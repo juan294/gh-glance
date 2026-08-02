@@ -18,7 +18,6 @@ pane next to your editor) where you want an always-on glance at repo activity
 without switching to the browser.
 
 ```
- 1:Actions (150)   2:Issues (0)   3:Pull requests (2)   4:Security (1)
     TITLE                            WORKFLOW   BRANCH         TIME    AGE
 ────────────────────────────────────────────────────────────────────────────
  ✓  ci: align release-probes acti… CI #443    develop        1m0s    4d ago
@@ -28,6 +27,7 @@ without switching to the browser.
  ✓  github_actions in / for actio… Dependabo… develop        34s     5d ago
  ✓  npm_and_yarn in / for typescr… Dependabo… develop        56s     5d ago
 
+ 1:Actions (150)   2:Issues (0)   3:Pull requests (2)   4:Security (1)
 updated just now · refreshing every 5s · ←/→ or 1-4 to switch tabs
 ```
 
@@ -53,7 +53,8 @@ current.
   severity carried by the icon's colour.
   Code scanning and secret scanning alerts are included too, on repos/plans
   that have GitHub Advanced Security enabled -- see [Limitations](#limitations).
-- Tab bar with live counts, switchable via `1`-`4`, arrow keys, or `Tab`/`Shift+Tab`
+- Tab bar with live counts, pinned to the bottom of the pane alongside the
+  status line, switchable via `1`-`4`, arrow keys, or `Tab`/`Shift+Tab`
 - Status icons are real GitHub Octicons (via the Nerd Font glyph set), not emoji
 - Adapts row count to the terminal pane's height live, on resize
 - Enters the terminal's alternate screen buffer on launch (like `lazygit`,

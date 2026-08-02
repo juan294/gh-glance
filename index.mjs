@@ -461,30 +461,31 @@ function App() {
   const error = errors[tab.key];
   const counts = Object.fromEntries(TABS.map((t) => [t.key, data[t.key].length]));
 
-  // Reserve lines for: tab bar, column header, separator, footer gap + footer
-  // text (5), plus a 1-line safety margin, plus one line per security note.
+  // Reserve lines for: column header + its separator (2), the tab bar (1) and
+  // the status line (1), plus a 1-line safety margin and one line per security
+  // note. Any slack left over is absorbed by the spacer below.
   const extraLines = tab.key === "security" ? securityNotes.length : 0;
-  const height = rows - 6 - extraLines;
+  const height = rows - 5 - extraLines;
   const visibleItems = items.slice(0, Math.max(1, height));
 
   return e(
     Box,
-    { flexDirection: "column", width: "100%" },
-    e(TabBar, { activeIndex, counts }),
+    { flexDirection: "column", width: "100%", height: rows },
     error && e(Text, { color: "red" }, error),
     tab.key === "security" && securityNotes.map((note, i) => e(Text, { key: i, color: "gray" }, note)),
     e(HeaderCells, { cells: tab.header }),
     ...visibleItems.map((item) => e(tab.Row, { key: item.id ?? item.databaseId ?? item.number, item, now })),
+    // Pins the tab bar and status line to the bottom of the pane, so the tabs
+    // stay put instead of riding up under the column headers on a tab that
+    // only has a handful of rows.
+    e(Box, { flexGrow: 1 }),
+    e(TabBar, { activeIndex, counts }),
     e(
-      Box,
-      { marginTop: 1 },
-      e(
-        Text,
-        { color: "gray" },
-        lastFetched
-          ? `updated ${formatAge(lastFetched, now)} · refreshing every ${REFRESH_MS / 1000}s · ←/→ or 1-4 to switch tabs`
-          : "loading…",
-      ),
+      Text,
+      { color: "gray" },
+      lastFetched
+        ? `updated ${formatAge(lastFetched, now)} · refreshing every ${REFRESH_MS / 1000}s · ←/→ or 1-4 to switch tabs`
+        : "loading…",
     ),
   );
 }
