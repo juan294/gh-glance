@@ -79,6 +79,35 @@ npm link   # makes the `gh-glance` command available globally
 
 (Not yet published to npm -- clone + `npm link` is the current install path.)
 
+`npm link` is what puts `gh-glance` on your `PATH`; it symlinks the global
+bin at your Node version's `bin/` directory through to this checkout:
+
+```
+<node>/bin/gh-glance -> <node>/lib/node_modules/gh-glance -> /path/to/your/clone
+```
+
+Because the link resolves to the clone rather than to a copy, you can move
+or rename the directory and the command keeps working. Two things do break
+it, and both are fixed by re-running `npm link` from the clone:
+
+- switching Node versions (nvm/fnm install their own global `bin/`)
+- setting up on a fresh machine, or after `npm unlink -g gh-glance`
+
+### Using it as a workspace pane
+
+`gh-glance` takes no arguments and infers the repo from the working
+directory, so it drops straight into a pane definition of whatever
+workspace tool you use. With [summon](https://github.com/juan294/summon),
+that's a one-line pane in a layout file:
+
+```
+pane.enhance=gh-glance
+```
+
+Point the pane at the bare command rather than an absolute path to
+`index.mjs` -- resolving through `PATH` is what lets the clone move without
+every layout needing an edit.
+
 ## Usage
 
 Run it from inside any locally cloned GitHub repository:
