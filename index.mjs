@@ -84,12 +84,14 @@ function shortErr(err) {
   return err?.shortMessage ?? err?.message ?? String(err);
 }
 
-// Some pty wrappers (and a terminal mid-resize) report a height of 0 or
-// undefined. Taking that literally collapses the table to a single row, so
-// fall back to a sane default until a real height arrives.
+// Some pty wrappers (and a terminal mid-resize) report a size of 0 or
+// undefined. Taking that literally collapses the table to a single row (or
+// draws a zero-width border), so fall back to sane defaults until real
+// dimensions arrive.
 const DEFAULT_ROWS = 30;
-function usableRows(rows) {
-  return typeof rows === "number" && rows > 0 ? rows : DEFAULT_ROWS;
+const DEFAULT_COLS = 80;
+function usableSize(value, fallback) {
+  return typeof value === "number" && value > 0 ? value : fallback;
 }
 
 // ---------- Data fetchers ----------
@@ -245,6 +247,15 @@ async function fetchSecurity() {
 
 // ---------- Shared layout primitives ----------
 
+// ANSI 8 ("gray", i.e. bright-black) sits close to the background on most dark
+// themes -- legible in a screenshot, not at a glance. Text you're meant to
+// actually read uses ANSI 7 instead: still a step below the default
+// foreground, but with real contrast against the pane. "gray" is kept for the
+// frame and separators, where receding is the whole point.
+const MUTED = "white";
+const BORDER_COLOR = "gray";
+const TITLE_COLOR = "cyanBright";
+
 function Column({ width, grow, children, bold, color }) {
   return e(
     Box,
@@ -256,8 +267,36 @@ function Column({ width, grow, children, bold, color }) {
 function HeaderCells({ cells }) {
   return e(
     Box,
-    { flexDirection: "row", borderStyle: "single", borderTop: false, borderLeft: false, borderRight: false },
-    ...cells.map((c, i) => e(Column, { key: i, ...c.props, bold: true, color: "gray" }, c.label)),
+    { flexDirection: "row", borderStyle: "single", borderTop: false, borderLeft: false, borderRight: false, borderColor: BORDER_COLOR },
+    ...cells.map((c, i) => e(Column, { key: i, ...c.props, bold: true, color: MUTED }, c.label)),
+  );
+}
+
+// ---------- Panel frame ----------
+
+// Ink can draw a border but not label one, so the horizontal edges are plain
+// text and the box between them contributes only its verticals. Drawing them
+// ourselves is what lets the tab name sit in the top edge and the row count in
+// the bottom, the way lazygit labels its panels.
+function PanelEdge({ width, top, label, labelColor }) {
+  const [open, close] = top ? ["╭", "╮"] : ["╰", "╯"];
+  const text = label ? ` ${label} ` : "";
+  // The title hugs the left corner and the count the right, so each edge
+  // spends a single dash on the side its label isn't on.
+  const fill = width - 3 - text.length;
+  // Too narrow to seat the label without wrapping the line: keep the frame,
+  // drop the text.
+  if (fill < 0) {
+    return e(Text, { color: BORDER_COLOR }, open + "─".repeat(Math.max(0, width - 2)) + close);
+  }
+  return e(
+    Text,
+    { color: BORDER_COLOR },
+    open,
+    top ? "─" : "─".repeat(fill),
+    e(Text, { color: labelColor, bold: true }, text),
+    top ? "─".repeat(fill) : "─",
+    close,
   );
 }
 
@@ -304,7 +343,7 @@ function ActionsRow({ item, now }) {
     e(Column, { width: 10, color: "blue" }, `${item.workflowName} #${item.number}`),
     e(Column, { width: 14, color: "magenta" }, item.headBranch),
     e(Column, { width: 7 }, formatDuration(finished - started)),
-    e(Column, { width: 8, color: "gray" }, formatAge(started, now)),
+    e(Column, { width: 8, color: MUTED }, formatAge(started, now)),
   );
 }
 
@@ -326,7 +365,7 @@ function IssueRow({ item, now }) {
     e(Column, { grow: true }, `#${item.number} ${item.title}`),
     e(Column, { width: 12, color: "blue" }, item.author?.login ?? ""),
     e(Column, { width: 14, color: "magenta" }, item.labels?.[0]?.name ?? ""),
-    e(Column, { width: 8, color: "gray" }, formatAge(new Date(item.updatedAt), now)),
+    e(Column, { width: 8, color: MUTED }, formatAge(new Date(item.updatedAt), now)),
   );
 }
 
@@ -358,7 +397,7 @@ function PRRow({ item, now }) {
     e(Column, { width: 12, color: "blue" }, item.author?.login ?? ""),
     e(Column, { width: 14, color: "magenta" }, item.headRefName),
     e(Column, { width: 10, color: review.color }, review.label),
-    e(Column, { width: 8, color: "gray" }, formatAge(new Date(item.updatedAt), now)),
+    e(Column, { width: 8, color: MUTED }, formatAge(new Date(item.updatedAt), now)),
   );
 }
 
@@ -387,7 +426,7 @@ function SecurityRow({ item, now }) {
     e(Column, { width: 3, color }, OCT.shield),
     e(Column, { width: 20, color: "blue" }, item.detail || item.kind),
     e(Column, { grow: true }, item.title),
-    e(Column, { width: 8, color: "gray" }, formatAge(new Date(item.createdAt), now)),
+    e(Column, { width: 8, color: MUTED }, formatAge(new Date(item.createdAt), now)),
   );
 }
 
@@ -414,9 +453,47 @@ function TabBar({ activeIndex, counts, loading, spin }) {
       return e(
         Box,
         { key: tab.key, marginRight: 2 },
-        e(Text, { bold: active, inverse: active, color: active ? undefined : "gray" }, ` ${label} `),
+        e(Text, { bold: active, inverse: active, color: active ? undefined : MUTED }, ` ${label} `),
       );
     }),
+  );
+}
+
+// ---------- Status bar ----------
+
+const KEY_HINTS = [
+  { label: "Tabs", keys: "←/→" },
+  { label: "Jump", keys: "1-4" },
+  { label: "Quit", keys: "^C" },
+];
+
+// Reserved so the hints don't shift sideways every time a refresh starts and
+// finishes. Wide enough for the spinner, a space and "Fetching".
+const FETCHING_WIDTH = 12;
+
+// Two tones rather than one flat gray: the keys you press are the part worth
+// finding at a glance, so they get the bright colour and the words describing
+// them stay dim. The indicator reads the same in both states -- only its
+// brightness and whether the spinner turns say which one you're in, so the
+// slot never changes shape or width under you.
+function StatusBar({ fetching, spin }) {
+  return e(
+    Box,
+    { flexDirection: "row" },
+    e(
+      Box,
+      { width: FETCHING_WIDTH, flexShrink: 0 },
+      e(Text, { color: fetching ? "cyanBright" : MUTED }, `${spin} Fetching`),
+    ),
+    ...KEY_HINTS.flatMap((hint, i) => [
+      i > 0 && e(Text, { key: `sep${i}`, color: BORDER_COLOR }, " │ "),
+      e(
+        Text,
+        { key: hint.label, wrap: "truncate-end" },
+        e(Text, { color: MUTED }, `${hint.label}: `),
+        e(Text, { color: "yellowBright", bold: true }, hint.keys),
+      ),
+    ]).filter(Boolean),
   );
 }
 
@@ -433,16 +510,16 @@ function App() {
   const [errors, setErrors] = useState({ actions: null, issues: null, prs: null, security: null });
   const [loading, setLoading] = useState({ actions: true, issues: true, prs: true, security: true });
   const [now, setNow] = useState(new Date());
-  const [lastFetched, setLastFetched] = useState(null);
-  const [rows, setRows] = useState(usableRows(stdout?.rows));
+  const [rows, setRows] = useState(usableSize(stdout?.rows, DEFAULT_ROWS));
+  const [cols, setCols] = useState(usableSize(stdout?.columns, DEFAULT_COLS));
   const [frame, setFrame] = useState(0);
 
   const tab = TABS[activeIndex];
-  const extraLines = tab.key === "security" ? securityNotes.length : 0;
-  // Reserve lines for: column header + its separator (2), the tab bar (1) and
-  // the status line (1), plus a 1-line safety margin. Slack is absorbed by the
-  // spacer in the tree below.
-  const bodyRows = Math.max(1, rows - 5 - extraLines);
+  const extraLines = (errors[tab.key] ? 1 : 0) + (tab.key === "security" ? securityNotes.length : 0);
+  // Reserve lines for: the panel's top and bottom edges (2), the column header
+  // and its separator (2), the tab bar (1) and the status line (1), plus a
+  // 1-line safety margin. Slack is absorbed by the spacer in the tree below.
+  const bodyRows = Math.max(1, rows - 7 - extraLines);
 
   // Read at fetch time rather than being a hook dependency, so dragging the
   // pane wider doesn't cancel and restart in-flight requests -- the next tick
@@ -540,7 +617,6 @@ function App() {
       ticks += 1;
       await Promise.allSettled(due.map(fetchTab));
       if (cancelled) return;
-      setLastFetched(new Date());
       // Advancing `now` is what forces a redraw, so only do it when it can
       // actually change what's on screen: durations of in-progress runs tick
       // every second, but every other age is minute-granular.
@@ -565,15 +641,21 @@ function App() {
     fetchTabRef.current?.(TABS[activeIndex].key);
   }, [activeIndex]);
 
-  // Animate only during the first load, and only while a fetch is actually in
-  // flight. Ink skips writing a frame identical to the last one, so a settled
-  // dashboard on an unchanged repo emits nothing at all -- but a spinner in the
-  // status line would defeat that by making every frame differ, redrawing the
-  // pane ten times a second for as long as the tool is open.
-  const firstLoad = TABS.some((t) => data[t.key] == null);
-  const showSpinner = firstLoad && anyLoading;
+  // Animate only while a fetch is actually in flight. Ink skips writing a frame
+  // identical to the last one, so a settled dashboard on an unchanged repo
+  // emits nothing at all -- an always-on spinner would defeat that by making
+  // every frame differ, redrawing the pane ten times a second for as long as
+  // the tool is open. Tying it to in-flight requests keeps the redraws inside
+  // the second or so each refresh takes, which is the point of showing it.
+  const showSpinner = anyLoading;
   useEffect(() => {
-    if (!showSpinner) return;
+    if (!showSpinner) {
+      // Park on a fixed frame rather than freezing wherever the animation
+      // happened to stop: the resting glyph is then the same every time, so
+      // consecutive idle frames stay byte-identical and Ink writes nothing.
+      setFrame(0);
+      return;
+    }
     const id = setInterval(() => setFrame((f) => (f + 1) % SPINNER.length), SPINNER_MS);
     return () => clearInterval(id);
   }, [showSpinner]);
@@ -583,7 +665,8 @@ function App() {
   useEffect(() => {
     if (!stdout) return;
     function onResize() {
-      setRows(usableRows(stdout.rows));
+      setRows(usableSize(stdout.rows, DEFAULT_ROWS));
+      setCols(usableSize(stdout.columns, DEFAULT_COLS));
     }
     stdout.on("resize", onResize);
     return () => stdout.off("resize", onResize);
@@ -605,37 +688,48 @@ function App() {
   );
 
   const visibleItems = (items ?? []).slice(0, bodyRows);
-  const pending = TABS.filter((t) => loading[t.key] && data[t.key] == null).map((t) => t.label.toLowerCase());
-
-  // Deliberately identical from tick to tick once settled: "updated just now"
-  // is the freshness signal, and a status line that changed on every refresh
-  // would force a redraw the frame comparison is there to avoid.
-  const status = firstLoad
-    ? `${spin} loading ${pending.join(", ") || "…"}`
-    : `updated ${formatAge(lastFetched, now)} · refreshing every ${REFRESH_MS / 1000}s · ←/→ or 1-4 to switch tabs`;
+  // Bottom-right of the frame, lazygit style: how much of the tab you can
+  // currently see out of how much there is.
+  const countLabel = items == null ? null : `${visibleItems.length} of ${counts[tab.key]}`;
 
   return e(
     Box,
     { flexDirection: "column", width: "100%", height: rows },
-    error && e(Text, { color: "red" }, error),
-    tab.key === "security" && securityNotes.map((note, i) => e(Text, { key: i, color: "gray" }, note)),
-    e(HeaderCells, { cells: tab.header }),
-    ...visibleItems.map((item) => e(tab.Row, { key: item.id ?? item.databaseId ?? item.number, item, now })),
-    // Distinguishes "still fetching" from "resolved and empty" in the body,
-    // which is the difference between a dashboard that looks hung and one that
-    // looks correct.
-    visibleItems.length === 0 &&
-      e(
-        Text,
-        { color: "gray" },
-        loading[tab.key] ? ` ${spin} loading ${tab.label.toLowerCase()}…` : `  no ${tab.countLabel}`,
-      ),
-    // Pins the tab bar and status line to the bottom of the pane, so the tabs
-    // stay put instead of riding up under the column headers on a tab that
-    // only has a handful of rows.
-    e(Box, { flexGrow: 1 }),
+    e(PanelEdge, { width: cols, top: true, label: tab.label, labelColor: TITLE_COLOR }),
+    e(
+      Box,
+      {
+        flexDirection: "column",
+        flexGrow: 1,
+        paddingX: 1,
+        // Only the verticals: the labelled edges above and below are drawn as
+        // text, and a border here too would double them up.
+        borderStyle: "round",
+        borderColor: BORDER_COLOR,
+        borderTop: false,
+        borderBottom: false,
+      },
+      error && e(Text, { color: "red" }, error),
+      tab.key === "security" && securityNotes.map((note, i) => e(Text, { key: i, color: MUTED }, note)),
+      e(HeaderCells, { cells: tab.header }),
+      ...visibleItems.map((item) => e(tab.Row, { key: item.id ?? item.databaseId ?? item.number, item, now })),
+      // Distinguishes "still fetching" from "resolved and empty" in the body,
+      // which is the difference between a dashboard that looks hung and one
+      // that looks correct.
+      visibleItems.length === 0 &&
+        e(
+          Text,
+          { color: MUTED },
+          loading[tab.key] ? `${spin} loading ${tab.label.toLowerCase()}…` : `no ${tab.countLabel}`,
+        ),
+      // Pushes the panel's bottom edge down to the foot of the pane, so the
+      // frame stays put instead of closing up under the column headers on a
+      // tab that only has a handful of rows.
+      e(Box, { flexGrow: 1 }),
+    ),
+    e(PanelEdge, { width: cols, top: false, label: countLabel, labelColor: MUTED }),
     e(TabBar, { activeIndex, counts, loading, spin }),
-    e(Text, { color: "gray" }, status),
+    e(StatusBar, { fetching: anyLoading, spin }),
   );
 }
 

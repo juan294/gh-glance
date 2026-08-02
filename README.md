@@ -18,21 +18,26 @@ pane next to your editor) where you want an always-on glance at repo activity
 without switching to the browser.
 
 ```
-    TITLE                            WORKFLOW   BRANCH         TIME    AGE
-────────────────────────────────────────────────────────────────────────────
- ✓  ci: align release-probes acti… CI #443    develop        1m0s    4d ago
- ✓  ci: align release-probes acti… CodeQL #3… develop        1m28s   4d ago
- ✗  chore(deps-dev): bump the dev… CI #442    develop        49s     5d ago
- ●  chore(deps-dev): bump the dev… CI #441    dependabot/np… 1m10s   5d ago
- ✓  github_actions in / for actio… Dependabo… develop        34s     5d ago
- ✓  npm_and_yarn in / for typescr… Dependabo… develop        56s     5d ago
-
- 1:Actions (150)   2:Issues (0)   3:Pull requests (2)   4:Security (1)
-updated just now · refreshing every 5s · ←/→ or 1-4 to switch tabs
+╭─ Actions ────────────────────────────────────────────────────────────────╮
+│    TITLE                          WORKFLOW   BRANCH         TIME    AGE  │
+│ ──────────────────────────────────────────────────────────────────────── │
+│ ✓  ci: align release-probes acti… CI #443    develop        1m0s    4d   │
+│ ✓  ci: align release-probes acti… CodeQL #3… develop        1m28s   4d   │
+│ ✗  chore(deps-dev): bump the dev… CI #442    develop        49s     5d   │
+│ ●  chore(deps-dev): bump the dev… CI #441    dependabot/np… 1m10s   5d   │
+│ ✓  github_actions in / for actio… Dependabo… develop        34s     5d   │
+│ ✓  npm_and_yarn in / for typescr… Dependabo… develop        56s     5d   │
+│                                                                          │
+╰──────────────────────────────────────────────────────────── 6 of 150+ ───╯
+ 1:Actions (150+)   2:Issues (0)   3:Pull requests (2)   4:Security (1)
+⠧ Fetching  Tabs: ←/→ │ Jump: 1-4 │ Quit: ^C
 ```
 
 > Status icons are Octicon glyphs from a Nerd Font; they're shown here as
 > `✓` `✗` `●` so they render in a browser.
+
+<!-- contract:allow-emoji -- the check/cross above stand in for Nerd Font
+     Octicons the app actually draws; they are literal examples, not decoration. -->
 
 ---
 
@@ -57,6 +62,10 @@ current.
   that have GitHub Advanced Security enabled -- see [Limitations](#limitations).
 - Tab bar with live counts, pinned to the bottom of the pane alongside the
   status line, switchable via `1`-`4`, arrow keys, or `Tab`/`Shift+Tab`
+- `lazygit`-style panel frame: the tab name sits in the top border, the
+  visible-of-total row count in the bottom
+- A spinning `Fetching` indicator while a refresh is in flight, so the pane
+  says when it's working without spending a line on it
 - Status icons are real GitHub Octicons (via the Nerd Font glyph set), not emoji
 - Adapts row count to the terminal pane's height live, on resize
 - Enters the terminal's alternate screen buffer on launch (like `lazygit`,
