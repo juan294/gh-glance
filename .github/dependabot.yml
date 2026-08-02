@@ -1,0 +1,34 @@
+version: 2
+
+updates:
+  # npm dependencies
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      # Keep major upgrades out of routine batches so they can be evaluated
+      # independently -- ink and react majors tend to need render changes.
+      runtime:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "eslint*"
+          - "@eslint/*"
+      tooling:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
+        patterns:
+          - "eslint*"
+          - "@eslint/*"
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"

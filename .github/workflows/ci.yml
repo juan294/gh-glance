@@ -6,15 +6,53 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
+    name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-      - run: npm install
+          node-version: 22
+          cache: npm
+      - run: npm ci
       - run: npm run lint
+
+  # The dashboard is a single ESM script with no build step, so the only
+  # version-dependent checks are that it parses and boots on every supported
+  # Node. 20.19 is the floor declared in `engines`.
+  smoke:
+    name: Smoke (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        node-version: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
       - name: Syntax check
         run: node --check index.mjs
+      - name: CLI boots
+        run: |
+          node index.mjs --version
+          node index.mjs --help
+      - name: Refuses a non-TTY stdout
+        run: |
+          if node index.mjs > /dev/null 2>&1; then
+            echo "expected a non-zero exit when stdout is not a TTY" >&2
+            exit 1
+          fi

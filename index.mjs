@@ -7,6 +7,7 @@
 // clear/flash on refresh.
 
 import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { promisify } from "node:util";
 import React, { useState, useEffect } from "react";
 import { render, Box, Text, useStdout, useInput, useStdin } from "ink";
@@ -61,6 +62,14 @@ function formatAge(date, now) {
 
 function shortErr(err) {
   return err?.shortMessage ?? err?.message ?? String(err);
+}
+
+// Some pty wrappers (and a terminal mid-resize) report a height of 0 or
+// undefined. Taking that literally collapses the table to a single row, so
+// fall back to a sane default until a real height arrives.
+const DEFAULT_ROWS = 30;
+function usableRows(rows) {
+  return typeof rows === "number" && rows > 0 ? rows : DEFAULT_ROWS;
 }
 
 // ---------- Data fetchers ----------
@@ -378,8 +387,12 @@ function App() {
   const [errors, setErrors] = useState({ actions: null, issues: null, prs: null, security: null });
   const [now, setNow] = useState(new Date());
   const [lastFetched, setLastFetched] = useState(null);
-  const [rows, setRows] = useState(stdout?.rows ?? 30);
+  const [rows, setRows] = useState(usableRows(stdout?.rows));
 
+  // `isActive` has to be coerced: ink only skips raw mode when the flag is
+  // strictly `false`, and Node reports `stdin.isTTY` as `undefined` -- not
+  // `false` -- when stdin isn't a terminal. Passing the raw value through
+  // would let ink call setRawMode() on a non-TTY stdin and throw on startup.
   useInput(
     (input, key) => {
       if (input >= "1" && input <= String(TABS.length)) {
@@ -392,7 +405,7 @@ function App() {
         setActiveIndex((i) => (i - 1 + TABS.length) % TABS.length);
       }
     },
-    { isActive: isRawModeSupported },
+    { isActive: Boolean(isRawModeSupported) },
   );
 
   useEffect(() => {
@@ -437,7 +450,7 @@ function App() {
   useEffect(() => {
     if (!stdout) return;
     function onResize() {
-      setRows(stdout.rows);
+      setRows(usableRows(stdout.rows));
     }
     stdout.on("resize", onResize);
     return () => stdout.off("resize", onResize);
@@ -474,6 +487,51 @@ function App() {
       ),
     ),
   );
+}
+
+// ---------- Entry point ----------
+
+const { version } = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"));
+
+const HELP = `gh-glance ${version} -- a live-refreshing GitHub dashboard for a narrow terminal pane.
+
+Usage:
+  gh-glance            Run the dashboard in the current repository
+  gh-glance --help     Show this help
+  gh-glance --version  Show the version
+
+Run it from inside a locally cloned GitHub repository; the repo is inferred
+from the git remote, the same way \`gh\` does it. Requires the \`gh\` CLI,
+authenticated via \`gh auth login\`.
+
+Keys:
+  1 2 3 4            Actions / Issues / Pull requests / Security
+  Left / Right       Previous / next tab
+  Tab / Shift+Tab    Next / previous tab
+  Ctrl+C             Quit
+`;
+
+const args = process.argv.slice(2);
+
+if (args.includes("--help") || args.includes("-h")) {
+  console.log(HELP);
+  process.exit(0);
+}
+if (args.includes("--version") || args.includes("-v")) {
+  console.log(version);
+  process.exit(0);
+}
+if (args.length > 0) {
+  console.error(`gh-glance: unknown argument: ${args[0]}\nRun \`gh-glance --help\` for usage.`);
+  process.exit(2);
+}
+
+// This is a full-screen live dashboard, not a reporting command -- piping it
+// somewhere would emit an endless stream of redraw frames, so fail fast with
+// an explanation instead.
+if (!process.stdout.isTTY) {
+  console.error("gh-glance: stdout is not a terminal. This is an interactive dashboard and can't be piped or redirected.");
+  process.exit(1);
 }
 
 // Enter the alternate screen buffer, same as lazygit/htop/vim, so the shell

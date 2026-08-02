@@ -11,6 +11,7 @@ export default [
         console: "readonly",
         setInterval: "readonly",
         clearInterval: "readonly",
+        URL: "readonly",
       },
     },
     rules: {

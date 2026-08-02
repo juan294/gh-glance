@@ -1,3 +1,18 @@
 node_modules/
 *.log
+*.tgz
 .DS_Store
+.env
+.env.*
+.vscode/
+.worktrees/
+CLAUDE.local.md
+.claude/settings.local.json
+
+# Security-sensitive files
+.npmrc
+*.pem
+*.key
+
+# Local summon config
+.summon

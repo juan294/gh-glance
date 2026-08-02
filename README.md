@@ -12,6 +12,23 @@ Built for pairing with a terminal multiplexer/workspace tool (e.g. a sidebar
 pane next to your editor) where you want an always-on glance at repo activity
 without switching to the browser.
 
+```
+ 1:Actions (150)   2:Issues (0)   3:Pull requests (2)   4:Security (1)
+    TITLE                            WORKFLOW   BRANCH         TIME    AGE
+────────────────────────────────────────────────────────────────────────────
+ ✓  ci: align release-probes acti… CI #443    develop        1m0s    4d ago
+ ✓  ci: align release-probes acti… CodeQL #3… develop        1m28s   4d ago
+ ✗  chore(deps-dev): bump the dev… CI #442    develop        49s     5d ago
+ ●  chore(deps-dev): bump the dev… CI #441    dependabot/np… 1m10s   5d ago
+ ✓  github_actions in / for actio… Dependabo… develop        34s     5d ago
+ ✓  npm_and_yarn in / for typescr… Dependabo… develop        56s     5d ago
+
+updated just now · refreshing every 5s · ←/→ or 1-4 to switch tabs
+```
+
+> Status icons are Octicon glyphs from a Nerd Font; they're shown here as
+> `✓` `✗` `●` so they render in a browser.
+
 ## Why
 
 GitHub's own web UI already shows all of this. `gh-glance` exists for the
@@ -27,7 +44,8 @@ current.
 - **Issues** -- open issues: title, author, first label, age
 - **Pull Requests** -- open PRs: title, author, branch, review status
   (approved / changes requested / pending), age
-- **Security** -- open Dependabot alerts (package, severity, summary, age).
+- **Security** -- open Dependabot alerts: package, summary, age, with
+  severity carried by the icon's colour.
   Code scanning and secret scanning alerts are included too, on repos/plans
   that have GitHub Advanced Security enabled -- see [Limitations](#limitations).
 - Tab bar with live counts, switchable via `1`-`4`, arrow keys, or `Tab`/`Shift+Tab`
@@ -66,6 +84,14 @@ gh-glance
 
 It infers the repository from the current directory's git remote, the same
 way `gh` itself does -- no flags or config needed.
+
+```bash
+gh-glance --help      # usage and keybindings
+gh-glance --version   # print the version
+```
+
+It's an interactive full-screen dashboard, so it exits with an error if
+stdout isn't a terminal rather than streaming redraw frames into a pipe.
 
 ### Keybindings
 

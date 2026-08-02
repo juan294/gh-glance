@@ -8,7 +8,9 @@
     "gh-glance": "./index.mjs"
   },
   "files": [
-    "index.mjs"
+    "index.mjs",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "lint": "eslint .",
