@@ -8,6 +8,7 @@ node_modules/
 .worktrees/
 CLAUDE.local.md
 .claude/settings.local.json
+.claude/metrics/
 
 # Security-sensitive files
 .npmrc

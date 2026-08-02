@@ -34,6 +34,8 @@ updated just now · refreshing every 5s · ←/→ or 1-4 to switch tabs
 > Status icons are Octicon glyphs from a Nerd Font; they're shown here as
 > `✓` `✗` `●` so they render in a browser.
 
+---
+
 ## Why
 
 GitHub's own web UI already shows all of this. `gh-glance` exists for the

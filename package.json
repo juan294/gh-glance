@@ -14,7 +14,8 @@
   ],
   "scripts": {
     "lint": "eslint .",
-    "start": "node index.mjs"
+    "start": "node index.mjs",
+    "prepare": "husky || true"
   },
   "keywords": [
     "github",
@@ -45,6 +46,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "eslint": "^10.8.0"
+    "eslint": "^10.8.0",
+    "husky": "^9.1.7"
   }
 }
