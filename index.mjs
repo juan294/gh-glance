@@ -9,16 +9,32 @@
 import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { promisify } from "node:util";
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { render, Box, Text, useStdout, useInput, useStdin } from "ink";
 
 const e = React.createElement;
 const execFileAsync = promisify(execFile);
 
 const REFRESH_MS = 5000;
-// Generous ceiling so even a tall desktop-monitor pane has enough rows
-// buffered to fill the space; cheap for `gh` to return either way.
+
+// `gh run list` costs roughly linearly in --limit (measured: ~1.2s at 20 runs,
+// ~3.0s at 100, ~4.9s at 150), so asking for a fixed 150 to render ~35 visible
+// rows was paying several seconds per refresh for rows nobody sees. Actions is
+// a scrolling log whose count is arbitrary anyway, so it fetches only what the
+// pane can show -- one extra row tells us whether to render the count as "n+".
+const MIN_RUN_LIMIT = 20;
+
+// Issues and PRs are sets rather than logs: the count *is* the signal, so these
+// stay generous. They are also far cheaper, being bounded by what's open.
 const LIST_LIMIT = 150;
+
+// Alert endpoints are filtered server-side to open items and capped at one
+// page. The previous --paginate walked the repo's entire alert history --
+// mostly closed alerts -- and then discarded them client-side.
+const ALERT_QUERY = "?state=open&per_page=100";
+
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_MS = 100;
 
 // ---------- Octicons (via the Nerd Font glyph set -- private-use-area
 // codepoints from ryanoasis/nerd-fonts glyphnames.json). Same icon shapes
@@ -74,12 +90,12 @@ function usableRows(rows) {
 
 // ---------- Data fetchers ----------
 
-async function fetchActions() {
+async function fetchActions(limit) {
   const { stdout } = await execFileAsync("gh", [
     "run",
     "list",
     "--limit",
-    String(LIST_LIMIT),
+    String(limit),
     "--json",
     "databaseId,displayTitle,workflowName,number,headBranch,event,status,conclusion,startedAt,updatedAt",
   ]);
@@ -122,8 +138,7 @@ async function fetchDependabotAlerts() {
   try {
     const { stdout } = await execFileAsync("gh", [
       "api",
-      "repos/{owner}/{repo}/dependabot/alerts",
-      "--paginate",
+      `repos/{owner}/{repo}/dependabot/alerts${ALERT_QUERY}`,
     ]);
     const raw = JSON.parse(stdout);
     const alerts = raw
@@ -146,8 +161,7 @@ async function fetchCodeScanningAlerts() {
   try {
     const { stdout } = await execFileAsync("gh", [
       "api",
-      "repos/{owner}/{repo}/code-scanning/alerts",
-      "--paginate",
+      `repos/{owner}/{repo}/code-scanning/alerts${ALERT_QUERY}`,
     ]);
     const raw = JSON.parse(stdout);
     const alerts = raw
@@ -170,8 +184,7 @@ async function fetchSecretScanningAlerts() {
   try {
     const { stdout } = await execFileAsync("gh", [
       "api",
-      "repos/{owner}/{repo}/secret-scanning/alerts",
-      "--paginate",
+      `repos/{owner}/{repo}/secret-scanning/alerts${ALERT_QUERY}`,
     ]);
     const raw = JSON.parse(stdout);
     const alerts = raw
@@ -359,14 +372,17 @@ const TABS = [
   { key: "security", label: "Security", header: SECURITY_HEADER, Row: SecurityRow, countLabel: "alerts" },
 ];
 
-function TabBar({ activeIndex, counts }) {
+function TabBar({ activeIndex, counts, loading, spin }) {
   return e(
     Box,
     { flexDirection: "row" },
     ...TABS.map((tab, i) => {
       const active = i === activeIndex;
       const count = counts[tab.key];
-      const label = `${i + 1}:${tab.label}${count != null ? ` (${count})` : ""}`;
+      // A tab that has never resolved shows the spinner where its count will
+      // go, so the first load reads as "working" rather than "empty".
+      const suffix = count == null ? (loading[tab.key] ? ` ${spin}` : "") : ` (${count})`;
+      const label = `${i + 1}:${tab.label}${suffix}`;
       return e(
         Box,
         { key: tab.key, marginRight: 2 },
@@ -382,12 +398,31 @@ function App() {
   const { stdout } = useStdout();
   const { isRawModeSupported } = useStdin();
   const [activeIndex, setActiveIndex] = useState(0);
-  const [data, setData] = useState({ actions: [], issues: [], prs: [], security: [] });
+  // `null` means "never resolved" -- distinct from `[]`, which means "resolved
+  // and genuinely empty". The tab bar and the body render those differently.
+  const [data, setData] = useState({ actions: null, issues: null, prs: null, security: null });
   const [securityNotes, setSecurityNotes] = useState([]);
   const [errors, setErrors] = useState({ actions: null, issues: null, prs: null, security: null });
+  const [loading, setLoading] = useState({ actions: true, issues: true, prs: true, security: true });
   const [now, setNow] = useState(new Date());
   const [lastFetched, setLastFetched] = useState(null);
   const [rows, setRows] = useState(usableRows(stdout?.rows));
+  const [frame, setFrame] = useState(0);
+
+  const tab = TABS[activeIndex];
+  const extraLines = tab.key === "security" ? securityNotes.length : 0;
+  // Reserve lines for: column header + its separator (2), the tab bar (1) and
+  // the status line (1), plus a 1-line safety margin. Slack is absorbed by the
+  // spacer in the tree below.
+  const bodyRows = Math.max(1, rows - 5 - extraLines);
+
+  // Read at fetch time rather than being a hook dependency, so dragging the
+  // pane wider doesn't cancel and restart in-flight requests -- the next tick
+  // simply asks for the new size.
+  const runLimitRef = useRef(0);
+  runLimitRef.current = Math.max(bodyRows + 1, MIN_RUN_LIMIT);
+
+  const anyLoading = Object.values(loading).some(Boolean);
 
   // `isActive` has to be coerced: ink only skips raw mode when the flag is
   // strictly `false`, and Node reports `stdin.isTTY` as `undefined` -- not
@@ -410,29 +445,44 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
+    let inFlight = false;
+
+    // Each tab commits its own result the moment it lands instead of waiting on
+    // a Promise.allSettled barrier. Actions is by far the slowest fetch, so
+    // barrelling everything together meant the three fast tabs sat invisible
+    // behind it and nothing at all appeared until the slowest call returned.
+    function commit(key, run) {
+      setLoading((l) => ({ ...l, [key]: true }));
+      return run()
+        .then((value) => {
+          if (cancelled) return;
+          setData((d) => ({ ...d, [key]: value.alerts ?? value }));
+          if (value.notes) setSecurityNotes(value.notes);
+          setErrors((x) => ({ ...x, [key]: null }));
+          setNow(new Date());
+        })
+        .catch((err) => {
+          if (!cancelled) setErrors((x) => ({ ...x, [key]: shortErr(err) }));
+        })
+        .finally(() => {
+          if (!cancelled) setLoading((l) => ({ ...l, [key]: false }));
+        });
+    }
 
     async function tick() {
-      const [actionsR, issuesR, prsR, securityR] = await Promise.allSettled([
-        fetchActions(),
-        fetchIssues(),
-        fetchPRs(),
-        fetchSecurity(),
+      // A slow repo used to outrun the interval: `gh run list --limit 150` took
+      // ~5s against a 5s tick, so refreshes stacked on top of each other.
+      if (inFlight) return;
+      inFlight = true;
+      const limit = runLimitRef.current;
+      await Promise.allSettled([
+        commit("actions", () => fetchActions(limit)),
+        commit("issues", () => fetchIssues()),
+        commit("prs", () => fetchPRs()),
+        commit("security", () => fetchSecurity()),
       ]);
+      inFlight = false;
       if (cancelled) return;
-
-      setData((d) => ({
-        actions: actionsR.status === "fulfilled" ? actionsR.value : d.actions,
-        issues: issuesR.status === "fulfilled" ? issuesR.value : d.issues,
-        prs: prsR.status === "fulfilled" ? prsR.value : d.prs,
-        security: securityR.status === "fulfilled" ? securityR.value.alerts : d.security,
-      }));
-      if (securityR.status === "fulfilled") setSecurityNotes(securityR.value.notes);
-      setErrors({
-        actions: actionsR.status === "rejected" ? shortErr(actionsR.reason) : null,
-        issues: issuesR.status === "rejected" ? shortErr(issuesR.reason) : null,
-        prs: prsR.status === "rejected" ? shortErr(prsR.reason) : null,
-        security: securityR.status === "rejected" ? shortErr(securityR.reason) : null,
-      });
       setLastFetched(new Date());
       setNow(new Date());
     }
@@ -445,6 +495,15 @@ function App() {
     };
   }, []);
 
+  // Only animate while something is actually in flight -- an idle dashboard
+  // should cost nothing, and a permanently ticking timer would redraw the pane
+  // ten times a second forever.
+  useEffect(() => {
+    if (!anyLoading) return;
+    const id = setInterval(() => setFrame((f) => (f + 1) % SPINNER.length), SPINNER_MS);
+    return () => clearInterval(id);
+  }, [anyLoading]);
+
   // React to the pane resizing immediately (desktop vs. laptop, or just
   // dragging the Ghostty window) instead of waiting for the next poll tick.
   useEffect(() => {
@@ -456,17 +515,32 @@ function App() {
     return () => stdout.off("resize", onResize);
   }, [stdout]);
 
-  const tab = TABS[activeIndex];
   const items = data[tab.key];
   const error = errors[tab.key];
-  const counts = Object.fromEntries(TABS.map((t) => [t.key, data[t.key].length]));
+  const spin = SPINNER[frame % SPINNER.length];
 
-  // Reserve lines for: column header + its separator (2), the tab bar (1) and
-  // the status line (1), plus a 1-line safety margin and one line per security
-  // note. Any slack left over is absorbed by the spacer below.
-  const extraLines = tab.key === "security" ? securityNotes.length : 0;
-  const height = rows - 5 - extraLines;
-  const visibleItems = items.slice(0, Math.max(1, height));
+  const counts = Object.fromEntries(
+    TABS.map((t) => {
+      const list = data[t.key];
+      if (list == null) return [t.key, null];
+      // Actions is capped to the pane height, so say so rather than implying
+      // the repo only ever ran that many workflows.
+      const capped = t.key === "actions" && list.length >= runLimitRef.current;
+      return [t.key, `${list.length}${capped ? "+" : ""}`];
+    }),
+  );
+
+  const visibleItems = (items ?? []).slice(0, bodyRows);
+  const pending = TABS.filter((t) => loading[t.key] && data[t.key] == null).map((t) => t.label.toLowerCase());
+
+  let status;
+  if (!lastFetched) {
+    status = `${spin} loading ${pending.join(", ") || "…"}`;
+  } else if (anyLoading) {
+    status = `${spin} refreshing · ←/→ or 1-4 to switch tabs`;
+  } else {
+    status = `updated ${formatAge(lastFetched, now)} · refreshing every ${REFRESH_MS / 1000}s · ←/→ or 1-4 to switch tabs`;
+  }
 
   return e(
     Box,
@@ -475,18 +549,21 @@ function App() {
     tab.key === "security" && securityNotes.map((note, i) => e(Text, { key: i, color: "gray" }, note)),
     e(HeaderCells, { cells: tab.header }),
     ...visibleItems.map((item) => e(tab.Row, { key: item.id ?? item.databaseId ?? item.number, item, now })),
+    // Distinguishes "still fetching" from "resolved and empty" in the body,
+    // which is the difference between a dashboard that looks hung and one that
+    // looks correct.
+    visibleItems.length === 0 &&
+      e(
+        Text,
+        { color: "gray" },
+        loading[tab.key] ? ` ${spin} loading ${tab.label.toLowerCase()}…` : `  no ${tab.countLabel}`,
+      ),
     // Pins the tab bar and status line to the bottom of the pane, so the tabs
     // stay put instead of riding up under the column headers on a tab that
     // only has a handful of rows.
     e(Box, { flexGrow: 1 }),
-    e(TabBar, { activeIndex, counts }),
-    e(
-      Text,
-      { color: "gray" },
-      lastFetched
-        ? `updated ${formatAge(lastFetched, now)} · refreshing every ${REFRESH_MS / 1000}s · ←/→ or 1-4 to switch tabs`
-        : "loading…",
-    ),
+    e(TabBar, { activeIndex, counts, loading, spin }),
+    e(Text, { color: "gray" }, status),
   );
 }
 
