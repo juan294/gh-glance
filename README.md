@@ -1,7 +1,12 @@
 # gh-glance
 
-[![CI](https://github.com/juan294/gh-glance/actions/workflows/ci.yml/badge.svg)](https://github.com/juan294/gh-glance/actions/workflows/ci.yml)
-[![CodeQL](https://github.com/juan294/gh-glance/actions/workflows/codeql.yml/badge.svg)](https://github.com/juan294/gh-glance/actions/workflows/codeql.yml)
+<a href="https://chapa.thecreativetoken.com/u/juan294">
+  <img src="https://chapa.thecreativetoken.com/u/juan294/badge.svg" alt="juan294's Chapa Impact Badge" width="100%" />
+</a>
+
+[![CI](https://github.com/juan294/gh-glance/actions/workflows/ci.yml/badge.svg?branch=develop&event=push)](https://github.com/juan294/gh-glance/actions/workflows/ci.yml?query=branch%3Adevelop+event%3Apush)
+[![CodeQL](https://github.com/juan294/gh-glance/actions/workflows/codeql.yml/badge.svg?branch=develop&event=push)](https://github.com/juan294/gh-glance/actions/workflows/codeql.yml?query=branch%3Adevelop+event%3Apush)
+![Node.js](https://img.shields.io/badge/Node.js-20.19%2B-43853d)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
 A live-refreshing GitHub dashboard that fits in a narrow terminal pane --

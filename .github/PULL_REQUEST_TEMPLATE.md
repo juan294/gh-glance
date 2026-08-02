@@ -24,6 +24,7 @@
 ## Self-Review Checklist
 
 - [ ] Code follows the project conventions
+- [ ] PR targets the `develop` branch
 - [ ] No tokens, secrets, or credentials included
 - [ ] `gh` is still invoked via `execFile` with an argument array, never a
       shell string built from repository data (see SECURITY.md)

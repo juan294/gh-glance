@@ -36,6 +36,31 @@ node index.mjs   # run it from inside any locally cloned GitHub repo
 
 There's no build step -- it's plain ESM JavaScript, run directly by Node.
 
+## Branching Model
+
+`develop` is the default branch and where all work lands. `main` tracks
+released state, and only ever moves via a `develop` -> `main` pull request.
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feat/your-feature
+```
+
+Open your pull request against `develop`, never against `main`.
+
+## Commit Format
+
+Use lowercase [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+feat: add a releases tab
+fix: handle repos with no workflow runs
+docs: clarify the Nerd Font fallback
+chore: bump dependencies
+refactor: extract the row-height calculation
+```
+
 ## Code Style
 
 - No TypeScript, no build tooling, no bundler -- this project intentionally
@@ -49,7 +74,19 @@ There's no build step -- it's plain ESM JavaScript, run directly by Node.
 
 ## Submitting a Pull Request
 
-1. Fork the repo and create a branch off `main`
+1. Fork the repo and create a branch off `develop`
 2. Make your change, keeping it scoped to one concern
-3. Run `npm run lint`
-4. Open a PR describing what changed and why
+3. Run `npm run lint` and `node --check index.mjs`
+4. Open a PR against `develop` describing what changed and why
+5. Make sure CI is green before requesting review
+
+## Code of Conduct
+
+This project follows the [Contributor Covenant Code of
+Conduct](CODE_OF_CONDUCT.md). By participating, you are expected to uphold
+this code.
+
+## Security
+
+If you discover a security vulnerability, please follow the [Security
+Policy](SECURITY.md) instead of opening a public issue.
