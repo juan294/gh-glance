@@ -33,6 +33,10 @@ const LIST_LIMIT = 150;
 // mostly closed alerts -- and then discarded them client-side.
 const ALERT_QUERY = "?state=open&per_page=100";
 
+// Inactive tabs only feed the tab-bar counts, so they refresh every Nth tick
+// rather than every tick -- 4 puts them on a 20s cycle at the default refresh.
+const BACKGROUND_EVERY = 4;
+
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_MS = 100;
 
@@ -99,7 +103,7 @@ async function fetchActions(limit) {
     "--json",
     "databaseId,displayTitle,workflowName,number,headBranch,event,status,conclusion,startedAt,updatedAt",
   ]);
-  return JSON.parse(stdout);
+  return { raw: stdout, parse: () => JSON.parse(stdout) };
 }
 
 async function fetchIssues() {
@@ -113,7 +117,7 @@ async function fetchIssues() {
     "--json",
     "number,title,author,labels,createdAt,updatedAt",
   ]);
-  return JSON.parse(stdout);
+  return { raw: stdout, parse: () => JSON.parse(stdout) };
 }
 
 async function fetchPRs() {
@@ -127,7 +131,7 @@ async function fetchPRs() {
     "--json",
     "number,title,author,headRefName,isDraft,reviewDecision,createdAt,updatedAt",
   ]);
-  return JSON.parse(stdout);
+  return { raw: stdout, parse: () => JSON.parse(stdout) };
 }
 
 // Dependabot alerts are broadly available. Code scanning and secret scanning
@@ -140,20 +144,25 @@ async function fetchDependabotAlerts() {
       "api",
       `repos/{owner}/{repo}/dependabot/alerts${ALERT_QUERY}`,
     ]);
-    const raw = JSON.parse(stdout);
-    const alerts = raw
-      .filter((a) => a.state === "open")
-      .map((a) => ({
-        id: `dependabot-${a.number}`,
-        kind: "Dependabot",
-        severity: a.security_advisory?.severity ?? "unknown",
-        title: a.security_advisory?.summary ?? "(no summary)",
-        detail: a.dependency?.package?.name ?? "",
-        createdAt: a.created_at,
-      }));
-    return { alerts, note: null };
+    return {
+      raw: stdout,
+      parse: () => ({
+        alerts: JSON.parse(stdout)
+          .filter((a) => a.state === "open")
+          .map((a) => ({
+            id: `dependabot-${a.number}`,
+            kind: "Dependabot",
+            severity: a.security_advisory?.severity ?? "unknown",
+            title: a.security_advisory?.summary ?? "(no summary)",
+            detail: a.dependency?.package?.name ?? "",
+            createdAt: a.created_at,
+          })),
+        note: null,
+      }),
+    };
   } catch (err) {
-    return { alerts: [], note: `Dependabot alerts: ${shortErr(err)}` };
+    const note = `Dependabot alerts: ${shortErr(err)}`;
+    return { raw: `unavailable:${note}`, parse: () => ({ alerts: [], note }) };
   }
 }
 
@@ -163,20 +172,25 @@ async function fetchCodeScanningAlerts() {
       "api",
       `repos/{owner}/{repo}/code-scanning/alerts${ALERT_QUERY}`,
     ]);
-    const raw = JSON.parse(stdout);
-    const alerts = raw
-      .filter((a) => a.state === "open")
-      .map((a) => ({
-        id: `codeql-${a.number}`,
-        kind: "CodeQL",
-        severity: a.rule?.security_severity_level ?? a.rule?.severity ?? "unknown",
-        title: a.rule?.description ?? a.rule?.name ?? "(no description)",
-        detail: a.most_recent_instance?.location?.path ?? "",
-        createdAt: a.created_at,
-      }));
-    return { alerts, note: null };
+    return {
+      raw: stdout,
+      parse: () => ({
+        alerts: JSON.parse(stdout)
+          .filter((a) => a.state === "open")
+          .map((a) => ({
+            id: `codeql-${a.number}`,
+            kind: "CodeQL",
+            severity: a.rule?.security_severity_level ?? a.rule?.severity ?? "unknown",
+            title: a.rule?.description ?? a.rule?.name ?? "(no description)",
+            detail: a.most_recent_instance?.location?.path ?? "",
+            createdAt: a.created_at,
+          })),
+        note: null,
+      }),
+    };
   } catch {
-    return { alerts: [], note: "Code scanning: not enabled (needs GitHub Advanced Security)" };
+    const note = "Code scanning: not enabled (needs GitHub Advanced Security)";
+    return { raw: `unavailable:${note}`, parse: () => ({ alerts: [], note }) };
   }
 }
 
@@ -186,20 +200,25 @@ async function fetchSecretScanningAlerts() {
       "api",
       `repos/{owner}/{repo}/secret-scanning/alerts${ALERT_QUERY}`,
     ]);
-    const raw = JSON.parse(stdout);
-    const alerts = raw
-      .filter((a) => a.state === "open")
-      .map((a) => ({
-        id: `secret-${a.number}`,
-        kind: "Secret",
-        severity: "critical",
-        title: a.secret_type_display_name ?? a.secret_type ?? "(unknown secret type)",
-        detail: "",
-        createdAt: a.created_at,
-      }));
-    return { alerts, note: null };
+    return {
+      raw: stdout,
+      parse: () => ({
+        alerts: JSON.parse(stdout)
+          .filter((a) => a.state === "open")
+          .map((a) => ({
+            id: `secret-${a.number}`,
+            kind: "Secret",
+            severity: "critical",
+            title: a.secret_type_display_name ?? a.secret_type ?? "(unknown secret type)",
+            detail: "",
+            createdAt: a.created_at,
+          })),
+        note: null,
+      }),
+    };
   } catch {
-    return { alerts: [], note: "Secret scanning: disabled" };
+    const note = "Secret scanning: disabled";
+    return { raw: `unavailable:${note}`, parse: () => ({ alerts: [], note }) };
   }
 }
 
@@ -210,8 +229,17 @@ async function fetchSecurity() {
     fetchSecretScanningAlerts(),
   ]);
   return {
-    alerts: [...dependabot.alerts, ...codeScanning.alerts, ...secretScanning.alerts],
-    notes: [dependabot.note, codeScanning.note, secretScanning.note].filter(Boolean),
+    // Joined with a NUL so a change in any one of the three shows up as a
+    // change in the combined payload, without risk of two different splits
+    // colliding on the same string.
+    raw: [dependabot.raw, codeScanning.raw, secretScanning.raw].join("\0"),
+    parse: () => {
+      const parts = [dependabot.parse(), codeScanning.parse(), secretScanning.parse()];
+      return {
+        alerts: parts.flatMap((p) => p.alerts),
+        notes: parts.map((p) => p.note).filter(Boolean),
+      };
+    },
   };
 }
 
@@ -424,6 +452,20 @@ function App() {
 
   const anyLoading = Object.values(loading).some(Boolean);
 
+  // Read inside the polling closure, which is created once on mount and must
+  // not be torn down and rebuilt every time you press a tab key.
+  const activeIndexRef = useRef(activeIndex);
+  activeIndexRef.current = activeIndex;
+
+  // An in-progress run's elapsed time is the only thing on screen that changes
+  // faster than once a minute, so it decides how often `now` has to advance.
+  const hasInProgressRef = useRef(false);
+  hasInProgressRef.current = (data.actions ?? []).some((r) => r.status !== "completed");
+
+  const inFlightRef = useRef({});
+  const rawRef = useRef({});
+  const fetchTabRef = useRef(null);
+
   // `isActive` has to be coerced: ink only skips raw mode when the flag is
   // strictly `false`, and Node reports `stdin.isTTY` as `undefined` -- not
   // `false` -- when stdin isn't a terminal. Passing the raw value through
@@ -445,46 +487,66 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
-    let inFlight = false;
+    let ticks = 0;
 
     // Each tab commits its own result the moment it lands instead of waiting on
     // a Promise.allSettled barrier. Actions is by far the slowest fetch, so
     // barrelling everything together meant the three fast tabs sat invisible
     // behind it and nothing at all appeared until the slowest call returned.
     function commit(key, run) {
-      setLoading((l) => ({ ...l, [key]: true }));
+      // Per-tab rather than one flag for the whole tick, so switching tabs can
+      // refresh the tab you just landed on without waiting on an unrelated
+      // background fetch -- and so a slow repo can't stack refreshes.
+      if (inFlightRef.current[key]) return Promise.resolve();
+      inFlightRef.current[key] = true;
+      setLoading((l) => (l[key] ? l : { ...l, [key]: true }));
       return run()
-        .then((value) => {
+        .then(({ raw, parse }) => {
           if (cancelled) return;
+          setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
+          // Identical payload: skip the parse *and* the state update. Returning
+          // the same state object makes React bail out of the re-render, so an
+          // idle repo stops redrawing the pane entirely.
+          if (rawRef.current[key] === raw) return;
+          rawRef.current[key] = raw;
+          const value = parse();
           setData((d) => ({ ...d, [key]: value.alerts ?? value }));
           if (value.notes) setSecurityNotes(value.notes);
-          setErrors((x) => ({ ...x, [key]: null }));
-          setNow(new Date());
         })
         .catch((err) => {
           if (!cancelled) setErrors((x) => ({ ...x, [key]: shortErr(err) }));
         })
         .finally(() => {
-          if (!cancelled) setLoading((l) => ({ ...l, [key]: false }));
+          inFlightRef.current[key] = false;
+          if (!cancelled) setLoading((l) => (l[key] ? { ...l, [key]: false } : l));
         });
     }
 
+    function fetchTab(key) {
+      if (key === "actions") return commit(key, () => fetchActions(runLimitRef.current));
+      if (key === "issues") return commit(key, () => fetchIssues());
+      if (key === "prs") return commit(key, () => fetchPRs());
+      return commit(key, () => fetchSecurity());
+    }
+    fetchTabRef.current = fetchTab;
+
     async function tick() {
-      // A slow repo used to outrun the interval: `gh run list --limit 150` took
-      // ~5s against a 5s tick, so refreshes stacked on top of each other.
-      if (inFlight) return;
-      inFlight = true;
-      const limit = runLimitRef.current;
-      await Promise.allSettled([
-        commit("actions", () => fetchActions(limit)),
-        commit("issues", () => fetchIssues()),
-        commit("prs", () => fetchPRs()),
-        commit("security", () => fetchSecurity()),
-      ]);
-      inFlight = false;
+      // Only the tab you're looking at needs to keep up with REFRESH_MS. The
+      // other three exist to keep the tab-bar counts honest, which tolerates
+      // being a few seconds behind -- so they refresh every BACKGROUND_EVERY
+      // ticks instead, cutting steady-state work to roughly a quarter.
+      const active = TABS[activeIndexRef.current].key;
+      const due = ticks % BACKGROUND_EVERY === 0 ? TABS.map((t) => t.key) : [active];
+      ticks += 1;
+      await Promise.allSettled(due.map(fetchTab));
       if (cancelled) return;
       setLastFetched(new Date());
-      setNow(new Date());
+      // Advancing `now` is what forces a redraw, so only do it when it can
+      // actually change what's on screen: durations of in-progress runs tick
+      // every second, but every other age is minute-granular.
+      setNow((prev) =>
+        hasInProgressRef.current || Date.now() - prev.getTime() >= 60_000 ? new Date() : prev,
+      );
     }
 
     tick();
@@ -495,14 +557,26 @@ function App() {
     };
   }, []);
 
-  // Only animate while something is actually in flight -- an idle dashboard
-  // should cost nothing, and a permanently ticking timer would redraw the pane
-  // ten times a second forever.
+  // Background tabs can be up to BACKGROUND_EVERY ticks stale, so the tab you
+  // switch to refreshes straight away rather than showing old data until its
+  // slot next comes round. On mount this is a no-op: the initial tick already
+  // has every tab in flight, and the per-tab guard rejects the duplicate.
   useEffect(() => {
-    if (!anyLoading) return;
+    fetchTabRef.current?.(TABS[activeIndex].key);
+  }, [activeIndex]);
+
+  // Animate only during the first load, and only while a fetch is actually in
+  // flight. Ink skips writing a frame identical to the last one, so a settled
+  // dashboard on an unchanged repo emits nothing at all -- but a spinner in the
+  // status line would defeat that by making every frame differ, redrawing the
+  // pane ten times a second for as long as the tool is open.
+  const firstLoad = TABS.some((t) => data[t.key] == null);
+  const showSpinner = firstLoad && anyLoading;
+  useEffect(() => {
+    if (!showSpinner) return;
     const id = setInterval(() => setFrame((f) => (f + 1) % SPINNER.length), SPINNER_MS);
     return () => clearInterval(id);
-  }, [anyLoading]);
+  }, [showSpinner]);
 
   // React to the pane resizing immediately (desktop vs. laptop, or just
   // dragging the Ghostty window) instead of waiting for the next poll tick.
@@ -533,14 +607,12 @@ function App() {
   const visibleItems = (items ?? []).slice(0, bodyRows);
   const pending = TABS.filter((t) => loading[t.key] && data[t.key] == null).map((t) => t.label.toLowerCase());
 
-  let status;
-  if (!lastFetched) {
-    status = `${spin} loading ${pending.join(", ") || "…"}`;
-  } else if (anyLoading) {
-    status = `${spin} refreshing · ←/→ or 1-4 to switch tabs`;
-  } else {
-    status = `updated ${formatAge(lastFetched, now)} · refreshing every ${REFRESH_MS / 1000}s · ←/→ or 1-4 to switch tabs`;
-  }
+  // Deliberately identical from tick to tick once settled: "updated just now"
+  // is the freshness signal, and a status line that changed on every refresh
+  // would force a redraw the frame comparison is there to avoid.
+  const status = firstLoad
+    ? `${spin} loading ${pending.join(", ") || "…"}`
+    : `updated ${formatAge(lastFetched, now)} · refreshing every ${REFRESH_MS / 1000}s · ←/→ or 1-4 to switch tabs`;
 
   return e(
     Box,
