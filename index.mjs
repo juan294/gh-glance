@@ -1616,14 +1616,43 @@ if (IS_MAIN) {
   installCrashHandlers();
   enterAlternateScreen();
   process.on("exit", restoreScreen);
+
+  const app = render(e(App));
+
   // 128 + signal number, so a supervisor or `timeout` can tell an interrupted
   // run from a clean one. These fire on external `kill` and when raw mode is
   // unavailable; the ordinary Ctrl+C path goes through ink's own handler.
-  process.on("SIGINT", () => process.exit(130));
-  process.on("SIGTERM", () => process.exit(143));
-  process.on("SIGHUP", () => process.exit(129));
-
-  render(e(App));
+  //
+  // Unmounting before restoring is load-bearing, not tidiness. signal-exit runs
+  // our own `exit` listener ahead of ink's teardown, so simply exiting here let
+  // restoreScreen hand the terminal back to the primary buffer *first* and ink
+  // then repainted onto it -- and because the root Box is `height: rows` the
+  // frame always exactly fills the viewport, so that repaint takes ink's
+  // `isUnmounting && previousOutputHeight >= viewportRows` branch and is
+  // preceded by \x1b[2J\x1b[3J. \x1b[3J erases the scrollback, so a `kill` threw
+  // away the user's terminal history and left a dead dashboard behind it
+  // (measured: 2,728 bytes on an 80x24 pane).
+  //
+  // Unmounting first puts that final repaint inside the alternate screen, where
+  // restoreScreen discards it -- which is the ordering the q/Esc path already
+  // gets for free through ink's own handleExit. ink's final layout and render
+  // are synchronous, so the repaint has landed by the time we restore, and
+  // exiting immediately afterwards keeps the prompt-exit guarantee: waiting for
+  // the event loop to drain would let a hung `gh` turn Ctrl+C into an apparent
+  // hang.
+  const bySignal = (code) => () => {
+    try {
+      app.unmount();
+    } catch {
+      // Teardown is best effort. restoreScreen below, and the `exit` listener
+      // above, both still run, so the terminal is handed back either way.
+    }
+    restoreScreen();
+    process.exit(code);
+  };
+  process.on("SIGINT", bySignal(130));
+  process.on("SIGTERM", bySignal(143));
+  process.on("SIGHUP", bySignal(129));
 }
 
 // Exported for unit tests. The dashboard itself is still one file; these are
