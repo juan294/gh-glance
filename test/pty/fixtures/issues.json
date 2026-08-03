@@ -1,0 +1,44 @@
+[
+ {
+  "number": 41,
+  "title": "SIGTERM erases the terminal scrollback",
+  "author": {
+   "login": "juan294"
+  },
+  "labels": [
+   {
+    "name": "bug"
+   }
+  ],
+  "createdAt": "2026-08-01T00:00:00Z",
+  "updatedAt": "2026-08-03T09:00:00Z"
+ },
+ {
+  "number": 37,
+  "title": "pty end-to-end harness\rand diagnostics",
+  "author": {
+   "login": "juan294"
+  },
+  "labels": [
+   {
+    "name": "strategic"
+   }
+  ],
+  "createdAt": "2026-07-30T00:00:00Z",
+  "updatedAt": "2026-08-02T09:00:00Z"
+ },
+ {
+  "number": 33,
+  "title": "\u001b]8;;https://evil.example\u0007row selection\u001b]8;;\u0007",
+  "author": {
+   "login": "juan294"
+  },
+  "labels": [
+   {
+    "name": "ux"
+   }
+  ],
+  "createdAt": "2026-07-29T00:00:00Z",
+  "updatedAt": "2026-08-01T09:00:00Z"
+ }
+]

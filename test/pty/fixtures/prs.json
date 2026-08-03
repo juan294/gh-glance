@@ -1,0 +1,26 @@
+[
+ {
+  "number": 40,
+  "title": "release: v0.2.0",
+  "author": {
+   "login": "juan294"
+  },
+  "headRefName": "develop",
+  "isDraft": false,
+  "reviewDecision": "APPROVED",
+  "createdAt": "2026-08-01T00:00:00Z",
+  "updatedAt": "2026-08-03T08:00:00Z"
+ },
+ {
+  "number": 39,
+  "title": "wip: scrolling",
+  "author": {
+   "login": "juan294"
+  },
+  "headRefName": "feat/scrolling-and-selection",
+  "isDraft": true,
+  "reviewDecision": null,
+  "createdAt": "2026-07-28T00:00:00Z",
+  "updatedAt": "2026-08-02T08:00:00Z"
+ }
+]
