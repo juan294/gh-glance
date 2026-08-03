@@ -96,14 +96,16 @@ byte totals. Those belong to the unit suite or to nothing.
 
 ## Phases
 
-| # | Phase | Files | Depends on | Batch |
-|---|---|---|---|---|
-| 1 | Capture primitive and fixture `gh` | `test/pty/run.sh`, `test/pty/fixtures/gh`, `test/pty/capture.mjs` | — | |
-| 2 | Structural assertions (the #41 assertion fails here) | `test/pty/e2e.test.mjs` | 1 | |
-| 3 | Fix #41 | `index.mjs`, `CHANGELOG.md` | 2 | |
-| 4 | CI job, advisory | `.github/workflows/ci.yml` | 2, 3 | |
-| 5 | Interactive key coverage | `test/pty/keys.test.mjs` | 4 | `[batch-eligible]` |
-| 6 | Document the harness | `CONTRIBUTING.md` | 4 | `[batch-eligible]` |
+All six implemented on `worktree-pty-harness`; commit for each in the last column.
+
+| # | Phase | Files | Depends on | Batch | Commit |
+|---|---|---|---|---|---|
+| 1 [x] | Capture primitive and fixture `gh` | `test/pty/run.sh`, `test/pty/fixtures/gh`, `test/pty/capture.mjs` | — | | `37d862f` |
+| 2 [x] | Structural assertions (the #41 assertion fails here) | `test/pty/e2e.test.mjs` | 1 | | `8235ff1` |
+| 3 [x] | Fix #41 | `index.mjs`, `CHANGELOG.md` | 2 | | `a1f4b80` |
+| 4 [x] | CI job, advisory | `.github/workflows/ci.yml` | 2, 3 | | `1fa782a` |
+| 5 [x] | Interactive key coverage | `test/pty/keys.test.mjs` | 4 | `[batch-eligible]` | `9099fe2` |
+| 6 [x] | Document the harness | `CONTRIBUTING.md` | 4 | `[batch-eligible]` | `9099fe2` |
 
 Phases 5 and 6 touch disjoint files and depend only on 1-4, so `/batch` can run
 them in parallel. Phases 1-4 are strictly sequential: 2 needs 1's primitive, 3
