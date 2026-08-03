@@ -110,6 +110,20 @@ const BACKOFF_STEPS_MS = [60_000, 300_000, 1_800_000, 3_600_000];
 // byte-identical-idle-frame property the rest of this file works to keep.
 const STALE_AFTER_MS = 30_000;
 
+// Mutable because the fetchers below are defined before argv is parsed, and the
+// argv block is what fills this in. Everything here has a working default, so
+// the zero-argument invocation the README documents behaves exactly as before.
+const runtime = {
+  repo: null, // null means "let gh infer it from the git remote", as today
+  refreshMs: REFRESH_MS,
+  verbose: false,
+  initialTabIndex: 0,
+};
+
+// The four tab keys, needed by --tab validation which runs long before the TABS
+// table itself is built.
+const TAB_KEYS = ["actions", "issues", "prs", "security"];
+
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_MS = 100;
 
@@ -267,15 +281,49 @@ const GH_ENV_OVERRIDES = {
   GH_PAGER: "cat",
 };
 
+// Verbose output goes to stderr and never to stdout: stdout is ink's frame
+// stream, and writing anything else into it corrupts the diff and the
+// alternate-screen state. The argv block refuses --verbose while stderr is still
+// a terminal, so these lines always land in a file rather than on top of the
+// dashboard.
+function logGh(args, startedAt, outcome) {
+  if (!runtime.verbose) return;
+  const ms = Date.now() - startedAt;
+  process.stderr.write(
+    `${new Date().toISOString()} gh ${args.join(" ")} -- ${outcome} in ${ms}ms\n`,
+  );
+}
+
 async function runGh(args, { signal } = {}) {
-  const { stdout } = await execFileAsync("gh", args, {
-    timeout: GH_TIMEOUT_MS,
-    killSignal: "SIGKILL",
-    maxBuffer: GH_MAX_BUFFER,
-    env: { ...process.env, ...GH_ENV_OVERRIDES },
-    signal,
-  });
-  return stdout;
+  const startedAt = Date.now();
+  try {
+    const { stdout } = await execFileAsync("gh", args, {
+      timeout: GH_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+      maxBuffer: GH_MAX_BUFFER,
+      env: { ...process.env, ...GH_ENV_OVERRIDES },
+      signal,
+    });
+    logGh(args, startedAt, `ok ${stdout.length}B`);
+    return stdout;
+  } catch (err) {
+    logGh(args, startedAt, `FAILED ${shortErr(err)}`);
+    throw err;
+  }
+}
+
+// `--repo` for the list subcommands. Empty when unset, so the argv vector stays
+// byte-identical to what shipped before.
+function repoArgs() {
+  return runtime.repo ? ["--repo", runtime.repo] : [];
+}
+
+// `gh api` has no --repo; it resolves the {owner}/{repo} placeholder from the
+// working directory. Substituting the validated value is what makes --repo work
+// for the alert endpoints. REPO_PATTERN is why this is safe to interpolate into
+// a request path.
+function apiPath(path) {
+  return runtime.repo ? path.replace("{owner}/{repo}", runtime.repo) : path;
 }
 
 // ---------- Data fetchers ----------
@@ -285,6 +333,7 @@ async function fetchActions(limit, signal) {
     [
       "run",
       "list",
+      ...repoArgs(),
       "--limit",
       String(limit),
       "--json",
@@ -325,6 +374,7 @@ async function fetchIssues(signal) {
     [
       "issue",
       "list",
+      ...repoArgs(),
       "--state",
       "open",
       "--limit",
@@ -354,6 +404,7 @@ async function fetchPRs(signal) {
     [
       "pr",
       "list",
+      ...repoArgs(),
       "--state",
       "open",
       "--limit",
@@ -470,7 +521,7 @@ async function fetchAlertSource(source, signal, now) {
     return { raw: `backoff:${note}`, parse: () => ({ alerts: [], note, truncated: false }) };
   }
   try {
-    const raw = await runGh(["api", source.path, "--jq", source.jq], { signal });
+    const raw = await runGh(["api", apiPath(source.path), "--jq", source.jq], { signal });
     clearBackoff(source.key);
     return {
       raw,
@@ -558,12 +609,104 @@ async function preflight() {
     }
     return `gh-glance: could not run gh: ${shortErr(err)}`;
   }
+  // Only meaningful when the repository is being inferred from the working
+  // directory. With --repo or GH_REPO the cwd is irrelevant, and refusing to
+  // start outside a checkout would defeat the flag's whole purpose -- watching a
+  // repository you have not cloned.
+  if (runtime.repo || process.env.GH_REPO) return null;
   try {
     await execFileAsync("git", ["rev-parse", "--git-dir"], { timeout: GH_TIMEOUT_MS });
   } catch {
-    return "gh-glance: not inside a git repository.\nRun it from a cloned GitHub repository, or set GH_REPO=owner/name.";
+    return (
+      "gh-glance: not inside a git repository.\n" +
+      "Run it from a cloned GitHub repository, or pass --repo owner/name."
+    );
   }
   return null;
+}
+
+// ---------- Command line ----------
+
+// The repository name is the only user-supplied value that reaches a subprocess
+// argument *and* gets interpolated into a `gh api` path. execFile with an array
+// means there is no shell to inject into, but an unvalidated value in the API
+// path would be a request-forgery primitive against arbitrary endpoints -- so it
+// is validated once, here at the boundary, against exactly what GitHub allows in
+// an owner or repository name.
+const REPO_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\/[A-Za-z0-9._-]+$/;
+
+// Below roughly two seconds a fetch cannot finish before the next tick, so the
+// in-flight guard absorbs every other one and the effective rate is whatever
+// `gh` can sustain -- the requested interval silently stops being real. Clamping
+// with a stated minimum is honest where silently accepting it would not be.
+const MIN_REFRESH_SECONDS = 2;
+const MAX_REFRESH_SECONDS = 3600;
+
+// The argv surface was a strict allowlist that exited 2 on anything unknown.
+// That is a feature, not an accident -- a typo fails loudly instead of being
+// ignored -- so widening it keeps the same shape: every flag is named here, and
+// anything else still exits 2.
+function parseArgs(argv) {
+  const opts = { help: false, showVersion: false, repo: null, refresh: null, tab: null, verbose: false };
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    const takeValue = (name) => {
+      const inline = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : null;
+      if (inline !== null) return inline;
+      i += 1;
+      if (i >= argv.length) throw new Error(`${name} needs a value`);
+      return argv[i];
+    };
+
+    if (arg === "--help" || arg === "-h") opts.help = true;
+    else if (arg === "--version" || arg === "-v") opts.showVersion = true;
+    else if (arg === "--verbose") opts.verbose = true;
+    else if (arg === "--repo" || arg === "-R" || arg.startsWith("--repo=")) {
+      opts.repo = takeValue("--repo");
+    } else if (arg === "--refresh" || arg.startsWith("--refresh=")) {
+      opts.refresh = takeValue("--refresh");
+    } else if (arg === "--tab" || arg.startsWith("--tab=")) {
+      opts.tab = takeValue("--tab");
+    } else {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+  }
+  return opts;
+}
+
+// Returns { repo, refreshMs, tabKey, verbose } or throws with a message that
+// says what to do about it.
+function validateArgs(opts, tabKeys) {
+  if (opts.repo !== null && !REPO_PATTERN.test(opts.repo)) {
+    throw new Error(`--repo must look like owner/name, got: ${opts.repo}`);
+  }
+
+  let refreshMs = null;
+  if (opts.refresh !== null) {
+    const seconds = Number(opts.refresh);
+    if (!Number.isFinite(seconds) || !Number.isInteger(seconds)) {
+      throw new Error(`--refresh must be a whole number of seconds, got: ${opts.refresh}`);
+    }
+    if (seconds < MIN_REFRESH_SECONDS || seconds > MAX_REFRESH_SECONDS) {
+      throw new Error(
+        `--refresh must be between ${MIN_REFRESH_SECONDS} and ${MAX_REFRESH_SECONDS} seconds, got: ${seconds}`,
+      );
+    }
+    refreshMs = seconds * 1000;
+  }
+
+  if (opts.tab !== null && !tabKeys.includes(opts.tab)) {
+    throw new Error(`--tab must be one of ${tabKeys.join(", ")}, got: ${opts.tab}`);
+  }
+
+  return {
+    help: opts.help,
+    showVersion: opts.showVersion,
+    repo: opts.repo,
+    refreshMs,
+    tabKey: opts.tab,
+    verbose: opts.verbose,
+  };
 }
 
 // ---------- Entry point ----------
@@ -573,9 +716,25 @@ const { version } = JSON.parse(readFileSync(new URL("./package.json", import.met
 const HELP = `gh-glance ${version} -- a live-refreshing GitHub dashboard for a narrow terminal pane.
 
 Usage:
-  gh-glance            Run the dashboard in the current repository
-  gh-glance --help     Show this help
-  gh-glance --version  Show the version
+  gh-glance                     Run the dashboard in the current repository
+  gh-glance --repo owner/name   Watch a specific repository instead
+  gh-glance --refresh 15        Poll the active tab every 15 seconds
+  gh-glance --tab security      Start on a specific tab
+  gh-glance --verbose 2>log     Log every gh call to a file (see below)
+  gh-glance --help              Show this help
+  gh-glance --version           Show the version
+
+Options:
+  -R, --repo <owner/name>  Repository to watch. Without it the repo is inferred
+                           from the git remote, the same way \`gh\` does it.
+  --refresh <seconds>      Active-tab poll interval (${MIN_REFRESH_SECONDS}-${MAX_REFRESH_SECONDS},
+                           default ${REFRESH_MS / 1000}). Background tabs stay at
+                           ${BACKGROUND_EVERY}x this.
+  --tab <name>             Tab to start on: ${TAB_KEYS.join(", ")}.
+  --verbose                Write one line per gh invocation to stderr. stderr
+                           must be redirected -- writing it to the terminal
+                           would draw over the dashboard, so this refuses to
+                           start otherwise.
 
 Run it from inside a locally cloned GitHub repository; the repo is inferred
 from the git remote, the same way \`gh\` does it. Requires the \`gh\` CLI
@@ -595,7 +754,7 @@ Keys:
   q / Esc / Ctrl+C   Quit
 
 Environment:
-  GH_REPO=owner/name        Watch a specific repository
+  GH_REPO=owner/name        Watch a specific repository (--repo takes precedence)
   GH_GLANCE_ICONS=unicode   Plain-unicode status icons (no Nerd Font needed)
   GH_GLANCE_NO_ANIMATION=1  Freeze the spinner (no motion)
   NO_COLOR=1                Disable colour (status stays readable)
@@ -610,20 +769,44 @@ Environment:
 // Precedence is preserved: an unknown argument is reported before the non-TTY
 // refusal, because a typo is the more actionable of the two.
 if (IS_MAIN) {
-  const args = process.argv.slice(2);
+  let opts;
+  try {
+    opts = validateArgs(parseArgs(process.argv.slice(2)), TAB_KEYS);
+  } catch (err) {
+    // Exit 2 for every argv problem, unchanged from when the only possible
+    // problem was an unrecognised flag. CI asserts this code.
+    console.error(`gh-glance: ${err.message}\nRun \`gh-glance --help\` for usage.`);
+    process.exit(2);
+  }
 
-  if (args.includes("--help") || args.includes("-h")) {
+  // Checked after parsing rather than before, so `gh-glance --repo` with no
+  // value reports the missing value rather than silently printing help.
+  if (opts.help) {
     console.log(HELP);
     process.exit(0);
   }
-  if (args.includes("--version") || args.includes("-v")) {
+  if (opts.showVersion) {
     console.log(version);
     process.exit(0);
   }
-  if (args.length > 0) {
-    console.error(`gh-glance: unknown argument: ${args[0]}\nRun \`gh-glance --help\` for usage.`);
+
+  // Verbose output must never reach stdout -- that is ink's frame stream, and
+  // anything else in it corrupts the diff and the alternate-screen state. stderr
+  // is safe only once it is redirected somewhere; while it is still the
+  // terminal, these lines would be painted straight over the dashboard. Refusing
+  // is better than quietly producing a corrupted screen.
+  if (opts.verbose && process.stderr.isTTY) {
+    console.error(
+      "gh-glance: --verbose writes a log to stderr, which would draw over the dashboard.\n" +
+        "Redirect it to a file, e.g. `gh-glance --verbose 2>gh-glance.log`.",
+    );
     process.exit(2);
   }
+
+  runtime.repo = opts.repo;
+  runtime.verbose = opts.verbose;
+  if (opts.refreshMs !== null) runtime.refreshMs = opts.refreshMs;
+  if (opts.tabKey !== null) runtime.initialTabIndex = TAB_KEYS.indexOf(opts.tabKey);
 
   // This is a full-screen live dashboard, not a reporting command -- piping it
   // somewhere would emit an endless stream of redraw frames, so fail fast with
@@ -1214,7 +1397,7 @@ function App() {
   const { stdout } = useStdout();
   const { isRawModeSupported } = useStdin();
   const { exit } = useApp();
-  const [activeIndex, setActiveIndex] = useState(0);
+  const [activeIndex, setActiveIndex] = useState(runtime.initialTabIndex);
   // `null` means "never resolved" -- distinct from `[]`, which means "resolved
   // and genuinely empty". The tab bar and the body render those differently.
   const [data, setData] = useState({ actions: null, issues: null, prs: null, security: null });
@@ -1399,7 +1582,7 @@ function App() {
     }
 
     tick();
-    const id = setInterval(tick, REFRESH_MS);
+    const id = setInterval(tick, runtime.refreshMs);
     return () => {
       cancelled = true;
       clearInterval(id);
@@ -1485,8 +1668,9 @@ function App() {
   // purpose -- see STALE_AFTER_MS.
   const lastOk = meta[tab.key]?.at;
   const staleFor = lastOk == null ? null : now.getTime() - lastOk;
+  const staleThreshold = Math.max(STALE_AFTER_MS, runtime.refreshMs * 6);
   const staleLabel =
-    staleFor != null && staleFor > STALE_AFTER_MS
+    staleFor != null && staleFor > staleThreshold
       ? `stale ${formatDuration(Math.min(staleFor, 359_999_000))}`
       : null;
 
@@ -1658,6 +1842,12 @@ if (IS_MAIN) {
 // Exported for unit tests. The dashboard itself is still one file; these are
 // the pure functions worth pinning, and nothing here is part of the public API.
 export {
+  parseArgs,
+  validateArgs,
+  REPO_PATTERN,
+  MIN_REFRESH_SECONDS,
+  MAX_REFRESH_SECONDS,
+  TAB_KEYS,
   safe,
   shortErr,
   isUnavailable,

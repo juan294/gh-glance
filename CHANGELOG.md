@@ -19,6 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Flags: `--repo`, `--refresh`, `--tab`, `--verbose`.** The tool still takes no
+  arguments by default. `--repo owner/name` watches a repository you have not
+  cloned, and works from any directory. `--refresh` sets the active-tab interval
+  between 2 and 3600 seconds — below two a fetch cannot finish before the next
+  tick, so the value would silently stop being real, and it is refused rather
+  than accepted. `--tab` picks the starting tab. An unrecognised flag still
+  exits 2 rather than being ignored.
+- **`--verbose`** writes one line per `gh` invocation to stderr with its duration
+  and outcome, for attaching to a bug report. It refuses to start while stderr
+  is still a terminal, because the log would otherwise be drawn over the
+  dashboard.
 - A pty end-to-end harness (`npm run test:pty`). It drives the real binary under
   a pseudo-terminal against a fixture `gh`, and asserts the things unit tests
   structurally cannot reach: that the alternate screen is entered and left
