@@ -8,18 +8,34 @@ on:
   schedule:
     - cron: "0 6 * * 1"
 
+permissions:
+  contents: read
+
+# CodeQL is a required status check and previously had neither a concurrency
+# group nor a timeout, so rapid successive pushes left superseded analyses
+# running to completion and a hung one could block merges indefinitely.
+# Observed runtime is ~1m30s, so the timeout has real margin: too tight and
+# intermittent cancellations become intermittent merge blocks.
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   analyze:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       security-events: write
       contents: read
     strategy:
+      fail-fast: false
       matrix:
         language: ["javascript-typescript"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: github/codeql-action/init@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # init and analyze are subpaths of one repository and must be pinned to
+      # the same commit, or the two halves can disagree.
+      - uses: github/codeql-action/init@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4
         with:
           languages: ${{ matrix.language }}
-      - uses: github/codeql-action/analyze@v4
+      - uses: github/codeql-action/analyze@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4

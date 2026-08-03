@@ -1,0 +1,51 @@
+name: Release
+
+# The published tarball was the one artifact no gate touched: branch protection
+# and code scanning stop at `main`, while `npm publish` ran from a laptop over
+# whatever happened to be in the working tree -- `npm pack` reads the working
+# tree, not the tag, so uncommitted edits could ship silently. The registry's
+# unpublish window is 72 hours and the version number is burned permanently
+# either way, so the artifact has to be built from a verified, tagged source.
+#
+# Triggered ONLY by a published release. Adding `push: tags` as well would
+# double-publish, and the second run would hard-fail on E403.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm
+    permissions:
+      contents: read
+      # Scoped to this job only. The repository default is `contents: read`;
+      # granting id-token at workflow level would hand it to every job.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm run lint
+      - run: node --check index.mjs
+      - run: npm test
+      - name: Verify the tag matches package.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(node -p "require('./package.json').version")
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version $pkg" >&2
+            exit 1
+          fi
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
