@@ -5,6 +5,28 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`kill` no longer erases your terminal scrollback.** On `SIGTERM`, `SIGINT`
+  and `SIGHUP` the dashboard handed the terminal back to the primary buffer and
+  the renderer then repainted onto it — preceded by an erase-scrollback escape,
+  so a `kill` threw away the terminal history and left a dead dashboard frame
+  behind. Measured at 2,728 bytes on an 80x24 pane. Quitting with `q`, `Esc` or
+  `Ctrl+C` was never affected. Found by the new pty harness; present since
+  before 0.2.0.
+
+### Added
+
+- A pty end-to-end harness (`npm run test:pty`). It drives the real binary under
+  a pseudo-terminal against a fixture `gh`, and asserts the things unit tests
+  structurally cannot reach: that the alternate screen is entered and left
+  exactly once, that the cursor is restored, that the final frame is exactly as
+  tall as the terminal and never wider, that a narrow pane still draws its
+  chrome, that signal exit codes are 143/130/129, and that nothing is left on
+  the primary buffer afterwards. It runs in CI as an advisory check.
+
 ## [0.2.0] - 2026-08-03
 
 First release. `0.1.0` was never published to any registry and was never
