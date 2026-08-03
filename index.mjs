@@ -1167,7 +1167,12 @@ const STALE_WIDTH = 10;
 // them stay dim. The accent is the panel-title cyan rather than the amber used
 // for in-progress status, so amber means exactly one thing across the product.
 function StatusBar({ fetching, spin, stale, interactive }) {
-  const hints = interactive ? KEY_HINTS : KEY_HINTS.filter((h) => h.label === "Quit");
+  // Without raw mode none of the key handlers run, so advertising them would be
+  // telling the user something untrue about what the app can do. Ctrl+C still
+  // works there, because the tty delivers a real SIGINT.
+  const hints = interactive
+    ? KEY_HINTS
+    : [{ label: "Quit", keys: "^C" }];
   return e(
     Box,
     { flexDirection: "row" },

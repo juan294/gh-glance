@@ -7,7 +7,7 @@ Requests, and Security alerts in one narrow pane. Shells out to the `gh` CLI.
 
 ## Stack
 
-Node.js (ESM, `>=20.19`), Ink v7 + React v19 for the terminal UI. No
+Node.js (ESM, `>=22`), Ink v7 + React v19 for the terminal UI. No
 TypeScript, no build step, no bundler -- the entire app is `index.mjs`, run
 directly by Node. This is intentional; see CONTRIBUTING.md before adding
 build tooling.
@@ -29,13 +29,14 @@ Use /clear between tasks, /compact when context is heavy.
 ```bash
 npm run lint            # ESLint
 npm start               # node index.mjs
+npm test                # node:test unit suite
 node --check index.mjs  # syntax check (no build step to catch this otherwise)
 node index.mjs --version
 node index.mjs --help
 ```
 
-There is no test suite. CI substitutes a smoke job (syntax check + CLI boot
-check across Node 20/22/24) for unit tests.
+Tests are `node --test` (built-in runner, no framework) in `test/`, plus a CI
+smoke job (syntax check + CLI boot + exit-code assertions) across Node 22/24.
 
 ## Git Workflow
 

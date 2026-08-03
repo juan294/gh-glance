@@ -1,6 +1,6 @@
 {
   "name": "gh-glance",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A live-refreshing GitHub dashboard for your terminal: Actions, Issues, Pull Requests, and Security alerts in one narrow pane",
   "type": "module",
   "bin": {
