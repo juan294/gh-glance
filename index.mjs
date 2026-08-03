@@ -930,6 +930,21 @@ const TITLE_COLOR = "cyanBright";
 const IDENTIFIER = "blue";
 const REF = "magenta";
 
+// Status colours, named by what they mean rather than what they look like. The
+// meaning was previously carried only by repetition -- 28 inline literals across
+// six values -- so a reader had to infer that redBright meant "failed" here and
+// "critical" there.
+//
+// INERT and BORDER_COLOR are the same value on purpose and must stay separate
+// names: one is chrome that should recede, the other is content that is
+// genuinely de-emphasised. Merging them means the next person who retunes the
+// frame colour silently restyles every skipped run.
+const OK = "greenBright";
+const BAD = "redBright";
+const ATTENTION = "yellowBright";
+const INERT = "gray";
+const ERROR_TEXT = "red";
+
 // `label` becomes the cell's text under INK_SCREEN_READER, where the icon
 // column is otherwise a private-use codepoint that announces as nothing --
 // leaving every row with no status at all. It is derived from the same lookup
@@ -1016,7 +1031,7 @@ class RowBoundary extends React.Component {
 
   render() {
     if (this.state.failed) {
-      return e(Text, { color: "redBright" }, "! this row could not be rendered");
+      return e(Text, { color: BAD }, "! this row could not be rendered");
     }
     return this.props.children;
   }
@@ -1032,25 +1047,25 @@ class RowBoundary extends React.Component {
 // (timed_out vs action_required; skipped vs queued) is resolved by
 // GH_GLANCE_ICONS=unicode, where every state has its own ASCII character.
 const RUN_STATUS_ICON = {
-  success: { icon: OCT.checkCircleFill, color: "greenBright", label: "success" },
-  failure: { icon: OCT.xCircleFill, color: "redBright", label: "failed" },
-  startup_failure: { icon: OCT.xCircleFill, color: "redBright", label: "startup failure" },
-  timed_out: { icon: OCT.alertFill, color: "redBright", label: "timed out" },
-  action_required: { icon: OCT.alertFill, color: "yellowBright", label: "action required" },
-  cancelled: { icon: OCT.skipFill, color: "gray", label: "cancelled" },
-  skipped: { icon: OCT.dotFill, color: "gray", label: "skipped" },
-  neutral: { icon: OCT.dotFill, color: "gray", label: "neutral" },
-  stale: { icon: OCT.dotFill, color: "gray", label: "stale" },
+  success: { icon: OCT.checkCircleFill, color: OK, label: "success" },
+  failure: { icon: OCT.xCircleFill, color: BAD, label: "failed" },
+  startup_failure: { icon: OCT.xCircleFill, color: BAD, label: "startup failure" },
+  timed_out: { icon: OCT.alertFill, color: BAD, label: "timed out" },
+  action_required: { icon: OCT.alertFill, color: ATTENTION, label: "action required" },
+  cancelled: { icon: OCT.skipFill, color: INERT, label: "cancelled" },
+  skipped: { icon: OCT.dotFill, color: INERT, label: "skipped" },
+  neutral: { icon: OCT.dotFill, color: INERT, label: "neutral" },
+  stale: { icon: OCT.dotFill, color: INERT, label: "stale" },
 };
-const RUN_UNKNOWN_ICON = { icon: "?", color: "gray", label: "unknown" };
+const RUN_UNKNOWN_ICON = { icon: "?", color: INERT, label: "unknown" };
 
 // github.com draws a run that is actually executing as an amber circle with a
 // turning segment, and one that is merely queued as the same amber standing
 // still -- the motion, not the colour, is what separates them. With animation
 // disabled there is no motion to distinguish them, so the running state falls
 // back to the alert glyph rather than silently reading as queued.
-const RUN_PENDING_ICON = { icon: OCT.dotFill, color: "yellowBright", label: "queued" };
-const RUN_RUNNING_STATIC = { icon: OCT.alertFill, color: "yellowBright", label: "running" };
+const RUN_PENDING_ICON = { icon: OCT.dotFill, color: ATTENTION, label: "queued" };
+const RUN_RUNNING_STATIC = { icon: OCT.alertFill, color: ATTENTION, label: "running" };
 
 // Remote strings index these tables, and a plain object literal answers
 // inherited keys -- `SEVERITY_COLOR["constructor"]` returned a function, which
@@ -1064,7 +1079,7 @@ function pick(table, key, fallback) {
 function runStatusIcon(run, spin) {
   if (run.status === "in_progress") {
     return spin
-      ? { icon: spin, color: "yellowBright", label: "running" }
+      ? { icon: spin, color: ATTENTION, label: "running" }
       : RUN_RUNNING_STATIC;
   }
   if (run.status !== "completed") return RUN_PENDING_ICON;
@@ -1133,7 +1148,7 @@ const ISSUES_HEADER_COMPACT = [
 
 function IssueRow({ item, now, compact, cursor }) {
   const cells = [
-    e(Column, { key: "i", width: 3, color: "greenBright", label: "open issue" }, `${cursor ? ">" : " "}${OCT.issueOpened}`),
+    e(Column, { key: "i", width: 3, color: OK, label: "open issue" }, `${cursor ? ">" : " "}${OCT.issueOpened}`),
     e(Column, { key: "t", grow: true }, `#${item.number} ${item.title}`),
   ];
   if (!compact) {
@@ -1164,16 +1179,16 @@ const PRS_HEADER_COMPACT = [
 ];
 
 const REVIEW_LABEL = {
-  APPROVED: { label: "approved", color: "greenBright" },
-  CHANGES_REQUESTED: { label: "changes", color: "redBright" },
-  REVIEW_REQUIRED: { label: "pending", color: "yellowBright" },
+  APPROVED: { label: "approved", color: OK },
+  CHANGES_REQUESTED: { label: "changes", color: BAD },
+  REVIEW_REQUIRED: { label: "pending", color: ATTENTION },
 };
-const REVIEW_NONE = { label: "", color: "gray" };
+const REVIEW_NONE = { label: "", color: INERT };
 
 function PRRow({ item, now, compact, cursor }) {
   const prIcon = item.isDraft
-    ? { icon: OCT.pullRequestDraft, color: "gray", label: "draft pull request" }
-    : { icon: OCT.pullRequest, color: "greenBright", label: "open pull request" };
+    ? { icon: OCT.pullRequestDraft, color: INERT, label: "draft pull request" }
+    : { icon: OCT.pullRequest, color: OK, label: "open pull request" };
   const review = pick(REVIEW_LABEL, item.reviewDecision, REVIEW_NONE);
   const cells = [
     e(Column, { key: "i", width: 3, color: prIcon.color, label: prIcon.label }, `${cursor ? ">" : " "}${prIcon.icon}`),
@@ -1218,12 +1233,12 @@ const SECURITY_HEADER_COMPACT = [
 ];
 
 const SEVERITY_STYLE = {
-  critical: { color: "redBright", short: "crit" },
-  high: { color: "redBright", short: "high" },
-  medium: { color: "yellowBright", short: "med" },
-  moderate: { color: "yellowBright", short: "med" },
-  low: { color: "gray", short: "low" },
-  unknown: { color: "gray", short: "?" },
+  critical: { color: BAD, short: "crit" },
+  high: { color: BAD, short: "high" },
+  medium: { color: ATTENTION, short: "med" },
+  moderate: { color: ATTENTION, short: "med" },
+  low: { color: INERT, short: "low" },
+  unknown: { color: INERT, short: "?" },
 };
 const SEVERITY_UNKNOWN = SEVERITY_STYLE.unknown;
 
@@ -1250,6 +1265,7 @@ function SecurityRow({ item, now, compact, cursor }) {
 const TABS = [
   {
     key: "actions",
+    fetch: ({ signal, runLimit }) => fetchActions(runLimit, signal),
     label: "Actions",
     short: "Actions",
     header: ACTIONS_HEADER,
@@ -1259,6 +1275,7 @@ const TABS = [
   },
   {
     key: "issues",
+    fetch: ({ signal }) => fetchIssues(signal),
     label: "Issues",
     short: "Issues",
     header: ISSUES_HEADER,
@@ -1268,6 +1285,7 @@ const TABS = [
   },
   {
     key: "prs",
+    fetch: ({ signal }) => fetchPRs(signal),
     label: "Pull requests",
     short: "PRs",
     header: PRS_HEADER,
@@ -1277,6 +1295,7 @@ const TABS = [
   },
   {
     key: "security",
+    fetch: ({ signal }) => fetchSecurity(signal),
     label: "Security",
     short: "Security",
     header: SECURITY_HEADER,
@@ -1410,7 +1429,7 @@ function StatusBar({ fetching, spin, stale, interactive }) {
     e(
       Box,
       { width: STALE_WIDTH, flexShrink: 0 },
-      stale ? e(Text, { color: "yellowBright" }, stale) : null,
+      stale ? e(Text, { color: ATTENTION }, stale) : null,
     ),
     ...hints
       .flatMap((hint, i) => [
@@ -1424,6 +1443,49 @@ function StatusBar({ fetching, spin, stale, interactive }) {
       ])
       .filter(Boolean),
   );
+}
+
+// ---------- Layout ----------
+
+// Terminal size, and the label breakpoint that depends on it.
+//
+// The usableSize guard is applied on every read path, not just the first: pty
+// wrappers and a terminal mid-resize report 0 or undefined, and taking either
+// literally collapses the table. ink's own useWindowSize does not apply that
+// fallback, which is why this stays hand-rolled.
+function useTerminalSize(stdout) {
+  const [size, setSize] = useState(() => ({
+    rows: usableSize(stdout?.rows, DEFAULT_ROWS),
+    cols: usableSize(stdout?.columns, DEFAULT_COLS),
+    useShortLabels: usableSize(stdout?.columns, DEFAULT_COLS) < TAB_LABEL_FULL_WIDTH,
+  }));
+
+  useEffect(() => {
+    if (!stdout) return;
+    function onResize() {
+      const cols = usableSize(stdout.columns, DEFAULT_COLS);
+      const rows = usableSize(stdout.rows, DEFAULT_ROWS);
+      setSize((previous) => {
+        // Hysteresis on the label breakpoint: switch to short labels below it,
+        // back to full only once comfortably above, so a pane dragged along the
+        // boundary does not emit a different frame on every resize event.
+        const useShortLabels = previous.useShortLabels
+          ? cols < TAB_LABEL_FULL_WIDTH + TAB_LABEL_HYSTERESIS
+          : cols < TAB_LABEL_FULL_WIDTH;
+        // Same object when nothing moved, so a resize event that changes
+        // nothing cannot cost a redraw.
+        return previous.rows === rows &&
+          previous.cols === cols &&
+          previous.useShortLabels === useShortLabels
+          ? previous
+          : { rows, cols, useShortLabels };
+      });
+    }
+    stdout.on("resize", onResize);
+    return () => stdout.off("resize", onResize);
+  }, [stdout]);
+
+  return size;
 }
 
 // ---------- App ----------
@@ -1446,17 +1508,13 @@ function App() {
   const [errors, setErrors] = useState({ actions: null, issues: null, prs: null, security: null });
   const [loading, setLoading] = useState({ actions: true, issues: true, prs: true, security: true });
   const [now, setNow] = useState(new Date());
-  const [rows, setRows] = useState(usableSize(stdout?.rows, DEFAULT_ROWS));
-  const [cols, setCols] = useState(usableSize(stdout?.columns, DEFAULT_COLS));
+  const { rows, cols, useShortLabels } = useTerminalSize(stdout);
   const [frame, setFrame] = useState(0);
   // Per tab, so switching away and back keeps your place. Keyed by item, and
   // both are plain state: they change only on a keypress, so an idle repo still
   // renders byte-identical frames and ink still writes nothing.
   const [selected, setSelected] = useState({});
   const [offset, setOffset] = useState({});
-  const [useShortLabels, setUseShortLabels] = useState(
-    usableSize(stdout?.columns, DEFAULT_COLS) < TAB_LABEL_FULL_WIDTH,
-  );
 
   const tab = TABS[activeIndex];
   const extraLines = (errors[tab.key] ? 1 : 0) + (tab.key === "security" ? securityNotes.length : 0);
@@ -1660,10 +1718,11 @@ function App() {
 
     function fetchTab(key) {
       const signal = controller.signal;
-      if (key === "actions") return commit(key, () => fetchActions(runLimitRef.current, signal));
-      if (key === "issues") return commit(key, () => fetchIssues(signal));
-      if (key === "prs") return commit(key, () => fetchPRs(signal));
-      return commit(key, () => fetchSecurity(signal));
+      const descriptor = TABS.find((t) => t.key === key);
+      // Every tab carries its own fetcher on the registry, so adding a tab is a
+      // TABS entry plus a fetcher rather than an entry plus an edit to a chain
+      // in a different part of the file.
+      return commit(key, () => descriptor.fetch({ signal, runLimit: runLimitRef.current }));
     }
     fetchTabRef.current = fetchTab;
 
@@ -1727,27 +1786,6 @@ function App() {
     const id = setInterval(() => setFrame((f) => (f + 1) % SPINNER.length), SPINNER_MS);
     return () => clearInterval(id);
   }, [showSpinner]);
-
-  // React to the pane resizing immediately (desktop vs. laptop, or just
-  // dragging the Ghostty window) instead of waiting for the next poll tick.
-  useEffect(() => {
-    if (!stdout) return;
-    function onResize() {
-      const nextCols = usableSize(stdout.columns, DEFAULT_COLS);
-      setRows(usableSize(stdout.rows, DEFAULT_ROWS));
-      setCols(nextCols);
-      // Hysteresis: switch to short labels below the breakpoint, back to full
-      // only once comfortably above it, so a pane dragged along the boundary
-      // doesn't emit a different frame on every resize event.
-      setUseShortLabels((short) =>
-        short
-          ? nextCols < TAB_LABEL_FULL_WIDTH + TAB_LABEL_HYSTERESIS
-          : nextCols < TAB_LABEL_FULL_WIDTH,
-      );
-    }
-    stdout.on("resize", onResize);
-    return () => stdout.off("resize", onResize);
-  }, [stdout]);
 
   const items = data[tab.key];
   const error = errors[tab.key];
@@ -1829,7 +1867,7 @@ function App() {
       // truncate-end is what makes the one-line reservation in `extraLines`
       // true by construction. Predicting the wrapped height instead would mean
       // duplicating ink's width model, and would still be wrong on resize.
-      error && e(Text, { color: "red", wrap: "truncate-end" }, error),
+      error && e(Text, { color: ERROR_TEXT, wrap: "truncate-end" }, error),
       tab.key === "security" &&
         securityNotes.map((note, i) =>
           e(Text, { key: i, dimColor: true, wrap: "truncate-end" }, note),
