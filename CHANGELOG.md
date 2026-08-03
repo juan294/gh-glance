@@ -5,6 +5,73 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-08-03
+
+The dashboard stops being read-only: you can now move through the table and open
+what you are looking at. The rest of the release is the audit backlog `0.2.0`
+deferred — a configuration surface, structural refactors, and the first tests
+that drive the real binary under a terminal.
+
+### Added
+
+- **Row selection, scrolling, and opening items in a browser.** `↑`/`↓` or
+  `j`/`k` move a cursor, `PgUp`/`PgDn` move a page, and `Enter` opens the
+  selected run, issue or pull request. The cursor tracks the item rather than
+  the row position, so it stays put as new rows arrive above it rather than
+  drifting every few seconds. The marker is a plain `>` sharing the existing
+  icon column, so it survives `NO_COLOR` and costs no width.
+- **Flags: `--repo`, `--refresh`, `--tab`, `--verbose`.** The tool still takes no
+  arguments by default. `--repo owner/name` watches a repository you have not
+  cloned, and works from any directory. `--refresh` sets the active-tab interval
+  between 2 and 3600 seconds — below two a fetch cannot finish before the next
+  tick, so the value would silently stop being real, and it is refused rather
+  than accepted. `--tab` picks the starting tab. An unrecognised flag still
+  exits 2 rather than being ignored.
+- **`--verbose`** writes one line per `gh` invocation to stderr with its duration
+  and outcome, for attaching to a bug report. It refuses to start while stderr
+  is still a terminal, because the log would otherwise be drawn over the
+  dashboard.
+- A pty end-to-end harness (`npm run test:pty`). It drives the real binary under
+  a pseudo-terminal against a fixture `gh`, and asserts the things unit tests
+  structurally cannot reach: that the alternate screen is entered and left
+  exactly once, that the cursor is restored, that the final frame is exactly as
+  tall as the terminal and never wider, that a narrow pane still draws its
+  chrome, that signal exit codes are 143/130/129, and that nothing is left on
+  the primary buffer afterwards. It runs in CI as an advisory check.
+
+### Changed
+
+- **Terminal traffic roughly halved.** The renderer now updates only the lines
+  that changed instead of rewriting the whole viewport: measured 13,918 bytes
+  down to 6,799 on a settled 80x24 pane.
+- Rows are memoised and the spinner frame is no longer handed to the three tabs
+  that ignore it, so a running workflow animates one glyph instead of
+  reconciling every row ten times a second.
+- The Actions tab count carries a `!` when the newest run failed, so "is CI red"
+  is answerable from any tab rather than only from that one.
+- The status bar's key hints are plain ASCII. The arrows, return symbol and
+  box-drawing separator it used are East-Asian-Ambiguous, which the renderer
+  measures as two columns each — enough to overflow an 80-column terminal once
+  selection added a hint.
+- The four fetchers are driven by one registry rather than four near-identical
+  functions, colours are named rather than repeated as literals, and the
+  terminal-size hook is extracted. No behaviour changed.
+- Installing from a git URL or a local directory no longer writes git hooks.
+- `develop` is now PR-only, admin-enforced, with eight required checks. Its
+  previous protection required an approving review that a solo maintainer could
+  not give, so every commit had been landing as a direct push and the required
+  checks gated nothing.
+
+### Fixed
+
+- **`kill` no longer erases your terminal scrollback.** On `SIGTERM`, `SIGINT`
+  and `SIGHUP` the dashboard handed the terminal back to the primary buffer and
+  the renderer then repainted onto it — preceded by an erase-scrollback escape,
+  so a `kill` threw away the terminal history and left a dead dashboard frame
+  behind. Measured at 2,728 bytes on an 80x24 pane. Quitting with `q`, `Esc` or
+  `Ctrl+C` was never affected. Found by the new pty harness; present since
+  before 0.2.0.
+
 ## [0.2.0] - 2026-08-03
 
 First release. `0.1.0` was never published to any registry and was never
@@ -129,4 +196,5 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
+[0.3.0]: https://github.com/juan294/gh-glance/releases/tag/v0.3.0
 [0.2.0]: https://github.com/juan294/gh-glance/releases/tag/v0.2.0

@@ -30,13 +30,16 @@ Use /clear between tasks, /compact when context is heavy.
 npm run lint            # ESLint
 npm start               # node index.mjs
 npm test                # node:test unit suite
+npm run test:pty        # end-to-end under a pseudo-terminal (slower, advisory in CI)
 node --check index.mjs  # syntax check (no build step to catch this otherwise)
 node index.mjs --version
 node index.mjs --help
 ```
 
-Tests are `node --test` (built-in runner, no framework) in `test/`, plus a CI
-smoke job (syntax check + CLI boot + exit-code assertions) across Node 22/24.
+Tests are `node --test` (built-in runner, no framework) in `test/`: a fast unit
+suite, plus `test/pty/` which drives the real binary under a pseudo-terminal
+against a fixture `gh`. CI also runs a smoke job (syntax check, CLI boot,
+exit-code assertions) across Node 22/24.
 
 ## Git Workflow
 
@@ -49,10 +52,18 @@ smoke job (syntax check + CLI boot + exit-code assertions) across Node 22/24.
 Conventional commits, lowercase, no scope required:
 `feat|fix|docs|chore|refactor: description`
 
+`develop` is protected: pushes to it are rejected, and changes land through a
+pull request whose checks pass. No approving review is required, so a solo
+maintainer is not deadlocked -- but CI is now a hard precondition rather than a
+report that arrives after the fact.
+
 ```bash
-# Push -- commit before pulling (hook enforced)
+# Branch, commit, push the branch, open a PR against develop
+git checkout -b fix/short-slug
 git add <files> && git commit -m "msg"
-git pull --rebase && git push
+git push -u origin fix/short-slug
+gh pr create --base develop --fill
+gh pr merge --squash --delete-branch   # once checks are green
 ```
 
 Open PRs against `develop`, never against `main`. Run verification

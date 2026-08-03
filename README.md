@@ -21,23 +21,25 @@ without switching to the browser.
 ╭─ Actions ────────────────────────────────────────────────────────────────╮
 │     TITLE                    WORKFLOW   BRANCH         TIME    UPDATED   │
 │ ──────────────────────────────────────────────────────────────────────── │
-│ +   CodeQL                   #19 CodeQL develop        1m20s   6m ago    │
-│ +   feat: spin an amber ico… #18 CodeQL develop        1m24s   1h ago    │
-│ +   feat: spin an amber ico… #18 CI     develop        23s     1h ago    │
-│ +   fix: load React's produ… #17 CI     develop        27s     1h ago    │
-│ +   fix: load React's produ… #17 CodeQL develop        1m17s   1h ago    │
-│ +   chore: adopt cc-rpi blu… #16 CodeQL develop        1m28s   17h ago   │
-│ +   chore: adopt cc-rpi blu… #16 CI     develop        18s     17h ago   │
+│ >+  ci: pin actions to comm… #443 CI    develop        1m20s   2d ago    │
+│  x  fix: restore the primar… #442 Code… develop        1m28s   2d ago    │
+│  !  chore: bump dependencies #441 CI    dependa…int-10 56h49m  2d ago    │
+│  -  docs: update the readme  #440 CI    develop        15s     3d ago    │
 │                                                                          │
-╰─────────────────────────────────────────────────────────────── 7 of 20+ ─╯
-[1:Actions (20+)]   2:Issues (31)    3:PRs (0)    4:Security (0)
-⠋ Fetching            Tabs: ←/→ │ Jump: 1-4 │ Refresh: r │ Quit: q
+│                                                                          │
+╰───────────────────────────────────────────────────────────────── 4 of 4 ─╯
+[1:Actions (4)]   2:Issues (3)    3:PRs (2)    4:Security (0)
+⠋ Fetching            Move: jk | Open: Ent | Refresh: r | Quit: q
 ```
 
 > Captured from a real run at 76 columns with `GH_GLANCE_ICONS=unicode`, so the
 > status icons render in a browser. With a Nerd Font (the default) they are
-> Octicon glyphs instead. The `20+` on the Actions tab is the truncation marker:
-> Actions fetches only as many runs as the pane can show.
+> Octicon glyphs instead.
+>
+> The `>` on the first row is the cursor. Two more markers appear when they
+> apply: a `+` after a tab's count means the list was truncated by the fetch
+> limit, and a `!` after the Actions count means the newest run failed — so
+> "is CI red" is answerable without switching to that tab.
 
 <!-- contract:allow-emoji -- the check/cross above stand in for Nerd Font
      Octicons the app actually draws; they are literal examples, not decoration. -->
@@ -156,8 +158,15 @@ stdout isn't a terminal rather than streaming redraw frames into a pipe.
 | `1` `2` `3` `4` | Jump to Actions / Issues / Pull Requests / Security |
 | `←` / `→` | Previous / next tab |
 | `Tab` / `Shift+Tab` | Next / previous tab |
+| `↑` / `↓` or `j` / `k` | Move the cursor between rows |
+| `PgUp` / `PgDn` | Move a page at a time |
+| `Enter` | Open the selected item in your browser |
 | `r` | Refresh the current tab now |
 | `q` / `Esc` / `Ctrl+C` | Quit |
+
+The cursor tracks the *item*, not the row position, so it stays on what you
+selected as new rows arrive above it. `Enter` works on Actions, Issues and Pull
+Requests; the Security tab has no per-alert `gh` command to open.
 
 If `gh-glance` is started without an interactive stdin (for example with stdin
 redirected), the key handlers cannot run and the status bar shows only `Quit: ^C`
@@ -165,8 +174,19 @@ rather than advertising keys that would do nothing.
 
 ## Configuration
 
-`gh-glance` takes no arguments by design, so it drops straight into a pane
-definition. The few things worth changing are environment variables:
+`gh-glance` still takes no arguments by default, so it drops straight into a
+pane definition. Flags are there when you want them:
+
+| Flag | Effect |
+|---|---|
+| `-R`, `--repo owner/name` | Watch a specific repository instead of the current directory's. Works from anywhere -- you do not need a local clone. |
+| `--refresh <seconds>` | Active-tab poll interval, 2-3600, default 5. Background tabs stay at 12x this. |
+| `--tab <name>` | Start on `actions`, `issues`, `prs` or `security`. |
+| `--verbose` | Log one line per `gh` call to stderr, with timing and outcome. stderr must be redirected: `gh-glance --verbose 2>gh-glance.log`. |
+
+An unrecognised flag exits 2 rather than being ignored, so a typo fails loudly.
+
+Environment variables work too, and the flags take precedence:
 
 | Variable | Effect |
 |---|---|
@@ -174,6 +194,7 @@ definition. The few things worth changing are environment variables:
 | `GH_GLANCE_ICONS=unicode` | Plain ASCII status icons, for terminals without a Nerd Font |
 | `GH_GLANCE_NO_ANIMATION=1` | Freeze the spinner — no motion at all |
 | `NO_COLOR=1` | Disable colour. Status stays readable: severity has its own column, run states have distinct glyphs, and the active tab is bracketed |
+| `INK_SCREEN_READER=true` | Switch the renderer to a linear, unthrottled mode. The status icons carry text labels for it, but this path has not been tested against a real screen reader — treat it as unverified rather than supported. |
 
 ## Rate limit
 
@@ -193,10 +214,12 @@ commands share.
   it *can* get (Dependabot alerts work independently of GHAS). If your repo
   has GHAS enabled, those alerts just show up automatically -- no
   configuration needed.
-- No pagination/scrolling within a tab yet -- it shows as many rows as fit
-  the pane height, and the count in the bottom edge tells you how much you are
-  not seeing. Tracked in
-  [#33](https://github.com/juan294/gh-glance/issues/33).
+- Scrolling moves through what was fetched, not through everything on GitHub.
+  Issues and Pull Requests fetch 150, so there is real range there. Actions
+  deliberately fetches about a screenful -- its cost is linear in the number of
+  runs requested -- so scrolling that tab has little to move through. The count
+  in the bottom edge always says how much you are seeing out of how much was
+  fetched.
 - **Minimum width.** Below about 61 columns the table drops to a compact layout
   (icon, title, and one other column) so the frame, tab bar and status line stay
   on screen. Below about 24 columns it will not lay out sensibly.
@@ -238,6 +261,8 @@ in some terminals, which would shift every column to their right.
 | A tab's count is red | That tab's last fetch failed. The error itself is shown when you switch to it. |
 | `stale 2m` in the status bar | The visible tab has not refreshed successfully for a while — usually a network drop. |
 | It exits immediately when piped | Intentional. It is a full-screen dashboard, not a reporting command. |
+| It stopped updating and you cannot tell why | Run `gh-glance --verbose 2>gh-glance.log`, reproduce, then read the log: one line per `gh` call with its duration and outcome. Attach it to a bug report. |
+| `--verbose` refuses to start | stderr is still your terminal, where the log would draw over the dashboard. Redirect it to a file. |
 
 ## Contributing
 

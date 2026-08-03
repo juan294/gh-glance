@@ -1,6 +1,6 @@
 {
   "name": "gh-glance",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A live-refreshing GitHub dashboard for your terminal: Actions, Issues, Pull Requests, and Security alerts in one narrow pane",
   "type": "module",
   "bin": {
@@ -14,10 +14,11 @@
   ],
   "scripts": {
     "lint": "eslint . --max-warnings 0",
-    "prepare": "husky || true",
+    "prepare": "node -e \"process.exit(require('fs').existsSync('.git')?0:1)\" && husky || true",
     "prepublishOnly": "npm run lint && node --check index.mjs && npm test",
     "start": "node index.mjs",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "test:pty": "node --test --test-timeout=120000 test/pty/*.test.mjs"
   },
   "keywords": [
     "github",

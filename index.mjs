@@ -110,6 +110,20 @@ const BACKOFF_STEPS_MS = [60_000, 300_000, 1_800_000, 3_600_000];
 // byte-identical-idle-frame property the rest of this file works to keep.
 const STALE_AFTER_MS = 30_000;
 
+// Mutable because the fetchers below are defined before argv is parsed, and the
+// argv block is what fills this in. Everything here has a working default, so
+// the zero-argument invocation the README documents behaves exactly as before.
+const runtime = {
+  repo: null, // null means "let gh infer it from the git remote", as today
+  refreshMs: REFRESH_MS,
+  verbose: false,
+  initialTabIndex: 0,
+};
+
+// The four tab keys, needed by --tab validation which runs long before the TABS
+// table itself is built.
+const TAB_KEYS = ["actions", "issues", "prs", "security"];
+
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_MS = 100;
 
@@ -267,15 +281,49 @@ const GH_ENV_OVERRIDES = {
   GH_PAGER: "cat",
 };
 
+// Verbose output goes to stderr and never to stdout: stdout is ink's frame
+// stream, and writing anything else into it corrupts the diff and the
+// alternate-screen state. The argv block refuses --verbose while stderr is still
+// a terminal, so these lines always land in a file rather than on top of the
+// dashboard.
+function logGh(args, startedAt, outcome) {
+  if (!runtime.verbose) return;
+  const ms = Date.now() - startedAt;
+  process.stderr.write(
+    `${new Date().toISOString()} gh ${args.join(" ")} -- ${outcome} in ${ms}ms\n`,
+  );
+}
+
 async function runGh(args, { signal } = {}) {
-  const { stdout } = await execFileAsync("gh", args, {
-    timeout: GH_TIMEOUT_MS,
-    killSignal: "SIGKILL",
-    maxBuffer: GH_MAX_BUFFER,
-    env: { ...process.env, ...GH_ENV_OVERRIDES },
-    signal,
-  });
-  return stdout;
+  const startedAt = Date.now();
+  try {
+    const { stdout } = await execFileAsync("gh", args, {
+      timeout: GH_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+      maxBuffer: GH_MAX_BUFFER,
+      env: { ...process.env, ...GH_ENV_OVERRIDES },
+      signal,
+    });
+    logGh(args, startedAt, `ok ${stdout.length}B`);
+    return stdout;
+  } catch (err) {
+    logGh(args, startedAt, `FAILED ${shortErr(err)}`);
+    throw err;
+  }
+}
+
+// `--repo` for the list subcommands. Empty when unset, so the argv vector stays
+// byte-identical to what shipped before.
+function repoArgs() {
+  return runtime.repo ? ["--repo", runtime.repo] : [];
+}
+
+// `gh api` has no --repo; it resolves the {owner}/{repo} placeholder from the
+// working directory. Substituting the validated value is what makes --repo work
+// for the alert endpoints. REPO_PATTERN is why this is safe to interpolate into
+// a request path.
+function apiPath(path) {
+  return runtime.repo ? path.replace("{owner}/{repo}", runtime.repo) : path;
 }
 
 // ---------- Data fetchers ----------
@@ -285,6 +333,7 @@ async function fetchActions(limit, signal) {
     [
       "run",
       "list",
+      ...repoArgs(),
       "--limit",
       String(limit),
       "--json",
@@ -325,6 +374,7 @@ async function fetchIssues(signal) {
     [
       "issue",
       "list",
+      ...repoArgs(),
       "--state",
       "open",
       "--limit",
@@ -354,6 +404,7 @@ async function fetchPRs(signal) {
     [
       "pr",
       "list",
+      ...repoArgs(),
       "--state",
       "open",
       "--limit",
@@ -470,7 +521,7 @@ async function fetchAlertSource(source, signal, now) {
     return { raw: `backoff:${note}`, parse: () => ({ alerts: [], note, truncated: false }) };
   }
   try {
-    const raw = await runGh(["api", source.path, "--jq", source.jq], { signal });
+    const raw = await runGh(["api", apiPath(source.path), "--jq", source.jq], { signal });
     clearBackoff(source.key);
     return {
       raw,
@@ -536,6 +587,31 @@ async function fetchSecurity(signal) {
   };
 }
 
+// ---------- Selection ----------
+
+// The cursor tracks the ITEM, never the row index. Rows arrive newest-first and
+// a new run pushes everything down every few seconds, so an index-based cursor
+// would drift under the reader continuously. Keyed the same way the render loop
+// keys its rows.
+function itemKey(item) {
+  return item?.id ?? item?.databaseId ?? item?.number ?? null;
+}
+
+// `gh <kind> view --web` for the tabs that have a per-item command. The Security
+// tab is absent on purpose: alerts have no `gh` view subcommand, so there is
+// nothing honest to open.
+const OPENABLE = { actions: "run", issues: "issue", prs: "pr" };
+
+// Output is captured rather than inherited. `gh ... --web` prints "Opening ...
+// in your browser" to stdout, and stdout is ink's frame stream -- letting that
+// through would corrupt the diff and the alternate screen.
+async function openInBrowser(tabKey, item, signal) {
+  const kind = pick(OPENABLE, tabKey, null);
+  const number = item?.number ?? item?.databaseId;
+  if (!kind || number == null) return;
+  await runGh([kind, "view", ...repoArgs(), String(number), "--web"], { signal });
+}
+
 // ---------- Startup preflight ----------
 
 // Three failures are guaranteed on a fresh machine or a terminal that happens
@@ -558,12 +634,104 @@ async function preflight() {
     }
     return `gh-glance: could not run gh: ${shortErr(err)}`;
   }
+  // Only meaningful when the repository is being inferred from the working
+  // directory. With --repo or GH_REPO the cwd is irrelevant, and refusing to
+  // start outside a checkout would defeat the flag's whole purpose -- watching a
+  // repository you have not cloned.
+  if (runtime.repo || process.env.GH_REPO) return null;
   try {
     await execFileAsync("git", ["rev-parse", "--git-dir"], { timeout: GH_TIMEOUT_MS });
   } catch {
-    return "gh-glance: not inside a git repository.\nRun it from a cloned GitHub repository, or set GH_REPO=owner/name.";
+    return (
+      "gh-glance: not inside a git repository.\n" +
+      "Run it from a cloned GitHub repository, or pass --repo owner/name."
+    );
   }
   return null;
+}
+
+// ---------- Command line ----------
+
+// The repository name is the only user-supplied value that reaches a subprocess
+// argument *and* gets interpolated into a `gh api` path. execFile with an array
+// means there is no shell to inject into, but an unvalidated value in the API
+// path would be a request-forgery primitive against arbitrary endpoints -- so it
+// is validated once, here at the boundary, against exactly what GitHub allows in
+// an owner or repository name.
+const REPO_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\/[A-Za-z0-9._-]+$/;
+
+// Below roughly two seconds a fetch cannot finish before the next tick, so the
+// in-flight guard absorbs every other one and the effective rate is whatever
+// `gh` can sustain -- the requested interval silently stops being real. Clamping
+// with a stated minimum is honest where silently accepting it would not be.
+const MIN_REFRESH_SECONDS = 2;
+const MAX_REFRESH_SECONDS = 3600;
+
+// The argv surface was a strict allowlist that exited 2 on anything unknown.
+// That is a feature, not an accident -- a typo fails loudly instead of being
+// ignored -- so widening it keeps the same shape: every flag is named here, and
+// anything else still exits 2.
+function parseArgs(argv) {
+  const opts = { help: false, showVersion: false, repo: null, refresh: null, tab: null, verbose: false };
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    const takeValue = (name) => {
+      const inline = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : null;
+      if (inline !== null) return inline;
+      i += 1;
+      if (i >= argv.length) throw new Error(`${name} needs a value`);
+      return argv[i];
+    };
+
+    if (arg === "--help" || arg === "-h") opts.help = true;
+    else if (arg === "--version" || arg === "-v") opts.showVersion = true;
+    else if (arg === "--verbose") opts.verbose = true;
+    else if (arg === "--repo" || arg === "-R" || arg.startsWith("--repo=")) {
+      opts.repo = takeValue("--repo");
+    } else if (arg === "--refresh" || arg.startsWith("--refresh=")) {
+      opts.refresh = takeValue("--refresh");
+    } else if (arg === "--tab" || arg.startsWith("--tab=")) {
+      opts.tab = takeValue("--tab");
+    } else {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+  }
+  return opts;
+}
+
+// Returns { repo, refreshMs, tabKey, verbose } or throws with a message that
+// says what to do about it.
+function validateArgs(opts, tabKeys) {
+  if (opts.repo !== null && !REPO_PATTERN.test(opts.repo)) {
+    throw new Error(`--repo must look like owner/name, got: ${opts.repo}`);
+  }
+
+  let refreshMs = null;
+  if (opts.refresh !== null) {
+    const seconds = Number(opts.refresh);
+    if (!Number.isFinite(seconds) || !Number.isInteger(seconds)) {
+      throw new Error(`--refresh must be a whole number of seconds, got: ${opts.refresh}`);
+    }
+    if (seconds < MIN_REFRESH_SECONDS || seconds > MAX_REFRESH_SECONDS) {
+      throw new Error(
+        `--refresh must be between ${MIN_REFRESH_SECONDS} and ${MAX_REFRESH_SECONDS} seconds, got: ${seconds}`,
+      );
+    }
+    refreshMs = seconds * 1000;
+  }
+
+  if (opts.tab !== null && !tabKeys.includes(opts.tab)) {
+    throw new Error(`--tab must be one of ${tabKeys.join(", ")}, got: ${opts.tab}`);
+  }
+
+  return {
+    help: opts.help,
+    showVersion: opts.showVersion,
+    repo: opts.repo,
+    refreshMs,
+    tabKey: opts.tab,
+    verbose: opts.verbose,
+  };
 }
 
 // ---------- Entry point ----------
@@ -573,9 +741,25 @@ const { version } = JSON.parse(readFileSync(new URL("./package.json", import.met
 const HELP = `gh-glance ${version} -- a live-refreshing GitHub dashboard for a narrow terminal pane.
 
 Usage:
-  gh-glance            Run the dashboard in the current repository
-  gh-glance --help     Show this help
-  gh-glance --version  Show the version
+  gh-glance                     Run the dashboard in the current repository
+  gh-glance --repo owner/name   Watch a specific repository instead
+  gh-glance --refresh 15        Poll the active tab every 15 seconds
+  gh-glance --tab security      Start on a specific tab
+  gh-glance --verbose 2>log     Log every gh call to a file (see below)
+  gh-glance --help              Show this help
+  gh-glance --version           Show the version
+
+Options:
+  -R, --repo <owner/name>  Repository to watch. Without it the repo is inferred
+                           from the git remote, the same way \`gh\` does it.
+  --refresh <seconds>      Active-tab poll interval (${MIN_REFRESH_SECONDS}-${MAX_REFRESH_SECONDS},
+                           default ${REFRESH_MS / 1000}). Background tabs stay at
+                           ${BACKGROUND_EVERY}x this.
+  --tab <name>             Tab to start on: ${TAB_KEYS.join(", ")}.
+  --verbose                Write one line per gh invocation to stderr. stderr
+                           must be redirected -- writing it to the terminal
+                           would draw over the dashboard, so this refuses to
+                           start otherwise.
 
 Run it from inside a locally cloned GitHub repository; the repo is inferred
 from the git remote, the same way \`gh\` does it. Requires the \`gh\` CLI
@@ -591,11 +775,14 @@ Keys:
   1 2 3 4            Actions / Issues / Pull requests / Security
   Left / Right       Previous / next tab
   Tab / Shift+Tab    Next / previous tab
+  Up / Down, j / k   Move the cursor between rows
+  PgUp / PgDn        Move a page at a time
+  Enter              Open the selected item in your browser
   r                  Refresh the current tab now
   q / Esc / Ctrl+C   Quit
 
 Environment:
-  GH_REPO=owner/name        Watch a specific repository
+  GH_REPO=owner/name        Watch a specific repository (--repo takes precedence)
   GH_GLANCE_ICONS=unicode   Plain-unicode status icons (no Nerd Font needed)
   GH_GLANCE_NO_ANIMATION=1  Freeze the spinner (no motion)
   NO_COLOR=1                Disable colour (status stays readable)
@@ -610,20 +797,44 @@ Environment:
 // Precedence is preserved: an unknown argument is reported before the non-TTY
 // refusal, because a typo is the more actionable of the two.
 if (IS_MAIN) {
-  const args = process.argv.slice(2);
+  let opts;
+  try {
+    opts = validateArgs(parseArgs(process.argv.slice(2)), TAB_KEYS);
+  } catch (err) {
+    // Exit 2 for every argv problem, unchanged from when the only possible
+    // problem was an unrecognised flag. CI asserts this code.
+    console.error(`gh-glance: ${err.message}\nRun \`gh-glance --help\` for usage.`);
+    process.exit(2);
+  }
 
-  if (args.includes("--help") || args.includes("-h")) {
+  // Checked after parsing rather than before, so `gh-glance --repo` with no
+  // value reports the missing value rather than silently printing help.
+  if (opts.help) {
     console.log(HELP);
     process.exit(0);
   }
-  if (args.includes("--version") || args.includes("-v")) {
+  if (opts.showVersion) {
     console.log(version);
     process.exit(0);
   }
-  if (args.length > 0) {
-    console.error(`gh-glance: unknown argument: ${args[0]}\nRun \`gh-glance --help\` for usage.`);
+
+  // Verbose output must never reach stdout -- that is ink's frame stream, and
+  // anything else in it corrupts the diff and the alternate-screen state. stderr
+  // is safe only once it is redirected somewhere; while it is still the
+  // terminal, these lines would be painted straight over the dashboard. Refusing
+  // is better than quietly producing a corrupted screen.
+  if (opts.verbose && process.stderr.isTTY) {
+    console.error(
+      "gh-glance: --verbose writes a log to stderr, which would draw over the dashboard.\n" +
+        "Redirect it to a file, e.g. `gh-glance --verbose 2>gh-glance.log`.",
+    );
     process.exit(2);
   }
+
+  runtime.repo = opts.repo;
+  runtime.verbose = opts.verbose;
+  if (opts.refreshMs !== null) runtime.refreshMs = opts.refreshMs;
+  if (opts.tabKey !== null) runtime.initialTabIndex = TAB_KEYS.indexOf(opts.tabKey);
 
   // This is a full-screen live dashboard, not a reporting command -- piping it
   // somewhere would emit an endless stream of redraw frames, so fail fast with
@@ -722,6 +933,21 @@ const TITLE_COLOR = "cyanBright";
 const IDENTIFIER = "blue";
 const REF = "magenta";
 
+// Status colours, named by what they mean rather than what they look like. The
+// meaning was previously carried only by repetition -- 28 inline literals across
+// six values -- so a reader had to infer that redBright meant "failed" here and
+// "critical" there.
+//
+// INERT and BORDER_COLOR are the same value on purpose and must stay separate
+// names: one is chrome that should recede, the other is content that is
+// genuinely de-emphasised. Merging them means the next person who retunes the
+// frame colour silently restyles every skipped run.
+const OK = "greenBright";
+const BAD = "redBright";
+const ATTENTION = "yellowBright";
+const INERT = "gray";
+const ERROR_TEXT = "red";
+
 // `label` becomes the cell's text under INK_SCREEN_READER, where the icon
 // column is otherwise a private-use codepoint that announces as nothing --
 // leaving every row with no status at all. It is derived from the same lookup
@@ -808,7 +1034,7 @@ class RowBoundary extends React.Component {
 
   render() {
     if (this.state.failed) {
-      return e(Text, { color: "redBright" }, "! this row could not be rendered");
+      return e(Text, { color: BAD }, "! this row could not be rendered");
     }
     return this.props.children;
   }
@@ -824,25 +1050,25 @@ class RowBoundary extends React.Component {
 // (timed_out vs action_required; skipped vs queued) is resolved by
 // GH_GLANCE_ICONS=unicode, where every state has its own ASCII character.
 const RUN_STATUS_ICON = {
-  success: { icon: OCT.checkCircleFill, color: "greenBright", label: "success" },
-  failure: { icon: OCT.xCircleFill, color: "redBright", label: "failed" },
-  startup_failure: { icon: OCT.xCircleFill, color: "redBright", label: "startup failure" },
-  timed_out: { icon: OCT.alertFill, color: "redBright", label: "timed out" },
-  action_required: { icon: OCT.alertFill, color: "yellowBright", label: "action required" },
-  cancelled: { icon: OCT.skipFill, color: "gray", label: "cancelled" },
-  skipped: { icon: OCT.dotFill, color: "gray", label: "skipped" },
-  neutral: { icon: OCT.dotFill, color: "gray", label: "neutral" },
-  stale: { icon: OCT.dotFill, color: "gray", label: "stale" },
+  success: { icon: OCT.checkCircleFill, color: OK, label: "success" },
+  failure: { icon: OCT.xCircleFill, color: BAD, label: "failed" },
+  startup_failure: { icon: OCT.xCircleFill, color: BAD, label: "startup failure" },
+  timed_out: { icon: OCT.alertFill, color: BAD, label: "timed out" },
+  action_required: { icon: OCT.alertFill, color: ATTENTION, label: "action required" },
+  cancelled: { icon: OCT.skipFill, color: INERT, label: "cancelled" },
+  skipped: { icon: OCT.dotFill, color: INERT, label: "skipped" },
+  neutral: { icon: OCT.dotFill, color: INERT, label: "neutral" },
+  stale: { icon: OCT.dotFill, color: INERT, label: "stale" },
 };
-const RUN_UNKNOWN_ICON = { icon: "?", color: "gray", label: "unknown" };
+const RUN_UNKNOWN_ICON = { icon: "?", color: INERT, label: "unknown" };
 
 // github.com draws a run that is actually executing as an amber circle with a
 // turning segment, and one that is merely queued as the same amber standing
 // still -- the motion, not the colour, is what separates them. With animation
 // disabled there is no motion to distinguish them, so the running state falls
 // back to the alert glyph rather than silently reading as queued.
-const RUN_PENDING_ICON = { icon: OCT.dotFill, color: "yellowBright", label: "queued" };
-const RUN_RUNNING_STATIC = { icon: OCT.alertFill, color: "yellowBright", label: "running" };
+const RUN_PENDING_ICON = { icon: OCT.dotFill, color: ATTENTION, label: "queued" };
+const RUN_RUNNING_STATIC = { icon: OCT.alertFill, color: ATTENTION, label: "running" };
 
 // Remote strings index these tables, and a plain object literal answers
 // inherited keys -- `SEVERITY_COLOR["constructor"]` returned a function, which
@@ -856,7 +1082,7 @@ function pick(table, key, fallback) {
 function runStatusIcon(run, spin) {
   if (run.status === "in_progress") {
     return spin
-      ? { icon: spin, color: "yellowBright", label: "running" }
+      ? { icon: spin, color: ATTENTION, label: "running" }
       : RUN_RUNNING_STATIC;
   }
   if (run.status !== "completed") return RUN_PENDING_ICON;
@@ -880,7 +1106,7 @@ const ACTIONS_HEADER_COMPACT = [
   { label: "UPDATED", props: { width: 8 } },
 ];
 
-function ActionsRow({ item, now, spin, compact }) {
+function ActionsRow({ item, now, spin, compact, cursor }) {
   const { icon, color, label } = runStatusIcon(item, spin);
   const started = new Date(item.startedAt);
   const finished = item.status === "completed" ? new Date(item.updatedAt) : now;
@@ -888,7 +1114,7 @@ function ActionsRow({ item, now, spin, compact }) {
     return e(
       Box,
       { flexDirection: "row" },
-      e(Column, { width: 3, color, label }, icon),
+      e(Column, { width: 3, color, label }, `${cursor ? ">" : " "}${icon}`),
       e(Column, { grow: true }, item.displayTitle),
       e(Column, { width: 8, dim: true }, formatAge(new Date(item.updatedAt), now)),
     );
@@ -896,7 +1122,7 @@ function ActionsRow({ item, now, spin, compact }) {
   return e(
     Box,
     { flexDirection: "row" },
-    e(Column, { width: 3, color, label }, icon),
+    e(Column, { width: 3, color, label }, `${cursor ? ">" : " "}${icon}`),
     e(Column, { grow: true }, item.displayTitle),
     // The run number is the actionable half and used to be the first thing
     // truncation ate, since it sat at the tail of a 10-column cell.
@@ -923,9 +1149,9 @@ const ISSUES_HEADER_COMPACT = [
   { label: "UPDATED", props: { width: 8 } },
 ];
 
-function IssueRow({ item, now, compact }) {
+function IssueRow({ item, now, compact, cursor }) {
   const cells = [
-    e(Column, { key: "i", width: 3, color: "greenBright", label: "open issue" }, OCT.issueOpened),
+    e(Column, { key: "i", width: 3, color: OK, label: "open issue" }, `${cursor ? ">" : " "}${OCT.issueOpened}`),
     e(Column, { key: "t", grow: true }, `#${item.number} ${item.title}`),
   ];
   if (!compact) {
@@ -956,19 +1182,19 @@ const PRS_HEADER_COMPACT = [
 ];
 
 const REVIEW_LABEL = {
-  APPROVED: { label: "approved", color: "greenBright" },
-  CHANGES_REQUESTED: { label: "changes", color: "redBright" },
-  REVIEW_REQUIRED: { label: "pending", color: "yellowBright" },
+  APPROVED: { label: "approved", color: OK },
+  CHANGES_REQUESTED: { label: "changes", color: BAD },
+  REVIEW_REQUIRED: { label: "pending", color: ATTENTION },
 };
-const REVIEW_NONE = { label: "", color: "gray" };
+const REVIEW_NONE = { label: "", color: INERT };
 
-function PRRow({ item, now, compact }) {
+function PRRow({ item, now, compact, cursor }) {
   const prIcon = item.isDraft
-    ? { icon: OCT.pullRequestDraft, color: "gray", label: "draft pull request" }
-    : { icon: OCT.pullRequest, color: "greenBright", label: "open pull request" };
+    ? { icon: OCT.pullRequestDraft, color: INERT, label: "draft pull request" }
+    : { icon: OCT.pullRequest, color: OK, label: "open pull request" };
   const review = pick(REVIEW_LABEL, item.reviewDecision, REVIEW_NONE);
   const cells = [
-    e(Column, { key: "i", width: 3, color: prIcon.color, label: prIcon.label }, prIcon.icon),
+    e(Column, { key: "i", width: 3, color: prIcon.color, label: prIcon.label }, `${cursor ? ">" : " "}${prIcon.icon}`),
     e(Column, { key: "t", grow: true }, `#${item.number} ${item.title}`),
   ];
   if (!compact) {
@@ -1010,19 +1236,19 @@ const SECURITY_HEADER_COMPACT = [
 ];
 
 const SEVERITY_STYLE = {
-  critical: { color: "redBright", short: "crit" },
-  high: { color: "redBright", short: "high" },
-  medium: { color: "yellowBright", short: "med" },
-  moderate: { color: "yellowBright", short: "med" },
-  low: { color: "gray", short: "low" },
-  unknown: { color: "gray", short: "?" },
+  critical: { color: BAD, short: "crit" },
+  high: { color: BAD, short: "high" },
+  medium: { color: ATTENTION, short: "med" },
+  moderate: { color: ATTENTION, short: "med" },
+  low: { color: INERT, short: "low" },
+  unknown: { color: INERT, short: "?" },
 };
 const SEVERITY_UNKNOWN = SEVERITY_STYLE.unknown;
 
-function SecurityRow({ item, now, compact }) {
+function SecurityRow({ item, now, compact, cursor }) {
   const sev = pick(SEVERITY_STYLE, item.severity, SEVERITY_UNKNOWN);
   const cells = [
-    e(Column, { key: "i", width: 3, color: sev.color, label: `${sev.short} severity` }, OCT.shield),
+    e(Column, { key: "i", width: 3, color: sev.color, label: `${sev.short} severity` }, `${cursor ? ">" : " "}${OCT.shield}`),
     e(Column, { key: "s", width: 4, color: sev.color }, sev.short),
   ];
   if (!compact) {
@@ -1039,41 +1265,55 @@ function SecurityRow({ item, now, compact }) {
 
 // ---------- Tabs ----------
 
+// Memoised because their inputs are stable by construction. Two things must
+// stay true for that to hold: `now` must keep being replaced rather than
+// mutated, and the raw-payload bail-out must keep producing fresh item objects
+// when data genuinely changes. In-place mutation of a parsed item would make a
+// memoised row silently stop updating.
+const MemoActionsRow = React.memo(ActionsRow);
+const MemoIssueRow = React.memo(IssueRow);
+const MemoPRRow = React.memo(PRRow);
+const MemoSecurityRow = React.memo(SecurityRow);
+
 const TABS = [
   {
     key: "actions",
+    fetch: ({ signal, runLimit }) => fetchActions(runLimit, signal),
     label: "Actions",
     short: "Actions",
     header: ACTIONS_HEADER,
     compactHeader: ACTIONS_HEADER_COMPACT,
-    Row: ActionsRow,
+    Row: MemoActionsRow,
     countLabel: "runs",
   },
   {
     key: "issues",
+    fetch: ({ signal }) => fetchIssues(signal),
     label: "Issues",
     short: "Issues",
     header: ISSUES_HEADER,
     compactHeader: ISSUES_HEADER_COMPACT,
-    Row: IssueRow,
+    Row: MemoIssueRow,
     countLabel: "open issues",
   },
   {
     key: "prs",
+    fetch: ({ signal }) => fetchPRs(signal),
     label: "Pull requests",
     short: "PRs",
     header: PRS_HEADER,
     compactHeader: PRS_HEADER_COMPACT,
-    Row: PRRow,
+    Row: MemoPRRow,
     countLabel: "open PRs",
   },
   {
     key: "security",
+    fetch: ({ signal }) => fetchSecurity(signal),
     label: "Security",
     short: "Security",
     header: SECURITY_HEADER,
     compactHeader: SECURITY_HEADER_COMPACT,
-    Row: SecurityRow,
+    Row: MemoSecurityRow,
     countLabel: "alerts",
   },
 ];
@@ -1149,9 +1389,19 @@ function TabBar({ activeIndex, counts, firstLoad, failed, spin, useShort }) {
 
 // ---------- Status bar ----------
 
+// Every glyph here is width-1 ASCII, deliberately. The arrows, the return
+// symbol and the box-drawing separator are all East-Asian-Ambiguous: ink
+// measures them as two columns in its width model, and a status bar built from
+// them overflowed an 80-column terminal by six columns once selection added a
+// hint. Same trap the unicode icon table already documents -- prefer strictly
+// narrow ASCII over pretty-but-ambiguous.
+//
+// Tab switching is not listed: the tab bar already renders "1:Actions", so the
+// digits document themselves, and the arrow keys are in --help. The hints that
+// survive are the ones nothing else on screen reveals.
 const KEY_HINTS = [
-  { label: "Tabs", keys: "←/→" },
-  { label: "Jump", keys: "1-4" },
+  { label: "Move", keys: "jk" },
+  { label: "Open", keys: "Ent" },
   { label: "Refresh", keys: "r" },
   { label: "Quit", keys: "q" },
 ];
@@ -1192,11 +1442,11 @@ function StatusBar({ fetching, spin, stale, interactive }) {
     e(
       Box,
       { width: STALE_WIDTH, flexShrink: 0 },
-      stale ? e(Text, { color: "yellowBright" }, stale) : null,
+      stale ? e(Text, { color: ATTENTION }, stale) : null,
     ),
     ...hints
       .flatMap((hint, i) => [
-        i > 0 && e(Text, { key: `sep${i}`, color: BORDER_COLOR }, " │ "),
+        i > 0 && e(Text, { key: `sep${i}`, color: BORDER_COLOR }, " | "),
         e(
           Text,
           { key: hint.label, wrap: "truncate-end" },
@@ -1208,13 +1458,56 @@ function StatusBar({ fetching, spin, stale, interactive }) {
   );
 }
 
+// ---------- Layout ----------
+
+// Terminal size, and the label breakpoint that depends on it.
+//
+// The usableSize guard is applied on every read path, not just the first: pty
+// wrappers and a terminal mid-resize report 0 or undefined, and taking either
+// literally collapses the table. ink's own useWindowSize does not apply that
+// fallback, which is why this stays hand-rolled.
+function useTerminalSize(stdout) {
+  const [size, setSize] = useState(() => ({
+    rows: usableSize(stdout?.rows, DEFAULT_ROWS),
+    cols: usableSize(stdout?.columns, DEFAULT_COLS),
+    useShortLabels: usableSize(stdout?.columns, DEFAULT_COLS) < TAB_LABEL_FULL_WIDTH,
+  }));
+
+  useEffect(() => {
+    if (!stdout) return;
+    function onResize() {
+      const cols = usableSize(stdout.columns, DEFAULT_COLS);
+      const rows = usableSize(stdout.rows, DEFAULT_ROWS);
+      setSize((previous) => {
+        // Hysteresis on the label breakpoint: switch to short labels below it,
+        // back to full only once comfortably above, so a pane dragged along the
+        // boundary does not emit a different frame on every resize event.
+        const useShortLabels = previous.useShortLabels
+          ? cols < TAB_LABEL_FULL_WIDTH + TAB_LABEL_HYSTERESIS
+          : cols < TAB_LABEL_FULL_WIDTH;
+        // Same object when nothing moved, so a resize event that changes
+        // nothing cannot cost a redraw.
+        return previous.rows === rows &&
+          previous.cols === cols &&
+          previous.useShortLabels === useShortLabels
+          ? previous
+          : { rows, cols, useShortLabels };
+      });
+    }
+    stdout.on("resize", onResize);
+    return () => stdout.off("resize", onResize);
+  }, [stdout]);
+
+  return size;
+}
+
 // ---------- App ----------
 
 function App() {
   const { stdout } = useStdout();
   const { isRawModeSupported } = useStdin();
   const { exit } = useApp();
-  const [activeIndex, setActiveIndex] = useState(0);
+  const [activeIndex, setActiveIndex] = useState(runtime.initialTabIndex);
   // `null` means "never resolved" -- distinct from `[]`, which means "resolved
   // and genuinely empty". The tab bar and the body render those differently.
   const [data, setData] = useState({ actions: null, issues: null, prs: null, security: null });
@@ -1228,12 +1521,13 @@ function App() {
   const [errors, setErrors] = useState({ actions: null, issues: null, prs: null, security: null });
   const [loading, setLoading] = useState({ actions: true, issues: true, prs: true, security: true });
   const [now, setNow] = useState(new Date());
-  const [rows, setRows] = useState(usableSize(stdout?.rows, DEFAULT_ROWS));
-  const [cols, setCols] = useState(usableSize(stdout?.columns, DEFAULT_COLS));
+  const { rows, cols, useShortLabels } = useTerminalSize(stdout);
   const [frame, setFrame] = useState(0);
-  const [useShortLabels, setUseShortLabels] = useState(
-    usableSize(stdout?.columns, DEFAULT_COLS) < TAB_LABEL_FULL_WIDTH,
-  );
+  // Per tab, so switching away and back keeps your place. Keyed by item, and
+  // both are plain state: they change only on a keypress, so an idle repo still
+  // renders byte-identical frames and ink still writes nothing.
+  const [selected, setSelected] = useState({});
+  const [offset, setOffset] = useState({});
 
   const tab = TABS[activeIndex];
   const extraLines = (errors[tab.key] ? 1 : 0) + (tab.key === "security" ? securityNotes.length : 0);
@@ -1272,10 +1566,74 @@ function App() {
 
   const interactive = Boolean(isRawModeSupported);
 
+  // useInput's handler is created before the render body computes the visible
+  // slice, so the movement handlers read through a ref -- the same pattern the
+  // poll loop uses for runLimitRef and activeIndexRef, and for the same reason:
+  // the closure must see current values without being rebuilt on every change.
+  const navRef = useRef({ items: [], key: null, bodyRows: 1, tabKey: "actions" });
+  navRef.current = {
+    items: data[tab.key] ?? [],
+    key: selected[tab.key] ?? null,
+    bodyRows,
+    tabKey: tab.key,
+  };
+  const pageStep = Math.max(1, bodyRows - 1);
+
+  const abortSelectionRef = useRef(null);
+
+  function moveSelection(delta) {
+    const { items, key: currentKey, bodyRows: rows_, tabKey } = navRef.current;
+    if (items.length === 0) return;
+    const current = currentKey == null ? -1 : items.findIndex((i) => itemKey(i) === currentKey);
+    // From "nothing selected", down lands on the first row and up on the last,
+    // which is what every list in this category does.
+    const next =
+      current === -1
+        ? delta > 0
+          ? 0
+          : items.length - 1
+        : Math.min(items.length - 1, Math.max(0, current + delta));
+    setSelected((s) => ({ ...s, [tabKey]: itemKey(items[next]) }));
+    // Keep the cursor on screen. Only the offset needed to reveal it changes,
+    // so scrolling never jumps further than it has to.
+    setOffset((o) => {
+      const start = o[tabKey] ?? 0;
+      const maxStart = Math.max(0, items.length - rows_);
+      let nextStart = Math.min(start, maxStart);
+      if (next < nextStart) nextStart = next;
+      else if (next >= nextStart + rows_) nextStart = next - rows_ + 1;
+      return nextStart === (o[tabKey] ?? 0) ? o : { ...o, [tabKey]: nextStart };
+    });
+  }
+
+  function openSelected() {
+    const { items, key: currentKey, tabKey } = navRef.current;
+    const item = items.find((i) => itemKey(i) === currentKey);
+    if (!item) return;
+    const controller = new AbortController();
+    abortSelectionRef.current = controller;
+    // Fire and forget: a browser launch must not block the render loop, and a
+    // failure surfaces through the tab's normal error line rather than as an
+    // unhandled rejection.
+    openInBrowser(tabKey, item, controller.signal).catch((err) => {
+      setErrors((x) => ({ ...x, [tabKey]: shortErr(err) }));
+    });
+  }
+
   useInput(
     (input, key) => {
       if (input === "q" || key.escape) {
         exit();
+      } else if (key.downArrow || input === "j") {
+        moveSelection(1);
+      } else if (key.upArrow || input === "k") {
+        moveSelection(-1);
+      } else if (key.pageDown) {
+        moveSelection(pageStep);
+      } else if (key.pageUp) {
+        moveSelection(-pageStep);
+      } else if (key.return) {
+        openSelected();
       } else if (input === "r") {
         // Goes through the same per-tab in-flight guard as the poll loop, so
         // holding the key down cannot stack concurrent subprocesses.
@@ -1373,10 +1731,11 @@ function App() {
 
     function fetchTab(key) {
       const signal = controller.signal;
-      if (key === "actions") return commit(key, () => fetchActions(runLimitRef.current, signal));
-      if (key === "issues") return commit(key, () => fetchIssues(signal));
-      if (key === "prs") return commit(key, () => fetchPRs(signal));
-      return commit(key, () => fetchSecurity(signal));
+      const descriptor = TABS.find((t) => t.key === key);
+      // Every tab carries its own fetcher on the registry, so adding a tab is a
+      // TABS entry plus a fetcher rather than an entry plus an edit to a chain
+      // in a different part of the file.
+      return commit(key, () => descriptor.fetch({ signal, runLimit: runLimitRef.current }));
     }
     fetchTabRef.current = fetchTab;
 
@@ -1399,7 +1758,7 @@ function App() {
     }
 
     tick();
-    const id = setInterval(tick, REFRESH_MS);
+    const id = setInterval(tick, runtime.refreshMs);
     return () => {
       cancelled = true;
       clearInterval(id);
@@ -1441,27 +1800,6 @@ function App() {
     return () => clearInterval(id);
   }, [showSpinner]);
 
-  // React to the pane resizing immediately (desktop vs. laptop, or just
-  // dragging the Ghostty window) instead of waiting for the next poll tick.
-  useEffect(() => {
-    if (!stdout) return;
-    function onResize() {
-      const nextCols = usableSize(stdout.columns, DEFAULT_COLS);
-      setRows(usableSize(stdout.rows, DEFAULT_ROWS));
-      setCols(nextCols);
-      // Hysteresis: switch to short labels below the breakpoint, back to full
-      // only once comfortably above it, so a pane dragged along the boundary
-      // doesn't emit a different frame on every resize event.
-      setUseShortLabels((short) =>
-        short
-          ? nextCols < TAB_LABEL_FULL_WIDTH + TAB_LABEL_HYSTERESIS
-          : nextCols < TAB_LABEL_FULL_WIDTH,
-      );
-    }
-    stdout.on("resize", onResize);
-    return () => stdout.off("resize", onResize);
-  }, [stdout]);
-
   const items = data[tab.key];
   const error = errors[tab.key];
   const spin = SPINNER[frame % SPINNER.length];
@@ -1474,7 +1812,16 @@ function App() {
       // LIST_LIMIT and alerts at one page of 100. Reporting those as exact made
       // the count stop moving through a genuine change on any repo big enough
       // for this tool to matter.
-      return [t.key, `${list.length}${meta[t.key]?.truncated ? "+" : ""}`];
+      const suffix = meta[t.key]?.truncated ? "+" : "";
+      // Newest first, so the head of the list is the run that decides whether
+      // CI is currently red.
+      const broken =
+        t.key === "actions" &&
+        list.length > 0 &&
+        list[0].status === "completed" &&
+        list[0].conclusion !== "success" &&
+        list[0].conclusion !== "skipped";
+      return [t.key, `${list.length}${suffix}${broken ? "!" : ""}`];
     }),
   );
   const failed = Object.fromEntries(TABS.map((t) => [t.key, Boolean(errors[t.key])]));
@@ -1485,15 +1832,35 @@ function App() {
   // purpose -- see STALE_AFTER_MS.
   const lastOk = meta[tab.key]?.at;
   const staleFor = lastOk == null ? null : now.getTime() - lastOk;
+  const staleThreshold = Math.max(STALE_AFTER_MS, runtime.refreshMs * 6);
   const staleLabel =
-    staleFor != null && staleFor > STALE_AFTER_MS
+    staleFor != null && staleFor > staleThreshold
       ? `stale ${formatDuration(Math.min(staleFor, 359_999_000))}`
       : null;
 
-  const visibleItems = (items ?? []).slice(0, bodyRows);
+  const allItems = items ?? [];
+  const tabOffsetRaw = offset[tab.key] ?? 0;
+  // Re-clamped on every render rather than only on resize: the payload can
+  // shrink under us between ticks, and a stale offset would render an empty
+  // body while the count in the frame said otherwise.
+  const maxOffset = Math.max(0, allItems.length - bodyRows);
+  const tabOffset = Math.min(tabOffsetRaw, maxOffset);
+  const visibleItems = allItems.slice(tabOffset, tabOffset + bodyRows);
+
+  // Matched by key, never by position. If the selected item is gone -- closed,
+  // merged, or aged out of the fetch window -- no row matches and nothing is
+  // highlighted, which is the honest state; the next arrow key selects from the
+  // top again. Resolving to a neighbouring index instead would silently move
+  // the cursor onto an unrelated row.
+  const selectedKey = selected[tab.key] ?? null;
   // Bottom-right of the frame, lazygit style: how much of the tab you can
   // currently see out of how much there is.
-  const countLabel = items == null ? null : `${visibleItems.length} of ${counts[tab.key]}`;
+  const countLabel =
+    items == null
+      ? null
+      : tabOffset > 0
+        ? `${tabOffset + 1}-${tabOffset + visibleItems.length} of ${counts[tab.key]}`
+        : `${visibleItems.length} of ${counts[tab.key]}`;
 
   // Fixed columns deliberately do not shrink, so BRANCH and TIME stay readable
   // at ordinary widths. Narrow panes drop columns instead, which keeps the
@@ -1504,7 +1871,7 @@ function App() {
 
   return e(
     Box,
-    { flexDirection: "column", width: "100%", height: rows },
+    { flexDirection: "column", width: "100%", height: Math.min(rows, usableSize(stdout?.rows, rows)) },
     e(PanelEdge, { width: cols, top: true, label: tab.label, labelColor: TITLE_COLOR }),
     e(
       Box,
@@ -1522,18 +1889,27 @@ function App() {
       // truncate-end is what makes the one-line reservation in `extraLines`
       // true by construction. Predicting the wrapped height instead would mean
       // duplicating ink's width model, and would still be wrong on resize.
-      error && e(Text, { color: "red", wrap: "truncate-end" }, error),
+      error && e(Text, { color: ERROR_TEXT, wrap: "truncate-end" }, error),
       tab.key === "security" &&
         securityNotes.map((note, i) =>
           e(Text, { key: i, dimColor: true, wrap: "truncate-end" }, note),
         ),
       e(HeaderCells, { cells: header }),
       ...visibleItems.map((item) => {
-        const key = item.id ?? item.databaseId ?? item.number;
+        const key = itemKey(item);
         return e(
           RowBoundary,
           { key, resetKey: key },
-          e(tab.Row, { item, now, compact, spin: showSpinner ? spin : null }),
+          e(tab.Row, {
+            item,
+            now,
+            compact,
+            cursor: key === selectedKey,
+            // Only the Actions rows read this. Passing it to the others would
+            // change a prop ten times a second on every tab and defeat the
+            // memoisation below for no visible effect.
+            spin: tab.key === "actions" && showSpinner ? spin : null,
+          }),
         );
       }),
       // Distinguishes "still fetching" from "resolved and empty" in the body,
@@ -1616,19 +1992,64 @@ if (IS_MAIN) {
   installCrashHandlers();
   enterAlternateScreen();
   process.on("exit", restoreScreen);
+
+  // Ink's default renderer erases and rewrites the whole viewport on every
+  // change; incremental mode updates only the lines that differ. Measured on a
+  // settled 80x24 pane: 13,918 bytes of terminal traffic down to the figure in
+  // the commit message.
+  //
+  // PE-M1 flagged the risk: ink's own source notes a Windows-console desync for
+  // frames that exactly fill the viewport, which this app always does since the
+  // root box is the terminal height. Windows is already documented as untested
+  // (README Limitations), and the pty harness covers the two platforms that are
+  // supported, so the flag is verified where it is claimed to work.
+  const app = render(e(App), { incrementalRendering: true });
+
   // 128 + signal number, so a supervisor or `timeout` can tell an interrupted
   // run from a clean one. These fire on external `kill` and when raw mode is
   // unavailable; the ordinary Ctrl+C path goes through ink's own handler.
-  process.on("SIGINT", () => process.exit(130));
-  process.on("SIGTERM", () => process.exit(143));
-  process.on("SIGHUP", () => process.exit(129));
-
-  render(e(App));
+  //
+  // Unmounting before restoring is load-bearing, not tidiness. signal-exit runs
+  // our own `exit` listener ahead of ink's teardown, so simply exiting here let
+  // restoreScreen hand the terminal back to the primary buffer *first* and ink
+  // then repainted onto it -- and because the root Box is `height: rows` the
+  // frame always exactly fills the viewport, so that repaint takes ink's
+  // `isUnmounting && previousOutputHeight >= viewportRows` branch and is
+  // preceded by \x1b[2J\x1b[3J. \x1b[3J erases the scrollback, so a `kill` threw
+  // away the user's terminal history and left a dead dashboard behind it
+  // (measured: 2,728 bytes on an 80x24 pane).
+  //
+  // Unmounting first puts that final repaint inside the alternate screen, where
+  // restoreScreen discards it -- which is the ordering the q/Esc path already
+  // gets for free through ink's own handleExit. ink's final layout and render
+  // are synchronous, so the repaint has landed by the time we restore, and
+  // exiting immediately afterwards keeps the prompt-exit guarantee: waiting for
+  // the event loop to drain would let a hung `gh` turn Ctrl+C into an apparent
+  // hang.
+  const bySignal = (code) => () => {
+    try {
+      app.unmount();
+    } catch {
+      // Teardown is best effort. restoreScreen below, and the `exit` listener
+      // above, both still run, so the terminal is handed back either way.
+    }
+    restoreScreen();
+    process.exit(code);
+  };
+  process.on("SIGINT", bySignal(130));
+  process.on("SIGTERM", bySignal(143));
+  process.on("SIGHUP", bySignal(129));
 }
 
 // Exported for unit tests. The dashboard itself is still one file; these are
 // the pure functions worth pinning, and nothing here is part of the public API.
 export {
+  parseArgs,
+  validateArgs,
+  REPO_PATTERN,
+  MIN_REFRESH_SECONDS,
+  MAX_REFRESH_SECONDS,
+  TAB_KEYS,
   safe,
   shortErr,
   isUnavailable,

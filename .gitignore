@@ -6,6 +6,7 @@ node_modules/
 .env.*
 .vscode/
 .worktrees/
+.claude/worktrees/
 CLAUDE.local.md
 .claude/settings.local.json
 .claude/metrics/

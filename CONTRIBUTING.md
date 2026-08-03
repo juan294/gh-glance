@@ -42,12 +42,41 @@ There's no build step -- it's plain ESM JavaScript, run directly by Node.
 npm test          # node:test, no framework, no config
 npm run lint      # eslint, fails on warnings
 node --check index.mjs
+npm run test:pty  # end-to-end, drives the real binary under a pty (slower)
 ```
 
 Tests live in `test/` and use Node's built-in runner, so they add no build step
 and no test-framework dependency. `index.mjs` guards its entry point behind a
 main-module check, which is what makes it importable from a test without
 launching the dashboard -- please keep that guard intact.
+
+### The pty harness
+
+`npm run test:pty` runs `test/pty/`. It launches the real `index.mjs` inside a
+pseudo-terminal with a fixture `gh` on `PATH`, then asserts over the captured
+bytes. It covers what unit tests structurally cannot: rendered frame geometry,
+terminal state on exit, and the key handlers. It found the scrollback bug fixed
+in `[Unreleased]`.
+
+It is a separate script from `npm test` on purpose. The unit run is fast and is
+a required CI check; the pty run is slow, is timing-sensitive by nature, and
+runs in CI as **advisory** -- it reports on every PR but cannot block a merge.
+If you make it flake, the right response is to delete the offending assertion,
+not to add retries.
+
+One rule keeps it worth having: **assert structure, never cell contents.** Line
+counts, widths, escape-sequence balance and exit codes survive a copy change.
+The text inside a cell does not, and asserting it would turn every wording
+change into a red build.
+
+Two things to know before editing it:
+
+- `script(1)` is mutually incompatible between macOS (BSD) and Linux (GNU) --
+  different argument order, different command form, and GNU needs `-e` to
+  propagate the exit code. `test/pty/run.sh` implements both; a change to one
+  branch needs checking against the other, and CI only exercises the GNU one.
+- The fixture `gh` will drift from the real CLI over time. That is expected: it
+  pins the contract the app depends on, not the CLI's behaviour.
 
 Worth knowing about the app's shape before changing it:
 
@@ -73,6 +102,10 @@ git checkout -b feat/your-feature
 ```
 
 Open your pull request against `develop`, never against `main`.
+
+`develop` is protected and rejects direct pushes, including from maintainers.
+No approving review is required, so a single contributor is not blocked, but the
+required checks have to be green before anything lands.
 
 ## Commit Format
 

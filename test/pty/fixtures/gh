@@ -1,0 +1,44 @@
+#!/bin/sh
+# Deterministic stand-in for the gh CLI.
+#
+# index.mjs calls `gh` by bare name (index.mjs:271) and merges rather than
+# replaces the child environment (index.mjs:275), so putting this directory
+# earlier on PATH intercepts every call the app makes. That removes the network,
+# the rate limit, and the real repository's contents from the harness -- which is
+# what lets it assert on structure without the result changing between runs.
+#
+# Every invocation is appended to GH_GLANCE_FIXTURE_LOG. A test asserts that log
+# is non-empty, which is what distinguishes "the app rendered an empty dashboard"
+# from "the capture failed and we are asserting against nothing".
+
+: "${GH_GLANCE_FIXTURE_LOG:=/dev/null}"
+echo "$*" >> "$GH_GLANCE_FIXTURE_LOG"
+
+FIXTURE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+case "$1" in
+  --version)
+    # preflight() runs this first and exits 3 if it fails (index.mjs:552-560),
+    # so nothing renders unless this succeeds.
+    echo "gh version 2.97.0 (fixture)"
+    ;;
+  run)
+    cat "$FIXTURE_DIR/runs.json"
+    ;;
+  issue)
+    cat "$FIXTURE_DIR/issues.json"
+    ;;
+  pr)
+    cat "$FIXTURE_DIR/prs.json"
+    ;;
+  api)
+    # The three alert endpoints. An empty array is a *successful* fetch with no
+    # alerts, which keeps the Security tab in its resolved-and-empty state
+    # rather than its error state -- errors would add note lines and change the
+    # frame's reserved-line arithmetic (index.mjs:1239-1243).
+    echo '[]'
+    ;;
+  *)
+    echo '[]'
+    ;;
+esac
