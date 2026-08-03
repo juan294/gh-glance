@@ -7,6 +7,14 @@ name: Release
 # unpublish window is 72 hours and the version number is burned permanently
 # either way, so the artifact has to be built from a verified, tagged source.
 #
+# Authentication is OIDC trusted publishing, not a token. There is no NPM_TOKEN
+# secret in this repository and there should never be one: npm restricted
+# bypass-2FA granular tokens from account management in August 2026 and removes
+# their direct-publish ability in January 2027. The trust relationship is
+# registered against this repo, THIS FILENAME, and the `npm` environment --
+# renaming this file or that environment silently breaks publishing, so change
+# either only alongside `npm trust github gh-glance`.
+#
 # Triggered ONLY by a published release. Adding `push: tags` as well would
 # double-publish, and the second run would hard-fail on E403.
 on:
@@ -26,26 +34,94 @@ jobs:
       contents: read
       # Scoped to this job only. The repository default is `contents: read`;
       # granting id-token at workflow level would hand it to every job.
+      # This is what mints the OIDC token npm exchanges for publish rights.
       id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Needed by the ancestry check below, which reads origin/main.
+          fetch-depth: 0
+
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
           cache: npm
           registry-url: https://registry.npmjs.org
+
+      - name: Ensure npm supports trusted publishing
+        # Node 22 still bundles npm 10.9, which has no OIDC support at all and
+        # fails with a bare 401 that reads like a credentials problem. Trusted
+        # publishing needs >= 11.5.1, so upgrade before anything touches the
+        # registry and record the version in the log.
+        run: |
+          npm install -g npm@latest
+          npm --version
+
       - run: npm ci
       - run: npm run lint
       - run: node --check index.mjs
       - run: npm test
-      - name: Verify the tag matches package.json
+
+      - name: Verify the tag matches package.json and the changelog
         run: |
           tag="${GITHUB_REF_NAME#v}"
           pkg=$(node -p "require('./package.json').version")
           if [ "$tag" != "$pkg" ]; then
-            echo "tag $GITHUB_REF_NAME does not match package.json version $pkg" >&2
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $pkg"
             exit 1
           fi
-      - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          if ! grep -q "^## \[$pkg\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$pkg]' section"
+            exit 1
+          fi
+
+      - name: Verify the tag is on main and is what we are building
+        # A release can be cut from any ref through the API. Publishing is
+        # irreversible after 72 hours, so refuse anything that is not an
+        # ancestor of main or that does not point at this exact checkout.
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_SHA is not reachable from origin/main"
+            exit 1
+          fi
+          tag_sha=$(git rev-list -n1 "$GITHUB_REF_NAME")
+          if [ "$tag_sha" != "$GITHUB_SHA" ]; then
+            echo "::error::tag $GITHUB_REF_NAME points at $tag_sha, not the built commit $GITHUB_SHA"
+            exit 1
+          fi
+
+      - name: Pack and smoke-test the actual tarball
+        # Install what will be published, not the working tree. A missing bin
+        # shebang or a `files` entry that dropped index.mjs only shows up here.
+        run: |
+          npm pack
+          tarball=$(ls gh-glance-*.tgz)
+          echo "tarball: $tarball"
+          for required in package/index.mjs package/README.md package/LICENSE; do
+            if ! tar tzf "$tarball" | grep -qx "$required"; then
+              echo "::error::$required missing from the tarball"
+              exit 1
+            fi
+          done
+          npm install -g "$tarball"
+          gh-glance --version
+          gh-glance --help
+
+      - name: Skip if this version is already on the registry
+        # Re-running a release (or a re-published GitHub release) would
+        # otherwise hard-fail on E403 and report a red release for a version
+        # that shipped correctly the first time.
+        run: |
+          pkg=$(node -p "require('./package.json').version")
+          if npm view "gh-glance@${pkg}" version >/dev/null 2>&1; then
+            echo "::warning::gh-glance@${pkg} is already published; skipping publish."
+            echo "ALREADY_PUBLISHED=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Publish
+        if: env.ALREADY_PUBLISHED != 'true'
+        # No NODE_AUTH_TOKEN. npm detects the OIDC environment, exchanges the
+        # id-token for a short-lived publish credential, and attaches SLSA
+        # provenance automatically.
+        run: npm publish --provenance --access public
