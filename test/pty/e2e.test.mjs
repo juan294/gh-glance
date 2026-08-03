@@ -89,12 +89,18 @@ test("the panel frame and tab bar are drawn at full width", () => {
 });
 
 test("the frame does not repaint by full clear in steady state", () => {
-  // Two clears are the alternate-screen entry itself. Substantially more means
+  // Two clears are the alternate-screen entry itself, and measurement puts a
+  // healthy run at exactly two across 80x24, 45x20 and 60x16. Anything more is
   // the overflow-repaint path, where ink clears and rewrites the whole screen
-  // every frame instead of diffing.
+  // every frame instead of diffing -- which is what a frame wider or taller than
+  // the viewport causes, and the reason the width assertions above exist.
   assert.ok(
-    wide.fullClears <= 4,
+    wide.fullClears <= 2,
     `${wide.fullClears} full clears suggests an overflow repaint loop`,
+  );
+  assert.ok(
+    narrow.fullClears <= 2,
+    `${narrow.fullClears} full clears in compact mode suggests an overflow repaint loop`,
   );
 });
 
