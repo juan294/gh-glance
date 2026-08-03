@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/juan294/gh-glance/actions/workflows/ci.yml/badge.svg?branch=develop&event=push)](https://github.com/juan294/gh-glance/actions/workflows/ci.yml?query=branch%3Adevelop+event%3Apush)
 [![CodeQL](https://github.com/juan294/gh-glance/actions/workflows/codeql.yml/badge.svg?branch=develop&event=push)](https://github.com/juan294/gh-glance/actions/workflows/codeql.yml?query=branch%3Adevelop+event%3Apush)
-![Node.js](https://img.shields.io/badge/Node.js-20.19%2B-43853d)
+![Node.js](https://img.shields.io/badge/Node.js-22%2B-43853d)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
 A live-refreshing GitHub dashboard that fits in a narrow terminal pane --
@@ -19,22 +19,25 @@ without switching to the browser.
 
 ```
 ╭─ Actions ────────────────────────────────────────────────────────────────╮
-│    TITLE                          WORKFLOW   BRANCH         TIME    AGE  │
+│     TITLE                    WORKFLOW   BRANCH         TIME    UPDATED   │
 │ ──────────────────────────────────────────────────────────────────────── │
-│ ✓  ci: align release-probes acti… CI #443    develop        1m0s    4d   │
-│ ✓  ci: align release-probes acti… CodeQL #3… develop        1m28s   4d   │
-│ ✗  chore(deps-dev): bump the dev… CI #442    develop        49s     5d   │
-│ ●  chore(deps-dev): bump the dev… CI #441    dependabot/np… 1m10s   5d   │
-│ ✓  github_actions in / for actio… Dependabo… develop        34s     5d   │
-│ ✓  npm_and_yarn in / for typescr… Dependabo… develop        56s     5d   │
+│ +   CodeQL                   #19 CodeQL develop        1m20s   6m ago    │
+│ +   feat: spin an amber ico… #18 CodeQL develop        1m24s   1h ago    │
+│ +   feat: spin an amber ico… #18 CI     develop        23s     1h ago    │
+│ +   fix: load React's produ… #17 CI     develop        27s     1h ago    │
+│ +   fix: load React's produ… #17 CodeQL develop        1m17s   1h ago    │
+│ +   chore: adopt cc-rpi blu… #16 CodeQL develop        1m28s   17h ago   │
+│ +   chore: adopt cc-rpi blu… #16 CI     develop        18s     17h ago   │
 │                                                                          │
-╰──────────────────────────────────────────────────────────── 6 of 150+ ───╯
- 1:Actions (150+)   2:Issues (0)   3:Pull requests (2)   4:Security (1)
-⠧ Fetching  Tabs: ←/→ │ Jump: 1-4 │ Quit: ^C
+╰─────────────────────────────────────────────────────────────── 7 of 20+ ─╯
+[1:Actions (20+)]   2:Issues (31)    3:PRs (0)    4:Security (0)
+⠋ Fetching            Tabs: ←/→ │ Jump: 1-4 │ Refresh: r │ Quit: q
 ```
 
-> Status icons are Octicon glyphs from a Nerd Font; they're shown here as
-> `✓` `✗` `●` so they render in a browser.
+> Captured from a real run at 76 columns with `GH_GLANCE_ICONS=unicode`, so the
+> status icons render in a browser. With a Nerd Font (the default) they are
+> Octicon glyphs instead. The `20+` on the Actions tab is the truncation marker:
+> Actions fetches only as many runs as the pane can show.
 
 <!-- contract:allow-emoji -- the check/cross above stand in for Nerd Font
      Octicons the app actually draws; they are literal examples, not decoration. -->
@@ -56,8 +59,9 @@ current.
 - **Issues** -- open issues: title, author, first label, age
 - **Pull Requests** -- open PRs: title, author, branch, review status
   (approved / changes requested / pending), age
-- **Security** -- open Dependabot alerts: package, summary, age, with
-  severity carried by the icon's colour.
+- **Security** -- open Dependabot alerts: package, summary, age, sorted with the
+  most severe first and with severity spelled out in its own column, not carried
+  by colour alone.
   Code scanning and secret scanning alerts are included too, on repos/plans
   that have GitHub Advanced Security enabled -- see [Limitations](#limitations).
 - Tab bar with live counts, pinned to the bottom of the pane alongside the
@@ -67,6 +71,12 @@ current.
 - A spinning `Fetching` indicator while a refresh is in flight, so the pane
   says when it's working without spending a line on it
 - Status icons are real GitHub Octicons (via the Nerd Font glyph set), not emoji
+  -- with a plain-ASCII fallback for terminals without one
+- Readable without colour: severity has its own column, run states have distinct
+  glyphs, and the active tab is bracketed, so `NO_COLOR=1` and colour-vision
+  deficiency both stay navigable
+- Says when it is stale rather than showing old data silently, and marks a tab
+  whose last refresh failed
 - Adapts row count to the terminal pane's height live, on resize
 - Enters the terminal's alternate screen buffer on launch (like `lazygit`,
   `htop`, `vim`) so the shell prompt that launched it stays out of view, and
@@ -74,8 +84,8 @@ current.
 
 ## Prerequisites
 
-- [Node.js](https://nodejs.org/) `>=20.19`
-- The [`gh` CLI](https://cli.github.com/), authenticated (`gh auth login`)
+- [Node.js](https://nodejs.org/) `>=22` (Ink requires it; Node 20 is end-of-life)
+- The [`gh` CLI](https://cli.github.com/) `>=2.20`, authenticated (`gh auth login`)
 - A terminal font with [Nerd Font](https://www.nerdfonts.com/) glyphs (for the
   status icons to render correctly -- without one, they'll show as blank
   boxes; see [Icons without a Nerd Font](#icons-without-a-nerd-font))
@@ -146,9 +156,35 @@ stdout isn't a terminal rather than streaming redraw frames into a pipe.
 | `1` `2` `3` `4` | Jump to Actions / Issues / Pull Requests / Security |
 | `←` / `→` | Previous / next tab |
 | `Tab` / `Shift+Tab` | Next / previous tab |
-| `Ctrl+C` | Quit |
+| `r` | Refresh the current tab now |
+| `q` / `Esc` / `Ctrl+C` | Quit |
+
+If `gh-glance` is started without an interactive stdin (for example with stdin
+redirected), the key handlers cannot run and the status bar shows only `Quit: ^C`
+rather than advertising keys that would do nothing.
+
+## Configuration
+
+`gh-glance` takes no arguments by design, so it drops straight into a pane
+definition. The few things worth changing are environment variables:
+
+| Variable | Effect |
+|---|---|
+| `GH_REPO=owner/name` | Watch a specific repository instead of the current directory's |
+| `GH_GLANCE_ICONS=unicode` | Plain ASCII status icons, for terminals without a Nerd Font |
+| `GH_GLANCE_NO_ANIMATION=1` | Freeze the spinner — no motion at all |
+| `NO_COLOR=1` | Disable colour. Status stays readable: severity has its own column, run states have distinct glyphs, and the active tab is bracketed |
+
+## Rate limit
+
+The visible tab refreshes every 5 seconds; the other three refresh every 60
+seconds, purely to keep their counts honest. That works out at roughly 500
+REST requests an hour, about 10% of the 5,000/hour authenticated limit — so
+leaving a pane open all day does not exhaust the budget your other `gh`
+commands share.
 
 ## Limitations
+
 
 - **Security tab**: code scanning and secret scanning alerts require [GitHub
   Advanced Security](https://docs.github.com/en/code-security/getting-started/github-security-features).
@@ -158,19 +194,50 @@ stdout isn't a terminal rather than streaming redraw frames into a pipe.
   has GHAS enabled, those alerts just show up automatically -- no
   configuration needed.
 - No pagination/scrolling within a tab yet -- it shows as many rows as fit
-  the pane height, oldest overflow is simply not shown.
+  the pane height, and the count in the bottom edge tells you how much you are
+  not seeing. Tracked in
+  [#33](https://github.com/juan294/gh-glance/issues/33).
+- **Minimum width.** Below about 61 columns the table drops to a compact layout
+  (icon, title, and one other column) so the frame, tab bar and status line stay
+  on screen. Below about 24 columns it will not lay out sensibly.
+- Issues and pull requests are fetched 150 at a time and alerts 100 at a time.
+  A count is shown as `n+` when it was truncated, so the number is never
+  presented as exact when it is not.
+- The Actions **TIME** column measures from the run's start to its last update.
+  `gh` exposes no completion timestamp, so a workflow that was re-run later
+  reports the span up to the re-run rather than its original duration.
 - macOS/Linux terminals with ANSI + alternate-screen-buffer support. Not
-  tested on Windows.
+  tested on Windows -- `npm` will not stop you installing it there, but the
+  alternate-screen handling is unverified.
 
 ### Icons without a Nerd Font
 
 The status icons are Octicon glyphs from the [Nerd
 Fonts](https://www.nerdfonts.com/) private-use-area range. If your terminal
-font isn't a Nerd Font, they'll render as blank boxes. Either install a Nerd
-Font (many terminal setups already have one for prompt tools like
-[Starship](https://starship.rs/)), or swap the `OCT` glyph table near the top
-of `index.mjs` for plain-unicode equivalents (`✓` `✗` `●` etc.) -- see the
-git history for the pre-Octicon version.
+font isn't a Nerd Font they render as blank boxes -- which would leave status
+carried by the colour of a blank box, and by nothing at all under `NO_COLOR`.
+
+Set `GH_GLANCE_ICONS=unicode` for plain ASCII equivalents:
+
+```bash
+GH_GLANCE_ICONS=unicode gh-glance
+```
+
+They are deliberately single-cell ASCII rather than prettier symbols like `✓`
+and `✗`, because those are East-Asian-Ambiguous width and render two cells wide
+in some terminals, which would shift every column to their right.
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `the gh CLI is not installed` | Install it from [cli.github.com](https://cli.github.com), then `gh auth login`. |
+| `not inside a git repository` | Run it from a cloned GitHub repository, or set `GH_REPO=owner/name`. |
+| Status icons are blank boxes | Your terminal font is not a Nerd Font. Use `GH_GLANCE_ICONS=unicode`. |
+| Security tab shows a "not enabled" note | Code scanning and secret scanning need GitHub Advanced Security. Dependabot alerts work independently. A genuine auth or network failure shows the real error instead. |
+| A tab's count is red | That tab's last fetch failed. The error itself is shown when you switch to it. |
+| `stale 2m` in the status bar | The visible tab has not refreshed successfully for a while — usually a network drop. |
+| It exits immediately when piped | Intentional. It is a full-screen dashboard, not a reporting command. |
 
 ## Contributing
 

@@ -6,7 +6,8 @@ Only the current major release receives security patches.
 
 | Version | Supported |
 |---------|-----------|
-| 0.x     | Yes       |
+| 0.2.x   | Yes       |
+| < 0.2   | No (never released)  |
 
 ## Reporting a Vulnerability
 
@@ -50,8 +51,34 @@ arrays (`execFile("gh", ["run", "list", ...])`) -- never a shell string built
 by concatenating repository data. There is no code path that interpolates
 issue titles, branch names, commit messages, or any other repository-supplied
 text into a shell command. This rules out shell injection as an attack
-surface, even though the dashboard renders untrusted repository content
-(issue/PR titles, commit messages) to the terminal.
+surface.
+
+The dashboard also renders untrusted repository content -- issue and pull
+request titles, commit messages, branch and label names, advisory summaries.
+On a public repository anyone can choose those strings, and a commit subject has
+no byte restrictions at all. Because a terminal interprets control characters,
+that content is sanitized where it enters the application, in the parsing step,
+before it is stored or rendered:
+
+- **Stripped:** C0 control characters (`U+0000`-`U+001F`), `DEL`, and C1
+  (`U+0080`-`U+009F`). That covers `ESC`, so no escape sequence an attacker
+  writes can be assembled by the terminal -- no hyperlink spoofing, no cursor
+  movement over already-drawn rows, no bell, and no newline inflating one row
+  into several. Each run is replaced with a space rather than deleted.
+- **Preserved:** everything else, including emoji and ZWJ sequences, CJK and
+  other wide characters, combining marks, and right-to-left text. A sanitizer
+  that stripped by "printability" would also erase the tool's own status icons
+  and desynchronize column alignment.
+- **Clamped:** each field is limited to 300 codepoints, cut on a codepoint
+  boundary so a surrogate pair is never severed.
+
+This is the application's own guarantee, made at its own boundary. It does not
+rely on the rendering library's behaviour, which is documented to preserve some
+escape sequences on purpose so that callers can pass styled strings through.
+
+Values arriving from the API are also read through an own-property check before
+being used as lookup keys, so a field whose value happens to be `constructor` or
+`__proto__` cannot return an unexpected object into the render path.
 
 gh-glance never handles GitHub credentials directly -- authentication is
 entirely delegated to your existing `gh auth login` session. It has no
