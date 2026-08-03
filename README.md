@@ -156,8 +156,15 @@ stdout isn't a terminal rather than streaming redraw frames into a pipe.
 | `1` `2` `3` `4` | Jump to Actions / Issues / Pull Requests / Security |
 | `←` / `→` | Previous / next tab |
 | `Tab` / `Shift+Tab` | Next / previous tab |
+| `↑` / `↓` or `j` / `k` | Move the cursor between rows |
+| `PgUp` / `PgDn` | Move a page at a time |
+| `Enter` | Open the selected item in your browser |
 | `r` | Refresh the current tab now |
 | `q` / `Esc` / `Ctrl+C` | Quit |
+
+The cursor tracks the *item*, not the row position, so it stays on what you
+selected as new rows arrive above it. `Enter` works on Actions, Issues and Pull
+Requests; the Security tab has no per-alert `gh` command to open.
 
 If `gh-glance` is started without an interactive stdin (for example with stdin
 redirected), the key handlers cannot run and the status bar shows only `Quit: ^C`
@@ -204,10 +211,12 @@ commands share.
   it *can* get (Dependabot alerts work independently of GHAS). If your repo
   has GHAS enabled, those alerts just show up automatically -- no
   configuration needed.
-- No pagination/scrolling within a tab yet -- it shows as many rows as fit
-  the pane height, and the count in the bottom edge tells you how much you are
-  not seeing. Tracked in
-  [#33](https://github.com/juan294/gh-glance/issues/33).
+- Scrolling moves through what was fetched, not through everything on GitHub.
+  Issues and Pull Requests fetch 150, so there is real range there. Actions
+  deliberately fetches about a screenful -- its cost is linear in the number of
+  runs requested -- so scrolling that tab has little to move through. The count
+  in the bottom edge always says how much you are seeing out of how much was
+  fetched.
 - **Minimum width.** Below about 61 columns the table drops to a compact layout
   (icon, title, and one other column) so the frame, tab bar and status line stay
   on screen. Below about 24 columns it will not lay out sensibly.

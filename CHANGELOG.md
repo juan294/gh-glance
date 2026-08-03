@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Row selection, scrolling, and opening items in a browser.** `↑`/`↓` or
+  `j`/`k` move a cursor, `PgUp`/`PgDn` move a page, and `Enter` opens the
+  selected run, issue or pull request. The cursor tracks the item rather than
+  the row position, so it stays put as new rows arrive above it rather than
+  drifting every few seconds. The marker is a plain `>` sharing the existing
+  icon column, so it survives `NO_COLOR` and costs no width.
 - **Flags: `--repo`, `--refresh`, `--tab`, `--verbose`.** The tool still takes no
   arguments by default. `--repo owner/name` watches a repository you have not
   cloned, and works from any directory. `--refresh` sets the active-tab interval
@@ -153,6 +159,10 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - Secondary text uses the terminal's own dim attribute rather than a fixed
   colour chosen for dark themes, so it is readable on light backgrounds too.
 - The age column is labelled `UPDATED`, which is what it has always shown.
+- The status bar's key hints are plain ASCII. The arrows, return symbol and
+  box-drawing separator it used are East-Asian-Ambiguous, which the renderer
+  measures as two columns each — enough to overflow an 80-column terminal once
+  selection added a hint.
 - CI runs the test suite, no longer stops the matrix at the first failure,
   asserts exit codes rather than just non-zero, and pins every action to a
   commit SHA.

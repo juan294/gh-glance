@@ -587,6 +587,31 @@ async function fetchSecurity(signal) {
   };
 }
 
+// ---------- Selection ----------
+
+// The cursor tracks the ITEM, never the row index. Rows arrive newest-first and
+// a new run pushes everything down every few seconds, so an index-based cursor
+// would drift under the reader continuously. Keyed the same way the render loop
+// keys its rows.
+function itemKey(item) {
+  return item?.id ?? item?.databaseId ?? item?.number ?? null;
+}
+
+// `gh <kind> view --web` for the tabs that have a per-item command. The Security
+// tab is absent on purpose: alerts have no `gh` view subcommand, so there is
+// nothing honest to open.
+const OPENABLE = { actions: "run", issues: "issue", prs: "pr" };
+
+// Output is captured rather than inherited. `gh ... --web` prints "Opening ...
+// in your browser" to stdout, and stdout is ink's frame stream -- letting that
+// through would corrupt the diff and the alternate screen.
+async function openInBrowser(tabKey, item, signal) {
+  const kind = pick(OPENABLE, tabKey, null);
+  const number = item?.number ?? item?.databaseId;
+  if (!kind || number == null) return;
+  await runGh([kind, "view", ...repoArgs(), String(number), "--web"], { signal });
+}
+
 // ---------- Startup preflight ----------
 
 // Three failures are guaranteed on a fresh machine or a terminal that happens
@@ -1063,7 +1088,7 @@ const ACTIONS_HEADER_COMPACT = [
   { label: "UPDATED", props: { width: 8 } },
 ];
 
-function ActionsRow({ item, now, spin, compact }) {
+function ActionsRow({ item, now, spin, compact, cursor }) {
   const { icon, color, label } = runStatusIcon(item, spin);
   const started = new Date(item.startedAt);
   const finished = item.status === "completed" ? new Date(item.updatedAt) : now;
@@ -1071,7 +1096,7 @@ function ActionsRow({ item, now, spin, compact }) {
     return e(
       Box,
       { flexDirection: "row" },
-      e(Column, { width: 3, color, label }, icon),
+      e(Column, { width: 3, color, label }, `${cursor ? ">" : " "}${icon}`),
       e(Column, { grow: true }, item.displayTitle),
       e(Column, { width: 8, dim: true }, formatAge(new Date(item.updatedAt), now)),
     );
@@ -1079,7 +1104,7 @@ function ActionsRow({ item, now, spin, compact }) {
   return e(
     Box,
     { flexDirection: "row" },
-    e(Column, { width: 3, color, label }, icon),
+    e(Column, { width: 3, color, label }, `${cursor ? ">" : " "}${icon}`),
     e(Column, { grow: true }, item.displayTitle),
     // The run number is the actionable half and used to be the first thing
     // truncation ate, since it sat at the tail of a 10-column cell.
@@ -1106,9 +1131,9 @@ const ISSUES_HEADER_COMPACT = [
   { label: "UPDATED", props: { width: 8 } },
 ];
 
-function IssueRow({ item, now, compact }) {
+function IssueRow({ item, now, compact, cursor }) {
   const cells = [
-    e(Column, { key: "i", width: 3, color: "greenBright", label: "open issue" }, OCT.issueOpened),
+    e(Column, { key: "i", width: 3, color: "greenBright", label: "open issue" }, `${cursor ? ">" : " "}${OCT.issueOpened}`),
     e(Column, { key: "t", grow: true }, `#${item.number} ${item.title}`),
   ];
   if (!compact) {
@@ -1145,13 +1170,13 @@ const REVIEW_LABEL = {
 };
 const REVIEW_NONE = { label: "", color: "gray" };
 
-function PRRow({ item, now, compact }) {
+function PRRow({ item, now, compact, cursor }) {
   const prIcon = item.isDraft
     ? { icon: OCT.pullRequestDraft, color: "gray", label: "draft pull request" }
     : { icon: OCT.pullRequest, color: "greenBright", label: "open pull request" };
   const review = pick(REVIEW_LABEL, item.reviewDecision, REVIEW_NONE);
   const cells = [
-    e(Column, { key: "i", width: 3, color: prIcon.color, label: prIcon.label }, prIcon.icon),
+    e(Column, { key: "i", width: 3, color: prIcon.color, label: prIcon.label }, `${cursor ? ">" : " "}${prIcon.icon}`),
     e(Column, { key: "t", grow: true }, `#${item.number} ${item.title}`),
   ];
   if (!compact) {
@@ -1202,10 +1227,10 @@ const SEVERITY_STYLE = {
 };
 const SEVERITY_UNKNOWN = SEVERITY_STYLE.unknown;
 
-function SecurityRow({ item, now, compact }) {
+function SecurityRow({ item, now, compact, cursor }) {
   const sev = pick(SEVERITY_STYLE, item.severity, SEVERITY_UNKNOWN);
   const cells = [
-    e(Column, { key: "i", width: 3, color: sev.color, label: `${sev.short} severity` }, OCT.shield),
+    e(Column, { key: "i", width: 3, color: sev.color, label: `${sev.short} severity` }, `${cursor ? ">" : " "}${OCT.shield}`),
     e(Column, { key: "s", width: 4, color: sev.color }, sev.short),
   ];
   if (!compact) {
@@ -1332,9 +1357,19 @@ function TabBar({ activeIndex, counts, firstLoad, failed, spin, useShort }) {
 
 // ---------- Status bar ----------
 
+// Every glyph here is width-1 ASCII, deliberately. The arrows, the return
+// symbol and the box-drawing separator are all East-Asian-Ambiguous: ink
+// measures them as two columns in its width model, and a status bar built from
+// them overflowed an 80-column terminal by six columns once selection added a
+// hint. Same trap the unicode icon table already documents -- prefer strictly
+// narrow ASCII over pretty-but-ambiguous.
+//
+// Tab switching is not listed: the tab bar already renders "1:Actions", so the
+// digits document themselves, and the arrow keys are in --help. The hints that
+// survive are the ones nothing else on screen reveals.
 const KEY_HINTS = [
-  { label: "Tabs", keys: "←/→" },
-  { label: "Jump", keys: "1-4" },
+  { label: "Move", keys: "jk" },
+  { label: "Open", keys: "Ent" },
   { label: "Refresh", keys: "r" },
   { label: "Quit", keys: "q" },
 ];
@@ -1379,7 +1414,7 @@ function StatusBar({ fetching, spin, stale, interactive }) {
     ),
     ...hints
       .flatMap((hint, i) => [
-        i > 0 && e(Text, { key: `sep${i}`, color: BORDER_COLOR }, " │ "),
+        i > 0 && e(Text, { key: `sep${i}`, color: BORDER_COLOR }, " | "),
         e(
           Text,
           { key: hint.label, wrap: "truncate-end" },
@@ -1414,6 +1449,11 @@ function App() {
   const [rows, setRows] = useState(usableSize(stdout?.rows, DEFAULT_ROWS));
   const [cols, setCols] = useState(usableSize(stdout?.columns, DEFAULT_COLS));
   const [frame, setFrame] = useState(0);
+  // Per tab, so switching away and back keeps your place. Keyed by item, and
+  // both are plain state: they change only on a keypress, so an idle repo still
+  // renders byte-identical frames and ink still writes nothing.
+  const [selected, setSelected] = useState({});
+  const [offset, setOffset] = useState({});
   const [useShortLabels, setUseShortLabels] = useState(
     usableSize(stdout?.columns, DEFAULT_COLS) < TAB_LABEL_FULL_WIDTH,
   );
@@ -1455,10 +1495,74 @@ function App() {
 
   const interactive = Boolean(isRawModeSupported);
 
+  // useInput's handler is created before the render body computes the visible
+  // slice, so the movement handlers read through a ref -- the same pattern the
+  // poll loop uses for runLimitRef and activeIndexRef, and for the same reason:
+  // the closure must see current values without being rebuilt on every change.
+  const navRef = useRef({ items: [], key: null, bodyRows: 1, tabKey: "actions" });
+  navRef.current = {
+    items: data[tab.key] ?? [],
+    key: selected[tab.key] ?? null,
+    bodyRows,
+    tabKey: tab.key,
+  };
+  const pageStep = Math.max(1, bodyRows - 1);
+
+  const abortSelectionRef = useRef(null);
+
+  function moveSelection(delta) {
+    const { items, key: currentKey, bodyRows: rows_, tabKey } = navRef.current;
+    if (items.length === 0) return;
+    const current = currentKey == null ? -1 : items.findIndex((i) => itemKey(i) === currentKey);
+    // From "nothing selected", down lands on the first row and up on the last,
+    // which is what every list in this category does.
+    const next =
+      current === -1
+        ? delta > 0
+          ? 0
+          : items.length - 1
+        : Math.min(items.length - 1, Math.max(0, current + delta));
+    setSelected((s) => ({ ...s, [tabKey]: itemKey(items[next]) }));
+    // Keep the cursor on screen. Only the offset needed to reveal it changes,
+    // so scrolling never jumps further than it has to.
+    setOffset((o) => {
+      const start = o[tabKey] ?? 0;
+      const maxStart = Math.max(0, items.length - rows_);
+      let nextStart = Math.min(start, maxStart);
+      if (next < nextStart) nextStart = next;
+      else if (next >= nextStart + rows_) nextStart = next - rows_ + 1;
+      return nextStart === (o[tabKey] ?? 0) ? o : { ...o, [tabKey]: nextStart };
+    });
+  }
+
+  function openSelected() {
+    const { items, key: currentKey, tabKey } = navRef.current;
+    const item = items.find((i) => itemKey(i) === currentKey);
+    if (!item) return;
+    const controller = new AbortController();
+    abortSelectionRef.current = controller;
+    // Fire and forget: a browser launch must not block the render loop, and a
+    // failure surfaces through the tab's normal error line rather than as an
+    // unhandled rejection.
+    openInBrowser(tabKey, item, controller.signal).catch((err) => {
+      setErrors((x) => ({ ...x, [tabKey]: shortErr(err) }));
+    });
+  }
+
   useInput(
     (input, key) => {
       if (input === "q" || key.escape) {
         exit();
+      } else if (key.downArrow || input === "j") {
+        moveSelection(1);
+      } else if (key.upArrow || input === "k") {
+        moveSelection(-1);
+      } else if (key.pageDown) {
+        moveSelection(pageStep);
+      } else if (key.pageUp) {
+        moveSelection(-pageStep);
+      } else if (key.return) {
+        openSelected();
       } else if (input === "r") {
         // Goes through the same per-tab in-flight guard as the poll loop, so
         // holding the key down cannot stack concurrent subprocesses.
@@ -1674,10 +1778,29 @@ function App() {
       ? `stale ${formatDuration(Math.min(staleFor, 359_999_000))}`
       : null;
 
-  const visibleItems = (items ?? []).slice(0, bodyRows);
+  const allItems = items ?? [];
+  const tabOffsetRaw = offset[tab.key] ?? 0;
+  // Re-clamped on every render rather than only on resize: the payload can
+  // shrink under us between ticks, and a stale offset would render an empty
+  // body while the count in the frame said otherwise.
+  const maxOffset = Math.max(0, allItems.length - bodyRows);
+  const tabOffset = Math.min(tabOffsetRaw, maxOffset);
+  const visibleItems = allItems.slice(tabOffset, tabOffset + bodyRows);
+
+  // Matched by key, never by position. If the selected item is gone -- closed,
+  // merged, or aged out of the fetch window -- no row matches and nothing is
+  // highlighted, which is the honest state; the next arrow key selects from the
+  // top again. Resolving to a neighbouring index instead would silently move
+  // the cursor onto an unrelated row.
+  const selectedKey = selected[tab.key] ?? null;
   // Bottom-right of the frame, lazygit style: how much of the tab you can
   // currently see out of how much there is.
-  const countLabel = items == null ? null : `${visibleItems.length} of ${counts[tab.key]}`;
+  const countLabel =
+    items == null
+      ? null
+      : tabOffset > 0
+        ? `${tabOffset + 1}-${tabOffset + visibleItems.length} of ${counts[tab.key]}`
+        : `${visibleItems.length} of ${counts[tab.key]}`;
 
   // Fixed columns deliberately do not shrink, so BRANCH and TIME stay readable
   // at ordinary widths. Narrow panes drop columns instead, which keeps the
@@ -1713,11 +1836,17 @@ function App() {
         ),
       e(HeaderCells, { cells: header }),
       ...visibleItems.map((item) => {
-        const key = item.id ?? item.databaseId ?? item.number;
+        const key = itemKey(item);
         return e(
           RowBoundary,
           { key, resetKey: key },
-          e(tab.Row, { item, now, compact, spin: showSpinner ? spin : null }),
+          e(tab.Row, {
+            item,
+            now,
+            compact,
+            cursor: key === selectedKey,
+            spin: showSpinner ? spin : null,
+          }),
         );
       }),
       // Distinguishes "still fetching" from "resolved and empty" in the body,

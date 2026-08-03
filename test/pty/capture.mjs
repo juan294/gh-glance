@@ -96,7 +96,7 @@ export function parseCapture(raw) {
     // copy change would red the build for no defect.
     hasPanelFrame: /[╭╰╮╯]/.test(stripEscapes(raw)),
     hasTabBar: /1:(Actions|Act)/.test(stripEscapes(raw)),
-    hasFullKeyHints: /Tabs:/.test(stripEscapes(raw)),
+    hasFullKeyHints: /Move:/.test(stripEscapes(raw)),
   };
 }
 
