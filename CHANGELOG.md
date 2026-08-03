@@ -5,17 +5,12 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-08-03
 
-### Fixed
-
-- **`kill` no longer erases your terminal scrollback.** On `SIGTERM`, `SIGINT`
-  and `SIGHUP` the dashboard handed the terminal back to the primary buffer and
-  the renderer then repainted onto it — preceded by an erase-scrollback escape,
-  so a `kill` threw away the terminal history and left a dead dashboard frame
-  behind. Measured at 2,728 bytes on an 80x24 pane. Quitting with `q`, `Esc` or
-  `Ctrl+C` was never affected. Found by the new pty harness; present since
-  before 0.2.0.
+The dashboard stops being read-only: you can now move through the table and open
+what you are looking at. The rest of the release is the audit backlog `0.2.0`
+deferred — a configuration surface, structural refactors, and the first tests
+that drive the real binary under a terminal.
 
 ### Added
 
@@ -43,6 +38,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tall as the terminal and never wider, that a narrow pane still draws its
   chrome, that signal exit codes are 143/130/129, and that nothing is left on
   the primary buffer afterwards. It runs in CI as an advisory check.
+
+### Changed
+
+- **Terminal traffic roughly halved.** The renderer now updates only the lines
+  that changed instead of rewriting the whole viewport: measured 13,918 bytes
+  down to 6,799 on a settled 80x24 pane.
+- Rows are memoised and the spinner frame is no longer handed to the three tabs
+  that ignore it, so a running workflow animates one glyph instead of
+  reconciling every row ten times a second.
+- The Actions tab count carries a `!` when the newest run failed, so "is CI red"
+  is answerable from any tab rather than only from that one.
+- The status bar's key hints are plain ASCII. The arrows, return symbol and
+  box-drawing separator it used are East-Asian-Ambiguous, which the renderer
+  measures as two columns each — enough to overflow an 80-column terminal once
+  selection added a hint.
+- The four fetchers are driven by one registry rather than four near-identical
+  functions, colours are named rather than repeated as literals, and the
+  terminal-size hook is extracted. No behaviour changed.
+- Installing from a git URL or a local directory no longer writes git hooks.
+- `develop` is now PR-only, admin-enforced, with eight required checks. Its
+  previous protection required an approving review that a solo maintainer could
+  not give, so every commit had been landing as a direct push and the required
+  checks gated nothing.
+
+### Fixed
+
+- **`kill` no longer erases your terminal scrollback.** On `SIGTERM`, `SIGINT`
+  and `SIGHUP` the dashboard handed the terminal back to the primary buffer and
+  the renderer then repainted onto it — preceded by an erase-scrollback escape,
+  so a `kill` threw away the terminal history and left a dead dashboard frame
+  behind. Measured at 2,728 bytes on an 80x24 pane. Quitting with `q`, `Esc` or
+  `Ctrl+C` was never affected. Found by the new pty harness; present since
+  before 0.2.0.
 
 ## [0.2.0] - 2026-08-03
 
@@ -145,16 +173,6 @@ engineering, security, QA and UX. What follows is what changed as a result.
 
 ### Changed
 
-- **Terminal traffic roughly halved.** The renderer now updates only the lines
-  that changed instead of rewriting the whole viewport: measured 13,918 bytes
-  down to 6,799 on a settled 80x24 pane.
-- Rows are memoised and the spinner frame is no longer handed to the three tabs
-  that ignore it, so a running workflow animates one glyph instead of
-  reconciling every row ten times a second.
-- The Actions tab count carries a `!` when the newest run failed, so "is CI red"
-  is answerable from any tab rather than only from that one.
-- Installing from a git URL or a local directory no longer writes git hooks.
-
 - **Node 22 is now the minimum.** Ink and two of its dependencies already
   required it while the package claimed 20.19, so installs on the advertised
   floor emitted engine warnings. Node 20 reached end of life on 2026-04-30.
@@ -169,10 +187,6 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - Secondary text uses the terminal's own dim attribute rather than a fixed
   colour chosen for dark themes, so it is readable on light backgrounds too.
 - The age column is labelled `UPDATED`, which is what it has always shown.
-- The status bar's key hints are plain ASCII. The arrows, return symbol and
-  box-drawing separator it used are East-Asian-Ambiguous, which the renderer
-  measures as two columns each — enough to overflow an 80-column terminal once
-  selection added a hint.
 - CI runs the test suite, no longer stops the matrix at the first failure,
   asserts exit codes rather than just non-zero, and pins every action to a
   commit SHA.
@@ -182,4 +196,5 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
+[0.3.0]: https://github.com/juan294/gh-glance/releases/tag/v0.3.0
 [0.2.0]: https://github.com/juan294/gh-glance/releases/tag/v0.2.0
