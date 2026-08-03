@@ -243,11 +243,18 @@ branch -- the integration branch already holds the changes.
 
 1. Land the release prep on the integration branch:
 
+   `develop` is protected and rejects direct pushes, so release prep lands
+   through its own PR first.
+
    ```bash
    git checkout develop && git pull --rebase
+   git checkout -b release/vX.Y.Z-prep
    git add <changed-files>
    git commit -m "release: vX.Y.Z -- [summary from CHANGELOG]"
-   git push origin develop
+   git push -u origin release/vX.Y.Z-prep
+   gh pr create --base develop --title "release: vX.Y.Z" --body "[CHANGELOG entry]"
+   gh pr merge --squash --delete-branch    # once checks are green
+   git checkout develop && git pull --rebase
    ```
 
 2. Check for an existing release PR before creating one:
@@ -268,11 +275,18 @@ branch -- the integration branch already holds the changes.
    gh run list --branch develop --limit 1
    ```
 
-4. Merge with squash + auto-merge. NEVER pass `--delete-branch` -- `develop` is permanent:
+4. Merge with a MERGE COMMIT, not a squash, and never pass `--delete-branch` --
+   `develop` is permanent:
 
    ```bash
-   gh pr merge --squash --auto
+   gh pr merge --merge --auto
    ```
+
+   Squashing a permanent integration branch makes `main` and `develop` diverge:
+   the squashed commit exists only on `main`, so the next release PR replays
+   every commit again and, under `strict: true`, cannot merge until `main` is
+   merged back into `develop`. A merge commit keeps `main` a superset of
+   `develop`.
 
    Repos standardized per Rule #76 enable delete-branch-on-merge, but that only removes
    ordinary feature heads; deleting the permanent integration branch would be destructive.
