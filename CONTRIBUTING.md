@@ -13,15 +13,15 @@ documentation, contributions are welcome.
 
 - More tabs (e.g. discussions, releases)
 - Configurable columns / widths
-- A config file for refresh interval, tab order, or icon style (plain unicode
-  vs. Nerd Font Octicons)
-- Handling repos where `gh` isn't authenticated, or where a tab's underlying
-  feature is disabled, more gracefully
+- A config file or flags for refresh interval, tab order, or target repository
+  (see [#35](https://github.com/juan294/gh-glance/issues/35))
+- Row selection and scrolling, so you can open what you are looking at
+  (see [#33](https://github.com/juan294/gh-glance/issues/33))
 
 ## Prerequisites
 
-- Node.js `>=20.19`
-- The [`gh` CLI](https://cli.github.com/), authenticated (`gh auth login`)
+- Node.js `>=22` (Ink requires it; Node 20 is end-of-life)
+- The [`gh` CLI](https://cli.github.com/) `>=2.20`, authenticated (`gh auth login`)
 - A terminal font with [Nerd Font](https://www.nerdfonts.com/) glyphs, to see
   the status icons correctly (see the README for the plain-unicode fallback)
 
@@ -35,6 +35,31 @@ node index.mjs   # run it from inside any locally cloned GitHub repo
 ```
 
 There's no build step -- it's plain ESM JavaScript, run directly by Node.
+
+### Tests
+
+```bash
+npm test          # node:test, no framework, no config
+npm run lint      # eslint, fails on warnings
+node --check index.mjs
+```
+
+Tests live in `test/` and use Node's built-in runner, so they add no build step
+and no test-framework dependency. `index.mjs` guards its entry point behind a
+main-module check, which is what makes it importable from a test without
+launching the dashboard -- please keep that guard intact.
+
+Worth knowing about the app's shape before changing it:
+
+- The polling effect's empty dependency array is deliberate. Every value it
+  needs is read through a ref precisely so the interval is created once; adding
+  dependencies would rebuild it on every tab keypress and every resize and
+  cancel in-flight requests.
+- `commit()` skips both the parse and the state update when the raw payload is
+  unchanged, and returns the same state object, so an idle repo stops redrawing
+  entirely. Anything that returns a fresh object per tick undoes that.
+- Everything from `gh` goes through `safe()` before it is stored. See
+  `SECURITY.md`.
 
 ## Branching Model
 
@@ -66,7 +91,10 @@ refactor: extract the row-height calculation
 - No TypeScript, no build tooling, no bundler -- this project intentionally
   stays a single small script. If a change needs a build step, that's a sign
   to open an issue and discuss the tradeoff first.
-- Run `npm run lint` before submitting a PR.
+- Run `npm run lint` and `npm test` before submitting a PR.
+- The sample output block in `README.md` is captured from a real run. If you
+  change a column, a limit, or the status bar, regenerate it rather than editing
+  it by hand -- it drifted out of date once already.
 - Keep the four data-fetching functions (`fetchActions`, `fetchIssues`,
   `fetchPRs`, `fetchSecurity`) shelling out via `execFile` with argument
   arrays -- never build a shell string from repository data. See
@@ -76,7 +104,7 @@ refactor: extract the row-height calculation
 
 1. Fork the repo and create a branch off `develop`
 2. Make your change, keeping it scoped to one concern
-3. Run `npm run lint` and `node --check index.mjs`
+3. Run `npm run lint`, `npm test` and `node --check index.mjs`
 4. Open a PR against `develop` describing what changed and why
 5. Make sure CI is green before requesting review
 

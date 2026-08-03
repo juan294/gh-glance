@@ -13,33 +13,61 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Actions are pinned to full commit SHAs rather than floating major tags: a tag
+# is retargetable by its owner at any moment, and release.yml holds an OIDC
+# token with publish rights. The trailing version comment is what makes a
+# Dependabot SHA bump reviewable, so it is load-bearing rather than decoration.
 jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run lint
 
-  # The dashboard is a single ESM script with no build step, so the only
+  test:
+    name: Test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      # Without this the first version to fail cancels the others, which
+      # destroys exactly the signal a matrix exists to produce.
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      # Until this job existed, no function body in index.mjs was executed by
+      # any gate -- every smoke check below returns from the argv block long
+      # before render(), so a green tick meant only "this file parses".
+      - run: npm test
+
+  # The dashboard is a single ESM script with no build step, so the remaining
   # version-dependent checks are that it parses and boots on every supported
-  # Node. 20.19 is the floor declared in `engines`.
+  # Node. 22 is the floor declared in `engines`: ink, cli-truncate and
+  # slice-ansi all require >=22, and Node 20 reached end of life on 2026-04-30.
   smoke:
     name: Smoke (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
+      fail-fast: false
       matrix:
-        node-version: [20, 22, 24]
+        node-version: [22, 24]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
@@ -50,9 +78,31 @@ jobs:
         run: |
           node index.mjs --version
           node index.mjs --help
+      # This previously asserted only "some non-zero exit", which any startup
+      # crash or module-resolution failure would also satisfy. Pin the exact
+      # code and a short stable fragment of the message -- short so that
+      # rewording the sentence does not red the build.
       - name: Refuses a non-TTY stdout
         run: |
-          if node index.mjs > /dev/null 2>&1; then
-            echo "expected a non-zero exit when stdout is not a TTY" >&2
+          set +e
+          stderr=$(node index.mjs 2>&1 >/dev/null)
+          code=$?
+          set -e
+          if [ "$code" -ne 1 ]; then
+            echo "expected exit 1 for a non-TTY stdout, got $code" >&2
+            exit 1
+          fi
+          case "$stderr" in
+            *"not a terminal"*) ;;
+            *) echo "expected the non-TTY explanation, got: $stderr" >&2; exit 1 ;;
+          esac
+      - name: Rejects an unknown argument
+        run: |
+          set +e
+          node index.mjs --definitely-not-a-flag >/dev/null 2>&1
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then
+            echo "expected exit 2 for an unknown argument, got $code" >&2
             exit 1
           fi

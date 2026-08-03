@@ -4,9 +4,22 @@ on:
   pull_request:
     branches: [main, develop]
 
+# This is the only pre-merge check on new dependencies. It previously declared
+# no permissions block at all, inheriting the repository default. On fork PRs it
+# runs read-only and cannot post its summary comment; that is a cosmetic
+# limitation and must NOT be "fixed" by switching to pull_request_target with
+# write permissions.
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-review-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   dependency-review:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/dependency-review-action@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0

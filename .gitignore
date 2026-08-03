@@ -8,6 +8,7 @@ node_modules/
 .worktrees/
 CLAUDE.local.md
 .claude/settings.local.json
+.claude/metrics/
 
 # Security-sensitive files
 .npmrc
@@ -16,3 +17,6 @@ CLAUDE.local.md
 
 # Local summon config
 .summon
+
+# Agent audit reports (public repo -- kept local, Rule #70)
+docs/agents/
