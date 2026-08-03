@@ -106,3 +106,28 @@ jobs:
             echo "expected exit 2 for an unknown argument, got $code" >&2
             exit 1
           fi
+
+  # Deliberately NOT in required_status_checks on either branch. Issue #37
+  # records pty capture as "the classic source of flaky CI" and "the only item
+  # here that can make CI flaky", so this reports on every PR but a timing flake
+  # cannot block a merge. Promote it to required once it has a clean streak --
+  # that is a settings change, not a code change.
+  #
+  # One Node version, not a matrix: this exercises terminal behaviour, which does
+  # not vary by Node minor, and every extra leg multiplies the flake surface for
+  # no additional signal.
+  pty:
+    name: PTY (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Drives the real binary under a pseudo-terminal. This is the GNU
+      # (util-linux) branch of run.sh -- the BSD branch only ever runs on a
+      # developer's machine, so CI is the first place both are exercised.
+      - run: npm run test:pty
