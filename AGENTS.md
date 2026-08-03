@@ -104,8 +104,10 @@ describe what exists; do not suggest improvements unless asked.
 ## Verification and Git
 
 - Run the verification commands specified by the command file, the plan,
-  or `CLAUDE.md`: `npm run lint`, `node --check index.mjs`. There is no
-  test suite or typecheck step -- do not invent one.
+  or `CLAUDE.md`: `npm run lint`, `npm test`, `node --check index.mjs`.
+  There is no typecheck step -- do not invent one. Tests use Node's
+  built-in runner (`node --test`) and live in `test/`; do not add a test
+  framework, which would contradict the no-build-step stance.
 - Keep verification sequential unless the workflow explicitly says work
   can be parallelized
 - Preserve the project's git workflow exactly as described in
