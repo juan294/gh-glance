@@ -14,7 +14,7 @@
   ],
   "scripts": {
     "lint": "eslint . --max-warnings 0",
-    "prepare": "husky || true",
+    "prepare": "node -e \"process.exit(require('fs').existsSync('.git')?0:1)\" && husky || true",
     "prepublishOnly": "npm run lint && node --check index.mjs && npm test",
     "start": "node index.mjs",
     "test": "node --test test/*.test.mjs",
