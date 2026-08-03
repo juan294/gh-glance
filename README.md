@@ -95,13 +95,30 @@ current.
 ## Install
 
 ```bash
+npm install -g gh-glance
+```
+
+That is the whole install. `gh-glance` ships as a single `index.mjs` with no
+build step, so there is nothing to compile and nothing to configure -- the
+package is the source you can read in this repository.
+
+Every published version is built and signed by GitHub Actions from a tagged
+commit on `main`, never from a maintainer's laptop, and carries [npm
+provenance](https://docs.npmjs.com/generating-provenance-statements) linking
+the tarball back to the workflow run and commit that produced it. The
+"Provenance" section on the [package
+page](https://www.npmjs.com/package/gh-glance) shows the exact source.
+
+### From a clone
+
+For hacking on it, or to run an unreleased revision:
+
+```bash
 git clone https://github.com/juan294/gh-glance.git
 cd gh-glance
 npm install
 npm link   # makes the `gh-glance` command available globally
 ```
-
-(Not yet published to npm -- clone + `npm link` is the current install path.)
 
 `npm link` is what puts `gh-glance` on your `PATH`; it symlinks the global
 bin at your Node version's `bin/` directory through to this checkout:
@@ -116,6 +133,10 @@ it, and both are fixed by re-running `npm link` from the clone:
 
 - switching Node versions (nvm/fnm install their own global `bin/`)
 - setting up on a fresh machine, or after `npm unlink -g gh-glance`
+
+A linked clone shadows a global install, since both write the same bin name.
+Run `npm unlink -g gh-glance` before `npm install -g gh-glance` if you want
+to go back to the published version.
 
 ### Using it as a workspace pane
 

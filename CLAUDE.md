@@ -71,9 +71,28 @@ sequentially with `;` or `&&`, never as parallel Bash calls.
 
 ## Deployment
 
-None currently -- not yet published to npm (clone + `npm link` is the
-install path). `main` represents the released state of the source, not a
-deployed service.
+Published to npm as [`gh-glance`](https://www.npmjs.com/package/gh-glance).
+There is no server: `main` is the released state of the source, and the npm
+package is the artifact.
+
+`.github/workflows/release.yml` publishes automatically when a GitHub release
+is published. It authenticates with **OIDC trusted publishing, not a token** --
+there is no `NPM_TOKEN` secret in this repository and there must never be one.
+npm restricted bypass-2FA granular tokens from account management in Aug 2026
+and removes their direct-publish ability in Jan 2027.
+
+The trust relationship is registered against three things that must stay in
+lockstep, or publishing breaks with an opaque `401`:
+
+| Bound to | Value |
+|---|---|
+| Repository | `juan294/gh-glance` |
+| Workflow filename | `release.yml` |
+| Environment | `npm` |
+
+Re-register with `npm trust github gh-glance` if any of them changes. Note
+that Node 22 bundles npm 10.9, which has no OIDC support at all -- the
+workflow upgrades npm before publishing, and that step is load-bearing.
 
 Rules load from `.claude/rules/` and `.claude/skills/` automatically.
 
