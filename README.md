@@ -165,8 +165,19 @@ rather than advertising keys that would do nothing.
 
 ## Configuration
 
-`gh-glance` takes no arguments by design, so it drops straight into a pane
-definition. The few things worth changing are environment variables:
+`gh-glance` still takes no arguments by default, so it drops straight into a
+pane definition. Flags are there when you want them:
+
+| Flag | Effect |
+|---|---|
+| `-R`, `--repo owner/name` | Watch a specific repository instead of the current directory's. Works from anywhere -- you do not need a local clone. |
+| `--refresh <seconds>` | Active-tab poll interval, 2-3600, default 5. Background tabs stay at 12x this. |
+| `--tab <name>` | Start on `actions`, `issues`, `prs` or `security`. |
+| `--verbose` | Log one line per `gh` call to stderr, with timing and outcome. stderr must be redirected: `gh-glance --verbose 2>gh-glance.log`. |
+
+An unrecognised flag exits 2 rather than being ignored, so a typo fails loudly.
+
+Environment variables work too, and the flags take precedence:
 
 | Variable | Effect |
 |---|---|
@@ -238,6 +249,8 @@ in some terminals, which would shift every column to their right.
 | A tab's count is red | That tab's last fetch failed. The error itself is shown when you switch to it. |
 | `stale 2m` in the status bar | The visible tab has not refreshed successfully for a while — usually a network drop. |
 | It exits immediately when piped | Intentional. It is a full-screen dashboard, not a reporting command. |
+| It stopped updating and you cannot tell why | Run `gh-glance --verbose 2>gh-glance.log`, reproduce, then read the log: one line per `gh` call with its duration and outcome. Attach it to a bug report. |
+| `--verbose` refuses to start | stderr is still your terminal, where the log would draw over the dashboard. Redirect it to a file. |
 
 ## Contributing
 
