@@ -330,11 +330,15 @@ const RUN_STATUS_ICON = {
   stale: { icon: OCT.skipFill, color: "gray" },
   startup_failure: { icon: OCT.xCircleFill, color: "redBright" },
 };
-const RUN_IN_PROGRESS_ICON = { icon: OCT.dotFill, color: "cyanBright" };
+// github.com draws a run that is actually executing as an amber circle with a
+// turning segment, and one that is merely queued as the same amber standing
+// still -- the motion, not the colour, is what separates them. The frame comes
+// from the counter the "Fetching" indicator already uses, so the two spinners
+// on screen turn in step rather than drifting against each other.
 const RUN_PENDING_ICON = { icon: OCT.dotFill, color: "yellowBright" };
 
-function runStatusIcon(run) {
-  if (run.status === "in_progress") return RUN_IN_PROGRESS_ICON;
+function runStatusIcon(run, spin) {
+  if (run.status === "in_progress") return { icon: spin, color: "yellowBright" };
   if (run.status !== "completed") return RUN_PENDING_ICON;
   return RUN_STATUS_ICON[run.conclusion] ?? { icon: "?", color: "gray" };
 }
@@ -348,8 +352,8 @@ const ACTIONS_HEADER = [
   { label: "AGE", props: { width: 8 } },
 ];
 
-function ActionsRow({ item, now }) {
-  const { icon, color } = runStatusIcon(item);
+function ActionsRow({ item, now, spin }) {
+  const { icon, color } = runStatusIcon(item, spin);
   const started = new Date(item.startedAt);
   const finished = item.status === "completed" ? new Date(item.updatedAt) : now;
   return e(
@@ -500,7 +504,11 @@ function StatusBar({ fetching, spin }) {
     e(
       Box,
       { width: FETCHING_WIDTH, flexShrink: 0 },
-      e(Text, { color: fetching ? "cyanBright" : MUTED }, `${spin} Fetching`),
+      // Pinned to the resting frame when idle: the counter also drives the run
+      // icons, so borrowing it here would set this turning while a workflow
+      // executes -- saying "fetching" at a moment when nothing is being
+      // fetched.
+      e(Text, { color: fetching ? "cyanBright" : MUTED }, `${fetching ? spin : SPINNER[0]} Fetching`),
     ),
     ...KEY_HINTS.flatMap((hint, i) => [
       i > 0 && e(Text, { key: `sep${i}`, color: BORDER_COLOR }, " │ "),
@@ -551,10 +559,16 @@ function App() {
   const activeIndexRef = useRef(activeIndex);
   activeIndexRef.current = activeIndex;
 
-  // An in-progress run's elapsed time is the only thing on screen that changes
+  // An unfinished run's elapsed time is the only thing on screen that changes
   // faster than once a minute, so it decides how often `now` has to advance.
   const hasInProgressRef = useRef(false);
   hasInProgressRef.current = (data.actions ?? []).some((r) => r.status !== "completed");
+
+  // Queued runs don't spin -- standing still is how they read as queued -- and
+  // the icons only exist on the Actions tab, so a run turning behind another
+  // tab would be ten redraws a second nobody can see.
+  const hasRunningVisible =
+    tab.key === "actions" && (data.actions ?? []).some((r) => r.status === "in_progress");
 
   const inFlightRef = useRef({});
   const rawRef = useRef({});
@@ -658,13 +672,13 @@ function App() {
     fetchTabRef.current?.(TABS[activeIndex].key);
   }, [activeIndex]);
 
-  // Animate only while a fetch is actually in flight. Ink skips writing a frame
-  // identical to the last one, so a settled dashboard on an unchanged repo
-  // emits nothing at all -- an always-on spinner would defeat that by making
-  // every frame differ, redrawing the pane ten times a second for as long as
-  // the tool is open. Tying it to in-flight requests keeps the redraws inside
-  // the second or so each refresh takes, which is the point of showing it.
-  const showSpinner = anyLoading;
+  // Animate only when something on screen is genuinely moving: a fetch in
+  // flight, or a run executing. Ink skips writing a frame identical to the last
+  // one, so a settled dashboard on an unchanged repo emits nothing at all -- an
+  // always-on spinner would defeat that by making every frame differ, redrawing
+  // the pane ten times a second for as long as the tool is open. Tied to real
+  // activity, the redraws last exactly as long as the activity does.
+  const showSpinner = anyLoading || hasRunningVisible;
   useEffect(() => {
     if (!showSpinner) {
       // Park on a fixed frame rather than freezing wherever the animation
@@ -729,7 +743,7 @@ function App() {
       error && e(Text, { color: "red" }, error),
       tab.key === "security" && securityNotes.map((note, i) => e(Text, { key: i, color: MUTED }, note)),
       e(HeaderCells, { cells: tab.header }),
-      ...visibleItems.map((item) => e(tab.Row, { key: item.id ?? item.databaseId ?? item.number, item, now })),
+      ...visibleItems.map((item) => e(tab.Row, { key: item.id ?? item.databaseId ?? item.number, item, now, spin })),
       // Distinguishes "still fetching" from "resolved and empty" in the body,
       // which is the difference between a dashboard that looks hung and one
       // that looks correct.
