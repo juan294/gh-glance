@@ -103,6 +103,10 @@ git checkout -b feat/your-feature
 
 Open your pull request against `develop`, never against `main`.
 
+`develop` is protected and rejects direct pushes, including from maintainers.
+No approving review is required, so a single contributor is not blocked, but the
+required checks have to be green before anything lands.
+
 ## Commit Format
 
 Use lowercase [Conventional Commits](https://www.conventionalcommits.org/):

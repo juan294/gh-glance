@@ -21,23 +21,25 @@ without switching to the browser.
 ╭─ Actions ────────────────────────────────────────────────────────────────╮
 │     TITLE                    WORKFLOW   BRANCH         TIME    UPDATED   │
 │ ──────────────────────────────────────────────────────────────────────── │
-│ +   CodeQL                   #19 CodeQL develop        1m20s   6m ago    │
-│ +   feat: spin an amber ico… #18 CodeQL develop        1m24s   1h ago    │
-│ +   feat: spin an amber ico… #18 CI     develop        23s     1h ago    │
-│ +   fix: load React's produ… #17 CI     develop        27s     1h ago    │
-│ +   fix: load React's produ… #17 CodeQL develop        1m17s   1h ago    │
-│ +   chore: adopt cc-rpi blu… #16 CodeQL develop        1m28s   17h ago   │
-│ +   chore: adopt cc-rpi blu… #16 CI     develop        18s     17h ago   │
+│ >+  ci: pin actions to comm… #443 CI    develop        1m20s   2d ago    │
+│  x  fix: restore the primar… #442 Code… develop        1m28s   2d ago    │
+│  !  chore: bump dependencies #441 CI    dependa…int-10 56h49m  2d ago    │
+│  -  docs: update the readme  #440 CI    develop        15s     3d ago    │
 │                                                                          │
-╰─────────────────────────────────────────────────────────────── 7 of 20+ ─╯
-[1:Actions (20+)]   2:Issues (31)    3:PRs (0)    4:Security (0)
-⠋ Fetching            Tabs: ←/→ │ Jump: 1-4 │ Refresh: r │ Quit: q
+│                                                                          │
+╰───────────────────────────────────────────────────────────────── 4 of 4 ─╯
+[1:Actions (4)]   2:Issues (3)    3:PRs (2)    4:Security (0)
+⠋ Fetching            Move: jk | Open: Ent | Refresh: r | Quit: q
 ```
 
 > Captured from a real run at 76 columns with `GH_GLANCE_ICONS=unicode`, so the
 > status icons render in a browser. With a Nerd Font (the default) they are
-> Octicon glyphs instead. The `20+` on the Actions tab is the truncation marker:
-> Actions fetches only as many runs as the pane can show.
+> Octicon glyphs instead.
+>
+> The `>` on the first row is the cursor. Two more markers appear when they
+> apply: a `+` after a tab's count means the list was truncated by the fetch
+> limit, and a `!` after the Actions count means the newest run failed — so
+> "is CI red" is answerable without switching to that tab.
 
 <!-- contract:allow-emoji -- the check/cross above stand in for Nerd Font
      Octicons the app actually draws; they are literal examples, not decoration. -->

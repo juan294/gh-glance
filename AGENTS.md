@@ -104,7 +104,8 @@ describe what exists; do not suggest improvements unless asked.
 ## Verification and Git
 
 - Run the verification commands specified by the command file, the plan,
-  or `CLAUDE.md`: `npm run lint`, `npm test`, `node --check index.mjs`.
+  or `CLAUDE.md`: `npm run lint`, `npm test`, `node --check index.mjs`, and `npm run test:pty`
+  for anything touching rendering or the terminal lifecycle.
   There is no typecheck step -- do not invent one. Tests use Node's
   built-in runner (`node --test`) and live in `test/`; do not add a test
   framework, which would contradict the no-build-step stance.

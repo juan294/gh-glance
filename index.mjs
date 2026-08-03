@@ -775,6 +775,9 @@ Keys:
   1 2 3 4            Actions / Issues / Pull requests / Security
   Left / Right       Previous / next tab
   Tab / Shift+Tab    Next / previous tab
+  Up / Down, j / k   Move the cursor between rows
+  PgUp / PgDn        Move a page at a time
+  Enter              Open the selected item in your browser
   r                  Refresh the current tab now
   q / Esc / Ctrl+C   Quit
 

@@ -30,13 +30,16 @@ Use /clear between tasks, /compact when context is heavy.
 npm run lint            # ESLint
 npm start               # node index.mjs
 npm test                # node:test unit suite
+npm run test:pty        # end-to-end under a pseudo-terminal (slower, advisory in CI)
 node --check index.mjs  # syntax check (no build step to catch this otherwise)
 node index.mjs --version
 node index.mjs --help
 ```
 
-Tests are `node --test` (built-in runner, no framework) in `test/`, plus a CI
-smoke job (syntax check + CLI boot + exit-code assertions) across Node 22/24.
+Tests are `node --test` (built-in runner, no framework) in `test/`: a fast unit
+suite, plus `test/pty/` which drives the real binary under a pseudo-terminal
+against a fixture `gh`. CI also runs a smoke job (syntax check, CLI boot,
+exit-code assertions) across Node 22/24.
 
 ## Git Workflow
 
