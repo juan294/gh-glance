@@ -3,19 +3,21 @@
   "version": "0.1.0",
   "description": "A live-refreshing GitHub dashboard for your terminal: Actions, Issues, Pull Requests, and Security alerts in one narrow pane",
   "type": "module",
-  "main": "index.mjs",
   "bin": {
     "gh-glance": "./index.mjs"
   },
   "files": [
     "index.mjs",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
-    "lint": "eslint .",
+    "lint": "eslint . --max-warnings 0",
+    "prepare": "husky || true",
+    "prepublishOnly": "npm run lint && node --check index.mjs && npm test",
     "start": "node index.mjs",
-    "prepare": "husky || true"
+    "test": "node --test test/*.test.mjs"
   },
   "keywords": [
     "github",
@@ -38,7 +40,7 @@
   },
   "homepage": "https://github.com/juan294/gh-glance#readme",
   "engines": {
-    "node": ">=20.19"
+    "node": ">=22"
   },
   "dependencies": {
     "ink": "^7.1.1",
@@ -47,6 +49,8 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "eslint": "^10.8.0",
+    "eslint-plugin-react-hooks": "^7.1.0",
+    "globals": "^16.5.0",
     "husky": "^9.1.7"
   }
 }
