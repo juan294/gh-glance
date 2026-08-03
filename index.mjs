@@ -9,9 +9,26 @@
 import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { promisify } from "node:util";
-import React, { useState, useEffect, useRef } from "react";
-import { render, Box, Text, useStdout, useInput, useStdin } from "ink";
 
+// React's development build instruments every render with performance.measure()
+// calls for its DevTools timeline. In a browser those entries are dropped once
+// the timeline buffer fills; in Node the user-timing buffer is never trimmed,
+// so each render leaves a PerformanceMeasure behind permanently. A dashboard
+// that redraws for hours accumulates them until the heap is gone -- measured at
+// ~14 entries/s, which is a fatal "JavaScript heap out of memory" after a few
+// hours of uptime. Selecting React's production build turns the instrumentation
+// off at the source (verified: 0 entries, flat heap).
+//
+// react and ink pick their build by reading NODE_ENV at import time, and static
+// `import` is evaluated before any statement in this file, so the flag has to be
+// set first and the two loaded dynamically. NODE_ENV is only defaulted, not
+// overwritten, so `NODE_ENV=development gh-glance` still gets React's warnings.
+process.env.NODE_ENV ??= "production";
+const ReactModule = await import("react");
+const { render, Box, Text, useStdout, useInput, useStdin } = await import("ink");
+
+const React = ReactModule.default;
+const { useState, useEffect, useRef } = ReactModule;
 const e = React.createElement;
 const execFileAsync = promisify(execFile);
 
