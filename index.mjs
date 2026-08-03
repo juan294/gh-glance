@@ -1262,6 +1262,16 @@ function SecurityRow({ item, now, compact, cursor }) {
 
 // ---------- Tabs ----------
 
+// Memoised because their inputs are stable by construction. Two things must
+// stay true for that to hold: `now` must keep being replaced rather than
+// mutated, and the raw-payload bail-out must keep producing fresh item objects
+// when data genuinely changes. In-place mutation of a parsed item would make a
+// memoised row silently stop updating.
+const MemoActionsRow = React.memo(ActionsRow);
+const MemoIssueRow = React.memo(IssueRow);
+const MemoPRRow = React.memo(PRRow);
+const MemoSecurityRow = React.memo(SecurityRow);
+
 const TABS = [
   {
     key: "actions",
@@ -1270,7 +1280,7 @@ const TABS = [
     short: "Actions",
     header: ACTIONS_HEADER,
     compactHeader: ACTIONS_HEADER_COMPACT,
-    Row: ActionsRow,
+    Row: MemoActionsRow,
     countLabel: "runs",
   },
   {
@@ -1280,7 +1290,7 @@ const TABS = [
     short: "Issues",
     header: ISSUES_HEADER,
     compactHeader: ISSUES_HEADER_COMPACT,
-    Row: IssueRow,
+    Row: MemoIssueRow,
     countLabel: "open issues",
   },
   {
@@ -1290,7 +1300,7 @@ const TABS = [
     short: "PRs",
     header: PRS_HEADER,
     compactHeader: PRS_HEADER_COMPACT,
-    Row: PRRow,
+    Row: MemoPRRow,
     countLabel: "open PRs",
   },
   {
@@ -1300,7 +1310,7 @@ const TABS = [
     short: "Security",
     header: SECURITY_HEADER,
     compactHeader: SECURITY_HEADER_COMPACT,
-    Row: SecurityRow,
+    Row: MemoSecurityRow,
     countLabel: "alerts",
   },
 ];
@@ -1799,7 +1809,16 @@ function App() {
       // LIST_LIMIT and alerts at one page of 100. Reporting those as exact made
       // the count stop moving through a genuine change on any repo big enough
       // for this tool to matter.
-      return [t.key, `${list.length}${meta[t.key]?.truncated ? "+" : ""}`];
+      const suffix = meta[t.key]?.truncated ? "+" : "";
+      // Newest first, so the head of the list is the run that decides whether
+      // CI is currently red.
+      const broken =
+        t.key === "actions" &&
+        list.length > 0 &&
+        list[0].status === "completed" &&
+        list[0].conclusion !== "success" &&
+        list[0].conclusion !== "skipped";
+      return [t.key, `${list.length}${suffix}${broken ? "!" : ""}`];
     }),
   );
   const failed = Object.fromEntries(TABS.map((t) => [t.key, Boolean(errors[t.key])]));
@@ -1849,7 +1868,7 @@ function App() {
 
   return e(
     Box,
-    { flexDirection: "column", width: "100%", height: rows },
+    { flexDirection: "column", width: "100%", height: Math.min(rows, usableSize(stdout?.rows, rows)) },
     e(PanelEdge, { width: cols, top: true, label: tab.label, labelColor: TITLE_COLOR }),
     e(
       Box,
@@ -1883,7 +1902,10 @@ function App() {
             now,
             compact,
             cursor: key === selectedKey,
-            spin: showSpinner ? spin : null,
+            // Only the Actions rows read this. Passing it to the others would
+            // change a prop ten times a second on every tab and defeat the
+            // memoisation below for no visible effect.
+            spin: tab.key === "actions" && showSpinner ? spin : null,
           }),
         );
       }),
@@ -1968,7 +1990,17 @@ if (IS_MAIN) {
   enterAlternateScreen();
   process.on("exit", restoreScreen);
 
-  const app = render(e(App));
+  // Ink's default renderer erases and rewrites the whole viewport on every
+  // change; incremental mode updates only the lines that differ. Measured on a
+  // settled 80x24 pane: 13,918 bytes of terminal traffic down to the figure in
+  // the commit message.
+  //
+  // PE-M1 flagged the risk: ink's own source notes a Windows-console desync for
+  // frames that exactly fill the viewport, which this app always does since the
+  // root box is the terminal height. Windows is already documented as untested
+  // (README Limitations), and the pty harness covers the two platforms that are
+  // supported, so the flag is verified where it is claimed to work.
+  const app = render(e(App), { incrementalRendering: true });
 
   // 128 + signal number, so a supervisor or `timeout` can tell an interrupted
   // run from a clean one. These fire on external `kill` and when raw mode is

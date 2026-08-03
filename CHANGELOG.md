@@ -145,6 +145,16 @@ engineering, security, QA and UX. What follows is what changed as a result.
 
 ### Changed
 
+- **Terminal traffic roughly halved.** The renderer now updates only the lines
+  that changed instead of rewriting the whole viewport: measured 13,918 bytes
+  down to 6,799 on a settled 80x24 pane.
+- Rows are memoised and the spinner frame is no longer handed to the three tabs
+  that ignore it, so a running workflow animates one glyph instead of
+  reconciling every row ten times a second.
+- The Actions tab count carries a `!` when the newest run failed, so "is CI red"
+  is answerable from any tab rather than only from that one.
+- Installing from a git URL or a local directory no longer writes git hooks.
+
 - **Node 22 is now the minimum.** Ink and two of its dependencies already
   required it while the package claimed 20.19, so installs on the advertised
   floor emitted engine warnings. Node 20 reached end of life on 2026-04-30.
