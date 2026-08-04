@@ -611,11 +611,18 @@ const OPENABLE = { actions: "run", issues: "issue", prs: "pr" };
 // Output is captured rather than inherited. `gh ... --web` prints "Opening ...
 // in your browser" to stdout, and stdout is ink's frame stream -- letting that
 // through would corrupt the diff and the alternate screen.
+//
+// `gh run view` takes the run's databaseId, not its display `number` -- the
+// two are different ID spaces (databaseId is global across GitHub, number is
+// per-workflow and restarts near 1 in every repo), so a run's `number` is
+// almost never a valid databaseId elsewhere and 404s. `gh issue view` and
+// `gh pr view` are the opposite: they take the issue/PR number, and neither
+// row shape carries a databaseId to prefer instead.
 async function openInBrowser(tabKey, item, signal) {
   const kind = pick(OPENABLE, tabKey, null);
-  const number = item?.number ?? item?.databaseId;
-  if (!kind || number == null) return;
-  await runGh([kind, "view", ...repoArgs(), String(number), "--web"], { signal });
+  const id = kind === "run" ? (item?.databaseId ?? item?.number) : (item?.number ?? item?.databaseId);
+  if (!kind || id == null) return;
+  await runGh([kind, "view", ...repoArgs(), String(id), "--web"], { signal });
 }
 
 // ---------- Startup preflight ----------

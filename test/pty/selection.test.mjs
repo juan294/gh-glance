@@ -31,6 +31,19 @@ const moved = capture({
 // No movement at all, as the control.
 const untouched = capture({ cols: 80, rows: 24, settle: 4 });
 
+// Select the first Actions row (databaseId 101, display number 443 -- see
+// fixtures/runs.json) and press Enter to open it. Regression guard for the
+// bug where openInBrowser() preferred `number` over `databaseId` for runs:
+// `gh run view` takes the databaseId, and passing the display number instead
+// 404s against a real repo (the two ID spaces are unrelated).
+const opened = capture({
+  cols: 80,
+  rows: 24,
+  signal: "none",
+  settle: 20,
+  stdin: `sleep ${SETTLE}; printf 'j'; sleep 1; printf '\\r'; sleep 1; printf 'q'; sleep 2`,
+});
+
 test("nothing is selected until you move", () => {
   // The cursor marker shares the icon column, so an unselected pane has no ">"
   // anywhere in its rows. Starting with row one pre-selected would imply an
@@ -74,4 +87,11 @@ test("the frame keeps its geometry while a row is selected", () => {
     moved.finalFrame.widest <= 80,
     `widest line was ${moved.finalFrame.widest} with a row selected`,
   );
+});
+
+test("opening a run passes the databaseId to `gh run view`, not the display number", () => {
+  const viewCalls = opened.fixtureCalls.filter((call) => call.startsWith("run view"));
+  assert.equal(viewCalls.length, 1, `expected exactly one run view call, saw ${viewCalls.length}`);
+  assert.ok(viewCalls[0].includes("101"), `expected databaseId 101 in "${viewCalls[0]}"`);
+  assert.ok(!viewCalls[0].includes("443"), `display number 443 leaked into "${viewCalls[0]}"`);
 });
