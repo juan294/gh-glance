@@ -59,10 +59,11 @@ terminal state on exit, and the key handlers. It found the scrollback bug fixed
 in `0.3.0`.
 
 It is a separate script from `npm test` on purpose. The unit run is fast and is
-a required CI check; the pty run is slow, is timing-sensitive by nature, and
-runs in CI as **advisory** -- it reports on every PR but cannot block a merge.
-If you make it flake, the right response is to delete the offending assertion,
-not to add retries.
+required everywhere; the pty run is slow and timing-sensitive, so it reports on
+every pull request but is **required only on `main`** -- which in practice means
+it gates the release and nothing else. It was advisory until 2026-08-04 and was
+promoted after 38 consecutive runs without a failure. If you make it flake, the
+right response is to delete the offending assertion, not to add retries.
 
 One rule keeps it worth having: **assert structure, never cell contents.** Line
 counts, widths, escape-sequence balance and exit codes survive a copy change.

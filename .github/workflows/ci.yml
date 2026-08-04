@@ -107,17 +107,29 @@ jobs:
             exit 1
           fi
 
-  # Deliberately NOT in required_status_checks on either branch. Issue #37
-  # records pty capture as "the classic source of flaky CI" and "the only item
-  # here that can make CI flaky", so this reports on every PR but a timing flake
-  # cannot block a merge. Promote it to required once it has a clean streak --
-  # that is a settings change, not a code change.
+  # Required on `main`, and only on `main`. It was advisory at first because
+  # issue #37 records pty capture as "the classic source of flaky CI", with the
+  # stated bar for promoting it being a clean streak: 38 runs from 2026-08-02 to
+  # 2026-08-04, zero failures. Promoted 2026-08-04.
+  #
+  # `develop` is unprotected, so this gates nothing day to day -- it gates the
+  # `develop` -> `main` release PR and nothing else. That is the right place for
+  # it. The cost of a flake lands roughly once a week and is paid by re-running
+  # a job; the cost of not running it lands on whatever ships to npm. And what
+  # it covers is what unit tests structurally cannot see -- alternate-screen
+  # balance, cursor restore, exit codes, and whether unmount erases the user's
+  # scrollback, which *is* issue #37.
+  #
+  # If it does flake at release time, re-run the job. If it flakes twice in a
+  # quarter, reconsider rather than tolerate -- the name is the contract, so
+  # demoting it means renaming it back and updating the required contexts in
+  # settings, since protection matches by job name.
   #
   # One Node version, not a matrix: this exercises terminal behaviour, which does
   # not vary by Node minor, and every extra leg multiplies the flake surface for
   # no additional signal.
   pty:
-    name: PTY (advisory)
+    name: PTY
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

@@ -30,7 +30,7 @@ Use /clear between tasks, /compact when context is heavy.
 npm run lint            # ESLint
 npm start               # node index.mjs
 npm test                # node:test unit suite
-npm run test:pty        # end-to-end under a pseudo-terminal (slower, advisory in CI)
+npm run test:pty        # end-to-end under a pseudo-terminal (slower; gates `main` only)
 node --check index.mjs  # syntax check (no build step to catch this otherwise)
 node index.mjs --version
 node index.mjs --help
