@@ -30,7 +30,7 @@ without switching to the browser.
 │                                                                          │
 │                                                                          │
 ╰───────────────────────────────────────────────────────────────── 4 of 4 ─╯
-⠋ Fetching            Move: jk | Open: Ent | Refresh: r | Quit: q
+⣾ Fetching            Move: jk | Open: Ent | Refresh: r | Quit: q
 ```
 
 > Captured from a real run at 76 columns with `GH_GLANCE_ICONS=unicode`, so the
@@ -282,10 +282,23 @@ included, only their sizes. The report is safe to attach to a bug report.
 ## Rate limit
 
 The visible tab refreshes every 5 seconds; the other three refresh every 60
-seconds, purely to keep their counts honest. That works out at roughly 500
-REST requests an hour, about 10% of the 5,000/hour authenticated limit — so
-leaving a pane open all day does not exhaust the budget your other `gh`
-commands share.
+seconds, purely to keep their counts honest.
+
+With Actions, Issues or Pull Requests as the visible tab that works out at
+roughly 1,000 REST requests an hour — about 20% of the 5,000/hour
+authenticated limit. The Security tab is the expensive one, because it is
+three endpoints rather than one: watching it costs roughly 2,300 an hour,
+just under half the budget.
+
+Two things pull the real number down. An endpoint that is not enabled for the
+repository — code scanning and secret scanning without Advanced Security —
+backs off after its first refusal rather than being re-asked every tick, which
+removes two of the Security tab's three calls. And `--refresh` scales the
+whole figure: doubling the interval halves it.
+
+So a pane left open all day shares the budget with your other `gh` commands
+rather than exhausting it, but it is not free, and parking it on the Security
+tab is the case worth knowing about.
 
 ## Limitations
 

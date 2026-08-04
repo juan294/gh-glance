@@ -1161,6 +1161,9 @@ Keys:
 
 Environment:
   GH_REPO=owner/name        Watch a specific repository (--repo takes precedence)
+  GH_HOST=host              GitHub Enterprise or EMU host to send every call to.
+                            A host-qualified GH_REPO does not route \`gh api\`;
+                            this and --repo host/owner/name both do.
   GH_GLANCE_ICONS=unicode   Plain-unicode status icons (no Nerd Font needed)
   GH_GLANCE_NO_ANIMATION=1  Freeze the spinner (no motion)
   NO_COLOR=1                Disable colour (status stays readable)

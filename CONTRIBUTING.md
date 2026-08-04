@@ -56,7 +56,7 @@ launching the dashboard -- please keep that guard intact.
 pseudo-terminal with a fixture `gh` on `PATH`, then asserts over the captured
 bytes. It covers what unit tests structurally cannot: rendered frame geometry,
 terminal state on exit, and the key handlers. It found the scrollback bug fixed
-in `[Unreleased]`.
+in `0.3.0`.
 
 It is a separate script from `npm test` on purpose. The unit run is fast and is
 a required CI check; the pty run is slow, is timing-sensitive by nature, and
@@ -117,9 +117,19 @@ workflow *filename*, and the `npm` environment, so renaming
 `.github/workflows/release.yml` or that environment breaks publishing until
 `npm trust github gh-glance` is re-run.
 
-`develop` is protected and rejects direct pushes, including from maintainers.
-No approving review is required, so a single contributor is not blocked, but the
-required checks have to be green before anything lands.
+`develop` is not protected: the maintainer commits to it directly. The
+PR-per-change requirement was removed on 2026-08-04 as pure overhead on a solo
+project. CI still runs on `develop`, but it now reports *after* a push rather
+than gating it, which makes a green local run the only thing standing between a
+bad commit and a red default branch -- so run lint and the tests before you
+commit, not after.
+
+None of that applies to an outside contribution. You cannot push to this
+repository, so fork it and open a pull request against `develop` as described
+above; the same checks run on your PR and are worth waiting for.
+
+`main` is still protected and still rejects direct pushes, because it is what
+drives npm publishing.
 
 ## Commit Format
 
