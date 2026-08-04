@@ -2263,16 +2263,25 @@ function App() {
         ? `${tabOffset + 1}-${tabOffset + visibleItems.length} of ${counts[tab.key]}`
         : `${visibleItems.length} of ${counts[tab.key]}`;
 
+  // One column short of the reported width, not the full width: some
+  // terminals (observed in Ghostty, split-pane) clip or misrender whatever
+  // glyph lands on the pane's absolute last column -- for this frame that is
+  // always the right border. Stopping one column early costs a blank column
+  // of slack but keeps the border visible everywhere, regardless of which
+  // terminal is doing the clipping.
+  const frameCols = Math.max(1, cols - 1);
+
   // Fixed columns deliberately do not shrink, so BRANCH and TIME stay readable
   // at ordinary widths. Narrow panes drop columns instead, which keeps the
   // frame, the tab bar and the quit hint on screen -- the previous behaviour
-  // pushed all three off the bottom.
-  const compact = cols < MIN_TABLE_WIDTH;
+  // pushed all three off the bottom. Measured against frameCols, the width the
+  // frame itself actually gets, not the raw terminal width.
+  const compact = frameCols < MIN_TABLE_WIDTH;
   const header = compact ? tab.compactHeader : tab.header;
 
   return e(
     Box,
-    { flexDirection: "column", width: "100%", height: Math.min(rows, usableSize(stdout?.rows, rows)) },
+    { flexDirection: "column", width: frameCols, height: Math.min(rows, usableSize(stdout?.rows, rows)) },
     e(TabBar, {
       activeIndex,
       counts,
@@ -2281,8 +2290,8 @@ function App() {
       spin,
       useShort: useShortLabels,
     }),
-    e(Divider, { width: cols }),
-    e(PanelEdge, { width: cols, top: true, label: tab.label, labelColor: TITLE_COLOR }),
+    e(Divider, { width: frameCols }),
+    e(PanelEdge, { width: frameCols, top: true, label: tab.label, labelColor: TITLE_COLOR }),
     e(
       Box,
       {
@@ -2342,7 +2351,7 @@ function App() {
       // tab that only has a handful of rows.
       e(Box, { flexGrow: 1 }),
     ),
-    e(PanelEdge, { width: cols, top: false, label: countLabel, labelColor: BORDER_COLOR }),
+    e(PanelEdge, { width: frameCols, top: false, label: countLabel, labelColor: BORDER_COLOR }),
     e(StatusBar, {
       fetching: Object.values(loading).some(Boolean),
       spin: showSpinner ? spin : null,
