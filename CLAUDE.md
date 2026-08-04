@@ -46,28 +46,33 @@ exit-code assertions) across Node 22/24.
 - Integration branch: `develop` (default branch, all work lands here first)
 - Production branch: `main` (tracks released state; only moves via a
   `develop` -> `main` pull request)
-- Implementation happens in git worktrees or temporary branches, never
-  directly on `develop`
 
 Conventional commits, lowercase, no scope required:
 `feat|fix|docs|chore|refactor: description`
 
-`develop` is protected: pushes to it are rejected, and changes land through a
-pull request whose checks pass. No approving review is required, so a solo
-maintainer is not deadlocked -- but CI is now a hard precondition rather than a
-report that arrives after the fact.
+`develop` is unprotected: commit directly to it. This is a solo project, so
+the PR-per-change ceremony was pure overhead -- removed 2026-08-04. Run
+verification locally *before* committing (lint, test, test:pty as needed);
+CI on `develop` is now observed after the fact rather than gating the push,
+so a green local run is what stands between a bad commit and a red `develop`.
 
 ```bash
-# Branch, commit, push the branch, open a PR against develop
-git checkout -b fix/short-slug
 git add <files> && git commit -m "msg"
-git push -u origin fix/short-slug
-gh pr create --base develop --fill
+git pull --rebase && git push
+```
+
+`main` stays protected (PR + passing checks, admins included) since it drives
+npm publishing -- only move it via a `develop` -> `main` PR:
+
+```bash
+git checkout -b release/vX.Y.Z
+# bump version, update changelog, etc.
+git push -u origin release/vX.Y.Z
+gh pr create --base main --fill
 gh pr merge --squash --delete-branch   # once checks are green
 ```
 
-Open PRs against `develop`, never against `main`. Run verification
-sequentially with `;` or `&&`, never as parallel Bash calls.
+Run verification sequentially with `;` or `&&`, never as parallel Bash calls.
 
 ## Deployment
 
