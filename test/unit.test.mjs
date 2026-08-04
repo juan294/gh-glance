@@ -13,6 +13,9 @@ import {
   shortErr,
   isUnavailable,
   isRateLimited,
+  isAuthProblem,
+  AUTH_RETRY_MS,
+  BACKOFF_STEPS_MS,
   formatAge,
   formatDuration,
   usableSize,
@@ -117,6 +120,48 @@ test("error classification keys off HTTP status, not the process exit code", () 
   // so it must never latch the backoff.
   assert.ok(isRateLimited({ stderr: "HTTP 403: API rate limit exceeded" }));
   assert.ok(!isRateLimited({ stderr: "gh: Not Found (HTTP 404)" }));
+});
+
+test("a SAML/SSO 403 is an auth problem, not a disabled feature", () => {
+  // The forms GitHub and gh actually emit. On an EMU tenant the SAML session
+  // expires periodically and is re-authorized in the browser; reporting that as
+  // "not enabled for this repository" is a confident claim about the repo's
+  // configuration that is simply false, and latching it for an hour means the
+  // tab stays wrong long after the user fixed it.
+  for (const s of [
+    "HTTP 403: Resource protected by organization SAML enforcement. You must grant your OAuth token access to this organization (https://api.github.com/repos/acme/widget/code-scanning/alerts)",
+    "HTTP 403: Although you appear to have the correct authorization credentials, the organization has enabled OAuth App access restrictions",
+    "HTTP 401: Bad credentials",
+    "HTTP 403: Your token has not been granted the required scopes to execute this query",
+  ]) {
+    assert.equal(isAuthProblem({ stderr: s }), true, s);
+  }
+});
+
+test("a genuine not-enabled 403/404 is not an auth problem", () => {
+  // "Advanced Security must be enabled" contains no auth marker and not even
+  // the substring "authoriz", which is what keeps the real not-enabled path
+  // intact. If a future marker breaks this assertion, that marker is too broad.
+  for (const s of [
+    "HTTP 404: Not Found",
+    "HTTP 403: Advanced Security must be enabled for this repository",
+  ]) {
+    assert.equal(isAuthProblem({ stderr: s }), false, s);
+    // The combination fetchAlertSource actually evaluates.
+    assert.ok(isUnavailable({ stderr: s }) && !isAuthProblem({ stderr: s }), s);
+  }
+});
+
+test("a rate-limit message is still not an auth problem", () => {
+  assert.equal(isAuthProblem({ stderr: "HTTP 403: API rate limit exceeded" }), false);
+});
+
+test("the auth ladder is short, fixed, and far below the unavailable ladder", () => {
+  assert.equal(AUTH_RETRY_MS.length, 1, "an auth lapse must not escalate");
+  assert.ok(
+    AUTH_RETRY_MS[0] < BACKOFF_STEPS_MS[0],
+    `${AUTH_RETRY_MS[0]}ms must be below the first unavailable step (${BACKOFF_STEPS_MS[0]}ms)`,
+  );
 });
 
 test("formatAge() returns a placeholder instead of NaN for unusable dates", () => {

@@ -88,7 +88,10 @@ current.
 ## Prerequisites
 
 - [Node.js](https://nodejs.org/) `>=22` (Ink requires it; Node 20 is end-of-life)
-- The [`gh` CLI](https://cli.github.com/) `>=2.20`, authenticated (`gh auth login`)
+- The [`gh` CLI](https://cli.github.com/) `>=2.20`, authenticated for the host
+  you intend to watch (`gh auth login`, or `gh auth login --hostname <host>` on
+  a GitHub Enterprise or EMU tenant -- see [GitHub Enterprise and
+  EMU](#github-enterprise-and-emu))
 - A terminal font with [Nerd Font](https://www.nerdfonts.com/) glyphs (for the
   status icons to render correctly -- without one, they'll show as blank
   boxes; see [Icons without a Nerd Font](#icons-without-a-nerd-font))
@@ -201,10 +204,11 @@ pane definition. Flags are there when you want them:
 
 | Flag | Effect |
 |---|---|
-| `-R`, `--repo owner/name` | Watch a specific repository instead of the current directory's. Works from anywhere -- you do not need a local clone. |
+| `-R`, `--repo [host/]owner/name` | Watch a specific repository instead of the current directory's. Works from anywhere -- you do not need a local clone. The optional host targets a GitHub Enterprise or EMU data-residency tenant, e.g. `tenant.ghe.com/acme/widget`. |
 | `--refresh <seconds>` | Active-tab poll interval, 2-3600, default 5. Background tabs stay at 12x this. |
 | `--tab <name>` | Start on `actions`, `issues`, `prs` or `security`. |
 | `--verbose` | Log one line per `gh` call to stderr, with timing and outcome. stderr must be redirected: `gh-glance --verbose 2>gh-glance.log`. |
+| `--doctor` | Print a diagnostic report and exit. See [Diagnostics](#diagnostics). |
 
 An unrecognised flag exits 2 rather than being ignored, so a typo fails loudly.
 
@@ -212,11 +216,68 @@ Environment variables work too, and the flags take precedence:
 
 | Variable | Effect |
 |---|---|
-| `GH_REPO=owner/name` | Watch a specific repository instead of the current directory's |
+| `GH_REPO=owner/name` | Watch a specific repository instead of the current directory's. A host-qualified `GH_REPO` does **not** route the security-alert endpoints -- use `GH_HOST` or `--repo host/owner/name` for that |
+| `GH_HOST=<host>` | Send every call to a GitHub Enterprise or EMU host instead of `github.com`. Routes both the list commands and the alert endpoints |
+| `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GH_CONFIG_DIR` | Not read by `gh-glance` -- passed through to `gh` untouched, along with the proxy variables. `gh-glance` handles no credentials of its own |
 | `GH_GLANCE_ICONS=unicode` | Plain ASCII status icons, for terminals without a Nerd Font |
 | `GH_GLANCE_NO_ANIMATION=1` | Freeze the spinner — no motion at all |
 | `NO_COLOR=1` | Disable colour. Status stays readable: severity has its own column, run states have distinct glyphs, and the active tab is bracketed |
 | `INK_SCREEN_READER=true` | Switch the renderer to a linear, unthrottled mode. The status icons carry text labels for it, but this path has not been tested against a real screen reader — treat it as unverified rather than supported. |
+
+## GitHub Enterprise and EMU
+
+**The common case needs no configuration.** Authenticate once --
+`gh auth login --hostname <your-host>` -- then run `gh-glance` inside a clone of
+a work repository. The repository and its host are both resolved from the git
+remote, the same way `gh` does it.
+
+**There are two EMU forms.** Standard Enterprise Managed Users lives on
+`github.com`; EMU with data residency lives on `<slug>.ghe.com`. `gh auth
+status` tells you which you have, and only the second needs a host mentioned
+anywhere.
+
+**To watch a repository you have not cloned**, on a non-default host:
+
+```bash
+gh-glance --repo tenant.ghe.com/acme/widget
+```
+
+The `[host/]owner/name` form is the same one `gh --repo` accepts. The host must
+contain a dot, so `owner/name/extra` is still rejected as the typo it is rather
+than read as a request to a host named `owner`.
+
+**`GH_HOST` works too**, and is the better lever when every repository you watch
+lives on one enterprise host -- it routes the list commands and the alert
+endpoints alike. A host-qualified **`GH_REPO`**, by contrast, does *not* route
+`gh api`: it supplies the owner and repository and ignores the host, which is
+why `--repo` is the right tool for a one-off cross-host target.
+
+**SAML sessions expire.** When an enterprise session lapses, the endpoints
+answer 403 and the tab shows the real `gh` message. Re-authorize in the browser
+(or run `gh auth refresh`) and the dashboard recovers within about 30 seconds.
+It will not claim a feature is "not enabled" because of a lapse.
+
+### Diagnostics
+
+```bash
+gh-glance --doctor > report.txt
+```
+
+Collects, in one plain-text block: the `gh-glance`, Node and `gh` versions;
+which hosts `gh` is authenticated for; how the repository target resolved and
+from where; the relevant environment variables; and one probe per endpoint with
+the exact argv it sent, its outcome, and how any error was classified
+(`unavailable`, `rate-limited`, `auth-problem` or `other`).
+
+It exits 0 and prints a report even when `gh` is missing or you are outside a
+git repository -- those are conditions worth reporting rather than failing on --
+and it works through a pipe, unlike the dashboard itself.
+
+**Tokens are never printed.** Token-valued environment variables are reported
+as `set` or `not set` and never by value, not even a prefix; anything
+token-shaped anywhere in the captured text is replaced; proxy and remote URL
+credentials are stripped to scheme and host; and no API response bodies are
+included, only their sizes. The report is safe to attach to a bug report.
 
 ## Rate limit
 
@@ -254,6 +315,10 @@ commands share.
 - macOS/Linux terminals with ANSI + alternate-screen-buffer support. Not
   tested on Windows -- `npm` will not stop you installing it there, but the
   alternate-screen handling is unverified.
+- **No account pinning.** `gh`'s active account is global, so with two accounts
+  authenticated on the same host `gh-glance` follows whichever one `gh auth
+  switch` last selected -- it has no way to pin a pane to one of them. If you
+  need two panes on two accounts at once, give each its own `GH_CONFIG_DIR`.
 
 ### Icons without a Nerd Font
 
@@ -279,7 +344,10 @@ in some terminals, which would shift every column to their right.
 | `the gh CLI is not installed` | Install it from [cli.github.com](https://cli.github.com), then `gh auth login`. |
 | `not inside a git repository` | Run it from a cloned GitHub repository, or set `GH_REPO=owner/name`. |
 | Status icons are blank boxes | Your terminal font is not a Nerd Font. Use `GH_GLANCE_ICONS=unicode`. |
-| Security tab shows a "not enabled" note | Code scanning and secret scanning need GitHub Advanced Security. Dependabot alerts work independently. A genuine auth or network failure shows the real error instead. |
+| Security tab shows a "not enabled" note | Code scanning and secret scanning need GitHub Advanced Security. Dependabot alerts work independently. The note now appears only when the feature genuinely is unavailable: auth, SSO and network failures show the real error instead. |
+| `none of the git remotes ... point to a known GitHub host` | `gh` is not authenticated for that host. Run `gh auth login --hostname <host>`. |
+| Security tab empty on an enterprise host, other tabs fine | The alert endpoints were sent to the wrong host. Use `--repo host/owner/name` or set `GH_HOST` -- a host-qualified `GH_REPO` alone does not route them. |
+| Tabs start failing after working for a while | The enterprise SAML session lapsed. Re-authorize in the browser; the dashboard recovers within about 30 seconds. Run `gh-glance --doctor` to confirm. |
 | A tab's count is red | That tab's last fetch failed. The error itself is shown when you switch to it. |
 | `stale 2m` in the status bar | The visible tab has not refreshed successfully for a while — usually a network drop. |
 | It exits immediately when piped | Intentional. It is a full-screen dashboard, not a reporting command. |
