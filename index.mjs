@@ -1792,18 +1792,22 @@ function TabBar({ activeIndex, counts, firstLoad, failed, spin, useShort }) {
 
 // ---------- Status bar ----------
 
-// Every glyph here is width-1 ASCII, deliberately. The arrows, the return
-// symbol and the box-drawing separator are all East-Asian-Ambiguous: ink
-// measures them as two columns in its width model, and a status bar built from
-// them overflowed an 80-column terminal by six columns once selection added a
-// hint. Same trap the unicode icon table already documents -- prefer strictly
-// narrow ASCII over pretty-but-ambiguous.
+// Every glyph here is width-1 ASCII, deliberately, with one exception: the
+// Move arrows. The return symbol and the box-drawing separator are still
+// East-Asian-Ambiguous and stay out for that reason -- ink measures them as
+// two columns in its width model, and a status bar built from them overflowed
+// an 80-column terminal by six columns once selection added a hint. Same trap
+// the unicode icon table already documents -- prefer strictly narrow ASCII
+// over pretty-but-ambiguous. The arrow pair is a deliberate, tested exception:
+// `npm run test:pty` asserts the rendered frame stays within the terminal
+// width, so a font/terminal combo that renders them double-width fails loudly
+// there instead of silently shifting columns.
 //
 // Tab switching is not listed: the tab bar already renders "1:Actions", so the
 // digits document themselves, and the arrow keys are in --help. The hints that
 // survive are the ones nothing else on screen reveals.
 const KEY_HINTS = [
-  { label: "Move", keys: "jk" },
+  { label: "Move", keys: "↑↓" },
   { label: "Open", keys: "Ent" },
   { label: "Refresh", keys: "r" },
   { label: "Quit", keys: "q" },
