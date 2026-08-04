@@ -5,11 +5,13 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-08-04
 
-Correctness on GitHub Enterprise and Enterprise Managed Users tenants. Both
-entries below are the same failure: the dashboard stating something confident
-and wrong, which is precisely what its error classifier exists to prevent.
+Correctness on GitHub Enterprise and Enterprise Managed Users tenants, and a
+diagnostic command built to settle what a bug report cannot describe. The two
+enterprise entries below are the same failure: the dashboard stating something
+confident and wrong, which is precisely what its error classifier exists to
+prevent. The rest of the release is a run of layout and interaction fixes.
 
 ### Fixed
 
@@ -33,6 +35,38 @@ and wrong, which is precisely what its error classifier exists to prevent.
   `--hostname`, and both halves of the dashboard talk to the same server. The
   fixture-log assertions in `test/pty/routing.test.mjs` are the guard against it
   recurring.
+- **`Enter` on an Actions row opened the wrong run, or none at all.** Every
+  openable row passed its display `number` to `gh <kind> view`, which is right
+  for an issue or a pull request and wrong for a workflow run: runs are
+  addressed by `databaseId`, a different and global ID space, so a run's number
+  is almost never a valid one and the browser got a 404. Runs now open by
+  `databaseId`; issues and pull requests are unchanged.
+- **The panel's right border could be clipped at the terminal edge.** One
+  trailing column is now reserved for it, so the frame closes on terminals that
+  treat the final cell as the wrap boundary.
+- **The stale indicator reserved its column even when there was nothing to
+  say.** An idle dashboard now gives that width back to the table instead of
+  holding it empty against a label that only appears after 30 seconds without a
+  successful refresh.
+- **The spinner jittered against the status icons beside it.** The classic
+  "dots" braille set lights only one or two of a cell's eight dot positions per
+  frame, and in different corners each frame, so next to the solid circle glyphs
+  used for completed runs it visibly wandered rather than holding a centre. The
+  replacement lights six or seven dots per frame, reading as a filled blob of
+  the same visual weight, and stays width-1.
+
+### Changed
+
+- **The tab bar moved to the top of the pane**, above the table rather than
+  below it, with a divider separating the two. Below the table it was being
+  missed entirely; the status and key hints stay at the bottom.
+- **The rate-limit figures in the README were wrong and are now stated per
+  tab.** The documented "roughly 500 requests an hour, about 10% of the limit"
+  did not follow from the constants it described. A visible Actions, Issues or
+  Pull Requests tab costs about 1,000 an hour (20% of the 5,000/hour
+  authenticated limit); the Security tab, being three endpoints rather than one,
+  costs about 2,300 (47%). Both figures fall when an endpoint backs off because
+  the feature is not enabled, and `--refresh` scales the whole number.
 
 ### Added
 
@@ -275,6 +309,7 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
+[0.4.0]: https://github.com/juan294/gh-glance/releases/tag/v0.4.0
 [0.3.1]: https://github.com/juan294/gh-glance/releases/tag/v0.3.1
 [0.3.0]: https://github.com/juan294/gh-glance/releases/tag/v0.3.0
 [0.2.0]: https://github.com/juan294/gh-glance/releases/tag/v0.2.0
