@@ -90,7 +90,7 @@ request per minute.
 
 - Six `gh` invocations per full tick remain. That is accepted, and the reasons
   are now recorded rather than rediscovered.
-- The independent per-tab commit at `index.mjs:1322-1372` stays load-bearing.
+- The independent per-tab `commit()` at `index.mjs:2084-2134` stays load-bearing.
   Anything that reintroduces a barrier across tabs must clear the same bar this
   decision failed.
 - If GitHub later exposes workflow runs from `Repository` in GraphQL, the

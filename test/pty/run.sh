@@ -1,7 +1,7 @@
 #!/bin/sh
 # Capture a real run of index.mjs under a pty.
 #
-#   run.sh <cols> <rows> <outfile> [signal] [settle-seconds] [stdin-script]
+#   run.sh <cols> <rows> <outfile> [signal] [settle-seconds] [stdin-script] [args]
 #
 # `script(1)` is used rather than node-pty because a native dependency would
 # contradict the no-build-step, no-framework stance in CONTRIBUTING.md. The cost
@@ -22,6 +22,10 @@ OUT="${3:?}"
 SIGNAL="${4:-TERM}"
 SETTLE="${5:-4}"
 STDIN_SCRIPT="${6:-}"
+# Deliberately word-split where it is used below: this is a flag vector, not one
+# argument. Callers pass simple flags only -- the argv the app receives is
+# exactly what the routing tests assert on.
+APP_ARGS="${7:-}"
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO=$(CDPATH= cd -- "$HERE/../.." && pwd)
@@ -51,12 +55,12 @@ ENV_PREFIX="export PATH=\"$HERE/fixtures:\$PATH\";
 if [ "$SIGNAL" = "none" ]; then
   INNER="$ENV_PREFIX
     stty cols $COLS rows $ROWS;
-    env -u CI -u CONTINUOUS_INTEGRATION node index.mjs;
+    env -u CI -u CONTINUOUS_INTEGRATION node index.mjs $APP_ARGS;
     echo \"EXITCODE=\$?\""
 else
   INNER="$ENV_PREFIX
     stty cols $COLS rows $ROWS;
-    env -u CI -u CONTINUOUS_INTEGRATION node index.mjs &
+    env -u CI -u CONTINUOUS_INTEGRATION node index.mjs $APP_ARGS &
     p=\$!;
     sleep $SETTLE;
     kill -$SIGNAL \$p 2>/dev/null;

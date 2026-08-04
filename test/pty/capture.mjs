@@ -112,14 +112,15 @@ let captureSeq = 0;
  *                                  foreground so stdin stays an interactive tty
  * @param {number} [options.settle] seconds to let the app render
  * @param {string} [options.stdin]  shell snippet whose stdout is fed to the pty
+ * @param {string} [options.args]   flags handed to index.mjs, space-separated
  */
-export function capture({ cols, rows, signal = "TERM", settle = 4, stdin = "" }) {
+export function capture({ cols, rows, signal = "TERM", settle = 4, stdin = "", args = "" }) {
   captureSeq += 1;
   const out = join(tmpdir(), `gh-glance-pty-${process.pid}-${captureSeq}.txt`);
   try {
     execFileSync(
       "/bin/sh",
-      [RUN, String(cols), String(rows), out, signal, String(settle), stdin],
+      [RUN, String(cols), String(rows), out, signal, String(settle), stdin, args],
       { stdio: "ignore", timeout: (settle + 25) * 1000 },
     );
     const parsed = parseCapture(readFileSync(out, "utf8"));

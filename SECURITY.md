@@ -6,7 +6,8 @@ Only the current major release receives security patches.
 
 | Version | Supported |
 |---------|-----------|
-| 0.2.x   | Yes       |
+| 0.3.x   | Yes       |
+| 0.2.x   | No        |
 | < 0.2   | No (never released)  |
 
 ## Reporting a Vulnerability
@@ -80,9 +81,26 @@ Values arriving from the API are also read through an own-property check before
 being used as lookup keys, so a field whose value happens to be `constructor` or
 `__proto__` cannot return an unexpected object into the render path.
 
+The repository target is the one user-supplied value that both reaches a
+subprocess argument and is interpolated into a `gh api` request path, so it is
+validated once at the boundary. The `owner/name` half keeps the pattern and the
+hostile-input tests it has always had. When a host is present
+(`--repo host/owner/name`), it is validated separately -- as a dotted hostname,
+which is what keeps a three-part typo a rejected typo rather than a request to
+somewhere else -- and it is **never** interpolated into a request path. It is
+passed to `gh` as a `--hostname` argument instead.
+
+`--doctor` prints a report intended to be attached to a bug report, and it
+never prints credentials. Token-valued environment variables are reported as
+present or absent and never by value, not even a prefix; anything token-shaped
+anywhere in the captured text is replaced; credentials embedded in proxy and
+remote URLs are stripped; and no API response bodies are included, only their
+sizes.
+
 gh-glance never handles GitHub credentials directly -- authentication is
-entirely delegated to your existing `gh auth login` session. It has no
-network code of its own; every GitHub API call goes through the `gh` CLI.
+entirely delegated to your existing `gh auth login` session, including on
+GitHub Enterprise and EMU hosts. It has no network code of its own; every
+GitHub API call goes through the `gh` CLI.
 
 ## Scope
 

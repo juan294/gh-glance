@@ -5,6 +5,88 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-04
+
+Correctness on GitHub Enterprise and Enterprise Managed Users tenants, and a
+diagnostic command built to settle what a bug report cannot describe. The two
+enterprise entries below are the same failure: the dashboard stating something
+confident and wrong, which is precisely what its error classifier exists to
+prevent. The rest of the release is a run of layout and interaction fixes.
+
+### Fixed
+
+- **A lapsed enterprise SAML session was reported as "not enabled for this
+  repository", and latched for up to an hour.** EMU tenants expire the SAML
+  session periodically; while lapsed the API answers 403, which the classifier
+  could not tell apart from "this feature is switched off". So the Security tab
+  went blank under a false explanation, and the escalating backoff
+  (60s -> 300s -> 1800s -> 3600s) kept it that way long after the user had
+  re-authorized in the browser. Auth failures -- SAML, SSO, a credential not
+  authorized for the org, a missing token scope -- now surface `gh`'s real
+  message and take a short fixed 30s retry instead of the escalating ladder, so
+  recovery is bounded at about half a minute. A 403 with no auth markers still
+  produces the existing note and ladder.
+- **On a non-default host the three security-alert endpoints were queried
+  against `github.com`.** `gh api` has no `--repo`, so a host-qualified target
+  routed the four list-driven tabs to the enterprise host while the alert calls
+  went to `github.com`, 404ed, and -- via the defect above -- rendered as "not
+  enabled". The Security tab could therefore report that a feature was off for a
+  repository whose alerts it had never asked for. The host now travels as
+  `--hostname`, and both halves of the dashboard talk to the same server. The
+  fixture-log assertions in `test/pty/routing.test.mjs` are the guard against it
+  recurring.
+- **`Enter` on an Actions row opened the wrong run, or none at all.** Every
+  openable row passed its display `number` to `gh <kind> view`, which is right
+  for an issue or a pull request and wrong for a workflow run: runs are
+  addressed by `databaseId`, a different and global ID space, so a run's number
+  is almost never a valid one and the browser got a 404. Runs now open by
+  `databaseId`; issues and pull requests are unchanged.
+- **The panel's right border could be clipped at the terminal edge.** One
+  trailing column is now reserved for it, so the frame closes on terminals that
+  treat the final cell as the wrap boundary.
+- **The stale indicator reserved its column even when there was nothing to
+  say.** An idle dashboard now gives that width back to the table instead of
+  holding it empty against a label that only appears after 30 seconds without a
+  successful refresh.
+- **The spinner jittered against the status icons beside it.** The classic
+  "dots" braille set lights only one or two of a cell's eight dot positions per
+  frame, and in different corners each frame, so next to the solid circle glyphs
+  used for completed runs it visibly wandered rather than holding a centre. The
+  replacement lights six or seven dots per frame, reading as a filled blob of
+  the same visual weight, and stays width-1.
+
+### Changed
+
+- **The tab bar moved to the top of the pane**, above the table rather than
+  below it, with a divider separating the two. Below the table it was being
+  missed entirely; the status and key hints stay at the bottom.
+- **The rate-limit figures in the README were wrong and are now stated per
+  tab.** The documented "roughly 500 requests an hour, about 10% of the limit"
+  did not follow from the constants it described. A visible Actions, Issues or
+  Pull Requests tab costs about 1,000 an hour (20% of the 5,000/hour
+  authenticated limit); the Security tab, being three endpoints rather than one,
+  costs about 2,300 (47%). Both figures fall when an endpoint backs off because
+  the feature is not enabled, and `--refresh` scales the whole number.
+
+### Added
+
+- **`--repo` accepts `[host/]owner/name`**, the same form `gh --repo` itself
+  accepts, so a GitHub Enterprise or EMU data-residency tenant can be watched
+  from outside a clone: `gh-glance --repo tenant.ghe.com/acme/widget`. A host
+  must contain a dot, which is what keeps `owner/name/extra` a rejected typo
+  rather than a silent request to a host named `owner`. The host is validated
+  separately from the `owner/name` slug and is never interpolated into a request
+  path.
+- **`--doctor`**, a reporting command that prints versions, authenticated hosts,
+  how the repository target resolved, the relevant environment, and one probe
+  per endpoint -- with the exact argv sent and how any error was classified.
+  It exits 0 and reports rather than failing when `gh` is missing or the working
+  directory is not a repository, and it works through a pipe. Tokens are never
+  printed: token-valued variables are reported as present or absent, anything
+  token-shaped in captured text is replaced, URL credentials are stripped, and
+  no response bodies are included -- so the report is safe to attach to a bug
+  report.
+
 ## [0.3.1] - 2026-08-04
 
 First release published by CI rather than from a laptop, and the first carrying
@@ -227,6 +309,7 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
+[0.4.0]: https://github.com/juan294/gh-glance/releases/tag/v0.4.0
 [0.3.1]: https://github.com/juan294/gh-glance/releases/tag/v0.3.1
 [0.3.0]: https://github.com/juan294/gh-glance/releases/tag/v0.3.0
 [0.2.0]: https://github.com/juan294/gh-glance/releases/tag/v0.2.0

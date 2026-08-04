@@ -103,6 +103,13 @@ const GH_MAX_BUFFER = 16 * 1024 * 1024;
 // a lie about a security surface.
 const BACKOFF_STEPS_MS = [60_000, 300_000, 1_800_000, 3_600_000];
 
+// An auth failure is the opposite kind of thing: the user fixes it in seconds
+// by re-authorizing in the browser, so a ladder measured in half-hours would
+// leave the tab blank long after the cause was gone. A single short step keeps
+// recovery bounded at ~30s while still bounding what a lapse that lasts all
+// night costs -- two probes a minute per endpoint rather than one per tick.
+const AUTH_RETRY_MS = [30_000];
+
 // Past this, the active tab's data is old enough to say so. Deliberately
 // coarse: `now` only advances on minute boundaries when nothing is in progress,
 // so a minute-granular staleness label costs zero extra redraws, whereas a
@@ -115,6 +122,11 @@ const STALE_AFTER_MS = 30_000;
 // the zero-argument invocation the README documents behaves exactly as before.
 const runtime = {
   repo: null, // null means "let gh infer it from the git remote", as today
+  // null unless the target was host-qualified. `gh` accepts [HOST/]OWNER/REPO;
+  // when a host is present the list subcommands get it inside --repo and the
+  // `gh api` calls get it as --hostname, because gh api has no --repo and would
+  // otherwise silently query github.com while the other tabs read the tenant.
+  host: null,
   refreshMs: REFRESH_MS,
   verbose: false,
   initialTabIndex: 0,
@@ -124,7 +136,13 @@ const runtime = {
 // table itself is built.
 const TAB_KEYS = ["actions", "issues", "prs", "security"];
 
-const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+// The classic "dots" braille spinner lights only 1-2 of a cell's 8 dot
+// positions per frame, and different frames light different corners --
+// so next to the solid Nerd Font circle icons used for completed runs, it
+// visibly jitters instead of holding a steady center. This set lights 6-7
+// dots per frame, reading as a filled blob that matches the circle icons'
+// visual weight while staying in the same width-1 braille block.
+const SPINNER = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 const SPINNER_MS = 100;
 
 // Motion opt-out. This pane is designed to sit in peripheral vision for hours,
@@ -236,17 +254,70 @@ function shortErr(err) {
   return text.length > MAX_ERR_LENGTH ? `${text.slice(0, MAX_ERR_LENGTH - 1)}…` : text;
 }
 
+// Where gh's diagnosis actually lives on a rejected execFile: stderr carries
+// the HTTP line, and message is all a missing binary or a spawn failure leaves
+// behind. One expression rather than one per predicate, so a fourth predicate
+// cannot pick a fifth answer to the same question.
+function errText(err) {
+  return String(err?.stderr ?? err?.message ?? "");
+}
+
 // `gh api` puts the HTTP status in stderr and exits 1, so err.code is the
 // process exit code and says nothing about the cause. 403/404 is the honest
 // "you can't see this here" -- everything else (auth expiry, rate limiting,
 // DNS, a 502) is a real failure that used to be reported as a confident,
 // plausible, and wrong claim that the feature was switched off.
 function isUnavailable(err) {
-  return /HTTP (403|404)/.test(String(err?.stderr ?? err?.message ?? ""));
+  return /HTTP (403|404)/.test(errText(err));
 }
 
 function isRateLimited(err) {
-  return /rate limit|secondary rate|API rate limit/i.test(String(err?.stderr ?? err?.message ?? ""));
+  return /rate limit|secondary rate|API rate limit/i.test(errText(err));
+}
+
+// On an enterprise or EMU tenant a 403 carries meanings it never carries on a
+// personal account: an expired SAML session, a credential not authorized for
+// the org, a token missing a scope. None of those are statements about the
+// repository's configuration, and all of them are fixed by the user in seconds
+// -- so they must surface as themselves rather than as "not enabled", and must
+// not latch the hour-long backoff.
+//
+// Written broad on purpose. A message that fails to match degrades to the old
+// behaviour, and `--doctor` reports the verbatim text plus the classification
+// it received, so the pattern is tightened from evidence. A false positive
+// merely retries every 30s instead of backing off, which is cheap and
+// self-correcting. The asymmetry favours breadth.
+// `access restriction` is what catches the OAuth App restrictions form, which
+// says "you appear to have the correct authorization credentials" and so
+// matches none of the negative markers -- it is an authorization failure phrased
+// entirely in the positive. It stays clear of the genuine not-enabled messages,
+// which talk about features rather than access.
+const AUTH_MARKERS =
+  /SAML|single[- ]sign[- ]on|\bSSO\b|must grant|not authoriz|unauthoriz|access restriction|Bad credentials|requires authentication|re-?authoriz|token .*scope|missing .*scope|insufficient/i;
+
+function isAuthProblem(err) {
+  return AUTH_MARKERS.test(errText(err));
+}
+
+// The one place the three predicates are turned into a verdict. Both consumers
+// go through it -- the fetcher, to choose a note and a backoff ladder, and
+// `--doctor`, to report what gh-glance concluded -- so the report cannot claim
+// a classification the dashboard does not actually make. Deriving the order
+// twice would let exactly that drift in the moment it mattered most: AUTH_MARKERS
+// is deliberately broad and expected to grow, and the day it grows into a
+// message the rate-limit pattern also matches is the day two copies disagree.
+//
+// The order is a priority, not a sequence of independent tests. Rate limiting
+// arrives as a 403 and means the opposite of a permissions problem, so it
+// outranks the auth markers; both outrank "unavailable", which is the reading
+// of last resort for a 403/404 and the only one that makes a claim about the
+// repository's configuration.
+function classify(err) {
+  if (err == null) return "ok";
+  if (isRateLimited(err)) return "rate-limited";
+  if (isAuthProblem(err)) return "auth-problem";
+  if (isUnavailable(err)) return "unavailable";
+  return "other";
 }
 
 // Some pty wrappers (and a terminal mid-resize) report a size of 0 or
@@ -312,35 +383,58 @@ async function runGh(args, { signal } = {}) {
   }
 }
 
+// The target as `gh` spells it: host-qualified when a host was given, the bare
+// slug otherwise -- which is exactly the [HOST/]OWNER/REPO form `gh --repo`
+// documents.
+function qualifiedRepo() {
+  return runtime.host ? `${runtime.host}/${runtime.repo}` : runtime.repo;
+}
+
 // `--repo` for the list subcommands. Empty when unset, so the argv vector stays
 // byte-identical to what shipped before.
 function repoArgs() {
-  return runtime.repo ? ["--repo", runtime.repo] : [];
+  return runtime.repo ? ["--repo", qualifiedRepo()] : [];
+}
+
+// `gh api` has no --repo, so a host-qualified target has nowhere to put its
+// host: GH_REPO=host/owner/repo supplies the owner and repo and *ignores* the
+// host (verified against gh 2.97.0), which is the one combination where the
+// list tabs and the alert endpoints disagree about which server they are
+// talking to. --hostname is the flag gh api does have. Empty when no host was
+// given, so the default argv vector is unchanged.
+function apiHostArgs() {
+  return runtime.host ? ["--hostname", runtime.host] : [];
 }
 
 // `gh api` has no --repo; it resolves the {owner}/{repo} placeholder from the
 // working directory. Substituting the validated value is what makes --repo work
 // for the alert endpoints. REPO_PATTERN is why this is safe to interpolate into
-// a request path.
+// a request path -- and note it is the bare slug that goes in, never the host,
+// which travels as an argument rather than as path text.
 function apiPath(path) {
   return runtime.repo ? path.replace("{owner}/{repo}", runtime.repo) : path;
 }
 
 // ---------- Data fetchers ----------
 
+// The argv vector for each endpoint is built by a named function rather than
+// inline, because `--doctor` reports these vectors and a second copy of them
+// would be a report that drifts away from what the dashboard actually sends --
+// which is the failure mode the whole diagnostics command exists to rule out.
+function actionsArgs(limit) {
+  return [
+    "run",
+    "list",
+    ...repoArgs(),
+    "--limit",
+    String(limit),
+    "--json",
+    "databaseId,displayTitle,workflowName,number,headBranch,status,conclusion,startedAt,updatedAt",
+  ];
+}
+
 async function fetchActions(limit, signal) {
-  const raw = await runGh(
-    [
-      "run",
-      "list",
-      ...repoArgs(),
-      "--limit",
-      String(limit),
-      "--json",
-      "databaseId,displayTitle,workflowName,number,headBranch,status,conclusion,startedAt,updatedAt",
-    ],
-    { signal },
-  );
+  const raw = await runGh(actionsArgs(limit), { signal });
   return {
     raw,
     limit,
@@ -369,22 +463,23 @@ async function fetchActions(limit, signal) {
 // returns the same result count.
 const SORT_RECENT = ["--search", "sort:updated-desc"];
 
+function issuesArgs() {
+  return [
+    "issue",
+    "list",
+    ...repoArgs(),
+    "--state",
+    "open",
+    "--limit",
+    String(LIST_LIMIT),
+    ...SORT_RECENT,
+    "--json",
+    "number,title,author,labels,createdAt,updatedAt",
+  ];
+}
+
 async function fetchIssues(signal) {
-  const raw = await runGh(
-    [
-      "issue",
-      "list",
-      ...repoArgs(),
-      "--state",
-      "open",
-      "--limit",
-      String(LIST_LIMIT),
-      ...SORT_RECENT,
-      "--json",
-      "number,title,author,labels,createdAt,updatedAt",
-    ],
-    { signal },
-  );
+  const raw = await runGh(issuesArgs(), { signal });
   return {
     raw,
     limit: LIST_LIMIT,
@@ -399,22 +494,23 @@ async function fetchIssues(signal) {
   };
 }
 
+function prsArgs() {
+  return [
+    "pr",
+    "list",
+    ...repoArgs(),
+    "--state",
+    "open",
+    "--limit",
+    String(LIST_LIMIT),
+    ...SORT_RECENT,
+    "--json",
+    "number,title,author,headRefName,isDraft,reviewDecision,createdAt,updatedAt",
+  ];
+}
+
 async function fetchPRs(signal) {
-  const raw = await runGh(
-    [
-      "pr",
-      "list",
-      ...repoArgs(),
-      "--state",
-      "open",
-      "--limit",
-      String(LIST_LIMIT),
-      ...SORT_RECENT,
-      "--json",
-      "number,title,author,headRefName,isDraft,reviewDecision,createdAt,updatedAt",
-    ],
-    { signal },
-  );
+  const raw = await runGh(prsArgs(), { signal });
   return {
     raw,
     limit: LIST_LIMIT,
@@ -495,6 +591,10 @@ const ALERT_SOURCES = [
   },
 ];
 
+function alertArgs(source) {
+  return ["api", apiPath(source.path), ...apiHostArgs(), "--jq", source.jq];
+}
+
 // Per-source backoff. Keyed by source so one unavailable endpoint cannot slow
 // the other two, and capped rather than permanent so enabling Advanced Security
 // mid-session is picked up within the hour.
@@ -505,10 +605,19 @@ function backoffActive(key, now) {
   return Boolean(state) && now < state.until;
 }
 
-function recordFailure(key, now) {
+// Which ladder each verdict takes. "rate-limited" and "other" are absent on
+// purpose: a rate limit clears on its own schedule and a network drop clears
+// when the network does, so both keep today's behaviour of re-asking every tick
+// with the real message on screen.
+const FAILURE_LADDER = { unavailable: BACKOFF_STEPS_MS, "auth-problem": AUTH_RETRY_MS };
+
+// The ladder is a parameter rather than a second near-identical function,
+// which is the drift the ALERT_SOURCES comment below warns about: two copies of
+// this would diverge the first time one of them was fixed.
+function recordFailure(key, now, steps = BACKOFF_STEPS_MS) {
   const previous = alertBackoff.get(key);
-  const step = Math.min((previous?.step ?? -1) + 1, BACKOFF_STEPS_MS.length - 1);
-  alertBackoff.set(key, { step, until: now + BACKOFF_STEPS_MS[step] });
+  const step = Math.min((previous?.step ?? -1) + 1, steps.length - 1);
+  alertBackoff.set(key, { step, until: now + steps[step] });
 }
 
 function clearBackoff(key) {
@@ -521,7 +630,7 @@ async function fetchAlertSource(source, signal, now) {
     return { raw: `backoff:${note}`, parse: () => ({ alerts: [], note, truncated: false }) };
   }
   try {
-    const raw = await runGh(["api", apiPath(source.path), "--jq", source.jq], { signal });
+    const raw = await runGh(alertArgs(source), { signal });
     clearBackoff(source.key);
     return {
       raw,
@@ -535,14 +644,15 @@ async function fetchAlertSource(source, signal, now) {
       },
     };
   } catch (err) {
-    // A 403/404 means the feature genuinely is not available here and is worth
-    // backing off. Anything else -- expired token, rate limit, network -- is
-    // transient and must surface as itself rather than as a confident and wrong
-    // claim about the repo's configuration, and must not be latched.
-    const unavailable = isUnavailable(err) && !isRateLimited(err);
-    const note = unavailable ? source.unavailable : `${source.name}: ${shortErr(err)}`;
-    if (unavailable) {
-      recordFailure(source.key, now);
+    // Only "unavailable" is a statement about the repository's configuration,
+    // so it is the only verdict allowed to replace gh's message with the
+    // source's fixed note. Everything else -- an expired SAML session, a rate
+    // limit, a network drop -- surfaces as itself.
+    const verdict = classify(err);
+    const note = verdict === "unavailable" ? source.unavailable : `${source.name}: ${shortErr(err)}`;
+    const steps = pick(FAILURE_LADDER, verdict, null);
+    if (steps) {
+      recordFailure(source.key, now, steps);
       alertBackoff.get(source.key).note = note;
     }
     return { raw: `unavailable:${note}`, parse: () => ({ alerts: [], note, truncated: false }) };
@@ -605,11 +715,18 @@ const OPENABLE = { actions: "run", issues: "issue", prs: "pr" };
 // Output is captured rather than inherited. `gh ... --web` prints "Opening ...
 // in your browser" to stdout, and stdout is ink's frame stream -- letting that
 // through would corrupt the diff and the alternate screen.
+//
+// `gh run view` takes the run's databaseId, not its display `number` -- the
+// two are different ID spaces (databaseId is global across GitHub, number is
+// per-workflow and restarts near 1 in every repo), so a run's `number` is
+// almost never a valid databaseId elsewhere and 404s. `gh issue view` and
+// `gh pr view` are the opposite: they take the issue/PR number, and neither
+// row shape carries a databaseId to prefer instead.
 async function openInBrowser(tabKey, item, signal) {
   const kind = pick(OPENABLE, tabKey, null);
-  const number = item?.number ?? item?.databaseId;
-  if (!kind || number == null) return;
-  await runGh([kind, "view", ...repoArgs(), String(number), "--web"], { signal });
+  const id = kind === "run" ? (item?.databaseId ?? item?.number) : (item?.number ?? item?.databaseId);
+  if (!kind || id == null) return;
+  await runGh([kind, "view", ...repoArgs(), String(id), "--web"], { signal });
 }
 
 // ---------- Startup preflight ----------
@@ -650,6 +767,213 @@ async function preflight() {
   return null;
 }
 
+// ---------- Diagnostics (--doctor) ----------
+
+// This report is written to be pasted into a bug report or a chat window, which
+// makes it a disclosure surface before it is anything else. So redaction is not
+// a review note applied per call site -- it is applied once, at the single point
+// where the report is assembled, the same way safe() is the one boundary for
+// untrusted remote strings rather than six.
+//
+// Token shapes are gh's own prefixes (gho_/ghp_/ghu_/ghs_/ghr_ and
+// github_pat_). URL userinfo covers a proxy variable, a git remote with an
+// embedded credential, and anything else that carries `user:password@` -- gh
+// error messages quote the URL they failed on, so that is a real path for one
+// to arrive here.
+function redact(text) {
+  return String(text)
+    .replace(/gh[pousr]_[A-Za-z0-9]{16,}/g, "<redacted-token>")
+    .replace(/github_pat_[A-Za-z0-9_]{16,}/g, "<redacted-token>")
+    .replace(/\/\/[^/\s:@]+:[^/\s@]+@/g, "//<redacted>@");
+}
+
+// Values that are the thing being diagnosed, so they are printed as-is.
+const DOCTOR_ENV_PLAIN = [
+  "GH_HOST",
+  "GH_REPO",
+  "GH_CONFIG_DIR",
+  "NO_PROXY",
+  "GH_GLANCE_ICONS",
+  "GH_GLANCE_NO_ANIMATION",
+  "NO_COLOR",
+  "NODE_ENV",
+];
+const DOCTOR_ENV_PROXY = ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"];
+// Reported as present or absent and never printed, not even a prefix. Matched
+// by name so a variable nobody listed here -- GITHUB_EMU_TOKEN, some wrapper's
+// GH_API_KEY -- is still caught by shape rather than by having been foreseen.
+const SECRET_NAME = /_(TOKEN|SECRET|PASSWORD|KEY)$/i;
+const DOCTOR_ENV_SECRET = ["GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_TOKEN"];
+
+const NOT_SET = "not set";
+
+// Scheme and host only. A proxy URL is one of the few env values that routinely
+// carries a credential inline, and the host is the entire diagnostic value.
+function proxySummary(value) {
+  for (const candidate of [value, `http://${value}`]) {
+    try {
+      const url = new URL(candidate);
+      if (url.host) return `${url.protocol}//${url.host}`;
+    } catch {
+      // Not a URL in this form; try the next one, then give up.
+    }
+  }
+  return "(set, unparseable)";
+}
+
+// Every gh/GITHUB variable that is actually set gets a line, so the report shows
+// the environment as it is rather than as this list imagined it. Token-shaped
+// names still take the presence-only path below.
+function doctorEnvNames() {
+  const named = [...DOCTOR_ENV_PLAIN, ...DOCTOR_ENV_PROXY, ...DOCTOR_ENV_SECRET];
+  const known = new Set(named);
+  const extra = Object.keys(process.env).filter(
+    (name) => /^(GH|GITHUB)_/.test(name) && process.env[name] && !known.has(name),
+  );
+  return [...named, ...extra];
+}
+
+function envValue(name) {
+  const value = process.env[name];
+  if (SECRET_NAME.test(name)) return value ? "set" : NOT_SET;
+  if (!value) return NOT_SET;
+  if (DOCTOR_ENV_PROXY.includes(name)) return proxySummary(value);
+  return value;
+}
+
+// gh writes some of this to stdout and some to stderr depending on version and
+// on whether it succeeded, and a non-zero exit is itself worth reporting rather
+// than throwing. Both streams, whatever happened.
+async function captureGh(args) {
+  try {
+    return (await runGh(args)).trim();
+  } catch (err) {
+    const both = `${err?.stdout ?? ""}${err?.stderr ?? ""}`.trim();
+    return both || shortErr(err);
+  }
+}
+
+const PROBE_STDERR_LIMIT = 400;
+
+async function probe(name, args) {
+  const startedAt = Date.now();
+  try {
+    const stdout = await runGh(args);
+    return { name, args, ms: Date.now() - startedAt, bytes: stdout.length, classified: "ok" };
+  } catch (err) {
+    return {
+      name,
+      args,
+      ms: Date.now() - startedAt,
+      failed: true,
+      // Bodies are never included, only sizes -- and a failing endpoint's stderr
+      // is the one place the verbatim tenant message can be captured, which is
+      // the reason this command exists.
+      stderr: String(err?.stderr ?? "").trim().slice(0, PROBE_STDERR_LIMIT),
+      http: /HTTP (\d{3})/.exec(errText(err))?.[1] ?? null,
+      classified: classify(err),
+    };
+  }
+}
+
+const DOCTOR_LABEL_WIDTH = 18;
+const PROBE_LABEL_WIDTH = 12;
+
+// The underline is derived rather than typed, so renaming a heading cannot
+// leave a rule that is the wrong length underneath it.
+function section(title) {
+  return [title, "-".repeat(title.length)];
+}
+
+// A label longer than its column (GH_GLANCE_NO_ANIMATION, GH_ENTERPRISE_TOKEN)
+// would otherwise butt straight against its value with no separator at all,
+// which is unreadable exactly where the report is being skim-read for a
+// "set" / "not set".
+function field(label, value, width = DOCTOR_LABEL_WIDTH) {
+  return label.length < width ? `${label.padEnd(width)}${value}` : `${label}  ${value}`;
+}
+
+async function gitRemote() {
+  try {
+    const { stdout } = await execFileAsync("git", ["remote", "get-url", "origin"], {
+      timeout: GH_TIMEOUT_MS,
+    });
+    return stdout.trim() || "(no origin remote)";
+  } catch {
+    return "not a git repository (or no origin remote)";
+  }
+}
+
+function targetSource() {
+  if (runtime.repo) return "flag";
+  if (process.env.GH_REPO) return "GH_REPO";
+  return "git remote (or none, if this is not a checkout)";
+}
+
+async function runDoctor() {
+  // A live backoff would make an alert probe silently skip and report nothing,
+  // which is the opposite of what a diagnostic run is for.
+  alertBackoff.clear();
+
+  const probes = [
+    ["Actions (run list)", actionsArgs(MIN_RUN_LIMIT)],
+    ["Issues (issue list)", issuesArgs()],
+    ["Pull requests (pr list)", prsArgs()],
+    ...ALERT_SOURCES.map((source) => [source.name, alertArgs(source)]),
+  ];
+
+  // allSettled, and every probe already resolves rather than rejects, so one
+  // slow endpoint cannot suppress the other five. runGh's own GH_TIMEOUT_MS
+  // bounds each one.
+  const [ghVersion, authStatus, remote, results] = await Promise.all([
+    captureGh(["--version"]),
+    captureGh(["auth", "status"]),
+    gitRemote(),
+    Promise.all(probes.map(([name, args]) => probe(name, args))),
+  ]);
+
+  const lines = [
+    "gh-glance doctor",
+    "================",
+    field("gh-glance", version),
+    field("node", `${process.version}  ${process.platform}/${process.arch}`),
+    field("gh", ghVersion.split("\n")[0] || "NOT FOUND"),
+    "",
+    ...section("Authenticated hosts"),
+    authStatus || "(no output)",
+    "",
+    ...section("Repository target"),
+    field("source", targetSource()),
+    field("host", runtime.host ?? "(default -- gh infers it)"),
+    field("slug", runtime.repo ?? "(inferred from the working directory)"),
+    field("git remote", remote),
+    "",
+    ...section("Environment"),
+    ...doctorEnvNames().map((name) => field(name, envValue(name))),
+    "",
+    ...section("Endpoint probes"),
+  ];
+
+  const probeLine = (label, value) => lines.push(`  ${field(label, value, PROBE_LABEL_WIDTH)}`);
+  for (const result of results) {
+    lines.push(`  ${result.name}`);
+    probeLine("argv", `gh ${result.args.join(" ")}`);
+    probeLine(
+      "outcome",
+      result.failed ? `FAILED in ${result.ms}ms` : `ok ${result.bytes}B in ${result.ms}ms`,
+    );
+    if (result.http) probeLine("http", result.http);
+    probeLine("classified", result.classified);
+    if (result.stderr) probeLine("stderr", result.stderr);
+    lines.push("");
+  }
+
+  // The single redaction boundary. Everything above may have captured a token,
+  // a proxy credential or a URL with userinfo; nothing above is responsible for
+  // removing it.
+  return redact(lines.join("\n"));
+}
+
 // ---------- Command line ----------
 
 // The repository name is the only user-supplied value that reaches a subprocess
@@ -659,6 +983,40 @@ async function preflight() {
 // is validated once, here at the boundary, against exactly what GitHub allows in
 // an owner or repository name.
 const REPO_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\/[A-Za-z0-9._-]+$/;
+
+// A dot is mandatory, and that is the safety property rather than a nicety.
+// Without it "owner/name/extra" -- already in the hostile-input list -- would
+// stop being a rejected typo and quietly become "the repo name/extra on the
+// host named owner", i.e. a slip of the finger turning into a request to
+// somewhere else entirely. With it, every value in that list stays rejected.
+// Labels may not start or end with a hyphen and the string may not have an
+// empty, leading or trailing label, which is what rules out "-bad.host",
+// "host..com" and "host.com.".
+const HOST_PATTERN =
+  /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$/;
+
+const repoMessage = (value) => `--repo must look like owner/name or host/owner/name, got: ${value}`;
+
+// `gh` itself accepts [HOST/]OWNER/REPO for --repo and GH_REPO; this accepts
+// the same shape and splits it into the two things that are used differently --
+// the slug, which is interpolated into a `gh api` path, and the host, which
+// never is. REPO_PATTERN keeps its exact meaning: it validates the owner/name
+// half, here as before.
+function parseRepoTarget(value) {
+  const parts = String(value).split("/");
+  let host = null;
+  let slug;
+  if (parts.length === 3 && HOST_PATTERN.test(parts[0])) {
+    host = parts[0];
+    slug = `${parts[1]}/${parts[2]}`;
+  } else if (parts.length === 2) {
+    slug = String(value);
+  } else {
+    throw new Error(repoMessage(value));
+  }
+  if (!REPO_PATTERN.test(slug)) throw new Error(repoMessage(value));
+  return { host, slug };
+}
 
 // Below roughly two seconds a fetch cannot finish before the next tick, so the
 // in-flight guard absorbs every other one and the effective rate is whatever
@@ -672,7 +1030,15 @@ const MAX_REFRESH_SECONDS = 3600;
 // ignored -- so widening it keeps the same shape: every flag is named here, and
 // anything else still exits 2.
 function parseArgs(argv) {
-  const opts = { help: false, showVersion: false, repo: null, refresh: null, tab: null, verbose: false };
+  const opts = {
+    help: false,
+    showVersion: false,
+    doctor: false,
+    repo: null,
+    refresh: null,
+    tab: null,
+    verbose: false,
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     const takeValue = (name) => {
@@ -686,6 +1052,7 @@ function parseArgs(argv) {
     if (arg === "--help" || arg === "-h") opts.help = true;
     else if (arg === "--version" || arg === "-v") opts.showVersion = true;
     else if (arg === "--verbose") opts.verbose = true;
+    else if (arg === "--doctor") opts.doctor = true;
     else if (arg === "--repo" || arg === "-R" || arg.startsWith("--repo=")) {
       opts.repo = takeValue("--repo");
     } else if (arg === "--refresh" || arg.startsWith("--refresh=")) {
@@ -702,9 +1069,7 @@ function parseArgs(argv) {
 // Returns { repo, refreshMs, tabKey, verbose } or throws with a message that
 // says what to do about it.
 function validateArgs(opts, tabKeys) {
-  if (opts.repo !== null && !REPO_PATTERN.test(opts.repo)) {
-    throw new Error(`--repo must look like owner/name, got: ${opts.repo}`);
-  }
+  const { host, slug } = opts.repo !== null ? parseRepoTarget(opts.repo) : { host: null, slug: null };
 
   let refreshMs = null;
   if (opts.refresh !== null) {
@@ -727,7 +1092,9 @@ function validateArgs(opts, tabKeys) {
   return {
     help: opts.help,
     showVersion: opts.showVersion,
-    repo: opts.repo,
+    doctor: opts.doctor,
+    repo: slug,
+    host,
     refreshMs,
     tabKey: opts.tab,
     verbose: opts.verbose,
@@ -746,12 +1113,18 @@ Usage:
   gh-glance --refresh 15        Poll the active tab every 15 seconds
   gh-glance --tab security      Start on a specific tab
   gh-glance --verbose 2>log     Log every gh call to a file (see below)
+  gh-glance --doctor            Print a diagnostic report and exit
   gh-glance --help              Show this help
   gh-glance --version           Show the version
 
 Options:
-  -R, --repo <owner/name>  Repository to watch. Without it the repo is inferred
-                           from the git remote, the same way \`gh\` does it.
+  -R, --repo [host/]owner/name
+                           Repository to watch. Without it the repo is inferred
+                           from the git remote, the same way \`gh\` does it. The
+                           host form targets a GitHub Enterprise or EMU
+                           data-residency tenant (e.g. tenant.ghe.com/acme/api)
+                           and is unnecessary when running inside a clone of
+                           that repository.
   --refresh <seconds>      Active-tab poll interval (${MIN_REFRESH_SECONDS}-${MAX_REFRESH_SECONDS},
                            default ${REFRESH_MS / 1000}). Background tabs stay at
                            ${BACKGROUND_EVERY}x this.
@@ -760,6 +1133,11 @@ Options:
                            must be redirected -- writing it to the terminal
                            would draw over the dashboard, so this refuses to
                            start otherwise.
+  --doctor                 Gather versions, authenticated hosts, the resolved
+                           repo target and one probe per endpoint, then exit.
+                           Safe to redirect to a file and share -- tokens are
+                           never printed, proxy credentials are stripped, and
+                           no response bodies are included.
 
 Run it from inside a locally cloned GitHub repository; the repo is inferred
 from the git remote, the same way \`gh\` does it. Requires the \`gh\` CLI
@@ -783,6 +1161,9 @@ Keys:
 
 Environment:
   GH_REPO=owner/name        Watch a specific repository (--repo takes precedence)
+  GH_HOST=host              GitHub Enterprise or EMU host to send every call to.
+                            A host-qualified GH_REPO does not route \`gh api\`;
+                            this and --repo host/owner/name both do.
   GH_GLANCE_ICONS=unicode   Plain-unicode status icons (no Nerd Font needed)
   GH_GLANCE_NO_ANIMATION=1  Freeze the spinner (no motion)
   NO_COLOR=1                Disable colour (status stays readable)
@@ -818,6 +1199,19 @@ if (IS_MAIN) {
     process.exit(0);
   }
 
+  // A reporting command, like --help and --version: gather, print, exit. It sits
+  // here on purpose -- ahead of the non-TTY refusal, because the whole point is
+  // `gh-glance --doctor > report.txt`, and ahead of preflight(), because a
+  // missing gh and a cwd outside a repository are exactly the conditions worth
+  // reporting rather than exiting 3 over. The repo target is applied first so
+  // the probes exercise the real one.
+  if (opts.doctor) {
+    runtime.repo = opts.repo;
+    runtime.host = opts.host;
+    console.log(await runDoctor());
+    process.exit(0);
+  }
+
   // Verbose output must never reach stdout -- that is ink's frame stream, and
   // anything else in it corrupts the diff and the alternate-screen state. stderr
   // is safe only once it is redirected somewhere; while it is still the
@@ -832,6 +1226,7 @@ if (IS_MAIN) {
   }
 
   runtime.repo = opts.repo;
+  runtime.host = opts.host;
   runtime.verbose = opts.verbose;
   if (opts.refreshMs !== null) runtime.refreshMs = opts.refreshMs;
   if (opts.tabKey !== null) runtime.initialTabIndex = TAB_KEYS.indexOf(opts.tabKey);
@@ -1005,6 +1400,14 @@ function PanelEdge({ width, top, label, labelColor }) {
     top ? "─".repeat(fill) : "─",
     close,
   );
+}
+
+// A plain rule under the tab bar, distinct from PanelEdge's corners so it
+// reads as a separator rather than another frame. Without it the tab labels
+// sat flush against the panel's top border -- readable, but dense enough that
+// the two rows scanned as one.
+function Divider({ width }) {
+  return e(Text, { color: BORDER_COLOR, dimColor: true, "aria-hidden": true }, "─".repeat(Math.max(0, width)));
 }
 
 // ---------- Error containment ----------
@@ -1409,8 +1812,6 @@ const KEY_HINTS = [
 // Reserved so the hints don't shift sideways every time a refresh starts and
 // finishes. Wide enough for the spinner, a space and "Fetching".
 const FETCHING_WIDTH = 12;
-// Likewise for the staleness slot, which is empty most of the time.
-const STALE_WIDTH = 10;
 
 // Two tones rather than one flat gray: the keys you press are the part worth
 // finding at a glance, so they get the accent colour and the words describing
@@ -1439,11 +1840,13 @@ function StatusBar({ fetching, spin, stale, interactive }) {
         `${fetching && spin ? spin : SPINNER[0]} Fetching`,
       ),
     ),
-    e(
-      Box,
-      { width: STALE_WIDTH, flexShrink: 0 },
-      stale ? e(Text, { color: ATTENTION }, stale) : null,
-    ),
+    // No reserved width here, unlike the fetching slot above: this only
+    // toggles on a real problem (a stalled poll, a laptop that just woke up),
+    // not every refresh cycle, so letting the hints shift on that rare event
+    // is worth getting the column back for the other 99% of the time.
+    stale
+      ? e(Box, { marginRight: 1, flexShrink: 0 }, e(Text, { color: ATTENTION }, stale))
+      : null,
     ...hints
       .flatMap((hint, i) => [
         i > 0 && e(Text, { key: `sep${i}`, color: BORDER_COLOR }, " | "),
@@ -1531,10 +1934,11 @@ function App() {
 
   const tab = TABS[activeIndex];
   const extraLines = (errors[tab.key] ? 1 : 0) + (tab.key === "security" ? securityNotes.length : 0);
-  // Reserve lines for: the panel's top and bottom edges (2), the column header
-  // and its separator (2), the tab bar (1) and the status line (1), plus a
-  // 1-line safety margin. Slack is absorbed by the spacer in the tree below.
-  const bodyRows = Math.max(1, rows - 7 - extraLines);
+  // Reserve lines for: the tab bar and the divider under it (2), the panel's
+  // top and bottom edges (2), the column header and its separator (2), and
+  // the status line (1), plus a 1-line safety margin. Slack is absorbed by
+  // the spacer in the tree below.
+  const bodyRows = Math.max(1, rows - 8 - extraLines);
 
   // Read at fetch time rather than being a hook dependency, so dragging the
   // pane wider doesn't cancel and restart in-flight requests -- the next tick
@@ -1862,17 +2266,35 @@ function App() {
         ? `${tabOffset + 1}-${tabOffset + visibleItems.length} of ${counts[tab.key]}`
         : `${visibleItems.length} of ${counts[tab.key]}`;
 
+  // One column short of the reported width, not the full width: some
+  // terminals (observed in Ghostty, split-pane) clip or misrender whatever
+  // glyph lands on the pane's absolute last column -- for this frame that is
+  // always the right border. Stopping one column early costs a blank column
+  // of slack but keeps the border visible everywhere, regardless of which
+  // terminal is doing the clipping.
+  const frameCols = Math.max(1, cols - 1);
+
   // Fixed columns deliberately do not shrink, so BRANCH and TIME stay readable
   // at ordinary widths. Narrow panes drop columns instead, which keeps the
   // frame, the tab bar and the quit hint on screen -- the previous behaviour
-  // pushed all three off the bottom.
-  const compact = cols < MIN_TABLE_WIDTH;
+  // pushed all three off the bottom. Measured against frameCols, the width the
+  // frame itself actually gets, not the raw terminal width.
+  const compact = frameCols < MIN_TABLE_WIDTH;
   const header = compact ? tab.compactHeader : tab.header;
 
   return e(
     Box,
-    { flexDirection: "column", width: "100%", height: Math.min(rows, usableSize(stdout?.rows, rows)) },
-    e(PanelEdge, { width: cols, top: true, label: tab.label, labelColor: TITLE_COLOR }),
+    { flexDirection: "column", width: frameCols, height: Math.min(rows, usableSize(stdout?.rows, rows)) },
+    e(TabBar, {
+      activeIndex,
+      counts,
+      firstLoad,
+      failed,
+      spin,
+      useShort: useShortLabels,
+    }),
+    e(Divider, { width: frameCols }),
+    e(PanelEdge, { width: frameCols, top: true, label: tab.label, labelColor: TITLE_COLOR }),
     e(
       Box,
       {
@@ -1932,15 +2354,7 @@ function App() {
       // tab that only has a handful of rows.
       e(Box, { flexGrow: 1 }),
     ),
-    e(PanelEdge, { width: cols, top: false, label: countLabel, labelColor: BORDER_COLOR }),
-    e(TabBar, {
-      activeIndex,
-      counts,
-      firstLoad,
-      failed,
-      spin,
-      useShort: useShortLabels,
-    }),
+    e(PanelEdge, { width: frameCols, top: false, label: countLabel, labelColor: BORDER_COLOR }),
     e(StatusBar, {
       fetching: Object.values(loading).some(Boolean),
       spin: showSpinner ? spin : null,
@@ -2046,7 +2460,9 @@ if (IS_MAIN) {
 export {
   parseArgs,
   validateArgs,
+  parseRepoTarget,
   REPO_PATTERN,
+  HOST_PATTERN,
   MIN_REFRESH_SECONDS,
   MAX_REFRESH_SECONDS,
   TAB_KEYS,
@@ -2054,6 +2470,11 @@ export {
   shortErr,
   isUnavailable,
   isRateLimited,
+  isAuthProblem,
+  AUTH_RETRY_MS,
+  BACKOFF_STEPS_MS,
+  redact,
+  classify,
   formatAge,
   formatDuration,
   usableSize,

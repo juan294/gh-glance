@@ -11,6 +11,7 @@ import { test } from "node:test";
 import {
   parseArgs,
   validateArgs,
+  parseRepoTarget,
   REPO_PATTERN,
   MIN_REFRESH_SECONDS,
   MAX_REFRESH_SECONDS,
@@ -66,6 +67,49 @@ test("--repo rejects anything that is not owner/name", () => {
   for (const value of hostile) {
     assert.throws(() => parse(["--repo", value]), /must look like owner\/name/, JSON.stringify(value));
   }
+});
+
+test("--repo accepts the host-qualified form gh itself accepts", () => {
+  // `gh --repo` documents [HOST/]OWNER/REPO. Accepting the same shape is what
+  // lets a data-residency tenant (<slug>.ghe.com) be watched from outside a
+  // clone -- and the host has to travel separately from the slug, because the
+  // slug is interpolated into a `gh api` path and the host never is.
+  assert.deepEqual(parseRepoTarget("tenant.ghe.com/acme/widget"), {
+    host: "tenant.ghe.com",
+    slug: "acme/widget",
+  });
+  assert.deepEqual(parseRepoTarget("acme/widget"), { host: null, slug: "acme/widget" });
+  assert.deepEqual(parseRepoTarget("github.com/cli/cli"), { host: "github.com", slug: "cli/cli" });
+
+  const opts = parse(["--repo", "tenant.ghe.com/acme/widget"]);
+  assert.equal(opts.repo, "acme/widget", "the api path gets the bare slug");
+  assert.equal(opts.host, "tenant.ghe.com");
+  assert.equal(parse(["--repo", "acme/widget"]).host, null);
+  assert.equal(parse([]).host, null);
+});
+
+test("a host-qualified --repo still rejects everything the two-part form rejects", () => {
+  for (const value of [
+    "evil.com/owner/name/extra",
+    "evil.com/owner/",
+    "evil.com//name",
+    "evil.com/../etc",
+    "-bad.host/o/r",
+    "bad-.host/o/r",
+    "host..com/o/r",
+    ".host.com/o/r",
+    "host.com./o/r",
+    "nodot/owner/name",
+    "localhost/o/r",
+  ]) {
+    assert.throws(() => parseRepoTarget(value), /must look like owner\/name/, JSON.stringify(value));
+  }
+});
+
+test("a three-part value whose first part is not a hostname is still a typo, not a host", () => {
+  // The case the mandatory dot exists for: without it this would silently mean
+  // "the repo name/extra on the host named owner".
+  assert.throws(() => parseRepoTarget("owner/name/extra"), /must look like owner\/name/);
 });
 
 test("the repo pattern allows the names GitHub actually allows", () => {

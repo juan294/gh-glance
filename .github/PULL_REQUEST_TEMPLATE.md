@@ -19,7 +19,11 @@
 
 - [ ] `npm run lint` passes
 - [ ] `node --check index.mjs` passes
+- [ ] `npm test` passes
 - [ ] Ran `node index.mjs` in a real repository and confirmed all four tabs render
+- [ ] If this changes how `gh` is invoked (argv, host routing, or error
+      classification): ran `node index.mjs --doctor` and confirmed the argv and
+      classification for each endpoint are what you intended
 
 ## Self-Review Checklist
 

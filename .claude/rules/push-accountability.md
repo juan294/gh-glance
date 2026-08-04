@@ -6,12 +6,18 @@ description: Push accountability -- commit before pull, CI verification after pu
 
 Always commit before `git pull --rebase` -- hook enforced.
 
-`develop` and `main` are both protected and reject direct pushes. Work lands
-through a pull request whose required checks pass; no approving review is
-needed. CI is therefore a precondition for landing rather than something
-observed afterwards, which is the point -- a red `develop` used to be
-discovered only after it was already the branch everyone clones.
+`develop` is unprotected (removed 2026-08-04 -- solo project, PR-per-change was
+pure overhead): direct pushes land immediately, and CI on `develop` is
+observed *after* the fact rather than gating it. Run lint/test/test:pty
+locally before committing, since a green local run is the only thing standing
+between a bad commit and a red `develop`.
 
-After pushing a branch, spawn a background agent to monitor its checks.
-If CI fails, the agent investigates, fixes, and re-pushes to the same branch.
-Main terminal continues -- verification is non-blocking.
+`main` stays protected and rejects direct pushes: it drives npm publishing, so
+changes land through a `develop` -> `main` pull request whose required checks
+pass (no approving review needed, so a solo maintainer is not deadlocked).
+
+After pushing to either branch, spawn a background agent to monitor CI.
+If it fails on `develop`, the agent investigates and fixes forward with a new
+commit. If it fails on a `main`-bound PR branch, the agent investigates, fixes,
+and re-pushes to the same branch. Main terminal continues -- verification is
+non-blocking.
