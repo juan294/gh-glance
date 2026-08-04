@@ -47,6 +47,12 @@ const IS_MAIN = detectMainModule();
 
 const REFRESH_MS = 5000;
 
+// The row cursor otherwise persists forever once you touch a movement key --
+// useful while you're actually scanning a list, noise once you've moved on and
+// left the pane running in a corner of the screen. 60s idle (measured from the
+// last movement, not from tab switches or Enter) quietly drops it.
+const SELECTION_IDLE_MS = 60_000;
+
 // `gh run list` costs roughly linearly in --limit (measured: ~1.2s at 20 runs,
 // ~3.0s at 100, ~4.9s at 150), so asking for a fixed 150 to render ~35 visible
 // rows was paying several seconds per refresh for rows nobody sees. Actions is
@@ -2013,6 +2019,17 @@ function App() {
       return nextStart === (o[tabKey] ?? 0) ? o : { ...o, [tabKey]: nextStart };
     });
   }
+
+  // Rearms on every call to moveSelection (it's the only thing that changes
+  // `selected`), so this fires exactly 60s after the *last* movement -- tab
+  // switches and Enter don't count as activity and don't push it back. Clears
+  // every tab's cursor at once rather than just the visible one, so a tab you
+  // switch back to after being idle doesn't still show a stale row marked.
+  useEffect(() => {
+    if (Object.keys(selected).length === 0) return;
+    const timer = setTimeout(() => setSelected({}), SELECTION_IDLE_MS);
+    return () => clearTimeout(timer);
+  }, [selected]);
 
   function openSelected() {
     const { items, key: currentKey, tabKey } = navRef.current;
