@@ -1,4 +1,7 @@
-node_modules/
+# No trailing slash: a worktree often gets node_modules as a *symlink* to the
+# main checkout's copy rather than a real directory, and `node_modules/` matches
+# only a directory -- so the symlink was not ignored and could be committed.
+node_modules
 *.log
 *.tgz
 .DS_Store
