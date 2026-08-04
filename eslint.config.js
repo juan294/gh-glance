@@ -3,6 +3,12 @@ import globals from "globals";
 import reactHooks from "eslint-plugin-react-hooks";
 
 export default [
+  // Flat config's built-in defaults only skip node_modules/ and .git/ -- every
+  // other dot-directory, including nested worktrees under .claude/worktrees/
+  // (gitignored, but still real files on disk with their own in-progress lint
+  // state), is otherwise fair game for `eslint .` and can fail an unrelated
+  // commit's pre-commit hook.
+  { ignores: ["**/.claude/worktrees/**"] },
   js.configs.recommended,
   {
     files: ["**/*.mjs", "**/*.js"],
