@@ -1809,8 +1809,6 @@ const KEY_HINTS = [
 // Reserved so the hints don't shift sideways every time a refresh starts and
 // finishes. Wide enough for the spinner, a space and "Fetching".
 const FETCHING_WIDTH = 12;
-// Likewise for the staleness slot, which is empty most of the time.
-const STALE_WIDTH = 10;
 
 // Two tones rather than one flat gray: the keys you press are the part worth
 // finding at a glance, so they get the accent colour and the words describing
@@ -1839,11 +1837,13 @@ function StatusBar({ fetching, spin, stale, interactive }) {
         `${fetching && spin ? spin : SPINNER[0]} Fetching`,
       ),
     ),
-    e(
-      Box,
-      { width: STALE_WIDTH, flexShrink: 0 },
-      stale ? e(Text, { color: ATTENTION }, stale) : null,
-    ),
+    // No reserved width here, unlike the fetching slot above: this only
+    // toggles on a real problem (a stalled poll, a laptop that just woke up),
+    // not every refresh cycle, so letting the hints shift on that rare event
+    // is worth getting the column back for the other 99% of the time.
+    stale
+      ? e(Box, { marginRight: 1, flexShrink: 0 }, e(Text, { color: ATTENTION }, stale))
+      : null,
     ...hints
       .flatMap((hint, i) => [
         i > 0 && e(Text, { key: `sep${i}`, color: BORDER_COLOR }, " | "),
