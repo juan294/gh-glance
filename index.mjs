@@ -124,7 +124,13 @@ const runtime = {
 // table itself is built.
 const TAB_KEYS = ["actions", "issues", "prs", "security"];
 
-const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+// The classic "dots" braille spinner lights only 1-2 of a cell's 8 dot
+// positions per frame, and different frames light different corners --
+// so next to the solid Nerd Font circle icons used for completed runs, it
+// visibly jitters instead of holding a steady center. This set lights 6-7
+// dots per frame, reading as a filled blob that matches the circle icons'
+// visual weight while staying in the same width-1 braille block.
+const SPINNER = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 const SPINNER_MS = 100;
 
 // Motion opt-out. This pane is designed to sit in peripheral vision for hours,
