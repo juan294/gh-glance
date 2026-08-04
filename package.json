@@ -18,6 +18,7 @@
     "prepublishOnly": "npm run lint && node --check index.mjs && npm test",
     "start": "node index.mjs",
     "test": "node --test test/*.test.mjs",
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-include=index.mjs test/*.test.mjs",
     "test:pty": "node --test --test-timeout=120000 test/pty/*.test.mjs"
   },
   "keywords": [
