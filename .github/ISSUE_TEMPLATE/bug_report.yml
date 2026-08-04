@@ -93,6 +93,28 @@ body:
     validations:
       required: true
 
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Diagnostic report
+      description: |
+        Output of `gh-glance --doctor`. Optional, but it is the single most
+        useful thing you can attach -- it adds what the versions above cannot:
+        which hosts `gh` is authenticated for, how the repository target
+        resolved and from where, and one probe per endpoint showing the exact
+        `gh` command sent and how any error was classified. That last part is
+        usually what identifies the problem.
+
+        It is safe to paste. Tokens are never printed (only whether they are
+        set), credentials are stripped from proxy and remote URLs, and no API
+        response bodies are included.
+
+        It works even when the dashboard does not -- it reports rather than
+        exits when `gh` is missing or you are outside a git repository.
+      render: text
+    validations:
+      required: false
+
   - type: checkboxes
     id: nerd-font
     attributes:
