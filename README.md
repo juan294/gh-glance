@@ -18,6 +18,8 @@ pane next to your editor) where you want an always-on glance at repo activity
 without switching to the browser.
 
 ```
+[1:Actions (4)]   2:Issues (3)    3:PRs (2)    4:Security (0)
+────────────────────────────────────────────────────────────────────────────
 ╭─ Actions ────────────────────────────────────────────────────────────────╮
 │     TITLE                    WORKFLOW   BRANCH         TIME    UPDATED   │
 │ ──────────────────────────────────────────────────────────────────────── │
@@ -28,7 +30,6 @@ without switching to the browser.
 │                                                                          │
 │                                                                          │
 ╰───────────────────────────────────────────────────────────────── 4 of 4 ─╯
-[1:Actions (4)]   2:Issues (3)    3:PRs (2)    4:Security (0)
 ⠋ Fetching            Move: jk | Open: Ent | Refresh: r | Quit: q
 ```
 
@@ -66,8 +67,8 @@ current.
   by colour alone.
   Code scanning and secret scanning alerts are included too, on repos/plans
   that have GitHub Advanced Security enabled -- see [Limitations](#limitations).
-- Tab bar with live counts, pinned to the bottom of the pane alongside the
-  status line, switchable via `1`-`4`, arrow keys, or `Tab`/`Shift+Tab`
+- Tab bar with live counts, pinned to the top of the pane above a divider,
+  switchable via `1`-`4`, arrow keys, or `Tab`/`Shift+Tab`
 - `lazygit`-style panel frame: the tab name sits in the top border, the
   visible-of-total row count in the bottom
 - A spinning `Fetching` indicator while a refresh is in flight, so the pane

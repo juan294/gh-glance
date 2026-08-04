@@ -1007,6 +1007,14 @@ function PanelEdge({ width, top, label, labelColor }) {
   );
 }
 
+// A plain rule under the tab bar, distinct from PanelEdge's corners so it
+// reads as a separator rather than another frame. Without it the tab labels
+// sat flush against the panel's top border -- readable, but dense enough that
+// the two rows scanned as one.
+function Divider({ width }) {
+  return e(Text, { color: BORDER_COLOR, dimColor: true, "aria-hidden": true }, "─".repeat(Math.max(0, width)));
+}
+
 // ---------- Error containment ----------
 
 // Every field on screen is defined by GitHub and will keep changing shape. With
@@ -1531,10 +1539,11 @@ function App() {
 
   const tab = TABS[activeIndex];
   const extraLines = (errors[tab.key] ? 1 : 0) + (tab.key === "security" ? securityNotes.length : 0);
-  // Reserve lines for: the panel's top and bottom edges (2), the column header
-  // and its separator (2), the tab bar (1) and the status line (1), plus a
-  // 1-line safety margin. Slack is absorbed by the spacer in the tree below.
-  const bodyRows = Math.max(1, rows - 7 - extraLines);
+  // Reserve lines for: the tab bar and the divider under it (2), the panel's
+  // top and bottom edges (2), the column header and its separator (2), and
+  // the status line (1), plus a 1-line safety margin. Slack is absorbed by
+  // the spacer in the tree below.
+  const bodyRows = Math.max(1, rows - 8 - extraLines);
 
   // Read at fetch time rather than being a hook dependency, so dragging the
   // pane wider doesn't cancel and restart in-flight requests -- the next tick
@@ -1872,6 +1881,15 @@ function App() {
   return e(
     Box,
     { flexDirection: "column", width: "100%", height: Math.min(rows, usableSize(stdout?.rows, rows)) },
+    e(TabBar, {
+      activeIndex,
+      counts,
+      firstLoad,
+      failed,
+      spin,
+      useShort: useShortLabels,
+    }),
+    e(Divider, { width: cols }),
     e(PanelEdge, { width: cols, top: true, label: tab.label, labelColor: TITLE_COLOR }),
     e(
       Box,
@@ -1933,14 +1951,6 @@ function App() {
       e(Box, { flexGrow: 1 }),
     ),
     e(PanelEdge, { width: cols, top: false, label: countLabel, labelColor: BORDER_COLOR }),
-    e(TabBar, {
-      activeIndex,
-      counts,
-      firstLoad,
-      failed,
-      spin,
-      useShort: useShortLabels,
-    }),
     e(StatusBar, {
       fetching: Object.values(loading).some(Boolean),
       spin: showSpinner ? spin : null,
