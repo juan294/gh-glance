@@ -1,0 +1,48 @@
+name: Coverage
+
+on:
+  push:
+    branches: [develop]
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: Coverage report
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run authoritative coverage suite
+        id: coverage
+        shell: bash
+        run: |
+          set -o pipefail
+          npm run test:coverage 2>&1 | tee node-test-coverage.txt
+          node scripts/extract-coverage-metrics.mjs node-test-coverage.txt >> "$GITHUB_OUTPUT"
+      - name: Report coverage to Portfolio
+        env:
+          COVERAGE_SECRET: ${{ secrets.COVERAGE_SECRET }}
+          REPO: juan294/gh-glance
+          TEST_COUNT: ${{ steps.coverage.outputs.test_count }}
+          TESTS_PASSED: ${{ steps.coverage.outputs.tests_passed }}
+          TESTS_FAILED: ${{ steps.coverage.outputs.tests_failed }}
+          COVERAGE_PERCENT: ${{ steps.coverage.outputs.coverage_percent }}
+          SOURCE_COMMIT_SHA: ${{ github.sha }}
+          COVERAGE_RUN_ID: ${{ github.run_id }}
+          COVERAGE_WORKFLOW_REF: ${{ github.workflow_ref }}
+          SOURCE_TARGET_BRANCH: develop
+        run: bash scripts/report-coverage.sh

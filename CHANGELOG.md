@@ -5,6 +5,193 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-08-04
+
+Findings from a cross-functional audit, filtered hard: everything that would
+have added a release gate, a branch-protection rule or more test-harness
+machinery was rejected outright. What is left is behaviour you can see.
+
+### Added
+
+- **`?` shows the keys without leaving the dashboard.** Paging, `j`/`k`,
+  `Shift+Tab` and the cursor timeout existed only in `--help` and the README --
+  and because this is a full-screen app, reading `--help` meant quitting it
+  first. Any key closes the overlay. `--help`, the overlay and the status-bar
+  hints are now generated from one table, so a binding cannot go missing from one
+  of them.
+- **The panel names the repository** when it was chosen explicitly through
+  `--repo` or `GH_REPO` -- `╭─ Actions · acme/widget ─`. With several panes open,
+  or after changing directory, nothing on screen said which repository a pane was
+  watching. Dropped before the tab name when the pane is too narrow for both.
+- **`--doctor` reports API budget**: REST and GraphQL headroom straight from
+  GitHub, plus what this configuration will actually spend per hour. The steady
+  cost is not small and was invisible -- roughly 2,200 REST requests an hour at
+  the default refresh with the Security tab open, about 44% of a personal token's
+  allowance, and `--refresh 2` projects past the limit outright. `gh api
+  rate_limit` does not itself count against the limit.
+- **Native test coverage is measured and reported.** `npm run test:coverage`
+  runs the unit suite under Node's built-in coverage, and a nightly workflow
+  publishes the figure to the portfolio endpoint. The delivery script fails
+  closed on purpose: every input is required and a parse failure is an error
+  rather than a reported zero, so a broken producer cannot quietly claim perfect
+  coverage. Not wired into branch protection -- it reports, it does not gate.
+- **A first-run hint when icons may be blank.** Without a Nerd Font every status
+  icon renders as an empty box, which reads as a broken program rather than a
+  missing font, and the fix was documented only in places you had to quit to
+  read. Shown for the second the first fetch takes, and only when the Nerd glyphs
+  are actually in use.
+
+### Fixed
+
+- **The `stale` indicator no longer fires on a repository that is simply quiet.**
+  Freshness was recorded only when the payload *changed*, and the whole point of
+  the poll loop is that an unchanged payload short-circuits before that write --
+  so on any calm repo the timestamp froze and the status bar accrued a growing
+  `stale 2h13m` while every poll was succeeding on schedule. It now records the
+  last successful *poll*. The warning fired loudest in the one state that was
+  completely healthy, which is the fastest way to teach someone to ignore it.
+- **A tab whose fetch keeps failing no longer animates forever.** `setData` only
+  runs on success, so a tab that never succeeded stayed in its first-load state
+  permanently: the spinner ran at full rate for the life of the process while the
+  body rendered "loading actions…" directly above the error explaining that it had
+  failed. Measured at 7.8% of a core and 9.8 MB/hr of terminal writes,
+  indefinitely, triggered by something as ordinary as closing a laptop lid.
+  Motion now means "still working"; the error line means "not working".
+- **`Enter` is guarded against key repeat.** Holding it down spawned a
+  `gh <kind> view --web` per repeat event -- roughly thirty a second -- each
+  opening another browser tab. The `r` key beside it had this guard all along.
+- **The status bar adapts to narrow panes.** It was the only band that did not:
+  the table swaps to a compact header, the tab bar to short labels, the panel
+  edges drop their labels, and the status bar just let ink truncate. Because each
+  hint truncates individually the loss was silent -- at 45 columns the bar read
+  `Move: | Open:  | Refresh |Quit:…`, dropping the arrows, `Refresh`'s key, and
+  most of `Quit`, which is the one hint someone stuck in a full-screen app needs.
+  It now falls back to `↑↓ Ent r q`, which keeps every key.
+- **`--doctor` no longer prints the value of environment variables it was never
+  told about.** It discovers every `GH_*`/`GITHUB_*` variable that is set, and
+  printed the value of any whose *name* did not end in `_TOKEN`/`_SECRET`/
+  `_PASSWORD`/`_KEY` -- so `GH_APP_PEM` (an entire RSA private key) and
+  `GITHUB_OAUTH` were reproduced in full, in the one report that says it is safe
+  to paste into a bug report. Printing a value is now opt-in and the list is
+  curated; anything discovered reports `set` or `not set`.
+- **`--doctor --verbose` produces the log it advertises.** argv was applied to
+  runtime state in two places and they had drifted, so the doctor path silently
+  dropped `--verbose`, `--refresh` and `--tab`. There is one application site now.
+- **The 60s cursor clear no longer costs you your place.** Clearing the selection
+  left the scroll offset behind, and the next arrow key seeded from the top of the
+  list -- so scrolling to row 80 of 150, reading for a minute and pressing down
+  put you back at row 1, with no scroll animation to notice. Movement now seeds
+  from what is on screen.
+- **`safe()` sanitizes non-string input.** It returned early for anything that
+  was not a string, skipping both the control-character strip and the length
+  clamp -- the guarantee was being provided by GitHub's schema rather than by the
+  function that claims to provide it.
+- **The `!` "CI is red" marker stays in the tab bar**, where a label anchors it,
+  instead of also being interpolated into the frame's bottom edge as `4 of 4!`.
+- **A blind Security tab no longer reports a confident zero.** When all three
+  alert endpoints fail -- an expired SAML session, a token without
+  `security_events`, an org OAuth restriction -- the tab rendered
+  `4:Security (0)`, byte-identical to a genuinely clean repository, on the one
+  surface where a false all-clear is the worst available answer. It now reads
+  `(?)`. A repository that simply has Advanced Security switched off is a
+  different thing and stays quiet, because that is an answer rather than an
+  absence of one.
+- **A failing tab backs off instead of re-spawning `gh` every tick.** The three
+  list tabs had no backoff at all, so a wedged tab launched a subprocess every
+  five seconds indefinitely -- 720 an hour against a token already refusing --
+  and rate limiting was deliberately excluded from the ladder that did exist,
+  which had it backwards: GitHub's secondary limiter keys on sustained rate
+  against a limited *token*, so hammering can turn a self-clearing limit into a
+  longer block that also hits `git push`. Measured: two `gh run list` calls in
+  forty seconds where there were eight. The `r` key bypasses and clears the
+  backoff, because a refresh that silently declines to refresh would be worse
+  than no key at all.
+- **Errors on the Actions, Issues and PR tabs say what to do.** They rendered raw
+  `gh` stderr while the Security tab one across had been classifying the same
+  failures into remedies all along. An expired token now reads "GitHub
+  authorization failed -- try `gh auth login` or `gh auth refresh`". Unclassified
+  failures still show their real message: inventing a remedy for something
+  nobody recognised would be worse than showing what happened.
+- **Bidi override characters are stripped from remote text.** `U+202A`-`U+202E`
+  and the isolates measure as zero columns, so they cost no width and survived
+  truncation -- one `RLO` in an issue title makes the rest of that cell render
+  reversed on any terminal with bidi reordering, which is the same "the row does
+  not show its data" failure the control-character strip already prevents.
+  Deleted rather than replaced with a space, because they measure zero and a
+  space would shift every cell to its right. Genuine RTL, `LRM`, emoji, ZWJ
+  sequences and CJK are untouched.
+- **`REPO_PATTERN` rejects `owner/..`.** It reached the API path, and `gh`
+  forwards the dot segment unnormalized, so GitHub resolved it to a different
+  endpoint than the one intended. Names that merely contain or start with a dot
+  -- `owner/.github` -- are still valid.
+- **Backoff deadlines use a monotonic clock.** They measure elapsed time, and a
+  laptop resume or an NTP step could hold an alert source in backoff for an hour
+  of apparent time that never passed. Staleness deliberately stays on wall-clock
+  time, because a sleep gap is exactly what it exists to report.
+- **A crash no longer orphans `gh` children.** The handlers exited without
+  unmounting, so the cleanup that aborts in-flight subprocesses never ran. Both
+  the crash output and the `--verbose` log are now redacted, like `--doctor`
+  already was -- all three are artifacts users are told to attach to bug reports,
+  and `gh` error messages quote the URL they failed on.
+
+### Changed
+
+- **The spinner runs at 200ms rather than 100ms.** It is the single largest CPU
+  term in the app, because every frame makes ink rebuild and diff the whole
+  output string: measured 7.8% of a core at 100ms against 3.9% at 200ms, on a
+  0.33% idle floor. The motion is load-bearing -- it is the only thing separating
+  an executing run from a queued one -- so it is slowed, never stopped.
+- **Only an executing Actions row receives the spinner frame.** It went to every
+  visible row, so a prop changing several times a second defeated row
+  memoisation for all of them: 7,960 row renders over 20 seconds against 238.
+- **The panel names the repository** when it was chosen explicitly via `--repo`
+  or `GH_REPO` -- `╭─ Actions · acme/widget ─`. With several panes open, or after
+  changing directory, nothing on screen said which repository a pane was watching.
+  It is dropped before the tab name when the pane is too narrow for both.
+- **Column density is decided per tab.** One global breakpoint meant the widest
+  tab decided for the narrowest: Pull requests needs 61 columns and Security only
+  44, so Security dropped two columns a full 17 columns before it had to. Only
+  one tab is on screen at a time, so there is nothing to be inconsistent with.
+- **Below 24 columns the pane says "too narrow"** instead of rendering a table
+  that cannot fit. Under that width even the compact columns overflow, which
+  hard-wraps every row and drives ink into repainting the whole screen each
+  frame -- reachable just by dragging a sidebar narrow. Widening recovers
+  immediately.
+- **The Security tab collapses its not-enabled notes into one line.** Each
+  unavailable alert source took a full row above the column header, so any
+  repository without Advanced Security permanently spent two rows -- about a
+  tenth of a twenty-row pane -- restating a fact that will never change, on the
+  tab meant to make real alerts stand out. Failures that are not "not enabled"
+  keep their own lines, because those are actionable and transient.
+- **Alert ordering is pinned rather than left to each endpoint's default.**
+  Severity ranking runs over one page, so the page boundary decides what can be
+  ranked at all -- a critical alert sitting past it was never fetched, and the
+  pane showed "100+" with a screen of moderates. Newest-first at least makes the
+  cut deterministic.
+- **`-v` is no longer an alias for `--version`.** This CLI also has `--verbose`,
+  so `gh-glance -v 2>log` -- what you type when you want the log -- printed a
+  version string and exited 0. The argv surface exists to make typos fail loudly,
+  and this was the one flag that failed quietly. `--version` is unaffected.
+
+### Documentation
+
+- **Corrected a claim this project made about itself in 0.4.0 and repeated in the
+  0.4.1 release notes.** The status bar's `↑↓` glyphs were described as "a
+  deliberate, tested exception" whose double-width rendering "fails loudly" under
+  `npm run test:pty`. No such assertion exists or could: each hint truncates
+  individually, so the failure mode is silent text loss rather than overflow, and
+  at 80 columns the panel border is 79 cells against a 54-cell status bar, so the
+  bar never sets the maximum a width check would measure. The glyphs are fine;
+  the guarantee was not real, and a comment asserting coverage that does not
+  exist is worse than an acknowledged gap.
+- The README no longer claims every run state has a distinct glyph under
+  `NO_COLOR`. Timed-out, action-required and running share one, as do skipped,
+  neutral, stale and queued. The tab bar's `!` marker is what actually answers
+  "is CI red" without colour, and it does.
+- `eslint.config.js` no longer describes an inline `exhaustive-deps` suppression
+  that has never existed; the rule is now an error, which it can be precisely
+  because there is nothing to suppress.
+
 ## [0.4.1] - 2026-08-04
 
 Two fixes to the interactive surface: a selection marker that outlived its
@@ -329,6 +516,7 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
+[0.5.0]: https://github.com/juan294/gh-glance/releases/tag/v0.5.0
 [0.4.1]: https://github.com/juan294/gh-glance/releases/tag/v0.4.1
 [0.4.0]: https://github.com/juan294/gh-glance/releases/tag/v0.4.0
 [0.3.1]: https://github.com/juan294/gh-glance/releases/tag/v0.3.1

@@ -29,6 +29,12 @@ import {
   MIN_TABLE_WIDTH,
   OCT_NERD,
   OCT_UNICODE,
+  KEY_TABLE,
+  KEY_HINTS,
+  VERDICT_REMEDY,
+  RATE_LIMIT_RETRY_MS,
+  FAILURE_LADDER,
+  REPO_PATTERN,
 } from "../index.mjs";
 
 const ESC = String.fromCharCode(27);
@@ -293,4 +299,116 @@ test("the minimum-width guard is derived from the widest header", () => {
   // empty while the frame still looked correct.
   assert.ok(MIN_TABLE_WIDTH > 52, `guard must exceed the observed silent-failure band (got ${MIN_TABLE_WIDTH})`);
   assert.ok(MIN_TABLE_WIDTH < 80, "must not reject an ordinary 80-column terminal");
+});
+
+test("importing the app selects React's production build", async () => {
+  // Guards a fix that already cost one fatal OOM. React's development build
+  // records a PerformanceMeasure on every render and never releases them, which
+  // killed a long-running dashboard after roughly 90 minutes; the fix is the
+  // `process.env.NODE_ENV ??= "production"` on index.mjs's first line.
+  //
+  // It rests on two invariants nothing else checks. Line 23 must stay first, and
+  // react/ink must stay *dynamic* imports -- ES import declarations are hoisted
+  // and evaluated before any module-body statement, so a single innocuous
+  // `import { Box } from "ink"` at the top would load React before line 23 runs
+  // and silently select the development build. Asserting NODE_ENV is not enough,
+  // because line 23 sets it either way by the time the import settles; the build
+  // that actually loaded is the thing worth asserting.
+  //
+  // The discriminator is the size of React's client internals object: 4 keys in
+  // production, 12 in development (react 19.2.8). If a React upgrade changes the
+  // production shape this fails loudly here rather than silently in a user's
+  // terminal three hours in, which is the right place for that surprise.
+  // Imported dynamically, and deliberately not at the top of this file: a static
+  // `import React from "react"` is hoisted above the index.mjs import and would
+  // load react first, making this test fail for its own reason rather than the
+  // app's. Which is a fair demonstration of how easy the real regression is.
+  const React = (await import("react")).default;
+  const internals = React.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+  assert.ok(internals, "React client internals missing -- check the discriminator, not the app");
+  assert.equal(
+    Object.keys(internals).length,
+    4,
+    "React loaded its development build: NODE_ENV was read after react, " +
+      "or a static react/ink import was added above index.mjs's NODE_ENV default",
+  );
+});
+
+test("safe() strips bidi overrides without disturbing legitimate text", () => {
+  // A row must never display something other than its data. The C0 strip already
+  // closed the CR/LF/ESC versions of that; U+202A-U+202E and U+2066-U+2069 are
+  // the same attack by another route, and ink measures them as zero columns, so
+  // they cost no width and survived truncation untouched.
+  assert.equal(safe("harmless‮gnp.exe"), "harmlessgnp.exe");
+  assert.equal(safe("a⁦b⁩c"), "abc");
+  // Deleted, not replaced with a space: they measure zero, so substituting a
+  // space would ADD a visible column and shift every cell to its right.
+  assert.equal(Array.from(safe("ab‮cd")).length, 4);
+  // The things that must survive -- a sanitizer that ate these would be a worse
+  // bug than the one it fixes: real RTL, LRM, emoji, ZWJ sequences, CJK.
+  assert.equal(safe("مرحبا bug"), "مرحبا bug");
+  assert.equal(safe("a‎b"), "a‎b");
+  assert.equal(safe("ship \u{1F680}"), "ship \u{1F680}");
+  assert.equal(safe("\u{1F468}‍\u{1F469}‍\u{1F467}"), "\u{1F468}‍\u{1F469}‍\u{1F467}");
+  assert.equal(safe("修复错误"), "修复错误");
+});
+
+test("safe() sanitizes values that are not strings", () => {
+  // It used to return early for anything non-string, skipping both the control
+  // strip and the clamp -- so the guarantee was really being provided by
+  // GitHub's schema rather than by this function.
+  assert.equal(safe(["x[2Jy"]), "x [2Jy");
+  assert.equal(safe(null), "");
+  assert.equal(safe(undefined), "");
+  assert.equal(safe(5), "5");
+});
+
+test("REPO_PATTERN rejects dot segments but keeps real repository names", () => {
+  // `owner/..` reached apiPath() and produced `repos/owner/../dependabot/alerts`;
+  // gh forwards the dot segment unnormalized and GitHub resolves it server-side
+  // to a different endpoint entirely.
+  for (const bad of ["owner/..", "owner/.", "owner/...", "owner/x.git"]) {
+    assert.ok(!REPO_PATTERN.test(bad), `${bad} must be rejected`);
+  }
+  // Dots are legal inside names -- .github is a real and widely used repository,
+  // and over-tightening here would be a worse bug than the one being fixed.
+  for (const good of ["cli/cli", "owner/.github", "owner/docs.example.com", "o/a.b.c"]) {
+    assert.ok(REPO_PATTERN.test(good), `${good} must be accepted`);
+  }
+});
+
+test("every verdict with a remedy also has a backoff ladder, and vice versa", () => {
+  // The two tables are read together on every failure: one picks what the user
+  // is told, the other picks how hard we keep asking. A verdict in one and not
+  // the other means a tab that either explains itself and then hammers, or backs
+  // off in silence. "other" is in neither, deliberately -- an unclassified
+  // failure shows its real message and retries on the next tick.
+  assert.deepEqual(Object.keys(VERDICT_REMEDY).sort(), Object.keys(FAILURE_LADDER).sort());
+  assert.ok(!("other" in VERDICT_REMEDY));
+  assert.ok(!("ok" in FAILURE_LADDER));
+  // Short and flat: a rate limit clears on GitHub's own schedule, so the
+  // hour-long unavailable ladder would leave the pane blank long after the cause
+  // was gone.
+  assert.equal(RATE_LIMIT_RETRY_MS.length, 1);
+  assert.ok(RATE_LIMIT_RETRY_MS[0] <= BACKOFF_STEPS_MS[0]);
+});
+
+test("the status bar hints are a subset of the documented key table", () => {
+  // KEY_TABLE feeds both --help and the `?` overlay; KEY_HINTS is the short
+  // subset shown on the status bar. Nothing else enforces that they agree.
+  // Matched on the action, not the glyph: the bar renders "Move: ↑↓" where the
+  // table says "Up / Down, j / k", and those are two representations of one
+  // binding rather than a drift. What must not happen is the bar advertising an
+  // action the table never explains.
+  const documented = KEY_TABLE.map(([, desc]) => desc.toLowerCase()).join(" | ");
+  for (const hint of KEY_HINTS) {
+    assert.ok(
+      documented.includes(hint.label.toLowerCase()),
+      `status bar advertises "${hint.label}" but the key table documents no such action`,
+    );
+  }
+  assert.ok(
+    KEY_TABLE.some(([keys]) => keys === "?"),
+    "the overlay's own key must be listed in the table it renders",
+  );
 });

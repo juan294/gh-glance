@@ -74,7 +74,15 @@ const LIST_LIMIT = 150;
 // page. The previous --paginate walked the repo's entire alert history --
 // mostly closed alerts -- and then discarded them client-side.
 const ALERT_PER_PAGE = 100;
-const ALERT_QUERY = `?state=open&per_page=${ALERT_PER_PAGE}`;
+// Ordering is pinned rather than left to each endpoint's default. Severity
+// sorting happens client-side over whatever this returns, so on a repo with more
+// than a page of open alerts the *page boundary* decides what can be ranked at
+// all -- a critical alert sitting 150th by some endpoint's arbitrary default was
+// simply never fetched, and the pane showed "100+" with a screen of moderates.
+// Newest-first at least makes the cut deterministic and explainable, and it
+// survives GitHub changing a default underneath us. All three endpoints accept
+// these parameters.
+const ALERT_QUERY = `?state=open&per_page=${ALERT_PER_PAGE}&sort=created&direction=desc`;
 
 // Inactive tabs only feed the tab-bar counts, so they refresh every Nth tick
 // rather than every tick. Raised from 4 to 12 (a 60s cycle at the default
@@ -116,6 +124,16 @@ const BACKOFF_STEPS_MS = [60_000, 300_000, 1_800_000, 3_600_000];
 // night costs -- two probes a minute per endpoint rather than one per tick.
 const AUTH_RETRY_MS = [30_000];
 
+// A rate limit is the third shape: it clears on GitHub's schedule, usually
+// within the hour, and continuing to hammer is actively counterproductive --
+// the secondary limiter keys on sustained request rate against a token that is
+// already limited, so re-asking every tick can turn a self-clearing primary
+// limit into a longer block, and the block applies to the *token*, not to this
+// tool. A wedged pane could therefore degrade `git push` and everything else.
+// One minute, flat: long enough to stop amplifying, short enough that the pane
+// is current again well before a reset the user never notices.
+const RATE_LIMIT_RETRY_MS = [60_000];
+
 // Past this, the active tab's data is old enough to say so. Deliberately
 // coarse: `now` only advances on minute boundaries when nothing is in progress,
 // so a minute-granular staleness label costs zero extra redraws, whereas a
@@ -149,7 +167,14 @@ const TAB_KEYS = ["actions", "issues", "prs", "security"];
 // dots per frame, reading as a filled blob that matches the circle icons'
 // visual weight while staying in the same width-1 braille block.
 const SPINNER = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
-const SPINNER_MS = 100;
+// 200ms, not 100: the spinner is the single largest CPU term in the app, because
+// every frame makes ink rebuild and diff the whole output string. Measured on a
+// 40-row pane: 100ms costs 7.8% of a core and 9.8 MB/hr of terminal writes,
+// 200ms costs 3.9% and 5.2 MB/hr, against a 0.33% idle floor. The motion is
+// load-bearing -- it is the only thing separating an executing run from a queued
+// one (see RUN_RUNNING_STATIC) -- so it may be slowed but never stopped. Eight
+// frames at 200ms is a 1.6s cycle, still well inside one refresh.
+const SPINNER_MS = 200;
 
 // Motion opt-out. This pane is designed to sit in peripheral vision for hours,
 // which is exactly where repetitive motion is most costly for users with
@@ -176,15 +201,27 @@ const ANIMATE = !process.env.GH_GLANCE_NO_ANIMATION;
 // on the composed output stream, which would strip ink's own SGR codes, the
 // box-drawing in PanelEdge, and the alternate-screen escapes, i.e. the whole UI.
 //
-// Strip C0, DEL and C1 only. Emoji (including ZWJ sequences and variation
+// Strip C0, DEL, C1 -- and the explicit bidi overrides/isolates. Emoji (including ZWJ sequences and variation
 // selectors), CJK and other wide characters, combining marks and RTL text must
 // survive untouched -- ink's width arithmetic depends on measuring them
 // correctly, and the app's own Nerd Font glyphs live in the private use area, so
 // anything shaped like "strip non-ASCII" would erase every status icon on
 // screen. Control runs collapse to a single space rather than being deleted, so
 // "a\nb" reads as "a b" rather than "ab".
+//
+// U+202A-U+202E and U+2066-U+2069 (LRE/RLE/PDF/LRO/RLO and the isolates) are
+// stripped in a *separate* pass because they must be deleted rather than
+// collapsed to a space: ink measures them as zero columns, so replacing one with
+// a space would add a visible column and shift every cell to its right -- the
+// exact desync this file works to avoid. Without this, one RLO in an issue title
+// makes the rest of that cell render reversed on any terminal with bidi
+// reordering, so the row displays something other than its data. Deliberately
+// NOT extended to U+200E/U+200F or to general category Cf: those are how
+// legitimate mixed-direction Arabic and Hebrew titles render correctly, and
+// preserving real RTL text is a stated property of this function.
 // eslint-disable-next-line no-control-regex -- matching control characters is the entire purpose
 const CONTROL_CHARS = /[ --]+/g;
+const BIDI_OVERRIDES = /[‪-‮⁦-⁩]/g;
 
 // Titles are rendered at whatever length GitHub returns, and ink memoizes
 // wrapped text in a module-level cache it never evicts -- so unbounded remote
@@ -196,8 +233,14 @@ const CONTROL_CHARS = /[ --]+/g;
 const MAX_FIELD_LENGTH = 300;
 
 function safe(value) {
-  if (typeof value !== "string") return value == null ? "" : String(value);
-  const cleaned = value.replace(CONTROL_CHARS, " ").trim();
+  // Coerce first, sanitize always. Returning a non-string early skipped both the
+  // control-character strip and the length clamp, so an array or an object with a
+  // toString() came through untouched -- `safe(["[2Jx"])` returned the escape
+  // verbatim. GitHub returns strings for every field this is called on today, so
+  // the guarantee was being provided by the upstream schema rather than by the
+  // function that claims to provide it.
+  const value_ = typeof value === "string" ? value : value == null ? "" : String(value);
+  const cleaned = value_.replace(BIDI_OVERRIDES, "").replace(CONTROL_CHARS, " ").trim();
   const points = Array.from(cleaned);
   return points.length > MAX_FIELD_LENGTH ? points.slice(0, MAX_FIELD_LENGTH).join("") : cleaned;
 }
@@ -326,6 +369,26 @@ function classify(err) {
   return "other";
 }
 
+// What to put on screen for a verdict, in the voice the preflight already uses:
+// say what to do, not what the subprocess printed. The three tabs built on list
+// commands used to render raw `gh` stderr, so the failures people actually hit --
+// expired auth, a rate limit, a dropped network -- arrived as an untranslated
+// fragment of somebody else's CLI with no statement of what to do about it,
+// while the alert path one tab over had been classifying and translating all
+// along.
+//
+// `other` is deliberately absent. It is the unclassified bucket, and the raw
+// message is the most useful thing available for it -- inventing a remedy for a
+// failure nobody recognised would be worse than showing what happened. That
+// matters more than it looks: AUTH_MARKERS is deliberately broad, and a false
+// positive that only picked a retry ladder was cheap, whereas one that also
+// rewrites the on-screen text turns into a confidently wrong instruction.
+const VERDICT_REMEDY = {
+  "auth-problem": "GitHub authorization failed -- try `gh auth login` or `gh auth refresh`",
+  "rate-limited": "GitHub rate limit reached -- backing off, this clears on its own",
+  unavailable: "not available for this repository",
+};
+
 // Some pty wrappers (and a terminal mid-resize) report a size of 0 or
 // undefined. Taking that literally collapses the table to a single row (or
 // draws a zero-width border), so fall back to sane defaults until real
@@ -358,17 +421,52 @@ const GH_ENV_OVERRIDES = {
   GH_PAGER: "cat",
 };
 
+// The single redaction boundary for everything this process prints outside the
+// dashboard: the --verbose log, the crash handler's stack, and the --doctor
+// report. Declared here, above all three, rather than beside runDoctor() -- it
+// used to sit in the Diagnostics section and be reached backwards by hoisting.
+//
+// Token shapes and URL userinfo only. gh error messages quote the URL they
+// failed on, so that is a real path for a credential to arrive in output a user
+// is invited to paste into a bug report.
+function redact(text) {
+  return String(text)
+    .replace(/gh[pousr]_[A-Za-z0-9]{16,}/g, "<redacted-token>")
+    .replace(/github_pat_[A-Za-z0-9_]{16,}/g, "<redacted-token>")
+    .replace(/\/\/[^/\s:@]+:[^/\s@]+@/g, "//<redacted>@");
+}
+
 // Verbose output goes to stderr and never to stdout: stdout is ink's frame
 // stream, and writing anything else into it corrupts the diff and the
 // alternate-screen state. The argv block refuses --verbose while stderr is still
 // a terminal, so these lines always land in a file rather than on top of the
 // dashboard.
+//
+// The outcome is redacted for the same reason --doctor redacts its report: on a
+// failure it carries gh's own stderr, and gh error messages quote the URL they
+// failed on -- which is a real path for a token or a proxy credential to arrive
+// here. The README tells users to run `--verbose 2>gh-glance.log` and attach the
+// result to a bug report, so this is one of the three artifacts that leave the
+// machine, and it was the only one with no redaction boundary.
 function logGh(args, startedAt, outcome) {
   if (!runtime.verbose) return;
   const ms = Date.now() - startedAt;
   process.stderr.write(
-    `${new Date().toISOString()} gh ${args.join(" ")} -- ${outcome} in ${ms}ms\n`,
+    `${new Date().toISOString()} gh ${args.join(" ")} -- ${redact(outcome)} in ${ms}ms\n`,
   );
+}
+
+// The poll loop's AbortController, published here so the crash handlers can
+// reach it. A module-level handle rather than a ref because the crash path runs
+// outside React entirely -- there is no component left to read a ref from. Kept
+// in this section, above every consumer, so nothing has to reach downward for it.
+let liveAbort = null;
+function registerLiveAbort(controller) {
+  liveAbort = controller;
+}
+function abortLiveRequests() {
+  liveAbort?.abort();
+  liveAbort = null;
 }
 
 async function runGh(args, { signal } = {}) {
@@ -611,11 +709,15 @@ function backoffActive(key, now) {
   return Boolean(state) && now < state.until;
 }
 
-// Which ladder each verdict takes. "rate-limited" and "other" are absent on
-// purpose: a rate limit clears on its own schedule and a network drop clears
-// when the network does, so both keep today's behaviour of re-asking every tick
-// with the real message on screen.
-const FAILURE_LADDER = { unavailable: BACKOFF_STEPS_MS, "auth-problem": AUTH_RETRY_MS };
+// Which ladder each verdict takes. "other" stays absent on purpose: a network
+// drop clears when the network does, and re-asking every tick is how the pane
+// comes back the moment it does. "rate-limited" used to be absent for the same
+// stated reason, which had it backwards -- see RATE_LIMIT_RETRY_MS.
+const FAILURE_LADDER = {
+  unavailable: BACKOFF_STEPS_MS,
+  "auth-problem": AUTH_RETRY_MS,
+  "rate-limited": RATE_LIMIT_RETRY_MS,
+};
 
 // The ladder is a parameter rather than a second near-identical function,
 // which is the drift the ALERT_SOURCES comment below warns about: two copies of
@@ -632,8 +734,11 @@ function clearBackoff(key) {
 
 async function fetchAlertSource(source, signal, now) {
   if (backoffActive(source.key, now)) {
-    const note = alertBackoff.get(source.key).note;
-    return { raw: `backoff:${note}`, parse: () => ({ alerts: [], note, truncated: false }) };
+    const { note, verdict } = alertBackoff.get(source.key);
+    // The verdict is replayed alongside the note. Replaying only the note left
+    // the tab unable to tell "Dependabot is switched off here" from "we cannot
+    // see Dependabot" for the whole length of a backoff window.
+    return { raw: `backoff:${note}`, parse: () => ({ alerts: [], note, verdict, truncated: false }) };
   }
   try {
     const raw = await runGh(alertArgs(source), { signal });
@@ -645,6 +750,7 @@ async function fetchAlertSource(source, signal, now) {
         return {
           alerts: rows.map(source.map),
           note: null,
+          verdict: "ok",
           truncated: rows.length >= ALERT_PER_PAGE,
         };
       },
@@ -659,9 +765,12 @@ async function fetchAlertSource(source, signal, now) {
     const steps = pick(FAILURE_LADDER, verdict, null);
     if (steps) {
       recordFailure(source.key, now, steps);
-      alertBackoff.get(source.key).note = note;
+      Object.assign(alertBackoff.get(source.key), { note, verdict });
     }
-    return { raw: `unavailable:${note}`, parse: () => ({ alerts: [], note, truncated: false }) };
+    return {
+      raw: `unavailable:${note}`,
+      parse: () => ({ alerts: [], note, verdict, truncated: false }),
+    };
   }
 }
 
@@ -678,7 +787,14 @@ function severityRank(severity) {
 }
 
 async function fetchSecurity(signal) {
-  const now = Date.now();
+  // Monotonic, not wall-clock. These deadlines measure *elapsed* time, and
+  // Date.now() can jump: a laptop resume or an NTP correction stepping the clock
+  // backwards would hold an alert source in backoff for up to an hour of apparent
+  // time that never passed -- on a security surface, which is exactly what the
+  // capped ladder exists to prevent. Staleness deliberately stays on Date.now()
+  // for the mirror-image reason: a sleep gap is the thing it reports, and
+  // performance.now() does not advance across suspend.
+  const now = performance.now();
   const parts = await Promise.all(ALERT_SOURCES.map((s) => fetchAlertSource(s, signal, now)));
   return {
     // Joined with a NUL so a change in any one of the three shows up as a
@@ -697,6 +813,15 @@ async function fetchSecurity(signal) {
       return {
         alerts,
         notes: parsed.map((p) => p.note).filter(Boolean),
+        // "Blind" is not the same as "switched off", and the tab bar could not
+        // tell them apart: fetchAlertSource never rejects, so a repo whose three
+        // endpoints all 403'd on an expired SAML session rendered
+        // `4:Security (0)` -- byte-identical to a genuinely clean repo, on the
+        // one surface where a false all-clear is the worst possible answer.
+        // `unavailable` is excluded deliberately: that verdict IS an answer about
+        // the repository, and most repos have Advanced Security switched off, so
+        // treating it as blindness would mark almost everyone permanently unsure.
+        blind: parsed.some((p) => p.verdict != null && p.verdict !== "ok" && p.verdict !== "unavailable"),
         truncated: parsed.some((p) => p.truncated),
       };
     },
@@ -779,19 +904,9 @@ async function preflight() {
 // makes it a disclosure surface before it is anything else. So redaction is not
 // a review note applied per call site -- it is applied once, at the single point
 // where the report is assembled, the same way safe() is the one boundary for
-// untrusted remote strings rather than six.
-//
-// Token shapes are gh's own prefixes (gho_/ghp_/ghu_/ghs_/ghr_ and
-// github_pat_). URL userinfo covers a proxy variable, a git remote with an
-// embedded credential, and anything else that carries `user:password@` -- gh
-// error messages quote the URL they failed on, so that is a real path for one
-// to arrive here.
-function redact(text) {
-  return String(text)
-    .replace(/gh[pousr]_[A-Za-z0-9]{16,}/g, "<redacted-token>")
-    .replace(/github_pat_[A-Za-z0-9_]{16,}/g, "<redacted-token>")
-    .replace(/\/\/[^/\s:@]+:[^/\s@]+@/g, "//<redacted>@");
-}
+// untrusted remote strings rather than six. redact() itself now lives up in the
+// gh subprocess section, because the --verbose log and the crash handler need it
+// too and nothing should reach backwards for it.
 
 // Values that are the thing being diagnosed, so they are printed as-is.
 const DOCTOR_ENV_PLAIN = [
@@ -805,10 +920,9 @@ const DOCTOR_ENV_PLAIN = [
   "NODE_ENV",
 ];
 const DOCTOR_ENV_PROXY = ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"];
-// Reported as present or absent and never printed, not even a prefix. Matched
-// by name so a variable nobody listed here -- GITHUB_EMU_TOKEN, some wrapper's
-// GH_API_KEY -- is still caught by shape rather than by having been foreseen.
-const SECRET_NAME = /_(TOKEN|SECRET|PASSWORD|KEY)$/i;
+// Listed so they always get a line even when unset -- the absence of GH_TOKEN is
+// itself a diagnosis. Their values are never printed; see envValue(), where
+// presence-only is the default for everything outside DOCTOR_ENV_PLAIN.
 const DOCTOR_ENV_SECRET = ["GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_TOKEN"];
 
 const NOT_SET = "not set";
@@ -839,12 +953,21 @@ function doctorEnvNames() {
   return [...named, ...extra];
 }
 
+// Presence-only is the DEFAULT; printing a value is the opt-in, and the opt-in
+// list is curated above. This was the other way round -- print unless the *name*
+// ended in _TOKEN/_SECRET/_PASSWORD/_KEY -- which meant the discovery loop above
+// harvested variables nobody had reviewed and printed them in full. Verified
+// leaks under the old rule: GH_APP_PEM (a whole RSA private key), GITHUB_OAUTH,
+// GITHUB_PAT, GH_COOKIE, GH_CREDENTIALS. redact() only catches GitHub *token*
+// shapes, so anything else sailed through. This report is advertised as safe to
+// paste into a bug report, so the failure mode has to be a less useful line, not
+// a disclosed credential.
 function envValue(name) {
   const value = process.env[name];
-  if (SECRET_NAME.test(name)) return value ? "set" : NOT_SET;
   if (!value) return NOT_SET;
   if (DOCTOR_ENV_PROXY.includes(name)) return proxySummary(value);
-  return value;
+  if (DOCTOR_ENV_PLAIN.includes(name)) return value;
+  return "set";
 }
 
 // gh writes some of this to stdout and some to stderr depending on version and
@@ -916,6 +1039,58 @@ function targetSource() {
   return "git remote (or none, if this is not a checkout)";
 }
 
+// How much of the hourly API budget is left, and roughly how fast this
+// configuration spends it. The steady-state cost is not small and was invisible:
+// at the default 5s refresh with the Security tab open it is around 2,200 REST
+// requests an hour -- about 44% of a personal token's 5,000 -- and `--refresh 2`
+// projects past the limit outright, so it exhausts inside the hour, every hour.
+// The budget is shared with everything else the token does, so the first symptom
+// is usually "GitHub is broken" somewhere else entirely.
+//
+// `gh api rate_limit` is documented as not counting against the limit, and it
+// measures as free (verified: delta 0), so this is safe to run on a diagnostic
+// path. GHES tenants can be configured with a different ceiling, which is
+// exactly why this reports the server's own numbers rather than asserting 5,000.
+async function rateBudget() {
+  try {
+    const raw = await runGh(["api", "rate_limit"]);
+    const { resources } = JSON.parse(raw);
+    // formatAge() is for timestamps in the past and returns "-" for a future one,
+    // so the reset is rendered as a forward interval instead.
+    const fmt = (r) => {
+      if (!r) return "(absent)";
+      const inMs = r.reset * 1000 - Date.now();
+      const resets = inMs > 0 ? `resets in ${formatDuration(inMs)}` : "reset due";
+      return `${r.remaining}/${r.limit} left, ${resets}`;
+    };
+    return { core: fmt(resources?.core), graphql: fmt(resources?.graphql) };
+  } catch (err) {
+    return { core: `unavailable (${shortErr(err)})`, graphql: "unavailable" };
+  }
+}
+
+// Requests per hour this configuration will spend once it settles, derived from
+// the same constants the poll loop uses rather than from a number written down
+// once and left to rot. The active tab refreshes every tick; the other three
+// every BACKGROUND_EVERY ticks. Security is three REST calls per fetch, Actions
+// one, and Issues/PRs go to GraphQL instead (two POSTs each, because --search
+// routes through the search connection).
+function projectedHourlyCost(activeKey) {
+  const perHour = 3_600_000 / runtime.refreshMs;
+  const restCalls = { actions: 1, issues: 0, prs: 0, security: ALERT_SOURCES.length };
+  const graphqlCalls = { actions: 0, issues: 2, prs: 2, security: 0 };
+  let rest = 0;
+  let graphql = 0;
+  // TAB_KEYS rather than TABS: this runs on the --doctor path, which deliberately
+  // returns before the render tree is reached, and TABS is declared down there.
+  for (const key of TAB_KEYS) {
+    const ticks = key === activeKey ? perHour : perHour / BACKGROUND_EVERY;
+    rest += ticks * restCalls[key];
+    graphql += ticks * graphqlCalls[key];
+  }
+  return { rest: Math.round(rest), graphql: Math.round(graphql) };
+}
+
 async function runDoctor() {
   // A live backoff would make an alert probe silently skip and report nothing,
   // which is the opposite of what a diagnostic run is for.
@@ -931,10 +1106,11 @@ async function runDoctor() {
   // allSettled, and every probe already resolves rather than rejects, so one
   // slow endpoint cannot suppress the other five. runGh's own GH_TIMEOUT_MS
   // bounds each one.
-  const [ghVersion, authStatus, remote, results] = await Promise.all([
+  const [ghVersion, authStatus, remote, budget, results] = await Promise.all([
     captureGh(["--version"]),
     captureGh(["auth", "status"]),
     gitRemote(),
+    rateBudget(),
     Promise.all(probes.map(([name, args]) => probe(name, args))),
   ]);
 
@@ -953,6 +1129,18 @@ async function runDoctor() {
     field("host", runtime.host ?? "(default -- gh infers it)"),
     field("slug", runtime.repo ?? "(inferred from the working directory)"),
     field("git remote", remote),
+    "",
+    ...section("API budget"),
+    field("REST core", budget.core),
+    field("GraphQL", budget.graphql),
+    field(
+      "this config spends",
+      (() => {
+        const active = TAB_KEYS[runtime.initialTabIndex] ?? TAB_KEYS[0];
+        const { rest, graphql } = projectedHourlyCost(active);
+        return `~${rest} REST + ~${graphql} GraphQL per hour (refresh ${runtime.refreshMs / 1000}s, "${active}" active)`;
+      })(),
+    ),
     "",
     ...section("Environment"),
     ...doctorEnvNames().map((name) => field(name, envValue(name))),
@@ -988,7 +1176,19 @@ async function runDoctor() {
 // path would be a request-forgery primitive against arbitrary endpoints -- so it
 // is validated once, here at the boundary, against exactly what GitHub allows in
 // an owner or repository name.
-const REPO_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\/[A-Za-z0-9._-]+$/;
+//
+// The name half requires at least one character that is not a dot. Without that
+// it accepted `owner/..`, which `apiPath()` spliced into
+// `repos/owner/../dependabot/alerts` -- and gh forwards the dot segment
+// unnormalized, so GitHub resolves it server-side to a *different endpoint*
+// (verified: it lands on Get-a-repository). The value is operator-supplied, so
+// this was never a cross-user vulnerability, but it broke the one invariant the
+// comment above claims. A trailing `.git` is rejected for the same reason: it is
+// not a name GitHub issues, so accepting it can only mean someone pasted a clone
+// URL's tail. Names that merely *contain* or *start with* a dot stay valid --
+// `owner/.github` and `owner/docs.example.com` are both real.
+const REPO_PATTERN =
+  /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\/(?=[A-Za-z0-9._-]*[A-Za-z0-9_-])(?!.*\.git$)[A-Za-z0-9._-]+$/;
 
 // A dot is mandatory, and that is the safety property rather than a nicety.
 // Without it "owner/name/extra" -- already in the hostile-input list -- would
@@ -1055,8 +1255,13 @@ function parseArgs(argv) {
       return argv[i];
     };
 
+    // No `-v`. It used to mean --version, which is the conventional reading, but
+    // this CLI also has --verbose -- so `gh-glance -v 2>log`, which is what you
+    // type when you want the log, printed a version string and exited 0. That is
+    // the one argv path that failed quietly in a surface built to fail loudly.
+    // Unknown now, so it exits 2 and points at --help.
     if (arg === "--help" || arg === "-h") opts.help = true;
-    else if (arg === "--version" || arg === "-v") opts.showVersion = true;
+    else if (arg === "--version") opts.showVersion = true;
     else if (arg === "--verbose") opts.verbose = true;
     else if (arg === "--doctor") opts.doctor = true;
     else if (arg === "--repo" || arg === "-R" || arg.startsWith("--repo=")) {
@@ -1111,6 +1316,24 @@ function validateArgs(opts, tabKeys) {
 
 const { version } = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"));
 
+// The one key table. --help renders it, the `?` overlay renders it, and the
+// status bar's KEY_HINTS is the deliberately short subset of it -- so a binding
+// added in one place cannot go missing from the others, which is the same rule
+// this file already applies to argv vectors and to classify().
+const KEY_TABLE = [
+  ["1 2 3 4", "Actions / Issues / Pull requests / Security"],
+  ["Left / Right", "Previous / next tab"],
+  ["Tab / Shift+Tab", "Next / previous tab"],
+  ["Up / Down, j / k", "Move the cursor between rows"],
+  ["PgUp / PgDn", "Move a page at a time"],
+  ["Enter", "Open the selected item in your browser"],
+  ["r", "Refresh the current tab now"],
+  ["?", "Show the keys (any key closes it)"],
+  ["q / Esc / Ctrl+C", "Quit"],
+];
+const KEY_COL = Math.max(...KEY_TABLE.map(([k]) => k.length)) + 3;
+const keyTableLines = () => KEY_TABLE.map(([k, d]) => `${k.padEnd(KEY_COL)}${d}`);
+
 const HELP = `gh-glance ${version} -- a live-refreshing GitHub dashboard for a narrow terminal pane.
 
 Usage:
@@ -1156,14 +1379,9 @@ Status icons are GitHub Octicons and need a Nerd Font. Without one, set
 GH_GLANCE_ICONS=unicode for plain-unicode equivalents.
 
 Keys:
-  1 2 3 4            Actions / Issues / Pull requests / Security
-  Left / Right       Previous / next tab
-  Tab / Shift+Tab    Next / previous tab
-  Up / Down, j / k   Move the cursor between rows
-  PgUp / PgDn        Move a page at a time
-  Enter              Open the selected item in your browser
-  r                  Refresh the current tab now
-  q / Esc / Ctrl+C   Quit
+${keyTableLines()
+  .map((line) => `  ${line}`)
+  .join("\n")}
 
 The cursor clears itself after 60s with no movement.
 
@@ -1175,6 +1393,7 @@ Environment:
   GH_GLANCE_ICONS=unicode   Plain-unicode status icons (no Nerd Font needed)
   GH_GLANCE_NO_ANIMATION=1  Freeze the spinner (no motion)
   NO_COLOR=1                Disable colour (status stays readable)
+  INK_SCREEN_READER=true    Linear, unthrottled rendering (unverified -- see README)
 `;
 
 // argv and the TTY guard run *before* react and ink are imported. Loading ink
@@ -1196,6 +1415,20 @@ if (IS_MAIN) {
     process.exit(2);
   }
 
+  // One place argv becomes runtime state. It used to be two -- the --doctor
+  // branch set repo and host, the dashboard path set all five -- and they had
+  // already drifted: `--doctor --verbose` was accepted and silently dropped, so
+  // the one flag that shows what was actually sent to gh did nothing on the one
+  // command built to explain what gh-glance is doing. Same for --refresh and
+  // --tab. Applying everything up front cannot corrupt the doctor path, which
+  // never renders with ink; the --verbose TTY refusal below stays *below* the
+  // doctor branch on purpose, since that combination is useful and harmless.
+  runtime.repo = opts.repo;
+  runtime.host = opts.host;
+  runtime.verbose = opts.verbose;
+  if (opts.refreshMs !== null) runtime.refreshMs = opts.refreshMs;
+  if (opts.tabKey !== null) runtime.initialTabIndex = TAB_KEYS.indexOf(opts.tabKey);
+
   // Checked after parsing rather than before, so `gh-glance --repo` with no
   // value reports the missing value rather than silently printing help.
   if (opts.help) {
@@ -1211,11 +1444,8 @@ if (IS_MAIN) {
   // here on purpose -- ahead of the non-TTY refusal, because the whole point is
   // `gh-glance --doctor > report.txt`, and ahead of preflight(), because a
   // missing gh and a cwd outside a repository are exactly the conditions worth
-  // reporting rather than exiting 3 over. The repo target is applied first so
-  // the probes exercise the real one.
+  // reporting rather than exiting 3 over.
   if (opts.doctor) {
-    runtime.repo = opts.repo;
-    runtime.host = opts.host;
     console.log(await runDoctor());
     process.exit(0);
   }
@@ -1232,12 +1462,6 @@ if (IS_MAIN) {
     );
     process.exit(2);
   }
-
-  runtime.repo = opts.repo;
-  runtime.host = opts.host;
-  runtime.verbose = opts.verbose;
-  if (opts.refreshMs !== null) runtime.refreshMs = opts.refreshMs;
-  if (opts.tabKey !== null) runtime.initialTabIndex = TAB_KEYS.indexOf(opts.tabKey);
 
   // This is a full-screen live dashboard, not a reporting command -- piping it
   // somewhere would emit an endless stream of redraw frames, so fail fast with
@@ -1319,7 +1543,15 @@ const OCT_UNICODE = {
   shield: "s",
 };
 
-const OCT = process.env.GH_GLANCE_ICONS === "unicode" ? OCT_UNICODE : OCT_NERD;
+// Whether the private-use glyphs are in play. There is no way to ask a terminal
+// whether it can draw them -- the only honest probe is writing one and reading
+// the cursor back, which hangs on terminals that never answer -- so instead the
+// app says, once, where the escape hatch is. Without a Nerd Font every icon is a
+// blank box, which reads as "this program is broken" rather than "install a
+// font", and the remedy currently lives only in --help and the README: both of
+// which require quitting the full-screen app you are trying to evaluate.
+const USING_NERD_ICONS = process.env.GH_GLANCE_ICONS !== "unicode";
+const OCT = USING_NERD_ICONS ? OCT_NERD : OCT_UNICODE;
 
 // ---------- Shared layout primitives ----------
 
@@ -1482,7 +1714,7 @@ const RUN_PENDING_ICON = { icon: OCT.dotFill, color: ATTENTION, label: "queued" 
 const RUN_RUNNING_STATIC = { icon: OCT.alertFill, color: ATTENTION, label: "running" };
 
 // Remote strings index these tables, and a plain object literal answers
-// inherited keys -- `SEVERITY_COLOR["constructor"]` returned a function, which
+// inherited keys -- `SEVERITY_STYLE["constructor"]` returned a function, which
 // reaches ink's colour prop and throws, killing the render. `??` cannot catch
 // that, because an inherited value is not nullish. Code-scanning severity comes
 // from uploaded SARIF, so it is genuinely attacker-influenced.
@@ -1759,7 +1991,7 @@ const MIN_COMPACT_WIDTH = Math.max(...TABS.map((t) => minimumWidthFor(t.compactH
 const TAB_LABEL_FULL_WIDTH = 78;
 const TAB_LABEL_HYSTERESIS = 4;
 
-function TabBar({ activeIndex, counts, firstLoad, failed, spin, useShort }) {
+function TabBar({ activeIndex, counts, brokenCI, firstLoad, failed, spin, useShort }) {
   return e(
     Box,
     { flexDirection: "row" },
@@ -1768,7 +2000,12 @@ function TabBar({ activeIndex, counts, firstLoad, failed, spin, useShort }) {
       const count = counts[tab.key];
       // A tab that has never resolved shows the spinner where its count will
       // go, so the first load reads as "working" rather than "empty".
-      const suffix = count == null ? (firstLoad[tab.key] ? ` ${spin}` : "") : ` (${count})`;
+      const suffix =
+        count == null
+          ? firstLoad[tab.key]
+            ? ` ${spin}`
+            : ""
+          : ` (${count}${brokenCI[tab.key] ? "!" : ""})`;
       const name = useShort ? tab.short : tab.label;
       // Bold and inverse are both stripped at chalk level 0 (NO_COLOR, or a
       // dumb terminal), which left no indication at all of which tab was
@@ -1806,10 +2043,16 @@ function TabBar({ activeIndex, counts, firstLoad, failed, spin, useShort }) {
 // two columns in its width model, and a status bar built from them overflowed
 // an 80-column terminal by six columns once selection added a hint. Same trap
 // the unicode icon table already documents -- prefer strictly narrow ASCII
-// over pretty-but-ambiguous. The arrow pair is a deliberate, tested exception:
-// `npm run test:pty` asserts the rendered frame stays within the terminal
-// width, so a font/terminal combo that renders them double-width fails loudly
-// there instead of silently shifting columns.
+// over pretty-but-ambiguous. The arrow pair is a deliberate exception, and it
+// is NOT covered by a width assertion -- an earlier version of this comment
+// claimed `npm run test:pty` would catch a double-width rendering, and that was
+// wrong twice over. Each hint is wrap: "truncate-end", so the failure mode is
+// silent text loss rather than overflow, which no width check can see; and at 80
+// columns the panel border is 79 cells against a 54-cell status bar, so the bar
+// is not what sets the maximum anyway -- the arrows would have to add 25 columns
+// to move it, not 2. What actually bounds the risk is that there are two of
+// them and the compact breakpoint below keeps the whole set inside the frame.
+// Anything wider added here needs its own check, not this comment's assurance.
 //
 // Tab switching is not listed: the tab bar already renders "1:Actions", so the
 // digits document themselves, and the arrow keys are in --help. The hints that
@@ -1825,17 +2068,41 @@ const KEY_HINTS = [
 // finishes. Wide enough for the spinner, a space and "Fetching".
 const FETCHING_WIDTH = 12;
 
+// Width the full hint set needs: every "Label: keys" plus a " | " between each.
+// Derived from KEY_HINTS rather than written down, for the same reason
+// minimumWidthFor() derives the table breakpoint from its header descriptors --
+// a copy change must not be able to invalidate the number.
+const HINTS_FULL_WIDTH =
+  KEY_HINTS.reduce((sum, h) => sum + h.label.length + 2 + [...h.keys].length, 0) +
+  (KEY_HINTS.length - 1) * 3;
+// Compact drops the labels and keeps the keys, separated by a space:
+// "↑↓ Ent r q". No constant for its width -- nothing branches on it, and the
+// keys are short enough that it fits anywhere the frame itself does.
+//
+// The band where the full set fits. Below it the bar was the one part of the
+// layout with no width awareness -- the table swaps to a compact header, the tab
+// bar swaps to short labels, the panel edges drop their labels, and the status
+// bar just let ink truncate. Because each hint is wrap: "truncate-end", the
+// failure was silent text loss rather than overflow: at 45 columns the rendered
+// bar read "Move: | Open:  | Refresh |Quit:…" -- the arrows gone, Refresh
+// missing its key, and Quit, the last entry, first to be cut. That is the one
+// hint a confused first-time user needs, in a full-screen alternate-screen app.
+const STATUS_FULL_WIDTH = FETCHING_WIDTH + HINTS_FULL_WIDTH;
+
 // Two tones rather than one flat gray: the keys you press are the part worth
 // finding at a glance, so they get the accent colour and the words describing
 // them stay dim. The accent is the panel-title cyan rather than the amber used
 // for in-progress status, so amber means exactly one thing across the product.
-function StatusBar({ fetching, spin, stale, interactive }) {
+function StatusBar({ fetching, spin, stale, interactive, cols }) {
   // Without raw mode none of the key handlers run, so advertising them would be
   // telling the user something untrue about what the app can do. Ctrl+C still
   // works there, because the tty delivers a real SIGINT.
   const hints = interactive
     ? KEY_HINTS
     : [{ label: "Quit", keys: "^C" }];
+  // Measured against the *full* set even when a compact one is rendered, so the
+  // breakpoint does not move as the bar's own contents change.
+  const compact = interactive && cols < STATUS_FULL_WIDTH;
   return e(
     Box,
     { flexDirection: "row" },
@@ -1861,11 +2128,12 @@ function StatusBar({ fetching, spin, stale, interactive }) {
       : null,
     ...hints
       .flatMap((hint, i) => [
-        i > 0 && e(Text, { key: `sep${i}`, color: BORDER_COLOR }, " | "),
+        i > 0 &&
+          e(Text, { key: `sep${i}`, color: BORDER_COLOR }, compact ? " " : " | "),
         e(
           Text,
           { key: hint.label, wrap: "truncate-end" },
-          e(Text, { dimColor: true }, `${hint.label}: `),
+          compact ? null : e(Text, { dimColor: true }, `${hint.label}: `),
           e(Text, { color: TITLE_COLOR, bold: true }, hint.keys),
         ),
       ])
@@ -1933,6 +2201,12 @@ function App() {
     security: null,
   });
   const [securityNotes, setSecurityNotes] = useState([]);
+  // Whether the Security tab is currently unable to see its endpoints, as
+  // opposed to seeing that they are switched off. Drives the count marker.
+  const [securityBlind, setSecurityBlind] = useState(false);
+  // The `?` overlay. Renders only on a keypress, so consecutive idle frames are
+  // still byte-identical and the redraw suppression is untouched.
+  const [showHelp, setShowHelp] = useState(false);
   const [errors, setErrors] = useState({ actions: null, issues: null, prs: null, security: null });
   const [loading, setLoading] = useState({ actions: true, issues: true, prs: true, security: true });
   const [now, setNow] = useState(new Date());
@@ -1945,7 +2219,29 @@ function App() {
   const [offset, setOffset] = useState({});
 
   const tab = TABS[activeIndex];
-  const extraLines = (errors[tab.key] ? 1 : 0) + (tab.key === "security" ? securityNotes.length : 0);
+  // The not-enabled notes are collapsed into a single line. Each unavailable
+  // alert source used to contribute a full-width row above the column header,
+  // and on any repo without Advanced Security that is two permanent lines --
+  // roughly 10% of a twenty-row pane, forever, restating a fact that will never
+  // change, on the tab whose job is making real alerts stand out. Failures that
+  // are NOT "not enabled" keep their own lines: those are actionable and
+  // transient, and they are the ones worth the space. Derived here at render
+  // time rather than cached alongside the notes, because the unchanged-payload
+  // short-circuit can skip parse() entirely and a cached string would go stale.
+  const NOT_ENABLED = /not enabled/i;
+  const disabledNotes = securityNotes.filter((n) => NOT_ENABLED.test(n));
+  const otherNotes = securityNotes.filter((n) => !NOT_ENABLED.test(n));
+  const securityLines =
+    disabledNotes.length > 1
+      ? [
+          `${disabledNotes.map((n) => n.split(":")[0]).join(", ")}: not enabled here`,
+          ...otherNotes,
+        ]
+      : securityNotes;
+  // Counts the lines actually rendered, not the notes collected -- getting this
+  // wrong by one row is what makes ink repaint the whole frame.
+  const extraLines =
+    (errors[tab.key] ? 1 : 0) + (tab.key === "security" ? securityLines.length : 0);
   // Reserve lines for: the tab bar and the divider under it (2), the panel's
   // top and bottom edges (2), the column header and its separator (2), and
   // the status line (1), plus a 1-line safety margin. Slack is absorbed by
@@ -1977,8 +2273,12 @@ function App() {
   const inFlightRef = useRef({});
   const rawRef = useRef({});
   const cleanRef = useRef({});
+  // Last *successful* poll per tab, wall-clock. Wall-clock on purpose: a laptop
+  // sleeping is exactly the gap this is meant to report, and a monotonic clock
+  // does not advance across suspend. Never written on the failure path, or a
+  // persistently failing tab would report itself fresh forever.
+  const lastOkRef = useRef({});
   const fetchTabRef = useRef(null);
-  const abortRef = useRef(null);
 
   const interactive = Boolean(isRawModeSupported);
 
@@ -1986,28 +2286,40 @@ function App() {
   // slice, so the movement handlers read through a ref -- the same pattern the
   // poll loop uses for runLimitRef and activeIndexRef, and for the same reason:
   // the closure must see current values without being rebuilt on every change.
-  const navRef = useRef({ items: [], key: null, bodyRows: 1, tabKey: "actions" });
+  const navRef = useRef({ items: [], key: null, bodyRows: 1, tabKey: "actions", offset: 0 });
   navRef.current = {
     items: data[tab.key] ?? [],
     key: selected[tab.key] ?? null,
     bodyRows,
     tabKey: tab.key,
+    offset: offset[tab.key] ?? 0,
   };
   const pageStep = Math.max(1, bodyRows - 1);
 
-  const abortSelectionRef = useRef(null);
+  // Read through a ref for the same reason the poll loop does: the useInput
+  // closure must see the current value without being rebuilt on every toggle.
+  const showHelpRef = useRef(false);
+  showHelpRef.current = showHelp;
 
   function moveSelection(delta) {
-    const { items, key: currentKey, bodyRows: rows_, tabKey } = navRef.current;
+    const { items, key: currentKey, bodyRows: rows_, tabKey, offset: offsetRaw } = navRef.current;
     if (items.length === 0) return;
     const current = currentKey == null ? -1 : items.findIndex((i) => itemKey(i) === currentKey);
-    // From "nothing selected", down lands on the first row and up on the last,
-    // which is what every list in this category does.
+    const maxStart = Math.max(0, items.length - rows_);
+    // Re-clamped here for the same reason the render path re-clamps: the payload
+    // can shrink between ticks, so a stored offset can point past the end.
+    const start = Math.min(Math.max(0, offsetRaw), maxStart);
+    // From "nothing selected", seed from what is on screen -- down takes the
+    // first visible row, up the last. It used to take row 0 / the final row of
+    // the whole list, which meant the 60s idle clear silently cost you your
+    // place: scroll to row 80 of 150, read for a minute, press down, and you
+    // were back at row 1 with no scroll animation to notice. For an unscrolled
+    // list that fits the pane this is the same behaviour as before.
     const next =
       current === -1
         ? delta > 0
-          ? 0
-          : items.length - 1
+          ? start
+          : Math.min(items.length - 1, start + rows_ - 1)
         : Math.min(items.length - 1, Math.max(0, current + delta));
     setSelected((s) => ({ ...s, [tabKey]: itemKey(items[next]) }));
     // Keep the cursor on screen. Only the offset needed to reveal it changes,
@@ -2033,24 +2345,46 @@ function App() {
     return () => clearTimeout(timer);
   }, [selected]);
 
+  // Guarded per item, not globally: holding Enter down produces terminal key
+  // repeat at ~30/s, and every event used to spawn another `gh <kind> view --web`
+  // and open another browser tab. The `r` key next to it already guards this way
+  // through the poll loop's in-flight map; Enter simply never did. Keyed by item
+  // rather than by tab so that moving to a different row and opening it
+  // immediately still works -- selection does not move on Enter, so a second
+  // press within the window is always a duplicate of the first.
+  const openingRef = useRef({});
+
   function openSelected() {
     const { items, key: currentKey, tabKey } = navRef.current;
     const item = items.find((i) => itemKey(i) === currentKey);
     if (!item) return;
-    const controller = new AbortController();
-    abortSelectionRef.current = controller;
+    const guard = `${tabKey}:${itemKey(item)}`;
+    if (openingRef.current[guard]) return;
+    openingRef.current[guard] = true;
     // Fire and forget: a browser launch must not block the render loop, and a
     // failure surfaces through the tab's normal error line rather than as an
     // unhandled rejection.
-    openInBrowser(tabKey, item, controller.signal).catch((err) => {
-      setErrors((x) => ({ ...x, [tabKey]: shortErr(err) }));
-    });
+    openInBrowser(tabKey, item)
+      .catch((err) => {
+        setErrors((x) => ({ ...x, [tabKey]: shortErr(err) }));
+      })
+      .finally(() => {
+        delete openingRef.current[guard];
+      });
   }
 
   useInput(
     (input, key) => {
       if (input === "q" || key.escape) {
         exit();
+      } else if (showHelpRef.current) {
+        // Any key dismisses -- except quit, handled above, which must never be
+        // swallowed by a modal in a full-screen app. Deliberately does not fall
+        // through to the binding the key would normally trigger: closing the
+        // overlay is the whole intent of that press.
+        setShowHelp(false);
+      } else if (input === "?") {
+        setShowHelp(true);
       } else if (key.downArrow || input === "j") {
         moveSelection(1);
       } else if (key.upArrow || input === "k") {
@@ -2063,8 +2397,11 @@ function App() {
         openSelected();
       } else if (input === "r") {
         // Goes through the same per-tab in-flight guard as the poll loop, so
-        // holding the key down cannot stack concurrent subprocesses.
-        fetchTabRef.current?.(TABS[activeIndexRef.current].key);
+        // holding the key down cannot stack concurrent subprocesses. `force`
+        // bypasses (and clears) any failure backoff: this key is the user saying
+        // "try again now", and a refresh that silently declined to refresh would
+        // be worse than no key at all.
+        fetchTabRef.current?.(TABS[activeIndexRef.current].key, { force: true });
       } else if (input >= "1" && input <= String(TABS.length)) {
         setActiveIndex(Number(input) - 1);
       } else if (key.tab && key.shift) {
@@ -2098,7 +2435,7 @@ function App() {
     let cancelled = false;
     let ticks = 0;
     const controller = new AbortController();
-    abortRef.current = controller;
+    registerLiveAbort(controller);
 
     // Each tab commits its own result the moment it lands instead of waiting on
     // a Promise.allSettled barrier. Actions is by far the slowest fetch, so
@@ -2124,6 +2461,19 @@ function App() {
           // at the top of this handler and the early return fired before parse()
           // could be retried, leaving the tab permanently showing "no runs" with
           // no error at all. Both now happen only after a successful parse.
+          // Freshness is recorded on every *successful poll*, including the
+          // identical-payload path below, and deliberately not in `meta`. It used
+          // to ride on meta.at, which is only written past the early return -- so
+          // on a quiet repo, where every payload is byte-identical by design, the
+          // timestamp froze at the last time data changed and the status bar
+          // accrued a growing "stale 2h13m" while every poll was succeeding on
+          // schedule. The indicator fired loudest in the one state that is
+          // completely healthy. A ref rather than state because writing state here
+          // would allocate a new object every tick and permanently defeat the
+          // React bail-out this early return exists to preserve.
+          lastOkRef.current[key] = Date.now();
+          // Clear on the first success or a single failure latches the ladder.
+          clearBackoff(`tab:${key}`);
           if (rawRef.current[key] === raw && cleanRef.current[key]) {
             setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
             return;
@@ -2144,11 +2494,27 @@ function App() {
             },
           }));
           if (value.notes) setSecurityNotes(value.notes);
+          if (key === "security") {
+            setSecurityBlind((b) => (b === Boolean(value.blind) ? b : Boolean(value.blind)));
+          }
         })
         .catch((err) => {
           if (cancelled || err?.name === "AbortError") return;
           cleanRef.current[key] = false;
-          setErrors((x) => ({ ...x, [key]: shortErr(err) }));
+          // Classified, not dumped. The three list tabs used to put raw `gh`
+          // stderr on screen while the alert path one tab over translated the
+          // same verdicts into something actionable. VERDICT_REMEDY replaces the
+          // message rather than prefixing it, because the error slot is exactly
+          // one line and a prefix would truncate away the diagnostic half.
+          const verdict = classify(err);
+          setErrors((x) => ({ ...x, [key]: pick(VERDICT_REMEDY, verdict, null) ?? shortErr(err) }));
+          // ...and back off, which the list tabs never did at all. A tab wedged
+          // on an expired token used to re-spawn `gh` every tick forever -- 720
+          // subprocesses an hour, indefinitely, against a token that is already
+          // refusing. "other" has no ladder on purpose: a network drop should
+          // recover on the very next tick once the network is back.
+          const steps = pick(FAILURE_LADDER, verdict, null);
+          if (steps) recordFailure(`tab:${key}`, performance.now(), steps);
         })
         .finally(() => {
           inFlightRef.current[key] = false;
@@ -2156,9 +2522,15 @@ function App() {
         });
     }
 
-    function fetchTab(key) {
+    // `force` is what the `r` key passes, and it is the whole reason the backoff
+    // above is safe to add. Without it, pressing refresh on a backed-off tab
+    // would silently do nothing -- taking away the one control the user has at
+    // exactly the moment the pane looks broken and they reach for it.
+    function fetchTab(key, { force = false } = {}) {
       const signal = controller.signal;
       const descriptor = TABS.find((t) => t.key === key);
+      if (!force && backoffActive(`tab:${key}`, performance.now())) return Promise.resolve();
+      if (force) clearBackoff(`tab:${key}`);
       // Every tab carries its own fetcher on the registry, so adding a tab is a
       // TABS entry plus a fetcher rather than an entry plus an edit to a chain
       // in a different part of the file.
@@ -2174,7 +2546,10 @@ function App() {
       const active = TABS[activeIndexRef.current].key;
       const due = ticks % BACKGROUND_EVERY === 0 ? TABS.map((t) => t.key) : [active];
       ticks += 1;
-      await Promise.allSettled(due.map(fetchTab));
+      // Mapped explicitly rather than passing fetchTab by reference: Array.map
+      // hands the callback an index as its second argument, which would land in
+      // the options bag and make every background tab look force-refreshed.
+      await Promise.allSettled(due.map((key) => fetchTab(key)));
       if (cancelled) return;
       // Advancing `now` is what forces a redraw, so only do it when it can
       // actually change what's on screen: durations of in-progress runs tick
@@ -2212,7 +2587,18 @@ function App() {
   // idle hour, and the exact opposite of the redraw suppression above. The
   // first load genuinely is worth animating, because an empty pane with no
   // motion reads as broken; after that, only a run actually executing is.
-  const firstLoad = Object.fromEntries(TABS.map((t) => [t.key, data[t.key] == null]));
+  // "Never resolved" and "never *succeeded*" are different states, and conflating
+  // them pinned the spinner on forever. setData is only ever called on success,
+  // so a tab whose fetch keeps failing -- offline laptop, VPN down, expired auth,
+  // Actions disabled on the repo -- kept data === null, kept firstLoad true, and
+  // kept the 100ms interval running for the life of the process while the body
+  // rendered "loading actions..." directly above the error explaining it had
+  // failed. Measured at 7.8% of a core and 9.8 MB/hr of terminal writes,
+  // indefinitely, on the single most ordinary failure there is. Motion now means
+  // "still working"; the error line means "not working"; nothing claims both.
+  const firstLoad = Object.fromEntries(
+    TABS.map((t) => [t.key, data[t.key] == null && !errors[t.key]]),
+  );
   const anyFirstLoad = Object.values(firstLoad).some(Boolean);
   const showSpinner = ANIMATE && (anyFirstLoad || hasRunningVisible);
   useEffect(() => {
@@ -2240,15 +2626,30 @@ function App() {
       // the count stop moving through a genuine change on any repo big enough
       // for this tool to matter.
       const suffix = meta[t.key]?.truncated ? "+" : "";
-      // Newest first, so the head of the list is the run that decides whether
-      // CI is currently red.
-      const broken =
+      // A blind Security tab reports "?" rather than a number it cannot stand
+      // behind. Zero alerts and zero visibility look identical otherwise.
+      if (t.key === "security" && securityBlind) return [t.key, "?"];
+      return [t.key, `${list.length}${suffix}`];
+    }),
+  );
+  // Kept out of `counts` because the two have different audiences. In the tab bar
+  // `!` sits next to a label and means "the newest run failed"; interpolated into
+  // the frame's bottom edge it produced "4 of 4!", where there is nothing for it
+  // to attach to and it reads as emphasis or a typo. `+` composes fine in both
+  // places, so only this one had to move. Newest first, so the head of the list
+  // is the run that decides whether CI is currently red.
+  const brokenCI = Object.fromEntries(
+    TABS.map((t) => {
+      const list = data[t.key];
+      return [
+        t.key,
         t.key === "actions" &&
-        list.length > 0 &&
-        list[0].status === "completed" &&
-        list[0].conclusion !== "success" &&
-        list[0].conclusion !== "skipped";
-      return [t.key, `${list.length}${suffix}${broken ? "!" : ""}`];
+          Array.isArray(list) &&
+          list.length > 0 &&
+          list[0].status === "completed" &&
+          list[0].conclusion !== "success" &&
+          list[0].conclusion !== "skipped",
+      ];
     }),
   );
   const failed = Object.fromEntries(TABS.map((t) => [t.key, Boolean(errors[t.key])]));
@@ -2257,7 +2658,11 @@ function App() {
   // poll only surfaces on the tab you have selected, and after a laptop sleep
   // every pane is plausible and wrong. Threshold-gated and minute-granular on
   // purpose -- see STALE_AFTER_MS.
-  const lastOk = meta[tab.key]?.at;
+  // Read from the ref written on every successful poll, not from meta.at, which
+  // only moves when the *payload* changes -- see lastOkRef. Reading a ref during
+  // render lags by one render, which is harmless here because `now` advances on
+  // its own and the label is minute-granular by design.
+  const lastOk = lastOkRef.current[tab.key];
   const staleFor = lastOk == null ? null : now.getTime() - lastOk;
   const staleThreshold = Math.max(STALE_AFTER_MS, runtime.refreshMs * 6);
   const staleLabel =
@@ -2297,13 +2702,46 @@ function App() {
   // terminal is doing the clipping.
   const frameCols = Math.max(1, cols - 1);
 
+  // Name the repository in the top edge when it was chosen explicitly, because
+  // then it is not the one you would guess from the working directory. Nothing
+  // on screen said which repo a pane was watching, and the documented workflow is
+  // several panes side by side plus `--repo` from anywhere -- so telling them
+  // apart meant quitting and running --doctor. Only the explicit cases are shown:
+  // resolving the *inferred* repo would cost a subprocess call at startup for a
+  // label that, by definition, names the directory you are already sitting in.
+  //
+  // GH_REPO is read straight from the environment and never went through
+  // parseRepoTarget, so unlike runtime.repo it is unvalidated -- safe() before it
+  // is drawn, on the same rule as every other string this app does not own.
+  // Dropped before the tab name rather than with it: PanelEdge drops its whole
+  // label when it cannot seat one, so a single concatenated string would take the
+  // tab name down with the target at ordinary widths.
+  const target = runtime.repo ?? safe(process.env.GH_REPO ?? "");
+  const withTarget = target ? `${tab.label} · ${target}` : tab.label;
+  const topLabel = frameCols - 3 - withTarget.length >= 0 ? withTarget : tab.label;
+
   // Fixed columns deliberately do not shrink, so BRANCH and TIME stay readable
   // at ordinary widths. Narrow panes drop columns instead, which keeps the
   // frame, the tab bar and the quit hint on screen -- the previous behaviour
   // pushed all three off the bottom. Measured against frameCols, the width the
   // frame itself actually gets, not the raw terminal width.
-  const compact = frameCols < MIN_TABLE_WIDTH;
+  // Per tab, not one global flag. MIN_TABLE_WIDTH is a max across all four, so
+  // the widest tab was deciding for the narrowest: Pull requests needs 61
+  // columns and Security only 44, which meant Security dropped two columns a
+  // full 17 columns before it had to. Only one tab is on screen at a time, so
+  // the cost -- different tabs showing different column counts at the same width
+  // -- is not something you can actually see. MIN_TABLE_WIDTH stays as the
+  // exported worst case, which is what the tests pin.
+  const compact = frameCols < minimumWidthFor(tab.header);
   const header = compact ? tab.compactHeader : tab.header;
+
+  // Below the compact set's own floor even the fixed columns overflow, which
+  // hard-wraps every row and drives ink into clearing and repainting the whole
+  // screen each frame -- the one failure mode this file is most engineered to
+  // avoid, and it was reachable simply by dragging a sidebar narrow. The guard
+  // sits after usableSize(), which substitutes DEFAULT_COLS for a 0 reported
+  // mid-resize, so a transient zero cannot be mistaken for a genuinely tiny pane.
+  const tooNarrow = frameCols < MIN_COMPACT_WIDTH;
 
   return e(
     Box,
@@ -2311,13 +2749,14 @@ function App() {
     e(TabBar, {
       activeIndex,
       counts,
+      brokenCI,
       firstLoad,
       failed,
       spin,
       useShort: useShortLabels,
     }),
     e(Divider, { width: frameCols }),
-    e(PanelEdge, { width: frameCols, top: true, label: tab.label, labelColor: TITLE_COLOR }),
+    e(PanelEdge, { width: frameCols, top: true, label: topLabel, labelColor: TITLE_COLOR }),
     e(
       Box,
       {
@@ -2334,13 +2773,31 @@ function App() {
       // truncate-end is what makes the one-line reservation in `extraLines`
       // true by construction. Predicting the wrapped height instead would mean
       // duplicating ink's width model, and would still be wrong on resize.
-      error && e(Text, { color: ERROR_TEXT, wrap: "truncate-end" }, error),
-      tab.key === "security" &&
-        securityNotes.map((note, i) =>
+      // Below the compact floor, say so instead of rendering a table that cannot
+      // fit. The frame, the tab bar and the quit hint stay, so widening the pane
+      // recovers immediately -- this is a render-time branch and touches no state.
+      // Short enough to survive at the widths it actually appears at -- a message
+      // about the pane being too narrow that is itself truncated would be a joke.
+      // Clamped to bodyRows so it can never push the frame past `rows` and
+      // trigger the full repaint the height reservation exists to prevent, and
+      // truncate-end so it degrades rather than wraps in a narrow pane. Every
+      // glyph in KEY_TABLE is plain ASCII, which is what keeps it safe here.
+      showHelp &&
+        keyTableLines()
+          .slice(0, bodyRows)
+          .map((line, i) => e(Text, { key: `help${i}`, wrap: "truncate-end" }, line)),
+      !showHelp &&
+        tooNarrow &&
+        e(Text, { dimColor: true, wrap: "truncate-end" }, "too narrow"),
+      !showHelp && !tooNarrow && error && e(Text, { color: ERROR_TEXT, wrap: "truncate-end" }, error),
+      !showHelp &&
+        !tooNarrow &&
+        tab.key === "security" &&
+        securityLines.map((note, i) =>
           e(Text, { key: i, dimColor: true, wrap: "truncate-end" }, note),
         ),
-      e(HeaderCells, { cells: header }),
-      ...visibleItems.map((item) => {
+      !showHelp && !tooNarrow && e(HeaderCells, { cells: header }),
+      ...(tooNarrow || showHelp ? [] : visibleItems).map((item) => {
         const key = itemKey(item);
         return e(
           RowBoundary,
@@ -2350,10 +2807,13 @@ function App() {
             now,
             compact,
             cursor: key === selectedKey,
-            // Only the Actions rows read this. Passing it to the others would
-            // change a prop ten times a second on every tab and defeat the
-            // memoisation below for no visible effect.
-            spin: tab.key === "actions" && showSpinner ? spin : null,
+            // Only an *executing* Actions row reads this. It used to go to every
+            // visible row on the tab, so a prop that changes several times a
+            // second defeated the memoisation below for all of them rather than
+            // for the one or two actually spinning -- measured at 7,960 row
+            // renders over 20s against 238 with this condition.
+            spin:
+              tab.key === "actions" && showSpinner && item.status === "in_progress" ? spin : null,
           }),
         );
       }),
@@ -2361,13 +2821,25 @@ function App() {
       // which is the difference between a dashboard that looks hung and one
       // that looks correct. Driven by "never resolved" rather than by the
       // loading flag, which toggles on every tick and made a settled-empty tab
-      // swap its message every five seconds.
-      visibleItems.length === 0 &&
+      // swap its message every five seconds. Suppressed entirely when a tab has
+      // an error and has never resolved: the error line directly above already
+      // says what happened, and "no runs" underneath it reads as a fact about the
+      // repository rather than the absence of an answer.
+      !showHelp &&
+        !tooNarrow &&
+        visibleItems.length === 0 &&
+        !(error && items == null) &&
         e(
           Text,
           { dimColor: true },
           firstLoad[tab.key]
-            ? `${showSpinner ? spin : SPINNER[0]} loading ${tab.label.toLowerCase()}…`
+            ? `${showSpinner ? spin : SPINNER[0]} loading ${tab.label.toLowerCase()}…` +
+              // Shown only while the first fetch is in flight, so it costs a
+              // second of one line at startup and nothing after -- and it lands
+              // exactly when someone is staring at a fresh pane deciding whether
+              // the thing works. Suppressed once icons are already ASCII, since
+              // then there is nothing to fix.
+              (USING_NERD_ICONS ? "   (icons blank? GH_GLANCE_ICONS=unicode)" : "")
             : tab.key === "security" && securityNotes.length === ALERT_SOURCES.length
               ? "no alert sources available"
               : `no ${tab.countLabel}`,
@@ -2383,6 +2855,7 @@ function App() {
       spin: showSpinner ? spin : null,
       stale: staleLabel,
       interactive,
+      cols: frameCols,
     }),
   );
 }
@@ -2413,11 +2886,27 @@ function restoreScreen() {
 // then discarded -- and nothing ever set a non-zero exit code, so the dashboard
 // simply vanished and any wrapper saw success. Restore the primary buffer
 // *first*, then write, or the fix reproduces the problem it is fixing.
+//
+// Aborting in-flight `gh` children is the poll effect's job on every other exit
+// path, but its cleanup only runs through ink's unmount -- which an explicit
+// process.exit() skips. Without this, a crash orphaned up to six subprocesses
+// for the length of GH_TIMEOUT_MS. The abort runs *after* restoreScreen() and is
+// wrapped, because an exception thrown here would replace the stack trace this
+// handler exists to print with an unrelated one.
+//
+// Both messages go through redact(): a stack can carry a URL with inline
+// credentials, and this output is what a user pastes into a bug report -- the
+// same reasoning --doctor already applies to its own report.
 function installCrashHandlers() {
   const fail = (label) => (err) => {
     restoreScreen();
+    try {
+      abortLiveRequests();
+    } catch {
+      // Nothing useful to do about a failure here, and the stack below matters more.
+    }
     console.error(`gh-glance: ${label}`);
-    console.error(err instanceof Error ? (err.stack ?? err.message) : String(err));
+    console.error(redact(err instanceof Error ? (err.stack ?? err.message) : String(err)));
     process.exit(1);
   };
   process.on("uncaughtException", fail("crashed"));
@@ -2512,4 +3001,9 @@ export {
   MIN_COMPACT_WIDTH,
   OCT_NERD,
   OCT_UNICODE,
+  KEY_TABLE,
+  KEY_HINTS,
+  VERDICT_REMEDY,
+  RATE_LIMIT_RETRY_MS,
+  FAILURE_LADDER,
 };

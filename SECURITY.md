@@ -6,7 +6,8 @@ Only the current major release receives security patches.
 
 | Version | Supported |
 |---------|-----------|
-| 0.4.x   | Yes       |
+| 0.5.x   | Yes       |
+| 0.4.x   | No        |
 | 0.3.x   | No        |
 | 0.2.x   | No        |
 | < 0.2   | No (never released)  |
@@ -67,8 +68,19 @@ before it is stored or rendered:
   writes can be assembled by the terminal -- no hyperlink spoofing, no cursor
   movement over already-drawn rows, no bell, and no newline inflating one row
   into several. Each run is replaced with a space rather than deleted.
+- **Deleted:** the explicit bidirectional overrides and isolates
+  (`U+202A`-`U+202E`, `U+2066`-`U+2069`). A single `RLO` in an issue title makes
+  the rest of that cell render reversed on any terminal that applies bidi
+  reordering, which is the same "the row shows something other than its data"
+  failure the control-character strip prevents -- and because these measure as
+  zero columns, they cost no width and survived truncation untouched. Deleted
+  rather than replaced with a space, precisely because they measure zero: a
+  space would add a visible column and shift every cell to its right.
 - **Preserved:** everything else, including emoji and ZWJ sequences, CJK and
-  other wide characters, combining marks, and right-to-left text. A sanitizer
+  other wide characters, combining marks, and genuine right-to-left text. `LRM`
+  and `RLM` (`U+200E`/`U+200F`) are untouched, because they are how ordinary
+  mixed-direction Arabic and Hebrew titles render correctly -- the deletion above
+  is scoped to the explicit overrides, not to bidi as a category. A sanitizer
   that stripped by "printability" would also erase the tool's own status icons
   and desynchronize column alignment.
 - **Clamped:** each field is limited to 300 codepoints, cut on a codepoint
@@ -84,19 +96,34 @@ being used as lookup keys, so a field whose value happens to be `constructor` or
 
 The repository target is the one user-supplied value that both reaches a
 subprocess argument and is interpolated into a `gh api` request path, so it is
-validated once at the boundary. The `owner/name` half keeps the pattern and the
-hostile-input tests it has always had. When a host is present
+validated once at the boundary. The `owner/name` half is matched against what
+GitHub actually issues as a name: it must contain at least one character that is
+not a dot, and may not end in `.git`. That is what rejects `owner/..`, which
+otherwise reached the path as `repos/owner/../dependabot/alerts` -- `gh`
+forwards the dot segment unnormalized and GitHub resolves it server-side to a
+different endpoint than the one intended. Names that merely contain or begin
+with a dot, like `owner/.github`, stay valid. When a host is present
 (`--repo host/owner/name`), it is validated separately -- as a dotted hostname,
 which is what keeps a three-part typo a rejected typo rather than a request to
 somewhere else -- and it is **never** interpolated into a request path. It is
 passed to `gh` as a `--hostname` argument instead.
 
-`--doctor` prints a report intended to be attached to a bug report, and it
-never prints credentials. Token-valued environment variables are reported as
-present or absent and never by value, not even a prefix; anything token-shaped
-anywhere in the captured text is replaced; credentials embedded in proxy and
-remote URLs are stripped; and no API response bodies are included, only their
-sizes.
+`--doctor` prints a report intended to be attached to a bug report, and it never
+prints credentials. Environment values are printed only for a short curated list
+-- the variables that are themselves the thing being diagnosed, such as
+`GH_HOST`, `GH_REPO` and `NO_COLOR`. Every other variable it finds, including any
+`GH_*`/`GITHUB_*` name it was never told about, is reported as present or absent
+and never by value, not even a prefix. Presence-only is the default and printing
+is the exception, rather than the other way round, so a credential in a variable
+nobody anticipated fails safe. On top of that: anything token-shaped anywhere in
+the captured text is replaced; credentials embedded in proxy and remote URLs are
+stripped; and no API response bodies are included, only their sizes.
+
+The same redaction covers the other two things this program writes outside the
+dashboard: the `--verbose` log, and the message printed if it crashes. Both are
+artifacts users are invited to attach to a bug report, and `gh` error messages
+quote the URL they failed on -- which is a real path for a credential to reach
+them.
 
 gh-glance never handles GitHub credentials directly -- authentication is
 entirely delegated to your existing `gh auth login` session, including on

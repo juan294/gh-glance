@@ -161,7 +161,14 @@ test("--help and --version survive validation", () => {
   assert.equal(parse(["--help"]).help, true);
   assert.equal(parse(["-h"]).help, true);
   assert.equal(parse(["--version"]).showVersion, true);
-  assert.equal(parse(["-v"]).showVersion, true);
+});
+
+test("-v is rejected rather than silently meaning --version", () => {
+  // It used to be an alias for --version, in a CLI that also has --verbose -- so
+  // `gh-glance -v 2>log`, which is what you type when you want the log, printed a
+  // version string and exited 0. The allowlist exists so a typo fails loudly, and
+  // this was the one flag that failed quietly.
+  assert.throws(() => parse(["-v"]), /unknown argument: -v/);
 });
 
 test("flags combine", () => {

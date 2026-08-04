@@ -151,10 +151,12 @@ refactor: extract the row-height calculation
 - The sample output block in `README.md` is captured from a real run. If you
   change a column, a limit, or the status bar, regenerate it rather than editing
   it by hand -- it drifted out of date once already.
-- Keep the four data-fetching functions (`fetchActions`, `fetchIssues`,
-  `fetchPRs`, `fetchSecurity`) shelling out via `execFile` with argument
-  arrays -- never build a shell string from repository data. See
-  `SECURITY.md` for why this matters.
+- Keep every call to `gh` going through the single `runGh()` seam, which uses
+  `execFile` with an argument array -- never build a shell string from
+  repository data. The four data-fetching functions (`fetchActions`,
+  `fetchIssues`, `fetchPRs`, `fetchSecurity`) compose argv vectors and hand them
+  to it; a second path to the subprocess is what this rule exists to prevent.
+  See `SECURITY.md` for why it matters.
 
 ## Submitting a Pull Request
 

@@ -58,9 +58,18 @@ export function parseCapture(raw) {
   for (const match of raw.matchAll(FRAME_BOUNDARY)) {
     lastBoundaryEnd = match.index + match[0].length;
   }
-  const finalFrameLines = visibleLines(raw.slice(lastBoundaryEnd)).filter(
-    (line) => !/^EXITCODE=/.test(line),
-  );
+  // Strip the harness's own echo rather than dropping lines that start with it.
+  // run.sh writes `EXITCODE=$?` after the app exits, and ink's final frame ends
+  // without a trailing newline -- so the echo concatenates onto the last visible
+  // line instead of occupying its own. An anchored filter never matched it, and
+  // the artifact was being measured as part of the frame: the status bar read
+  // "...Quit: qEXITCODE=0", inflating `widest` by 11 columns, and when the echo
+  // did land on its own line a leading space let it escape the filter and count
+  // toward the height. Both of those feed the suite's two structural assertions,
+  // so they were measuring part app and part harness.
+  const finalFrameLines = visibleLines(
+    raw.slice(lastBoundaryEnd).replace(/EXITCODE=\d+\s*$/, ""),
+  ).filter((line) => !/^EXITCODE=/.test(line));
 
   // Everything after the restore sequence landed on the PRIMARY buffer. This is
   // the #41 surface: the app's exit listener restores the primary buffer
