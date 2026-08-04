@@ -16,6 +16,14 @@ echo "$*" >> "$GH_GLANCE_FIXTURE_LOG"
 
 FIXTURE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
+# Lets a test drive the error classifier end to end -- a SAML 403 has no other
+# way to be produced without a real enterprise tenant. Unset by default, so
+# every pre-existing test sees exactly the fixture it saw before.
+if [ -n "${GH_GLANCE_FIXTURE_FAIL:-}" ] && [ "$1" = "api" ]; then
+  echo "$GH_GLANCE_FIXTURE_FAIL" >&2
+  exit 1
+fi
+
 case "$1" in
   --version)
     # preflight() runs this first and exits 3 if it fails (index.mjs:552-560),

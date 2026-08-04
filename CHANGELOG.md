@@ -5,6 +5,54 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Correctness on GitHub Enterprise and Enterprise Managed Users tenants. Both
+entries below are the same failure: the dashboard stating something confident
+and wrong, which is precisely what its error classifier exists to prevent.
+
+### Fixed
+
+- **A lapsed enterprise SAML session was reported as "not enabled for this
+  repository", and latched for up to an hour.** EMU tenants expire the SAML
+  session periodically; while lapsed the API answers 403, which the classifier
+  could not tell apart from "this feature is switched off". So the Security tab
+  went blank under a false explanation, and the escalating backoff
+  (60s -> 300s -> 1800s -> 3600s) kept it that way long after the user had
+  re-authorized in the browser. Auth failures -- SAML, SSO, a credential not
+  authorized for the org, a missing token scope -- now surface `gh`'s real
+  message and take a short fixed 30s retry instead of the escalating ladder, so
+  recovery is bounded at about half a minute. A 403 with no auth markers still
+  produces the existing note and ladder.
+- **On a non-default host the three security-alert endpoints were queried
+  against `github.com`.** `gh api` has no `--repo`, so a host-qualified target
+  routed the four list-driven tabs to the enterprise host while the alert calls
+  went to `github.com`, 404ed, and -- via the defect above -- rendered as "not
+  enabled". The Security tab could therefore report that a feature was off for a
+  repository whose alerts it had never asked for. The host now travels as
+  `--hostname`, and both halves of the dashboard talk to the same server. The
+  fixture-log assertions in `test/pty/routing.test.mjs` are the guard against it
+  recurring.
+
+### Added
+
+- **`--repo` accepts `[host/]owner/name`**, the same form `gh --repo` itself
+  accepts, so a GitHub Enterprise or EMU data-residency tenant can be watched
+  from outside a clone: `gh-glance --repo tenant.ghe.com/acme/widget`. A host
+  must contain a dot, which is what keeps `owner/name/extra` a rejected typo
+  rather than a silent request to a host named `owner`. The host is validated
+  separately from the `owner/name` slug and is never interpolated into a request
+  path.
+- **`--doctor`**, a reporting command that prints versions, authenticated hosts,
+  how the repository target resolved, the relevant environment, and one probe
+  per endpoint -- with the exact argv sent and how any error was classified.
+  It exits 0 and reports rather than failing when `gh` is missing or the working
+  directory is not a repository, and it works through a pipe. Tokens are never
+  printed: token-valued variables are reported as present or absent, anything
+  token-shaped in captured text is replaced, URL credentials are stripped, and
+  no response bodies are included -- so the report is safe to attach to a bug
+  report.
+
 ## [0.3.1] - 2026-08-04
 
 First release published by CI rather than from a laptop, and the first carrying
