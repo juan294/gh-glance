@@ -30,7 +30,7 @@ without switching to the browser.
 │                                                                          │
 │                                                                          │
 ╰───────────────────────────────────────────────────────────────── 4 of 4 ─╯
-⣾ Fetching            Move: jk | Open: Ent | Refresh: r | Quit: q
+⣾ Fetching  Move: ↑↓ | Open: Ent | Refresh: r | Quit: q
 ```
 
 > Captured from a real run at 76 columns with `GH_GLANCE_ICONS=unicode`, so the
@@ -191,7 +191,9 @@ stdout isn't a terminal rather than streaming redraw frames into a pipe.
 
 The cursor tracks the *item*, not the row position, so it stays on what you
 selected as new rows arrive above it. `Enter` works on Actions, Issues and Pull
-Requests; the Security tab has no per-alert `gh` command to open.
+Requests; the Security tab has no per-alert `gh` command to open. It clears
+itself after 60s with no cursor movement, so a pane left idle in the corner of
+a screen doesn't sit there marked forever.
 
 If `gh-glance` is started without an interactive stdin (for example with stdin
 redirected), the key handlers cannot run and the status bar shows only `Quit: ^C`

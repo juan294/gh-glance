@@ -5,6 +5,26 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-08-04
+
+Two fixes to the interactive surface: a selection marker that outlived its
+usefulness, and a key hint that named the wrong keys.
+
+### Fixed
+
+- **The row cursor clears itself after 60s without movement.** Once you pressed
+  a movement key the selection marker stayed on screen until you quit, so a pane
+  left in the corner of a screen sat there marked at something you had stopped
+  caring about an hour ago. Any movement key rearms the timer; expiry clears the
+  cursor on every tab, not just the visible one.
+- **The `Move` hint in the status bar reads `↑↓` rather than `jk`.** The hints
+  are otherwise strictly width-1 ASCII, because East-Asian-Ambiguous glyphs
+  measure as two columns in ink's width model and overflowed an 80-column
+  terminal once before. The arrow pair is a deliberate exception: the pty suite
+  asserts the rendered frame stays inside the terminal width, so a font that
+  renders them double-width fails there loudly instead of shifting columns
+  silently.
+
 ## [0.4.0] - 2026-08-04
 
 Correctness on GitHub Enterprise and Enterprise Managed Users tenants, and a
@@ -309,6 +329,7 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
+[0.4.1]: https://github.com/juan294/gh-glance/releases/tag/v0.4.1
 [0.4.0]: https://github.com/juan294/gh-glance/releases/tag/v0.4.0
 [0.3.1]: https://github.com/juan294/gh-glance/releases/tag/v0.3.1
 [0.3.0]: https://github.com/juan294/gh-glance/releases/tag/v0.3.0

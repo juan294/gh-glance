@@ -20,6 +20,8 @@
 - [ ] `npm run lint` passes
 - [ ] `node --check index.mjs` passes
 - [ ] `npm test` passes
+- [ ] `npm run test:pty` passes (required on `main`; run it for anything
+      touching rendering or the terminal lifecycle)
 - [ ] Ran `node index.mjs` in a real repository and confirmed all four tabs render
 - [ ] If this changes how `gh` is invoked (argv, host routing, or error
       classification): ran `node index.mjs --doctor` and confirmed the argv and

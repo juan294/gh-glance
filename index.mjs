@@ -47,6 +47,12 @@ const IS_MAIN = detectMainModule();
 
 const REFRESH_MS = 5000;
 
+// The row cursor otherwise persists forever once you touch a movement key --
+// useful while you're actually scanning a list, noise once you've moved on and
+// left the pane running in a corner of the screen. 60s idle (measured from the
+// last movement, not from tab switches or Enter) quietly drops it.
+const SELECTION_IDLE_MS = 60_000;
+
 // `gh run list` costs roughly linearly in --limit (measured: ~1.2s at 20 runs,
 // ~3.0s at 100, ~4.9s at 150), so asking for a fixed 150 to render ~35 visible
 // rows was paying several seconds per refresh for rows nobody sees. Actions is
@@ -1159,6 +1165,8 @@ Keys:
   r                  Refresh the current tab now
   q / Esc / Ctrl+C   Quit
 
+The cursor clears itself after 60s with no movement.
+
 Environment:
   GH_REPO=owner/name        Watch a specific repository (--repo takes precedence)
   GH_HOST=host              GitHub Enterprise or EMU host to send every call to.
@@ -1792,18 +1800,22 @@ function TabBar({ activeIndex, counts, firstLoad, failed, spin, useShort }) {
 
 // ---------- Status bar ----------
 
-// Every glyph here is width-1 ASCII, deliberately. The arrows, the return
-// symbol and the box-drawing separator are all East-Asian-Ambiguous: ink
-// measures them as two columns in its width model, and a status bar built from
-// them overflowed an 80-column terminal by six columns once selection added a
-// hint. Same trap the unicode icon table already documents -- prefer strictly
-// narrow ASCII over pretty-but-ambiguous.
+// Every glyph here is width-1 ASCII, deliberately, with one exception: the
+// Move arrows. The return symbol and the box-drawing separator are still
+// East-Asian-Ambiguous and stay out for that reason -- ink measures them as
+// two columns in its width model, and a status bar built from them overflowed
+// an 80-column terminal by six columns once selection added a hint. Same trap
+// the unicode icon table already documents -- prefer strictly narrow ASCII
+// over pretty-but-ambiguous. The arrow pair is a deliberate, tested exception:
+// `npm run test:pty` asserts the rendered frame stays within the terminal
+// width, so a font/terminal combo that renders them double-width fails loudly
+// there instead of silently shifting columns.
 //
 // Tab switching is not listed: the tab bar already renders "1:Actions", so the
 // digits document themselves, and the arrow keys are in --help. The hints that
 // survive are the ones nothing else on screen reveals.
 const KEY_HINTS = [
-  { label: "Move", keys: "jk" },
+  { label: "Move", keys: "↑↓" },
   { label: "Open", keys: "Ent" },
   { label: "Refresh", keys: "r" },
   { label: "Quit", keys: "q" },
@@ -2009,6 +2021,17 @@ function App() {
       return nextStart === (o[tabKey] ?? 0) ? o : { ...o, [tabKey]: nextStart };
     });
   }
+
+  // Rearms on every call to moveSelection (it's the only thing that changes
+  // `selected`), so this fires exactly 60s after the *last* movement -- tab
+  // switches and Enter don't count as activity and don't push it back. Clears
+  // every tab's cursor at once rather than just the visible one, so a tab you
+  // switch back to after being idle doesn't still show a stale row marked.
+  useEffect(() => {
+    if (Object.keys(selected).length === 0) return;
+    const timer = setTimeout(() => setSelected({}), SELECTION_IDLE_MS);
+    return () => clearTimeout(timer);
+  }, [selected]);
 
   function openSelected() {
     const { items, key: currentKey, tabKey } = navRef.current;
