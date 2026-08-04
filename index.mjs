@@ -1165,6 +1165,8 @@ Keys:
   r                  Refresh the current tab now
   q / Esc / Ctrl+C   Quit
 
+The cursor clears itself after 60s with no movement.
+
 Environment:
   GH_REPO=owner/name        Watch a specific repository (--repo takes precedence)
   GH_HOST=host              GitHub Enterprise or EMU host to send every call to.

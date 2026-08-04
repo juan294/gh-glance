@@ -15,8 +15,6 @@ documentation, contributions are welcome.
 - Configurable columns / widths
 - A config file or flags for refresh interval, tab order, or target repository
   (see [#35](https://github.com/juan294/gh-glance/issues/35))
-- Row selection and scrolling, so you can open what you are looking at
-  (see [#33](https://github.com/juan294/gh-glance/issues/33))
 
 ## Prerequisites
 
