@@ -29,13 +29,16 @@ export default [
       "no-unused-vars": ["error", { argsIgnorePattern: "^_" }],
       // The app is 100% hooks and leans on hand-managed invariants -- refs
       // written during render and read inside a closure created once on mount --
-      // that these rules exist to check. exhaustive-deps stays a warning, not an
-      // error: the poll effect's empty dependency array is deliberate and
-      // load-bearing (adding the "missing" deps would rebuild the interval on
-      // every tab keypress and every resize, cancelling in-flight requests), and
-      // it is suppressed inline with that reason at the call site.
+      // that these rules exist to check. exhaustive-deps is an error, and there
+      // is no inline suppression anywhere -- an earlier version of this comment
+      // said there was, which was never true. The poll effect's empty dependency
+      // array satisfies the rule as written, because every value the closure
+      // captures is a ref or a setState function and the rule treats both as
+      // stable. That is the point: if a suppression ever becomes necessary, it is
+      // the signal that a real dependency crept in and the interval is about to
+      // start rebuilding on every keypress.
       "react-hooks/rules-of-hooks": "error",
-      "react-hooks/exhaustive-deps": "warn",
+      "react-hooks/exhaustive-deps": "error",
     },
   },
 ];

@@ -75,9 +75,12 @@ current.
   says when it's working without spending a line on it
 - Status icons are real GitHub Octicons (via the Nerd Font glyph set), not emoji
   -- with a plain-ASCII fallback for terminals without one
-- Readable without colour: severity has its own column, run states have distinct
-  glyphs, and the active tab is bracketed, so `NO_COLOR=1` and colour-vision
-  deficiency both stay navigable
+- Readable without colour: severity has its own column, a failing newest run puts
+  a `!` on the Actions tab, and the active tab is bracketed, so `NO_COLOR=1` and
+  colour-vision deficiency both stay navigable. Run-state *glyphs* are not all
+  distinct -- timed-out, action-required and running share one, as do skipped,
+  neutral, stale and queued -- so the tab marker, not the row icon, is what
+  answers "is CI red" without colour
 - Says when it is stale rather than showing old data silently, and marks a tab
   whose last refresh failed
 - Adapts row count to the terminal pane's height live, on resize

@@ -294,3 +294,36 @@ test("the minimum-width guard is derived from the widest header", () => {
   assert.ok(MIN_TABLE_WIDTH > 52, `guard must exceed the observed silent-failure band (got ${MIN_TABLE_WIDTH})`);
   assert.ok(MIN_TABLE_WIDTH < 80, "must not reject an ordinary 80-column terminal");
 });
+
+test("importing the app selects React's production build", async () => {
+  // Guards a fix that already cost one fatal OOM. React's development build
+  // records a PerformanceMeasure on every render and never releases them, which
+  // killed a long-running dashboard after roughly 90 minutes; the fix is the
+  // `process.env.NODE_ENV ??= "production"` on index.mjs's first line.
+  //
+  // It rests on two invariants nothing else checks. Line 23 must stay first, and
+  // react/ink must stay *dynamic* imports -- ES import declarations are hoisted
+  // and evaluated before any module-body statement, so a single innocuous
+  // `import { Box } from "ink"` at the top would load React before line 23 runs
+  // and silently select the development build. Asserting NODE_ENV is not enough,
+  // because line 23 sets it either way by the time the import settles; the build
+  // that actually loaded is the thing worth asserting.
+  //
+  // The discriminator is the size of React's client internals object: 4 keys in
+  // production, 12 in development (react 19.2.8). If a React upgrade changes the
+  // production shape this fails loudly here rather than silently in a user's
+  // terminal three hours in, which is the right place for that surprise.
+  // Imported dynamically, and deliberately not at the top of this file: a static
+  // `import React from "react"` is hoisted above the index.mjs import and would
+  // load react first, making this test fail for its own reason rather than the
+  // app's. Which is a fair demonstration of how easy the real regression is.
+  const React = (await import("react")).default;
+  const internals = React.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+  assert.ok(internals, "React client internals missing -- check the discriminator, not the app");
+  assert.equal(
+    Object.keys(internals).length,
+    4,
+    "React loaded its development build: NODE_ENV was read after react, " +
+      "or a static react/ink import was added above index.mjs's NODE_ENV default",
+  );
+});

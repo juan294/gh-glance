@@ -5,6 +5,98 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Findings from a cross-functional audit, filtered hard: everything that would
+have added a release gate, a branch-protection rule or more test-harness
+machinery was rejected outright. What is left is behaviour you can see.
+
+### Fixed
+
+- **The `stale` indicator no longer fires on a repository that is simply quiet.**
+  Freshness was recorded only when the payload *changed*, and the whole point of
+  the poll loop is that an unchanged payload short-circuits before that write --
+  so on any calm repo the timestamp froze and the status bar accrued a growing
+  `stale 2h13m` while every poll was succeeding on schedule. It now records the
+  last successful *poll*. The warning fired loudest in the one state that was
+  completely healthy, which is the fastest way to teach someone to ignore it.
+- **A tab whose fetch keeps failing no longer animates forever.** `setData` only
+  runs on success, so a tab that never succeeded stayed in its first-load state
+  permanently: the spinner ran at full rate for the life of the process while the
+  body rendered "loading actions…" directly above the error explaining that it had
+  failed. Measured at 7.8% of a core and 9.8 MB/hr of terminal writes,
+  indefinitely, triggered by something as ordinary as closing a laptop lid.
+  Motion now means "still working"; the error line means "not working".
+- **`Enter` is guarded against key repeat.** Holding it down spawned a
+  `gh <kind> view --web` per repeat event -- roughly thirty a second -- each
+  opening another browser tab. The `r` key beside it had this guard all along.
+- **The status bar adapts to narrow panes.** It was the only band that did not:
+  the table swaps to a compact header, the tab bar to short labels, the panel
+  edges drop their labels, and the status bar just let ink truncate. Because each
+  hint truncates individually the loss was silent -- at 45 columns the bar read
+  `Move: | Open:  | Refresh |Quit:…`, dropping the arrows, `Refresh`'s key, and
+  most of `Quit`, which is the one hint someone stuck in a full-screen app needs.
+  It now falls back to `↑↓ Ent r q`, which keeps every key.
+- **`--doctor` no longer prints the value of environment variables it was never
+  told about.** It discovers every `GH_*`/`GITHUB_*` variable that is set, and
+  printed the value of any whose *name* did not end in `_TOKEN`/`_SECRET`/
+  `_PASSWORD`/`_KEY` -- so `GH_APP_PEM` (an entire RSA private key) and
+  `GITHUB_OAUTH` were reproduced in full, in the one report that says it is safe
+  to paste into a bug report. Printing a value is now opt-in and the list is
+  curated; anything discovered reports `set` or `not set`.
+- **`--doctor --verbose` produces the log it advertises.** argv was applied to
+  runtime state in two places and they had drifted, so the doctor path silently
+  dropped `--verbose`, `--refresh` and `--tab`. There is one application site now.
+- **The 60s cursor clear no longer costs you your place.** Clearing the selection
+  left the scroll offset behind, and the next arrow key seeded from the top of the
+  list -- so scrolling to row 80 of 150, reading for a minute and pressing down
+  put you back at row 1, with no scroll animation to notice. Movement now seeds
+  from what is on screen.
+- **`safe()` sanitizes non-string input.** It returned early for anything that
+  was not a string, skipping both the control-character strip and the length
+  clamp -- the guarantee was being provided by GitHub's schema rather than by the
+  function that claims to provide it.
+- **The `!` "CI is red" marker stays in the tab bar**, where a label anchors it,
+  instead of also being interpolated into the frame's bottom edge as `4 of 4!`.
+
+### Changed
+
+- **The spinner runs at 200ms rather than 100ms.** It is the single largest CPU
+  term in the app, because every frame makes ink rebuild and diff the whole
+  output string: measured 7.8% of a core at 100ms against 3.9% at 200ms, on a
+  0.33% idle floor. The motion is load-bearing -- it is the only thing separating
+  an executing run from a queued one -- so it is slowed, never stopped.
+- **Only an executing Actions row receives the spinner frame.** It went to every
+  visible row, so a prop changing several times a second defeated row
+  memoisation for all of them: 7,960 row renders over 20 seconds against 238.
+- **The panel names the repository** when it was chosen explicitly via `--repo`
+  or `GH_REPO` -- `╭─ Actions · acme/widget ─`. With several panes open, or after
+  changing directory, nothing on screen said which repository a pane was watching.
+  It is dropped before the tab name when the pane is too narrow for both.
+- **`-v` is no longer an alias for `--version`.** This CLI also has `--verbose`,
+  so `gh-glance -v 2>log` -- what you type when you want the log -- printed a
+  version string and exited 0. The argv surface exists to make typos fail loudly,
+  and this was the one flag that failed quietly. `--version` is unaffected.
+
+### Documentation
+
+- **Corrected a claim this project made about itself in 0.4.0 and repeated in the
+  0.4.1 release notes.** The status bar's `↑↓` glyphs were described as "a
+  deliberate, tested exception" whose double-width rendering "fails loudly" under
+  `npm run test:pty`. No such assertion exists or could: each hint truncates
+  individually, so the failure mode is silent text loss rather than overflow, and
+  at 80 columns the panel border is 79 cells against a 54-cell status bar, so the
+  bar never sets the maximum a width check would measure. The glyphs are fine;
+  the guarantee was not real, and a comment asserting coverage that does not
+  exist is worse than an acknowledged gap.
+- The README no longer claims every run state has a distinct glyph under
+  `NO_COLOR`. Timed-out, action-required and running share one, as do skipped,
+  neutral, stale and queued. The tab bar's `!` marker is what actually answers
+  "is CI red" without colour, and it does.
+- `eslint.config.js` no longer describes an inline `exhaustive-deps` suppression
+  that has never existed; the rule is now an error, which it can be precisely
+  because there is nothing to suppress.
+
 ## [0.4.1] - 2026-08-04
 
 Two fixes to the interactive surface: a selection marker that outlived its
@@ -329,6 +421,7 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.4.1...HEAD
 [0.4.1]: https://github.com/juan294/gh-glance/releases/tag/v0.4.1
 [0.4.0]: https://github.com/juan294/gh-glance/releases/tag/v0.4.0
 [0.3.1]: https://github.com/juan294/gh-glance/releases/tag/v0.3.1
