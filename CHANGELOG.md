@@ -11,6 +11,30 @@ Findings from a cross-functional audit, filtered hard: everything that would
 have added a release gate, a branch-protection rule or more test-harness
 machinery was rejected outright. What is left is behaviour you can see.
 
+### Added
+
+- **`?` shows the keys without leaving the dashboard.** Paging, `j`/`k`,
+  `Shift+Tab` and the cursor timeout existed only in `--help` and the README --
+  and because this is a full-screen app, reading `--help` meant quitting it
+  first. Any key closes the overlay. `--help`, the overlay and the status-bar
+  hints are now generated from one table, so a binding cannot go missing from one
+  of them.
+- **The panel names the repository** when it was chosen explicitly through
+  `--repo` or `GH_REPO` -- `╭─ Actions · acme/widget ─`. With several panes open,
+  or after changing directory, nothing on screen said which repository a pane was
+  watching. Dropped before the tab name when the pane is too narrow for both.
+- **`--doctor` reports API budget**: REST and GraphQL headroom straight from
+  GitHub, plus what this configuration will actually spend per hour. The steady
+  cost is not small and was invisible -- roughly 2,200 REST requests an hour at
+  the default refresh with the Security tab open, about 44% of a personal token's
+  allowance, and `--refresh 2` projects past the limit outright. `gh api
+  rate_limit` does not itself count against the limit.
+- **A first-run hint when icons may be blank.** Without a Nerd Font every status
+  icon renders as an empty box, which reads as a broken program rather than a
+  missing font, and the fix was documented only in places you had to quit to
+  read. Shown for the second the first fetch takes, and only when the Nerd glyphs
+  are actually in use.
+
 ### Fixed
 
 - **The `stale` indicator no longer fires on a repository that is simply quiet.**
@@ -58,6 +82,51 @@ machinery was rejected outright. What is left is behaviour you can see.
   function that claims to provide it.
 - **The `!` "CI is red" marker stays in the tab bar**, where a label anchors it,
   instead of also being interpolated into the frame's bottom edge as `4 of 4!`.
+- **A blind Security tab no longer reports a confident zero.** When all three
+  alert endpoints fail -- an expired SAML session, a token without
+  `security_events`, an org OAuth restriction -- the tab rendered
+  `4:Security (0)`, byte-identical to a genuinely clean repository, on the one
+  surface where a false all-clear is the worst available answer. It now reads
+  `(?)`. A repository that simply has Advanced Security switched off is a
+  different thing and stays quiet, because that is an answer rather than an
+  absence of one.
+- **A failing tab backs off instead of re-spawning `gh` every tick.** The three
+  list tabs had no backoff at all, so a wedged tab launched a subprocess every
+  five seconds indefinitely -- 720 an hour against a token already refusing --
+  and rate limiting was deliberately excluded from the ladder that did exist,
+  which had it backwards: GitHub's secondary limiter keys on sustained rate
+  against a limited *token*, so hammering can turn a self-clearing limit into a
+  longer block that also hits `git push`. Measured: two `gh run list` calls in
+  forty seconds where there were eight. The `r` key bypasses and clears the
+  backoff, because a refresh that silently declines to refresh would be worse
+  than no key at all.
+- **Errors on the Actions, Issues and PR tabs say what to do.** They rendered raw
+  `gh` stderr while the Security tab one across had been classifying the same
+  failures into remedies all along. An expired token now reads "GitHub
+  authorization failed -- try `gh auth login` or `gh auth refresh`". Unclassified
+  failures still show their real message: inventing a remedy for something
+  nobody recognised would be worse than showing what happened.
+- **Bidi override characters are stripped from remote text.** `U+202A`-`U+202E`
+  and the isolates measure as zero columns, so they cost no width and survived
+  truncation -- one `RLO` in an issue title makes the rest of that cell render
+  reversed on any terminal with bidi reordering, which is the same "the row does
+  not show its data" failure the control-character strip already prevents.
+  Deleted rather than replaced with a space, because they measure zero and a
+  space would shift every cell to its right. Genuine RTL, `LRM`, emoji, ZWJ
+  sequences and CJK are untouched.
+- **`REPO_PATTERN` rejects `owner/..`.** It reached the API path, and `gh`
+  forwards the dot segment unnormalized, so GitHub resolved it to a different
+  endpoint than the one intended. Names that merely contain or start with a dot
+  -- `owner/.github` -- are still valid.
+- **Backoff deadlines use a monotonic clock.** They measure elapsed time, and a
+  laptop resume or an NTP step could hold an alert source in backoff for an hour
+  of apparent time that never passed. Staleness deliberately stays on wall-clock
+  time, because a sleep gap is exactly what it exists to report.
+- **A crash no longer orphans `gh` children.** The handlers exited without
+  unmounting, so the cleanup that aborts in-flight subprocesses never ran. Both
+  the crash output and the `--verbose` log are now redacted, like `--doctor`
+  already was -- all three are artifacts users are told to attach to bug reports,
+  and `gh` error messages quote the URL they failed on.
 
 ### Changed
 
@@ -73,6 +142,26 @@ machinery was rejected outright. What is left is behaviour you can see.
   or `GH_REPO` -- `╭─ Actions · acme/widget ─`. With several panes open, or after
   changing directory, nothing on screen said which repository a pane was watching.
   It is dropped before the tab name when the pane is too narrow for both.
+- **Column density is decided per tab.** One global breakpoint meant the widest
+  tab decided for the narrowest: Pull requests needs 61 columns and Security only
+  44, so Security dropped two columns a full 17 columns before it had to. Only
+  one tab is on screen at a time, so there is nothing to be inconsistent with.
+- **Below 24 columns the pane says "too narrow"** instead of rendering a table
+  that cannot fit. Under that width even the compact columns overflow, which
+  hard-wraps every row and drives ink into repainting the whole screen each
+  frame -- reachable just by dragging a sidebar narrow. Widening recovers
+  immediately.
+- **The Security tab collapses its not-enabled notes into one line.** Each
+  unavailable alert source took a full row above the column header, so any
+  repository without Advanced Security permanently spent two rows -- about a
+  tenth of a twenty-row pane -- restating a fact that will never change, on the
+  tab meant to make real alerts stand out. Failures that are not "not enabled"
+  keep their own lines, because those are actionable and transient.
+- **Alert ordering is pinned rather than left to each endpoint's default.**
+  Severity ranking runs over one page, so the page boundary decides what can be
+  ranked at all -- a critical alert sitting past it was never fetched, and the
+  pane showed "100+" with a screen of moderates. Newest-first at least makes the
+  cut deterministic.
 - **`-v` is no longer an alias for `--version`.** This CLI also has `--verbose`,
   so `gh-glance -v 2>log` -- what you type when you want the log -- printed a
   version string and exited 0. The argv surface exists to make typos fail loudly,

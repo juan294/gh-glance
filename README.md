@@ -190,13 +190,19 @@ stdout isn't a terminal rather than streaming redraw frames into a pipe.
 | `PgUp` / `PgDn` | Move a page at a time |
 | `Enter` | Open the selected item in your browser |
 | `r` | Refresh the current tab now |
+| `?` | Show the keys without leaving the dashboard (any key closes it) |
 | `q` / `Esc` / `Ctrl+C` | Quit |
 
 The cursor tracks the *item*, not the row position, so it stays on what you
 selected as new rows arrive above it. `Enter` works on Actions, Issues and Pull
 Requests; the Security tab has no per-alert `gh` command to open. It clears
 itself after 60s with no cursor movement, so a pane left idle in the corner of
-a screen doesn't sit there marked forever.
+a screen doesn't sit there marked forever -- and the next arrow key picks up
+from what is on screen rather than jumping back to the top of the list.
+
+When the repository was chosen explicitly, with `--repo` or `GH_REPO`, the panel
+says so: `╭─ Actions · acme/widget ─`. That is what tells two side-by-side panes
+apart. It is dropped before the tab name when the pane is too narrow for both.
 
 If `gh-glance` is started without an interactive stdin (for example with stdin
 redirected), the key handlers cannot run and the status bar shows only `Quit: ^C`

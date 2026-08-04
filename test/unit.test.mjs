@@ -29,6 +29,12 @@ import {
   MIN_TABLE_WIDTH,
   OCT_NERD,
   OCT_UNICODE,
+  KEY_TABLE,
+  KEY_HINTS,
+  VERDICT_REMEDY,
+  RATE_LIMIT_RETRY_MS,
+  FAILURE_LADDER,
+  REPO_PATTERN,
 } from "../index.mjs";
 
 const ESC = String.fromCharCode(27);
@@ -325,5 +331,84 @@ test("importing the app selects React's production build", async () => {
     4,
     "React loaded its development build: NODE_ENV was read after react, " +
       "or a static react/ink import was added above index.mjs's NODE_ENV default",
+  );
+});
+
+test("safe() strips bidi overrides without disturbing legitimate text", () => {
+  // A row must never display something other than its data. The C0 strip already
+  // closed the CR/LF/ESC versions of that; U+202A-U+202E and U+2066-U+2069 are
+  // the same attack by another route, and ink measures them as zero columns, so
+  // they cost no width and survived truncation untouched.
+  assert.equal(safe("harmless‮gnp.exe"), "harmlessgnp.exe");
+  assert.equal(safe("a⁦b⁩c"), "abc");
+  // Deleted, not replaced with a space: they measure zero, so substituting a
+  // space would ADD a visible column and shift every cell to its right.
+  assert.equal(Array.from(safe("ab‮cd")).length, 4);
+  // The things that must survive -- a sanitizer that ate these would be a worse
+  // bug than the one it fixes: real RTL, LRM, emoji, ZWJ sequences, CJK.
+  assert.equal(safe("مرحبا bug"), "مرحبا bug");
+  assert.equal(safe("a‎b"), "a‎b");
+  assert.equal(safe("ship \u{1F680}"), "ship \u{1F680}");
+  assert.equal(safe("\u{1F468}‍\u{1F469}‍\u{1F467}"), "\u{1F468}‍\u{1F469}‍\u{1F467}");
+  assert.equal(safe("修复错误"), "修复错误");
+});
+
+test("safe() sanitizes values that are not strings", () => {
+  // It used to return early for anything non-string, skipping both the control
+  // strip and the clamp -- so the guarantee was really being provided by
+  // GitHub's schema rather than by this function.
+  assert.equal(safe(["x[2Jy"]), "x [2Jy");
+  assert.equal(safe(null), "");
+  assert.equal(safe(undefined), "");
+  assert.equal(safe(5), "5");
+});
+
+test("REPO_PATTERN rejects dot segments but keeps real repository names", () => {
+  // `owner/..` reached apiPath() and produced `repos/owner/../dependabot/alerts`;
+  // gh forwards the dot segment unnormalized and GitHub resolves it server-side
+  // to a different endpoint entirely.
+  for (const bad of ["owner/..", "owner/.", "owner/...", "owner/x.git"]) {
+    assert.ok(!REPO_PATTERN.test(bad), `${bad} must be rejected`);
+  }
+  // Dots are legal inside names -- .github is a real and widely used repository,
+  // and over-tightening here would be a worse bug than the one being fixed.
+  for (const good of ["cli/cli", "owner/.github", "owner/docs.example.com", "o/a.b.c"]) {
+    assert.ok(REPO_PATTERN.test(good), `${good} must be accepted`);
+  }
+});
+
+test("every verdict with a remedy also has a backoff ladder, and vice versa", () => {
+  // The two tables are read together on every failure: one picks what the user
+  // is told, the other picks how hard we keep asking. A verdict in one and not
+  // the other means a tab that either explains itself and then hammers, or backs
+  // off in silence. "other" is in neither, deliberately -- an unclassified
+  // failure shows its real message and retries on the next tick.
+  assert.deepEqual(Object.keys(VERDICT_REMEDY).sort(), Object.keys(FAILURE_LADDER).sort());
+  assert.ok(!("other" in VERDICT_REMEDY));
+  assert.ok(!("ok" in FAILURE_LADDER));
+  // Short and flat: a rate limit clears on GitHub's own schedule, so the
+  // hour-long unavailable ladder would leave the pane blank long after the cause
+  // was gone.
+  assert.equal(RATE_LIMIT_RETRY_MS.length, 1);
+  assert.ok(RATE_LIMIT_RETRY_MS[0] <= BACKOFF_STEPS_MS[0]);
+});
+
+test("the status bar hints are a subset of the documented key table", () => {
+  // KEY_TABLE feeds both --help and the `?` overlay; KEY_HINTS is the short
+  // subset shown on the status bar. Nothing else enforces that they agree.
+  // Matched on the action, not the glyph: the bar renders "Move: ↑↓" where the
+  // table says "Up / Down, j / k", and those are two representations of one
+  // binding rather than a drift. What must not happen is the bar advertising an
+  // action the table never explains.
+  const documented = KEY_TABLE.map(([, desc]) => desc.toLowerCase()).join(" | ");
+  for (const hint of KEY_HINTS) {
+    assert.ok(
+      documented.includes(hint.label.toLowerCase()),
+      `status bar advertises "${hint.label}" but the key table documents no such action`,
+    );
+  }
+  assert.ok(
+    KEY_TABLE.some(([keys]) => keys === "?"),
+    "the overlay's own key must be listed in the table it renders",
   );
 });
