@@ -53,6 +53,23 @@ const REFRESH_MS = 5000;
 // last movement, not from tab switches or Enter) quietly drops it.
 const SELECTION_IDLE_MS = 60_000;
 
+// How long a first fetch has to still be unresolved before the loading line
+// offers the Nerd Font escape hatch. The hint used to be unconditional, which
+// put a line naming an environment variable in front of every user on every
+// start to catch the minority whose terminal cannot draw the glyphs -- a dim
+// "loading actions…" reads as "working", the same line with a remedy attached
+// reads as a warning, and it was on screen for the whole first fetch every time.
+//
+// The threshold is set from the fetch that actually gates it, not from a round
+// number: the hint hangs off the *visible* tab's loading line, and the tab you
+// land on is Actions, whose `gh run list` is by far the slowest call here
+// (measured against this repo: issues/PRs/alerts resolve 0.6-1.1s after the
+// first frame, runs 1.4-3.0s). 1.5s would have fired on most ordinary starts --
+// i.e. changed nothing. 3s sits past the slow end of that range, so a start that
+// reaches it is genuinely stuck rather than merely fetching, which is exactly
+// the moment the remedy is worth a line.
+const ICON_HINT_AFTER_MS = 3000;
+
 // `gh run list` costs roughly linearly in --limit (measured: ~1.2s at 20 runs,
 // ~3.0s at 100, ~4.9s at 150), so asking for a fixed 150 to render ~35 visible
 // rows was paying several seconds per refresh for rows nobody sees. Actions is
@@ -2207,6 +2224,10 @@ function App() {
   // The `?` overlay. Renders only on a keypress, so consecutive idle frames are
   // still byte-identical and the redraw suppression is untouched.
   const [showHelp, setShowHelp] = useState(false);
+  // Set once, ICON_HINT_AFTER_MS into a first load that is still running. Never
+  // reset: it only gates a line that a resolved tab stops rendering anyway, and
+  // clearing it would cost a second state write for no visible difference.
+  const [iconHintDue, setIconHintDue] = useState(false);
   const [errors, setErrors] = useState({ actions: null, issues: null, prs: null, security: null });
   const [loading, setLoading] = useState({ actions: true, issues: true, prs: true, security: true });
   const [now, setNow] = useState(new Date());
@@ -2613,6 +2634,18 @@ function App() {
     return () => clearInterval(id);
   }, [showSpinner]);
 
+  // Armed on the same condition the loading line renders on, so a start that
+  // resolves inside ICON_HINT_AFTER_MS clears the timer on the way past and
+  // never writes state at all -- the fast path stays exactly as many renders as
+  // it was. `anyFirstLoad` excludes tabs that failed (see firstLoad above), so a
+  // wedged tab cannot hold this armed: an error line already says what happened,
+  // and a font hint underneath it would be answering a question nobody asked.
+  useEffect(() => {
+    if (!anyFirstLoad || iconHintDue) return;
+    const timer = setTimeout(() => setIconHintDue(true), ICON_HINT_AFTER_MS);
+    return () => clearTimeout(timer);
+  }, [anyFirstLoad, iconHintDue]);
+
   const items = data[tab.key];
   const error = errors[tab.key];
   const spin = SPINNER[frame % SPINNER.length];
@@ -2834,12 +2867,13 @@ function App() {
           { dimColor: true },
           firstLoad[tab.key]
             ? `${showSpinner ? spin : SPINNER[0]} loading ${tab.label.toLowerCase()}…` +
-              // Shown only while the first fetch is in flight, so it costs a
-              // second of one line at startup and nothing after -- and it lands
-              // exactly when someone is staring at a fresh pane deciding whether
-              // the thing works. Suppressed once icons are already ASCII, since
-              // then there is nothing to fix.
-              (USING_NERD_ICONS ? "   (icons blank? GH_GLANCE_ICONS=unicode)" : "")
+              // Appended only once a first fetch has been running for
+              // ICON_HINT_AFTER_MS, so an ordinary start never shows it: the
+              // remedy is for someone looking at a pane of blank boxes, and by
+              // then they have been looking long enough to want an explanation.
+              // Suppressed once icons are already ASCII, since then there is
+              // nothing to fix.
+              (USING_NERD_ICONS && iconHintDue ? "   (icons blank? GH_GLANCE_ICONS=unicode)" : "")
             : tab.key === "security" && securityNotes.length === ALERT_SOURCES.length
               ? "no alert sources available"
               : `no ${tab.countLabel}`,

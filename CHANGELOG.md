@@ -5,6 +5,21 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The blank-icons hint waits for a start that is actually stuck.** It shipped
+  in 0.5.0 on the loading line unconditionally, so every start put a line naming
+  an environment variable in front of everyone for the second or two the first
+  fetch takes -- a dim `loading actions…` reads as "working", the same line with
+  a remedy attached reads as a warning about a problem you do not have. It now
+  appears only once a first fetch has been running 3s, which is past the slow end
+  of what `gh run list` costs on the tab you land on (measured: 1.4-3.0s after
+  the first frame, against 0.6-1.1s for the other three tabs). An ordinary start
+  never shows it; a pane of blank boxes that is genuinely waiting still explains
+  itself.
+
 ## [0.5.0] - 2026-08-04
 
 Findings from a cross-functional audit, filtered hard: everything that would
