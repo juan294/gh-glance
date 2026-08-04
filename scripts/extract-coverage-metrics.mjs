@@ -8,12 +8,12 @@ function requiredMatch(source, pattern, label) {
 }
 
 export function parseNodeTestCoverage(source) {
-  const testCount = Number(requiredMatch(source, /^\s*(?:ℹ\s+)?tests\s+(\d+)\s*$/m, 'test count'));
-  const passing = Number(requiredMatch(source, /^\s*(?:ℹ\s+)?pass\s+(\d+)\s*$/m, 'passing count'));
-  const failing = Number(requiredMatch(source, /^\s*(?:ℹ\s+)?fail\s+(\d+)\s*$/m, 'failing count'));
+  const testCount = Number(requiredMatch(source, /^\s*(?:[ℹ#]\s+)?tests\s+(\d+)\s*$/m, 'test count'));
+  const passing = Number(requiredMatch(source, /^\s*(?:[ℹ#]\s+)?pass\s+(\d+)\s*$/m, 'passing count'));
+  const failing = Number(requiredMatch(source, /^\s*(?:[ℹ#]\s+)?fail\s+(\d+)\s*$/m, 'failing count'));
   const coveragePercent = Number(requiredMatch(
     source,
-    /^\s*(?:ℹ\s+)?all files\s*\|\s*(\d+(?:\.\d+)?)\s*\|/m,
+    /^\s*(?:[ℹ#]\s+)?all files\s*\|\s*(\d+(?:\.\d+)?)\s*\|/m,
     'all-files line coverage',
   ));
 

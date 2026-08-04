@@ -42,6 +42,15 @@ test('keeps skipped tests in the total without treating them as failures', () =>
   );
 });
 
+test('accepts the hash-prefixed TAP summary emitted by Node 22 on Linux', () => {
+  assert.deepEqual(parseNodeTestCoverage(SAMPLE.replaceAll('ℹ', '#')), {
+    testCount: 87,
+    passing: 87,
+    failing: 0,
+    coveragePercent: 82.35,
+  });
+});
+
 test('rejects missing, zero, failed, or malformed coverage summaries', () => {
   for (const source of [
     '',
