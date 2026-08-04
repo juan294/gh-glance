@@ -37,10 +37,12 @@ without switching to the browser.
 > status icons render in a browser. With a Nerd Font (the default) they are
 > Octicon glyphs instead.
 >
-> The `>` on the first row is the cursor. Two more markers appear when they
+> The `>` on the first row is the cursor. Three more markers appear when they
 > apply: a `+` after a tab's count means the list was truncated by the fetch
-> limit, and a `!` after the Actions count means the newest run failed — so
-> "is CI red" is answerable without switching to that tab.
+> limit, a `!` after the Actions count means the newest run failed — so "is CI
+> red" is answerable without switching to that tab — and a `?` in place of the
+> Security count means its endpoints could not be read, which is not the same
+> as there being nothing to report.
 
 <!-- contract:allow-emoji -- the check/cross above stand in for Nerd Font
      Octicons the app actually draws; they are literal examples, not decoration. -->
@@ -64,15 +66,18 @@ current.
   (approved / changes requested / pending), age
 - **Security** -- open Dependabot alerts: package, summary, age, sorted with the
   most severe first and with severity spelled out in its own column, not carried
-  by colour alone.
+  by colour alone. One page of 100 newest alerts is fetched and ranked, so on a
+  repository with more open alerts than that the ranking covers the newest 100
+  rather than everything -- the `+` marker on the count is what tells you.
   Code scanning and secret scanning alerts are included too, on repos/plans
   that have GitHub Advanced Security enabled -- see [Limitations](#limitations).
 - Tab bar with live counts, pinned to the top of the pane above a divider,
   switchable via `1`-`4`, arrow keys, or `Tab`/`Shift+Tab`
 - `lazygit`-style panel frame: the tab name sits in the top border, the
   visible-of-total row count in the bottom
-- A spinning `Fetching` indicator while a refresh is in flight, so the pane
-  says when it's working without spending a line on it
+- A `Fetching` indicator that brightens on every refresh and animates during the
+  first load or while a workflow run is executing, so the pane says when it's
+  working without spending a line on it
 - Status icons are real GitHub Octicons (via the Nerd Font glyph set), not emoji
   -- with a plain-ASCII fallback for terminals without one
 - Readable without colour: severity has its own column, a failing newest run puts
@@ -232,7 +237,7 @@ Environment variables work too, and the flags take precedence:
 | `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GH_CONFIG_DIR` | Not read by `gh-glance` -- passed through to `gh` untouched, along with the proxy variables. `gh-glance` handles no credentials of its own |
 | `GH_GLANCE_ICONS=unicode` | Plain ASCII status icons, for terminals without a Nerd Font |
 | `GH_GLANCE_NO_ANIMATION=1` | Freeze the spinner — no motion at all |
-| `NO_COLOR=1` | Disable colour. Status stays readable: severity has its own column, run states have distinct glyphs, and the active tab is bracketed |
+| `NO_COLOR=1` | Disable colour. Status stays readable: severity has its own column, a failing newest run puts a `!` on the Actions tab, and the active tab is bracketed. Note that run-state glyphs are not all distinct -- see the feature list above |
 | `INK_SCREEN_READER=true` | Switch the renderer to a linear, unthrottled mode. The status icons carry text labels for it, but this path has not been tested against a real screen reader — treat it as unverified rather than supported. |
 
 ## GitHub Enterprise and EMU
@@ -276,36 +281,55 @@ gh-glance --doctor > report.txt
 
 Collects, in one plain-text block: the `gh-glance`, Node and `gh` versions;
 which hosts `gh` is authenticated for; how the repository target resolved and
-from where; the relevant environment variables; and one probe per endpoint with
-the exact argv it sent, its outcome, and how any error was classified
-(`unavailable`, `rate-limited`, `auth-problem` or `other`).
+from where; your remaining REST and GraphQL budget plus what this configuration
+will spend per hour; the relevant environment variables; and one probe per
+endpoint with the exact argv it sent, its outcome, and how any error was
+classified (`unavailable`, `rate-limited`, `auth-problem` or `other`).
+
+Add `--verbose` to get a log of every `gh` call it makes alongside the report.
 
 It exits 0 and prints a report even when `gh` is missing or you are outside a
 git repository -- those are conditions worth reporting rather than failing on --
 and it works through a pipe, unlike the dashboard itself.
 
-**Tokens are never printed.** Token-valued environment variables are reported
-as `set` or `not set` and never by value, not even a prefix; anything
-token-shaped anywhere in the captured text is replaced; proxy and remote URL
-credentials are stripped to scheme and host; and no API response bodies are
-included, only their sizes. The report is safe to attach to a bug report.
+**Values are printed only for variables on a short curated list** -- the ones
+that are the thing being diagnosed, like `GH_HOST`, `GH_REPO` and `NO_COLOR`.
+Everything else it finds, including any `GH_*`/`GITHUB_*` variable it was never
+told about, is reported as `set` or `not set` and never by value. On top of
+that: anything token-shaped anywhere in the captured text is replaced, proxy and
+remote URL credentials are stripped to scheme and host, and no API response
+bodies are included, only their sizes. The report is safe to attach to a bug
+report, and the same redaction covers the `--verbose` log and the message
+printed if `gh-glance` crashes.
 
 ## Rate limit
 
 The visible tab refreshes every 5 seconds; the other three refresh every 60
 seconds, purely to keep their counts honest.
 
-With Actions, Issues or Pull Requests as the visible tab that works out at
-roughly 1,000 REST requests an hour — about 20% of the 5,000/hour
-authenticated limit. The Security tab is the expensive one, because it is
-three endpoints rather than one: watching it costs roughly 2,300 an hour,
-just under half the budget.
+The tabs do not all draw on the same budget. Actions and Security spend REST
+calls; Issues and Pull Requests are sorted with `--search`, which routes them
+through GraphQL instead — a separate 5,000/hour allowance. With the default
+5-second refresh:
 
-Two things pull the real number down. An endpoint that is not enabled for the
-repository — code scanning and secret scanning without Advanced Security —
-backs off after its first refusal rather than being re-asked every tick, which
-removes two of the Security tab's three calls. And `--refresh` scales the
-whole figure: doubling the interval halves it.
+| Visible tab | REST / hour | GraphQL / hour |
+|---|---|---|
+| Actions | ~900 | ~240 |
+| Issues or Pull Requests | ~240 | ~1,560 |
+| Security | ~2,220 | ~240 |
+
+Security is the expensive one because it is three endpoints rather than one,
+and watching it costs just under half the REST budget. You do not have to take
+these figures on trust: `gh-glance --doctor` reports your actual remaining
+budget alongside what your configuration projects, which matters on a GitHub
+Enterprise tenant where the ceiling may not be 5,000 at all.
+
+Two things pull the real number down. Any endpoint that fails in a way
+`gh-glance` recognises backs off instead of being re-asked every tick — a
+feature that is not enabled for the repository retries on a ladder up to an
+hour, an authorization failure every 30 seconds, a rate limit every minute.
+Pressing `r` clears that backoff and retries immediately. And `--refresh`
+scales the whole figure: doubling the interval halves it.
 
 So a pane left open all day shares the budget with your other `gh` commands
 rather than exhausting it, but it is not free, and parking it on the Security
@@ -317,19 +341,29 @@ tab is the case worth knowing about.
 - **Security tab**: code scanning and secret scanning alerts require [GitHub
   Advanced Security](https://docs.github.com/en/code-security/getting-started/github-security-features).
   On repos/plans without it, `gh-glance` doesn't crash or spam errors -- it
-  shows a one-line note per unavailable feature and still displays whatever
-  it *can* get (Dependabot alerts work independently of GHAS). If your repo
-  has GHAS enabled, those alerts just show up automatically -- no
-  configuration needed.
+  says so in a single collapsed line -- `Code scanning, Secret scanning: not
+  enabled here` -- and still displays whatever it *can* get (Dependabot alerts
+  work independently of GHAS). If your repo has GHAS enabled, those alerts just
+  show up automatically -- no configuration needed.
+
+  If the alert endpoints cannot be read at all -- an expired SAML session, a
+  token without `security_events`, an org OAuth restriction -- the tab count
+  shows `?` rather than a number. A blind Security tab and a clean one are not
+  the same thing, and reporting `0` for both would be the worst available
+  answer on that particular surface.
 - Scrolling moves through what was fetched, not through everything on GitHub.
   Issues and Pull Requests fetch 150, so there is real range there. Actions
   deliberately fetches about a screenful -- its cost is linear in the number of
   runs requested -- so scrolling that tab has little to move through. The count
   in the bottom edge always says how much you are seeing out of how much was
   fetched.
-- **Minimum width.** Below about 61 columns the table drops to a compact layout
-  (icon, title, and one other column) so the frame, tab bar and status line stay
-  on screen. Below about 24 columns it will not lay out sensibly.
+- **Minimum width.** Each tab drops to a compact layout (icon, title, and one
+  other column) at its own threshold, so a narrow pane keeps as much as that
+  particular tab can fit: Security holds its full set down to 44 columns,
+  Issues to 50, Actions to 56, Pull Requests to 61. Below 24 columns nothing
+  useful fits, so the pane says `too narrow` and keeps the frame, tab bar and
+  quit hint; widening it recovers immediately. The status bar has its own
+  breakpoint and drops to bare keys (`↑↓ Ent r q`) rather than truncating.
 - Issues and pull requests are fetched 150 at a time and alerts 100 at a time.
   A count is shown as `n+` when it was truncated, so the number is never
   presented as exact when it is not.
@@ -372,10 +406,13 @@ in some terminals, which would shift every column to their right.
 | `none of the git remotes ... point to a known GitHub host` | `gh` is not authenticated for that host. Run `gh auth login --hostname <host>`. |
 | Security tab empty on an enterprise host, other tabs fine | The alert endpoints were sent to the wrong host. Use `--repo host/owner/name` or set `GH_HOST` -- a host-qualified `GH_REPO` alone does not route them. |
 | Tabs start failing after working for a while | The enterprise SAML session lapsed. Re-authorize in the browser; the dashboard recovers within about 30 seconds. Run `gh-glance --doctor` to confirm. |
-| A tab's count is red | That tab's last fetch failed. The error itself is shown when you switch to it. |
+| A tab's count is red | That tab's last fetch failed. The error itself is shown when you switch to it, translated into what to do about it where `gh-glance` recognises the failure. |
+| Security tab shows `?` instead of a number | The alert endpoints could not be read at all -- an expired SAML session, a token without `security_events`, or an org OAuth restriction. `?` means "unknown", not "zero"; run `gh-glance --doctor` to see which probe failed and how it was classified. |
+| A failing tab seems to have stopped retrying | It backs off deliberately, rather than re-spawning `gh` every five seconds against an endpoint that is refusing. Press `r` to clear the backoff and retry now. |
+| `unknown argument: -v` | `-v` used to mean `--version` and no longer does, because this CLI also has `--verbose`. Use `--version` or `--verbose` explicitly. |
 | `stale 2m` in the status bar | The visible tab has not refreshed successfully for a while — usually a network drop. |
 | It exits immediately when piped | Intentional. It is a full-screen dashboard, not a reporting command. |
-| It stopped updating and you cannot tell why | Run `gh-glance --verbose 2>gh-glance.log`, reproduce, then read the log: one line per `gh` call with its duration and outcome. Attach it to a bug report. |
+| It stopped updating and you cannot tell why | Run `gh-glance --verbose 2>gh-glance.log`, reproduce, then read the log: one line per `gh` call with its duration and outcome. It is redacted the same way `--doctor` is, so it is safe to attach to a bug report. `--doctor --verbose` logs the probes too. |
 | `--verbose` refuses to start | stderr is still your terminal, where the log would draw over the dashboard. Redirect it to a file. |
 
 ## Contributing

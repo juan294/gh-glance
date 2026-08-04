@@ -1393,6 +1393,7 @@ Environment:
   GH_GLANCE_ICONS=unicode   Plain-unicode status icons (no Nerd Font needed)
   GH_GLANCE_NO_ANIMATION=1  Freeze the spinner (no motion)
   NO_COLOR=1                Disable colour (status stays readable)
+  INK_SCREEN_READER=true    Linear, unthrottled rendering (unverified -- see README)
 `;
 
 // argv and the TTY guard run *before* react and ink are imported. Loading ink

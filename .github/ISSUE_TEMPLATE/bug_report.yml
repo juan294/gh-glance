@@ -101,12 +101,14 @@ body:
         Output of `gh-glance --doctor`. Optional, but it is the single most
         useful thing you can attach -- it adds what the versions above cannot:
         which hosts `gh` is authenticated for, how the repository target
-        resolved and from where, and one probe per endpoint showing the exact
-        `gh` command sent and how any error was classified. That last part is
-        usually what identifies the problem.
+        resolved and from where, your remaining API budget, and one probe per
+        endpoint showing the exact `gh` command sent and how any error was
+        classified. That last part is usually what identifies the problem.
 
-        It is safe to paste. Tokens are never printed (only whether they are
-        set), credentials are stripped from proxy and remote URLs, and no API
+        It is safe to paste. Environment values are printed only for a short
+        curated list of variables that are themselves the thing being
+        diagnosed; everything else is reported as set or not set and never by
+        value. Credentials are stripped from proxy and remote URLs, and no API
         response bodies are included.
 
         It works even when the dashboard does not -- it reports rather than
