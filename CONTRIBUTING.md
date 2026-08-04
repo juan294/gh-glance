@@ -103,6 +103,20 @@ git checkout -b feat/your-feature
 
 Open your pull request against `develop`, never against `main`.
 
+Publishing a `main` commit to npm is automatic: publishing a GitHub release
+triggers `.github/workflows/release.yml`, which republishes from the tagged
+commit. Nothing is ever published from a maintainer's machine, because
+`npm pack` reads the working tree rather than the tag and would happily ship
+uncommitted edits.
+
+The workflow authenticates with OIDC trusted publishing and holds no
+credentials. Do not add an `NPM_TOKEN` secret to this repository -- npm is
+withdrawing token-based publishing (Jan 2027), and the trust relationship
+already covers it. The relationship is registered against the repository, the
+workflow *filename*, and the `npm` environment, so renaming
+`.github/workflows/release.yml` or that environment breaks publishing until
+`npm trust github gh-glance` is re-run.
+
 `develop` is protected and rejects direct pushes, including from maintainers.
 No approving review is required, so a single contributor is not blocked, but the
 required checks have to be green before anything lands.
