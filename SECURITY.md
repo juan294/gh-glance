@@ -6,7 +6,8 @@ Only the current major release receives security patches.
 
 | Version | Supported |
 |---------|-----------|
-| 0.4.x   | Yes       |
+| 0.5.x   | Yes       |
+| 0.4.x   | No        |
 | 0.3.x   | No        |
 | 0.2.x   | No        |
 | < 0.2   | No (never released)  |
