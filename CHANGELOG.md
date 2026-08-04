@@ -5,6 +5,37 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-08-04
+
+First release published by CI rather than from a laptop, and the first carrying
+an [npm provenance
+attestation](https://docs.npmjs.com/generating-provenance-statements) linking
+the tarball to the workflow run and commit that built it.
+
+### Fixed
+
+- **The install instructions on the npm page told you to clone the
+  repository.** `README.md` ships inside the tarball, and the copy published
+  with `0.3.0` still said "Not yet published to npm -- clone + `npm link` is
+  the current install path". It was written before there was a package and was
+  false the moment one existed. `npm install -g gh-glance` is now the first
+  thing the page shows.
+
+### Added
+
+- **Publishing is automatic and credential-free.** Publishing a GitHub release
+  builds and publishes from the tagged commit via OIDC trusted publishing.
+  There is no `NPM_TOKEN` in the repository and there will not be one: npm
+  revoked all classic tokens in December 2025, removed account and package
+  management from bypass-2FA granular tokens in August 2026, and removes their
+  direct-publish ability in January 2027.
+- The release workflow now installs the packed tarball globally and runs the
+  binary before publishing, so a dropped `files` entry or a broken bin shebang
+  fails the release rather than the next person's install. It also refuses a
+  tag that is not reachable from `main` or that does not point at the commit
+  being built, and skips a version that is already on the registry rather than
+  hard-failing on `E403`.
+
 ## [0.3.0] - 2026-08-03
 
 The dashboard stops being read-only: you can now move through the table and open
@@ -196,5 +227,6 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
+[0.3.1]: https://github.com/juan294/gh-glance/releases/tag/v0.3.1
 [0.3.0]: https://github.com/juan294/gh-glance/releases/tag/v0.3.0
 [0.2.0]: https://github.com/juan294/gh-glance/releases/tag/v0.2.0
