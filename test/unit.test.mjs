@@ -14,6 +14,9 @@ import {
   isUnavailable,
   isRateLimited,
   isAuthProblem,
+  classify,
+  toTabError,
+  formatTabError,
   AUTH_RETRY_MS,
   BACKOFF_STEPS_MS,
   formatAge,
@@ -42,6 +45,9 @@ const BEL = String.fromCharCode(7);
 const NUL = String.fromCharCode(0);
 const DEL = String.fromCharCode(127);
 const C1 = String.fromCharCode(155);
+const NO_LOGIN_ERROR = "You are not logged into any GitHub hosts. To log in, run: gh auth login";
+const REPOSITORY_RESOLUTION_ERROR =
+  "GraphQL: Could not resolve to a Repository with the name 'Nvteca/cashflor-forecast'. (repository)";
 
 test("safe() strips the escape classes that survive ink's own sanitizer", () => {
   // Each of these was verified to reach the terminal unmodified through ink.
@@ -126,6 +132,47 @@ test("error classification keys off HTTP status, not the process exit code", () 
   // so it must never latch the backoff.
   assert.ok(isRateLimited({ stderr: "HTTP 403: API rate limit exceeded" }));
   assert.ok(!isRateLimited({ stderr: "gh: Not Found (HTTP 404)" }));
+});
+
+test("fresh gh login failures are auth problems", () => {
+  for (const message of [
+    NO_LOGIN_ERROR,
+    "To get started with GitHub CLI, please run: gh auth login",
+    "none of the git remotes configured for this repository\npoint to a known GitHub host",
+  ]) {
+    assert.equal(isAuthProblem({ stderr: message }), true, message);
+    assert.equal(classify({ stderr: message }), "auth-problem", message);
+  }
+});
+
+test("the screenshot GraphQL resolution failure is unavailable", () => {
+  const error = { stderr: REPOSITORY_RESOLUTION_ERROR };
+  assert.equal(isUnavailable(error), true);
+  assert.equal(classify(error), "unavailable");
+});
+
+test("unrelated GraphQL errors remain other", () => {
+  const error = { stderr: "GraphQL: Something went wrong while executing your query" };
+  assert.equal(isUnavailable(error), false);
+  assert.equal(classify(error), "other");
+});
+
+test("structured tab errors select actionable one-line remedies", () => {
+  const repositoryError = toTabError({ stderr: REPOSITORY_RESOLUTION_ERROR });
+  assert.equal(formatTabError(repositoryError), VERDICT_REMEDY.unavailable);
+
+  const authError = toTabError({ stderr: NO_LOGIN_ERROR });
+  assert.equal(formatTabError(authError), VERDICT_REMEDY["auth-problem"]);
+
+  const raw = "dial tcp: lookup api.github.com: no such host";
+  assert.equal(formatTabError(toTabError({ stderr: raw })), raw);
+  assert.equal(formatTabError({ kind: "text", text: "browser launch failed" }), "browser launch failed");
+  assert.equal(formatTabError(null), null);
+
+  for (const remedy of Object.values(VERDICT_REMEDY)) {
+    assert.equal(remedy.includes("\n"), false, remedy);
+    assert.ok(remedy.length <= 120, remedy);
+  }
 });
 
 test("a SAML/SSO 403 is an auth problem, not a disabled feature", () => {

@@ -334,7 +334,11 @@ function errText(err) {
 // DNS, a 502) is a real failure that used to be reported as a confident,
 // plausible, and wrong claim that the feature was switched off.
 function isUnavailable(err) {
-  return /HTTP (403|404)/.test(errText(err));
+  const text = errText(err);
+  return (
+    /HTTP (403|404)/.test(text) ||
+    /Could not resolve to a Repository with the name .* \(repository\)/i.test(text)
+  );
 }
 
 function isRateLimited(err) {
@@ -359,7 +363,7 @@ function isRateLimited(err) {
 // entirely in the positive. It stays clear of the genuine not-enabled messages,
 // which talk about features rather than access.
 const AUTH_MARKERS =
-  /SAML|single[- ]sign[- ]on|\bSSO\b|must grant|not authoriz|unauthoriz|access restriction|Bad credentials|requires authentication|re-?authoriz|token .*scope|missing .*scope|insufficient/i;
+  /SAML|single[- ]sign[- ]on|\bSSO\b|must grant|not authoriz|unauthoriz|access restriction|Bad credentials|requires authentication|re-?authoriz|token .*scope|missing .*scope|insufficient|not logged into any GitHub hosts|To get started with GitHub CLI|run: gh auth login|none of the git remotes[\s\S]*known GitHub host/i;
 
 function isAuthProblem(err) {
   return AUTH_MARKERS.test(errText(err));
@@ -401,10 +405,30 @@ function classify(err) {
 // positive that only picked a retry ladder was cheap, whereas one that also
 // rewrites the on-screen text turns into a confidently wrong instruction.
 const VERDICT_REMEDY = {
-  "auth-problem": "GitHub authorization failed -- try `gh auth login` or `gh auth refresh`",
+  "auth-problem":
+    "GitHub login or authorization required -- run `gh auth status`, then `gh auth login` or `gh auth refresh`",
   "rate-limited": "GitHub rate limit reached -- backing off, this clears on its own",
-  unavailable: "not available for this repository",
+  unavailable:
+    "Repository not found or inaccessible to the active `gh` account -- check `gh auth status` and the repository target",
 };
+
+function toTabError(err) {
+  return { kind: "fetch", verdict: classify(err), raw: shortErr(err) };
+}
+
+function textTabError(err) {
+  return { kind: "text", text: shortErr(err) };
+}
+
+function formatTabError(error, failureContext = null) {
+  if (error == null) return null;
+  if (error.kind === "text") return error.text;
+  if (error.verdict === "other") return error.raw;
+  if (error.verdict === "unavailable" && failureContext?.repo?.ok) {
+    return "not available for this repository";
+  }
+  return pick(VERDICT_REMEDY, error.verdict, null) ?? error.raw;
+}
 
 // Some pty wrappers (and a terminal mid-resize) report a size of 0 or
 // undefined. Taking that literally collapses the table to a single row (or
@@ -2240,6 +2264,7 @@ function App() {
   const [offset, setOffset] = useState({});
 
   const tab = TABS[activeIndex];
+  const tabError = errors[tab.key];
   // The not-enabled notes are collapsed into a single line. Each unavailable
   // alert source used to contribute a full-width row above the column header,
   // and on any repo without Advanced Security that is two permanent lines --
@@ -2262,7 +2287,7 @@ function App() {
   // Counts the lines actually rendered, not the notes collected -- getting this
   // wrong by one row is what makes ink repaint the whole frame.
   const extraLines =
-    (errors[tab.key] ? 1 : 0) + (tab.key === "security" ? securityLines.length : 0);
+    (tabError ? 1 : 0) + (tab.key === "security" ? securityLines.length : 0);
   // Reserve lines for: the tab bar and the divider under it (2), the panel's
   // top and bottom edges (2), the column header and its separator (2), and
   // the status line (1), plus a 1-line safety margin. Slack is absorbed by
@@ -2387,7 +2412,7 @@ function App() {
     // unhandled rejection.
     openInBrowser(tabKey, item)
       .catch((err) => {
-        setErrors((x) => ({ ...x, [tabKey]: shortErr(err) }));
+        setErrors((x) => ({ ...x, [tabKey]: textTabError(err) }));
       })
       .finally(() => {
         delete openingRef.current[guard];
@@ -2522,13 +2547,13 @@ function App() {
         .catch((err) => {
           if (cancelled || err?.name === "AbortError") return;
           cleanRef.current[key] = false;
-          // Classified, not dumped. The three list tabs used to put raw `gh`
-          // stderr on screen while the alert path one tab over translated the
-          // same verdicts into something actionable. VERDICT_REMEDY replaces the
-          // message rather than prefixing it, because the error slot is exactly
-          // one line and a prefix would truncate away the diagnostic half.
-          const verdict = classify(err);
-          setErrors((x) => ({ ...x, [key]: pick(VERDICT_REMEDY, verdict, null) ?? shortErr(err) }));
+          // Preserve both the verdict and the bounded raw error in state. The
+          // renderer translates recognized verdicts at draw time, which lets a
+          // later repository/account context refine the one-line remedy without
+          // throwing away the original evidence.
+          const failure = toTabError(err);
+          const verdict = failure.verdict;
+          setErrors((x) => ({ ...x, [key]: failure }));
           // ...and back off, which the list tabs never did at all. A tab wedged
           // on an expired token used to re-spawn `gh` every tick forever -- 720
           // subprocesses an hour, indefinitely, against a token that is already
@@ -2647,7 +2672,7 @@ function App() {
   }, [anyFirstLoad, iconHintDue]);
 
   const items = data[tab.key];
-  const error = errors[tab.key];
+  const displayError = formatTabError(tabError, null);
   const spin = SPINNER[frame % SPINNER.length];
 
   const counts = Object.fromEntries(
@@ -2822,7 +2847,10 @@ function App() {
       !showHelp &&
         tooNarrow &&
         e(Text, { dimColor: true, wrap: "truncate-end" }, "too narrow"),
-      !showHelp && !tooNarrow && error && e(Text, { color: ERROR_TEXT, wrap: "truncate-end" }, error),
+      !showHelp &&
+        !tooNarrow &&
+        displayError &&
+        e(Text, { color: ERROR_TEXT, wrap: "truncate-end" }, displayError),
       !showHelp &&
         !tooNarrow &&
         tab.key === "security" &&
@@ -2861,7 +2889,7 @@ function App() {
       !showHelp &&
         !tooNarrow &&
         visibleItems.length === 0 &&
-        !(error && items == null) &&
+        !(tabError && items == null) &&
         e(
           Text,
           { dimColor: true },
@@ -3017,6 +3045,8 @@ export {
   isUnavailable,
   isRateLimited,
   isAuthProblem,
+  toTabError,
+  formatTabError,
   AUTH_RETRY_MS,
   BACKOFF_STEPS_MS,
   redact,
