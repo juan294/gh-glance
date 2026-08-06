@@ -16,12 +16,22 @@ echo "$*" >> "$GH_GLANCE_FIXTURE_LOG"
 
 FIXTURE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-# Lets a test drive the error classifier end to end -- a SAML 403 has no other
-# way to be produced without a real enterprise tenant. Unset by default, so
-# every pre-existing test sees exactly the fixture it saw before.
-if [ -n "${GH_GLANCE_FIXTURE_FAIL:-}" ] && [ "$1" = "api" ]; then
-  echo "$GH_GLANCE_FIXTURE_FAIL" >&2
-  exit 1
+# Lets tests drive the error classifier end to end. The selector defaults to
+# api so the original SAML fixture contract remains unchanged. Split the list
+# without shell pattern matching: an unknown selector must fail no command.
+if [ -n "${GH_GLANCE_FIXTURE_FAIL:-}" ]; then
+  fail_on="${GH_GLANCE_FIXTURE_FAIL_ON:-api}"
+  while [ -n "$fail_on" ]; do
+    selector=${fail_on%%,*}
+    if [ "$1" = "$selector" ]; then
+      echo "$GH_GLANCE_FIXTURE_FAIL" >&2
+      exit 1
+    fi
+    case "$fail_on" in
+      *,*) fail_on=${fail_on#*,} ;;
+      *) break ;;
+    esac
+  done
 fi
 
 case "$1" in
@@ -38,6 +48,23 @@ case "$1" in
     ;;
   pr)
     cat "$FIXTURE_DIR/prs.json"
+    ;;
+  repo)
+    if [ "${2:-}" = "view" ]; then
+      echo '{"nameWithOwner":"acme/widget","url":"https://github.com/acme/widget","viewerPermission":"READ"}'
+    else
+      echo '[]'
+    fi
+    ;;
+  auth)
+    if [ "${2:-}" = "status" ] && [ "${3:-}" = "--active" ] &&
+      [ "${4:-}" = "--json" ] && [ "${5:-}" = "hosts" ]; then
+      echo '[{"host":"github.com","login":"octocat"}]'
+    else
+      echo 'github.com'
+      echo '  Logged in to github.com account octocat (keyring)'
+      echo '  - Active account: true'
+    fi
     ;;
   api)
     # The three alert endpoints. An empty array is a *successful* fetch with no

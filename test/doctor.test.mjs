@@ -90,6 +90,14 @@ async function doctor({ env = {}, args = [] } = {}) {
   return stdout;
 }
 
+function probeBlock(report, name) {
+  const marker = `  ${name}\n`;
+  const start = report.indexOf(marker);
+  assert.notEqual(start, -1, `missing ${name} probe in report`);
+  const end = report.indexOf("\n\n", start);
+  return report.slice(start, end === -1 ? undefined : end);
+}
+
 test("--doctor exits 0 through a pipe and prints a complete report", async () => {
   // execFile gives the child a pipe for stdout, which is precisely the
   // condition the dashboard refuses to start under (exit 1). A reporting
@@ -144,6 +152,44 @@ test("--doctor classifies a SAML 403 as an auth problem, end to end", async () =
   assert.match(out, /^ {2}http {8}403$/m, out);
   assert.ok(out.includes(message), "the verbatim tenant message must survive into the report");
   assert.ok(!out.includes("not enabled"), "a SAML lapse was reported as a disabled feature");
+});
+
+test("--doctor classifies the real no-login issue failure", async () => {
+  const message = "To get started with GitHub CLI, please run: gh auth login";
+  const out = await doctor({
+    env: { GH_GLANCE_FIXTURE_FAIL: message, GH_GLANCE_FIXTURE_FAIL_ON: "issue" },
+  });
+  const block = probeBlock(out, "Issues (issue list)");
+  assert.match(block, /^ {2}classified {2}auth-problem$/m, block);
+  assert.ok(block.includes(message), block);
+});
+
+test("--doctor classifies the screenshot GraphQL failure", async () => {
+  const message =
+    "GraphQL: Could not resolve to a Repository with the name 'Nvteca/cashflor-forecast'. (repository)";
+  const out = await doctor({
+    env: { GH_GLANCE_FIXTURE_FAIL: message, GH_GLANCE_FIXTURE_FAIL_ON: "issue" },
+  });
+  const block = probeBlock(out, "Issues (issue list)");
+  assert.match(block, /^ {2}classified {2}unavailable$/m, block);
+  assert.ok(block.includes(message), block);
+});
+
+test("--doctor reports a failed repository-access probe separately", async () => {
+  const message =
+    "GraphQL: Could not resolve to a Repository with the name 'Nvteca/cashflor-forecast'. (repository)";
+  const out = await doctor({
+    env: { GH_GLANCE_FIXTURE_FAIL: message, GH_GLANCE_FIXTURE_FAIL_ON: "repo" },
+  });
+  const repositoryBlock = probeBlock(out, "Repository access");
+  assert.match(repositoryBlock, /^ {2}classified {2}unavailable$/m, repositoryBlock);
+  assert.ok(repositoryBlock.includes(message), repositoryBlock);
+
+  for (const name of ["Actions (run list)", "Issues (issue list)", "Pull requests (pr list)"]) {
+    const block = probeBlock(out, name);
+    assert.match(block, /^ {2}outcome {5}ok /m, block);
+    assert.match(block, /^ {2}classified {2}ok$/m, block);
+  }
 });
 
 test("--doctor reports the host-qualified target it was given", async () => {
