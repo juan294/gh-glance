@@ -333,11 +333,18 @@ function errText(err) {
 // "you can't see this here" -- everything else (auth expiry, rate limiting,
 // DNS, a 502) is a real failure that used to be reported as a confident,
 // plausible, and wrong claim that the feature was switched off.
+// The GraphQL variant is matched as two fixed substrings rather than one
+// `.*`-joined regex: CodeQL (js/polynomial-redos) flags a wildcard spanning
+// attacker-influenced text -- a repository name gh echoes back verbatim --
+// as worst-case superlinear. Two `includes` calls are index-scan cheap
+// regardless of what sits between the markers and carry no backtracking risk.
 function isUnavailable(err) {
   const text = errText(err);
+  const lower = text.toLowerCase();
   return (
     /HTTP (403|404)/.test(text) ||
-    /Could not resolve to a Repository with the name .* \(repository\)/i.test(text)
+    (lower.includes("could not resolve to a repository with the name") &&
+      lower.includes("(repository)"))
   );
 }
 
