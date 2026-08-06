@@ -23,6 +23,25 @@ import { MIN_TABLE_WIDTH } from "../../index.mjs";
 // set. Both are killed with SIGTERM, which is the path #41 lives on.
 const wide = capture({ cols: 80, rows: 24 });
 const narrow = capture({ cols: 45, rows: 20 });
+const repositoryResolutionFailure =
+  "GraphQL: Could not resolve to a Repository with the name 'Nvteca/cashflor-forecast'. (repository)";
+const inaccessibleRepository = capture({
+  cols: 80,
+  rows: 24,
+  args: "--tab issues",
+  env: {
+    GH_GLANCE_FIXTURE_FAIL: repositoryResolutionFailure,
+    GH_GLANCE_FIXTURE_FAIL_ON: "issue,repo",
+  },
+});
+const missingRemoteDetached = capture({
+  cols: 80,
+  rows: 24,
+  env: {
+    GH_GLANCE_FIXTURE_FAIL: "failed to determine base repo: no git remotes found",
+    GH_GLANCE_FIXTURE_FAIL_ON: "run,issue,pr,api",
+  },
+});
 
 test("the app reaches the data layer at all", () => {
   // Guards the silent failures: a zero-byte BSD capture when stdin is a socket,
@@ -36,6 +55,58 @@ test("the app reaches the data layer at all", () => {
     wide.fixtureCalls.some((call) => call.startsWith("run list")),
     "expected the Actions tab to fetch on first paint",
   );
+});
+
+test("healthy startup does not probe optional failure context", () => {
+  assert.ok(
+    !wide.fixtureCalls.some((call) => call.startsWith("repo view")),
+    "healthy startup unexpectedly probed repository context",
+  );
+  assert.ok(
+    !wide.fixtureCalls.some((call) => call.startsWith("auth status") && call.includes("--json hosts")),
+    "healthy startup unexpectedly probed compact auth context",
+  );
+});
+
+test("an inaccessible repository resolves failure context once", () => {
+  const calls = inaccessibleRepository.fixtureCalls;
+  assert.ok(calls.some((call) => call.startsWith("issue list")), "Issues did not fail");
+  assert.ok(calls.some((call) => call.startsWith("repo view")), "repository context was not read");
+  assert.ok(
+    calls.some((call) => call.startsWith("auth status") && call.includes("--json hosts")),
+    "auth context was not read",
+  );
+  assert.ok(
+    calls.filter((call) => call.startsWith("repo view")).length <= 1,
+    "repository context was read more than once",
+  );
+  assert.ok(
+    calls.filter((call) => call.startsWith("auth status") && call.includes("--json hosts")).length <=
+      1,
+    "auth context was read more than once",
+  );
+});
+
+test("the failure frame preserves terminal geometry and clean teardown", () => {
+  assert.equal(inaccessibleRepository.finalFrame.lines.length, 24);
+  assert.ok(
+    inaccessibleRepository.finalFrame.widest <= 80,
+    `widest failure line was ${inaccessibleRepository.finalFrame.widest} in an 80-column terminal`,
+  );
+  assert.equal(inaccessibleRepository.altEnter, 1);
+  assert.equal(inaccessibleRepository.altExit, 1);
+  assert.equal(inaccessibleRepository.afterRestore.hasScrollbackErase, false);
+  assert.equal(inaccessibleRepository.afterRestore.hasClear, false);
+  assert.equal(inaccessibleRepository.afterRestore.visible, "");
+});
+
+test("detached missing-remote setup advertises no unavailable keys", () => {
+  const frame = missingRemoteDetached.finalFrame.lines.join("\n");
+  assert.ok(!frame.includes("Enter"), frame);
+  assert.ok(!frame.includes("q/Esc"), frame);
+  assert.ok(frame.includes("Ctrl+C"), frame);
+  assert.equal(missingRemoteDetached.finalFrame.lines.length, 24);
+  assert.ok(missingRemoteDetached.finalFrame.widest <= 80);
 });
 
 test("the alternate screen is entered exactly once and left exactly once", () => {

@@ -6,6 +6,8 @@
 // main-module check, so this does not parse argv, enter the alternate screen,
 // or start the dashboard.
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { test } from "node:test";
 
 import {
@@ -14,6 +16,17 @@ import {
   isUnavailable,
   isRateLimited,
   isAuthProblem,
+  isMissingRemote,
+  forwardSignalToChild,
+  classify,
+  toTabError,
+  formatTabError,
+  parseRepoContext,
+  parseAuthContext,
+  buildFailureContext,
+  failureTargetHost,
+  unavailableRemedy,
+  createFailureContextCoordinator,
   AUTH_RETRY_MS,
   BACKOFF_STEPS_MS,
   formatAge,
@@ -31,6 +44,9 @@ import {
   OCT_UNICODE,
   KEY_TABLE,
   KEY_HINTS,
+  REMOTE_SETUP_HINTS,
+  REMOTE_SETUP_LINES,
+  REMOTE_SETUP_NONINTERACTIVE_LINES,
   VERDICT_REMEDY,
   RATE_LIMIT_RETRY_MS,
   FAILURE_LADDER,
@@ -42,6 +58,25 @@ const BEL = String.fromCharCode(7);
 const NUL = String.fromCharCode(0);
 const DEL = String.fromCharCode(127);
 const C1 = String.fromCharCode(155);
+const NO_LOGIN_ERROR = "You are not logged into any GitHub hosts. To log in, run: gh auth login";
+const REPOSITORY_RESOLUTION_ERROR =
+  "GraphQL: Could not resolve to a Repository with the name 'Nvteca/cashflor-forecast'. (repository)";
+const NO_REMOTE_ERROR = "failed to determine base repo: no git remotes found";
+const MISSING_REPOSITORY_CONTEXT = {
+  ok: false,
+  verdict: "other",
+  raw: "Repository context unavailable",
+};
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolve_, reject_) => {
+    resolve = resolve_;
+    reject = reject_;
+  });
+  return { promise, resolve, reject };
+}
 
 test("safe() strips the escape classes that survive ink's own sanitizer", () => {
   // Each of these was verified to reach the terminal unmodified through ink.
@@ -127,6 +162,389 @@ test("error classification keys off HTTP status, not the process exit code", () 
   assert.ok(isRateLimited({ stderr: "HTTP 403: API rate limit exceeded" }));
   assert.ok(!isRateLimited({ stderr: "gh: Not Found (HTTP 404)" }));
 });
+
+test("fresh gh login failures are auth problems", () => {
+  for (const message of [
+    NO_LOGIN_ERROR,
+    "To get started with GitHub CLI, please run: gh auth login",
+    "none of the git remotes configured for this repository\npoint to a known GitHub host",
+  ]) {
+    assert.equal(isAuthProblem({ stderr: message }), true, message);
+    assert.equal(classify({ stderr: message }), "auth-problem", message);
+  }
+});
+
+test("a local repository without remotes is an onboarding state", () => {
+  for (const message of [NO_REMOTE_ERROR, "no git remotes found"]) {
+    const error = { stderr: message };
+    assert.equal(isMissingRemote(error), true, message);
+    assert.equal(classify(error), "no-remote", message);
+    assert.equal(formatTabError(toTabError(error)), VERDICT_REMEDY["no-remote"]);
+  }
+  assert.equal(isMissingRemote({ stderr: "no git repository found" }), false);
+});
+
+test("the screenshot GraphQL resolution failure is unavailable", () => {
+  const error = { stderr: REPOSITORY_RESOLUTION_ERROR };
+  assert.equal(isUnavailable(error), true);
+  assert.equal(classify(error), "unavailable");
+});
+
+test("unrelated GraphQL errors remain other", () => {
+  const error = { stderr: "GraphQL: Something went wrong while executing your query" };
+  assert.equal(isUnavailable(error), false);
+  assert.equal(classify(error), "other");
+});
+
+test("structured tab errors select actionable one-line remedies", () => {
+  const repositoryError = toTabError({ stderr: REPOSITORY_RESOLUTION_ERROR });
+  assert.equal(formatTabError(repositoryError), VERDICT_REMEDY.unavailable);
+
+  const authError = toTabError({ stderr: NO_LOGIN_ERROR });
+  assert.equal(formatTabError(authError), VERDICT_REMEDY["auth-problem"]);
+
+  const raw = "dial tcp: lookup api.github.com: no such host";
+  assert.equal(formatTabError(toTabError({ stderr: raw })), raw);
+  assert.equal(formatTabError({ kind: "text", text: "browser launch failed" }), "browser launch failed");
+  assert.equal(formatTabError(null), null);
+
+  for (const remedy of Object.values(VERDICT_REMEDY)) {
+    assert.equal(remedy.includes("\n"), false, remedy);
+    assert.ok(remedy.length <= 120, remedy);
+  }
+});
+
+test("repository context parsing validates and sanitizes every required field", () => {
+  assert.deepEqual(
+    parseRepoContext(
+      JSON.stringify({
+        nameWithOwner: "acme/\nwidget",
+        url: "https://github.com/acme/\rwidget",
+        viewerPermission: "WR\u202eITE",
+      }),
+    ),
+    {
+      ok: true,
+      nameWithOwner: "acme/ widget",
+      url: "https://github.com/acme/ widget",
+      viewerPermission: "WRITE",
+    },
+  );
+
+  for (const raw of [
+    "not json",
+    "null",
+    "[]",
+    JSON.stringify({ url: "https://github.com/acme/widget", viewerPermission: "READ" }),
+    JSON.stringify({ nameWithOwner: "acme/widget", viewerPermission: "READ" }),
+    JSON.stringify({ nameWithOwner: "acme/widget", url: "https://github.com/acme/widget" }),
+    JSON.stringify({
+      nameWithOwner: 42,
+      url: "https://github.com/acme/widget",
+      viewerPermission: "READ",
+    }),
+    JSON.stringify({
+      nameWithOwner: "acme/widget",
+      url: null,
+      viewerPermission: "READ",
+    }),
+    JSON.stringify({
+      nameWithOwner: "acme/widget",
+      url: "https://github.com/acme/widget",
+      viewerPermission: ["READ"],
+    }),
+  ]) {
+    assert.equal(parseRepoContext(raw), null, raw);
+  }
+});
+
+test("auth context parsing filters rows, sanitizes identity, and never retains tokens", () => {
+  const secret = "ghp_PLANTED_SECRET";
+  const parsed = parseAuthContext(
+    JSON.stringify([
+      {
+        host: "git\nhub.com",
+        login: "ju\u202ean",
+        token: secret,
+        scopes: ["repo"],
+      },
+      { host: "tenant.ghe.com", login: "alice" },
+      null,
+      [],
+      { host: "missing-login.example.com" },
+      { login: "missing-host" },
+      { host: 42, login: "number-host" },
+      { host: "number-login.example.com", login: 42 },
+    ]),
+  );
+
+  assert.deepEqual(parsed, [
+    { host: "git hub.com", login: "juan" },
+    { host: "tenant.ghe.com", login: "alice" },
+  ]);
+  const serialized = JSON.stringify(parsed);
+  assert.equal(serialized.includes(secret), false);
+  assert.equal(serialized.includes("token"), false);
+
+  for (const raw of ["not json", "null", "{}", JSON.stringify({ hosts: [] })]) {
+    assert.equal(parseAuthContext(raw), null, raw);
+  }
+  assert.deepEqual(parseAuthContext(JSON.stringify([null, {}, { host: "github.com" }])), []);
+});
+
+test("failure context building normalizes valid, malformed, and rejected settlements", () => {
+  const repository = {
+    nameWithOwner: "acme/widget",
+    url: "https://github.com/acme/widget",
+    viewerPermission: "READ",
+  };
+  const accounts = [{ host: "github.com", login: "alice" }];
+
+  assert.deepEqual(
+    buildFailureContext(
+      { status: "fulfilled", value: JSON.stringify(repository) },
+      { status: "fulfilled", value: JSON.stringify(accounts) },
+    ),
+    { repo: { ok: true, ...repository }, accounts },
+  );
+
+  assert.deepEqual(
+    buildFailureContext(
+      { status: "fulfilled", value: "malformed repository JSON" },
+      { status: "fulfilled", value: "malformed auth JSON" },
+    ),
+    { repo: MISSING_REPOSITORY_CONTEXT, accounts: null },
+  );
+
+  assert.deepEqual(
+    buildFailureContext(
+      { status: "rejected", reason: { stderr: REPOSITORY_RESOLUTION_ERROR } },
+      { status: "rejected", reason: new Error("unsupported gh auth flags") },
+    ),
+    {
+      repo: { ok: false, verdict: "unavailable", raw: REPOSITORY_RESOLUTION_ERROR },
+      accounts: null,
+    },
+  );
+
+  assert.deepEqual(
+    buildFailureContext(
+      { status: "fulfilled", value: JSON.stringify(repository) },
+      { status: "rejected", reason: new Error("auth context unavailable") },
+    ),
+    { repo: { ok: true, ...repository }, accounts: null },
+  );
+});
+
+test("unavailable formatting distinguishes a visible repository from a failed target", () => {
+  const error = toTabError({ stderr: REPOSITORY_RESOLUTION_ERROR });
+  assert.equal(
+    formatTabError(error, {
+      repo: { ok: true, nameWithOwner: "acme/widget", url: "https://github.com/acme/widget" },
+      accounts: [{ host: "github.com", login: "alice" }],
+    }),
+    "not available for this repository",
+  );
+  assert.equal(
+    formatTabError(error, { repo: MISSING_REPOSITORY_CONTEXT, accounts: null }),
+    VERDICT_REMEDY.unavailable,
+  );
+});
+
+test("failure target host follows explicit sources before an unambiguous account host", () => {
+  const soleAccount = [{ host: "accounts.example.com", login: "alice" }];
+  assert.equal(
+    failureTargetHost({
+      runtimeHost: "runtime.example.com",
+      ghHost: "env.example.com",
+      ghRepo: "repo.example.com/acme/widget",
+      accounts: soleAccount,
+    }),
+    "runtime.example.com",
+  );
+  assert.equal(
+    failureTargetHost({
+      runtimeHost: null,
+      ghHost: "env.example.com",
+      ghRepo: "repo.example.com/acme/widget",
+      accounts: soleAccount,
+    }),
+    "env.example.com",
+  );
+  assert.equal(
+    failureTargetHost({
+      runtimeHost: null,
+      ghHost: null,
+      ghRepo: "repo.example.com/acme/widget",
+      accounts: soleAccount,
+    }),
+    "repo.example.com",
+  );
+  assert.equal(
+    failureTargetHost({ ghRepo: "acme/widget", accounts: soleAccount }),
+    "accounts.example.com",
+  );
+  assert.equal(
+    failureTargetHost({
+      ghRepo: "https://repo.example.com/acme/widget",
+      accounts: soleAccount,
+    }),
+    "accounts.example.com",
+  );
+  assert.equal(
+    failureTargetHost({
+      accounts: [
+        { host: "same.example.com", login: "alice" },
+        { host: "same.example.com", login: "bob" },
+      ],
+    }),
+    "same.example.com",
+  );
+  assert.equal(
+    failureTargetHost({
+      accounts: [
+        { host: "one.example.com", login: "alice" },
+        { host: "two.example.com", login: "bob" },
+      ],
+    }),
+    null,
+  );
+  assert.equal(failureTargetHost({ accounts: [] }), null);
+  assert.equal(failureTargetHost({ accounts: null }), null);
+});
+
+test("unavailable remedy personalizes one matching account only within the line budget", () => {
+  const host = "tenant.ghe.com";
+  const account = { host, login: "alice" };
+  assert.equal(
+    unavailableRemedy([account, { host: "github.com", login: "bob" }], host),
+    "Repository not found or inaccessible to alice@tenant.ghe.com -- check the target or run `gh auth switch`",
+  );
+  for (const [accounts, targetHost] of [
+    [[], host],
+    [[{ host: "github.com", login: "bob" }], host],
+    [[account], null],
+    [[account, { host, login: "charlie" }], host],
+  ]) {
+    assert.equal(unavailableRemedy(accounts, targetHost), VERDICT_REMEDY.unavailable);
+  }
+
+  const prefix = "Repository not found or inaccessible to ";
+  const suffix = " -- check the target or run `gh auth switch`";
+  const boundaryHost = "g.io";
+  const exactLogin = "x".repeat(120 - prefix.length - 1 - boundaryHost.length - suffix.length);
+  const exact = unavailableRemedy([{ host: boundaryHost, login: exactLogin }], boundaryHost);
+  assert.equal(exact.length, 120);
+  assert.equal(exact.includes("\n"), false);
+  assert.equal(
+    unavailableRemedy([{ host: boundaryHost, login: `${exactLogin}x` }], boundaryHost),
+    VERDICT_REMEDY.unavailable,
+  );
+});
+
+test("failure context coordinator deduplicates and caches one resolution per epoch", async () => {
+  const pending = deferred();
+  const signal = { name: "test signal" };
+  const context = { repo: { ok: true }, accounts: [] };
+  const commits = [];
+  let resolveCalls = 0;
+  const coordinator = createFailureContextCoordinator({
+    resolve: (receivedSignal) => {
+      resolveCalls += 1;
+      assert.equal(receivedSignal, signal);
+      return pending.promise;
+    },
+    commit: (value) => commits.push(value),
+    fallback: { repo: MISSING_REPOSITORY_CONTEXT, accounts: null },
+  });
+
+  const first = coordinator.ensure(signal);
+  const duplicate = coordinator.ensure(signal);
+  await Promise.resolve();
+  assert.equal(resolveCalls, 1);
+  pending.resolve(context);
+  assert.deepEqual(await Promise.all([first, duplicate]), [true, true]);
+  assert.deepEqual(commits, [context]);
+
+  assert.equal(await coordinator.ensure(signal), true);
+  assert.equal(resolveCalls, 1);
+  assert.deepEqual(commits, [context]);
+});
+
+test("failure context coordinator caches a resolver rejection as a non-fatal fallback", async () => {
+  const fallback = { repo: MISSING_REPOSITORY_CONTEXT, accounts: null };
+  const commits = [];
+  let resolveCalls = 0;
+  const coordinator = createFailureContextCoordinator({
+    resolve: () => {
+      resolveCalls += 1;
+      throw new Error("resolver failed unexpectedly");
+    },
+    commit: (value) => commits.push(value),
+    fallback,
+  });
+
+  assert.equal(await coordinator.ensure(), false);
+  assert.deepEqual(commits, [fallback]);
+  await coordinator.ensure();
+  assert.equal(resolveCalls, 1);
+  assert.deepEqual(commits, [fallback]);
+});
+
+test("failure context coordinator does not reinterpret commit failures as resolver failures", async () => {
+  let commitCalls = 0;
+  const coordinator = createFailureContextCoordinator({
+    resolve: () => ({ repo: { ok: true }, accounts: [] }),
+    commit: () => {
+      commitCalls += 1;
+      throw new Error("commit failed");
+    },
+    fallback: { repo: MISSING_REPOSITORY_CONTEXT, accounts: null },
+  });
+
+  await assert.rejects(coordinator.ensure(), /commit failed/);
+  assert.equal(commitCalls, 1);
+});
+
+for (const staleSettlement of ["fulfilled", "rejected"]) {
+  test(`invalidating a pending ${staleSettlement} context prevents its stale commit`, async () => {
+    const pending = [];
+    const commits = [];
+    let resolveCalls = 0;
+    const coordinator = createFailureContextCoordinator({
+      resolve: () => {
+        resolveCalls += 1;
+        const next = deferred();
+        pending.push(next);
+        return next.promise;
+      },
+      commit: (value) => commits.push(value),
+      fallback: { repo: MISSING_REPOSITORY_CONTEXT, accounts: null },
+    });
+
+    const stale = coordinator.ensure();
+    await Promise.resolve();
+    coordinator.invalidate();
+    assert.deepEqual(commits, [null]);
+
+    const fresh = coordinator.ensure();
+    await Promise.resolve();
+    assert.equal(resolveCalls, 2);
+
+    if (staleSettlement === "fulfilled") {
+      pending[0].resolve({ repo: { ok: true, nameWithOwner: "old/repo" }, accounts: [] });
+    } else {
+      pending[0].reject(new Error("stale resolver failed"));
+    }
+    assert.equal(await stale, false);
+    assert.deepEqual(commits, [null]);
+
+    const current = { repo: { ok: true, nameWithOwner: "new/repo" }, accounts: [] };
+    pending[1].resolve(current);
+    assert.equal(await fresh, true);
+    assert.deepEqual(commits, [null, current]);
+  });
+}
 
 test("a SAML/SSO 403 is an auth problem, not a disabled feature", () => {
   // The forms GitHub and gh actually emit. On an EMU tenant the SAML session
@@ -411,4 +829,49 @@ test("the status bar hints are a subset of the documented key table", () => {
     KEY_TABLE.some(([keys]) => keys === "?"),
     "the overlay's own key must be listed in the table it renders",
   );
+});
+
+test("the missing-remote prompt exposes only explicit setup and exit actions", () => {
+  assert.deepEqual(REMOTE_SETUP_HINTS, [
+    { label: "Create remote", keys: "Ent" },
+    { label: "Quit", keys: "q" },
+  ]);
+  assert.ok(REMOTE_SETUP_LINES.some((line) => line.includes("gh repo create")));
+  assert.ok(REMOTE_SETUP_LINES.some((line) => line.includes("Push an existing local repository")));
+  assert.ok(REMOTE_SETUP_LINES.every((line) => !line.includes("--source")));
+  assert.ok(REMOTE_SETUP_LINES.some((line) => line.includes("gh-glance --repo owner/name")));
+  assert.ok(REMOTE_SETUP_LINES.every((line) => !line.includes("--public")));
+  assert.ok(REMOTE_SETUP_LINES.every((line) => !line.includes("--private")));
+  assert.ok(REMOTE_SETUP_NONINTERACTIVE_LINES.every((line) => !line.includes("Enter")));
+  assert.ok(REMOTE_SETUP_NONINTERACTIVE_LINES.some((line) => line.includes("Ctrl+C")));
+});
+
+test("setup signal forwarding terminates a delayed child", async () => {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    stdio: "ignore",
+  });
+  const exited = once(child, "exit");
+  assert.equal(forwardSignalToChild(child, "SIGTERM"), true);
+  const [code, signal] = await exited;
+  assert.equal(code, null);
+  assert.equal(signal, "SIGTERM");
+  assert.equal(forwardSignalToChild(child, "SIGTERM"), false);
+});
+
+test("setup signal forwarding escalates when a child ignores SIGTERM", async () => {
+  const child = spawn(
+    process.execPath,
+    ["-e", 'process.on("SIGTERM", () => {}); console.log("ready"); setInterval(() => {}, 1000)'],
+    { stdio: ["ignore", "pipe", "ignore"] },
+  );
+  await once(child.stdout, "data");
+  const exited = once(child, "exit");
+  assert.equal(forwardSignalToChild(child, "SIGTERM"), true);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(child.exitCode, null);
+  assert.equal(child.signalCode, null);
+  assert.equal(forwardSignalToChild(child, "SIGKILL"), true);
+  const [code, signal] = await exited;
+  assert.equal(code, null);
+  assert.equal(signal, "SIGKILL");
 });
