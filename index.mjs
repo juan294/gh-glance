@@ -22,7 +22,7 @@
 // disarmDevBuildLeak() for how that path is kept survivable rather than fatal.
 process.env.NODE_ENV ??= "production";
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -369,6 +369,14 @@ function isAuthProblem(err) {
   return AUTH_MARKERS.test(errText(err));
 }
 
+// A local repository with no remote is an onboarding state, not an API or
+// authentication failure. Both strings are emitted by current gh commands:
+// list commands include the "failed to determine base repo" prefix, while
+// `gh repo view` returns the shorter form.
+function isMissingRemote(err) {
+  return /(?:failed to determine base repo:\s*)?no git remotes found/i.test(errText(err));
+}
+
 // The one place the three predicates are turned into a verdict. Both consumers
 // go through it -- the fetcher, to choose a note and a backoff ladder, and
 // `--doctor`, to report what gh-glance concluded -- so the report cannot claim
@@ -384,6 +392,7 @@ function isAuthProblem(err) {
 // repository's configuration.
 function classify(err) {
   if (err == null) return "ok";
+  if (isMissingRemote(err)) return "no-remote";
   if (isRateLimited(err)) return "rate-limited";
   if (isAuthProblem(err)) return "auth-problem";
   if (isUnavailable(err)) return "unavailable";
@@ -405,6 +414,8 @@ function classify(err) {
 // positive that only picked a retry ladder was cheap, whereas one that also
 // rewrites the on-screen text turns into a confidently wrong instruction.
 const VERDICT_REMEDY = {
+  "no-remote":
+    "No GitHub remote found -- press Enter to create one, or use `gh-glance --repo owner/name`",
   "auth-problem":
     "GitHub login or authorization required -- run `gh auth status`, then `gh auth login` or `gh auth refresh`",
   "rate-limited": "GitHub rate limit reached -- backing off, this clears on its own",
@@ -546,12 +557,20 @@ function logGh(args, startedAt, outcome) {
 // outside React entirely -- there is no component left to read a ref from. Kept
 // in this section, above every consumer, so nothing has to reach downward for it.
 let liveAbort = null;
+let setupChild = null;
 function registerLiveAbort(controller) {
   liveAbort = controller;
 }
 function abortLiveRequests() {
   liveAbort?.abort();
   liveAbort = null;
+}
+
+function forwardSignalToChild(child, signal) {
+  // child.killed means only that kill() was called successfully; it becomes
+  // true before the process exits and therefore cannot gate SIGKILL escalation.
+  if (!child || child.exitCode !== null || child.signalCode !== null) return false;
+  return child.kill(signal);
 }
 
 async function runGh(args, { signal } = {}) {
@@ -939,6 +958,7 @@ function backoffActive(key, now) {
 // comes back the moment it does. "rate-limited" used to be absent for the same
 // stated reason, which had it backwards -- see RATE_LIMIT_RETRY_MS.
 const FAILURE_LADDER = {
+  "no-remote": BACKOFF_STEPS_MS,
   unavailable: BACKOFF_STEPS_MS,
   "auth-problem": AUTH_RETRY_MS,
   "rate-limited": RATE_LIMIT_RETRY_MS,
@@ -1552,7 +1572,7 @@ const KEY_TABLE = [
   ["Tab / Shift+Tab", "Next / previous tab"],
   ["Up / Down, j / k", "Move the cursor between rows"],
   ["PgUp / PgDn", "Move a page at a time"],
-  ["Enter", "Open the selected item in your browser"],
+  ["Enter", "Open the selected item or accept a prompt"],
   ["r", "Refresh the current tab now"],
   ["?", "Show the keys (any key closes it)"],
   ["q / Esc / Ctrl+C", "Quit"],
@@ -2290,17 +2310,29 @@ const KEY_HINTS = [
   { label: "Quit", keys: "q" },
 ];
 
+const REMOTE_SETUP_HINTS = [
+  { label: "Create remote", keys: "Ent" },
+  { label: "Quit", keys: "q" },
+];
+
+const REMOTE_SETUP_LINES = [
+  "No GitHub remote found",
+  "gh-glance needs a GitHub repository to show this dashboard.",
+  "Enter  Start `gh repo create` (choose Push an existing local repository)",
+  "q/Esc  Quit, or restart with `gh-glance --repo owner/name`",
+];
+
+const REMOTE_SETUP_NONINTERACTIVE_LINES = [
+  "No GitHub remote found",
+  "Run `gh repo create` in an interactive terminal.",
+  "Choose Push an existing local repository.",
+  "Or use `gh-glance --repo owner/name`; Ctrl+C quits.",
+];
+
 // Reserved so the hints don't shift sideways every time a refresh starts and
 // finishes. Wide enough for the spinner, a space and "Fetching".
 const FETCHING_WIDTH = 12;
 
-// Width the full hint set needs: every "Label: keys" plus a " | " between each.
-// Derived from KEY_HINTS rather than written down, for the same reason
-// minimumWidthFor() derives the table breakpoint from its header descriptors --
-// a copy change must not be able to invalidate the number.
-const HINTS_FULL_WIDTH =
-  KEY_HINTS.reduce((sum, h) => sum + h.label.length + 2 + [...h.keys].length, 0) +
-  (KEY_HINTS.length - 1) * 3;
 // Compact drops the labels and keeps the keys, separated by a space:
 // "↑↓ Ent r q". No constant for its width -- nothing branches on it, and the
 // keys are short enough that it fits anywhere the frame itself does.
@@ -2313,22 +2345,24 @@ const HINTS_FULL_WIDTH =
 // bar read "Move: | Open:  | Refresh |Quit:…" -- the arrows gone, Refresh
 // missing its key, and Quit, the last entry, first to be cut. That is the one
 // hint a confused first-time user needs, in a full-screen alternate-screen app.
-const STATUS_FULL_WIDTH = FETCHING_WIDTH + HINTS_FULL_WIDTH;
-
 // Two tones rather than one flat gray: the keys you press are the part worth
 // finding at a glance, so they get the accent colour and the words describing
 // them stay dim. The accent is the panel-title cyan rather than the amber used
 // for in-progress status, so amber means exactly one thing across the product.
-function StatusBar({ fetching, spin, stale, interactive, cols }) {
+function StatusBar({ fetching, spin, stale, interactive, cols, remoteSetup = false }) {
   // Without raw mode none of the key handlers run, so advertising them would be
   // telling the user something untrue about what the app can do. Ctrl+C still
   // works there, because the tty delivers a real SIGINT.
   const hints = interactive
-    ? KEY_HINTS
+    ? remoteSetup
+      ? REMOTE_SETUP_HINTS
+      : KEY_HINTS
     : [{ label: "Quit", keys: "^C" }];
-  // Measured against the *full* set even when a compact one is rendered, so the
-  // breakpoint does not move as the bar's own contents change.
-  const compact = interactive && cols < STATUS_FULL_WIDTH;
+  const hintsFullWidth =
+    hints.reduce((sum, hint) => sum + hint.label.length + 2 + [...hint.keys].length, 0) +
+    (hints.length - 1) * 3;
+  // Measured against the active full set even when a compact one is rendered.
+  const compact = interactive && cols < FETCHING_WIDTH + hintsFullWidth;
   return e(
     Box,
     { flexDirection: "row" },
@@ -2342,7 +2376,7 @@ function StatusBar({ fetching, spin, stale, interactive, cols }) {
       e(
         Text,
         { color: fetching ? TITLE_COLOR : undefined, dimColor: !fetching },
-        `${fetching && spin ? spin : SPINNER[0]} Fetching`,
+        remoteSetup ? `${SPINNER[0]} Setup` : `${fetching && spin ? spin : SPINNER[0]} Fetching`,
       ),
     ),
     // No reserved width here, unlike the fetching slot above: this only
@@ -2412,7 +2446,7 @@ function useTerminalSize(stdout) {
 
 // ---------- App ----------
 
-function App() {
+function App({ onCreateRemote = () => {} } = {}) {
   const { stdout } = useStdout();
   const { isRawModeSupported } = useStdin();
   const { exit } = useApp();
@@ -2451,6 +2485,13 @@ function App() {
 
   const tab = TABS[activeIndex];
   const tabError = errors[tab.key];
+  // Once any endpoint proves the folder has no remote, the whole dashboard is
+  // in setup mode. Keeping this tab-local made a quick tab switch replace the
+  // onboarding prompt with a second raw fetch failure while another command
+  // was still settling.
+  const remoteSetup = Object.values(errors).some(
+    (error) => error?.kind === "fetch" && error.verdict === "no-remote",
+  );
   // The not-enabled notes are collapsed into a single line. Each unavailable
   // alert source used to contribute a full-width row above the column header,
   // and on any repo without Advanced Security that is two permanent lines --
@@ -2473,7 +2514,8 @@ function App() {
   // Counts the lines actually rendered, not the notes collected -- getting this
   // wrong by one row is what makes ink repaint the whole frame.
   const extraLines =
-    (tabError ? 1 : 0) + (tab.key === "security" ? securityLines.length : 0);
+    (tabError && !remoteSetup ? 1 : 0) +
+    (tab.key === "security" && !remoteSetup ? securityLines.length : 0);
   // Reserve lines for: the tab bar and the divider under it (2), the panel's
   // top and bottom edges (2), the column header and its separator (2), and
   // the status line (1), plus a 1-line safety margin. Slack is absorbed by
@@ -2533,6 +2575,8 @@ function App() {
   // closure must see the current value without being rebuilt on every toggle.
   const showHelpRef = useRef(false);
   showHelpRef.current = showHelp;
+  const remoteSetupRef = useRef(false);
+  remoteSetupRef.current = remoteSetup;
 
   function moveSelection(delta) {
     const { items, key: currentKey, bodyRows: rows_, tabKey, offset: offsetRaw } = navRef.current;
@@ -2627,7 +2671,8 @@ function App() {
       } else if (key.pageUp) {
         moveSelection(-pageStep);
       } else if (key.return) {
-        openSelected();
+        if (remoteSetupRef.current) onCreateRemote();
+        else openSelected();
       } else if (input === "r") {
         // Goes through the same per-tab in-flight guard as the poll loop, so
         // holding the key down cannot stack concurrent subprocesses. `force`
@@ -2791,6 +2836,11 @@ function App() {
     fetchTabRef.current = fetchTab;
 
     async function tick() {
+      // Setup mode owns the whole screen and can only finish by handing off to
+      // gh or exiting. Hidden tab retries cannot make that state more useful,
+      // so stop spawning subprocesses once any endpoint proves there is no
+      // remote. The interval may still wake, but this branch is otherwise idle.
+      if (remoteSetupRef.current) return;
       // Only the tab you're looking at needs to keep up with REFRESH_MS. The
       // other three exist to keep the tab-bar counts honest, which tolerates
       // being a minute behind -- so they refresh every BACKGROUND_EVERY ticks
@@ -2853,7 +2903,7 @@ function App() {
     TABS.map((t) => [t.key, data[t.key] == null && !errors[t.key]]),
   );
   const anyFirstLoad = Object.values(firstLoad).some(Boolean);
-  const showSpinner = ANIMATE && (anyFirstLoad || hasRunningVisible);
+  const showSpinner = !remoteSetup && ANIMATE && (anyFirstLoad || hasRunningVisible);
   useEffect(() => {
     if (!showSpinner) {
       // Park on a fixed frame rather than freezing wherever the animation
@@ -2917,7 +2967,9 @@ function App() {
       ];
     }),
   );
-  const failed = Object.fromEntries(TABS.map((t) => [t.key, Boolean(errors[t.key])]));
+  const failed = Object.fromEntries(
+    TABS.map((t) => [t.key, Boolean(errors[t.key]) && errors[t.key]?.verdict !== "no-remote"]),
+  );
 
   // Data can be arbitrarily old without anything on screen saying so: a failing
   // poll only surfaces on the tab you have selected, and after a laptop sleep
@@ -3056,16 +3108,35 @@ function App() {
         e(Text, { dimColor: true, wrap: "truncate-end" }, "too narrow"),
       !showHelp &&
         !tooNarrow &&
+        !remoteSetup &&
         displayError &&
         e(Text, { color: ERROR_TEXT, wrap: "truncate-end" }, displayError),
       !showHelp &&
         !tooNarrow &&
+        !remoteSetup &&
         tab.key === "security" &&
         securityLines.map((note, i) =>
           e(Text, { key: i, dimColor: true, wrap: "truncate-end" }, note),
         ),
-      !showHelp && !tooNarrow && e(HeaderCells, { cells: header }),
-      ...(tooNarrow || showHelp ? [] : visibleItems).map((item) => {
+      !showHelp &&
+        !tooNarrow &&
+        remoteSetup &&
+        (interactive ? REMOTE_SETUP_LINES : REMOTE_SETUP_NONINTERACTIVE_LINES).map(
+          (line, index) =>
+            e(
+              Text,
+              {
+                key: `remote-setup-${index}`,
+                color: index === 0 ? TITLE_COLOR : undefined,
+                bold: index === 0,
+                dimColor: index === 1,
+                wrap: "truncate-end",
+              },
+              line,
+            ),
+        ),
+      !showHelp && !tooNarrow && !remoteSetup && e(HeaderCells, { cells: header }),
+      ...(tooNarrow || showHelp || remoteSetup ? [] : visibleItems).map((item) => {
         const key = itemKey(item);
         return e(
           RowBoundary,
@@ -3095,6 +3166,7 @@ function App() {
       // repository rather than the absence of an answer.
       !showHelp &&
         !tooNarrow &&
+        !remoteSetup &&
         visibleItems.length === 0 &&
         !(tabError && items == null) &&
         e(
@@ -3125,6 +3197,7 @@ function App() {
       stale: staleLabel,
       interactive,
       cols: frameCols,
+      remoteSetup,
     }),
   );
 }
@@ -3198,7 +3271,42 @@ if (IS_MAIN) {
   // root box is the terminal height. Windows is already documented as untested
   // (README Limitations), and the pty harness covers the two platforms that are
   // supported, so the flag is verified where it is claimed to work.
-  const app = render(e(App), { incrementalRendering: true });
+  let app;
+  let remoteSetupStarted = false;
+  const createRemote = () => {
+    if (remoteSetupStarted) return;
+    remoteSetupStarted = true;
+    try {
+      app?.unmount();
+    } catch {
+      // The interactive gh flow matters more than a best-effort final repaint.
+    }
+    restoreScreen();
+    abortLiveRequests();
+
+    // Plain `gh repo create` is the interactive form. Supplying --source here
+    // would switch gh to non-interactive mode and require gh-glance to choose a
+    // visibility on the user's behalf, which this consent boundary must never
+    // do. The prompt tells the user which interactive path matches this folder.
+    const child = spawn("gh", ["repo", "create"], {
+      stdio: "inherit",
+      env: process.env,
+    });
+    setupChild = child;
+    child.once("error", (err) => {
+      if (setupChild === child) setupChild = null;
+      console.error(`gh-glance: could not start repository setup: ${redact(shortErr(err))}`);
+      process.exitCode = 1;
+    });
+    child.once("exit", (code, signal) => {
+      if (setupChild === child) setupChild = null;
+      process.exitCode = signal ? 1 : (code ?? 1);
+      if (code === 0) {
+        console.log("gh repo create finished. Run gh-glance again when this folder has a remote.");
+      }
+    });
+  };
+  app = render(e(App, { onCreateRemote: createRemote }), { incrementalRendering: true });
 
   // 128 + signal number, so a supervisor or `timeout` can tell an interrupted
   // run from a clean one. These fire on external `kill` and when raw mode is
@@ -3221,19 +3329,38 @@ if (IS_MAIN) {
   // exiting immediately afterwards keeps the prompt-exit guarantee: waiting for
   // the event loop to drain would let a hung `gh` turn Ctrl+C into an apparent
   // hang.
-  const bySignal = (code) => () => {
-    try {
-      app.unmount();
-    } catch {
-      // Teardown is best effort. restoreScreen below, and the `exit` listener
-      // above, both still run, so the terminal is handed back either way.
+  let signalExitStarted = false;
+  const bySignal = (code, signal) => () => {
+    if (signalExitStarted) return;
+    signalExitStarted = true;
+    const finish = () => {
+      try {
+        app.unmount();
+      } catch {
+        // Teardown is best effort. restoreScreen below, and the `exit` listener
+        // above, both still run, so the terminal is handed back either way.
+      }
+      restoreScreen();
+      process.exit(code);
+    };
+
+    const child = setupChild;
+    if (forwardSignalToChild(child, signal)) {
+      const force = setTimeout(() => {
+        forwardSignalToChild(child, "SIGKILL");
+        finish();
+      }, 1000);
+      child.once("exit", () => {
+        clearTimeout(force);
+        finish();
+      });
+      return;
     }
-    restoreScreen();
-    process.exit(code);
+    finish();
   };
-  process.on("SIGINT", bySignal(130));
-  process.on("SIGTERM", bySignal(143));
-  process.on("SIGHUP", bySignal(129));
+  process.on("SIGINT", bySignal(130, "SIGINT"));
+  process.on("SIGTERM", bySignal(143, "SIGTERM"));
+  process.on("SIGHUP", bySignal(129, "SIGHUP"));
 }
 
 // Exported for unit tests. The dashboard itself is still one file; these are
@@ -3252,6 +3379,8 @@ export {
   isUnavailable,
   isRateLimited,
   isAuthProblem,
+  isMissingRemote,
+  forwardSignalToChild,
   toTabError,
   formatTabError,
   parseRepoContext,
@@ -3280,6 +3409,9 @@ export {
   OCT_UNICODE,
   KEY_TABLE,
   KEY_HINTS,
+  REMOTE_SETUP_HINTS,
+  REMOTE_SETUP_LINES,
+  REMOTE_SETUP_NONINTERACTIVE_LINES,
   VERDICT_REMEDY,
   RATE_LIMIT_RETRY_MS,
   FAILURE_LADDER,

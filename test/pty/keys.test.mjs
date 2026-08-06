@@ -42,6 +42,27 @@ const keyed = capture({
 // interactive gate works in both directions.
 const detached = capture({ cols: 80, rows: 24, settle: 4 });
 
+const noRemoteEnv = {
+  GH_GLANCE_FIXTURE_FAIL: "failed to determine base repo: no git remotes found",
+  GH_GLANCE_FIXTURE_FAIL_ON: "run,issue,pr,api",
+};
+const remoteSetupAccepted = capture({
+  cols: 80,
+  rows: 24,
+  signal: "none",
+  settle: 12,
+  stdin: "sleep 3; printf '\\r'; sleep 1; printf 'confirm\\n'; sleep 2",
+  env: noRemoteEnv,
+});
+const remoteSetupDeclined = capture({
+  cols: 80,
+  rows: 24,
+  signal: "none",
+  settle: 10,
+  stdin: "sleep 3; printf 'q'; sleep 2",
+  env: noRemoteEnv,
+});
+
 test("keys are advertised only when stdin is interactive", () => {
   // Asserting one direction would pass against a permanently-open gate, so both
   // are checked. index.mjs shows the full hints when raw mode is supported and
@@ -88,4 +109,26 @@ test("q quits cleanly and leaves nothing on the primary buffer", () => {
     "",
     `a dead frame was left on the primary buffer: ${JSON.stringify(keyed.afterRestore.visible.slice(0, 120))}`,
   );
+});
+
+test("Enter hands missing-remote setup to gh exactly once", () => {
+  const creates = remoteSetupAccepted.fixtureCalls.filter(
+    (call) => call === "repo create",
+  );
+  assert.equal(creates.length, 1);
+  assert.equal(remoteSetupAccepted.exitCode, 0);
+  assert.equal(remoteSetupAccepted.altEnter, 1);
+  assert.equal(remoteSetupAccepted.altExit, 1);
+  assert.match(remoteSetupAccepted.afterRestore.visible, /Interactive fixture accepted confirm/);
+});
+
+test("quitting the missing-remote prompt makes no repository change", () => {
+  assert.ok(
+    !remoteSetupDeclined.fixtureCalls.some((call) => call.startsWith("repo create")),
+    "declining setup unexpectedly invoked gh repo create",
+  );
+  assert.equal(remoteSetupDeclined.exitCode, 0);
+  assert.equal(remoteSetupDeclined.altEnter, 1);
+  assert.equal(remoteSetupDeclined.altExit, 1);
+  assert.equal(remoteSetupDeclined.afterRestore.visible, "");
 });

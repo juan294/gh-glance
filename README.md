@@ -228,7 +228,7 @@ stdout isn't a terminal rather than streaming redraw frames into a pipe.
 | `Tab` / `Shift+Tab` | Next / previous tab |
 | `↑` / `↓` or `j` / `k` | Move the cursor between rows |
 | `PgUp` / `PgDn` | Move a page at a time |
-| `Enter` | Open the selected item in your browser |
+| `Enter` | Open the selected item, or accept an onboarding prompt |
 | `r` | Refresh the current tab now |
 | `?` | Show the keys without leaving the dashboard (any key closes it) |
 | `q` / `Esc` / `Ctrl+C` | Quit |
@@ -239,6 +239,14 @@ Requests; the Security tab has no per-alert `gh` command to open. It clears
 itself after 60s with no cursor movement, so a pane left idle in the corner of
 a screen doesn't sit there marked forever -- and the next arrow key picks up
 from what is on screen rather than jumping back to the top of the list.
+
+If the current local repository has no GitHub remote, gh-glance shows a setup
+prompt instead of raw `gh` stderr. Press `Enter` to leave the dashboard and run
+the interactive `gh repo create` flow, then choose **Push an existing local
+repository**. Plain `gh repo create` is intentional: adding `--source` would
+switch `gh` into non-interactive mode and require choosing a visibility in
+advance. Press `q` or `Esc` to decline. To watch an existing repository without
+attaching this folder, restart with `gh-glance --repo owner/name`.
 
 When the repository was chosen explicitly, with `--repo` or `GH_REPO`, the panel
 says so: `╭─ Actions · acme/widget ─`. That is what tells two side-by-side panes
@@ -442,6 +450,7 @@ in some terminals, which would shift every column to their right.
 |---|---|
 | `the gh CLI is not installed` | Install it from [cli.github.com](https://cli.github.com), then `gh auth login`. |
 | `not inside a git repository` | Run it from a cloned GitHub repository, or set `GH_REPO=owner/name`. |
+| `No GitHub remote found` | Press `Enter` to start `gh repo create`, then choose **Push an existing local repository**. Or press `q` and run `gh-glance --repo owner/name` to watch an existing repository without attaching this folder. |
 | `GitHub login or authorization required` | Run `gh auth status`. With no account, run `gh auth login`; with an expired authorization, run `gh auth refresh`; then press `r`. |
 | `Repository not found or inaccessible to the active gh account` | The active identity cannot resolve the target. Check `gh auth status`, `git remote -v` or the explicit `--repo`, and use `gh auth switch` only if the wrong account is active. |
 | `GraphQL: Could not resolve to a Repository...` in older gh-glance versions | The response has the same ambiguity: a missing or renamed target, or a private repository not visible to the active account. Run `gh-glance --doctor`. |

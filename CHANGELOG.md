@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **An interactive missing-remote onboarding prompt.** Starting gh-glance in a
+  local repository with no remotes now offers to hand off to the user-confirmed
+  interactive `gh repo create` flow, while keeping quit and explicit `--repo`
+  paths visible. Declining the prompt makes no repository change.
 - **Failure-triggered account and repository context.** After an ambiguous
   repository-access failure, gh-glance performs read-only active-account and
   repository checks through `gh`, and `--doctor` now includes a `Repository

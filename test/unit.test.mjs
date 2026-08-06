@@ -6,6 +6,8 @@
 // main-module check, so this does not parse argv, enter the alternate screen,
 // or start the dashboard.
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { test } from "node:test";
 
 import {
@@ -14,6 +16,8 @@ import {
   isUnavailable,
   isRateLimited,
   isAuthProblem,
+  isMissingRemote,
+  forwardSignalToChild,
   classify,
   toTabError,
   formatTabError,
@@ -40,6 +44,9 @@ import {
   OCT_UNICODE,
   KEY_TABLE,
   KEY_HINTS,
+  REMOTE_SETUP_HINTS,
+  REMOTE_SETUP_LINES,
+  REMOTE_SETUP_NONINTERACTIVE_LINES,
   VERDICT_REMEDY,
   RATE_LIMIT_RETRY_MS,
   FAILURE_LADDER,
@@ -54,6 +61,7 @@ const C1 = String.fromCharCode(155);
 const NO_LOGIN_ERROR = "You are not logged into any GitHub hosts. To log in, run: gh auth login";
 const REPOSITORY_RESOLUTION_ERROR =
   "GraphQL: Could not resolve to a Repository with the name 'Nvteca/cashflor-forecast'. (repository)";
+const NO_REMOTE_ERROR = "failed to determine base repo: no git remotes found";
 const MISSING_REPOSITORY_CONTEXT = {
   ok: false,
   verdict: "other",
@@ -164,6 +172,16 @@ test("fresh gh login failures are auth problems", () => {
     assert.equal(isAuthProblem({ stderr: message }), true, message);
     assert.equal(classify({ stderr: message }), "auth-problem", message);
   }
+});
+
+test("a local repository without remotes is an onboarding state", () => {
+  for (const message of [NO_REMOTE_ERROR, "no git remotes found"]) {
+    const error = { stderr: message };
+    assert.equal(isMissingRemote(error), true, message);
+    assert.equal(classify(error), "no-remote", message);
+    assert.equal(formatTabError(toTabError(error)), VERDICT_REMEDY["no-remote"]);
+  }
+  assert.equal(isMissingRemote({ stderr: "no git repository found" }), false);
 });
 
 test("the screenshot GraphQL resolution failure is unavailable", () => {
@@ -811,4 +829,49 @@ test("the status bar hints are a subset of the documented key table", () => {
     KEY_TABLE.some(([keys]) => keys === "?"),
     "the overlay's own key must be listed in the table it renders",
   );
+});
+
+test("the missing-remote prompt exposes only explicit setup and exit actions", () => {
+  assert.deepEqual(REMOTE_SETUP_HINTS, [
+    { label: "Create remote", keys: "Ent" },
+    { label: "Quit", keys: "q" },
+  ]);
+  assert.ok(REMOTE_SETUP_LINES.some((line) => line.includes("gh repo create")));
+  assert.ok(REMOTE_SETUP_LINES.some((line) => line.includes("Push an existing local repository")));
+  assert.ok(REMOTE_SETUP_LINES.every((line) => !line.includes("--source")));
+  assert.ok(REMOTE_SETUP_LINES.some((line) => line.includes("gh-glance --repo owner/name")));
+  assert.ok(REMOTE_SETUP_LINES.every((line) => !line.includes("--public")));
+  assert.ok(REMOTE_SETUP_LINES.every((line) => !line.includes("--private")));
+  assert.ok(REMOTE_SETUP_NONINTERACTIVE_LINES.every((line) => !line.includes("Enter")));
+  assert.ok(REMOTE_SETUP_NONINTERACTIVE_LINES.some((line) => line.includes("Ctrl+C")));
+});
+
+test("setup signal forwarding terminates a delayed child", async () => {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    stdio: "ignore",
+  });
+  const exited = once(child, "exit");
+  assert.equal(forwardSignalToChild(child, "SIGTERM"), true);
+  const [code, signal] = await exited;
+  assert.equal(code, null);
+  assert.equal(signal, "SIGTERM");
+  assert.equal(forwardSignalToChild(child, "SIGTERM"), false);
+});
+
+test("setup signal forwarding escalates when a child ignores SIGTERM", async () => {
+  const child = spawn(
+    process.execPath,
+    ["-e", 'process.on("SIGTERM", () => {}); console.log("ready"); setInterval(() => {}, 1000)'],
+    { stdio: ["ignore", "pipe", "ignore"] },
+  );
+  await once(child.stdout, "data");
+  const exited = once(child, "exit");
+  assert.equal(forwardSignalToChild(child, "SIGTERM"), true);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(child.exitCode, null);
+  assert.equal(child.signalCode, null);
+  assert.equal(forwardSignalToChild(child, "SIGKILL"), true);
+  const [code, signal] = await exited;
+  assert.equal(code, null);
+  assert.equal(signal, "SIGKILL");
 });

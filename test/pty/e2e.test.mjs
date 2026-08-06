@@ -34,6 +34,14 @@ const inaccessibleRepository = capture({
     GH_GLANCE_FIXTURE_FAIL_ON: "issue,repo",
   },
 });
+const missingRemoteDetached = capture({
+  cols: 80,
+  rows: 24,
+  env: {
+    GH_GLANCE_FIXTURE_FAIL: "failed to determine base repo: no git remotes found",
+    GH_GLANCE_FIXTURE_FAIL_ON: "run,issue,pr,api",
+  },
+});
 
 test("the app reaches the data layer at all", () => {
   // Guards the silent failures: a zero-byte BSD capture when stdin is a socket,
@@ -90,6 +98,15 @@ test("the failure frame preserves terminal geometry and clean teardown", () => {
   assert.equal(inaccessibleRepository.afterRestore.hasScrollbackErase, false);
   assert.equal(inaccessibleRepository.afterRestore.hasClear, false);
   assert.equal(inaccessibleRepository.afterRestore.visible, "");
+});
+
+test("detached missing-remote setup advertises no unavailable keys", () => {
+  const frame = missingRemoteDetached.finalFrame.lines.join("\n");
+  assert.ok(!frame.includes("Enter"), frame);
+  assert.ok(!frame.includes("q/Esc"), frame);
+  assert.ok(frame.includes("Ctrl+C"), frame);
+  assert.equal(missingRemoteDetached.finalFrame.lines.length, 24);
+  assert.ok(missingRemoteDetached.finalFrame.widest <= 80);
 });
 
 test("the alternate screen is entered exactly once and left exactly once", () => {

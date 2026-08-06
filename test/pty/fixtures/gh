@@ -52,6 +52,26 @@ case "$1" in
   repo)
     if [ "${2:-}" = "view" ]; then
       echo '{"nameWithOwner":"acme/widget","url":"https://github.com/acme/widget","viewerPermission":"READ"}'
+    elif [ "${2:-}" = "create" ] && [ "$#" -eq 2 ]; then
+      [ -t 0 ] && [ -t 1 ] || {
+        echo 'repository setup did not inherit an interactive terminal' >&2
+        exit 1
+      }
+      stty -a | grep -Eq '(^|[ ;])icanon([ ;]|$)' || {
+        echo 'repository setup inherited raw input mode' >&2
+        exit 1
+      }
+      printf 'Fixture setup choice: '
+      IFS= read -r setup_choice
+      setup_choice=$(printf '%s' "$setup_choice" | tr -d '\r')
+      [ "$setup_choice" = "confirm" ] || {
+        echo 'repository setup did not receive its confirmation' >&2
+        exit 1
+      }
+      echo 'Interactive fixture accepted confirm'
+    elif [ "${2:-}" = "create" ]; then
+      echo '`--public`, `--private`, or `--internal` required when not running interactively' >&2
+      exit 1
     else
       echo '[]'
     fi

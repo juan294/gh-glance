@@ -136,6 +136,11 @@ strings are sanitized before rendering, and doctor output remains protected by
 the presence-only and redaction rules above. Login, authorization refresh, and
 account switching remain explicit user-owned `gh` commands.
 
+Repository creation is also user-owned. When a local repository has no remote,
+gh-glance invokes plain `gh repo create` only after the user presses `Enter`;
+that is `gh`'s interactive form, so `gh` owns the setup questions and repository
+creation. Quitting the prompt invokes no creation command.
+
 ## Scope
 
 Out of scope: issues requiring physical access to the machine, vulnerabilities
