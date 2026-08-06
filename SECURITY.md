@@ -128,7 +128,13 @@ them.
 gh-glance never handles GitHub credentials directly -- authentication is
 entirely delegated to your existing `gh auth login` session, including on
 GitHub Enterprise and EMU hosts. It has no network code of its own; every
-GitHub API call goes through the `gh` CLI.
+GitHub API call goes through the `gh` CLI. Failure context invokes only the
+read-only `gh auth status` and `gh repo view` commands. It never requests
+`--show-token`, invokes `gh auth token`, supplies a token argument, or
+deliberately inspects a credential value. Optional account and repository
+strings are sanitized before rendering, and doctor output remains protected by
+the presence-only and redaction rules above. Login, authorization refresh, and
+account switching remain explicit user-owned `gh` commands.
 
 ## Scope
 

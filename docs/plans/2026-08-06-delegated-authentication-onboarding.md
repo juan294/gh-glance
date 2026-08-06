@@ -275,7 +275,7 @@ evidence command is `gh-glance --doctor`; the recovery commands are owned by
 | 1 | Failure semantics and one-line remedies | `index.mjs`, `test/unit.test.mjs` | — | [x] |
 | 2 | Failure-triggered account/repository context | `index.mjs`, `test/unit.test.mjs`, `test/doctor.test.mjs`, `test/pty/e2e.test.mjs` | — | [x] |
 | 3 | Deterministic doctor and PTY evidence | `test/pty/fixtures/gh`, `test/doctor.test.mjs`, `test/pty/capture.mjs`, `test/pty/e2e.test.mjs` | `[batch-eligible]` with phase 4 after phase 2 | [x] |
-| 4 | First-run and troubleshooting documentation | `README.md`, `CHANGELOG.md`, `SECURITY.md` | `[batch-eligible]` with phase 3 after phase 2 | [ ] |
+| 4 | First-run and troubleshooting documentation | `README.md`, `CHANGELOG.md`, `SECURITY.md` | `[batch-eligible]` with phase 3 after phase 2 | [x] |
 
 Phases 1 and 2 are sequential because both edit `index.mjs` and Phase 2 consumes
 Phase 1's structured failure contract. After Phase 2, Phases 3 and 4 share no

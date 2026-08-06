@@ -121,6 +121,41 @@ the tarball back to the workflow run and commit that produced it. The
 "Provenance" section on the [package
 page](https://www.npmjs.com/package/gh-glance) shows the exact source.
 
+### First run
+
+`gh-glance` uses the credentials and active account already selected by your
+local `gh` CLI. It does not request, inspect, or store the token itself. Check
+that account before starting the dashboard:
+
+```bash
+gh auth status
+
+# Only when no account is active:
+gh auth login
+
+gh-glance
+```
+
+Cloning over SSH or HTTPS and authenticating `gh` are separate credential
+paths, so a successful clone does not prove that the active `gh` account can
+access the repository through the API. For a non-default host, authenticate it
+explicitly with `gh auth login --hostname <host>`.
+
+If several accounts are authenticated on the same host, inspect and select the
+one you intend to use:
+
+```bash
+gh auth status
+gh auth switch --hostname github.com --user <login>
+```
+
+`gh auth switch` is an explicit user command, not a gh-glance action. It changes
+the active account globally for that `gh` configuration. If `gh auth switch
+--help` is unavailable, update `gh` to use this optional multi-account workflow;
+the core gh-glance minimum remains unchanged. To keep simultaneous panes on
+different accounts, use separate `GH_CONFIG_DIR` values as described under
+[No account pinning](#limitations).
+
 ### From a clone
 
 For hacking on it, or to run an unreleased revision:
@@ -234,7 +269,7 @@ Environment variables work too, and the flags take precedence:
 |---|---|
 | `GH_REPO=owner/name` | Watch a specific repository instead of the current directory's. A host-qualified `GH_REPO` does **not** route the security-alert endpoints -- use `GH_HOST` or `--repo host/owner/name` for that |
 | `GH_HOST=<host>` | Send every call to a GitHub Enterprise or EMU host instead of `github.com`. Routes both the list commands and the alert endpoints |
-| `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GH_CONFIG_DIR` | Not read by `gh-glance` -- passed through to `gh` untouched, along with the proxy variables. `gh-glance` handles no credentials of its own |
+| `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GH_CONFIG_DIR` | Not read by `gh-glance` -- passed through to `gh` untouched, along with the proxy variables. `gh-glance` handles no credentials of its own. Separate `GH_CONFIG_DIR` values can isolate simultaneous panes on different accounts; see [No account pinning](#limitations) |
 | `GH_GLANCE_ICONS=unicode` | Plain ASCII status icons, for terminals without a Nerd Font |
 | `GH_GLANCE_NO_ANIMATION=1` | Freeze the spinner — no motion at all |
 | `NO_COLOR=1` | Disable colour. Status stays readable: severity has its own column, a failing newest run puts a `!` on the Actions tab, and the active tab is bracketed. Note that run-state glyphs are not all distinct -- see the feature list above |
@@ -282,9 +317,15 @@ gh-glance --doctor > report.txt
 Collects, in one plain-text block: the `gh-glance`, Node and `gh` versions;
 which hosts `gh` is authenticated for; how the repository target resolved and
 from where; your remaining REST and GraphQL budget plus what this configuration
-will spend per hour; the relevant environment variables; and one probe per
-endpoint with the exact argv it sent, its outcome, and how any error was
-classified (`unavailable`, `rate-limited`, `auth-problem` or `other`).
+will spend per hour; the relevant environment variables; a read-only
+`Repository access` probe; and one probe per dashboard endpoint with the exact
+argv it sent, its outcome, and how any error was classified (`unavailable`,
+`rate-limited`, `auth-problem` or `other`).
+
+The `Repository access` probe shows whether the target resolves for the active
+`gh` credentials. A failed GitHub resolution response cannot distinguish a
+nonexistent, renamed, or stale target from a private repository hidden from
+that identity.
 
 Add `--verbose` to get a log of every `gh` call it makes alongside the report.
 
@@ -401,6 +442,10 @@ in some terminals, which would shift every column to their right.
 |---|---|
 | `the gh CLI is not installed` | Install it from [cli.github.com](https://cli.github.com), then `gh auth login`. |
 | `not inside a git repository` | Run it from a cloned GitHub repository, or set `GH_REPO=owner/name`. |
+| `GitHub login or authorization required` | Run `gh auth status`. With no account, run `gh auth login`; with an expired authorization, run `gh auth refresh`; then press `r`. |
+| `Repository not found or inaccessible to the active gh account` | The active identity cannot resolve the target. Check `gh auth status`, `git remote -v` or the explicit `--repo`, and use `gh auth switch` only if the wrong account is active. |
+| `GraphQL: Could not resolve to a Repository...` in older gh-glance versions | The response has the same ambiguity: a missing or renamed target, or a private repository not visible to the active account. Run `gh-glance --doctor`. |
+| Actions says `not available for this repository` while Repository access is `ok` | The repository resolved, but that endpoint is unavailable; inspect the corresponding doctor block. |
 | Status icons are blank boxes | Your terminal font is not a Nerd Font. Use `GH_GLANCE_ICONS=unicode`. |
 | Security tab shows a "not enabled" note | Code scanning and secret scanning need GitHub Advanced Security. Dependabot alerts work independently. The note now appears only when the feature genuinely is unavailable: auth, SSO and network failures show the real error instead. |
 | `none of the git remotes ... point to a known GitHub host` | `gh` is not authenticated for that host. Run `gh auth login --hostname <host>`. |
