@@ -2405,6 +2405,12 @@ function StatusBar({ fetching, spin, stale, interactive, cols, remoteSetup = fal
         ),
       ])
       .filter(Boolean),
+    // Right-aligned, like lazygit's footer. Dropped in compact mode rather than
+    // left to shrink alongside the hints: it would compete for the same shrink
+    // budget as "Quit", the one hint the comment above already fought to keep
+    // on screen down to 45 columns, and version digits are not worth that.
+    !compact && e(Box, { flexGrow: 1 }),
+    !compact && e(Text, { key: "version", dimColor: true, wrap: "truncate-end" }, version),
   );
 }
 

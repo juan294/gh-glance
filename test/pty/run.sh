@@ -52,11 +52,20 @@ ENV_PREFIX="export PATH=\"$HERE/fixtures:\$PATH\";
 # A pty has no controlling terminal here, so it defaults to 0x0 -- exactly the
 # input usableSize() guards (index.mjs:244-246). COLUMNS/LINES are ignored
 # because Node reads TIOCGWINSZ, so stty is the only mechanism that works.
+# The leading newline is load-bearing: ink's final frame ends without a
+# trailing newline, so without it EXITCODE glues onto the last visible line
+# instead of occupying its own. capture.mjs already strips that with an
+# end-anchored regex, but GNU script(1) trails its own "Script done on..."
+# banner after the marker, which breaks the anchor and only surfaced once a
+# status bar right-aligned real content flush to the frame's edge, leaving no
+# slack for the glued text to hide in. Guaranteeing the newline here makes the
+# marker always land on its own line, on both platforms, regardless of how
+# close to the edge the app's own content gets.
 if [ "$SIGNAL" = "none" ]; then
   INNER="$ENV_PREFIX
     stty cols $COLS rows $ROWS;
     env -u CI -u CONTINUOUS_INTEGRATION node index.mjs $APP_ARGS;
-    echo \"EXITCODE=\$?\""
+    printf '\nEXITCODE=%s\n' \"\$?\""
 else
   INNER="$ENV_PREFIX
     stty cols $COLS rows $ROWS;
@@ -65,7 +74,7 @@ else
     sleep $SETTLE;
     kill -$SIGNAL \$p 2>/dev/null;
     wait \$p;
-    echo \"EXITCODE=\$?\""
+    printf '\nEXITCODE=%s\n' \"\$?\""
 fi
 
 # The exit code is echoed into the capture rather than read from script(1),
