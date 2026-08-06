@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-06
+
+### Security
+
+- **The GraphQL repository-resolution check no longer risks catastrophic
+  backtracking.** CodeQL flagged `isUnavailable()`'s `.*`-joined pattern as
+  worst-case superlinear over the repository name `gh` echoes back verbatim in
+  its error text -- attacker-influenced input reaching a vulnerable regex. It
+  is now two fixed-substring checks with the same matching behaviour and no
+  backtracking risk.
+
+### Added
+
+- **The status bar shows gh-glance's own version**, right-aligned in the
+  lower-right corner the way lazygit's footer does. It is dropped on narrow
+  terminals rather than left to compete with the `Quit` hint for space.
+
 ## [0.6.0] - 2026-08-06
 
 ### Added
@@ -557,6 +574,7 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
+[0.6.1]: https://github.com/juan294/gh-glance/releases/tag/v0.6.1
 [0.6.0]: https://github.com/juan294/gh-glance/releases/tag/v0.6.0
 [0.5.1]: https://github.com/juan294/gh-glance/releases/tag/v0.5.1
 [0.5.0]: https://github.com/juan294/gh-glance/releases/tag/v0.5.0
