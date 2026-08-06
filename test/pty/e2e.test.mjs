@@ -38,6 +38,17 @@ test("the app reaches the data layer at all", () => {
   );
 });
 
+test("healthy startup does not probe optional failure context", () => {
+  assert.ok(
+    !wide.fixtureCalls.some((call) => call.startsWith("repo view")),
+    "healthy startup unexpectedly probed repository context",
+  );
+  assert.ok(
+    !wide.fixtureCalls.some((call) => call.startsWith("auth status") && call.includes("--json hosts")),
+    "healthy startup unexpectedly probed compact auth context",
+  );
+});
+
 test("the alternate screen is entered exactly once and left exactly once", () => {
   // An unbalanced pair strands the user's terminal in the alternate buffer,
   // which outlives the process.

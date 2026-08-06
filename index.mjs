@@ -420,12 +420,56 @@ function textTabError(err) {
   return { kind: "text", text: shortErr(err) };
 }
 
+function failureTargetHost({ runtimeHost, ghHost, ghRepo, accounts } = {}) {
+  let ghRepoHost = null;
+  if (ghRepo) {
+    try {
+      ghRepoHost = parseRepoTarget(ghRepo).host;
+    } catch {
+      // GH_REPO is external process state, not validated argv. An invalid value
+      // is not evidence about which host an unavailable repository targeted.
+    }
+  }
+
+  const accountHosts = Array.isArray(accounts)
+    ? accounts
+        .map((account) => (typeof account?.host === "string" ? safe(account.host) : ""))
+        .filter(Boolean)
+    : [];
+  const distinctHosts = new Map(accountHosts.map((host) => [host.toLowerCase(), host]));
+  const soleAccountHost = distinctHosts.size === 1 ? distinctHosts.values().next().value : null;
+
+  return runtimeHost || ghHost || ghRepoHost || soleAccountHost || null;
+}
+
+function unavailableRemedy(accounts, targetHost) {
+  if (!Array.isArray(accounts) || !targetHost) return VERDICT_REMEDY.unavailable;
+  const normalizedTarget = String(targetHost).toLowerCase();
+  let matching = null;
+  for (const account of accounts) {
+    if (typeof account?.host !== "string" || typeof account?.login !== "string") continue;
+    const host = safe(account.host);
+    const login = safe(account.login);
+    if (!host || !login || host.toLowerCase() !== normalizedTarget) continue;
+    if (matching !== null) return VERDICT_REMEDY.unavailable;
+    matching = { host, login };
+  }
+  if (matching === null) return VERDICT_REMEDY.unavailable;
+
+  const { host, login } = matching;
+  const candidate = `Repository not found or inaccessible to ${login}@${host} -- check the target or run \`gh auth switch\``;
+  return candidate.length <= MAX_ERR_LENGTH ? candidate : VERDICT_REMEDY.unavailable;
+}
+
 function formatTabError(error, failureContext = null) {
   if (error == null) return null;
   if (error.kind === "text") return error.text;
   if (error.verdict === "other") return error.raw;
   if (error.verdict === "unavailable" && failureContext?.repo?.ok) {
     return "not available for this repository";
+  }
+  if (error.verdict === "unavailable") {
+    return unavailableRemedy(failureContext?.accounts, failureContext?.targetHost);
   }
   return pick(VERDICT_REMEDY, error.verdict, null) ?? error.raw;
 }
@@ -566,6 +610,146 @@ function apiPath(path) {
 // inline, because `--doctor` reports these vectors and a second copy of them
 // would be a report that drifts away from what the dashboard actually sends --
 // which is the failure mode the whole diagnostics command exists to rule out.
+function repoContextArgs() {
+  const target = runtime.repo ? qualifiedRepo() : null;
+  return [
+    "repo",
+    "view",
+    ...(target ? [target] : []),
+    "--json",
+    "nameWithOwner,url,viewerPermission",
+  ];
+}
+
+function authContextArgs() {
+  return [
+    "auth",
+    "status",
+    "--active",
+    "--json",
+    "hosts",
+    "--jq",
+    ".hosts | to_entries | map(.key as $host | .value[] | select(.active == true) | {host: $host, login: .login})",
+  ];
+}
+
+function parseRepoContext(raw) {
+  try {
+    const value = JSON.parse(raw);
+    if (
+      value == null ||
+      Array.isArray(value) ||
+      typeof value !== "object" ||
+      typeof value.nameWithOwner !== "string" ||
+      typeof value.url !== "string" ||
+      typeof value.viewerPermission !== "string"
+    ) {
+      return null;
+    }
+    return {
+      ok: true,
+      nameWithOwner: safe(value.nameWithOwner),
+      url: safe(value.url),
+      viewerPermission: safe(value.viewerPermission),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseAuthContext(raw) {
+  try {
+    const value = JSON.parse(raw);
+    if (!Array.isArray(value)) return null;
+    return value
+      .filter(
+        (row) =>
+          row != null &&
+          !Array.isArray(row) &&
+          typeof row === "object" &&
+          typeof row.host === "string" &&
+          typeof row.login === "string",
+      )
+      .map((row) => ({ host: safe(row.host), login: safe(row.login) }));
+  } catch {
+    return null;
+  }
+}
+
+function failedContext(err) {
+  return { ok: false, verdict: classify(err), raw: shortErr(err) };
+}
+
+function missingFailureContext() {
+  return {
+    repo: { ok: false, verdict: "other", raw: "Repository context unavailable" },
+    accounts: null,
+  };
+}
+
+function buildFailureContext(repoSettlement, authSettlement) {
+  const parsedRepo =
+    repoSettlement?.status === "fulfilled" ? parseRepoContext(repoSettlement.value) : null;
+  const repo =
+    parsedRepo ??
+    (repoSettlement?.status === "rejected"
+      ? failedContext(repoSettlement.reason)
+      : missingFailureContext().repo);
+  const accounts =
+    authSettlement?.status === "fulfilled" ? parseAuthContext(authSettlement.value) : null;
+  return { repo, accounts };
+}
+
+async function resolveFailureContext(signal) {
+  const [repo, auth] = await Promise.allSettled([
+    runGh(repoContextArgs(), { signal }),
+    runGh(authContextArgs(), { signal }),
+  ]);
+  return buildFailureContext(repo, auth);
+}
+
+function createFailureContextCoordinator({ resolve, commit, fallback }) {
+  let epoch = 0;
+  let value = null;
+  let inFlight = null;
+
+  function ensure(signal) {
+    const captured = epoch;
+    if (value !== null) return Promise.resolve(true);
+    if (inFlight?.epoch === captured) return inFlight.promise;
+
+    const promise = Promise.resolve()
+      .then(() => resolve(signal))
+      .then(
+        (result) => {
+          if (epoch !== captured) return false;
+          commit(result);
+          value = result;
+          return true;
+        },
+        () => {
+          if (epoch !== captured) return false;
+          commit(fallback);
+          value = fallback;
+          return false;
+        },
+      )
+      .finally(() => {
+        if (inFlight?.epoch === captured) inFlight = null;
+      });
+    inFlight = { epoch: captured, promise };
+    return promise;
+  }
+
+  function invalidate() {
+    epoch += 1;
+    value = null;
+    commit(null);
+  }
+
+  return { ensure, invalidate };
+}
+
 function actionsArgs(limit) {
   return [
     "run",
@@ -1138,6 +1322,7 @@ async function runDoctor() {
   alertBackoff.clear();
 
   const probes = [
+    ["Repository access", repoContextArgs()],
     ["Actions (run list)", actionsArgs(MIN_RUN_LIMIT)],
     ["Issues (issue list)", issuesArgs()],
     ["Pull requests (pr list)", prsArgs()],
@@ -1145,7 +1330,7 @@ async function runDoctor() {
   ];
 
   // allSettled, and every probe already resolves rather than rejects, so one
-  // slow endpoint cannot suppress the other five. runGh's own GH_TIMEOUT_MS
+  // slow endpoint cannot suppress the other six. runGh's own GH_TIMEOUT_MS
   // bounds each one.
   const [ghVersion, authStatus, remote, budget, results] = await Promise.all([
     captureGh(["--version"]),
@@ -2253,6 +2438,7 @@ function App() {
   // clearing it would cost a second state write for no visible difference.
   const [iconHintDue, setIconHintDue] = useState(false);
   const [errors, setErrors] = useState({ actions: null, issues: null, prs: null, security: null });
+  const [failureContext, setFailureContext] = useState(null);
   const [loading, setLoading] = useState({ actions: true, issues: true, prs: true, security: true });
   const [now, setNow] = useState(new Date());
   const { rows, cols, useShortLabels } = useTerminalSize(stdout);
@@ -2325,6 +2511,7 @@ function App() {
   // persistently failing tab would report itself fresh forever.
   const lastOkRef = useRef({});
   const fetchTabRef = useRef(null);
+  const contextCoordinatorRef = useRef(null);
 
   const interactive = Boolean(isRawModeSupported);
 
@@ -2447,6 +2634,7 @@ function App() {
         // bypasses (and clears) any failure backoff: this key is the user saying
         // "try again now", and a refresh that silently declined to refresh would
         // be worse than no key at all.
+        contextCoordinatorRef.current?.invalidate();
         fetchTabRef.current?.(TABS[activeIndexRef.current].key, { force: true });
       } else if (input >= "1" && input <= String(TABS.length)) {
         setActiveIndex(Number(input) - 1);
@@ -2482,6 +2670,23 @@ function App() {
     let ticks = 0;
     const controller = new AbortController();
     registerLiveAbort(controller);
+    const withTargetHost = (context) => ({
+      ...context,
+      targetHost: failureTargetHost({
+        runtimeHost: runtime.host,
+        ghHost: process.env.GH_HOST,
+        ghRepo: process.env.GH_REPO,
+        accounts: context.accounts,
+      }),
+    });
+    const coordinator = createFailureContextCoordinator({
+      resolve: async (signal) => withTargetHost(await resolveFailureContext(signal)),
+      commit: (context) => {
+        if (!cancelled) setFailureContext(context);
+      },
+      fallback: withTargetHost(missingFailureContext()),
+    });
+    contextCoordinatorRef.current = coordinator;
 
     // Each tab commits its own result the moment it lands instead of waiting on
     // a Promise.allSettled barrier. Actions is by far the slowest fetch, so
@@ -2554,6 +2759,7 @@ function App() {
           const failure = toTabError(err);
           const verdict = failure.verdict;
           setErrors((x) => ({ ...x, [key]: failure }));
+          if (verdict === "unavailable") coordinator.ensure(controller.signal);
           // ...and back off, which the list tabs never did at all. A tab wedged
           // on an expired token used to re-spawn `gh` every tick forever -- 720
           // subprocesses an hour, indefinitely, against a token that is already
@@ -2610,9 +2816,10 @@ function App() {
     return () => {
       cancelled = true;
       clearInterval(id);
+      if (contextCoordinatorRef.current === coordinator) contextCoordinatorRef.current = null;
       // `cancelled` stops state updates from a promise that already resolved;
       // the signal stops the subprocess itself, so quitting doesn't orphan up to
-      // six `gh` children mid-request. They cover different windows and both are
+      // eight `gh` children mid-request. They cover different windows and both are
       // needed.
       controller.abort();
     };
@@ -2672,7 +2879,7 @@ function App() {
   }, [anyFirstLoad, iconHintDue]);
 
   const items = data[tab.key];
-  const displayError = formatTabError(tabError, null);
+  const displayError = formatTabError(tabError, failureContext);
   const spin = SPINNER[frame % SPINNER.length];
 
   const counts = Object.fromEntries(
@@ -3047,6 +3254,12 @@ export {
   isAuthProblem,
   toTabError,
   formatTabError,
+  parseRepoContext,
+  parseAuthContext,
+  buildFailureContext,
+  failureTargetHost,
+  unavailableRemedy,
+  createFailureContextCoordinator,
   AUTH_RETRY_MS,
   BACKOFF_STEPS_MS,
   redact,

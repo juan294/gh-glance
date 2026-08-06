@@ -100,8 +100,9 @@ test("--doctor exits 0 through a pipe and prints a complete report", async () =>
   assert.match(out, /Repository target/);
   assert.match(out, /Environment/);
   assert.match(out, /Endpoint probes/);
-  // One block per endpoint the dashboard actually calls.
-  assert.equal(out.match(/^ {2}classified {2}/gm)?.length, 6, out);
+  assert.match(out, /^ {2}Repository access$/m);
+  // One block per diagnostic probe, including failure-triggered repository access.
+  assert.equal(out.match(/^ {2}classified {2}/gm)?.length, 7, out);
 });
 
 test("--doctor never prints a token that was planted in its environment", async () => {
@@ -149,6 +150,10 @@ test("--doctor reports the host-qualified target it was given", async () => {
   const out = await doctor({ args: ["--repo", "tenant.ghe.com/acme/widget"] });
   assert.match(out, /^host {14}tenant\.ghe\.com$/m);
   assert.match(out, /^slug {14}acme\/widget$/m);
+  assert.match(
+    out,
+    /argv {8}gh repo view tenant\.ghe\.com\/acme\/widget --json nameWithOwner,url,viewerPermission/,
+  );
   // The D2 guard, stated in the report: the host travels as --hostname and
   // never as path text.
   assert.match(out, /argv {8}gh api repos\/acme\/widget\/.*--hostname tenant\.ghe\.com/);
