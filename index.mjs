@@ -971,6 +971,82 @@ const ALERT_SOURCES = [
 const REST_PER_FETCH = { actions: 2, issues: 0, prs: 0, security: ALERT_SOURCES.length };
 const GRAPHQL_PER_FETCH = { actions: 0, issues: 2, prs: 2, security: 0 };
 
+// Ceiling on adaptive widening. An adaptive interval needs one: a minute is
+// where the pane stops being live in any useful sense, and past it the honest
+// answer is fewer panes, not a slower one.
+const MAX_ADAPTIVE_REFRESH_MS = 60_000;
+
+// Target this fraction of what the token can afford, not all of it. The margin
+// is for the user's own `gh` and `git` commands, which are the whole reason the
+// pane yields at all -- see RATE_LIMIT_RETRY_MS.
+const BUDGET_SAFETY = 0.8;
+
+// Below this many of our own REST calls in a probe window, the share inference
+// is noise -- one call against a global delta of one reads as "we are the only
+// consumer" whether or not that is true. Under the threshold the loop declines
+// to adapt rather than guessing.
+const MIN_SAMPLE_CALLS = 5;
+
+// Only move the applied interval when the target differs by more than this
+// factor either way, so a budget wobbling around a boundary cannot make the
+// poll rate flap. Same reasoning as TAB_LABEL_HYSTERESIS.
+const ADAPTIVE_HYSTERESIS = 1.25;
+
+// How wide the active-tab interval has to be for this instance to fit its share
+// of the token's remaining budget.
+//
+// The share is *inferred*, not configured: this instance knows exactly how many
+// REST calls it has spent since the last probe, and `rate_limit` reports how
+// many the token spent in total over the same window. The ratio is how many
+// equivalent consumers are on this token -- other panes, a `gh pr checks
+// --watch`, an agent shelling out to `gh`. That is why no IPC and no on-disk
+// registry is needed: the token's own counter is the shared channel, and it
+// already aggregates everything.
+//
+// Deliberately one-directional: the returned value is never below `floorMs`, so
+// --refresh and GH_GLANCE_REFRESH stay a floor the loop widens from and cannot
+// tighten past. A single instance on a fresh window computes a required interval
+// below the floor and therefore stays at exactly the configured refresh, which
+// is what keeps this from changing ordinary single-pane behaviour.
+//
+// MAX_ADAPTIVE_REFRESH_MS is wrapped in Math.max(floorMs, ...) at every exit, so
+// a user who configures a refresh wider than the cap is never silently sped up.
+function adaptiveRefreshMs({ budget, sample, restPerTick, floorMs, nowMs }) {
+  if (!budget || !Number.isFinite(budget.remaining) || restPerTick <= 0) return floorMs;
+  if (budget.remaining <= 0) return Math.max(floorMs, MAX_ADAPTIVE_REFRESH_MS);
+
+  const secondsToReset = Math.max(1, (budget.resetMs - nowMs) / 1000);
+  const affordable = (budget.remaining / secondsToReset) * BUDGET_SAFETY;
+  if (affordable <= 0) return Math.max(floorMs, MAX_ADAPTIVE_REFRESH_MS);
+
+  const share =
+    sample && sample.myRestCalls >= MIN_SAMPLE_CALLS && sample.globalUsed > 0
+      ? Math.max(1, sample.globalUsed / sample.myRestCalls)
+      : 1;
+
+  const mine = affordable / share;
+  const requiredMs = (restPerTick / mine) * 1000;
+  return Math.min(Math.max(floorMs, requiredMs), Math.max(floorMs, MAX_ADAPTIVE_REFRESH_MS));
+}
+
+// Whether a newly computed target is different enough to act on.
+function adaptiveChangeWorthApplying(appliedMs, targetMs) {
+  if (appliedMs <= 0) return true;
+  const ratio = targetMs / appliedMs;
+  return ratio >= ADAPTIVE_HYSTERESIS || ratio <= 1 / ADAPTIVE_HYSTERESIS;
+}
+
+// REST cost of one tick in this configuration: the active tab every tick, the
+// other three amortised over BACKGROUND_EVERY. Same table and same shape as
+// projectedHourlyCost, so the controller and the report cannot disagree.
+function restPerTick(activeKey) {
+  let cost = REST_PER_FETCH[activeKey] ?? 0;
+  for (const key of TAB_KEYS) {
+    if (key !== activeKey) cost += (REST_PER_FETCH[key] ?? 0) / BACKGROUND_EVERY;
+  }
+  return cost;
+}
+
 function alertArgs(source) {
   return ["api", apiPath(source.path), ...apiHostArgs(), "--jq", source.jq];
 }
@@ -4480,6 +4556,15 @@ export {
   REST_PER_FETCH,
   GRAPHQL_PER_FETCH,
   projectedHourlyCost,
+  REFRESH_MS,
+  BACKGROUND_EVERY,
+  adaptiveRefreshMs,
+  adaptiveChangeWorthApplying,
+  restPerTick,
+  MAX_ADAPTIVE_REFRESH_MS,
+  BUDGET_SAFETY,
+  MIN_SAMPLE_CALLS,
+  ADAPTIVE_HYSTERESIS,
   safe,
   shortErr,
   isUnavailable,

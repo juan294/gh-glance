@@ -83,6 +83,39 @@ imports `parseArgs`/`validateArgs`. The plan specifies the entry block explicitl
 around it, so this was followed as written. The consequence is real: three
 `doctor.test.mjs` tests spawn a child process to cover the substitution.
 
+### Phase 3
+
+**`BUDGET_PROBE_MS` declared in Phase 4, not Phase 3.**
+Plan said: declare it in Phase 3's constants block alongside the other four.
+Found: nothing in Phase 3 reads it — it is the probe cadence, used only by the
+loop — so `npm run lint` failed the phase outright on `no-unused-vars`.
+Chose: moved the declaration (comment unchanged) into the Phase 4 commit, at the
+same position in the same block.
+Why: the alternative was exporting a constant no test uses, purely to satisfy the
+linter. The constants block ends up exactly as the plan describes it.
+
+**`restPerTick` assertions use `assertClose`, not `assert.equal`.**
+Plan said: `assert.equal(restPerTick("issues"), (2 + 3) / BACKGROUND_EVERY)`.
+Found: fails. `restPerTick` accumulates one division per background tab, so
+`0 + 2/12 + 3/12` is `0.41666666666666663` while `5/12` is `0.4166666666666667`.
+Chose: `assertClose(..., 1e-12)` for all three tabs.
+Why: the assertion is about amortisation being applied, not about float
+associativity. `assertClose` is already the phase's own helper.
+
+**Fixed a defect in the plan's `at()` test helper.**
+Plan said:
+```js
+const at = (over) => ({ budget: { ...FRESH, ...over?.budget }, nowMs: 0,
+                        restPerTick: 2.25, floorMs: 5000, ...over });
+```
+Found: `...over` comes last, so it **replaces** the merged `budget` wholesale.
+Any row overriding one budget field loses `resetMs`, making `secondsToReset` NaN
+and the result NaN. This surfaced as "widening is capped" returning NaN; the
+"exhausted budget" row passed only because `remaining: 0` returns before
+`resetMs` is read — so the bug would have shipped half-hidden.
+Chose: moved `budget` after the spread so the merge always wins.
+Why: as written, a case could silently stop testing the thing it is named for.
+
 ### Process (all phases)
 
 **No worktree.**

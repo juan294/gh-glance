@@ -82,6 +82,14 @@ import {
   REST_PER_FETCH,
   GRAPHQL_PER_FETCH,
   projectedHourlyCost,
+  REFRESH_MS,
+  BACKGROUND_EVERY,
+  adaptiveRefreshMs,
+  adaptiveChangeWorthApplying,
+  restPerTick,
+  MAX_ADAPTIVE_REFRESH_MS,
+  BUDGET_SAFETY,
+  MIN_SAMPLE_CALLS,
 } from "../index.mjs";
 
 const ESC = String.fromCharCode(27);
@@ -2090,6 +2098,115 @@ test("projected hourly cost, per active tab, at the default refresh", () => {
   assert.deepEqual(projectedHourlyCost("issues"), { rest: 300, graphql: 1560 });
   assert.deepEqual(projectedHourlyCost("prs"), { rest: 300, graphql: 1560 });
   assert.deepEqual(projectedHourlyCost("security"), { rest: 2280, graphql: 240 });
+});
+
+// The control law. These assertions are the specification -- the function is
+// pure, so the rubric can be stated exactly rather than observed through a
+// timer. Expected intervals are derived, not guessed: with
+// restPerTick("actions") = 2 + 3/12 = 2.25 and a fresh window (5000 remaining,
+// resetting in an hour), affordable = 5000/3600 * 0.8 = 1.111 calls/sec.
+function assertClose(actual, expected, tolerance) {
+  assert.ok(
+    Math.abs(actual - expected) <= tolerance,
+    `expected ${actual} within ${tolerance} of ${expected}`,
+  );
+}
+
+const FRESH = { remaining: 5000, limit: 5000, resetMs: 3_600_000 };
+// `budget` is merged onto FRESH *after* the general spread: a row that overrides
+// only `remaining` must keep the fresh window's resetMs, or secondsToReset goes
+// NaN and the case silently stops testing what it names.
+const at = (over) => ({
+  nowMs: 0,
+  restPerTick: 2.25,
+  floorMs: 5000,
+  ...over,
+  budget: { ...FRESH, ...over?.budget },
+});
+const sample = (mine, global) => ({ myRestCalls: mine, globalUsed: global });
+
+test("a single instance stays at the configured floor", () => {
+  // required = 2.25 / 1.111 = 2.03s, below the 5s floor. This is the property
+  // that keeps adaptation from being a regression for ordinary single-pane use.
+  assert.equal(adaptiveRefreshMs(at({ sample: sample(100, 100) })), 5000);
+});
+
+test("three panes sit just above the floor", () => {
+  assertClose(adaptiveRefreshMs(at({ sample: sample(100, 300) })), 6075, 200);
+});
+
+test("seven panes widen to about 14 seconds", () => {
+  assertClose(adaptiveRefreshMs(at({ sample: sample(100, 700) })), 14175, 500);
+});
+
+test("ten panes widen to about 20 seconds", () => {
+  assertClose(adaptiveRefreshMs(at({ sample: sample(100, 1000) })), 20250, 500);
+});
+
+test("the aggregate of N adapted panes lands near the safety target", () => {
+  // The property that matters, asserted directly rather than inferred from the
+  // intervals: N panes each polling at the computed interval spend at most
+  // BUDGET_SAFETY of the hourly limit, leaving the rest for the user's own gh.
+  for (const n of [1, 3, 7, 10, 20]) {
+    const ms = adaptiveRefreshMs(at({ sample: sample(100, 100 * n) }));
+    const aggregate = n * (3_600_000 / ms) * 2.25;
+    assert.ok(aggregate <= 5000 * BUDGET_SAFETY + 1, `n=${n} spent ${aggregate}`);
+  }
+});
+
+test("an exhausted budget goes straight to the cap", () => {
+  assert.equal(
+    adaptiveRefreshMs(at({ budget: { remaining: 0 }, sample: sample(100, 700) })),
+    MAX_ADAPTIVE_REFRESH_MS,
+  );
+});
+
+test("widening is capped", () => {
+  assert.equal(
+    adaptiveRefreshMs(at({ budget: { remaining: 10 }, sample: sample(100, 9000) })),
+    MAX_ADAPTIVE_REFRESH_MS,
+  );
+});
+
+test("too small a sample declines to infer a share", () => {
+  // Floor, not a wild extrapolation: one call against a global delta of one
+  // reads as "we are the only consumer" whether or not that is true.
+  assert.equal(adaptiveRefreshMs(at({ sample: sample(MIN_SAMPLE_CALLS - 1, 5000) })), 5000);
+});
+
+test("a missing or unreadable budget returns the floor unchanged", () => {
+  for (const budget of [null, undefined, { remaining: NaN }]) {
+    assert.equal(adaptiveRefreshMs({ ...at(), budget, sample: sample(100, 700) }), 5000);
+  }
+});
+
+test("the configured floor is never tightened, even above the cap", () => {
+  const ms = adaptiveRefreshMs({ ...at({ sample: sample(100, 100) }), floorMs: 120_000 });
+  assert.equal(ms, 120_000);
+});
+
+test("hysteresis suppresses small moves and admits large ones", () => {
+  assert.equal(adaptiveChangeWorthApplying(10_000, 11_000), false); // +10%
+  assert.equal(adaptiveChangeWorthApplying(10_000, 9_500), false); // -5%
+  assert.equal(adaptiveChangeWorthApplying(10_000, 13_000), true); // +30%
+  assert.equal(adaptiveChangeWorthApplying(10_000, 7_000), true); // -30%
+  assert.equal(adaptiveChangeWorthApplying(0, 5_000), true); // first apply
+});
+
+test("restPerTick amortises the background tabs", () => {
+  // Close rather than exact: the function accumulates one division per
+  // background tab, so 0 + 2/12 + 3/12 is not bit-identical to 5/12.
+  assertClose(restPerTick("actions"), 2 + 3 / BACKGROUND_EVERY, 1e-12);
+  assertClose(restPerTick("security"), 3 + 2 / BACKGROUND_EVERY, 1e-12);
+  assertClose(restPerTick("issues"), (2 + 3) / BACKGROUND_EVERY, 1e-12);
+});
+
+test("restPerTick and projectedHourlyCost agree", () => {
+  // Two derivations of the same quantity; if they drift, one of them is wrong.
+  for (const key of TAB_KEYS) {
+    const perHour = restPerTick(key) * (3_600_000 / REFRESH_MS);
+    assertClose(perHour, projectedHourlyCost(key).rest, 1);
+  }
 });
 
 test("the status bar hints are a subset of the documented key table", () => {
