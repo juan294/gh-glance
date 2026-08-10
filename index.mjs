@@ -108,6 +108,8 @@ const ALERT_QUERY = `?state=open&per_page=${ALERT_PER_PAGE}&sort=created&directi
 // single pane. Only the tab you are looking at needs REFRESH_MS latency; the
 // other three exist to keep counts honest, which tolerates a minute.
 const BACKGROUND_EVERY = 12;
+// What one fetch of each tab costs lives in REST_PER_FETCH / GRAPHQL_PER_FETCH,
+// declared with ALERT_SOURCES below because the security figure derives from it.
 
 // A stalled `gh` used to wedge a tab permanently: the promise never settled, so
 // the in-flight guard was never cleared and that tab stopped fetching for the
@@ -946,6 +948,20 @@ const ALERT_SOURCES = [
   },
 ];
 
+// What one fetch of each tab costs, per budget. The single source of truth:
+// `projectedHourlyCost` derives the hourly figure from it and the spend meter
+// bills against it, so a corrected number cannot reach one and miss the other.
+//
+// actions is 2, not 1: measured 2026-08-10 with `GH_DEBUG=api`, `gh run list`
+// issues GET /actions/runs *and* GET /actions/workflows. The 1 that stood here
+// understated the default tab -- the tab every pane starts on, since
+// initialTabIndex defaults to 0 -- by half.
+//
+// issues and prs are 0 REST because SORT_RECENT's --search routes both through
+// GraphQL entirely (2 POSTs each, confirmed by the same measurement).
+const REST_PER_FETCH = { actions: 2, issues: 0, prs: 0, security: ALERT_SOURCES.length };
+const GRAPHQL_PER_FETCH = { actions: 0, issues: 2, prs: 2, security: 0 };
+
 function alertArgs(source) {
   return ["api", apiPath(source.path), ...apiHostArgs(), "--jq", source.jq];
 }
@@ -1293,8 +1309,8 @@ function targetSource() {
 
 // How much of the hourly API budget is left, and roughly how fast this
 // configuration spends it. The steady-state cost is not small and was invisible:
-// at the default 5s refresh with the Security tab open it is around 2,200 REST
-// requests an hour -- about 44% of a personal token's 5,000 -- and `--refresh 2`
+// at the default 5s refresh with the Security tab open it is around 2,280 REST
+// requests an hour -- about 46% of a personal token's 5,000 -- and `--refresh 2`
 // projects past the limit outright, so it exhausts inside the hour, every hour.
 // The budget is shared with everything else the token does, so the first symptom
 // is usually "GitHub is broken" somewhere else entirely.
@@ -1324,21 +1340,19 @@ async function rateBudget() {
 // Requests per hour this configuration will spend once it settles, derived from
 // the same constants the poll loop uses rather than from a number written down
 // once and left to rot. The active tab refreshes every tick; the other three
-// every BACKGROUND_EVERY ticks. Security is three REST calls per fetch, Actions
-// one, and Issues/PRs go to GraphQL instead (two POSTs each, because --search
-// routes through the search connection).
+// every BACKGROUND_EVERY ticks. The per-fetch prices come from REST_PER_FETCH
+// and GRAPHQL_PER_FETCH, which are also what the spend meter bills against --
+// two copies of them would diverge the first time one was fixed.
 function projectedHourlyCost(activeKey) {
   const perHour = 3_600_000 / runtime.refreshMs;
-  const restCalls = { actions: 1, issues: 0, prs: 0, security: ALERT_SOURCES.length };
-  const graphqlCalls = { actions: 0, issues: 2, prs: 2, security: 0 };
   let rest = 0;
   let graphql = 0;
   // TAB_KEYS rather than TABS: this runs on the --doctor path, which deliberately
   // returns before the render tree is reached, and TABS is declared down there.
   for (const key of TAB_KEYS) {
     const ticks = key === activeKey ? perHour : perHour / BACKGROUND_EVERY;
-    rest += ticks * restCalls[key];
-    graphql += ticks * graphqlCalls[key];
+    rest += ticks * REST_PER_FETCH[key];
+    graphql += ticks * GRAPHQL_PER_FETCH[key];
   }
   return { rest: Math.round(rest), graphql: Math.round(graphql) };
 }
@@ -3387,6 +3401,10 @@ export {
   MIN_REFRESH_SECONDS,
   MAX_REFRESH_SECONDS,
   TAB_KEYS,
+  ALERT_SOURCES,
+  REST_PER_FETCH,
+  GRAPHQL_PER_FETCH,
+  projectedHourlyCost,
   safe,
   shortErr,
   isUnavailable,

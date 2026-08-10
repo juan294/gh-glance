@@ -51,6 +51,11 @@ import {
   RATE_LIMIT_RETRY_MS,
   FAILURE_LADDER,
   REPO_PATTERN,
+  TAB_KEYS,
+  ALERT_SOURCES,
+  REST_PER_FETCH,
+  GRAPHQL_PER_FETCH,
+  projectedHourlyCost,
 } from "../index.mjs";
 
 const ESC = String.fromCharCode(27);
@@ -809,6 +814,37 @@ test("every verdict with a remedy also has a backoff ladder, and vice versa", ()
   // was gone.
   assert.equal(RATE_LIMIT_RETRY_MS.length, 1);
   assert.ok(RATE_LIMIT_RETRY_MS[0] <= BACKOFF_STEPS_MS[0]);
+});
+
+test("the per-fetch cost tables cover every tab and nothing else", () => {
+  assert.deepEqual(Object.keys(REST_PER_FETCH).sort(), [...TAB_KEYS].sort());
+  assert.deepEqual(Object.keys(GRAPHQL_PER_FETCH).sort(), [...TAB_KEYS].sort());
+});
+
+test("an actions fetch costs two REST calls", () => {
+  // Measured 2026-08-10: gh run list issues /actions/runs and
+  // /actions/workflows. Pinned because the adaptive throttle budgets against it.
+  assert.equal(REST_PER_FETCH.actions, 2);
+});
+
+test("issues and prs cost no REST and two GraphQL, because --search routes them", () => {
+  for (const key of ["issues", "prs"]) {
+    assert.equal(REST_PER_FETCH[key], 0, key);
+    assert.equal(GRAPHQL_PER_FETCH[key], 2, key);
+  }
+});
+
+test("security costs one REST per alert source", () => {
+  assert.equal(REST_PER_FETCH.security, ALERT_SOURCES.length);
+});
+
+test("projected hourly cost, per active tab, at the default refresh", () => {
+  // runtime.refreshMs is REFRESH_MS on an imported module (the argv block is
+  // gated on IS_MAIN), so these are the default-refresh figures.
+  assert.deepEqual(projectedHourlyCost("actions"), { rest: 1620, graphql: 240 });
+  assert.deepEqual(projectedHourlyCost("issues"), { rest: 300, graphql: 1560 });
+  assert.deepEqual(projectedHourlyCost("prs"), { rest: 300, graphql: 1560 });
+  assert.deepEqual(projectedHourlyCost("security"), { rest: 2280, graphql: 240 });
 });
 
 test("the status bar hints are a subset of the documented key table", () => {
