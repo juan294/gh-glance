@@ -999,13 +999,61 @@ const BUDGET_PROBE_MS = 60_000;
 // Below this many of our own REST calls in a probe window, the share inference
 // is noise -- one call against a global delta of one reads as "we are the only
 // consumer" whether or not that is true. Under the threshold the loop declines
-// to adapt rather than guessing.
+// to infer a new share rather than guessing.
 const MIN_SAMPLE_CALLS = 5;
 
 // Only move the applied interval when the target differs by more than this
 // factor either way, so a budget wobbling around a boundary cannot make the
 // poll rate flap. Same reasoning as TAB_LABEL_HYSTERESIS.
 const ADAPTIVE_HYSTERESIS = 1.25;
+
+// Whether a probe window holds enough of our own calls for the ratio below to
+// mean anything. Named rather than inlined because the control law and the loop
+// that feeds it must agree on the answer: the law uses it to decide whether to
+// infer, and the loop uses it to decide whether the window may be closed.
+function sampleIsUsable(sample) {
+  return Boolean(sample) && sample.myRestCalls >= MIN_SAMPLE_CALLS && sample.globalUsed > 0;
+}
+
+// How many equivalent consumers are on this token, from one probe window.
+//
+// `lastShare` is what the previous measurable window said, and it is the answer
+// whenever this window is not measurable. Falling back to 1 instead would be the
+// controller starving its own input: a pane that has widened to 40s makes about
+// three REST calls per probe window, below MIN_SAMPLE_CALLS, so it would read
+// "no other consumers", snap back to the floor, spend fast enough to measure
+// again, and re-throttle -- a flap on a two-minute cycle at exactly the instance
+// counts the widening exists for. Holding the last measurement keeps the pane
+// where it is until a window is long enough to say otherwise.
+function inferShare(sample, lastShare = 1) {
+  return sampleIsUsable(sample)
+    ? Math.max(1, sample.globalUsed / sample.myRestCalls)
+    : Math.max(1, lastShare);
+}
+
+// One probe window's bookkeeping. Pure, so the flap it prevents is testable
+// without a timer: `prev` is `{ used, spent }` from the last window that could
+// be measured, or null before the first probe.
+//
+// The baseline only advances when the window was usable, so an unmeasurable
+// window is not thrown away -- it grows until it holds MIN_SAMPLE_CALLS of our
+// own calls, with both halves of the ratio still spanning the same stretch of
+// time. The cost is latency, not accuracy: a pane at the 60s cap needs two or
+// three probes rather than one to notice that the other panes have exited.
+function nextProbeWindow(prev, budget, spentTotal) {
+  // A window reset makes `used` fall. The span before the reset cannot be
+  // compared against the counter after it, so the window restarts here and this
+  // cycle infers nothing -- the caller keeps the share it last measured, which
+  // is the one direction that cannot spike the poll rate at the top of an hour.
+  if (prev === null || budget.used < prev.used) {
+    return { sample: null, next: { used: budget.used, spent: spentTotal } };
+  }
+  const sample = {
+    globalUsed: budget.used - prev.used,
+    myRestCalls: spentTotal - prev.spent,
+  };
+  return { sample, next: sampleIsUsable(sample) ? { used: budget.used, spent: spentTotal } : prev };
+}
 
 // How wide the active-tab interval has to be for this instance to fit its share
 // of the token's remaining budget.
@@ -1026,7 +1074,10 @@ const ADAPTIVE_HYSTERESIS = 1.25;
 //
 // MAX_ADAPTIVE_REFRESH_MS is wrapped in Math.max(floorMs, ...) at every exit, so
 // a user who configures a refresh wider than the cap is never silently sped up.
-function adaptiveRefreshMs({ budget, sample, restPerTick, floorMs, nowMs }) {
+//
+// `lastShare` defaults to 1, so a caller with no history behaves exactly as this
+// did before it existed: one instance, no adaptation.
+function adaptiveRefreshMs({ budget, sample, restPerTick, floorMs, nowMs, lastShare = 1 }) {
   if (!budget || !Number.isFinite(budget.remaining) || restPerTick <= 0) return floorMs;
   if (budget.remaining <= 0) return Math.max(floorMs, MAX_ADAPTIVE_REFRESH_MS);
 
@@ -1034,12 +1085,7 @@ function adaptiveRefreshMs({ budget, sample, restPerTick, floorMs, nowMs }) {
   const affordable = (budget.remaining / secondsToReset) * BUDGET_SAFETY;
   if (affordable <= 0) return Math.max(floorMs, MAX_ADAPTIVE_REFRESH_MS);
 
-  const share =
-    sample && sample.myRestCalls >= MIN_SAMPLE_CALLS && sample.globalUsed > 0
-      ? Math.max(1, sample.globalUsed / sample.myRestCalls)
-      : 1;
-
-  const mine = affordable / share;
+  const mine = affordable / inferShare(sample, lastShare);
   const requiredMs = (restPerTick / mine) * 1000;
   return Math.min(Math.max(floorMs, requiredMs), Math.max(floorMs, MAX_ADAPTIVE_REFRESH_MS));
 }
@@ -1448,7 +1494,10 @@ function targetSource() {
 // exactly why this reports the server's own numbers rather than asserting 5,000.
 async function rateBudget() {
   try {
-    const raw = await runGh(["api", "rate_limit"]);
+    // Host-routed like every other `gh api` call: a budget is per token *per
+    // server*, so on a GHES tenant the github.com numbers are not merely stale,
+    // they belong to a different limit entirely.
+    const raw = await runGh(["api", "rate_limit", ...apiHostArgs()]);
     const { resources } = JSON.parse(raw);
     // formatAge() is for timestamps in the past and returns "-" for a future one,
     // so the reset is rendered as a forward interval instead.
@@ -1474,7 +1523,11 @@ async function rateBudget() {
 // measures as free (verified: delta 0).
 async function readCoreBudget(signal) {
   try {
-    const raw = await runGh(["api", "rate_limit"], { signal });
+    // apiHostArgs() for the same reason the alert endpoints carry it: --repo
+    // host/owner/name sets runtime.host without setting GH_HOST, so without the
+    // flag this reads github.com's budget while the pane spends against the
+    // tenant -- and then throttles, or fails to, against an unrelated number.
+    const raw = await runGh(["api", "rate_limit", ...apiHostArgs()], { signal });
     const core = JSON.parse(raw)?.resources?.core;
     if (!core || !Number.isFinite(core.remaining)) return null;
     return {
@@ -4011,8 +4064,11 @@ function App({ onCreateRemote = () => {} } = {}) {
     // minute at full rate first.
     let lastProbeAt = 0;
     let probeInFlight = false;
-    let prevUsed = null;
-    let prevSpent = 0;
+    // The open probe window, and the last share it was able to measure. Both are
+    // carried by nextProbeWindow/inferShare rather than reset every probe -- see
+    // those functions for why a throttled pane must not re-measure from scratch.
+    let probeWindow = null;
+    let lastShare = 1;
 
     function rearm(ms) {
       appliedMs = ms;
@@ -4028,20 +4084,17 @@ function App({ onCreateRemote = () => {} } = {}) {
         // flight at unmount is killed along with everything else.
         const budget = await readCoreBudget(controller.signal);
         if (cancelled || !budget) return;
-        // A window reset makes `used` fall; treat the new value as the delta
-        // rather than going negative.
-        const globalUsed =
-          prevUsed === null || budget.used < prevUsed ? budget.used : budget.used - prevUsed;
-        const sample =
-          prevUsed === null
-            ? null // first probe: no window to measure our own share over
-            : { globalUsed, myRestCalls: restSpentTotal - prevSpent };
-        prevUsed = budget.used;
-        prevSpent = restSpentTotal;
+        const { sample, next } = nextProbeWindow(probeWindow, budget, restSpentTotal);
+        probeWindow = next;
+        // Updated before the law reads it. inferShare is idempotent, so passing
+        // the already-updated value cannot change the answer -- it just keeps
+        // one variable holding the current share rather than two.
+        lastShare = inferShare(sample, lastShare);
 
         const target = adaptiveRefreshMs({
           budget,
           sample,
+          lastShare,
           floorMs: runtime.refreshMs,
           nowMs: Date.now(),
           restPerTick: restPerTick(TABS[activeIndexRef.current].key),
@@ -4714,6 +4767,9 @@ export {
   BACKGROUND_EVERY,
   adaptiveRefreshMs,
   adaptiveChangeWorthApplying,
+  sampleIsUsable,
+  inferShare,
+  nextProbeWindow,
   restPerTick,
   MAX_ADAPTIVE_REFRESH_MS,
   BUDGET_SAFETY,

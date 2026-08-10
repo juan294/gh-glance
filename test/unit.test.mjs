@@ -86,6 +86,9 @@ import {
   BACKGROUND_EVERY,
   adaptiveRefreshMs,
   adaptiveChangeWorthApplying,
+  sampleIsUsable,
+  inferShare,
+  nextProbeWindow,
   restPerTick,
   MAX_ADAPTIVE_REFRESH_MS,
   BUDGET_SAFETY,
@@ -2170,8 +2173,91 @@ test("widening is capped", () => {
 
 test("too small a sample declines to infer a share", () => {
   // Floor, not a wild extrapolation: one call against a global delta of one
-  // reads as "we are the only consumer" whether or not that is true.
+  // reads as "we are the only consumer" whether or not that is true. Floor
+  // specifically because there is no earlier measurement to hold -- see below.
   assert.equal(adaptiveRefreshMs(at({ sample: sample(MIN_SAMPLE_CALLS - 1, 5000) })), 5000);
+});
+
+test("an unmeasurable window holds the widened interval, not the floor", () => {
+  // The same rubric row as "seven panes", reached with a window too small to
+  // re-measure. Dropping to the floor here is the flap: a pane wide enough to
+  // need throttling is, by construction, too quiet to keep proving it.
+  assertClose(adaptiveRefreshMs(at({ sample: sample(2, 700), lastShare: 7 })), 14175, 500);
+});
+
+test("inferShare holds the last measurement when the window cannot be measured", () => {
+  assert.equal(inferShare(sample(100, 700)), 7);
+  assert.equal(inferShare(sample(2, 700), 7), 7);
+  assert.equal(inferShare(null, 7), 7);
+  // Never below 1, from either source: fewer than one consumer is not a thing,
+  // and a share under 1 would compute an interval tighter than the floor.
+  assert.equal(inferShare(sample(100, 50)), 1);
+  assert.equal(inferShare(null, 0.2), 1);
+});
+
+test("an unmeasurable probe window stays open instead of restarting", () => {
+  const first = nextProbeWindow(null, { used: 100 }, 0);
+  assert.equal(first.sample, null, "the first probe has no window to measure over");
+  assert.deepEqual(first.next, { used: 100, spent: 0 });
+
+  // Two of our own calls, below MIN_SAMPLE_CALLS: the baseline must not advance,
+  // or the next window starts equally short and the pane can never re-measure.
+  const small = nextProbeWindow(first.next, { used: 140 }, 2);
+  assert.equal(sampleIsUsable(small.sample), false);
+  assert.deepEqual(small.next, first.next);
+
+  // One probe later the accumulated window is measurable -- and both halves of
+  // the ratio span the whole stretch, not just the last minute of it.
+  const grown = nextProbeWindow(small.next, { used: 200 }, 6);
+  assert.deepEqual(grown.sample, { globalUsed: 100, myRestCalls: 6 });
+  assert.deepEqual(grown.next, { used: 200, spent: 6 });
+});
+
+test("a rate-limit window reset restarts the probe window", () => {
+  // `used` falling means the hour rolled over. The span before the reset cannot
+  // be compared against the counter after it, so this cycle infers nothing
+  // rather than reporting a negative delta.
+  const { sample: s, next } = nextProbeWindow({ used: 4000, spent: 900 }, { used: 12 }, 950);
+  assert.equal(s, null);
+  assert.deepEqual(next, { used: 12, spent: 950 });
+});
+
+test("a throttled pane does not flap back to the floor between measurable windows", () => {
+  // The closed-loop property the rubric above cannot see, because every row
+  // there is handed its sample. Twenty panes widen to ~40s, at which point one
+  // probe window holds ~3 of this pane's calls -- under MIN_SAMPLE_CALLS. If the
+  // loop re-measured from scratch it would read "no other consumers", snap to
+  // the floor, spend enough to measure again, and re-throttle: a two-minute flap
+  // at exactly the instance count the widening exists for.
+  //
+  // The budget is held healthy on purpose. That is the trap: once the panes have
+  // throttled, nothing about `remaining` says they must stay throttled, and the
+  // inferred share is the only thing holding them there.
+  const PANES = 20;
+  let applied = 5000;
+  let spent = 0;
+  let used = 0;
+  let probeWindow = null;
+  let share = 1;
+  const settled = [];
+
+  for (let probe = 0; probe < 12; probe++) {
+    const mine = (60_000 / applied) * 2.25; // one probe window at the current interval
+    spent += mine;
+    used += mine * PANES;
+    const budget = { ...FRESH, used };
+
+    const step = nextProbeWindow(probeWindow, budget, spent);
+    probeWindow = step.next;
+    share = inferShare(step.sample, share);
+    const target = adaptiveRefreshMs(at({ budget, sample: step.sample, lastShare: share }));
+    if (adaptiveChangeWorthApplying(applied, target)) applied = target;
+
+    if (probe >= 2) settled.push(applied);
+  }
+
+  assert.ok(Math.min(...settled) > 5000, `returned to the floor: ${settled.join(", ")}`);
+  assertClose(applied, 40_500, 2000);
 });
 
 test("a missing or unreadable budget returns the floor unchanged", () => {

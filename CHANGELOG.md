@@ -46,6 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hourly budget rather than five. The figure was wrong in `--doctor`, in the
   README's per-tab table, and in ADR 0001's request count. Measured with
   `GH_DEBUG=api`; the projection and the new throttle now read one shared table.
+- **`--doctor` reads the API budget from the right server.** `gh api rate_limit`
+  was the one `gh api` call sent without `--hostname`, so with
+  `--repo host/owner/name` the reported budget came from github.com while every
+  other call went to the tenant. A rate limit is per token *per server*, so the
+  two figures belong to unrelated limits.
 
 ## [0.6.1] - 2026-08-06
 

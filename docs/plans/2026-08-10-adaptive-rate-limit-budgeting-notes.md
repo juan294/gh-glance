@@ -156,6 +156,49 @@ Chose: billed on the first line of the `.then`, ahead of that guard.
 Why: GitHub counted those requests whether or not this process still wants them,
 and under-billing biases the inferred share the *unsafe* way.
 
+### Post-validation (2026-08-10)
+
+Two defects `/validate` found after Phase 5. Neither is a deviation from the
+plan — the plan specified both behaviours and both specifications were wrong.
+
+**The budget probe was not host-routed.**
+Plan said: `runGh(["api", "rate_limit"], { signal })`, and Phase 4 flagged only
+that the probe must not be *metered*.
+Found: it was the one `gh api` call in the file without `apiHostArgs()`.
+`--repo host/owner/name` sets `runtime.host` without setting `GH_HOST`, so the
+controller read github.com's budget while the pane spent against the tenant, and
+throttled — or did not — against a number from an unrelated limit. `rateBudget()`
+shared the omission and predates the plan, so `--doctor` has reported the wrong
+server's budget since it shipped.
+Chose: `apiHostArgs()` at both call sites, with a `routing.test.mjs` capture
+asserting the probe carries `--hostname`. `apiCalls`' exclusion comment was
+corrected too: the probe is host-agnostic in its *path*, never its *host*.
+
+**The control loop starved its own input above ~24s.**
+Plan said: `MIN_SAMPLE_CALLS` guards share inference; below it the loop "returns
+the floor and does not adapt". The rubric tabulates 20 panes settling at 40.5s.
+Found: those two cannot both hold. At 40.5s a pane makes ~3 REST calls per 60s
+probe window — under the threshold — so it inferred a share of 1, snapped to the
+floor, spent enough to measure again, and re-throttled. Simulated against the
+shipped functions: `5000 -> 40500 -> 5000 -> 40500` on every probe, indefinitely.
+The pure rubric could not see it because every row is handed its sample; the
+defect only exists once the controller's output feeds its own input.
+Chose: the share carries forward (`inferShare`) and an unmeasurable window stays
+open rather than restarting (`nextProbeWindow`), so both halves of the ratio grow
+over the same span until it can be measured. Both are pure and exported, and a
+closed-loop test now simulates 20 panes over 12 probes and asserts the interval
+never returns to the floor.
+Why: the alternative — scaling `BUDGET_PROBE_MS` with the applied interval —
+fixes the sample size but not the reset-to-1 fallback, which is the half that
+actually causes the flap. Cost is latency, not accuracy: a pane at the cap now
+needs two or three probes rather than one to notice the other panes have exited,
+which the plan's "~2 probe cycles" manual check should be read against.
+
+The window-reset branch changed shape as a consequence. It used to treat the
+post-reset `used` as the delta; with an accumulating window that would compare a
+counter after the reset against our own spend from before it, so it now restarts
+the window and infers nothing for that cycle, holding the last share.
+
 ### Process (all phases)
 
 **No worktree.**
