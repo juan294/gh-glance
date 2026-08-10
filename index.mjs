@@ -1776,7 +1776,7 @@ const ReactModule = await import("react");
 const { render, Box, Text, useStdout, useInput, useStdin, useApp } = await import("ink");
 
 const React = ReactModule.default;
-const { useState, useEffect, useRef } = ReactModule;
+const { useState, useEffect, useMemo, useRef } = ReactModule;
 const e = React.createElement;
 
 // The NODE_ENV escape hatch above is genuinely useful -- React's warnings are
@@ -1902,7 +1902,7 @@ function HeaderCells({ cells }) {
       borderRight: false,
       borderColor: BORDER_COLOR,
     },
-    ...cells.map((c, i) => e(Column, { key: i, ...c.props, bold: true, dim: true }, c.label)),
+    ...cells.map((c) => e(Column, { key: c.key, ...c.props, bold: true, dim: true }, c.label)),
   );
 }
 
@@ -2025,23 +2025,23 @@ function runStatusIcon(run, spin) {
 }
 
 const ACTIONS_HEADER = [
-  { label: "", props: { width: 3 } },
-  { label: "TITLE", props: { grow: true } },
-  { label: "WORKFLOW", props: { width: 10 } },
-  { label: "BRANCH", props: { width: 14 } },
-  { label: "TIME", props: { width: 7 } },
-  { label: "UPDATED", props: { width: 8 } },
+  { key: "status", label: "", props: { width: 3 }, adjustable: false },
+  { key: "title", label: "TITLE", props: { grow: true }, adjustable: false },
+  { key: "workflow", label: "WORKFLOW", props: { width: 10 }, adjustable: true, minWidth: 5 },
+  { key: "branch", label: "BRANCH", props: { width: 14 }, adjustable: true, minWidth: 6 },
+  { key: "time", label: "TIME", props: { width: 7 }, adjustable: true, minWidth: 5 },
+  { key: "updated", label: "UPDATED", props: { width: 8 }, adjustable: true, minWidth: 6 },
 ];
 
 // Dropped in order of least value first: BRANCH and WORKFLOW are inferable
 // from the title far more often than the status icon or the age are.
 const ACTIONS_HEADER_COMPACT = [
-  { label: "", props: { width: 3 } },
-  { label: "TITLE", props: { grow: true } },
-  { label: "UPDATED", props: { width: 8 } },
+  { key: "status", label: "", props: { width: 3 } },
+  { key: "title", label: "TITLE", props: { grow: true } },
+  { key: "updated", label: "UPDATED", props: { width: 8 } },
 ];
 
-function ActionsRow({ item, now, spin, compact, cursor }) {
+function ActionsRow({ item, now, spin, compact, cursor, columns }) {
   const { icon, color, label } = runStatusIcon(item, spin);
   const started = new Date(item.startedAt);
   const finished = item.status === "completed" ? new Date(item.updatedAt) : now;
@@ -2049,52 +2049,52 @@ function ActionsRow({ item, now, spin, compact, cursor }) {
     return e(
       Box,
       { flexDirection: "row" },
-      e(Column, { width: 3, color, label }, `${cursor ? ">" : " "}${icon}`),
-      e(Column, { grow: true }, item.displayTitle),
-      e(Column, { width: 8, dim: true }, formatAge(new Date(item.updatedAt), now)),
+      e(Column, { ...columnProps(columns, "status"), color, label }, `${cursor ? ">" : " "}${icon}`),
+      e(Column, columnProps(columns, "title"), item.displayTitle),
+      e(Column, { ...columnProps(columns, "updated"), dim: true }, formatAge(new Date(item.updatedAt), now)),
     );
   }
   return e(
     Box,
     { flexDirection: "row" },
-    e(Column, { width: 3, color, label }, `${cursor ? ">" : " "}${icon}`),
-    e(Column, { grow: true }, item.displayTitle),
+    e(Column, { ...columnProps(columns, "status"), color, label }, `${cursor ? ">" : " "}${icon}`),
+    e(Column, columnProps(columns, "title"), item.displayTitle),
     // The run number is the actionable half and used to be the first thing
     // truncation ate, since it sat at the tail of a 10-column cell.
-    e(Column, { width: 10, color: IDENTIFIER }, `#${item.number} ${item.workflowName}`),
-    e(Column, { width: 14, color: REF, wrap: "truncate-middle" }, item.headBranch),
-    e(Column, { width: 7 }, formatDuration(finished - started)),
-    e(Column, { width: 8, dim: true }, formatAge(new Date(item.updatedAt), now)),
+    e(Column, { ...columnProps(columns, "workflow"), color: IDENTIFIER }, `#${item.number} ${item.workflowName}`),
+    e(Column, { ...columnProps(columns, "branch"), color: REF, wrap: "truncate-middle" }, item.headBranch),
+    e(Column, columnProps(columns, "time"), formatDuration(finished - started)),
+    e(Column, { ...columnProps(columns, "updated"), dim: true }, formatAge(new Date(item.updatedAt), now)),
   );
 }
 
 // ---------- Issues tab ----------
 
 const ISSUES_HEADER = [
-  { label: "", props: { width: 3 } },
-  { label: "TITLE", props: { grow: true } },
-  { label: "AUTHOR", props: { width: 12 } },
-  { label: "LABEL", props: { width: 14 } },
-  { label: "UPDATED", props: { width: 8 } },
+  { key: "status", label: "", props: { width: 3 }, adjustable: false },
+  { key: "title", label: "TITLE", props: { grow: true }, adjustable: false },
+  { key: "author", label: "AUTHOR", props: { width: 12 }, adjustable: true, minWidth: 6 },
+  { key: "label", label: "LABEL", props: { width: 14 }, adjustable: true, minWidth: 6 },
+  { key: "updated", label: "UPDATED", props: { width: 8 }, adjustable: true, minWidth: 6 },
 ];
 
 const ISSUES_HEADER_COMPACT = [
-  { label: "", props: { width: 3 } },
-  { label: "TITLE", props: { grow: true } },
-  { label: "UPDATED", props: { width: 8 } },
+  { key: "status", label: "", props: { width: 3 } },
+  { key: "title", label: "TITLE", props: { grow: true } },
+  { key: "updated", label: "UPDATED", props: { width: 8 } },
 ];
 
-function IssueRow({ item, now, compact, cursor }) {
+function IssueRow({ item, now, compact, cursor, columns }) {
   const cells = [
-    e(Column, { key: "i", width: 3, color: OK, label: "open issue" }, `${cursor ? ">" : " "}${OCT.issueOpened}`),
-    e(Column, { key: "t", grow: true }, `#${item.number} ${item.title}`),
+    e(Column, { key: "status", ...columnProps(columns, "status"), color: OK, label: "open issue" }, `${cursor ? ">" : " "}${OCT.issueOpened}`),
+    e(Column, { key: "title", ...columnProps(columns, "title") }, `#${item.number} ${item.title}`),
   ];
   if (!compact) {
-    cells.push(e(Column, { key: "a", width: 12, color: IDENTIFIER }, item.author));
-    cells.push(e(Column, { key: "l", width: 14, color: REF }, item.label));
+    cells.push(e(Column, { key: "author", ...columnProps(columns, "author"), color: IDENTIFIER }, item.author));
+    cells.push(e(Column, { key: "label", ...columnProps(columns, "label"), color: REF }, item.label));
   }
   cells.push(
-    e(Column, { key: "u", width: 8, dim: true }, formatAge(new Date(item.updatedAt), now)),
+    e(Column, { key: "updated", ...columnProps(columns, "updated"), dim: true }, formatAge(new Date(item.updatedAt), now)),
   );
   return e(Box, { flexDirection: "row" }, ...cells);
 }
@@ -2102,18 +2102,18 @@ function IssueRow({ item, now, compact, cursor }) {
 // ---------- Pull requests tab ----------
 
 const PRS_HEADER = [
-  { label: "", props: { width: 3 } },
-  { label: "TITLE", props: { grow: true } },
-  { label: "AUTHOR", props: { width: 12 } },
-  { label: "BRANCH", props: { width: 14 } },
-  { label: "REVIEW", props: { width: 10 } },
-  { label: "UPDATED", props: { width: 8 } },
+  { key: "status", label: "", props: { width: 3 }, adjustable: false },
+  { key: "title", label: "TITLE", props: { grow: true }, adjustable: false },
+  { key: "author", label: "AUTHOR", props: { width: 12 }, adjustable: true, minWidth: 6 },
+  { key: "branch", label: "BRANCH", props: { width: 14 }, adjustable: true, minWidth: 6 },
+  { key: "review", label: "REVIEW", props: { width: 10 }, adjustable: true, minWidth: 7 },
+  { key: "updated", label: "UPDATED", props: { width: 8 }, adjustable: true, minWidth: 6 },
 ];
 
 const PRS_HEADER_COMPACT = [
-  { label: "", props: { width: 3 } },
-  { label: "TITLE", props: { grow: true } },
-  { label: "REVIEW", props: { width: 10 } },
+  { key: "status", label: "", props: { width: 3 } },
+  { key: "title", label: "TITLE", props: { grow: true } },
+  { key: "review", label: "REVIEW", props: { width: 10 } },
 ];
 
 const REVIEW_LABEL = {
@@ -2123,25 +2123,25 @@ const REVIEW_LABEL = {
 };
 const REVIEW_NONE = { label: "", color: INERT };
 
-function PRRow({ item, now, compact, cursor }) {
+function PRRow({ item, now, compact, cursor, columns }) {
   const prIcon = item.isDraft
     ? { icon: OCT.pullRequestDraft, color: INERT, label: "draft pull request" }
     : { icon: OCT.pullRequest, color: OK, label: "open pull request" };
   const review = pick(REVIEW_LABEL, item.reviewDecision, REVIEW_NONE);
   const cells = [
-    e(Column, { key: "i", width: 3, color: prIcon.color, label: prIcon.label }, `${cursor ? ">" : " "}${prIcon.icon}`),
-    e(Column, { key: "t", grow: true }, `#${item.number} ${item.title}`),
+    e(Column, { key: "status", ...columnProps(columns, "status"), color: prIcon.color, label: prIcon.label }, `${cursor ? ">" : " "}${prIcon.icon}`),
+    e(Column, { key: "title", ...columnProps(columns, "title") }, `#${item.number} ${item.title}`),
   ];
   if (!compact) {
-    cells.push(e(Column, { key: "a", width: 12, color: IDENTIFIER }, item.author));
+    cells.push(e(Column, { key: "author", ...columnProps(columns, "author"), color: IDENTIFIER }, item.author));
     cells.push(
-      e(Column, { key: "b", width: 14, color: REF, wrap: "truncate-middle" }, item.headRefName),
+      e(Column, { key: "branch", ...columnProps(columns, "branch"), color: REF, wrap: "truncate-middle" }, item.headRefName),
     );
   }
-  cells.push(e(Column, { key: "r", width: 10, color: review.color }, review.label));
+  cells.push(e(Column, { key: "review", ...columnProps(columns, "review"), color: review.color }, review.label));
   if (!compact) {
     cells.push(
-      e(Column, { key: "u", width: 8, dim: true }, formatAge(new Date(item.updatedAt), now)),
+      e(Column, { key: "updated", ...columnProps(columns, "updated"), dim: true }, formatAge(new Date(item.updatedAt), now)),
     );
   }
   return e(Box, { flexDirection: "row" }, ...cells);
@@ -2155,19 +2155,19 @@ function PRRow({ item, now, compact, cursor }) {
 // text column states it outright; the width comes out of PACKAGE / FILE, whose
 // contents were already being truncated.
 const SECURITY_HEADER = [
-  { label: "", props: { width: 3 } },
-  { label: "SEV", props: { width: 4 } },
-  { label: "PACKAGE / FILE", props: { width: 16 } },
-  { label: "SUMMARY", props: { grow: true } },
-  { label: "AGE", props: { width: 8 } },
+  { key: "status", label: "", props: { width: 3 }, adjustable: false },
+  { key: "severity", label: "SEV", props: { width: 4 }, adjustable: false },
+  { key: "package", label: "PACKAGE / FILE", props: { width: 16 }, adjustable: true, minWidth: 6 },
+  { key: "summary", label: "SUMMARY", props: { grow: true }, adjustable: false },
+  { key: "age", label: "AGE", props: { width: 8 }, adjustable: true, minWidth: 6 },
 ];
 
 // SEV is the last thing to drop on this tab: it is the whole point of the pane
 // and the only non-colour severity channel.
 const SECURITY_HEADER_COMPACT = [
-  { label: "", props: { width: 3 } },
-  { label: "SEV", props: { width: 4 } },
-  { label: "SUMMARY", props: { grow: true } },
+  { key: "status", label: "", props: { width: 3 } },
+  { key: "severity", label: "SEV", props: { width: 4 } },
+  { key: "summary", label: "SUMMARY", props: { grow: true } },
 ];
 
 const SEVERITY_STYLE = {
@@ -2180,19 +2180,19 @@ const SEVERITY_STYLE = {
 };
 const SEVERITY_UNKNOWN = SEVERITY_STYLE.unknown;
 
-function SecurityRow({ item, now, compact, cursor }) {
+function SecurityRow({ item, now, compact, cursor, columns }) {
   const sev = pick(SEVERITY_STYLE, item.severity, SEVERITY_UNKNOWN);
   const cells = [
-    e(Column, { key: "i", width: 3, color: sev.color, label: `${sev.short} severity` }, `${cursor ? ">" : " "}${OCT.shield}`),
-    e(Column, { key: "s", width: 4, color: sev.color }, sev.short),
+    e(Column, { key: "status", ...columnProps(columns, "status"), color: sev.color, label: `${sev.short} severity` }, `${cursor ? ">" : " "}${OCT.shield}`),
+    e(Column, { key: "severity", ...columnProps(columns, "severity"), color: sev.color }, sev.short),
   ];
   if (!compact) {
-    cells.push(e(Column, { key: "p", width: 16, color: IDENTIFIER }, item.detail || item.kind));
+    cells.push(e(Column, { key: "package", ...columnProps(columns, "package"), color: IDENTIFIER }, item.detail || item.kind));
   }
-  cells.push(e(Column, { key: "t", grow: true }, item.title));
+  cells.push(e(Column, { key: "summary", ...columnProps(columns, "summary") }, item.title));
   if (!compact) {
     cells.push(
-      e(Column, { key: "a", width: 8, dim: true }, formatAge(new Date(item.createdAt), now)),
+      e(Column, { key: "age", ...columnProps(columns, "age"), dim: true }, formatAge(new Date(item.createdAt), now)),
     );
   }
   return e(Box, { flexDirection: "row" }, ...cells);
@@ -2252,6 +2252,78 @@ const TABS = [
     countLabel: "alerts",
   },
 ];
+
+const EMPTY_WIDTH_OVERRIDES = Object.freeze({});
+
+function columnProps(columns, key) {
+  const column = columns.find((candidate) => candidate.key === key);
+  if (!column) throw new Error(`Unknown column: ${key}`);
+  return column.props;
+}
+
+function isAdjustableWidthColumn(column) {
+  return (
+    column.adjustable &&
+    Number.isSafeInteger(column.props.width) &&
+    Number.isSafeInteger(column.minWidth)
+  );
+}
+
+function resolveHeader(base, overrides = EMPTY_WIDTH_OVERRIDES) {
+  let changed = false;
+  const resolved = base.map((column) => {
+    if (
+      !isAdjustableWidthColumn(column) ||
+      overrides == null ||
+      !Object.hasOwn(overrides, column.key) ||
+      !Number.isSafeInteger(overrides[column.key])
+    ) {
+      return column;
+    }
+
+    const width = Math.max(column.minWidth, overrides[column.key]);
+    if (width === column.props.width) return column;
+    changed = true;
+    return { ...column, props: { ...column.props, width } };
+  });
+  return changed ? resolved : base;
+}
+
+function fitHeaderToFrame(preferred, defaults, frameCols) {
+  const preferredFloor = minimumWidthFor(preferred);
+  if (preferredFloor <= frameCols) return preferred;
+  if (minimumWidthFor(defaults) > frameCols) return null;
+
+  let remaining = preferredFloor - frameCols;
+  return preferred.map((column) => {
+    if (remaining <= 0 || !Number.isSafeInteger(column.props.width)) return column;
+    const defaultColumn = defaults.find((candidate) => candidate.key === column.key);
+    const defaultWidth = defaultColumn?.props.width;
+    if (!Number.isSafeInteger(defaultWidth) || column.props.width <= defaultWidth) return column;
+
+    const shrinkBy = Math.min(remaining, column.props.width - defaultWidth);
+    remaining -= shrinkBy;
+    return { ...column, props: { ...column.props, width: column.props.width - shrinkBy } };
+  });
+}
+
+function adjustWidth({ header, key, delta, frameCols }) {
+  if (!Number.isSafeInteger(delta) || delta === 0 || !Number.isSafeInteger(frameCols)) return header;
+  const index = header.findIndex((column) => column.key === key);
+  if (index < 0) return header;
+
+  const column = header[index];
+  if (!isAdjustableWidthColumn(column)) return header;
+
+  const available = Math.max(0, frameCols - minimumWidthFor(header));
+  const maximum = column.props.width + available;
+  const width = Math.min(maximum, Math.max(column.minWidth, column.props.width + delta));
+  if (width === column.props.width) return header;
+
+  const adjusted = [...header];
+  adjusted[index] = { ...column, props: { ...column.props, width } };
+  return adjusted;
+}
 
 // The narrowest width each tab's table can render without its fixed columns
 // overflowing the frame. Derived from the header descriptors rather than
@@ -3101,8 +3173,16 @@ function App({ onCreateRemote = () => {} } = {}) {
   // the cost -- different tabs showing different column counts at the same width
   // -- is not something you can actually see. MIN_TABLE_WIDTH stays as the
   // exported worst case, which is what the tests pin.
-  const compact = frameCols < minimumWidthFor(tab.header);
-  const header = compact ? tab.compactHeader : tab.header;
+  const preferredHeader = useMemo(
+    () => resolveHeader(tab.header, EMPTY_WIDTH_OVERRIDES),
+    [tab.header],
+  );
+  const effectiveHeader = useMemo(
+    () => fitHeaderToFrame(preferredHeader, tab.header, frameCols),
+    [preferredHeader, tab.header, frameCols],
+  );
+  const compact = effectiveHeader == null;
+  const header = compact ? tab.compactHeader : effectiveHeader;
 
   // Below the compact set's own floor even the fixed columns overflow, which
   // hard-wraps every row and drives ink into clearing and repainting the whole
@@ -3197,6 +3277,7 @@ function App({ onCreateRemote = () => {} } = {}) {
             item,
             now,
             compact,
+            columns: header,
             cursor: key === selectedKey,
             // Only an *executing* Actions row reads this. It used to go to every
             // visible row on the tab, so a prop that changes several times a
@@ -3454,6 +3535,10 @@ export {
   usableSize,
   severityRank,
   pick,
+  columnProps,
+  resolveHeader,
+  fitHeaderToFrame,
+  adjustWidth,
   minimumWidthFor,
   runStatusIcon,
   RUN_STATUS_ICON,
@@ -3461,6 +3546,7 @@ export {
   REVIEW_LABEL,
   MIN_TABLE_WIDTH,
   MIN_COMPACT_WIDTH,
+  TABS,
   OCT_NERD,
   OCT_UNICODE,
   KEY_TABLE,

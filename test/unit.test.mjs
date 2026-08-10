@@ -34,6 +34,11 @@ import {
   usableSize,
   severityRank,
   pick,
+  TABS,
+  columnProps,
+  resolveHeader,
+  fitHeaderToFrame,
+  adjustWidth,
   minimumWidthFor,
   runStatusIcon,
   RUN_STATUS_ICON,
@@ -722,6 +727,303 @@ test("the minimum-width guard is derived from the widest header", () => {
   // empty while the frame still looked correct.
   assert.ok(MIN_TABLE_WIDTH > 52, `guard must exceed the observed silent-failure band (got ${MIN_TABLE_WIDTH})`);
   assert.ok(MIN_TABLE_WIDTH < 80, "must not reject an ordinary 80-column terminal");
+});
+
+const EXPECTED_COLUMN_GEOMETRY = {
+  actions: {
+    full: [
+      ["status", { width: 3 }],
+      ["title", { grow: true }],
+      ["workflow", { width: 10 }],
+      ["branch", { width: 14 }],
+      ["time", { width: 7 }],
+      ["updated", { width: 8 }],
+    ],
+    compact: [
+      ["status", { width: 3 }],
+      ["title", { grow: true }],
+      ["updated", { width: 8 }],
+    ],
+  },
+  issues: {
+    full: [
+      ["status", { width: 3 }],
+      ["title", { grow: true }],
+      ["author", { width: 12 }],
+      ["label", { width: 14 }],
+      ["updated", { width: 8 }],
+    ],
+    compact: [
+      ["status", { width: 3 }],
+      ["title", { grow: true }],
+      ["updated", { width: 8 }],
+    ],
+  },
+  prs: {
+    full: [
+      ["status", { width: 3 }],
+      ["title", { grow: true }],
+      ["author", { width: 12 }],
+      ["branch", { width: 14 }],
+      ["review", { width: 10 }],
+      ["updated", { width: 8 }],
+    ],
+    compact: [
+      ["status", { width: 3 }],
+      ["title", { grow: true }],
+      ["review", { width: 10 }],
+    ],
+  },
+  security: {
+    full: [
+      ["status", { width: 3 }],
+      ["severity", { width: 4 }],
+      ["package", { width: 16 }],
+      ["summary", { grow: true }],
+      ["age", { width: 8 }],
+    ],
+    compact: [
+      ["status", { width: 3 }],
+      ["severity", { width: 4 }],
+      ["summary", { grow: true }],
+    ],
+  },
+};
+
+const EXPECTED_ADJUSTABLE_COLUMNS = {
+  actions: { workflow: 5, branch: 6, time: 5, updated: 6 },
+  issues: { author: 6, label: 6, updated: 6 },
+  prs: { author: 6, branch: 6, review: 7, updated: 6 },
+  security: { package: 6, age: 6 },
+};
+
+const actionsHeader = TABS.find(({ key }) => key === "actions").header;
+
+function geometry(columns) {
+  return columns.map(({ key, props }) => [key, props]);
+}
+
+test("column descriptors have stable unique keys and the planned adjustable inventory", () => {
+  assert.deepEqual(TABS.map(({ key }) => key), Object.keys(EXPECTED_COLUMN_GEOMETRY));
+
+  for (const tab of TABS) {
+    for (const columns of [tab.header, tab.compactHeader]) {
+      const keys = columns.map(({ key }) => key);
+      assert.ok(keys.every((key) => /^[a-z][a-z0-9]*$/.test(key)), `${tab.key}: invalid key`);
+      assert.equal(new Set(keys).size, keys.length, `${tab.key}: duplicate column key`);
+    }
+
+    assert.deepEqual(
+      tab.header
+        .filter(({ adjustable }) => adjustable)
+        .map(({ key, minWidth }) => [key, minWidth]),
+      Object.entries(EXPECTED_ADJUSTABLE_COLUMNS[tab.key]),
+      `${tab.key}: adjustable full columns or minima drifted`,
+    );
+    assert.ok(
+      tab.compactHeader.every(({ adjustable }) => !adjustable),
+      `${tab.key}: compact columns must remain locked`,
+    );
+  }
+});
+
+test("empty overrides preserve the established full and compact geometry", () => {
+  for (const tab of TABS) {
+    const resolved = resolveHeader(tab.header, {});
+    assert.deepEqual(geometry(resolved), EXPECTED_COLUMN_GEOMETRY[tab.key].full);
+    assert.deepEqual(geometry(tab.compactHeader), EXPECTED_COLUMN_GEOMETRY[tab.key].compact);
+    resolved.forEach((column, index) => {
+      assert.strictEqual(column, tab.header[index], `${tab.key}.${column.key} was copied needlessly`);
+    });
+  }
+});
+
+test("resolving an override replaces only its adjustable descriptor", () => {
+  const base = actionsHeader;
+  const overrides = { branch: 18 };
+  const resolved = resolveHeader(base, overrides);
+  const branchIndex = base.findIndex(({ key }) => key === "branch");
+
+  assert.deepEqual(columnProps(resolved, "branch"), { width: 18 });
+  assert.notStrictEqual(resolved[branchIndex], base[branchIndex]);
+  assert.notStrictEqual(resolved[branchIndex].props, base[branchIndex].props);
+  resolved.forEach((column, index) => {
+    if (index !== branchIndex) assert.strictEqual(column, base[index]);
+  });
+  assert.deepEqual(overrides, { branch: 18 });
+});
+
+test("locked and invalid overrides cannot escape the width contract", () => {
+  const base = actionsHeader;
+
+  for (const overrides of [
+    { status: 20 },
+    { title: 20 },
+    { missing: 20 },
+    { branch: 12.5 },
+    { branch: Number.NaN },
+    { branch: Number.POSITIVE_INFINITY },
+  ]) {
+    const resolved = resolveHeader(base, overrides);
+    assert.deepEqual(geometry(resolved), EXPECTED_COLUMN_GEOMETRY.actions.full);
+    resolved.forEach((column, index) => assert.strictEqual(column, base[index]));
+  }
+
+  for (const tab of TABS) {
+    for (const [key, minWidth] of Object.entries(EXPECTED_ADJUSTABLE_COLUMNS[tab.key])) {
+      assert.equal(columnProps(resolveHeader(tab.header, { [key]: 1 }), key).width, minWidth);
+    }
+  }
+});
+
+test("width helpers do not mutate descriptors, props, arrays, or overrides", () => {
+  const base = actionsHeader;
+  const baseBefore = structuredClone(base);
+  const overrides = Object.freeze({ workflow: 12, branch: 18 });
+  const overridesBefore = structuredClone(overrides);
+  const preferred = resolveHeader(base, overrides);
+  const preferredBefore = structuredClone(preferred);
+
+  fitHeaderToFrame(preferred, base, 59);
+  adjustWidth({ header: preferred, key: "branch", delta: 3, frameCols: 70 });
+
+  assert.deepEqual(base, baseBefore);
+  assert.deepEqual(preferred, preferredBefore);
+  assert.deepEqual(overrides, overridesBefore);
+});
+
+const ROW_FIXTURES = {
+  actions: {
+    item: {
+      status: "completed",
+      conclusion: "success",
+      startedAt: "2026-08-10T10:00:00Z",
+      updatedAt: "2026-08-10T10:01:00Z",
+      displayTitle: "Ship widths",
+      number: 101,
+      workflowName: "CI",
+      headBranch: "develop",
+    },
+    spin: null,
+  },
+  issues: {
+    item: {
+      number: 102,
+      title: "Resizable columns",
+      author: "octocat",
+      label: "enhancement",
+      updatedAt: "2026-08-10T10:01:00Z",
+    },
+  },
+  prs: {
+    item: {
+      number: 103,
+      title: "Use descriptor widths",
+      author: "octocat",
+      headRefName: "feature/widths",
+      reviewDecision: "APPROVED",
+      updatedAt: "2026-08-10T10:01:00Z",
+      isDraft: false,
+    },
+  },
+  security: {
+    item: {
+      severity: "high",
+      detail: "ink",
+      kind: "dependabot",
+      title: "Update dependency",
+      createdAt: "2026-08-10T10:01:00Z",
+    },
+  },
+};
+
+test("every full and compact row consumes the selected descriptor geometry", () => {
+  for (const tab of TABS) {
+    for (const [layout, baseColumns] of [
+      ["full", tab.header],
+      ["compact", tab.compactHeader],
+    ]) {
+      const columns = baseColumns.map((column, index) => ({
+        ...column,
+        props: { width: 31 + index },
+      }));
+      const rendered = tab.Row.type({
+        ...ROW_FIXTURES[tab.key],
+        now: new Date("2026-08-10T10:02:00Z"),
+        compact: layout === "compact",
+        cursor: false,
+        columns,
+      });
+      const children = Array.isArray(rendered.props.children)
+        ? rendered.props.children
+        : [rendered.props.children];
+
+      assert.deepEqual(
+        children.map(({ props }) => props.width),
+        columns.map(({ props }) => props.width),
+        `${tab.key}.${layout}: row geometry did not come from the selected descriptors`,
+      );
+      assert.ok(
+        children.every(({ props }) => props.grow === undefined),
+        `${tab.key}.${layout}: a private grow literal escaped the descriptor model`,
+      );
+    }
+  }
+});
+
+test("resolved fixed widths remain the single source for the minimum-width guard", () => {
+  const base = actionsHeader;
+  const wider = resolveHeader(base, { branch: 18 });
+
+  assert.equal(minimumWidthFor(base), 56);
+  assert.equal(minimumWidthFor(wider), minimumWidthFor(base) + 4);
+});
+
+test("width adjustment clamps to the semantic minimum and current frame budget", () => {
+  const base = actionsHeader;
+  const atMinimum = adjustWidth({ header: base, key: "branch", delta: -100, frameCols: 80 });
+  const atMaximum = adjustWidth({ header: base, key: "branch", delta: 100, frameCols: 60 });
+
+  assert.equal(columnProps(atMinimum, "branch").width, 6);
+  assert.equal(columnProps(atMaximum, "branch").width, 18);
+  assert.equal(minimumWidthFor(atMaximum), 60, "the four-cell grow budget must remain intact");
+  assert.strictEqual(
+    adjustWidth({ header: atMinimum, key: "branch", delta: -1, frameCols: 80 }),
+    atMinimum,
+  );
+  assert.strictEqual(
+    adjustWidth({ header: atMaximum, key: "branch", delta: 1, frameCols: 60 }),
+    atMaximum,
+  );
+  assert.strictEqual(adjustWidth({ header: base, key: "branch", delta: 0, frameCols: 80 }), base);
+  assert.strictEqual(adjustWidth({ header: base, key: "title", delta: 1, frameCols: 80 }), base);
+});
+
+test("fitting preserves preferred identity, shrinks above defaults in order, or returns null", () => {
+  const defaults = actionsHeader;
+  const preferred = resolveHeader(defaults, { workflow: 12, branch: 18 });
+
+  assert.strictEqual(fitHeaderToFrame(preferred, defaults, 62), preferred);
+
+  const fitted = fitHeaderToFrame(preferred, defaults, 59);
+  assert.equal(minimumWidthFor(fitted), 59);
+  assert.equal(columnProps(fitted, "workflow").width, 10);
+  assert.equal(columnProps(fitted, "branch").width, 17);
+  assert.deepEqual(
+    geometry(fitHeaderToFrame(preferred, defaults, 56)),
+    EXPECTED_COLUMN_GEOMETRY.actions.full,
+  );
+  assert.equal(fitHeaderToFrame(preferred, defaults, 55), null);
+});
+
+test("fitting never widens a preference below its default", () => {
+  const defaults = actionsHeader;
+  const preferred = resolveHeader(defaults, { workflow: 20, branch: 8 });
+  const fitted = fitHeaderToFrame(preferred, defaults, 58);
+
+  assert.equal(minimumWidthFor(fitted), 58);
+  assert.equal(columnProps(fitted, "workflow").width, 18);
+  assert.equal(columnProps(fitted, "branch").width, 8);
 });
 
 test("importing the app selects React's production build", async () => {
