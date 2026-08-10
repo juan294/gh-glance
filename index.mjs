@@ -23,7 +23,16 @@
 process.env.NODE_ENV ??= "production";
 
 import { execFile, spawn } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
+import {
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -2337,6 +2346,227 @@ function minimumWidthFor(header) {
   // + 2 border verticals, + 2 paddingX, + at least 4 columns for TITLE.
   return fixed + 8;
 }
+
+// ---------- Width preferences ----------
+
+const WIDTH_PREFERENCES_VERSION = 1;
+let widthPreferenceTempSequence = 0;
+
+function widthPreferencesPath({
+  env = process.env,
+  platform = process.platform,
+  home = homedir(),
+} = {}) {
+  const xdgRoot = env?.XDG_CONFIG_HOME;
+  const root =
+    typeof xdgRoot === "string" && xdgRoot.length > 0 && isAbsolute(xdgRoot)
+      ? xdgRoot
+      : platform === "darwin"
+        ? join(home, "Library", "Application Support")
+        : join(home, ".config");
+  return join(root, "gh-glance", "preferences.json");
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeWidthOverrides(overrides, tabs = TABS, { omitDefaults = false } = {}) {
+  if (!isRecord(overrides)) return {};
+
+  const normalized = {};
+  for (const tab of tabs) {
+    if (!Object.hasOwn(overrides, tab.key) || !isRecord(overrides[tab.key])) continue;
+
+    const source = overrides[tab.key];
+    const tabOverrides = {};
+    for (const column of tab.header) {
+      if (!isAdjustableWidthColumn(column) || !Object.hasOwn(source, column.key)) continue;
+      const width = source[column.key];
+      if (!Number.isSafeInteger(width) || width < column.minWidth) continue;
+      if (omitDefaults && width === column.props.width) continue;
+      tabOverrides[column.key] = width;
+    }
+    if (Object.keys(tabOverrides).length > 0) normalized[tab.key] = tabOverrides;
+  }
+  return normalized;
+}
+
+function decodeWidthPreferences(raw, tabs = TABS) {
+  let document;
+  try {
+    document = JSON.parse(raw);
+  } catch (error) {
+    return { preferences: {}, error };
+  }
+
+  if (
+    !isRecord(document) ||
+    !Object.hasOwn(document, "version") ||
+    document.version !== WIDTH_PREFERENCES_VERSION ||
+    !Object.hasOwn(document, "tabs") ||
+    !isRecord(document.tabs)
+  ) {
+    return { preferences: {}, error: new Error("Unsupported width preferences document") };
+  }
+
+  return { preferences: normalizeWidthOverrides(document.tabs, tabs), error: null };
+}
+
+function parseWidthPreferences(raw, tabs = TABS) {
+  return decodeWidthPreferences(raw, tabs).preferences;
+}
+
+function serializeWidthPreferences(overrides, tabs = TABS) {
+  const document = {
+    version: WIDTH_PREFERENCES_VERSION,
+    tabs: normalizeWidthOverrides(overrides, tabs, { omitDefaults: true }),
+  };
+  return `${JSON.stringify(document, null, 2)}\n`;
+}
+
+function loadWidthPreferences(path, tabs = TABS) {
+  let raw;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    return error?.code === "ENOENT"
+      ? { preferences: {}, error: null }
+      : { preferences: {}, error };
+  }
+  return decodeWidthPreferences(raw, tabs);
+}
+
+function saveWidthPreferences(path, overrides, tabs = TABS) {
+  let tempPath = null;
+  try {
+    const payload = serializeWidthPreferences(overrides, tabs);
+    const parent = dirname(path);
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    widthPreferenceTempSequence += 1;
+    tempPath = `${path}.${process.pid}.${Date.now()}.${widthPreferenceTempSequence}.tmp`;
+    writeFileSync(tempPath, payload, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    renameSync(tempPath, path);
+    return { ok: true };
+  } catch (error) {
+    if (tempPath !== null) {
+      try {
+        unlinkSync(tempPath);
+      } catch {
+        // The write may have failed before creating it. Cleanup is best effort
+        // and deliberately targets only this operation's exact temporary file.
+      }
+    }
+    return { ok: false, error };
+  }
+}
+
+function createWidthPreferenceWriter({ write, delay = 200, onResult = () => {} }) {
+  let latest = EMPTY_WIDTH_OVERRIDES;
+  let generation = 0;
+  let persistedGeneration = 0;
+  let timer = null;
+  let flushPromise = null;
+
+  function report(result) {
+    try {
+      onResult(result);
+    } catch {
+      // Persistence reporting is advisory and must not reach Ink's render path.
+    }
+    return result;
+  }
+
+  function failed(error) {
+    return { ok: false, error };
+  }
+
+  async function writeGeneration(value) {
+    let pending;
+    try {
+      // Keep this call before the first await. The production writer is
+      // synchronous, so an unmount flush completes the filesystem replacement
+      // before React hands terminal teardown back to its caller.
+      pending = write(value);
+    } catch (error) {
+      return failed(error);
+    }
+
+    try {
+      const result = await pending;
+      return result?.ok === false ? result : (result ?? { ok: true });
+    } catch (error) {
+      return failed(error);
+    }
+  }
+
+  async function drain() {
+    let result = { ok: true, written: false };
+    while (persistedGeneration < generation) {
+      const attemptedGeneration = generation;
+      const value = latest;
+      result = await writeGeneration(value);
+
+      const isLatest = attemptedGeneration === generation;
+      if (result.ok !== false) {
+        persistedGeneration = Math.max(persistedGeneration, attemptedGeneration);
+      }
+
+      // The loop serializes a superseding write behind this completion, so its
+      // result owns the warning state. A stale completion is deliberately not
+      // reported, while async replacements can neither race on disk nor report
+      // out of order.
+      if (!isLatest) continue;
+      report(result);
+      // Leave the latest generation dirty after failure. A later flush/dispose
+      // retries it; concurrent callers still share this completed attempt.
+      if (result.ok === false) return result;
+    }
+    return result;
+  }
+
+  function flush() {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (flushPromise !== null) return flushPromise;
+    if (persistedGeneration >= generation) {
+      return Promise.resolve({ ok: true, written: false });
+    }
+
+    const pending = drain().finally(() => {
+      if (flushPromise === pending) flushPromise = null;
+    });
+    flushPromise = pending;
+    return pending;
+  }
+
+  function schedule(value) {
+    latest = value;
+    generation += 1;
+    if (timer === null) {
+      timer = setTimeout(() => {
+        timer = null;
+        void flush();
+      }, delay);
+      timer.unref?.();
+    } else {
+      timer.refresh();
+    }
+  }
+
+  return {
+    schedule,
+    flush,
+    dispose: flush,
+  };
+}
+
 // Below this the full column set cannot render without its fixed columns
 // overflowing the frame -- rows hard-wrap and ink switches to clearing and
 // repainting the whole screen every frame. Worse, in the band just above the
@@ -2575,6 +2805,49 @@ function App({ onCreateRemote = () => {} } = {}) {
   const { isRawModeSupported } = useStdin();
   const { exit } = useApp();
   const [activeIndex, setActiveIndex] = useState(runtime.initialTabIndex);
+  const [preferencePath] = useState(() => widthPreferencesPath());
+  const [widthOverrides] = useState(
+    () => loadWidthPreferences(preferencePath).preferences,
+  );
+  const widthOverridesRef = useRef(widthOverrides);
+  widthOverridesRef.current = widthOverrides;
+  // Phase 3 will render this in the contextual width-mode status. Keeping the
+  // result as state now establishes the persistence contract without adding an
+  // error row or changing the Phase 2 UI.
+  const [, setWidthSaveError] = useState(null);
+  const widthPreferencesMountedRef = useRef(true);
+  const [widthPreferenceWriter] = useState(() =>
+    createWidthPreferenceWriter({
+      write: (overrides) => saveWidthPreferences(preferencePath, overrides),
+      onResult: (result) => {
+        if (!widthPreferencesMountedRef.current) return;
+        setWidthSaveError(
+          result?.ok === false
+            ? (result.error ?? new Error("Width preferences could not be saved"))
+            : null,
+        );
+      },
+    }),
+  );
+  // Phase 2 has no input that changes widths yet. This effect deliberately
+  // skips the loaded object, then becomes the persistence seam for the width
+  // state updates introduced by the keyboard and mouse phases.
+  const lastScheduledWidthOverridesRef = useRef(widthOverrides);
+  useEffect(() => {
+    if (widthOverrides === lastScheduledWidthOverridesRef.current) return;
+    lastScheduledWidthOverridesRef.current = widthOverrides;
+    widthPreferenceWriter.schedule(widthOverrides);
+  }, [widthOverrides, widthPreferenceWriter]);
+  useEffect(() => {
+    widthPreferencesMountedRef.current = true;
+    return () => {
+      // saveWidthPreferences() itself runs synchronously inside dispose(), but
+      // writer result reporting settles through a promise. Mark unmounted first
+      // so that later callback cannot enqueue state on a departing App.
+      widthPreferencesMountedRef.current = false;
+      void widthPreferenceWriter.dispose();
+    };
+  }, [widthPreferenceWriter]);
   // `null` means "never resolved" -- distinct from `[]`, which means "resolved
   // and genuinely empty". The tab bar and the body render those differently.
   const [data, setData] = useState({ actions: null, issues: null, prs: null, security: null });
@@ -3173,9 +3446,11 @@ function App({ onCreateRemote = () => {} } = {}) {
   // the cost -- different tabs showing different column counts at the same width
   // -- is not something you can actually see. MIN_TABLE_WIDTH stays as the
   // exported worst case, which is what the tests pin.
+  const tabOverrides = pick(widthOverridesRef.current, tab.key, EMPTY_WIDTH_OVERRIDES) ??
+    EMPTY_WIDTH_OVERRIDES;
   const preferredHeader = useMemo(
-    () => resolveHeader(tab.header, EMPTY_WIDTH_OVERRIDES),
-    [tab.header],
+    () => resolveHeader(tab.header, tabOverrides),
+    [tab.header, tabOverrides],
   );
   const effectiveHeader = useMemo(
     () => fitHeaderToFrame(preferredHeader, tab.header, frameCols),
@@ -3540,6 +3815,13 @@ export {
   fitHeaderToFrame,
   adjustWidth,
   minimumWidthFor,
+  WIDTH_PREFERENCES_VERSION,
+  widthPreferencesPath,
+  parseWidthPreferences,
+  serializeWidthPreferences,
+  loadWidthPreferences,
+  saveWidthPreferences,
+  createWidthPreferenceWriter,
   runStatusIcon,
   RUN_STATUS_ICON,
   SEVERITY_STYLE,

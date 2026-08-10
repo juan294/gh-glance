@@ -8,6 +8,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import {
@@ -40,6 +41,11 @@ import {
   fitHeaderToFrame,
   adjustWidth,
   minimumWidthFor,
+  WIDTH_PREFERENCES_VERSION,
+  widthPreferencesPath,
+  parseWidthPreferences,
+  serializeWidthPreferences,
+  createWidthPreferenceWriter,
   runStatusIcon,
   RUN_STATUS_ICON,
   SEVERITY_STYLE,
@@ -86,6 +92,20 @@ function deferred() {
     reject = reject_;
   });
   return { promise, resolve, reject };
+}
+
+async function within(promise, milliseconds = 1000) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("timed out waiting for test result")), milliseconds);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 test("safe() strips the escape classes that survive ink's own sanitizer", () => {
@@ -1024,6 +1044,325 @@ test("fitting never widens a preference below its default", () => {
   assert.equal(minimumWidthFor(fitted), 58);
   assert.equal(columnProps(fitted, "workflow").width, 18);
   assert.equal(columnProps(fitted, "branch").width, 8);
+});
+
+test("width preference paths prefer an absolute XDG root on every supported platform", () => {
+  const root = join("/tmp", "gh-glance-xdg");
+  const expected = join(root, "gh-glance", "preferences.json");
+
+  for (const platform of ["darwin", "linux"]) {
+    assert.equal(
+      widthPreferencesPath({
+        env: { XDG_CONFIG_HOME: root },
+        platform,
+        home: join("/home", "ignored"),
+      }),
+      expected,
+    );
+  }
+});
+
+test("width preference paths use platform fallbacks for empty or relative XDG roots", () => {
+  const macHome = join("/Users", "octocat");
+  const linuxHome = join("/home", "octocat");
+
+  for (const xdg of [undefined, "", "relative/config"]) {
+    const env = xdg === undefined ? {} : { XDG_CONFIG_HOME: xdg };
+    assert.equal(
+      widthPreferencesPath({ env, platform: "darwin", home: macHome }),
+      join(macHome, "Library", "Application Support", "gh-glance", "preferences.json"),
+    );
+    assert.equal(
+      widthPreferencesPath({ env, platform: "linux", home: linuxHome }),
+      join(linuxHome, ".config", "gh-glance", "preferences.json"),
+    );
+  }
+});
+
+test("width preference parsing accepts only known versioned adjustable widths", () => {
+  const parsed = parseWidthPreferences(`{
+    "version": ${WIDTH_PREFERENCES_VERSION},
+    "tabs": {
+      "security": {"package": 20, "age": 5, "severity": 30, "constructor": 30},
+      "actions": {"workflow": 5, "branch": 18, "time": 4, "status": 30, "__proto__": 30},
+      "issues": {"author": 6, "label": 6, "updated": 9007199254740992},
+      "prs": {"review": 7, "branch": 6.5},
+      "unknown": {"branch": 99},
+      "__proto__": {"branch": 99}
+    }
+  }`);
+
+  assert.deepEqual(parsed, {
+    actions: { workflow: 5, branch: 18 },
+    issues: { author: 6, label: 6 },
+    prs: { review: 7 },
+    security: { package: 20 },
+  });
+  assert.equal(Object.hasOwn(parsed, "__proto__"), false);
+  assert.equal(Object.hasOwn(parsed.actions, "__proto__"), false);
+});
+
+test("width preference parsing treats malformed, unknown, and wrong-shaped documents as empty", () => {
+  for (const raw of [
+    "not json",
+    "null",
+    "[]",
+    "{}",
+    '{"version":2,"tabs":{"actions":{"branch":18}}}',
+    '{"version":1,"tabs":null}',
+    '{"version":1,"tabs":[]}',
+    '{"version":1,"tabs":{"actions":null}}',
+    '{"version":1,"tabs":{"actions":[]}}',
+    '{"version":1,"tabs":{"actions":{"branch":"18"}}}',
+  ]) {
+    assert.deepEqual(parseWidthPreferences(raw), {}, raw);
+  }
+});
+
+test("width preference serialization stores only ordered deviations and a trailing newline", () => {
+  const overrides = Object.freeze({
+    security: Object.freeze({ package: 16, age: 9 }),
+    unknown: Object.freeze({ branch: 99 }),
+    issues: Object.freeze({ author: 5, updated: 8, label: 6 }),
+    actions: Object.freeze({
+      workflow: 10,
+      updated: 9,
+      branch: 18,
+      time: Number.NaN,
+      title: 30,
+    }),
+  });
+
+  assert.equal(
+    serializeWidthPreferences(overrides),
+    `{
+  "version": 1,
+  "tabs": {
+    "actions": {
+      "branch": 18,
+      "updated": 9
+    },
+    "issues": {
+      "label": 6
+    },
+    "security": {
+      "age": 9
+    }
+  }
+}
+`,
+  );
+});
+
+test("width preference parse and serialization round-trip stably without mutation", () => {
+  const overrides = Object.freeze({
+    actions: Object.freeze({ workflow: 7, branch: 18 }),
+    issues: Object.freeze({ author: 9 }),
+  });
+  const before = structuredClone(overrides);
+
+  const serialized = serializeWidthPreferences(overrides);
+  const parsed = parseWidthPreferences(serialized);
+
+  assert.deepEqual(parsed, before);
+  assert.equal(serializeWidthPreferences(parsed), serialized);
+  assert.deepEqual(overrides, before);
+});
+
+test("width preference writer coalesces trailing schedules to the latest state", async () => {
+  const writes = [];
+  const completed = deferred();
+  const writer = createWidthPreferenceWriter({
+    delay: 5,
+    write: (value) => {
+      writes.push(value);
+      return { ok: true };
+    },
+    onResult: completed.resolve,
+  });
+  const first = { actions: { branch: 15 } };
+  const latest = { actions: { branch: 18 } };
+
+  writer.schedule(first);
+  writer.schedule(latest);
+  assert.deepEqual(await within(completed.promise), { ok: true });
+  assert.deepEqual(writes, [latest]);
+
+  await writer.dispose();
+  assert.deepEqual(writes, [latest], "dispose must not repeat an already-clean write");
+});
+
+test("width preference writer flushes latest state once and dispose flushes dirty state", async () => {
+  const writes = [];
+  const results = [];
+  const writer = createWidthPreferenceWriter({
+    delay: 60_000,
+    write: (value) => {
+      writes.push(value);
+      return { ok: true };
+    },
+    onResult: (result) => results.push(result),
+  });
+  const first = { actions: { workflow: 11 } };
+  const latest = { actions: { workflow: 12 } };
+
+  writer.schedule(first);
+  writer.schedule(latest);
+  await writer.flush();
+  await writer.flush();
+  assert.deepEqual(writes, [latest]);
+  assert.deepEqual(results, [{ ok: true }]);
+
+  const disposeWriter = createWidthPreferenceWriter({
+    delay: 60_000,
+    write: (value) => {
+      writes.push(value);
+      return { ok: true };
+    },
+    onResult: (result) => results.push(result),
+  });
+  const onDispose = { security: { package: 20 } };
+  disposeWriter.schedule(onDispose);
+  await disposeWriter.dispose();
+  assert.deepEqual(writes, [latest, onDispose]);
+  assert.deepEqual(results, [{ ok: true }, { ok: true }]);
+});
+
+test("width preference writer converts synchronous throws and rejections into result state", async () => {
+  for (const [label, write] of [
+    [
+      "throw",
+      () => {
+        throw new Error("disk threw");
+      },
+    ],
+    ["rejection", async () => Promise.reject(new Error("disk rejected"))],
+  ]) {
+    const results = [];
+    const writer = createWidthPreferenceWriter({
+      delay: 60_000,
+      write,
+      onResult: (result) => results.push(result),
+    });
+    writer.schedule({ actions: { branch: 18 } });
+
+    await writer.flush();
+
+    assert.equal(results.length, 1, label);
+    assert.equal(results[0].ok, false, label);
+    assert.ok(results[0].error instanceof Error, label);
+    await writer.dispose();
+  }
+});
+
+test("a failed width preference flush remains pending for a later retry", async () => {
+  const value = { actions: { branch: 18 } };
+  const writes = [];
+  const results = [];
+  const failure = new Error("temporary write failure");
+  const writer = createWidthPreferenceWriter({
+    delay: 60_000,
+    write: (received) => {
+      writes.push(received);
+      return writes.length === 1 ? { ok: false, error: failure } : { ok: true };
+    },
+    onResult: (result) => results.push(result),
+  });
+
+  writer.schedule(value);
+  assert.deepEqual(await writer.flush(), { ok: false, error: failure });
+  assert.deepEqual(await writer.flush(), { ok: true });
+
+  assert.deepEqual(writes, [value, value]);
+  assert.deepEqual(results, [{ ok: false, error: failure }, { ok: true }]);
+  await writer.dispose();
+  assert.deepEqual(writes, [value, value], "a successful retry must leave the writer clean");
+});
+
+test("dispose retries the latest state after an earlier write failure", async () => {
+  const initial = { actions: { branch: 18 } };
+  const latest = { actions: { branch: 20 } };
+  const writes = [];
+  const results = [];
+  const failure = new Error("first write failed");
+  const writer = createWidthPreferenceWriter({
+    delay: 60_000,
+    write: (value) => {
+      writes.push(value);
+      return writes.length === 1 ? { ok: false, error: failure } : { ok: true };
+    },
+    onResult: (result) => results.push(result),
+  });
+
+  writer.schedule(initial);
+  await writer.flush();
+  writer.schedule(latest);
+  await writer.dispose();
+
+  assert.deepEqual(writes, [initial, latest]);
+  assert.deepEqual(results, [{ ok: false, error: failure }, { ok: true }]);
+});
+
+test("overlapping asynchronous width preference writes are serialized in schedule order", async () => {
+  const first = deferred();
+  const second = deferred();
+  const initial = { actions: { branch: 18 } };
+  const latest = { actions: { branch: 20 } };
+  const writes = [];
+  const results = [];
+  const writer = createWidthPreferenceWriter({
+    delay: 60_000,
+    write: (value) => {
+      writes.push(value);
+      return writes.length === 1 ? first.promise : second.promise;
+    },
+    onResult: (result) => results.push(result),
+  });
+
+  writer.schedule(initial);
+  const firstFlush = writer.flush();
+  writer.schedule(latest);
+  const overlappingFlush = writer.flush();
+
+  assert.deepEqual(writes, [initial], "the second write must wait for the first to settle");
+  assert.deepEqual(results, []);
+
+  first.resolve({ ok: true, id: "initial" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(writes, [initial, latest]);
+  assert.deepEqual(results, [], "a superseded completion must not report stale result state");
+
+  second.resolve({ ok: true, id: "latest" });
+  await within(Promise.all([firstFlush, overlappingFlush]));
+  assert.deepEqual(results, [{ ok: true, id: "latest" }]);
+  await writer.dispose();
+});
+
+test("concurrent width preference flushes share one in-flight write", async () => {
+  const pending = deferred();
+  const value = { issues: { author: 9 } };
+  const writes = [];
+  const results = [];
+  const writer = createWidthPreferenceWriter({
+    delay: 60_000,
+    write: (received) => {
+      writes.push(received);
+      return pending.promise;
+    },
+    onResult: (result) => results.push(result),
+  });
+
+  writer.schedule(value);
+  const flushes = [writer.flush(), writer.flush(), writer.flush()];
+  assert.deepEqual(writes, [value]);
+
+  pending.resolve({ ok: true });
+  const flushResults = await within(Promise.all(flushes));
+
+  assert.deepEqual(writes, [value]);
+  assert.deepEqual(results, [{ ok: true }]);
+  assert.deepEqual(flushResults, [{ ok: true }, { ok: true }, { ok: true }]);
+  await writer.dispose();
 });
 
 test("importing the app selects React's production build", async () => {

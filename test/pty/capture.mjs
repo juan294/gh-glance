@@ -12,9 +12,9 @@
 //      terminal, so a width check that does not skip them fails on Linux only.
 
 import { execFileSync } from "node:child_process";
-import { readFileSync, existsSync, rmSync } from "node:fs";
+import { readFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { tmpdir } from "node:os";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -123,6 +123,8 @@ let captureSeq = 0;
  * @param {string} [options.stdin]  shell snippet whose stdout is fed to the pty
  * @param {string} [options.args]   flags handed to index.mjs, space-separated
  * @param {object} [options.env]    environment overrides for the fixture run
+ * @param {string} [options.configHome] caller-owned absolute config root; when
+ *                                      omitted, capture creates and cleans one
  */
 export function capture({
   cols,
@@ -132,9 +134,18 @@ export function capture({
   stdin = "",
   args = "",
   env = {},
+  configHome,
 }) {
+  if (configHome != null && (!isAbsolute(configHome) || configHome.length === 0)) {
+    throw new TypeError("configHome must be an absolute path");
+  }
+
   captureSeq += 1;
   const out = join(tmpdir(), `gh-glance-pty-${process.pid}-${captureSeq}.txt`);
+  const ownsConfigHome = configHome == null;
+  const effectiveConfigHome = ownsConfigHome
+    ? mkdtempSync(join(tmpdir(), "gh-glance-pty-config-"))
+    : configHome;
   try {
     execFileSync(
       "/bin/sh",
@@ -142,7 +153,10 @@ export function capture({
       {
         stdio: "ignore",
         timeout: (settle + 25) * 1000,
-        env: { ...process.env, ...env },
+        // Isolation wins over caller-supplied environment overrides: every PTY
+        // run must be unable to observe the developer's real preferences. A
+        // caller that needs restart persistence supplies configHome explicitly.
+        env: { ...process.env, ...env, XDG_CONFIG_HOME: effectiveConfigHome },
       },
     );
     const parsed = parseCapture(readFileSync(out, "utf8"));
@@ -155,5 +169,6 @@ export function capture({
     for (const path of [out, `${out}.calls`]) {
       if (existsSync(path)) rmSync(path, { force: true });
     }
+    if (ownsConfigHome) rmSync(effectiveConfigHome, { recursive: true, force: true });
   }
 }
