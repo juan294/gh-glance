@@ -17,6 +17,9 @@
 // no-build-step stance rules out.
 
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import { capture } from "./capture.mjs";
@@ -62,6 +65,25 @@ const remoteSetupDeclined = capture({
   stdin: "sleep 3; printf 'q'; sleep 2",
   env: noRemoteEnv,
 });
+
+function assertCleanInteractiveCapture(result, { cols, rows, label }) {
+  assert.equal(result.exitCode, 0, `${label}: q should exit 0`);
+  assert.equal(result.finalFrame.lines.length, rows, `${label}: frame height`);
+  assert.ok(
+    result.finalFrame.widest <= cols,
+    `${label}: widest line was ${result.finalFrame.widest} in a ${cols}-column terminal`,
+  );
+  assert.equal(result.altEnter, 1, `${label}: alternate-screen enter count`);
+  assert.equal(result.altExit, 1, `${label}: alternate-screen exit count`);
+  assert.ok(result.cursorShows >= 1, `${label}: cursor was not restored`);
+  assert.equal(result.afterRestore.hasClear, false, `${label}: primary buffer was cleared`);
+  assert.equal(
+    result.afterRestore.hasScrollbackErase,
+    false,
+    `${label}: primary-buffer scrollback was erased`,
+  );
+  assert.equal(result.afterRestore.visible, "", `${label}: a dead frame remained after restore`);
+}
 
 test("keys are advertised only when stdin is interactive", () => {
   // Asserting one direction would pass against a permanently-open gate, so both
@@ -109,6 +131,81 @@ test("q quits cleanly and leaves nothing on the primary buffer", () => {
     "",
     `a dead frame was left on the primary buffer: ${JSON.stringify(keyed.afterRestore.visible.slice(0, 120))}`,
   );
+});
+
+test("keyboard width changes persist across processes and defaults remove deviations", () => {
+  const configHome = mkdtempSync(join(tmpdir(), "gh-glance-pty-widths-"));
+  const preferencePath = join(configHome, "gh-glance", "preferences.json");
+  try {
+    const widened = capture({
+      cols: 80,
+      rows: 24,
+      signal: "none",
+      settle: 12,
+      configHome,
+      // Every logical key is a separate write. Combined escape/key strings can
+      // be delivered as one useInput event and do not model a user's keypresses.
+      stdin:
+        `sleep ${SETTLE}; printf 'w'; sleep 1; printf '\\033[C'; ` +
+        "sleep 1; printf '\\r'; sleep 1; printf 'q'; sleep 2",
+    });
+
+    assertCleanInteractiveCapture(widened, { cols: 80, rows: 24, label: "widen" });
+    assert.deepEqual(JSON.parse(readFileSync(preferencePath, "utf8")), {
+      version: 1,
+      tabs: { actions: { workflow: 11 } },
+    });
+
+    const restoredThenReset = capture({
+      cols: 80,
+      rows: 24,
+      signal: "none",
+      settle: 12,
+      configHome,
+      stdin:
+        `sleep ${SETTLE}; printf 'w'; sleep 1; printf '\\033[D'; ` +
+        "sleep 1; printf '\\r'; sleep 1; printf 'q'; sleep 2",
+    });
+
+    assertCleanInteractiveCapture(restoredThenReset, {
+      cols: 80,
+      rows: 24,
+      label: "restore and reset",
+    });
+    assert.deepEqual(JSON.parse(readFileSync(preferencePath, "utf8")), {
+      version: 1,
+      tabs: {},
+    });
+  } finally {
+    // This exact root is caller-owned and was returned by this mkdtempSync call.
+    rmSync(configHome, { recursive: true, force: true });
+  }
+});
+
+test("compact width-mode input is a persistence no-op", () => {
+  const configHome = mkdtempSync(join(tmpdir(), "gh-glance-pty-widths-compact-"));
+  const preferencePath = join(configHome, "gh-glance", "preferences.json");
+  try {
+    const compact = capture({
+      cols: 45,
+      rows: 20,
+      signal: "none",
+      settle: 12,
+      configHome,
+      stdin:
+        `sleep ${SETTLE}; printf 'w'; sleep 1; printf '\\033[C'; ` +
+        "sleep 1; printf '\\033[D'; sleep 1; printf 'q'; sleep 2",
+    });
+
+    assertCleanInteractiveCapture(compact, { cols: 45, rows: 20, label: "compact" });
+    assert.equal(
+      existsSync(preferencePath),
+      false,
+      "compact-mode width keys must not create a preference file",
+    );
+  } finally {
+    rmSync(configHome, { recursive: true, force: true });
+  }
 });
 
 test("Enter hands missing-remote setup to gh exactly once", () => {

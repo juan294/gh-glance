@@ -1613,8 +1613,9 @@ const KEY_TABLE = [
   ["PgUp / PgDn", "Move a page at a time"],
   ["Enter", "Open the selected item or accept a prompt"],
   ["r", "Refresh the current tab now"],
+  ["w", "Adjust table column widths"],
   ["?", "Show the keys (any key closes it)"],
-  ["q / Esc / Ctrl+C", "Quit"],
+  ["q / Esc / Ctrl+C", "Quit (Esc leaves width mode)"],
 ];
 const KEY_COL = Math.max(...KEY_TABLE.map(([k]) => k.length)) + 3;
 const keyTableLines = () => KEY_TABLE.map(([k, d]) => `${k.padEnd(KEY_COL)}${d}`);
@@ -1888,10 +1889,10 @@ const ERROR_TEXT = "red";
 // column is otherwise a private-use codepoint that announces as nothing --
 // leaving every row with no status at all. It is derived from the same lookup
 // that picks the glyph, so the two cannot drift apart.
-function Column({ width, grow, children, bold, color, dim, wrap, label }) {
+function Column({ width, grow, children, bold, color, dim, wrap, label, marginRight = 1 }) {
   return e(
     Box,
-    { width, flexGrow: grow ? 1 : 0, flexShrink: grow ? 1 : 0, marginRight: 1 },
+    { width, flexGrow: grow ? 1 : 0, flexShrink: grow ? 1 : 0, marginRight },
     e(
       Text,
       { bold, color, dimColor: dim, wrap: wrap ?? "truncate-end", "aria-label": label },
@@ -1900,7 +1901,31 @@ function Column({ width, grow, children, bold, color, dim, wrap, label }) {
   );
 }
 
-function HeaderCells({ cells }) {
+// Each descriptor still owns one gutter cell, but an adjustable column owns
+// the edge that faces the flexible TITLE/SUMMARY reservoir. Fixed columns after
+// the grow cell therefore use the preceding descriptor's trailing gutter;
+// fixed columns before it use their own. Keeping this mapping pure lets the
+// pointer phase share the exact same geometry as the visible grips.
+function headerGutterKeyAt(cells, index, growIndex) {
+  if (!Array.isArray(cells) || !Number.isSafeInteger(index) || index < 0 || index >= cells.length) {
+    return null;
+  }
+  if (growIndex < 0) return null;
+  if (index < growIndex) {
+    return isAdjustableWidthColumn(cells[index]) ? cells[index].key : null;
+  }
+  return isAdjustableWidthColumn(cells[index + 1]) ? cells[index + 1].key : null;
+}
+
+function headerGutterKey(cells, index) {
+  const growIndex = Array.isArray(cells)
+    ? cells.findIndex((column) => column.props?.grow)
+    : -1;
+  return headerGutterKeyAt(cells, index, growIndex);
+}
+
+function HeaderCells({ cells, selectedWidthKey = null }) {
+  const growIndex = cells.findIndex((column) => column.props?.grow);
   return e(
     Box,
     {
@@ -1911,9 +1936,32 @@ function HeaderCells({ cells }) {
       borderRight: false,
       borderColor: BORDER_COLOR,
     },
-    ...cells.map((c) => e(Column, { key: c.key, ...c.props, bold: true, dim: true }, c.label)),
+    ...cells.flatMap((c, index) => {
+      const gripKey = headerGutterKeyAt(cells, index, growIndex);
+      const selected = gripKey !== null && gripKey === selectedWidthKey;
+      return [
+        e(
+          Column,
+          { key: `${c.key}:cell`, ...c.props, bold: true, dim: true, marginRight: 0 },
+          c.label,
+        ),
+        e(
+          Text,
+          {
+            key: `${c.key}:gutter`,
+            color: selected ? TITLE_COLOR : BORDER_COLOR,
+            bold: selected,
+            dimColor: gripKey !== null && !selected,
+            "aria-hidden": true,
+          },
+          gripKey === null ? " " : "│",
+        ),
+      ];
+    }),
   );
 }
+
+const MemoHeaderCells = React.memo(HeaderCells);
 
 // ---------- Panel frame ----------
 
@@ -2262,6 +2310,10 @@ const TABS = [
   },
 ];
 
+function tabForKey(key) {
+  return TABS.find((tab) => tab.key === key);
+}
+
 const EMPTY_WIDTH_OVERRIDES = Object.freeze({});
 
 function columnProps(columns, key) {
@@ -2272,10 +2324,29 @@ function columnProps(columns, key) {
 
 function isAdjustableWidthColumn(column) {
   return (
-    column.adjustable &&
+    column?.adjustable &&
     Number.isSafeInteger(column.props.width) &&
     Number.isSafeInteger(column.minWidth)
   );
+}
+
+function adjustableWidthKeys(tab) {
+  if (!tab || !Array.isArray(tab.header)) return [];
+  return tab.header.filter(isAdjustableWidthColumn).map((column) => column.key);
+}
+
+function selectWidthKey(tab, rememberedKey = null) {
+  const keys = adjustableWidthKeys(tab);
+  return keys.includes(rememberedKey) ? rememberedKey : (keys[0] ?? null);
+}
+
+function cycleWidthKey(tab, selectedKey, direction) {
+  if (!Number.isSafeInteger(direction) || direction === 0) return selectWidthKey(tab, selectedKey);
+  const keys = adjustableWidthKeys(tab);
+  if (keys.length === 0) return null;
+  const current = keys.indexOf(selectedKey);
+  if (current < 0) return direction > 0 ? keys[0] : keys[keys.length - 1];
+  return keys[(current + Math.sign(direction) + keys.length) % keys.length];
 }
 
 function resolveHeader(base, overrides = EMPTY_WIDTH_OVERRIDES) {
@@ -2316,6 +2387,14 @@ function fitHeaderToFrame(preferred, defaults, frameCols) {
   });
 }
 
+function effectiveHeaderFor(tab, tabOverrides, frameCols) {
+  return fitHeaderToFrame(
+    resolveHeader(tab.header, tabOverrides),
+    tab.header,
+    frameCols,
+  );
+}
+
 function adjustWidth({ header, key, delta, frameCols }) {
   if (!Number.isSafeInteger(delta) || delta === 0 || !Number.isSafeInteger(frameCols)) return header;
   const index = header.findIndex((column) => column.key === key);
@@ -2332,6 +2411,78 @@ function adjustWidth({ header, key, delta, frameCols }) {
   const adjusted = [...header];
   adjusted[index] = { ...column, props: { ...column.props, width } };
   return adjusted;
+}
+
+function removeWidthOverride(overrides, tabKey, key) {
+  if (!isRecord(overrides)) return overrides;
+  const tabOverrides = overrides[tabKey];
+  if (!isRecord(tabOverrides) || !Object.hasOwn(tabOverrides, key)) return overrides;
+
+  const nextTab = { ...tabOverrides };
+  delete nextTab[key];
+  if (Object.keys(nextTab).length > 0) return { ...overrides, [tabKey]: nextTab };
+
+  const next = { ...overrides };
+  delete next[tabKey];
+  return next;
+}
+
+// One immutable preference reducer for keyboard deltas and the pointer phase's
+// absolute drag snapshots. The optional geometry arguments are the live fitted
+// header and frame budget; omitting them gives unit callers semantic-minimum
+// clamping without inventing a terminal width.
+function updateWidthPreference({
+  overrides,
+  tab,
+  key,
+  nextWidth,
+  effectiveHeader,
+  frameCols,
+}) {
+  if (!isRecord(overrides) || !tab || !Array.isArray(tab.header) || !Number.isSafeInteger(nextWidth)) {
+    return overrides;
+  }
+  const defaultColumn = tab.header.find((column) => column.key === key);
+  if (!isAdjustableWidthColumn(defaultColumn)) return overrides;
+
+  const tabOverrides = isRecord(overrides[tab.key]) ? overrides[tab.key] : EMPTY_WIDTH_OVERRIDES;
+  const currentHeader = Array.isArray(effectiveHeader)
+    ? effectiveHeader
+    : resolveHeader(tab.header, tabOverrides);
+  const currentColumn = currentHeader.find((column) => column.key === key);
+  if (!isAdjustableWidthColumn(currentColumn)) return overrides;
+
+  const delta = nextWidth - currentColumn.props.width;
+  const liveFrameCols = Number.isSafeInteger(frameCols)
+    ? frameCols
+    : minimumWidthFor(currentHeader) + Math.max(0, delta);
+  const adjusted = adjustWidth({ header: currentHeader, key, delta, frameCols: liveFrameCols });
+  if (adjusted === currentHeader) return overrides;
+  const width = adjusted.find((column) => column.key === key).props.width;
+  const hasOverride = Object.hasOwn(tabOverrides, key);
+
+  if (width === defaultColumn.props.width) {
+    return removeWidthOverride(overrides, tab.key, key);
+  }
+
+  if (hasOverride && tabOverrides[key] === width) return overrides;
+  return { ...overrides, [tab.key]: { ...tabOverrides, [key]: width } };
+}
+
+function resetWidthPreference(overrides, tabKey, key) {
+  if (!isRecord(overrides)) return overrides;
+  const tab = tabForKey(tabKey);
+  const column = tab?.header.find((candidate) => candidate.key === key);
+  if (!isAdjustableWidthColumn(column)) return overrides;
+  return removeWidthOverride(overrides, tabKey, key);
+}
+
+function resetTabWidthPreferences(overrides, tabKey) {
+  if (!isRecord(overrides) || !Object.hasOwn(overrides, tabKey)) return overrides;
+  if (!tabForKey(tabKey)) return overrides;
+  const next = { ...overrides };
+  delete next[tabKey];
+  return next;
 }
 
 // The narrowest width each tab's table can render without its fixed columns
@@ -2681,6 +2832,26 @@ const REMOTE_SETUP_NONINTERACTIVE_LINES = [
 // finishes. Wide enough for the spinner, a space and "Fetching".
 const FETCHING_WIDTH = 12;
 
+function widthStatusText({ label, width, cols, saveError = false }) {
+  const budget = Number.isSafeInteger(cols) ? Math.max(0, cols) : 0;
+  const safeLabel = String(label ?? "").replace(/[^\x20-\x7e]/g, "?");
+  const safeWidth = Number.isSafeInteger(width) ? String(width) : "?";
+  const variants = saveError
+    ? [
+        `Width: ${safeLabel} ${safeWidth}  Widths not saved`,
+        `${safeLabel} ${safeWidth}  Widths not saved`,
+        "Widths not saved",
+      ]
+    : [
+        `Width: ${safeLabel} ${safeWidth}  Tab select  <- -> resize  r reset  Esc done`,
+        `Width: ${safeLabel} ${safeWidth}  <- -> resize  r reset  Esc done`,
+        `${safeLabel} ${safeWidth}  <- ->  r reset  Esc done`,
+        `${safeLabel} ${safeWidth} <- -> r Esc`,
+      ];
+  const fitting = variants.find((variant) => variant.length <= budget);
+  return fitting ?? variants[variants.length - 1].slice(0, budget);
+}
+
 // Compact drops the labels and keeps the keys, separated by a space:
 // "↑↓ Ent r q". No constant for its width -- nothing branches on it, and the
 // keys are short enough that it fits anywhere the frame itself does.
@@ -2697,7 +2868,33 @@ const FETCHING_WIDTH = 12;
 // finding at a glance, so they get the accent colour and the words describing
 // them stay dim. The accent is the panel-title cyan rather than the amber used
 // for in-progress status, so amber means exactly one thing across the product.
-function StatusBar({ fetching, spin, stale, interactive, cols, remoteSetup = false }) {
+function StatusBar({
+  fetching,
+  spin,
+  stale,
+  interactive,
+  cols,
+  remoteSetup = false,
+  widthMode = false,
+  widthColumn = null,
+  widthSaveError = null,
+}) {
+  if (widthMode && widthColumn) {
+    return e(
+      Box,
+      { flexDirection: "row" },
+      e(
+        Text,
+        { color: widthSaveError ? ATTENTION : undefined, wrap: "truncate-end" },
+        widthStatusText({
+          label: widthColumn.label,
+          width: widthColumn.props.width,
+          cols,
+          saveError: Boolean(widthSaveError),
+        }),
+      ),
+    );
+  }
   // Without raw mode none of the key handlers run, so advertising them would be
   // telling the user something untrue about what the app can do. Ctrl+C still
   // works there, because the tty delivers a real SIGINT.
@@ -2806,15 +3003,12 @@ function App({ onCreateRemote = () => {} } = {}) {
   const { exit } = useApp();
   const [activeIndex, setActiveIndex] = useState(runtime.initialTabIndex);
   const [preferencePath] = useState(() => widthPreferencesPath());
-  const [widthOverrides] = useState(
+  const [widthOverrides, setWidthOverrides] = useState(
     () => loadWidthPreferences(preferencePath).preferences,
   );
   const widthOverridesRef = useRef(widthOverrides);
   widthOverridesRef.current = widthOverrides;
-  // Phase 3 will render this in the contextual width-mode status. Keeping the
-  // result as state now establishes the persistence contract without adding an
-  // error row or changing the Phase 2 UI.
-  const [, setWidthSaveError] = useState(null);
+  const [widthSaveError, setWidthSaveError] = useState(null);
   const widthPreferencesMountedRef = useRef(true);
   const [widthPreferenceWriter] = useState(() =>
     createWidthPreferenceWriter({
@@ -2829,15 +3023,6 @@ function App({ onCreateRemote = () => {} } = {}) {
       },
     }),
   );
-  // Phase 2 has no input that changes widths yet. This effect deliberately
-  // skips the loaded object, then becomes the persistence seam for the width
-  // state updates introduced by the keyboard and mouse phases.
-  const lastScheduledWidthOverridesRef = useRef(widthOverrides);
-  useEffect(() => {
-    if (widthOverrides === lastScheduledWidthOverridesRef.current) return;
-    lastScheduledWidthOverridesRef.current = widthOverrides;
-    widthPreferenceWriter.schedule(widthOverrides);
-  }, [widthOverrides, widthPreferenceWriter]);
   useEffect(() => {
     widthPreferencesMountedRef.current = true;
     return () => {
@@ -2879,6 +3064,8 @@ function App({ onCreateRemote = () => {} } = {}) {
   // renders byte-identical frames and ink still writes nothing.
   const [selected, setSelected] = useState({});
   const [offset, setOffset] = useState({});
+  const [widthMode, setWidthMode] = useState(false);
+  const [selectedWidthKeyByTab, setSelectedWidthKeyByTab] = useState({});
 
   const tab = TABS[activeIndex];
   const tabError = errors[tab.key];
@@ -2974,6 +3161,102 @@ function App({ onCreateRemote = () => {} } = {}) {
   showHelpRef.current = showHelp;
   const remoteSetupRef = useRef(false);
   remoteSetupRef.current = remoteSetup;
+  const resizeRef = useRef({
+    active: false,
+    tabKey: "actions",
+    selectedKey: null,
+    effectiveHeader: null,
+    frameCols: 0,
+    compact: true,
+    fullHeaderVisible: false,
+  });
+
+  function applyWidthOverrides(next) {
+    const current = widthOverridesRef.current;
+    if (next === current) return false;
+    widthOverridesRef.current = next;
+    setWidthOverrides(next);
+    // Schedule in the input turn, not a post-render effect. Reset, mode exit and
+    // quit all flush immediately, and must not race ahead of React committing the
+    // state that contains the latest width.
+    widthPreferenceWriter.schedule(next);
+
+    const geometry = resizeRef.current;
+    const activeTab = tabForKey(geometry.tabKey);
+    if (activeTab) {
+      const nextTabOverrides = pick(next, activeTab.key, EMPTY_WIDTH_OVERRIDES) ??
+        EMPTY_WIDTH_OVERRIDES;
+      const effective = effectiveHeaderFor(activeTab, nextTabOverrides, geometry.frameCols);
+      resizeRef.current = {
+        ...geometry,
+        effectiveHeader: effective,
+        compact: effective == null,
+        fullHeaderVisible: geometry.fullHeaderVisible && effective != null,
+      };
+    }
+    return true;
+  }
+
+  function flushWidthPreferences() {
+    void widthPreferenceWriter.flush();
+  }
+
+  function leaveWidthMode() {
+    resizeRef.current = { ...resizeRef.current, active: false };
+    setWidthMode(false);
+    flushWidthPreferences();
+  }
+
+  function rememberWidthSelection(key) {
+    if (key === null) return;
+    const tabKey = resizeRef.current.tabKey;
+    resizeRef.current = { ...resizeRef.current, selectedKey: key };
+    setSelectedWidthKeyByTab((current) =>
+      current[tabKey] === key ? current : { ...current, [tabKey]: key },
+    );
+  }
+
+  function enterWidthMode() {
+    const geometry = resizeRef.current;
+    if (!geometry.fullHeaderVisible || geometry.compact) return;
+    const activeTab = tabForKey(geometry.tabKey);
+    const selectedKey = selectWidthKey(activeTab, geometry.selectedKey);
+    if (selectedKey === null) return;
+    rememberWidthSelection(selectedKey);
+    resizeRef.current = { ...resizeRef.current, active: true, selectedKey };
+    setWidthMode(true);
+  }
+
+  function resizeSelectedWidth(delta) {
+    const geometry = resizeRef.current;
+    if (!geometry.active || !geometry.fullHeaderVisible || geometry.compact) return;
+    const activeTab = tabForKey(geometry.tabKey);
+    const column = geometry.effectiveHeader?.find(
+      (candidate) => candidate.key === geometry.selectedKey,
+    );
+    if (!activeTab || !isAdjustableWidthColumn(column)) return;
+    const next = updateWidthPreference({
+      overrides: widthOverridesRef.current,
+      tab: activeTab,
+      key: geometry.selectedKey,
+      nextWidth: column.props.width + delta,
+      effectiveHeader: geometry.effectiveHeader,
+      frameCols: geometry.frameCols,
+    });
+    applyWidthOverrides(next);
+  }
+
+  function resetSelectedWidth() {
+    const { tabKey, selectedKey } = resizeRef.current;
+    applyWidthOverrides(resetWidthPreference(widthOverridesRef.current, tabKey, selectedKey));
+    flushWidthPreferences();
+  }
+
+  function resetActiveTabWidths() {
+    const { tabKey } = resizeRef.current;
+    applyWidthOverrides(resetTabWidthPreferences(widthOverridesRef.current, tabKey));
+    flushWidthPreferences();
+  }
 
   function moveSelection(delta) {
     const { items, key: currentKey, bodyRows: rows_, tabKey, offset: offsetRaw } = navRef.current;
@@ -3049,7 +3332,30 @@ function App({ onCreateRemote = () => {} } = {}) {
 
   useInput(
     (input, key) => {
-      if (input === "q" || key.escape) {
+      if (input === "q" || (input === "c" && key.ctrl)) {
+        flushWidthPreferences();
+        exit();
+      } else if (resizeRef.current.active) {
+        if (input === "w" || key.return || key.escape) {
+          leaveWidthMode();
+        } else if (key.tab) {
+          const activeTab = tabForKey(resizeRef.current.tabKey);
+          rememberWidthSelection(
+            cycleWidthKey(activeTab, resizeRef.current.selectedKey, key.shift ? -1 : 1),
+          );
+        } else if (key.leftArrow) {
+          resizeSelectedWidth(key.shift ? -5 : -1);
+        } else if (key.rightArrow) {
+          resizeSelectedWidth(key.shift ? 5 : 1);
+        } else if (input === "r") {
+          resetSelectedWidth();
+        } else if (input === "R") {
+          resetActiveTabWidths();
+        }
+        // Width mode owns every other key. In particular, digits, arrows, Tab,
+        // Enter and r must never fall through to their ordinary meanings.
+      } else if (key.escape) {
+        flushWidthPreferences();
         exit();
       } else if (showHelpRef.current) {
         // Any key dismisses -- except quit, handled above, which must never be
@@ -3059,6 +3365,8 @@ function App({ onCreateRemote = () => {} } = {}) {
         setShowHelp(false);
       } else if (input === "?") {
         setShowHelp(true);
+      } else if (input === "w") {
+        enterWidthMode();
       } else if (key.downArrow || input === "j") {
         moveSelection(1);
       } else if (key.upArrow || input === "k") {
@@ -3222,7 +3530,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     // exactly the moment the pane looks broken and they reach for it.
     function fetchTab(key, { force = false } = {}) {
       const signal = controller.signal;
-      const descriptor = TABS.find((t) => t.key === key);
+      const descriptor = tabForKey(key);
       if (!force && backoffActive(`tab:${key}`, performance.now())) return Promise.resolve();
       if (force) clearBackoff(`tab:${key}`);
       // Every tab carries its own fetcher on the registry, so adding a tab is a
@@ -3448,13 +3756,9 @@ function App({ onCreateRemote = () => {} } = {}) {
   // exported worst case, which is what the tests pin.
   const tabOverrides = pick(widthOverridesRef.current, tab.key, EMPTY_WIDTH_OVERRIDES) ??
     EMPTY_WIDTH_OVERRIDES;
-  const preferredHeader = useMemo(
-    () => resolveHeader(tab.header, tabOverrides),
-    [tab.header, tabOverrides],
-  );
   const effectiveHeader = useMemo(
-    () => fitHeaderToFrame(preferredHeader, tab.header, frameCols),
-    [preferredHeader, tab.header, frameCols],
+    () => effectiveHeaderFor(tab, tabOverrides, frameCols),
+    [tab, tabOverrides, frameCols],
   );
   const compact = effectiveHeader == null;
   const header = compact ? tab.compactHeader : effectiveHeader;
@@ -3466,6 +3770,29 @@ function App({ onCreateRemote = () => {} } = {}) {
   // sits after usableSize(), which substitutes DEFAULT_COLS for a 0 reported
   // mid-resize, so a transient zero cannot be mistaken for a genuinely tiny pane.
   const tooNarrow = frameCols < MIN_COMPACT_WIDTH;
+  const fullHeaderVisible = !compact && !showHelp && !tooNarrow && !remoteSetup;
+  const selectedWidthKey = selectedWidthKeyByTab[tab.key] ?? null;
+  const selectedWidthColumn = effectiveHeader?.find(
+    (column) => column.key === selectedWidthKey,
+  ) ?? null;
+  resizeRef.current = {
+    active: widthMode && fullHeaderVisible && selectedWidthColumn !== null,
+    tabKey: tab.key,
+    selectedKey: selectedWidthKey,
+    effectiveHeader,
+    frameCols,
+    compact,
+    fullHeaderVisible,
+  };
+
+  // A resize, help/setup transition, or replacement layout can remove the full
+  // header without a keypress. Stop owning input immediately through resizeRef,
+  // then settle the visible mode state and durable write in the effect.
+  useEffect(() => {
+    if (!widthMode || fullHeaderVisible) return;
+    setWidthMode(false);
+    void widthPreferenceWriter.flush();
+  }, [widthMode, fullHeaderVisible, widthPreferenceWriter]);
 
   return e(
     Box,
@@ -3542,7 +3869,13 @@ function App({ onCreateRemote = () => {} } = {}) {
               line,
             ),
         ),
-      !showHelp && !tooNarrow && !remoteSetup && e(HeaderCells, { cells: header }),
+      !showHelp &&
+        !tooNarrow &&
+        !remoteSetup &&
+        e(MemoHeaderCells, {
+          cells: header,
+          selectedWidthKey: resizeRef.current.active ? selectedWidthKey : null,
+        }),
       ...(tooNarrow || showHelp || remoteSetup ? [] : visibleItems).map((item) => {
         const key = itemKey(item);
         return e(
@@ -3606,6 +3939,9 @@ function App({ onCreateRemote = () => {} } = {}) {
       interactive,
       cols: frameCols,
       remoteSetup,
+      widthMode: resizeRef.current.active,
+      widthColumn: selectedWidthColumn,
+      widthSaveError,
     }),
   );
 }
@@ -3811,9 +4147,15 @@ export {
   severityRank,
   pick,
   columnProps,
+  adjustableWidthKeys,
+  selectWidthKey,
+  cycleWidthKey,
   resolveHeader,
   fitHeaderToFrame,
   adjustWidth,
+  updateWidthPreference,
+  resetWidthPreference,
+  resetTabWidthPreferences,
   minimumWidthFor,
   WIDTH_PREFERENCES_VERSION,
   widthPreferencesPath,
@@ -3833,6 +4175,9 @@ export {
   OCT_UNICODE,
   KEY_TABLE,
   KEY_HINTS,
+  widthStatusText,
+  headerGutterKey,
+  HeaderCells,
   REMOTE_SETUP_HINTS,
   REMOTE_SETUP_LINES,
   REMOTE_SETUP_NONINTERACTIVE_LINES,

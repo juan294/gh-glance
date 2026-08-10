@@ -37,9 +37,18 @@ import {
   pick,
   TABS,
   columnProps,
+  adjustableWidthKeys,
+  selectWidthKey,
+  cycleWidthKey,
   resolveHeader,
   fitHeaderToFrame,
   adjustWidth,
+  updateWidthPreference,
+  resetWidthPreference,
+  resetTabWidthPreferences,
+  widthStatusText,
+  headerGutterKey,
+  HeaderCells,
   minimumWidthFor,
   WIDTH_PREFERENCES_VERSION,
   widthPreferencesPath,
@@ -818,6 +827,7 @@ const EXPECTED_ADJUSTABLE_COLUMNS = {
 };
 
 const actionsHeader = TABS.find(({ key }) => key === "actions").header;
+const actionsTab = TABS.find(({ key }) => key === "actions");
 
 function geometry(columns) {
   return columns.map(({ key, props }) => [key, props]);
@@ -845,6 +855,71 @@ test("column descriptors have stable unique keys and the planned adjustable inve
       `${tab.key}: compact columns must remain locked`,
     );
   }
+});
+
+test("width selection exposes the exact adjustable inventory for every tab", () => {
+  for (const tab of TABS) {
+    assert.deepEqual(
+      adjustableWidthKeys(tab),
+      Object.keys(EXPECTED_ADJUSTABLE_COLUMNS[tab.key]),
+      `${tab.key}: width-mode inventory drifted`,
+    );
+  }
+});
+
+test("width selection starts at the first adjustable key and remembers a valid key per tab", () => {
+  const remembered = {
+    actions: "time",
+    issues: "label",
+    prs: "updated",
+    security: "age",
+  };
+
+  for (const tab of TABS) {
+    const first = Object.keys(EXPECTED_ADJUSTABLE_COLUMNS[tab.key])[0];
+    assert.equal(selectWidthKey(tab), first, `${tab.key}: first adjustable key`);
+    assert.equal(
+      selectWidthKey(tab, remembered[tab.key]),
+      remembered[tab.key],
+      `${tab.key}: remembered selection`,
+    );
+    assert.equal(
+      selectWidthKey(tab, "status"),
+      first,
+      `${tab.key}: locked remembered key must fall back`,
+    );
+    assert.equal(
+      selectWidthKey(tab, "missing"),
+      first,
+      `${tab.key}: missing remembered key must fall back`,
+    );
+  }
+
+  assert.equal(selectWidthKey({ key: "compact", header: actionsTab.compactHeader }), null);
+});
+
+test("Tab and Shift+Tab width selection wrap only over adjustable keys", () => {
+  for (const tab of TABS) {
+    const keys = Object.keys(EXPECTED_ADJUSTABLE_COLUMNS[tab.key]);
+    assert.equal(cycleWidthKey(tab, keys.at(-1), 1), keys[0], `${tab.key}: forward wrap`);
+    assert.equal(cycleWidthKey(tab, keys[0], -1), keys.at(-1), `${tab.key}: reverse wrap`);
+    for (let index = 0; index < keys.length; index += 1) {
+      assert.equal(
+        cycleWidthKey(tab, keys[index], 1),
+        keys[(index + 1) % keys.length],
+        `${tab.key}: forward from ${keys[index]}`,
+      );
+      assert.equal(
+        cycleWidthKey(tab, keys[index], -1),
+        keys[(index - 1 + keys.length) % keys.length],
+        `${tab.key}: reverse from ${keys[index]}`,
+      );
+    }
+  }
+
+  const compactTab = { key: "compact", header: actionsTab.compactHeader };
+  assert.equal(cycleWidthKey(compactTab, null, 1), null);
+  assert.equal(cycleWidthKey(compactTab, null, -1), null);
 });
 
 test("empty overrides preserve the established full and compact geometry", () => {
@@ -1019,6 +1094,181 @@ test("width adjustment clamps to the semantic minimum and current frame budget",
   assert.strictEqual(adjustWidth({ header: base, key: "title", delta: 1, frameCols: 80 }), base);
 });
 
+test("one-cell and five-cell width updates use the shared clamp and normalize deviations", () => {
+  for (const delta of [1, 5, -1, -5]) {
+    const effectiveHeader = actionsTab.header;
+    const adjusted = adjustWidth({
+      header: effectiveHeader,
+      key: "workflow",
+      delta,
+      frameCols: 79,
+    });
+    const nextWidth = columnProps(adjusted, "workflow").width;
+    const updated = updateWidthPreference({
+      overrides: {},
+      tab: actionsTab,
+      key: "workflow",
+      nextWidth,
+      effectiveHeader,
+      frameCols: 79,
+    });
+
+    assert.deepEqual(
+      updated,
+      nextWidth === columnProps(actionsTab.header, "workflow").width
+        ? {}
+        : { actions: { workflow: nextWidth } },
+      `delta ${delta}`,
+    );
+  }
+
+  const clampedHigh = updateWidthPreference({
+    overrides: {},
+    tab: actionsTab,
+    key: "workflow",
+    nextWidth: 100,
+    effectiveHeader: actionsTab.header,
+    frameCols: 60,
+  });
+  assert.deepEqual(clampedHigh, { actions: { workflow: 14 } });
+
+  const clampedLow = updateWidthPreference({
+    overrides: {},
+    tab: actionsTab,
+    key: "workflow",
+    nextWidth: -100,
+    effectiveHeader: actionsTab.header,
+    frameCols: 79,
+  });
+  assert.deepEqual(clampedLow, { actions: { workflow: 5 } });
+});
+
+test("width preference updates delete defaults and preserve unrelated deviations", () => {
+  const issues = Object.freeze({ author: 9 });
+  const overrides = Object.freeze({
+    actions: Object.freeze({ workflow: 15, branch: 18 }),
+    issues,
+  });
+  const effectiveHeader = resolveHeader(actionsTab.header, overrides.actions);
+
+  const updated = updateWidthPreference({
+    overrides,
+    tab: actionsTab,
+    key: "workflow",
+    nextWidth: 10,
+    effectiveHeader,
+    frameCols: 79,
+  });
+
+  assert.deepEqual(updated, {
+    actions: { branch: 18 },
+    issues: { author: 9 },
+  });
+  assert.strictEqual(updated.issues, issues, "an untouched tab must retain nested identity");
+  assert.deepEqual(overrides, {
+    actions: { workflow: 15, branch: 18 },
+    issues: { author: 9 },
+  });
+
+  const lastDeviation = updateWidthPreference({
+    overrides: { actions: { workflow: 15 }, issues },
+    tab: actionsTab,
+    key: "workflow",
+    nextWidth: 10,
+    effectiveHeader: resolveHeader(actionsTab.header, { workflow: 15 }),
+    frameCols: 79,
+  });
+  assert.deepEqual(lastDeviation, { issues: { author: 9 } });
+  assert.strictEqual(lastDeviation.issues, issues);
+});
+
+test("selected and tab resets remove only their intended deviations", () => {
+  const issues = Object.freeze({ author: 9 });
+  const overrides = Object.freeze({
+    actions: Object.freeze({ workflow: 15, branch: 18 }),
+    issues,
+  });
+
+  const selectedReset = resetWidthPreference(overrides, "actions", "workflow");
+  assert.deepEqual(selectedReset, {
+    actions: { branch: 18 },
+    issues: { author: 9 },
+  });
+  assert.strictEqual(selectedReset.issues, issues);
+
+  const lastSelectedReset = resetWidthPreference(selectedReset, "actions", "branch");
+  assert.deepEqual(lastSelectedReset, { issues: { author: 9 } });
+  assert.strictEqual(lastSelectedReset.issues, issues);
+
+  const tabReset = resetTabWidthPreferences(overrides, "actions");
+  assert.deepEqual(tabReset, { issues: { author: 9 } });
+  assert.strictEqual(tabReset.issues, issues);
+  assert.deepEqual(overrides, {
+    actions: { workflow: 15, branch: 18 },
+    issues: { author: 9 },
+  });
+});
+
+test("locked, compact, missing, unsafe, and clamped width operations preserve identity", () => {
+  const overrides = Object.freeze({ actions: Object.freeze({ workflow: 5 }) });
+  const atMinimum = resolveHeader(actionsTab.header, overrides.actions);
+
+  for (const operation of [
+    () =>
+      updateWidthPreference({
+        overrides,
+        tab: actionsTab,
+        key: "status",
+        nextWidth: 20,
+        effectiveHeader: atMinimum,
+        frameCols: 79,
+      }),
+    () =>
+      updateWidthPreference({
+        overrides,
+        tab: actionsTab,
+        key: "missing",
+        nextWidth: 20,
+        effectiveHeader: atMinimum,
+        frameCols: 79,
+      }),
+    () =>
+      updateWidthPreference({
+        overrides,
+        tab: actionsTab,
+        key: "workflow",
+        nextWidth: 4,
+        effectiveHeader: atMinimum,
+        frameCols: 79,
+      }),
+    () =>
+      updateWidthPreference({
+        overrides,
+        tab: actionsTab,
+        key: "workflow",
+        nextWidth: 5.5,
+        effectiveHeader: atMinimum,
+        frameCols: 79,
+      }),
+    () =>
+      updateWidthPreference({
+        overrides,
+        tab: actionsTab,
+        key: "workflow",
+        nextWidth: 20,
+        effectiveHeader: actionsTab.compactHeader,
+        frameCols: 44,
+      }),
+    () => resetWidthPreference(overrides, "actions", "status"),
+    () => resetWidthPreference(overrides, "actions", "missing"),
+    () => resetWidthPreference(overrides, "issues", "author"),
+    () => resetTabWidthPreferences(overrides, "issues"),
+    () => resetTabWidthPreferences(overrides, "missing"),
+  ]) {
+    assert.strictEqual(operation(), overrides);
+  }
+});
+
 test("fitting preserves preferred identity, shrinks above defaults in order, or returns null", () => {
   const defaults = actionsHeader;
   const preferred = resolveHeader(defaults, { workflow: 12, branch: 18 });
@@ -1044,6 +1294,114 @@ test("fitting never widens a preference below its default", () => {
   assert.equal(minimumWidthFor(fitted), 58);
   assert.equal(columnProps(fitted, "workflow").width, 18);
   assert.equal(columnProps(fitted, "branch").width, 8);
+});
+
+test("width-mode status variants stay bounded and use ASCII control glyphs", () => {
+  for (const cols of [79, 60, 44, 32, 20, 8, 1, 0]) {
+    const status = widthStatusText({ label: "WORKFLOW", width: 11, cols });
+    assert.ok([...status].length <= Math.max(0, cols), `${cols}: ${JSON.stringify(status)}`);
+    assert.match(status, /^[\x20-\x7e]*$/, `${cols}: status must be ASCII-only`);
+    assert.ok(!/[←→↑↓]/.test(status), `${cols}: ambiguous-width arrow escaped`);
+  }
+
+  for (const cols of [79, 60, 44]) {
+    const status = widthStatusText({ label: "WORKFLOW", width: 11, cols });
+    assert.match(status, /WORKFLOW/);
+    assert.match(status, /11/);
+    assert.match(status, /<-/);
+    assert.match(status, /->/);
+    assert.match(status, /\br\b/);
+    assert.match(status, /Esc/);
+  }
+});
+
+test("width-mode status surfaces a bounded nonfatal save warning", () => {
+  for (const cols of [79, 60, 44, 20, 8, 1, 0]) {
+    const status = widthStatusText({
+      label: "PACKAGE / FILE",
+      width: 16,
+      cols,
+      saveError: new Error("read-only filesystem"),
+    });
+    assert.ok([...status].length <= Math.max(0, cols), `${cols}: ${JSON.stringify(status)}`);
+    assert.match(status, /^[\x20-\x7e]*$/, `${cols}: warning must be ASCII-only`);
+    if (cols >= "Widths not saved".length) assert.match(status, /Widths not saved/);
+  }
+});
+
+const EXPECTED_HEADER_GUTTER_OWNERS = {
+  actions: [null, "workflow", "branch", "time", "updated", null],
+  issues: [null, "author", "label", "updated", null],
+  prs: [null, "author", "branch", "review", "updated", null],
+  security: [null, null, "package", "age", null],
+};
+
+test("header gutters belong to the adjustable edge facing the grow reservoir", () => {
+  for (const tab of TABS) {
+    assert.deepEqual(
+      tab.header.map((_, index) => headerGutterKey(tab.header, index)),
+      EXPECTED_HEADER_GUTTER_OWNERS[tab.key],
+      tab.key,
+    );
+    assert.deepEqual(
+      tab.compactHeader.map((_, index) => headerGutterKey(tab.compactHeader, index)),
+      tab.compactHeader.map(() => null),
+      `${tab.key}: compact gutters must stay locked`,
+    );
+  }
+});
+
+test("HeaderCells draws grips inside the existing one-cell gutters without changing geometry", () => {
+  for (const tab of TABS) {
+    const selectedWidthKey = adjustableWidthKeys(tab)[0];
+    const rendered = HeaderCells({ cells: tab.header, selectedWidthKey });
+    const children = Array.isArray(rendered.props.children)
+      ? rendered.props.children
+      : [rendered.props.children];
+
+    assert.equal(children.length, tab.header.length * 2, `${tab.key}: content/gutter pairs`);
+    let expectedFixedWidth = 0;
+    let renderedFixedWidth = 0;
+    for (let index = 0; index < tab.header.length; index += 1) {
+      const descriptor = tab.header[index];
+      const content = children[index * 2];
+      const gutter = children[index * 2 + 1];
+      const owner = headerGutterKey(tab.header, index);
+      const gutterText = gutter.props.children;
+
+      assert.deepEqual(
+        { width: content.props.width, grow: content.props.grow },
+        { width: descriptor.props.width, grow: descriptor.props.grow },
+        `${tab.key}.${descriptor.key}: content geometry`,
+      );
+      assert.equal([...gutterText].length, 1, `${tab.key}.${descriptor.key}: gutter width`);
+      assert.equal(gutterText, owner === null ? " " : "│", `${tab.key}.${descriptor.key}: grip`);
+      assert.equal(
+        Boolean(gutter.props.bold),
+        owner === selectedWidthKey,
+        `${tab.key}.${descriptor.key}: selected grip styling`,
+      );
+
+      expectedFixedWidth += (descriptor.props.width ?? 0) + 1;
+      renderedFixedWidth += (content.props.width ?? 0) + [...gutterText].length;
+    }
+    assert.equal(renderedFixedWidth, expectedFixedWidth, `${tab.key}: fixed geometry changed`);
+
+    const compactRendered = HeaderCells({
+      cells: tab.compactHeader,
+      selectedWidthKey,
+    });
+    const compactChildren = Array.isArray(compactRendered.props.children)
+      ? compactRendered.props.children
+      : [compactRendered.props.children];
+    assert.equal(compactChildren.length, tab.compactHeader.length * 2);
+    assert.ok(
+      compactChildren
+        .filter((_, index) => index % 2 === 1)
+        .every((gutter) => gutter.props.children === " "),
+      `${tab.key}: compact header unexpectedly rendered a grip`,
+    );
+  }
 });
 
 test("width preference paths prefer an absolute XDG root on every supported platform", () => {
