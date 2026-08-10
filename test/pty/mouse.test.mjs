@@ -194,16 +194,35 @@ if (path.basename(process.argv[1] || "") === "index.mjs") {
 });
 
 test("remote setup disables mouse reporting before handing the terminal to gh", () => {
-  const handoff = capture({
-    cols: 80,
-    rows: 24,
-    signal: "none",
-    settle: 12,
-    stdin: "sleep 3; printf '\\r'; sleep 1; printf 'confirm\\n'; sleep 2",
-    env: noRemoteEnv,
-  });
+  const configHome = mkdtempSync(join(tmpdir(), "gh-glance-pty-mouse-handoff-"));
+  const readyPath = join(configHome, "setup-ready");
+  let handoff;
+  let childReady;
+  try {
+    handoff = capture({
+      cols: 80,
+      rows: 24,
+      signal: "none",
+      settle: 12,
+      configHome,
+      stdin:
+        "sleep 3; printf '\\r'; i=0; " +
+        "while [ ! -f \"$GH_GLANCE_FIXTURE_READY\" ] && [ \"$i\" -lt 200 ]; " +
+        "do sleep 0.05; i=$((i + 1)); done; sleep 0.2; printf 'confirm\\n'; " +
+        "while :; do sleep 1; printf '\\n' || exit 0; done",
+      env: { ...noRemoteEnv, GH_GLANCE_FIXTURE_READY: readyPath },
+    });
+    childReady = existsSync(readyPath);
+  } finally {
+    rmSync(configHome, { recursive: true, force: true });
+  }
 
-  assert.equal(handoff.exitCode, 0, "successful gh setup handoff should exit 0");
+  assert.equal(
+    handoff.exitCode,
+    0,
+    `successful gh setup handoff should exit 0: ${handoff.afterRestore.visible}`,
+  );
+  assert.equal(childReady, true, "fixture child never advertised input readiness");
   // The parsed final region also contains the legitimate primary-buffer gh
   // transcript and echoed interactive input after handoff, so neither its line
   // count nor its width describes the 24x80 dashboard anymore.

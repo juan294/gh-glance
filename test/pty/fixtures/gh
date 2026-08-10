@@ -61,6 +61,9 @@ case "$1" in
         echo 'repository setup inherited raw input mode' >&2
         exit 1
       }
+      if [ -n "${GH_GLANCE_FIXTURE_READY:-}" ]; then
+        : > "$GH_GLANCE_FIXTURE_READY"
+      fi
       printf 'Fixture setup choice: '
       IFS= read -r setup_choice
       setup_choice=$(printf '%s' "$setup_choice" | tr -d '\r')

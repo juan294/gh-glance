@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Full-table columns can be resized with a mouse or keyboard.** Visible header
+  grips support left-button dragging, while `w` opens a keyboard width mode for
+  one- and five-cell adjustments and selected-column or active-tab resets.
+- **Width choices persist automatically per user and per tab.** Only deviations
+  from the built-in defaults are stored, so resetting a column or tab cleanly
+  returns it to the source-controlled layout.
+
+### Changed
+
+- **Oversized saved widths fit safely in narrower panes.** They are temporarily
+  reduced toward the defaults when the stock full table fits, without changing
+  the saved preference; widening the pane restores the preferred widths.
+- **Terminal mouse reporting is released on every cleanup path.** Clean quit,
+  signals, crashes, and the interactive remote-setup handoff disable button and
+  SGR reporting before the primary screen is restored.
+
 ## [0.6.1] - 2026-08-06
 
 ### Security

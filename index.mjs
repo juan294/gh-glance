@@ -3169,7 +3169,7 @@ function useTerminalSize(stdout) {
 function App({ onCreateRemote = () => {} } = {}) {
   const { stdout } = useStdout();
   const { isRawModeSupported } = useStdin();
-  const { exit } = useApp();
+  const { exit, suspendTerminal } = useApp();
   const [activeIndex, setActiveIndex] = useState(runtime.initialTabIndex);
   const [preferencePath] = useState(() => widthPreferencesPath());
   const [widthOverrides, setWidthOverrides] = useState(
@@ -3636,7 +3636,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       } else if (key.pageUp) {
         moveSelection(-pageStep);
       } else if (key.return) {
-        if (remoteSetupRef.current) onCreateRemote();
+        if (remoteSetupRef.current) onCreateRemote(suspendTerminal);
         else openSelected();
       } else if (input === "r") {
         // Goes through the same per-tab in-flight guard as the poll loop, so
@@ -4348,39 +4348,70 @@ if (IS_MAIN) {
   // (README Limitations), and the pty harness covers the two platforms that are
   // supported, so the flag is verified where it is claimed to work.
   let remoteSetupStarted = false;
-  const createRemote = () => {
+  const createRemote = (suspendTerminal) => {
     if (remoteSetupStarted) return;
     remoteSetupStarted = true;
-    unmountApp();
-    restoreScreen();
-    abortLiveRequests();
 
-    // Let Ink finish the input dispatch that selected setup before the child
-    // inherits stdin. Otherwise that dispatch can consume the first bytes meant
-    // for gh even though the app has already unmounted and restored the screen.
-    setImmediate(() => {
-      // Plain `gh repo create` is the interactive form. Supplying --source here
-      // would switch gh to non-interactive mode and require gh-glance to choose a
-      // visibility on the user's behalf, which this consent boundary must never
-      // do. The prompt tells the user which interactive path matches this folder.
-      const child = spawn("gh", ["repo", "create"], {
-        stdio: "inherit",
-        env: process.env,
-      });
-      setupChild = child;
-      child.once("error", (err) => {
-        if (setupChild === child) setupChild = null;
-        console.error(`gh-glance: could not start repository setup: ${redact(shortErr(err))}`);
+    // Release Ink's raw-mode/parser state before the child inherits stdin.
+    // Unmounting alone can leave an active readable dispatch racing the first
+    // bytes typed for gh, so one immediate boundary lets that dispatch return;
+    // the explicit stream cleanup below then prevents any future parent reads.
+    void suspendTerminal()
+      .then(async () => {
+        await new Promise((resolve) => setImmediate(resolve));
+        unmountApp();
+        // This is a permanent handoff, so the parent must not retain any stream
+        // consumer that can race the child for terminal bytes. Pausing/removing
+        // Node listeners does not close fd 0; the spawned process still inherits
+        // the same canonical TTY directly from the operating system.
+        process.stdin.pause();
+        process.stdin.removeAllListeners("readable");
+        process.stdin.removeAllListeners("data");
+        restoreScreen();
+        abortLiveRequests();
+
+        await new Promise((resolve) => {
+          // Plain `gh repo create` is the interactive form. Supplying --source
+          // here would switch gh to non-interactive mode and require gh-glance
+          // to choose a visibility on the user's behalf, which this consent
+          // boundary must never do. The prompt tells the user which interactive
+          // path matches this folder.
+          const child = spawn("gh", ["repo", "create"], {
+            stdio: "inherit",
+            env: process.env,
+          });
+          setupChild = child;
+          child.once("error", (err) => {
+            if (setupChild === child) setupChild = null;
+            console.error(
+              `gh-glance: could not start repository setup: ${redact(shortErr(err))}`,
+            );
+            process.exitCode = 1;
+            resolve();
+          });
+          child.once("exit", (code, signal) => {
+            if (setupChild === child) setupChild = null;
+            process.exitCode = signal ? 1 : (code ?? 1);
+            if (code === 0) {
+              console.log(
+                "gh repo create finished. Run gh-glance again when this folder has a remote.",
+              );
+            }
+            resolve();
+          });
+        });
+      })
+      .catch((err) => {
+        unmountApp();
+        restoreScreen();
+        try {
+          abortLiveRequests();
+        } catch {
+          // Preserve the handoff error below.
+        }
+        console.error(`gh-glance: could not hand off the terminal: ${redact(shortErr(err))}`);
         process.exitCode = 1;
       });
-      child.once("exit", (code, signal) => {
-        if (setupChild === child) setupChild = null;
-        process.exitCode = signal ? 1 : (code ?? 1);
-        if (code === 0) {
-          console.log("gh repo create finished. Run gh-glance again when this folder has a remote.");
-        }
-      });
-    });
   };
   app = render(e(App, { onCreateRemote: createRemote }), { incrementalRendering: true });
 
