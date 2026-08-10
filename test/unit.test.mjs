@@ -2201,6 +2201,14 @@ test("restPerTick amortises the background tabs", () => {
   assertClose(restPerTick("issues"), (2 + 3) / BACKGROUND_EVERY, 1e-12);
 });
 
+test("every tab's fetcher has a spend to report from the cost table", () => {
+  // Guards the drift this design is built to prevent: the meter bills from the
+  // same table the projection reads, so a tab with no entry would silently bill
+  // nothing and make the inferred share wrong. The richer attribution
+  // assertions live in the pty layer, because the fetchers need a `gh` to run.
+  for (const key of TAB_KEYS) assert.equal(typeof REST_PER_FETCH[key], "number");
+});
+
 test("restPerTick and projectedHourlyCost agree", () => {
   // Two derivations of the same quantity; if they drift, one of them is wrong.
   for (const key of TAB_KEYS) {

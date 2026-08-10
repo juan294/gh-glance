@@ -116,6 +116,46 @@ and the result NaN. This surfaced as "widening is capped" returning NaN; the
 Chose: moved `budget` after the spread so the merge always wins.
 Why: as written, a case could silently stop testing the thing it is named for.
 
+### Phase 4
+
+**`routing.test.mjs`'s `apiCalls` had to be narrowed.**
+Plan said: nothing about it.
+Found: the budget probe is `gh api rate_limit`, so it lands in the fixture log
+and is picked up by `apiCalls = fixtureCalls.filter(c => c.startsWith("api "))`.
+That helper feeds assertions like `call.includes("repos/acme/widget/")` and
+`call.includes("--hostname tenant.ghe.com")` — both of which the probe fails, by
+design: it is host-agnostic and carries no repository path. Three routing tests
+would have gone red on a correct implementation.
+Chose: excluded `api rate_limit` from that filter, with a comment saying why.
+Why: those tests are about *alert endpoint* routing. Widening them to accommodate
+the probe would have weakened the defect guard they exist to be.
+
+**`capture()` exposes no `screen`, and `hasPanelFrame`/`hasTabBar` are not functions.**
+Plan said: `drained.screen`, `hasPanelFrame(drained)`, `hasTabBar(drained)`.
+Found: `parseCapture` returns `finalFrame: { lines, widest }` and booleans
+`hasPanelFrame` / `hasTabBar` (`test/pty/capture.mjs:87-110`). None of the three
+spec forms exist.
+Chose: a local `screenOf(result)` joining `finalFrame.lines`, and the booleans
+read as properties.
+Why: mechanical correction to the real helper API.
+
+**Added a probe-ran guard test the plan did not list.**
+Plan said: four captures.
+Found: every one of them passes vacuously if the loop never probes — "no badge"
+and "fewer run-list calls" are both satisfied by a pane that did nothing.
+Chose: added "the budget probe runs at all", asserting `api rate_limit` reached
+the fixture.
+Why: without it the file could go green while testing nothing.
+
+**The meter bills before the `cancelled` early return.**
+Plan said: `restSpentTotal += result.restSpent ?? 0` "immediately where the result
+lands".
+Found: placing it after the existing `if (cancelled) return` would drop the
+billing for any fetch that landed during unmount.
+Chose: billed on the first line of the `.then`, ahead of that guard.
+Why: GitHub counted those requests whether or not this process still wants them,
+and under-billing biases the inferred share the *unsafe* way.
+
 ### Process (all phases)
 
 **No worktree.**

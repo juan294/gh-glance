@@ -24,7 +24,11 @@ const slugOnly = capture({ cols: 80, rows: 24, args: "--repo acme/widget" });
 const hostQualified = capture({ cols: 80, rows: 24, args: `--repo ${HOST}/acme/widget` });
 
 const listCalls = (result) => result.fixtureCalls.filter((call) => /^(run|issue|pr) /.test(call));
-const apiCalls = (result) => result.fixtureCalls.filter((call) => call.startsWith("api "));
+// The alert endpoints only. `api rate_limit` is the adaptive throttle's budget
+// probe: it is deliberately host-agnostic and carries no repository path, so it
+// would fail every assertion below about where an alert endpoint was routed.
+const apiCalls = (result) =>
+  result.fixtureCalls.filter((call) => call.startsWith("api ") && !call.startsWith("api rate_limit"));
 
 function assertReachedTheDataLayer(result, label) {
   assert.ok(result.fixtureCalls.length > 0, `${label}: the fixture gh was never invoked`);

@@ -804,6 +804,10 @@ async function fetchActions(limit, signal) {
   return {
     raw,
     limit,
+    // What this fetch actually cost, read from the one cost table rather than
+    // re-derived from the argv shape -- a second copy of the cost model is the
+    // drift this file warns about repeatedly.
+    restSpent: REST_PER_FETCH.actions,
     parse: () =>
       JSON.parse(raw).map((r) => ({
         databaseId: r.databaseId,
@@ -849,6 +853,9 @@ async function fetchIssues(signal) {
   return {
     raw,
     limit: LIST_LIMIT,
+    // Stated rather than omitted so the zero is visibly deliberate: SORT_RECENT's
+    // --search routes this through GraphQL, which is a separate budget.
+    restSpent: REST_PER_FETCH.issues,
     parse: () =>
       JSON.parse(raw).map((i) => ({
         number: i.number,
@@ -880,6 +887,8 @@ async function fetchPRs(signal) {
   return {
     raw,
     limit: LIST_LIMIT,
+    // Zero for the same reason as issues: --search makes this a GraphQL call.
+    restSpent: REST_PER_FETCH.prs,
     parse: () =>
       JSON.parse(raw).map((p) => ({
         number: p.number,
@@ -981,6 +990,12 @@ const MAX_ADAPTIVE_REFRESH_MS = 60_000;
 // pane yields at all -- see RATE_LIMIT_RETRY_MS.
 const BUDGET_SAFETY = 0.8;
 
+// How often to re-read the budget. `gh api rate_limit` does not count against
+// the limit (verified, delta 0 -- see rateBudget) but it is still a subprocess,
+// so once a minute rather than once a tick: the quantity it measures moves on
+// the scale of minutes.
+const BUDGET_PROBE_MS = 60_000;
+
 // Below this many of our own REST calls in a probe window, the share inference
 // is noise -- one call against a global delta of one reads as "we are the only
 // consumer" whether or not that is true. Under the threshold the loop declines
@@ -1056,6 +1071,18 @@ function alertArgs(source) {
 // mid-session is picked up within the hour.
 const alertBackoff = new Map();
 
+// REST calls this process has spent, ever. In-memory and per-process, in the
+// same spirit as alertBackoff above: lost on exit, and nothing depends on it
+// surviving. Only ever compared against itself between two budget probes, so it
+// needs no windowing and cannot overflow in any realistic session.
+//
+// Deliberately incomplete: openItem, preflight and resolveFailureContext also
+// spend, and are not counted, because they are occasional rather than periodic.
+// Under-reporting our own spend makes the inferred share *larger* and so
+// throttles slightly harder than strictly necessary -- the safe direction to err
+// in, which is why the imprecision is tolerated rather than chased.
+let restSpentTotal = 0;
+
 function backoffActive(key, now) {
   const state = alertBackoff.get(key);
   return Boolean(state) && now < state.until;
@@ -1091,13 +1118,20 @@ async function fetchAlertSource(source, signal, now) {
     // The verdict is replayed alongside the note. Replaying only the note left
     // the tab unable to tell "Dependabot is switched off here" from "we cannot
     // see Dependabot" for the whole length of a backoff window.
-    return { raw: `backoff:${note}`, parse: () => ({ alerts: [], note, verdict, truncated: false }) };
+    // Nothing was spawned, so nothing was billed -- which is the whole reason
+    // the meter is fed by the fetchers rather than by counting ticks.
+    return {
+      raw: `backoff:${note}`,
+      spent: 0,
+      parse: () => ({ alerts: [], note, verdict, truncated: false }),
+    };
   }
   try {
     const raw = await runGh(alertArgs(source), { signal });
     clearBackoff(source.key);
     return {
       raw,
+      spent: 1,
       parse: () => {
         const rows = JSON.parse(raw).filter((a) => a.state === "open");
         return {
@@ -1122,6 +1156,9 @@ async function fetchAlertSource(source, signal, now) {
     }
     return {
       raw: `unavailable:${note}`,
+      // A failed call still bills: the request reached GitHub and was counted
+      // whether it returned data, `[]`, or a 403.
+      spent: 1,
       parse: () => ({ alerts: [], note, verdict, truncated: false }),
     };
   }
@@ -1155,6 +1192,10 @@ async function fetchSecurity(signal) {
     // colliding on the same string.
     raw: parts.map((p) => p.raw).join("\0"),
     limit: ALERT_PER_PAGE,
+    // Summed from what each source reported rather than assumed to be
+    // ALERT_SOURCES.length: a source held off by backoff spawned nothing and
+    // must not be billed for it.
+    restSpent: parts.reduce((n, p) => n + p.spent, 0),
     parse: () => {
       const parsed = parts.map((p) => p.parse());
       const alerts = parsed.flatMap((p) => p.alerts);
@@ -1420,6 +1461,32 @@ async function rateBudget() {
     return { core: fmt(resources?.core), graphql: fmt(resources?.graphql) };
   } catch (err) {
     return { core: `unavailable (${shortErr(err)})`, graphql: "unavailable" };
+  }
+}
+
+// The same probe as rateBudget, but returning `core` as data rather than a
+// sentence, because the adaptive loop has to do arithmetic on it. rateBudget
+// keeps its own shape: it formats `graphql` too, which the controller does not
+// need, and it is on the --doctor path where a string is the product.
+//
+// Safe to run on a timer for the same reason it is safe on the diagnostic path:
+// `gh api rate_limit` is documented as not counting against the limit, and it
+// measures as free (verified: delta 0).
+async function readCoreBudget(signal) {
+  try {
+    const raw = await runGh(["api", "rate_limit"], { signal });
+    const core = JSON.parse(raw)?.resources?.core;
+    if (!core || !Number.isFinite(core.remaining)) return null;
+    return {
+      remaining: core.remaining,
+      limit: core.limit,
+      used: core.used,
+      resetMs: core.reset * 1000,
+    };
+  } catch {
+    // A probe failure must never be louder than the pane's own data: the loop
+    // simply does not adapt this cycle and stays at whatever it last applied.
+    return null;
   }
 }
 
@@ -3117,6 +3184,7 @@ function StatusBar({
   fetching,
   spin,
   stale,
+  throttle,
   interactive,
   cols,
   remoteSetup = false,
@@ -3124,6 +3192,9 @@ function StatusBar({
   widthColumn = null,
   widthSaveError = null,
 }) {
+  // Width mode owns the whole bar, so the throttle badge is deliberately not
+  // shown here: this state is transient and explicitly entered, and the widened
+  // interval is still reported the moment the user leaves it.
   if (widthMode && widthColumn) {
     return e(
       Box,
@@ -3175,6 +3246,12 @@ function StatusBar({
     // is worth getting the column back for the other 99% of the time.
     stale
       ? e(Box, { marginRight: 1, flexShrink: 0 }, e(Text, { color: ATTENTION }, stale))
+      : null,
+    // Same free-slot treatment as `stale` above. Dim rather than ATTENTION: a
+    // widened interval is the throttle working, not a failure, and colouring it
+    // like a problem would send the user looking for one.
+    throttle
+      ? e(Box, { marginRight: 1, flexShrink: 0 }, e(Text, { dimColor: true }, throttle))
       : null,
     ...hints
       .flatMap((hint, i) => [
@@ -3301,6 +3378,9 @@ function App({ onCreateRemote = () => {} } = {}) {
   const [errors, setErrors] = useState({ actions: null, issues: null, prs: null, security: null });
   const [failureContext, setFailureContext] = useState(null);
   const [loading, setLoading] = useState({ actions: true, issues: true, prs: true, security: true });
+  // The widened poll interval in ms while the adaptive throttle is holding one,
+  // or null at the configured refresh. Only ever set from inside the poll effect.
+  const [throttleMs, setThrottleMs] = useState(null);
   const [now, setNow] = useState(new Date());
   const { rows, cols, useShortLabels } = useTerminalSize(stdout);
   const [frame, setFrame] = useState(0);
@@ -3751,6 +3831,13 @@ function App({ onCreateRemote = () => {} } = {}) {
   // ref or a setState function, both of which the rule treats as stable -- so
   // this needs no suppression, and if one ever becomes necessary that is the
   // signal that a real dependency crept in.
+  //
+  // The adaptive throttle re-arms the timer, which is not a contradiction of the
+  // above: `rearm` swaps the interval from *inside* this effect, so the effect
+  // still runs exactly once and no closure, ref or AbortController is ever
+  // recreated. What is created once is the effect; what changes is only the
+  // delay `tick` is scheduled at. Do not move the re-arm into a dependency
+  // array -- that is precisely the teardown this comment exists to prevent.
   useEffect(() => {
     let cancelled = false;
     let ticks = 0;
@@ -3787,6 +3874,10 @@ function App({ onCreateRemote = () => {} } = {}) {
       setLoading((l) => (l[key] ? l : { ...l, [key]: true }));
       return run()
         .then((result) => {
+          // Billed before the `cancelled` early return: the requests were made
+          // and counted by GitHub whether or not this process still wants the
+          // answer.
+          restSpentTotal += result?.restSpent ?? 0;
           if (cancelled) return;
           const { raw, parse, limit } = result;
           // Identical payload: skip the parse *and* the state update. Returning
@@ -3836,6 +3927,11 @@ function App({ onCreateRemote = () => {} } = {}) {
           }
         })
         .catch((err) => {
+          // A rejected fetch carries no result, so its own spend is unknowable
+          // here; bill the tab's table cost instead. A request that failed after
+          // reaching GitHub still counted, and over-billing by an aborted call
+          // errs toward throttling harder, which is the safe direction.
+          restSpentTotal += REST_PER_FETCH[key] ?? 0;
           if (cancelled || err?.name === "AbortError") return;
           cleanRef.current[key] = false;
           // Preserve both the verdict and the bounded raw error in state. The
@@ -3882,6 +3978,10 @@ function App({ onCreateRemote = () => {} } = {}) {
       // so stop spawning subprocesses once any endpoint proves there is no
       // remote. The interval may still wake, but this branch is otherwise idle.
       if (remoteSetupRef.current) return;
+      // Kicked off, never awaited: the budget probe must not delay the fetches
+      // this tick is for. `probeInFlight` keeps a slow probe from stampeding.
+      const nowMs = Date.now();
+      if (!probeInFlight && nowMs - lastProbeAt >= BUDGET_PROBE_MS) void probeBudget(nowMs);
       // Only the tab you're looking at needs to keep up with REFRESH_MS. The
       // other three exist to keep the tab-bar counts honest, which tolerates
       // being a minute behind -- so they refresh every BACKGROUND_EVERY ticks
@@ -3902,11 +4002,64 @@ function App({ onCreateRemote = () => {} } = {}) {
       );
     }
 
+    // The adaptive throttle. `appliedMs` is what the timer is currently set to;
+    // runtime.refreshMs stays the floor it may widen from and never tighten past.
+    let appliedMs = runtime.refreshMs;
+    let intervalId = null;
+    // 0 rather than `now`, so the first tick probes immediately: a pane started
+    // into an already-drained budget must back off at once rather than spend a
+    // minute at full rate first.
+    let lastProbeAt = 0;
+    let probeInFlight = false;
+    let prevUsed = null;
+    let prevSpent = 0;
+
+    function rearm(ms) {
+      appliedMs = ms;
+      if (intervalId) clearInterval(intervalId);
+      intervalId = setInterval(tick, ms);
+    }
+
+    async function probeBudget(nowMs) {
+      probeInFlight = true;
+      lastProbeAt = nowMs; // set before awaiting, so ticks cannot stampede
+      try {
+        // `controller` is this effect's own AbortController, so a probe still in
+        // flight at unmount is killed along with everything else.
+        const budget = await readCoreBudget(controller.signal);
+        if (cancelled || !budget) return;
+        // A window reset makes `used` fall; treat the new value as the delta
+        // rather than going negative.
+        const globalUsed =
+          prevUsed === null || budget.used < prevUsed ? budget.used : budget.used - prevUsed;
+        const sample =
+          prevUsed === null
+            ? null // first probe: no window to measure our own share over
+            : { globalUsed, myRestCalls: restSpentTotal - prevSpent };
+        prevUsed = budget.used;
+        prevSpent = restSpentTotal;
+
+        const target = adaptiveRefreshMs({
+          budget,
+          sample,
+          floorMs: runtime.refreshMs,
+          nowMs: Date.now(),
+          restPerTick: restPerTick(TABS[activeIndexRef.current].key),
+        });
+        if (adaptiveChangeWorthApplying(appliedMs, target)) {
+          rearm(target);
+          setThrottleMs(target > runtime.refreshMs ? target : null);
+        }
+      } finally {
+        probeInFlight = false;
+      }
+    }
+
     tick();
-    const id = setInterval(tick, runtime.refreshMs);
+    rearm(runtime.refreshMs);
     return () => {
       cancelled = true;
-      clearInterval(id);
+      clearInterval(intervalId);
       if (contextCoordinatorRef.current === coordinator) contextCoordinatorRef.current = null;
       // `cancelled` stops state updates from a promise that already resolved;
       // the signal stops the subprocess itself, so quitting doesn't orphan up to
@@ -4294,6 +4447,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       fetching: Object.values(loading).some(Boolean),
       spin: showSpinner ? spin : null,
       stale: staleLabel,
+      throttle: throttleMs ? `throttled ${Math.round(throttleMs / 1000)}s` : null,
       interactive,
       cols: frameCols,
       remoteSetup,

@@ -90,6 +90,19 @@ case "$1" in
     fi
     ;;
   api)
+    # Budget probe, matched before the alert paths below. Remaining is injectable
+    # so a capture can drive the adaptive throttle; the default is a healthy
+    # budget, i.e. no adaptation and no badge.
+    : "${GH_GLANCE_FIXTURE_RATE_REMAINING:=5000}"
+    case "${2:-}" in
+      rate_limit)
+        reset=$(( $(date +%s) + 3600 ))
+        printf '{"resources":{"core":{"limit":5000,"used":%s,"remaining":%s,"reset":%s},' \
+          "$((5000 - GH_GLANCE_FIXTURE_RATE_REMAINING))" "$GH_GLANCE_FIXTURE_RATE_REMAINING" "$reset"
+        printf '"graphql":{"limit":5000,"used":0,"remaining":5000,"reset":%s}}}\n' "$reset"
+        exit 0
+        ;;
+    esac
     # The three alert endpoints. An empty array is a *successful* fetch with no
     # alerts, which keeps the Security tab in its resolved-and-empty state
     # rather than its error state -- errors would add note lines and change the
