@@ -99,3 +99,22 @@ request per minute.
 - `--jq` projection (PE-M2, shipped in v0.2.0) already captured the payload-size
   half of the original concern, cutting the security fetch roughly 48x without
   touching the transport.
+
+## Correction (2026-08-10)
+
+Two figures above are wrong and are corrected here rather than edited in place,
+because the decision they support still stands.
+
+- A full tick costs **six** REST requests, not five: `gh run list` issues
+  `GET /actions/runs` *and* `GET /actions/workflows` (measured with
+  `GH_DEBUG=api`, 2026-08-10). The GraphQL count of two is correct.
+- "Roughly 500 calls per hour" was never reached. It was PE-B1's *target*, not a
+  measurement, and it was already corrected twice in the README (`a89c816`,
+  `934d8a0`) from a cost model that itself understated Actions by half. The real
+  steady state at the default refresh is ~1,620 REST/hour with Actions visible.
+
+Neither changes the conclusion. The saving on offer from collapsing the data
+layer is still about one request per minute, and `core`/`graphql` are still
+independent budgets.
+
+See `docs/research/2026-08-10-api-request-cost-and-rate-limit-exhaustion.md`.

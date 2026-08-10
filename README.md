@@ -314,6 +314,7 @@ Environment variables work too, and the flags take precedence:
 | `GH_REPO=owner/name` | Watch a specific repository instead of the current directory's. A host-qualified `GH_REPO` does **not** route the security-alert endpoints -- use `GH_HOST` or `--repo host/owner/name` for that |
 | `GH_HOST=<host>` | Send every call to a GitHub Enterprise or EMU host instead of `github.com`. Routes both the list commands and the alert endpoints |
 | `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GH_CONFIG_DIR` | Not read by `gh-glance` -- passed through to `gh` untouched, along with the proxy variables. `gh-glance` handles no credentials of its own. Separate `GH_CONFIG_DIR` values can isolate simultaneous panes on different accounts; see [No account pinning](#limitations) |
+| `GH_GLANCE_REFRESH=<seconds>` | Active-tab poll interval, 2-3600. Sets it once for every pane in a shell; `--refresh` takes precedence. This is a floor -- see [Rate limit](#rate-limit) |
 | `GH_GLANCE_ICONS=unicode` | Plain ASCII status icons, for terminals without a Nerd Font |
 | `GH_GLANCE_NO_ANIMATION=1` | Freeze the spinner — no motion at all |
 | `NO_COLOR=1` | Disable colour. Status stays readable: severity has its own column, a failing newest run puts a `!` on the Actions tab, and the active tab is bracketed. Note that run-state glyphs are not all distinct -- see the feature list above |
@@ -423,15 +424,17 @@ through GraphQL instead — a separate 5,000/hour allowance. With the default
 
 | Visible tab | REST / hour | GraphQL / hour |
 |---|---|---|
-| Actions | ~900 | ~240 |
-| Issues or Pull Requests | ~240 | ~1,560 |
-| Security | ~2,220 | ~240 |
+| Actions | ~1,620 | ~240 |
+| Issues or Pull Requests | ~300 | ~1,560 |
+| Security | ~2,280 | ~240 |
 
-Security is the expensive one because it is three endpoints rather than one,
-and watching it costs just under half the REST budget. You do not have to take
-these figures on trust: `gh-glance --doctor` reports your actual remaining
-budget alongside what your configuration projects, which matters on a GitHub
-Enterprise tenant where the ceiling may not be 5,000 at all.
+Security is the most expensive, because it is three endpoints rather than one,
+and watching it costs just under half the REST budget. But Actions is not cheap
+either -- it is a third of the budget, and it is the tab every pane opens on,
+because one `gh run list` issues two REST requests rather than one. You do not
+have to take these figures on trust: `gh-glance --doctor` reports your actual
+remaining budget alongside what your configuration projects, which matters on a
+GitHub Enterprise tenant where the ceiling may not be 5,000 at all.
 
 Two things pull the real number down. Any endpoint that fails in a way
 `gh-glance` recognises backs off instead of being re-asked every tick — a
@@ -440,9 +443,18 @@ hour, an authorization failure every 30 seconds, a rate limit every minute.
 Pressing `r` clears that backoff and retries immediately. And `--refresh`
 scales the whole figure: doubling the interval halves it.
 
-So a pane left open all day shares the budget with your other `gh` commands
-rather than exhausting it, but it is not free, and parking it on the Security
-tab is the case worth knowing about.
+One pane on Actions costs about a third of an hourly REST budget, so roughly
+three panes fill it. Past that, `gh-glance` widens its own poll interval: it
+reads your remaining budget once a minute, works out how much of it belongs to
+this pane by comparing its own spend against the token's total, and slows down
+to fit -- up to a 60-second ceiling. The status bar says `throttled 18s` while
+that is in effect, and `r` still refreshes immediately. Nothing is shared
+between panes: the token's own counter is what they all read, so it also notices
+a `gh pr checks --watch` or anything else spending on the same token.
+
+`GH_GLANCE_REFRESH=30` sets a wider floor for every pane in a shell; `--refresh`
+still wins per pane. The adaptive interval only ever widens from that floor, so
+a single pane on a healthy budget stays at 5 seconds and shows no badge.
 
 ## Limitations
 

@@ -15,6 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Width choices persist automatically per user and per tab.** Only deviations
   from the built-in defaults are stored, so resetting a column or tab cleanly
   returns it to the source-controlled layout.
+- **`gh-glance` now widens its own poll interval when the API budget is
+  draining.** The rate limit is per token, not per process, so several panes
+  spent one budget while each throttled as though it were alone: seven panes
+  exhausted a 5,000/hour REST limit in under half an hour (measured 8,500
+  calls/hour). Each pane now reads `gh api rate_limit` once a minute -- a probe
+  that does not itself count against the limit -- infers how much of the budget
+  is its own by comparing its spend against the token's total, and slows down to
+  fit, up to a 60-second ceiling. A single pane is unaffected and stays at 5
+  seconds. The status bar shows `throttled 18s` whenever the interval has
+  widened, and `r` still refreshes immediately.
+- **`GH_GLANCE_REFRESH` sets the poll interval for every pane in a shell.** Same
+  2-3600 second range as `--refresh`, which still takes precedence.
 
 ### Changed
 
@@ -24,6 +36,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Terminal mouse reporting is released on every cleanup path.** Clean quit,
   signals, crashes, and the interactive remote-setup handoff disable button and
   SGR reporting before the primary screen is restored.
+
+### Fixed
+
+- **The cost model understated the Actions tab by half.** `gh run list` issues
+  two REST requests, not one -- `GET /actions/runs` and
+  `GET /actions/workflows` -- so a pane on Actions costs about 1,620 requests an
+  hour rather than the 900 `--doctor` reported, and roughly three panes fill an
+  hourly budget rather than five. The figure was wrong in `--doctor`, in the
+  README's per-tab table, and in ADR 0001's request count. Measured with
+  `GH_DEBUG=api`; the projection and the new throttle now read one shared table.
 
 ## [0.6.1] - 2026-08-06
 
