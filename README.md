@@ -25,12 +25,12 @@ without switching to the browser.
 │ ──────────────────────────────────────────────────────────────────────── │
 │ >+  ci: pin actions to comm… #443 CI    develop        1m20s   9d ago    │
 │  x  fix: restore the primar… #442 Code… develop        1m28s   9d ago    │
-│  !  chore: bump dependencies #441 CI    dependa…int-10 221h43m 9d ago    │
+│  !  chore: bump dependencies #441 CI    dependa…int-10 222h8m  9d ago    │
 │  -  docs: update the readme  #440 CI    develop        15s     10d ago   │
 │                                                                          │
 │                                                                          │
 ╰───────────────────────────────────────────────────────────────── 4 of 4 ─╯
-⣾ Fetching  Move: ↑↓ | Open: Ent | Refresh: r | Width: w | Quit: q     0.6.1
+⣾ Fetching  Move: ↑↓ | Open: Ent | Refresh: r | Width: w | Quit: q     0.7.0
 ```
 
 > Captured from a real run at 76 columns with `GH_GLANCE_ICONS=unicode`, so the

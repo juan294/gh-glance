@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-10
+
 ### Added
 
 - **Full-table columns can be resized with a mouse or keyboard.** Visible header
@@ -619,6 +621,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/juan294/gh-glance/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/juan294/gh-glance/releases/tag/v0.6.1
 [0.6.0]: https://github.com/juan294/gh-glance/releases/tag/v0.6.0
 [0.5.1]: https://github.com/juan294/gh-glance/releases/tag/v0.5.1
