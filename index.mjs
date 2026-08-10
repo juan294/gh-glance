@@ -23,7 +23,16 @@
 process.env.NODE_ENV ??= "production";
 
 import { execFile, spawn } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
+import {
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -108,6 +117,8 @@ const ALERT_QUERY = `?state=open&per_page=${ALERT_PER_PAGE}&sort=created&directi
 // single pane. Only the tab you are looking at needs REFRESH_MS latency; the
 // other three exist to keep counts honest, which tolerates a minute.
 const BACKGROUND_EVERY = 12;
+// What one fetch of each tab costs lives in REST_PER_FETCH / GRAPHQL_PER_FETCH,
+// declared with ALERT_SOURCES below because the security figure derives from it.
 
 // A stalled `gh` used to wedge a tab permanently: the promise never settled, so
 // the in-flight guard was never cleared and that tab stopped fetching for the
@@ -793,6 +804,10 @@ async function fetchActions(limit, signal) {
   return {
     raw,
     limit,
+    // What this fetch actually cost, read from the one cost table rather than
+    // re-derived from the argv shape -- a second copy of the cost model is the
+    // drift this file warns about repeatedly.
+    restSpent: REST_PER_FETCH.actions,
     parse: () =>
       JSON.parse(raw).map((r) => ({
         databaseId: r.databaseId,
@@ -838,6 +853,9 @@ async function fetchIssues(signal) {
   return {
     raw,
     limit: LIST_LIMIT,
+    // Stated rather than omitted so the zero is visibly deliberate: SORT_RECENT's
+    // --search routes this through GraphQL, which is a separate budget.
+    restSpent: REST_PER_FETCH.issues,
     parse: () =>
       JSON.parse(raw).map((i) => ({
         number: i.number,
@@ -869,6 +887,8 @@ async function fetchPRs(signal) {
   return {
     raw,
     limit: LIST_LIMIT,
+    // Zero for the same reason as issues: --search makes this a GraphQL call.
+    restSpent: REST_PER_FETCH.prs,
     parse: () =>
       JSON.parse(raw).map((p) => ({
         number: p.number,
@@ -946,6 +966,148 @@ const ALERT_SOURCES = [
   },
 ];
 
+// What one fetch of each tab costs, per budget. The single source of truth:
+// `projectedHourlyCost` derives the hourly figure from it and the spend meter
+// bills against it, so a corrected number cannot reach one and miss the other.
+//
+// actions is 2, not 1: measured 2026-08-10 with `GH_DEBUG=api`, `gh run list`
+// issues GET /actions/runs *and* GET /actions/workflows. The 1 that stood here
+// understated the default tab -- the tab every pane starts on, since
+// initialTabIndex defaults to 0 -- by half.
+//
+// issues and prs are 0 REST because SORT_RECENT's --search routes both through
+// GraphQL entirely (2 POSTs each, confirmed by the same measurement).
+const REST_PER_FETCH = { actions: 2, issues: 0, prs: 0, security: ALERT_SOURCES.length };
+const GRAPHQL_PER_FETCH = { actions: 0, issues: 2, prs: 2, security: 0 };
+
+// Ceiling on adaptive widening. An adaptive interval needs one: a minute is
+// where the pane stops being live in any useful sense, and past it the honest
+// answer is fewer panes, not a slower one.
+const MAX_ADAPTIVE_REFRESH_MS = 60_000;
+
+// Target this fraction of what the token can afford, not all of it. The margin
+// is for the user's own `gh` and `git` commands, which are the whole reason the
+// pane yields at all -- see RATE_LIMIT_RETRY_MS.
+const BUDGET_SAFETY = 0.8;
+
+// How often to re-read the budget. `gh api rate_limit` does not count against
+// the limit (verified, delta 0 -- see rateBudget) but it is still a subprocess,
+// so once a minute rather than once a tick: the quantity it measures moves on
+// the scale of minutes.
+const BUDGET_PROBE_MS = 60_000;
+
+// Below this many of our own REST calls in a probe window, the share inference
+// is noise -- one call against a global delta of one reads as "we are the only
+// consumer" whether or not that is true. Under the threshold the loop declines
+// to infer a new share rather than guessing.
+const MIN_SAMPLE_CALLS = 5;
+
+// Only move the applied interval when the target differs by more than this
+// factor either way, so a budget wobbling around a boundary cannot make the
+// poll rate flap. Same reasoning as TAB_LABEL_HYSTERESIS.
+const ADAPTIVE_HYSTERESIS = 1.25;
+
+// Whether a probe window holds enough of our own calls for the ratio below to
+// mean anything. Named rather than inlined because the control law and the loop
+// that feeds it must agree on the answer: the law uses it to decide whether to
+// infer, and the loop uses it to decide whether the window may be closed.
+function sampleIsUsable(sample) {
+  return Boolean(sample) && sample.myRestCalls >= MIN_SAMPLE_CALLS && sample.globalUsed > 0;
+}
+
+// How many equivalent consumers are on this token, from one probe window.
+//
+// `lastShare` is what the previous measurable window said, and it is the answer
+// whenever this window is not measurable. Falling back to 1 instead would be the
+// controller starving its own input: a pane that has widened to 40s makes about
+// three REST calls per probe window, below MIN_SAMPLE_CALLS, so it would read
+// "no other consumers", snap back to the floor, spend fast enough to measure
+// again, and re-throttle -- a flap on a two-minute cycle at exactly the instance
+// counts the widening exists for. Holding the last measurement keeps the pane
+// where it is until a window is long enough to say otherwise.
+function inferShare(sample, lastShare = 1) {
+  return sampleIsUsable(sample)
+    ? Math.max(1, sample.globalUsed / sample.myRestCalls)
+    : Math.max(1, lastShare);
+}
+
+// One probe window's bookkeeping. Pure, so the flap it prevents is testable
+// without a timer: `prev` is `{ used, spent }` from the last window that could
+// be measured, or null before the first probe.
+//
+// The baseline only advances when the window was usable, so an unmeasurable
+// window is not thrown away -- it grows until it holds MIN_SAMPLE_CALLS of our
+// own calls, with both halves of the ratio still spanning the same stretch of
+// time. The cost is latency, not accuracy: a pane at the 60s cap needs two or
+// three probes rather than one to notice that the other panes have exited.
+function nextProbeWindow(prev, budget, spentTotal) {
+  // A window reset makes `used` fall. The span before the reset cannot be
+  // compared against the counter after it, so the window restarts here and this
+  // cycle infers nothing -- the caller keeps the share it last measured, which
+  // is the one direction that cannot spike the poll rate at the top of an hour.
+  if (prev === null || budget.used < prev.used) {
+    return { sample: null, next: { used: budget.used, spent: spentTotal } };
+  }
+  const sample = {
+    globalUsed: budget.used - prev.used,
+    myRestCalls: spentTotal - prev.spent,
+  };
+  return { sample, next: sampleIsUsable(sample) ? { used: budget.used, spent: spentTotal } : prev };
+}
+
+// How wide the active-tab interval has to be for this instance to fit its share
+// of the token's remaining budget.
+//
+// The share is *inferred*, not configured: this instance knows exactly how many
+// REST calls it has spent since the last probe, and `rate_limit` reports how
+// many the token spent in total over the same window. The ratio is how many
+// equivalent consumers are on this token -- other panes, a `gh pr checks
+// --watch`, an agent shelling out to `gh`. That is why no IPC and no on-disk
+// registry is needed: the token's own counter is the shared channel, and it
+// already aggregates everything.
+//
+// Deliberately one-directional: the returned value is never below `floorMs`, so
+// --refresh and GH_GLANCE_REFRESH stay a floor the loop widens from and cannot
+// tighten past. A single instance on a fresh window computes a required interval
+// below the floor and therefore stays at exactly the configured refresh, which
+// is what keeps this from changing ordinary single-pane behaviour.
+//
+// MAX_ADAPTIVE_REFRESH_MS is wrapped in Math.max(floorMs, ...) at every exit, so
+// a user who configures a refresh wider than the cap is never silently sped up.
+//
+// `lastShare` defaults to 1, so a caller with no history behaves exactly as this
+// did before it existed: one instance, no adaptation.
+function adaptiveRefreshMs({ budget, sample, restPerTick, floorMs, nowMs, lastShare = 1 }) {
+  if (!budget || !Number.isFinite(budget.remaining) || restPerTick <= 0) return floorMs;
+  if (budget.remaining <= 0) return Math.max(floorMs, MAX_ADAPTIVE_REFRESH_MS);
+
+  const secondsToReset = Math.max(1, (budget.resetMs - nowMs) / 1000);
+  const affordable = (budget.remaining / secondsToReset) * BUDGET_SAFETY;
+  if (affordable <= 0) return Math.max(floorMs, MAX_ADAPTIVE_REFRESH_MS);
+
+  const mine = affordable / inferShare(sample, lastShare);
+  const requiredMs = (restPerTick / mine) * 1000;
+  return Math.min(Math.max(floorMs, requiredMs), Math.max(floorMs, MAX_ADAPTIVE_REFRESH_MS));
+}
+
+// Whether a newly computed target is different enough to act on.
+function adaptiveChangeWorthApplying(appliedMs, targetMs) {
+  if (appliedMs <= 0) return true;
+  const ratio = targetMs / appliedMs;
+  return ratio >= ADAPTIVE_HYSTERESIS || ratio <= 1 / ADAPTIVE_HYSTERESIS;
+}
+
+// REST cost of one tick in this configuration: the active tab every tick, the
+// other three amortised over BACKGROUND_EVERY. Same table and same shape as
+// projectedHourlyCost, so the controller and the report cannot disagree.
+function restPerTick(activeKey) {
+  let cost = REST_PER_FETCH[activeKey] ?? 0;
+  for (const key of TAB_KEYS) {
+    if (key !== activeKey) cost += (REST_PER_FETCH[key] ?? 0) / BACKGROUND_EVERY;
+  }
+  return cost;
+}
+
 function alertArgs(source) {
   return ["api", apiPath(source.path), ...apiHostArgs(), "--jq", source.jq];
 }
@@ -954,6 +1116,18 @@ function alertArgs(source) {
 // the other two, and capped rather than permanent so enabling Advanced Security
 // mid-session is picked up within the hour.
 const alertBackoff = new Map();
+
+// REST calls this process has spent, ever. In-memory and per-process, in the
+// same spirit as alertBackoff above: lost on exit, and nothing depends on it
+// surviving. Only ever compared against itself between two budget probes, so it
+// needs no windowing and cannot overflow in any realistic session.
+//
+// Deliberately incomplete: openItem, preflight and resolveFailureContext also
+// spend, and are not counted, because they are occasional rather than periodic.
+// Under-reporting our own spend makes the inferred share *larger* and so
+// throttles slightly harder than strictly necessary -- the safe direction to err
+// in, which is why the imprecision is tolerated rather than chased.
+let restSpentTotal = 0;
 
 function backoffActive(key, now) {
   const state = alertBackoff.get(key);
@@ -990,13 +1164,20 @@ async function fetchAlertSource(source, signal, now) {
     // The verdict is replayed alongside the note. Replaying only the note left
     // the tab unable to tell "Dependabot is switched off here" from "we cannot
     // see Dependabot" for the whole length of a backoff window.
-    return { raw: `backoff:${note}`, parse: () => ({ alerts: [], note, verdict, truncated: false }) };
+    // Nothing was spawned, so nothing was billed -- which is the whole reason
+    // the meter is fed by the fetchers rather than by counting ticks.
+    return {
+      raw: `backoff:${note}`,
+      spent: 0,
+      parse: () => ({ alerts: [], note, verdict, truncated: false }),
+    };
   }
   try {
     const raw = await runGh(alertArgs(source), { signal });
     clearBackoff(source.key);
     return {
       raw,
+      spent: 1,
       parse: () => {
         const rows = JSON.parse(raw).filter((a) => a.state === "open");
         return {
@@ -1021,6 +1202,9 @@ async function fetchAlertSource(source, signal, now) {
     }
     return {
       raw: `unavailable:${note}`,
+      // A failed call still bills: the request reached GitHub and was counted
+      // whether it returned data, `[]`, or a 403.
+      spent: 1,
       parse: () => ({ alerts: [], note, verdict, truncated: false }),
     };
   }
@@ -1054,6 +1238,10 @@ async function fetchSecurity(signal) {
     // colliding on the same string.
     raw: parts.map((p) => p.raw).join("\0"),
     limit: ALERT_PER_PAGE,
+    // Summed from what each source reported rather than assumed to be
+    // ALERT_SOURCES.length: a source held off by backoff spawned nothing and
+    // must not be billed for it.
+    restSpent: parts.reduce((n, p) => n + p.spent, 0),
     parse: () => {
       const parsed = parts.map((p) => p.parse());
       const alerts = parsed.flatMap((p) => p.alerts);
@@ -1168,6 +1356,7 @@ const DOCTOR_ENV_PLAIN = [
   "NO_PROXY",
   "GH_GLANCE_ICONS",
   "GH_GLANCE_NO_ANIMATION",
+  "GH_GLANCE_REFRESH",
   "NO_COLOR",
   "NODE_ENV",
 ];
@@ -1293,8 +1482,8 @@ function targetSource() {
 
 // How much of the hourly API budget is left, and roughly how fast this
 // configuration spends it. The steady-state cost is not small and was invisible:
-// at the default 5s refresh with the Security tab open it is around 2,200 REST
-// requests an hour -- about 44% of a personal token's 5,000 -- and `--refresh 2`
+// at the default 5s refresh with the Security tab open it is around 2,280 REST
+// requests an hour -- about 46% of a personal token's 5,000 -- and `--refresh 2`
 // projects past the limit outright, so it exhausts inside the hour, every hour.
 // The budget is shared with everything else the token does, so the first symptom
 // is usually "GitHub is broken" somewhere else entirely.
@@ -1305,7 +1494,10 @@ function targetSource() {
 // exactly why this reports the server's own numbers rather than asserting 5,000.
 async function rateBudget() {
   try {
-    const raw = await runGh(["api", "rate_limit"]);
+    // Host-routed like every other `gh api` call: a budget is per token *per
+    // server*, so on a GHES tenant the github.com numbers are not merely stale,
+    // they belong to a different limit entirely.
+    const raw = await runGh(["api", "rate_limit", ...apiHostArgs()]);
     const { resources } = JSON.parse(raw);
     // formatAge() is for timestamps in the past and returns "-" for a future one,
     // so the reset is rendered as a forward interval instead.
@@ -1321,24 +1513,52 @@ async function rateBudget() {
   }
 }
 
+// The same probe as rateBudget, but returning `core` as data rather than a
+// sentence, because the adaptive loop has to do arithmetic on it. rateBudget
+// keeps its own shape: it formats `graphql` too, which the controller does not
+// need, and it is on the --doctor path where a string is the product.
+//
+// Safe to run on a timer for the same reason it is safe on the diagnostic path:
+// `gh api rate_limit` is documented as not counting against the limit, and it
+// measures as free (verified: delta 0).
+async function readCoreBudget(signal) {
+  try {
+    // apiHostArgs() for the same reason the alert endpoints carry it: --repo
+    // host/owner/name sets runtime.host without setting GH_HOST, so without the
+    // flag this reads github.com's budget while the pane spends against the
+    // tenant -- and then throttles, or fails to, against an unrelated number.
+    const raw = await runGh(["api", "rate_limit", ...apiHostArgs()], { signal });
+    const core = JSON.parse(raw)?.resources?.core;
+    if (!core || !Number.isFinite(core.remaining)) return null;
+    return {
+      remaining: core.remaining,
+      limit: core.limit,
+      used: core.used,
+      resetMs: core.reset * 1000,
+    };
+  } catch {
+    // A probe failure must never be louder than the pane's own data: the loop
+    // simply does not adapt this cycle and stays at whatever it last applied.
+    return null;
+  }
+}
+
 // Requests per hour this configuration will spend once it settles, derived from
 // the same constants the poll loop uses rather than from a number written down
 // once and left to rot. The active tab refreshes every tick; the other three
-// every BACKGROUND_EVERY ticks. Security is three REST calls per fetch, Actions
-// one, and Issues/PRs go to GraphQL instead (two POSTs each, because --search
-// routes through the search connection).
+// every BACKGROUND_EVERY ticks. The per-fetch prices come from REST_PER_FETCH
+// and GRAPHQL_PER_FETCH, which are also what the spend meter bills against --
+// two copies of them would diverge the first time one was fixed.
 function projectedHourlyCost(activeKey) {
   const perHour = 3_600_000 / runtime.refreshMs;
-  const restCalls = { actions: 1, issues: 0, prs: 0, security: ALERT_SOURCES.length };
-  const graphqlCalls = { actions: 0, issues: 2, prs: 2, security: 0 };
   let rest = 0;
   let graphql = 0;
   // TAB_KEYS rather than TABS: this runs on the --doctor path, which deliberately
   // returns before the render tree is reached, and TABS is declared down there.
   for (const key of TAB_KEYS) {
     const ticks = key === activeKey ? perHour : perHour / BACKGROUND_EVERY;
-    rest += ticks * restCalls[key];
-    graphql += ticks * graphqlCalls[key];
+    rest += ticks * REST_PER_FETCH[key];
+    graphql += ticks * GRAPHQL_PER_FETCH[key];
   }
   return { rest: Math.round(rest), graphql: Math.round(graphql) };
 }
@@ -1495,6 +1715,11 @@ function parseArgs(argv) {
     doctor: false,
     repo: null,
     refresh: null,
+    // Which surface supplied `refresh`, so validateArgs can name it in the
+    // bounds messages. argv never sets it -- the entry block does, when it
+    // falls back to GH_GLANCE_REFRESH -- but it is declared here so the shape
+    // parseArgs returns stays stated in one place.
+    refreshSource: null,
     tab: null,
     verbose: false,
   };
@@ -1537,13 +1762,16 @@ function validateArgs(opts, tabKeys) {
 
   let refreshMs = null;
   if (opts.refresh !== null) {
+    // Named so the message points at whichever surface supplied the value: the
+    // interval can now come from GH_GLANCE_REFRESH as well as --refresh.
+    const refreshLabel = opts.refreshSource ?? "--refresh";
     const seconds = Number(opts.refresh);
     if (!Number.isFinite(seconds) || !Number.isInteger(seconds)) {
-      throw new Error(`--refresh must be a whole number of seconds, got: ${opts.refresh}`);
+      throw new Error(`${refreshLabel} must be a whole number of seconds, got: ${opts.refresh}`);
     }
     if (seconds < MIN_REFRESH_SECONDS || seconds > MAX_REFRESH_SECONDS) {
       throw new Error(
-        `--refresh must be between ${MIN_REFRESH_SECONDS} and ${MAX_REFRESH_SECONDS} seconds, got: ${seconds}`,
+        `${refreshLabel} must be between ${MIN_REFRESH_SECONDS} and ${MAX_REFRESH_SECONDS} seconds, got: ${seconds}`,
       );
     }
     refreshMs = seconds * 1000;
@@ -1581,8 +1809,9 @@ const KEY_TABLE = [
   ["PgUp / PgDn", "Move a page at a time"],
   ["Enter", "Open the selected item or accept a prompt"],
   ["r", "Refresh the current tab now"],
+  ["w", "Adjust table column widths"],
   ["?", "Show the keys (any key closes it)"],
-  ["q / Esc / Ctrl+C", "Quit"],
+  ["q / Esc / Ctrl+C", "Quit (Esc leaves width mode)"],
 ];
 const KEY_COL = Math.max(...KEY_TABLE.map(([k]) => k.length)) + 3;
 const keyTableLines = () => KEY_TABLE.map(([k, d]) => `${k.padEnd(KEY_COL)}${d}`);
@@ -1643,6 +1872,9 @@ Environment:
   GH_HOST=host              GitHub Enterprise or EMU host to send every call to.
                             A host-qualified GH_REPO does not route \`gh api\`;
                             this and --repo host/owner/name both do.
+  GH_GLANCE_REFRESH=<seconds>
+                            Active-tab poll interval, ${MIN_REFRESH_SECONDS}-${MAX_REFRESH_SECONDS}
+                            (--refresh takes precedence)
   GH_GLANCE_ICONS=unicode   Plain-unicode status icons (no Nerd Font needed)
   GH_GLANCE_NO_ANIMATION=1  Freeze the spinner (no motion)
   NO_COLOR=1                Disable colour (status stays readable)
@@ -1660,7 +1892,20 @@ Environment:
 if (IS_MAIN) {
   let opts;
   try {
-    opts = validateArgs(parseArgs(process.argv.slice(2)), TAB_KEYS);
+    const argvOpts = parseArgs(process.argv.slice(2));
+    // The flag wins, which is the precedence GH_REPO already advertises -- but
+    // not its mechanism: GH_REPO is read at each use site, because `gh` honours
+    // it natively and a repo slug needs no validation. An interval does, so it
+    // is resolved once, here, and substituted before validation -- an
+    // out-of-range GH_GLANCE_REFRESH is then refused by the same two messages
+    // an out-of-range --refresh gets, rather than by a second copy of the
+    // bounds. It still reaches runtime through the one write site below rather
+    // than being assigned beside it.
+    if (argvOpts.refresh === null && process.env.GH_GLANCE_REFRESH) {
+      argvOpts.refresh = process.env.GH_GLANCE_REFRESH;
+      argvOpts.refreshSource = "GH_GLANCE_REFRESH";
+    }
+    opts = validateArgs(argvOpts, TAB_KEYS);
   } catch (err) {
     // Exit 2 for every argv problem, unchanged from when the only possible
     // problem was an unrecognised flag. CI asserts this code.
@@ -1734,10 +1979,10 @@ if (IS_MAIN) {
 }
 
 const ReactModule = await import("react");
-const { render, Box, Text, useStdout, useInput, useStdin, useApp } = await import("ink");
+const { render, measureElement, Box, Text, useStdout, useInput, useStdin, useApp } = await import("ink");
 
 const React = ReactModule.default;
-const { useState, useEffect, useRef } = ReactModule;
+const { useState, useEffect, useMemo, useRef, useCallback } = ReactModule;
 const e = React.createElement;
 
 // The NODE_ENV escape hatch above is genuinely useful -- React's warnings are
@@ -1840,10 +2085,10 @@ const ERROR_TEXT = "red";
 // column is otherwise a private-use codepoint that announces as nothing --
 // leaving every row with no status at all. It is derived from the same lookup
 // that picks the glyph, so the two cannot drift apart.
-function Column({ width, grow, children, bold, color, dim, wrap, label }) {
+function Column({ width, grow, children, bold, color, dim, wrap, label, marginRight = 1 }) {
   return e(
     Box,
-    { width, flexGrow: grow ? 1 : 0, flexShrink: grow ? 1 : 0, marginRight: 1 },
+    { width, flexGrow: grow ? 1 : 0, flexShrink: grow ? 1 : 0, marginRight },
     e(
       Text,
       { bold, color, dimColor: dim, wrap: wrap ?? "truncate-end", "aria-label": label },
@@ -1852,10 +2097,35 @@ function Column({ width, grow, children, bold, color, dim, wrap, label }) {
   );
 }
 
-function HeaderCells({ cells }) {
+// Each descriptor still owns one gutter cell, but an adjustable column owns
+// the edge that faces the flexible TITLE/SUMMARY reservoir. Fixed columns after
+// the grow cell therefore use the preceding descriptor's trailing gutter;
+// fixed columns before it use their own. Keeping this mapping pure lets the
+// pointer phase share the exact same geometry as the visible grips.
+function headerGutterKeyAt(cells, index, growIndex) {
+  if (!Array.isArray(cells) || !Number.isSafeInteger(index) || index < 0 || index >= cells.length) {
+    return null;
+  }
+  if (growIndex < 0) return null;
+  if (index < growIndex) {
+    return isAdjustableWidthColumn(cells[index]) ? cells[index].key : null;
+  }
+  return isAdjustableWidthColumn(cells[index + 1]) ? cells[index + 1].key : null;
+}
+
+function headerGutterKey(cells, index) {
+  const growIndex = Array.isArray(cells)
+    ? cells.findIndex((column) => column.props?.grow)
+    : -1;
+  return headerGutterKeyAt(cells, index, growIndex);
+}
+
+function HeaderCells({ cells, selectedWidthKey = null, headerRef = null }) {
+  const growIndex = cells.findIndex((column) => column.props?.grow);
   return e(
     Box,
     {
+      ref: headerRef,
       flexDirection: "row",
       borderStyle: "single",
       borderTop: false,
@@ -1863,7 +2133,198 @@ function HeaderCells({ cells }) {
       borderRight: false,
       borderColor: BORDER_COLOR,
     },
-    ...cells.map((c, i) => e(Column, { key: i, ...c.props, bold: true, dim: true }, c.label)),
+    ...cells.flatMap((c, index) => {
+      const gripKey = headerGutterKeyAt(cells, index, growIndex);
+      const selected = gripKey !== null && gripKey === selectedWidthKey;
+      return [
+        e(
+          Column,
+          { key: `${c.key}:cell`, ...c.props, bold: true, dim: true, marginRight: 0 },
+          c.label,
+        ),
+        e(
+          Text,
+          {
+            key: `${c.key}:gutter`,
+            color: selected ? TITLE_COLOR : BORDER_COLOR,
+            bold: selected,
+            dimColor: gripKey !== null && !selected,
+            "aria-hidden": true,
+          },
+          gripKey === null ? " " : "│",
+        ),
+      ];
+    }),
+  );
+}
+
+const MemoHeaderCells = React.memo(HeaderCells);
+
+function parseSgrMouse(input) {
+  if (typeof input !== "string") return null;
+  const match = /^\[<(\d+);(\d+);(\d+)([Mm])$/.exec(input);
+  if (!match) return null;
+
+  const code = Number(match[1]);
+  const encodedX = Number(match[2]);
+  const encodedY = Number(match[3]);
+  if (
+    !Number.isSafeInteger(code) ||
+    !Number.isSafeInteger(encodedX) ||
+    !Number.isSafeInteger(encodedY) ||
+    encodedX < 1 ||
+    encodedY < 1 ||
+    (code !== 0 && code !== 32)
+  ) {
+    return null;
+  }
+
+  return {
+    x: encodedX - 1,
+    y: encodedY - 1,
+    action: match[4] === "m" ? "release" : code === 32 ? "drag" : "press",
+  };
+}
+
+function dividerHandles({ header, metrics }) {
+  if (
+    !Array.isArray(header) ||
+    !metrics ||
+    !Number.isSafeInteger(metrics.x) ||
+    !Number.isSafeInteger(metrics.y) ||
+    !Number.isSafeInteger(metrics.width) ||
+    !Number.isSafeInteger(metrics.height) ||
+    metrics.x < 0 ||
+    metrics.y < 0 ||
+    metrics.width < 1 ||
+    metrics.height < 1
+  ) {
+    return [];
+  }
+
+  const growIndexes = header
+    .map((column, index) => column.props?.grow ? index : -1)
+    .filter((index) => index >= 0);
+  if (growIndexes.length !== 1) return [];
+  const growIndex = growIndexes[0];
+  const fixedWidth = header.reduce((sum, column, index) => {
+    if (index === growIndex) return sum;
+    return Number.isSafeInteger(column.props?.width) && column.props.width >= 0
+      ? sum + column.props.width
+      : Number.NaN;
+  }, 0);
+  const growWidth = metrics.width - header.length - fixedWidth;
+  const yEnd = metrics.y + metrics.height;
+  if (!Number.isSafeInteger(growWidth) || growWidth < 0 || !Number.isSafeInteger(yEnd)) return [];
+
+  const handles = [];
+  let x = metrics.x;
+  for (let index = 0; index < header.length; index += 1) {
+    const contentWidth = index === growIndex ? growWidth : header[index].props.width;
+    const gutterX = x + contentWidth;
+    const key = headerGutterKeyAt(header, index, growIndex);
+    if (key !== null) {
+      const ownerIndex = index < growIndex ? index : index + 1;
+      const owner = header[ownerIndex];
+      if (!isAdjustableWidthColumn(owner) || owner.key !== key) return [];
+      handles.push({
+        key,
+        x: gutterX,
+        yStart: metrics.y,
+        yEnd,
+        width: owner.props.width,
+        direction: ownerIndex < growIndex ? 1 : -1,
+      });
+    }
+    x = gutterX + 1;
+  }
+  return handles;
+}
+
+function hitDivider(handles, point, tolerance = 1) {
+  if (
+    !Array.isArray(handles) ||
+    !point ||
+    !Number.isSafeInteger(point.x) ||
+    !Number.isSafeInteger(point.y) ||
+    !Number.isSafeInteger(tolerance) ||
+    tolerance < 0
+  ) {
+    return null;
+  }
+
+  let nearest = null;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  for (const handle of handles) {
+    if (
+      !Number.isSafeInteger(handle?.x) ||
+      !Number.isSafeInteger(handle.yStart) ||
+      !Number.isSafeInteger(handle.yEnd) ||
+      point.y < handle.yStart ||
+      point.y >= handle.yEnd
+    ) {
+      continue;
+    }
+    const distance = Math.abs(point.x - handle.x);
+    if (
+      distance <= tolerance &&
+      (distance < nearestDistance ||
+        (distance === nearestDistance && (nearest === null || handle.x < nearest.x)))
+    ) {
+      nearest = handle;
+      nearestDistance = distance;
+    }
+  }
+  return nearest;
+}
+
+function beginDividerDrag({ event, handles, tabKey, tolerance = 1 }) {
+  if (event?.action !== "press" || typeof tabKey !== "string" || tabKey.length === 0) {
+    return null;
+  }
+  const handle = hitDivider(handles, event, tolerance);
+  if (!handle) return null;
+  return {
+    tabKey,
+    key: handle.key,
+    startX: event.x,
+    startWidth: handle.width,
+    direction: handle.direction,
+  };
+}
+
+function draggedWidth({
+  drag,
+  event,
+  tabKey,
+  fullHeaderVisible,
+  layoutValid = true,
+}) {
+  if (
+    !drag ||
+    event?.action !== "drag" ||
+    drag.tabKey !== tabKey ||
+    fullHeaderVisible !== true ||
+    layoutValid !== true ||
+    !Number.isSafeInteger(drag.startX) ||
+    !Number.isSafeInteger(drag.startWidth) ||
+    (drag.direction !== 1 && drag.direction !== -1) ||
+    !Number.isSafeInteger(event.x)
+  ) {
+    return null;
+  }
+  const nextWidth = drag.startWidth + drag.direction * (event.x - drag.startX);
+  return Number.isSafeInteger(nextWidth) ? { key: drag.key, nextWidth } : null;
+}
+
+function sameElementMetrics(left, right) {
+  return (
+    left != null &&
+    right != null &&
+    left.x === right.x &&
+    left.y === right.y &&
+    left.width === right.width &&
+    left.height === right.height
   );
 }
 
@@ -1986,23 +2447,23 @@ function runStatusIcon(run, spin) {
 }
 
 const ACTIONS_HEADER = [
-  { label: "", props: { width: 3 } },
-  { label: "TITLE", props: { grow: true } },
-  { label: "WORKFLOW", props: { width: 10 } },
-  { label: "BRANCH", props: { width: 14 } },
-  { label: "TIME", props: { width: 7 } },
-  { label: "UPDATED", props: { width: 8 } },
+  { key: "status", label: "", props: { width: 3 }, adjustable: false },
+  { key: "title", label: "TITLE", props: { grow: true }, adjustable: false },
+  { key: "workflow", label: "WORKFLOW", props: { width: 10 }, adjustable: true, minWidth: 5 },
+  { key: "branch", label: "BRANCH", props: { width: 14 }, adjustable: true, minWidth: 6 },
+  { key: "time", label: "TIME", props: { width: 7 }, adjustable: true, minWidth: 5 },
+  { key: "updated", label: "UPDATED", props: { width: 8 }, adjustable: true, minWidth: 6 },
 ];
 
 // Dropped in order of least value first: BRANCH and WORKFLOW are inferable
 // from the title far more often than the status icon or the age are.
 const ACTIONS_HEADER_COMPACT = [
-  { label: "", props: { width: 3 } },
-  { label: "TITLE", props: { grow: true } },
-  { label: "UPDATED", props: { width: 8 } },
+  { key: "status", label: "", props: { width: 3 } },
+  { key: "title", label: "TITLE", props: { grow: true } },
+  { key: "updated", label: "UPDATED", props: { width: 8 } },
 ];
 
-function ActionsRow({ item, now, spin, compact, cursor }) {
+function ActionsRow({ item, now, spin, compact, cursor, columns }) {
   const { icon, color, label } = runStatusIcon(item, spin);
   const started = new Date(item.startedAt);
   const finished = item.status === "completed" ? new Date(item.updatedAt) : now;
@@ -2010,52 +2471,52 @@ function ActionsRow({ item, now, spin, compact, cursor }) {
     return e(
       Box,
       { flexDirection: "row" },
-      e(Column, { width: 3, color, label }, `${cursor ? ">" : " "}${icon}`),
-      e(Column, { grow: true }, item.displayTitle),
-      e(Column, { width: 8, dim: true }, formatAge(new Date(item.updatedAt), now)),
+      e(Column, { ...columnProps(columns, "status"), color, label }, `${cursor ? ">" : " "}${icon}`),
+      e(Column, columnProps(columns, "title"), item.displayTitle),
+      e(Column, { ...columnProps(columns, "updated"), dim: true }, formatAge(new Date(item.updatedAt), now)),
     );
   }
   return e(
     Box,
     { flexDirection: "row" },
-    e(Column, { width: 3, color, label }, `${cursor ? ">" : " "}${icon}`),
-    e(Column, { grow: true }, item.displayTitle),
+    e(Column, { ...columnProps(columns, "status"), color, label }, `${cursor ? ">" : " "}${icon}`),
+    e(Column, columnProps(columns, "title"), item.displayTitle),
     // The run number is the actionable half and used to be the first thing
     // truncation ate, since it sat at the tail of a 10-column cell.
-    e(Column, { width: 10, color: IDENTIFIER }, `#${item.number} ${item.workflowName}`),
-    e(Column, { width: 14, color: REF, wrap: "truncate-middle" }, item.headBranch),
-    e(Column, { width: 7 }, formatDuration(finished - started)),
-    e(Column, { width: 8, dim: true }, formatAge(new Date(item.updatedAt), now)),
+    e(Column, { ...columnProps(columns, "workflow"), color: IDENTIFIER }, `#${item.number} ${item.workflowName}`),
+    e(Column, { ...columnProps(columns, "branch"), color: REF, wrap: "truncate-middle" }, item.headBranch),
+    e(Column, columnProps(columns, "time"), formatDuration(finished - started)),
+    e(Column, { ...columnProps(columns, "updated"), dim: true }, formatAge(new Date(item.updatedAt), now)),
   );
 }
 
 // ---------- Issues tab ----------
 
 const ISSUES_HEADER = [
-  { label: "", props: { width: 3 } },
-  { label: "TITLE", props: { grow: true } },
-  { label: "AUTHOR", props: { width: 12 } },
-  { label: "LABEL", props: { width: 14 } },
-  { label: "UPDATED", props: { width: 8 } },
+  { key: "status", label: "", props: { width: 3 }, adjustable: false },
+  { key: "title", label: "TITLE", props: { grow: true }, adjustable: false },
+  { key: "author", label: "AUTHOR", props: { width: 12 }, adjustable: true, minWidth: 6 },
+  { key: "label", label: "LABEL", props: { width: 14 }, adjustable: true, minWidth: 6 },
+  { key: "updated", label: "UPDATED", props: { width: 8 }, adjustable: true, minWidth: 6 },
 ];
 
 const ISSUES_HEADER_COMPACT = [
-  { label: "", props: { width: 3 } },
-  { label: "TITLE", props: { grow: true } },
-  { label: "UPDATED", props: { width: 8 } },
+  { key: "status", label: "", props: { width: 3 } },
+  { key: "title", label: "TITLE", props: { grow: true } },
+  { key: "updated", label: "UPDATED", props: { width: 8 } },
 ];
 
-function IssueRow({ item, now, compact, cursor }) {
+function IssueRow({ item, now, compact, cursor, columns }) {
   const cells = [
-    e(Column, { key: "i", width: 3, color: OK, label: "open issue" }, `${cursor ? ">" : " "}${OCT.issueOpened}`),
-    e(Column, { key: "t", grow: true }, `#${item.number} ${item.title}`),
+    e(Column, { key: "status", ...columnProps(columns, "status"), color: OK, label: "open issue" }, `${cursor ? ">" : " "}${OCT.issueOpened}`),
+    e(Column, { key: "title", ...columnProps(columns, "title") }, `#${item.number} ${item.title}`),
   ];
   if (!compact) {
-    cells.push(e(Column, { key: "a", width: 12, color: IDENTIFIER }, item.author));
-    cells.push(e(Column, { key: "l", width: 14, color: REF }, item.label));
+    cells.push(e(Column, { key: "author", ...columnProps(columns, "author"), color: IDENTIFIER }, item.author));
+    cells.push(e(Column, { key: "label", ...columnProps(columns, "label"), color: REF }, item.label));
   }
   cells.push(
-    e(Column, { key: "u", width: 8, dim: true }, formatAge(new Date(item.updatedAt), now)),
+    e(Column, { key: "updated", ...columnProps(columns, "updated"), dim: true }, formatAge(new Date(item.updatedAt), now)),
   );
   return e(Box, { flexDirection: "row" }, ...cells);
 }
@@ -2063,18 +2524,18 @@ function IssueRow({ item, now, compact, cursor }) {
 // ---------- Pull requests tab ----------
 
 const PRS_HEADER = [
-  { label: "", props: { width: 3 } },
-  { label: "TITLE", props: { grow: true } },
-  { label: "AUTHOR", props: { width: 12 } },
-  { label: "BRANCH", props: { width: 14 } },
-  { label: "REVIEW", props: { width: 10 } },
-  { label: "UPDATED", props: { width: 8 } },
+  { key: "status", label: "", props: { width: 3 }, adjustable: false },
+  { key: "title", label: "TITLE", props: { grow: true }, adjustable: false },
+  { key: "author", label: "AUTHOR", props: { width: 12 }, adjustable: true, minWidth: 6 },
+  { key: "branch", label: "BRANCH", props: { width: 14 }, adjustable: true, minWidth: 6 },
+  { key: "review", label: "REVIEW", props: { width: 10 }, adjustable: true, minWidth: 7 },
+  { key: "updated", label: "UPDATED", props: { width: 8 }, adjustable: true, minWidth: 6 },
 ];
 
 const PRS_HEADER_COMPACT = [
-  { label: "", props: { width: 3 } },
-  { label: "TITLE", props: { grow: true } },
-  { label: "REVIEW", props: { width: 10 } },
+  { key: "status", label: "", props: { width: 3 } },
+  { key: "title", label: "TITLE", props: { grow: true } },
+  { key: "review", label: "REVIEW", props: { width: 10 } },
 ];
 
 const REVIEW_LABEL = {
@@ -2084,25 +2545,25 @@ const REVIEW_LABEL = {
 };
 const REVIEW_NONE = { label: "", color: INERT };
 
-function PRRow({ item, now, compact, cursor }) {
+function PRRow({ item, now, compact, cursor, columns }) {
   const prIcon = item.isDraft
     ? { icon: OCT.pullRequestDraft, color: INERT, label: "draft pull request" }
     : { icon: OCT.pullRequest, color: OK, label: "open pull request" };
   const review = pick(REVIEW_LABEL, item.reviewDecision, REVIEW_NONE);
   const cells = [
-    e(Column, { key: "i", width: 3, color: prIcon.color, label: prIcon.label }, `${cursor ? ">" : " "}${prIcon.icon}`),
-    e(Column, { key: "t", grow: true }, `#${item.number} ${item.title}`),
+    e(Column, { key: "status", ...columnProps(columns, "status"), color: prIcon.color, label: prIcon.label }, `${cursor ? ">" : " "}${prIcon.icon}`),
+    e(Column, { key: "title", ...columnProps(columns, "title") }, `#${item.number} ${item.title}`),
   ];
   if (!compact) {
-    cells.push(e(Column, { key: "a", width: 12, color: IDENTIFIER }, item.author));
+    cells.push(e(Column, { key: "author", ...columnProps(columns, "author"), color: IDENTIFIER }, item.author));
     cells.push(
-      e(Column, { key: "b", width: 14, color: REF, wrap: "truncate-middle" }, item.headRefName),
+      e(Column, { key: "branch", ...columnProps(columns, "branch"), color: REF, wrap: "truncate-middle" }, item.headRefName),
     );
   }
-  cells.push(e(Column, { key: "r", width: 10, color: review.color }, review.label));
+  cells.push(e(Column, { key: "review", ...columnProps(columns, "review"), color: review.color }, review.label));
   if (!compact) {
     cells.push(
-      e(Column, { key: "u", width: 8, dim: true }, formatAge(new Date(item.updatedAt), now)),
+      e(Column, { key: "updated", ...columnProps(columns, "updated"), dim: true }, formatAge(new Date(item.updatedAt), now)),
     );
   }
   return e(Box, { flexDirection: "row" }, ...cells);
@@ -2116,19 +2577,19 @@ function PRRow({ item, now, compact, cursor }) {
 // text column states it outright; the width comes out of PACKAGE / FILE, whose
 // contents were already being truncated.
 const SECURITY_HEADER = [
-  { label: "", props: { width: 3 } },
-  { label: "SEV", props: { width: 4 } },
-  { label: "PACKAGE / FILE", props: { width: 16 } },
-  { label: "SUMMARY", props: { grow: true } },
-  { label: "AGE", props: { width: 8 } },
+  { key: "status", label: "", props: { width: 3 }, adjustable: false },
+  { key: "severity", label: "SEV", props: { width: 4 }, adjustable: false },
+  { key: "package", label: "PACKAGE / FILE", props: { width: 16 }, adjustable: true, minWidth: 6 },
+  { key: "summary", label: "SUMMARY", props: { grow: true }, adjustable: false },
+  { key: "age", label: "AGE", props: { width: 8 }, adjustable: true, minWidth: 6 },
 ];
 
 // SEV is the last thing to drop on this tab: it is the whole point of the pane
 // and the only non-colour severity channel.
 const SECURITY_HEADER_COMPACT = [
-  { label: "", props: { width: 3 } },
-  { label: "SEV", props: { width: 4 } },
-  { label: "SUMMARY", props: { grow: true } },
+  { key: "status", label: "", props: { width: 3 } },
+  { key: "severity", label: "SEV", props: { width: 4 } },
+  { key: "summary", label: "SUMMARY", props: { grow: true } },
 ];
 
 const SEVERITY_STYLE = {
@@ -2141,19 +2602,19 @@ const SEVERITY_STYLE = {
 };
 const SEVERITY_UNKNOWN = SEVERITY_STYLE.unknown;
 
-function SecurityRow({ item, now, compact, cursor }) {
+function SecurityRow({ item, now, compact, cursor, columns }) {
   const sev = pick(SEVERITY_STYLE, item.severity, SEVERITY_UNKNOWN);
   const cells = [
-    e(Column, { key: "i", width: 3, color: sev.color, label: `${sev.short} severity` }, `${cursor ? ">" : " "}${OCT.shield}`),
-    e(Column, { key: "s", width: 4, color: sev.color }, sev.short),
+    e(Column, { key: "status", ...columnProps(columns, "status"), color: sev.color, label: `${sev.short} severity` }, `${cursor ? ">" : " "}${OCT.shield}`),
+    e(Column, { key: "severity", ...columnProps(columns, "severity"), color: sev.color }, sev.short),
   ];
   if (!compact) {
-    cells.push(e(Column, { key: "p", width: 16, color: IDENTIFIER }, item.detail || item.kind));
+    cells.push(e(Column, { key: "package", ...columnProps(columns, "package"), color: IDENTIFIER }, item.detail || item.kind));
   }
-  cells.push(e(Column, { key: "t", grow: true }, item.title));
+  cells.push(e(Column, { key: "summary", ...columnProps(columns, "summary") }, item.title));
   if (!compact) {
     cells.push(
-      e(Column, { key: "a", width: 8, dim: true }, formatAge(new Date(item.createdAt), now)),
+      e(Column, { key: "age", ...columnProps(columns, "age"), dim: true }, formatAge(new Date(item.createdAt), now)),
     );
   }
   return e(Box, { flexDirection: "row" }, ...cells);
@@ -2214,6 +2675,181 @@ const TABS = [
   },
 ];
 
+function tabForKey(key) {
+  return TABS.find((tab) => tab.key === key);
+}
+
+const EMPTY_WIDTH_OVERRIDES = Object.freeze({});
+
+function columnProps(columns, key) {
+  const column = columns.find((candidate) => candidate.key === key);
+  if (!column) throw new Error(`Unknown column: ${key}`);
+  return column.props;
+}
+
+function isAdjustableWidthColumn(column) {
+  return (
+    column?.adjustable &&
+    Number.isSafeInteger(column.props.width) &&
+    Number.isSafeInteger(column.minWidth)
+  );
+}
+
+function adjustableWidthKeys(tab) {
+  if (!tab || !Array.isArray(tab.header)) return [];
+  return tab.header.filter(isAdjustableWidthColumn).map((column) => column.key);
+}
+
+function selectWidthKey(tab, rememberedKey = null) {
+  const keys = adjustableWidthKeys(tab);
+  return keys.includes(rememberedKey) ? rememberedKey : (keys[0] ?? null);
+}
+
+function cycleWidthKey(tab, selectedKey, direction) {
+  if (!Number.isSafeInteger(direction) || direction === 0) return selectWidthKey(tab, selectedKey);
+  const keys = adjustableWidthKeys(tab);
+  if (keys.length === 0) return null;
+  const current = keys.indexOf(selectedKey);
+  if (current < 0) return direction > 0 ? keys[0] : keys[keys.length - 1];
+  return keys[(current + Math.sign(direction) + keys.length) % keys.length];
+}
+
+function resolveHeader(base, overrides = EMPTY_WIDTH_OVERRIDES) {
+  let changed = false;
+  const resolved = base.map((column) => {
+    if (
+      !isAdjustableWidthColumn(column) ||
+      overrides == null ||
+      !Object.hasOwn(overrides, column.key) ||
+      !Number.isSafeInteger(overrides[column.key])
+    ) {
+      return column;
+    }
+
+    const width = Math.max(column.minWidth, overrides[column.key]);
+    if (width === column.props.width) return column;
+    changed = true;
+    return { ...column, props: { ...column.props, width } };
+  });
+  return changed ? resolved : base;
+}
+
+function fitHeaderToFrame(preferred, defaults, frameCols) {
+  const preferredFloor = minimumWidthFor(preferred);
+  if (preferredFloor <= frameCols) return preferred;
+  if (minimumWidthFor(defaults) > frameCols) return null;
+
+  let remaining = preferredFloor - frameCols;
+  return preferred.map((column) => {
+    if (remaining <= 0 || !Number.isSafeInteger(column.props.width)) return column;
+    const defaultColumn = defaults.find((candidate) => candidate.key === column.key);
+    const defaultWidth = defaultColumn?.props.width;
+    if (!Number.isSafeInteger(defaultWidth) || column.props.width <= defaultWidth) return column;
+
+    const shrinkBy = Math.min(remaining, column.props.width - defaultWidth);
+    remaining -= shrinkBy;
+    return { ...column, props: { ...column.props, width: column.props.width - shrinkBy } };
+  });
+}
+
+function effectiveHeaderFor(tab, tabOverrides, frameCols) {
+  return fitHeaderToFrame(
+    resolveHeader(tab.header, tabOverrides),
+    tab.header,
+    frameCols,
+  );
+}
+
+function adjustWidth({ header, key, delta, frameCols }) {
+  if (!Number.isSafeInteger(delta) || delta === 0 || !Number.isSafeInteger(frameCols)) return header;
+  const index = header.findIndex((column) => column.key === key);
+  if (index < 0) return header;
+
+  const column = header[index];
+  if (!isAdjustableWidthColumn(column)) return header;
+
+  const available = Math.max(0, frameCols - minimumWidthFor(header));
+  const maximum = column.props.width + available;
+  const width = Math.min(maximum, Math.max(column.minWidth, column.props.width + delta));
+  if (width === column.props.width) return header;
+
+  const adjusted = [...header];
+  adjusted[index] = { ...column, props: { ...column.props, width } };
+  return adjusted;
+}
+
+function removeWidthOverride(overrides, tabKey, key) {
+  if (!isRecord(overrides)) return overrides;
+  const tabOverrides = overrides[tabKey];
+  if (!isRecord(tabOverrides) || !Object.hasOwn(tabOverrides, key)) return overrides;
+
+  const nextTab = { ...tabOverrides };
+  delete nextTab[key];
+  if (Object.keys(nextTab).length > 0) return { ...overrides, [tabKey]: nextTab };
+
+  const next = { ...overrides };
+  delete next[tabKey];
+  return next;
+}
+
+// One immutable preference reducer for keyboard deltas and the pointer phase's
+// absolute drag snapshots. The optional geometry arguments are the live fitted
+// header and frame budget; omitting them gives unit callers semantic-minimum
+// clamping without inventing a terminal width.
+function updateWidthPreference({
+  overrides,
+  tab,
+  key,
+  nextWidth,
+  effectiveHeader,
+  frameCols,
+}) {
+  if (!isRecord(overrides) || !tab || !Array.isArray(tab.header) || !Number.isSafeInteger(nextWidth)) {
+    return overrides;
+  }
+  const defaultColumn = tab.header.find((column) => column.key === key);
+  if (!isAdjustableWidthColumn(defaultColumn)) return overrides;
+
+  const tabOverrides = isRecord(overrides[tab.key]) ? overrides[tab.key] : EMPTY_WIDTH_OVERRIDES;
+  const currentHeader = Array.isArray(effectiveHeader)
+    ? effectiveHeader
+    : resolveHeader(tab.header, tabOverrides);
+  const currentColumn = currentHeader.find((column) => column.key === key);
+  if (!isAdjustableWidthColumn(currentColumn)) return overrides;
+
+  const delta = nextWidth - currentColumn.props.width;
+  const liveFrameCols = Number.isSafeInteger(frameCols)
+    ? frameCols
+    : minimumWidthFor(currentHeader) + Math.max(0, delta);
+  const adjusted = adjustWidth({ header: currentHeader, key, delta, frameCols: liveFrameCols });
+  if (adjusted === currentHeader) return overrides;
+  const width = adjusted.find((column) => column.key === key).props.width;
+  const hasOverride = Object.hasOwn(tabOverrides, key);
+
+  if (width === defaultColumn.props.width) {
+    return removeWidthOverride(overrides, tab.key, key);
+  }
+
+  if (hasOverride && tabOverrides[key] === width) return overrides;
+  return { ...overrides, [tab.key]: { ...tabOverrides, [key]: width } };
+}
+
+function resetWidthPreference(overrides, tabKey, key) {
+  if (!isRecord(overrides)) return overrides;
+  const tab = tabForKey(tabKey);
+  const column = tab?.header.find((candidate) => candidate.key === key);
+  if (!isAdjustableWidthColumn(column)) return overrides;
+  return removeWidthOverride(overrides, tabKey, key);
+}
+
+function resetTabWidthPreferences(overrides, tabKey) {
+  if (!isRecord(overrides) || !Object.hasOwn(overrides, tabKey)) return overrides;
+  if (!tabForKey(tabKey)) return overrides;
+  const next = { ...overrides };
+  delete next[tabKey];
+  return next;
+}
+
 // The narrowest width each tab's table can render without its fixed columns
 // overflowing the frame. Derived from the header descriptors rather than
 // hard-coded, so adding or resizing a column cannot silently invalidate it.
@@ -2226,6 +2862,227 @@ function minimumWidthFor(header) {
   // + 2 border verticals, + 2 paddingX, + at least 4 columns for TITLE.
   return fixed + 8;
 }
+
+// ---------- Width preferences ----------
+
+const WIDTH_PREFERENCES_VERSION = 1;
+let widthPreferenceTempSequence = 0;
+
+function widthPreferencesPath({
+  env = process.env,
+  platform = process.platform,
+  home = homedir(),
+} = {}) {
+  const xdgRoot = env?.XDG_CONFIG_HOME;
+  const root =
+    typeof xdgRoot === "string" && xdgRoot.length > 0 && isAbsolute(xdgRoot)
+      ? xdgRoot
+      : platform === "darwin"
+        ? join(home, "Library", "Application Support")
+        : join(home, ".config");
+  return join(root, "gh-glance", "preferences.json");
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeWidthOverrides(overrides, tabs = TABS, { omitDefaults = false } = {}) {
+  if (!isRecord(overrides)) return {};
+
+  const normalized = {};
+  for (const tab of tabs) {
+    if (!Object.hasOwn(overrides, tab.key) || !isRecord(overrides[tab.key])) continue;
+
+    const source = overrides[tab.key];
+    const tabOverrides = {};
+    for (const column of tab.header) {
+      if (!isAdjustableWidthColumn(column) || !Object.hasOwn(source, column.key)) continue;
+      const width = source[column.key];
+      if (!Number.isSafeInteger(width) || width < column.minWidth) continue;
+      if (omitDefaults && width === column.props.width) continue;
+      tabOverrides[column.key] = width;
+    }
+    if (Object.keys(tabOverrides).length > 0) normalized[tab.key] = tabOverrides;
+  }
+  return normalized;
+}
+
+function decodeWidthPreferences(raw, tabs = TABS) {
+  let document;
+  try {
+    document = JSON.parse(raw);
+  } catch (error) {
+    return { preferences: {}, error };
+  }
+
+  if (
+    !isRecord(document) ||
+    !Object.hasOwn(document, "version") ||
+    document.version !== WIDTH_PREFERENCES_VERSION ||
+    !Object.hasOwn(document, "tabs") ||
+    !isRecord(document.tabs)
+  ) {
+    return { preferences: {}, error: new Error("Unsupported width preferences document") };
+  }
+
+  return { preferences: normalizeWidthOverrides(document.tabs, tabs), error: null };
+}
+
+function parseWidthPreferences(raw, tabs = TABS) {
+  return decodeWidthPreferences(raw, tabs).preferences;
+}
+
+function serializeWidthPreferences(overrides, tabs = TABS) {
+  const document = {
+    version: WIDTH_PREFERENCES_VERSION,
+    tabs: normalizeWidthOverrides(overrides, tabs, { omitDefaults: true }),
+  };
+  return `${JSON.stringify(document, null, 2)}\n`;
+}
+
+function loadWidthPreferences(path, tabs = TABS) {
+  let raw;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    return error?.code === "ENOENT"
+      ? { preferences: {}, error: null }
+      : { preferences: {}, error };
+  }
+  return decodeWidthPreferences(raw, tabs);
+}
+
+function saveWidthPreferences(path, overrides, tabs = TABS) {
+  let tempPath = null;
+  try {
+    const payload = serializeWidthPreferences(overrides, tabs);
+    const parent = dirname(path);
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    widthPreferenceTempSequence += 1;
+    tempPath = `${path}.${process.pid}.${Date.now()}.${widthPreferenceTempSequence}.tmp`;
+    writeFileSync(tempPath, payload, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    renameSync(tempPath, path);
+    return { ok: true };
+  } catch (error) {
+    if (tempPath !== null) {
+      try {
+        unlinkSync(tempPath);
+      } catch {
+        // The write may have failed before creating it. Cleanup is best effort
+        // and deliberately targets only this operation's exact temporary file.
+      }
+    }
+    return { ok: false, error };
+  }
+}
+
+function createWidthPreferenceWriter({ write, delay = 200, onResult = () => {} }) {
+  let latest = EMPTY_WIDTH_OVERRIDES;
+  let generation = 0;
+  let persistedGeneration = 0;
+  let timer = null;
+  let flushPromise = null;
+
+  function report(result) {
+    try {
+      onResult(result);
+    } catch {
+      // Persistence reporting is advisory and must not reach Ink's render path.
+    }
+    return result;
+  }
+
+  function failed(error) {
+    return { ok: false, error };
+  }
+
+  async function writeGeneration(value) {
+    let pending;
+    try {
+      // Keep this call before the first await. The production writer is
+      // synchronous, so an unmount flush completes the filesystem replacement
+      // before React hands terminal teardown back to its caller.
+      pending = write(value);
+    } catch (error) {
+      return failed(error);
+    }
+
+    try {
+      const result = await pending;
+      return result?.ok === false ? result : (result ?? { ok: true });
+    } catch (error) {
+      return failed(error);
+    }
+  }
+
+  async function drain() {
+    let result = { ok: true, written: false };
+    while (persistedGeneration < generation) {
+      const attemptedGeneration = generation;
+      const value = latest;
+      result = await writeGeneration(value);
+
+      const isLatest = attemptedGeneration === generation;
+      if (result.ok !== false) {
+        persistedGeneration = Math.max(persistedGeneration, attemptedGeneration);
+      }
+
+      // The loop serializes a superseding write behind this completion, so its
+      // result owns the warning state. A stale completion is deliberately not
+      // reported, while async replacements can neither race on disk nor report
+      // out of order.
+      if (!isLatest) continue;
+      report(result);
+      // Leave the latest generation dirty after failure. A later flush/dispose
+      // retries it; concurrent callers still share this completed attempt.
+      if (result.ok === false) return result;
+    }
+    return result;
+  }
+
+  function flush() {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (flushPromise !== null) return flushPromise;
+    if (persistedGeneration >= generation) {
+      return Promise.resolve({ ok: true, written: false });
+    }
+
+    const pending = drain().finally(() => {
+      if (flushPromise === pending) flushPromise = null;
+    });
+    flushPromise = pending;
+    return pending;
+  }
+
+  function schedule(value) {
+    latest = value;
+    generation += 1;
+    if (timer === null) {
+      timer = setTimeout(() => {
+        timer = null;
+        void flush();
+      }, delay);
+      timer.unref?.();
+    } else {
+      timer.refresh();
+    }
+  }
+
+  return {
+    schedule,
+    flush,
+    dispose: flush,
+  };
+}
+
 // Below this the full column set cannot render without its fixed columns
 // overflowing the frame -- rows hard-wrap and ink switches to clearing and
 // repainting the whole screen every frame. Worse, in the band just above the
@@ -2314,6 +3171,7 @@ const KEY_HINTS = [
   { label: "Move", keys: "↑↓" },
   { label: "Open", keys: "Ent" },
   { label: "Refresh", keys: "r" },
+  { label: "Width", keys: "w" },
   { label: "Quit", keys: "q" },
 ];
 
@@ -2340,6 +3198,26 @@ const REMOTE_SETUP_NONINTERACTIVE_LINES = [
 // finishes. Wide enough for the spinner, a space and "Fetching".
 const FETCHING_WIDTH = 12;
 
+function widthStatusText({ label, width, cols, saveError = false }) {
+  const budget = Number.isSafeInteger(cols) ? Math.max(0, cols) : 0;
+  const safeLabel = String(label ?? "").replace(/[^\x20-\x7e]/g, "?");
+  const safeWidth = Number.isSafeInteger(width) ? String(width) : "?";
+  const variants = saveError
+    ? [
+        `Width: ${safeLabel} ${safeWidth}  Widths not saved`,
+        `${safeLabel} ${safeWidth}  Widths not saved`,
+        "Widths not saved",
+      ]
+    : [
+        `Width: ${safeLabel} ${safeWidth}  Tab select  <- -> resize  r reset  Esc done`,
+        `Width: ${safeLabel} ${safeWidth}  <- -> resize  r reset  Esc done`,
+        `${safeLabel} ${safeWidth}  <- ->  r reset  Esc done`,
+        `${safeLabel} ${safeWidth} <- -> r Esc`,
+      ];
+  const fitting = variants.find((variant) => variant.length <= budget);
+  return fitting ?? variants[variants.length - 1].slice(0, budget);
+}
+
 // Compact drops the labels and keeps the keys, separated by a space:
 // "↑↓ Ent r q". No constant for its width -- nothing branches on it, and the
 // keys are short enough that it fits anywhere the frame itself does.
@@ -2356,7 +3234,37 @@ const FETCHING_WIDTH = 12;
 // finding at a glance, so they get the accent colour and the words describing
 // them stay dim. The accent is the panel-title cyan rather than the amber used
 // for in-progress status, so amber means exactly one thing across the product.
-function StatusBar({ fetching, spin, stale, interactive, cols, remoteSetup = false }) {
+function StatusBar({
+  fetching,
+  spin,
+  stale,
+  throttle,
+  interactive,
+  cols,
+  remoteSetup = false,
+  widthMode = false,
+  widthColumn = null,
+  widthSaveError = null,
+}) {
+  // Width mode owns the whole bar, so the throttle badge is deliberately not
+  // shown here: this state is transient and explicitly entered, and the widened
+  // interval is still reported the moment the user leaves it.
+  if (widthMode && widthColumn) {
+    return e(
+      Box,
+      { flexDirection: "row" },
+      e(
+        Text,
+        { color: widthSaveError ? ATTENTION : undefined, wrap: "truncate-end" },
+        widthStatusText({
+          label: widthColumn.label,
+          width: widthColumn.props.width,
+          cols,
+          saveError: Boolean(widthSaveError),
+        }),
+      ),
+    );
+  }
   // Without raw mode none of the key handlers run, so advertising them would be
   // telling the user something untrue about what the app can do. Ctrl+C still
   // works there, because the tty delivers a real SIGINT.
@@ -2392,6 +3300,12 @@ function StatusBar({ fetching, spin, stale, interactive, cols, remoteSetup = fal
     // is worth getting the column back for the other 99% of the time.
     stale
       ? e(Box, { marginRight: 1, flexShrink: 0 }, e(Text, { color: ATTENTION }, stale))
+      : null,
+    // Same free-slot treatment as `stale` above. Dim rather than ATTENTION: a
+    // widened interval is the throttle working, not a failure, and colouring it
+    // like a problem would send the user looking for one.
+    throttle
+      ? e(Box, { marginRight: 1, flexShrink: 0 }, e(Text, { dimColor: true }, throttle))
       : null,
     ...hints
       .flatMap((hint, i) => [
@@ -2462,8 +3376,39 @@ function useTerminalSize(stdout) {
 function App({ onCreateRemote = () => {} } = {}) {
   const { stdout } = useStdout();
   const { isRawModeSupported } = useStdin();
-  const { exit } = useApp();
+  const { exit, suspendTerminal } = useApp();
   const [activeIndex, setActiveIndex] = useState(runtime.initialTabIndex);
+  const [preferencePath] = useState(() => widthPreferencesPath());
+  const [widthOverrides, setWidthOverrides] = useState(
+    () => loadWidthPreferences(preferencePath).preferences,
+  );
+  const widthOverridesRef = useRef(widthOverrides);
+  widthOverridesRef.current = widthOverrides;
+  const [widthSaveError, setWidthSaveError] = useState(null);
+  const widthPreferencesMountedRef = useRef(true);
+  const [widthPreferenceWriter] = useState(() =>
+    createWidthPreferenceWriter({
+      write: (overrides) => saveWidthPreferences(preferencePath, overrides),
+      onResult: (result) => {
+        if (!widthPreferencesMountedRef.current) return;
+        setWidthSaveError(
+          result?.ok === false
+            ? (result.error ?? new Error("Width preferences could not be saved"))
+            : null,
+        );
+      },
+    }),
+  );
+  useEffect(() => {
+    widthPreferencesMountedRef.current = true;
+    return () => {
+      // saveWidthPreferences() itself runs synchronously inside dispose(), but
+      // writer result reporting settles through a promise. Mark unmounted first
+      // so that later callback cannot enqueue state on a departing App.
+      widthPreferencesMountedRef.current = false;
+      void widthPreferenceWriter.dispose();
+    };
+  }, [widthPreferenceWriter]);
   // `null` means "never resolved" -- distinct from `[]`, which means "resolved
   // and genuinely empty". The tab bar and the body render those differently.
   const [data, setData] = useState({ actions: null, issues: null, prs: null, security: null });
@@ -2487,6 +3432,9 @@ function App({ onCreateRemote = () => {} } = {}) {
   const [errors, setErrors] = useState({ actions: null, issues: null, prs: null, security: null });
   const [failureContext, setFailureContext] = useState(null);
   const [loading, setLoading] = useState({ actions: true, issues: true, prs: true, security: true });
+  // The widened poll interval in ms while the adaptive throttle is holding one,
+  // or null at the configured refresh. Only ever set from inside the poll effect.
+  const [throttleMs, setThrottleMs] = useState(null);
   const [now, setNow] = useState(new Date());
   const { rows, cols, useShortLabels } = useTerminalSize(stdout);
   const [frame, setFrame] = useState(0);
@@ -2495,6 +3443,8 @@ function App({ onCreateRemote = () => {} } = {}) {
   // renders byte-identical frames and ink still writes nothing.
   const [selected, setSelected] = useState({});
   const [offset, setOffset] = useState({});
+  const [widthMode, setWidthMode] = useState(false);
+  const [selectedWidthKeyByTab, setSelectedWidthKeyByTab] = useState({});
 
   const tab = TABS[activeIndex];
   const tabError = errors[tab.key];
@@ -2590,6 +3540,185 @@ function App({ onCreateRemote = () => {} } = {}) {
   showHelpRef.current = showHelp;
   const remoteSetupRef = useRef(false);
   remoteSetupRef.current = remoteSetup;
+  const headerRef = useRef(null);
+  const dragRef = useRef(null);
+  const resizeRef = useRef({
+    active: false,
+    tabKey: "actions",
+    selectedKey: null,
+    effectiveHeader: null,
+    frameCols: 0,
+    compact: true,
+    fullHeaderVisible: false,
+  });
+
+  useEffect(() => {
+    if (!interactive) return;
+    enableMouseReporting();
+    return () => {
+      dragRef.current = null;
+      disableMouseReporting();
+    };
+  }, [interactive]);
+
+  function applyWidthOverrides(next) {
+    const current = widthOverridesRef.current;
+    if (next === current) return false;
+    widthOverridesRef.current = next;
+    setWidthOverrides(next);
+    // Schedule in the input turn, not a post-render effect. Reset, mode exit and
+    // quit all flush immediately, and must not race ahead of React committing the
+    // state that contains the latest width.
+    widthPreferenceWriter.schedule(next);
+
+    const geometry = resizeRef.current;
+    const activeTab = tabForKey(geometry.tabKey);
+    if (activeTab) {
+      const nextTabOverrides = pick(next, activeTab.key, EMPTY_WIDTH_OVERRIDES) ??
+        EMPTY_WIDTH_OVERRIDES;
+      const effective = effectiveHeaderFor(activeTab, nextTabOverrides, geometry.frameCols);
+      resizeRef.current = {
+        ...geometry,
+        effectiveHeader: effective,
+        compact: effective == null,
+        fullHeaderVisible: geometry.fullHeaderVisible && effective != null,
+      };
+    }
+    return true;
+  }
+
+  function flushWidthPreferences() {
+    void widthPreferenceWriter.flush();
+  }
+
+  function leaveWidthMode() {
+    dragRef.current = null;
+    resizeRef.current = { ...resizeRef.current, active: false };
+    setWidthMode(false);
+    flushWidthPreferences();
+  }
+
+  function rememberWidthSelection(key) {
+    if (key === null) return;
+    const tabKey = resizeRef.current.tabKey;
+    resizeRef.current = { ...resizeRef.current, selectedKey: key };
+    setSelectedWidthKeyByTab((current) =>
+      current[tabKey] === key ? current : { ...current, [tabKey]: key },
+    );
+  }
+
+  function enterWidthMode(requestedKey = null) {
+    const geometry = resizeRef.current;
+    if (!geometry.fullHeaderVisible || geometry.compact) return false;
+    const activeTab = tabForKey(geometry.tabKey);
+    const selectedKey = selectWidthKey(activeTab, requestedKey ?? geometry.selectedKey);
+    if (selectedKey === null) return false;
+    rememberWidthSelection(selectedKey);
+    resizeRef.current = { ...resizeRef.current, active: true, selectedKey };
+    setWidthMode(true);
+    return true;
+  }
+
+  function resizeSelectedWidth(delta) {
+    const geometry = resizeRef.current;
+    if (!geometry.active || !geometry.fullHeaderVisible || geometry.compact) return;
+    const activeTab = tabForKey(geometry.tabKey);
+    const column = geometry.effectiveHeader?.find(
+      (candidate) => candidate.key === geometry.selectedKey,
+    );
+    if (!activeTab || !isAdjustableWidthColumn(column)) return;
+    const next = updateWidthPreference({
+      overrides: widthOverridesRef.current,
+      tab: activeTab,
+      key: geometry.selectedKey,
+      nextWidth: column.props.width + delta,
+      effectiveHeader: geometry.effectiveHeader,
+      frameCols: geometry.frameCols,
+    });
+    applyWidthOverrides(next);
+  }
+
+  function resetSelectedWidth() {
+    dragRef.current = null;
+    const { tabKey, selectedKey } = resizeRef.current;
+    applyWidthOverrides(resetWidthPreference(widthOverridesRef.current, tabKey, selectedKey));
+    flushWidthPreferences();
+  }
+
+  function resetActiveTabWidths() {
+    dragRef.current = null;
+    const { tabKey } = resizeRef.current;
+    applyWidthOverrides(resetTabWidthPreferences(widthOverridesRef.current, tabKey));
+    flushWidthPreferences();
+  }
+
+  const cancelWidthDrag = useCallback(() => {
+    if (dragRef.current === null) return false;
+    dragRef.current = null;
+    void widthPreferenceWriter.flush();
+    return true;
+  }, [widthPreferenceWriter]);
+
+  const measuredHeader = useCallback(() => {
+    return headerRef.current ? measureElement(headerRef.current) : null;
+  }, []);
+
+  function handleSgrMouse(event) {
+    if (event.action === "release") {
+      dragRef.current = null;
+      flushWidthPreferences();
+      return;
+    }
+
+    const geometry = resizeRef.current;
+    if (event.action === "press") {
+      if (!interactive || !geometry.fullHeaderVisible || geometry.compact) return;
+      const metrics = measuredHeader();
+      if (!metrics) return;
+      const drag = beginDividerDrag({
+        event,
+        handles: dividerHandles({ header: geometry.effectiveHeader, metrics }),
+        tabKey: geometry.tabKey,
+      });
+      if (!drag || !enterWidthMode(drag.key)) return;
+      dragRef.current = { ...drag, metrics };
+      return;
+    }
+
+    const drag = dragRef.current;
+    if (!drag) return;
+    const metrics = measuredHeader();
+    const layoutValid = sameElementMetrics(drag.metrics, metrics);
+    const proposal = draggedWidth({
+      drag,
+      event,
+      tabKey: geometry.tabKey,
+      fullHeaderVisible: geometry.fullHeaderVisible,
+      layoutValid,
+    });
+    if (!proposal) {
+      if (!layoutValid || drag.tabKey !== geometry.tabKey || !geometry.fullHeaderVisible) {
+        cancelWidthDrag();
+      }
+      return;
+    }
+
+    const activeTab = tabForKey(geometry.tabKey);
+    if (!activeTab) {
+      cancelWidthDrag();
+      return;
+    }
+    applyWidthOverrides(
+      updateWidthPreference({
+        overrides: widthOverridesRef.current,
+        tab: activeTab,
+        key: proposal.key,
+        nextWidth: proposal.nextWidth,
+        effectiveHeader: geometry.effectiveHeader,
+        frameCols: geometry.frameCols,
+      }),
+    );
+  }
 
   function moveSelection(delta) {
     const { items, key: currentKey, bodyRows: rows_, tabKey, offset: offsetRaw } = navRef.current;
@@ -2665,7 +3794,38 @@ function App({ onCreateRemote = () => {} } = {}) {
 
   useInput(
     (input, key) => {
-      if (input === "q" || key.escape) {
+      // Ink delivers a complete unrecognised CSI token with its leading Escape
+      // removed. Consume the whole SGR namespace here, including unsupported
+      // buttons/modifiers, so no report can fall through to keyboard bindings.
+      if (input.startsWith("[<")) {
+        const mouse = parseSgrMouse(input);
+        if (mouse) handleSgrMouse(mouse);
+        return;
+      }
+      if (input === "q" || (input === "c" && key.ctrl)) {
+        flushWidthPreferences();
+        exit();
+      } else if (resizeRef.current.active) {
+        if (input === "w" || key.return || key.escape) {
+          leaveWidthMode();
+        } else if (key.tab) {
+          const activeTab = tabForKey(resizeRef.current.tabKey);
+          rememberWidthSelection(
+            cycleWidthKey(activeTab, resizeRef.current.selectedKey, key.shift ? -1 : 1),
+          );
+        } else if (key.leftArrow) {
+          resizeSelectedWidth(key.shift ? -5 : -1);
+        } else if (key.rightArrow) {
+          resizeSelectedWidth(key.shift ? 5 : 1);
+        } else if (input === "r") {
+          resetSelectedWidth();
+        } else if (input === "R") {
+          resetActiveTabWidths();
+        }
+        // Width mode owns every other key. In particular, digits, arrows, Tab,
+        // Enter and r must never fall through to their ordinary meanings.
+      } else if (key.escape) {
+        flushWidthPreferences();
         exit();
       } else if (showHelpRef.current) {
         // Any key dismisses -- except quit, handled above, which must never be
@@ -2675,6 +3835,8 @@ function App({ onCreateRemote = () => {} } = {}) {
         setShowHelp(false);
       } else if (input === "?") {
         setShowHelp(true);
+      } else if (input === "w") {
+        enterWidthMode();
       } else if (key.downArrow || input === "j") {
         moveSelection(1);
       } else if (key.upArrow || input === "k") {
@@ -2684,7 +3846,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       } else if (key.pageUp) {
         moveSelection(-pageStep);
       } else if (key.return) {
-        if (remoteSetupRef.current) onCreateRemote();
+        if (remoteSetupRef.current) onCreateRemote(suspendTerminal);
         else openSelected();
       } else if (input === "r") {
         // Goes through the same per-tab in-flight guard as the poll loop, so
@@ -2723,6 +3885,13 @@ function App({ onCreateRemote = () => {} } = {}) {
   // ref or a setState function, both of which the rule treats as stable -- so
   // this needs no suppression, and if one ever becomes necessary that is the
   // signal that a real dependency crept in.
+  //
+  // The adaptive throttle re-arms the timer, which is not a contradiction of the
+  // above: `rearm` swaps the interval from *inside* this effect, so the effect
+  // still runs exactly once and no closure, ref or AbortController is ever
+  // recreated. What is created once is the effect; what changes is only the
+  // delay `tick` is scheduled at. Do not move the re-arm into a dependency
+  // array -- that is precisely the teardown this comment exists to prevent.
   useEffect(() => {
     let cancelled = false;
     let ticks = 0;
@@ -2759,6 +3928,10 @@ function App({ onCreateRemote = () => {} } = {}) {
       setLoading((l) => (l[key] ? l : { ...l, [key]: true }));
       return run()
         .then((result) => {
+          // Billed before the `cancelled` early return: the requests were made
+          // and counted by GitHub whether or not this process still wants the
+          // answer.
+          restSpentTotal += result?.restSpent ?? 0;
           if (cancelled) return;
           const { raw, parse, limit } = result;
           // Identical payload: skip the parse *and* the state update. Returning
@@ -2808,6 +3981,11 @@ function App({ onCreateRemote = () => {} } = {}) {
           }
         })
         .catch((err) => {
+          // A rejected fetch carries no result, so its own spend is unknowable
+          // here; bill the tab's table cost instead. A request that failed after
+          // reaching GitHub still counted, and over-billing by an aborted call
+          // errs toward throttling harder, which is the safe direction.
+          restSpentTotal += REST_PER_FETCH[key] ?? 0;
           if (cancelled || err?.name === "AbortError") return;
           cleanRef.current[key] = false;
           // Preserve both the verdict and the bounded raw error in state. The
@@ -2838,7 +4016,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     // exactly the moment the pane looks broken and they reach for it.
     function fetchTab(key, { force = false } = {}) {
       const signal = controller.signal;
-      const descriptor = TABS.find((t) => t.key === key);
+      const descriptor = tabForKey(key);
       if (!force && backoffActive(`tab:${key}`, performance.now())) return Promise.resolve();
       if (force) clearBackoff(`tab:${key}`);
       // Every tab carries its own fetcher on the registry, so adding a tab is a
@@ -2854,6 +4032,10 @@ function App({ onCreateRemote = () => {} } = {}) {
       // so stop spawning subprocesses once any endpoint proves there is no
       // remote. The interval may still wake, but this branch is otherwise idle.
       if (remoteSetupRef.current) return;
+      // Kicked off, never awaited: the budget probe must not delay the fetches
+      // this tick is for. `probeInFlight` keeps a slow probe from stampeding.
+      const nowMs = Date.now();
+      if (!probeInFlight && nowMs - lastProbeAt >= BUDGET_PROBE_MS) void probeBudget(nowMs);
       // Only the tab you're looking at needs to keep up with REFRESH_MS. The
       // other three exist to keep the tab-bar counts honest, which tolerates
       // being a minute behind -- so they refresh every BACKGROUND_EVERY ticks
@@ -2874,11 +4056,64 @@ function App({ onCreateRemote = () => {} } = {}) {
       );
     }
 
+    // The adaptive throttle. `appliedMs` is what the timer is currently set to;
+    // runtime.refreshMs stays the floor it may widen from and never tighten past.
+    let appliedMs = runtime.refreshMs;
+    let intervalId = null;
+    // 0 rather than `now`, so the first tick probes immediately: a pane started
+    // into an already-drained budget must back off at once rather than spend a
+    // minute at full rate first.
+    let lastProbeAt = 0;
+    let probeInFlight = false;
+    // The open probe window, and the last share it was able to measure. Both are
+    // carried by nextProbeWindow/inferShare rather than reset every probe -- see
+    // those functions for why a throttled pane must not re-measure from scratch.
+    let probeWindow = null;
+    let lastShare = 1;
+
+    function rearm(ms) {
+      appliedMs = ms;
+      if (intervalId) clearInterval(intervalId);
+      intervalId = setInterval(tick, ms);
+    }
+
+    async function probeBudget(nowMs) {
+      probeInFlight = true;
+      lastProbeAt = nowMs; // set before awaiting, so ticks cannot stampede
+      try {
+        // `controller` is this effect's own AbortController, so a probe still in
+        // flight at unmount is killed along with everything else.
+        const budget = await readCoreBudget(controller.signal);
+        if (cancelled || !budget) return;
+        const { sample, next } = nextProbeWindow(probeWindow, budget, restSpentTotal);
+        probeWindow = next;
+        // Updated before the law reads it. inferShare is idempotent, so passing
+        // the already-updated value cannot change the answer -- it just keeps
+        // one variable holding the current share rather than two.
+        lastShare = inferShare(sample, lastShare);
+
+        const target = adaptiveRefreshMs({
+          budget,
+          sample,
+          lastShare,
+          floorMs: runtime.refreshMs,
+          nowMs: Date.now(),
+          restPerTick: restPerTick(TABS[activeIndexRef.current].key),
+        });
+        if (adaptiveChangeWorthApplying(appliedMs, target)) {
+          rearm(target);
+          setThrottleMs(target > runtime.refreshMs ? target : null);
+        }
+      } finally {
+        probeInFlight = false;
+      }
+    }
+
     tick();
-    const id = setInterval(tick, runtime.refreshMs);
+    rearm(runtime.refreshMs);
     return () => {
       cancelled = true;
-      clearInterval(id);
+      clearInterval(intervalId);
       if (contextCoordinatorRef.current === coordinator) contextCoordinatorRef.current = null;
       // `cancelled` stops state updates from a promise that already resolved;
       // the signal stops the subprocess itself, so quitting doesn't orphan up to
@@ -3062,8 +4297,14 @@ function App({ onCreateRemote = () => {} } = {}) {
   // the cost -- different tabs showing different column counts at the same width
   // -- is not something you can actually see. MIN_TABLE_WIDTH stays as the
   // exported worst case, which is what the tests pin.
-  const compact = frameCols < minimumWidthFor(tab.header);
-  const header = compact ? tab.compactHeader : tab.header;
+  const tabOverrides = pick(widthOverridesRef.current, tab.key, EMPTY_WIDTH_OVERRIDES) ??
+    EMPTY_WIDTH_OVERRIDES;
+  const effectiveHeader = useMemo(
+    () => effectiveHeaderFor(tab, tabOverrides, frameCols),
+    [tab, tabOverrides, frameCols],
+  );
+  const compact = effectiveHeader == null;
+  const header = compact ? tab.compactHeader : effectiveHeader;
 
   // Below the compact set's own floor even the fixed columns overflow, which
   // hard-wraps every row and drives ink into clearing and repainting the whole
@@ -3072,6 +4313,50 @@ function App({ onCreateRemote = () => {} } = {}) {
   // sits after usableSize(), which substitutes DEFAULT_COLS for a 0 reported
   // mid-resize, so a transient zero cannot be mistaken for a genuinely tiny pane.
   const tooNarrow = frameCols < MIN_COMPACT_WIDTH;
+  const fullHeaderVisible = !compact && !showHelp && !tooNarrow && !remoteSetup;
+  const selectedWidthKey = selectedWidthKeyByTab[tab.key] ?? null;
+  const selectedWidthColumn = effectiveHeader?.find(
+    (column) => column.key === selectedWidthKey,
+  ) ?? null;
+  resizeRef.current = {
+    active: widthMode && fullHeaderVisible && selectedWidthColumn !== null,
+    tabKey: tab.key,
+    selectedKey: selectedWidthKey,
+    effectiveHeader,
+    frameCols,
+    compact,
+    fullHeaderVisible,
+  };
+
+  // A resize, help/setup transition, or replacement layout can remove the full
+  // header without a keypress. Stop owning input immediately through resizeRef,
+  // then settle the visible mode state and durable write in the effect.
+  useEffect(() => {
+    let flushed = false;
+    const drag = dragRef.current;
+    if (drag) {
+      const metrics = measuredHeader();
+      if (
+        drag.tabKey !== tab.key ||
+        !fullHeaderVisible ||
+        !sameElementMetrics(drag.metrics, metrics)
+      ) {
+        flushed = cancelWidthDrag();
+      }
+    }
+    if (!widthMode || fullHeaderVisible) return;
+    setWidthMode(false);
+    if (!flushed) void widthPreferenceWriter.flush();
+  }, [
+    widthMode,
+    fullHeaderVisible,
+    tab.key,
+    frameCols,
+    extraLines,
+    cancelWidthDrag,
+    measuredHeader,
+    widthPreferenceWriter,
+  ]);
 
   return e(
     Box,
@@ -3148,7 +4433,14 @@ function App({ onCreateRemote = () => {} } = {}) {
               line,
             ),
         ),
-      !showHelp && !tooNarrow && !remoteSetup && e(HeaderCells, { cells: header }),
+      !showHelp &&
+        !tooNarrow &&
+        !remoteSetup &&
+        e(MemoHeaderCells, {
+          cells: header,
+          selectedWidthKey: resizeRef.current.active ? selectedWidthKey : null,
+          headerRef,
+        }),
       ...(tooNarrow || showHelp || remoteSetup ? [] : visibleItems).map((item) => {
         const key = itemKey(item);
         return e(
@@ -3158,6 +4450,7 @@ function App({ onCreateRemote = () => {} } = {}) {
             item,
             now,
             compact,
+            columns: header,
             cursor: key === selectedKey,
             // Only an *executing* Actions row reads this. It used to go to every
             // visible row on the tab, so a prop that changes several times a
@@ -3208,9 +4501,13 @@ function App({ onCreateRemote = () => {} } = {}) {
       fetching: Object.values(loading).some(Boolean),
       spin: showSpinner ? spin : null,
       stale: staleLabel,
+      throttle: throttleMs ? `throttled ${Math.round(throttleMs / 1000)}s` : null,
       interactive,
       cols: frameCols,
       remoteSetup,
+      widthMode: resizeRef.current.active,
+      widthColumn: selectedWidthColumn,
+      widthSaveError,
     }),
   );
 }
@@ -3224,16 +4521,58 @@ function enterAlternateScreen() {
   process.stdout.write("\x1b[?1049h\x1b[2J\x1b[H");
 }
 
-// Idempotent by construction: writing the exit sequence while already on the
-// primary buffer is a no-op, which matters because this runs both from the
-// crash handlers and from the `exit` listener. `?25h` is here because ink only
-// restores cursor visibility through its own unmount path, which an explicit
-// process.exit() skips.
-let screenRestored = false;
+function createTerminalLifecycle(write) {
+  if (typeof write !== "function") throw new TypeError("write must be a function");
+  let mouseReportingEnabled = false;
+  let screenRestored = false;
+
+  function enableMouseReporting() {
+    if (mouseReportingEnabled || screenRestored) return false;
+    write("\x1b[?1002h\x1b[?1006h");
+    mouseReportingEnabled = true;
+    return true;
+  }
+
+  function disableMouseReporting() {
+    if (!mouseReportingEnabled) return false;
+    write("\x1b[?1002l\x1b[?1006l");
+    mouseReportingEnabled = false;
+    return true;
+  }
+
+  function restoreScreen() {
+    if (screenRestored) return false;
+    disableMouseReporting();
+    screenRestored = true;
+    // Ink restores the cursor only through its own unmount path, which an
+    // explicit process.exit() skips.
+    write("\x1b[?25h\x1b[?1049l");
+    return true;
+  }
+
+  return {
+    enableMouseReporting,
+    disableMouseReporting,
+    restoreScreen,
+    isMouseReportingEnabled: () => mouseReportingEnabled,
+  };
+}
+
+const terminalLifecycle = createTerminalLifecycle((output) => process.stdout.write(output));
+
+function enableMouseReporting() {
+  return terminalLifecycle.enableMouseReporting();
+}
+
+function disableMouseReporting() {
+  return terminalLifecycle.disableMouseReporting();
+}
+
+// Idempotent because both the lifecycle controller and this process-level
+// wrapper share one restored state. Mouse modes are always disabled before the
+// alternate buffer is released, including when this is only the exit backstop.
 function restoreScreen() {
-  if (screenRestored) return;
-  screenRestored = true;
-  process.stdout.write("\x1b[?25h\x1b[?1049l");
+  return terminalLifecycle.restoreScreen();
 }
 
 // A crash used to be indistinguishable from a clean quit. Ink catches render
@@ -3242,18 +4581,18 @@ function restoreScreen() {
 // simply vanished and any wrapper saw success. Restore the primary buffer
 // *first*, then write, or the fix reproduces the problem it is fixing.
 //
-// Aborting in-flight `gh` children is the poll effect's job on every other exit
-// path, but its cleanup only runs through ink's unmount -- which an explicit
-// process.exit() skips. Without this, a crash orphaned up to six subprocesses
-// for the length of GH_TIMEOUT_MS. The abort runs *after* restoreScreen() and is
-// wrapped, because an exception thrown here would replace the stack trace this
-// handler exists to print with an unrelated one.
+// Unmount before restore so Ink's final repaint stays in the alternate buffer.
+// A crash before app assignment, or another failure during unmount, can skip the
+// poll effect's cleanup, so abortLiveRequests() remains an explicit backstop.
+// It runs *after* restoreScreen() and is wrapped because an exception there must
+// not replace the stack trace this handler exists to print.
 //
 // Both messages go through redact(): a stack can carry a URL with inline
 // credentials, and this output is what a user pastes into a bug report -- the
 // same reasoning --doctor already applies to its own report.
-function installCrashHandlers() {
+function installCrashHandlers(unmountApp) {
   const fail = (label) => (err) => {
+    unmountApp();
     restoreScreen();
     try {
       abortLiveRequests();
@@ -3269,8 +4608,16 @@ function installCrashHandlers() {
 }
 
 if (IS_MAIN) {
+  let app;
+  const unmountApp = () => {
+    try {
+      app?.unmount();
+    } catch {
+      // Teardown is best effort. Every caller still restores the terminal.
+    }
+  };
   disarmDevBuildLeak();
-  installCrashHandlers();
+  installCrashHandlers(unmountApp);
   enterAlternateScreen();
   process.on("exit", restoreScreen);
 
@@ -3284,40 +4631,71 @@ if (IS_MAIN) {
   // root box is the terminal height. Windows is already documented as untested
   // (README Limitations), and the pty harness covers the two platforms that are
   // supported, so the flag is verified where it is claimed to work.
-  let app;
   let remoteSetupStarted = false;
-  const createRemote = () => {
+  const createRemote = (suspendTerminal) => {
     if (remoteSetupStarted) return;
     remoteSetupStarted = true;
-    try {
-      app?.unmount();
-    } catch {
-      // The interactive gh flow matters more than a best-effort final repaint.
-    }
-    restoreScreen();
-    abortLiveRequests();
 
-    // Plain `gh repo create` is the interactive form. Supplying --source here
-    // would switch gh to non-interactive mode and require gh-glance to choose a
-    // visibility on the user's behalf, which this consent boundary must never
-    // do. The prompt tells the user which interactive path matches this folder.
-    const child = spawn("gh", ["repo", "create"], {
-      stdio: "inherit",
-      env: process.env,
-    });
-    setupChild = child;
-    child.once("error", (err) => {
-      if (setupChild === child) setupChild = null;
-      console.error(`gh-glance: could not start repository setup: ${redact(shortErr(err))}`);
-      process.exitCode = 1;
-    });
-    child.once("exit", (code, signal) => {
-      if (setupChild === child) setupChild = null;
-      process.exitCode = signal ? 1 : (code ?? 1);
-      if (code === 0) {
-        console.log("gh repo create finished. Run gh-glance again when this folder has a remote.");
-      }
-    });
+    // Release Ink's raw-mode/parser state before the child inherits stdin.
+    // Unmounting alone can leave an active readable dispatch racing the first
+    // bytes typed for gh, so one immediate boundary lets that dispatch return;
+    // the explicit stream cleanup below then prevents any future parent reads.
+    void suspendTerminal()
+      .then(async () => {
+        await new Promise((resolve) => setImmediate(resolve));
+        unmountApp();
+        // This is a permanent handoff, so the parent must not retain any stream
+        // consumer that can race the child for terminal bytes. Pausing/removing
+        // Node listeners does not close fd 0; the spawned process still inherits
+        // the same canonical TTY directly from the operating system.
+        process.stdin.pause();
+        process.stdin.removeAllListeners("readable");
+        process.stdin.removeAllListeners("data");
+        restoreScreen();
+        abortLiveRequests();
+
+        await new Promise((resolve) => {
+          // Plain `gh repo create` is the interactive form. Supplying --source
+          // here would switch gh to non-interactive mode and require gh-glance
+          // to choose a visibility on the user's behalf, which this consent
+          // boundary must never do. The prompt tells the user which interactive
+          // path matches this folder.
+          const child = spawn("gh", ["repo", "create"], {
+            stdio: "inherit",
+            env: process.env,
+          });
+          setupChild = child;
+          child.once("error", (err) => {
+            if (setupChild === child) setupChild = null;
+            console.error(
+              `gh-glance: could not start repository setup: ${redact(shortErr(err))}`,
+            );
+            process.exitCode = 1;
+            resolve();
+          });
+          child.once("exit", (code, signal) => {
+            if (setupChild === child) setupChild = null;
+            process.exitCode = signal ? 1 : (code ?? 1);
+            if (code === 0) {
+              console.log(
+                "gh repo create finished. Run gh-glance again when this folder has a remote.",
+              );
+            }
+            resolve();
+          });
+        });
+      })
+      .catch((err) => {
+        unmountApp();
+        restoreScreen();
+        try {
+          abortLiveRequests();
+        } catch {
+          // Preserve the handoff error below.
+        }
+        console.error(`gh-glance: could not hand off the terminal: ${redact(shortErr(err))}`);
+        process.exitCode = 1;
+      });
   };
   app = render(e(App, { onCreateRemote: createRemote }), { incrementalRendering: true });
 
@@ -3347,12 +4725,7 @@ if (IS_MAIN) {
     if (signalExitStarted) return;
     signalExitStarted = true;
     const finish = () => {
-      try {
-        app.unmount();
-      } catch {
-        // Teardown is best effort. restoreScreen below, and the `exit` listener
-        // above, both still run, so the terminal is handed back either way.
-      }
+      unmountApp();
       restoreScreen();
       process.exit(code);
     };
@@ -3387,6 +4760,22 @@ export {
   MIN_REFRESH_SECONDS,
   MAX_REFRESH_SECONDS,
   TAB_KEYS,
+  ALERT_SOURCES,
+  REST_PER_FETCH,
+  GRAPHQL_PER_FETCH,
+  projectedHourlyCost,
+  REFRESH_MS,
+  BACKGROUND_EVERY,
+  adaptiveRefreshMs,
+  adaptiveChangeWorthApplying,
+  sampleIsUsable,
+  inferShare,
+  nextProbeWindow,
+  restPerTick,
+  MAX_ADAPTIVE_REFRESH_MS,
+  BUDGET_SAFETY,
+  MIN_SAMPLE_CALLS,
+  ADAPTIVE_HYSTERESIS,
   safe,
   shortErr,
   isUnavailable,
@@ -3411,17 +4800,44 @@ export {
   usableSize,
   severityRank,
   pick,
+  columnProps,
+  adjustableWidthKeys,
+  selectWidthKey,
+  cycleWidthKey,
+  resolveHeader,
+  fitHeaderToFrame,
+  adjustWidth,
+  updateWidthPreference,
+  resetWidthPreference,
+  resetTabWidthPreferences,
   minimumWidthFor,
+  WIDTH_PREFERENCES_VERSION,
+  widthPreferencesPath,
+  parseWidthPreferences,
+  serializeWidthPreferences,
+  loadWidthPreferences,
+  saveWidthPreferences,
+  createWidthPreferenceWriter,
   runStatusIcon,
   RUN_STATUS_ICON,
   SEVERITY_STYLE,
   REVIEW_LABEL,
   MIN_TABLE_WIDTH,
   MIN_COMPACT_WIDTH,
+  TABS,
   OCT_NERD,
   OCT_UNICODE,
   KEY_TABLE,
   KEY_HINTS,
+  widthStatusText,
+  headerGutterKey,
+  HeaderCells,
+  parseSgrMouse,
+  dividerHandles,
+  hitDivider,
+  beginDividerDrag,
+  draggedWidth,
+  createTerminalLifecycle,
   REMOTE_SETUP_HINTS,
   REMOTE_SETUP_LINES,
   REMOTE_SETUP_NONINTERACTIVE_LINES,

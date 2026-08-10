@@ -8,6 +8,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import {
@@ -34,7 +35,32 @@ import {
   usableSize,
   severityRank,
   pick,
+  TABS,
+  columnProps,
+  adjustableWidthKeys,
+  selectWidthKey,
+  cycleWidthKey,
+  resolveHeader,
+  fitHeaderToFrame,
+  adjustWidth,
+  updateWidthPreference,
+  resetWidthPreference,
+  resetTabWidthPreferences,
+  widthStatusText,
+  headerGutterKey,
+  parseSgrMouse,
+  dividerHandles,
+  hitDivider,
+  beginDividerDrag,
+  draggedWidth,
+  createTerminalLifecycle,
+  HeaderCells,
   minimumWidthFor,
+  WIDTH_PREFERENCES_VERSION,
+  widthPreferencesPath,
+  parseWidthPreferences,
+  serializeWidthPreferences,
+  createWidthPreferenceWriter,
   runStatusIcon,
   RUN_STATUS_ICON,
   SEVERITY_STYLE,
@@ -51,6 +77,22 @@ import {
   RATE_LIMIT_RETRY_MS,
   FAILURE_LADDER,
   REPO_PATTERN,
+  TAB_KEYS,
+  ALERT_SOURCES,
+  REST_PER_FETCH,
+  GRAPHQL_PER_FETCH,
+  projectedHourlyCost,
+  REFRESH_MS,
+  BACKGROUND_EVERY,
+  adaptiveRefreshMs,
+  adaptiveChangeWorthApplying,
+  sampleIsUsable,
+  inferShare,
+  nextProbeWindow,
+  restPerTick,
+  MAX_ADAPTIVE_REFRESH_MS,
+  BUDGET_SAFETY,
+  MIN_SAMPLE_CALLS,
 } from "../index.mjs";
 
 const ESC = String.fromCharCode(27);
@@ -76,6 +118,20 @@ function deferred() {
     reject = reject_;
   });
   return { promise, resolve, reject };
+}
+
+async function within(promise, milliseconds = 1000) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("timed out waiting for test result")), milliseconds);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 test("safe() strips the escape classes that survive ink's own sanitizer", () => {
@@ -719,6 +775,1211 @@ test("the minimum-width guard is derived from the widest header", () => {
   assert.ok(MIN_TABLE_WIDTH < 80, "must not reject an ordinary 80-column terminal");
 });
 
+const EXPECTED_COLUMN_GEOMETRY = {
+  actions: {
+    full: [
+      ["status", { width: 3 }],
+      ["title", { grow: true }],
+      ["workflow", { width: 10 }],
+      ["branch", { width: 14 }],
+      ["time", { width: 7 }],
+      ["updated", { width: 8 }],
+    ],
+    compact: [
+      ["status", { width: 3 }],
+      ["title", { grow: true }],
+      ["updated", { width: 8 }],
+    ],
+  },
+  issues: {
+    full: [
+      ["status", { width: 3 }],
+      ["title", { grow: true }],
+      ["author", { width: 12 }],
+      ["label", { width: 14 }],
+      ["updated", { width: 8 }],
+    ],
+    compact: [
+      ["status", { width: 3 }],
+      ["title", { grow: true }],
+      ["updated", { width: 8 }],
+    ],
+  },
+  prs: {
+    full: [
+      ["status", { width: 3 }],
+      ["title", { grow: true }],
+      ["author", { width: 12 }],
+      ["branch", { width: 14 }],
+      ["review", { width: 10 }],
+      ["updated", { width: 8 }],
+    ],
+    compact: [
+      ["status", { width: 3 }],
+      ["title", { grow: true }],
+      ["review", { width: 10 }],
+    ],
+  },
+  security: {
+    full: [
+      ["status", { width: 3 }],
+      ["severity", { width: 4 }],
+      ["package", { width: 16 }],
+      ["summary", { grow: true }],
+      ["age", { width: 8 }],
+    ],
+    compact: [
+      ["status", { width: 3 }],
+      ["severity", { width: 4 }],
+      ["summary", { grow: true }],
+    ],
+  },
+};
+
+const EXPECTED_ADJUSTABLE_COLUMNS = {
+  actions: { workflow: 5, branch: 6, time: 5, updated: 6 },
+  issues: { author: 6, label: 6, updated: 6 },
+  prs: { author: 6, branch: 6, review: 7, updated: 6 },
+  security: { package: 6, age: 6 },
+};
+
+const actionsHeader = TABS.find(({ key }) => key === "actions").header;
+const actionsTab = TABS.find(({ key }) => key === "actions");
+const actionsDividerMetrics = { x: 10, y: 7, width: 75, height: 2 };
+const actionsDividerHandles = dividerHandles({
+  header: actionsHeader,
+  metrics: actionsDividerMetrics,
+});
+
+function geometry(columns) {
+  return columns.map(({ key, props }) => [key, props]);
+}
+
+test("column descriptors have stable unique keys and the planned adjustable inventory", () => {
+  assert.deepEqual(TABS.map(({ key }) => key), Object.keys(EXPECTED_COLUMN_GEOMETRY));
+
+  for (const tab of TABS) {
+    for (const columns of [tab.header, tab.compactHeader]) {
+      const keys = columns.map(({ key }) => key);
+      assert.ok(keys.every((key) => /^[a-z][a-z0-9]*$/.test(key)), `${tab.key}: invalid key`);
+      assert.equal(new Set(keys).size, keys.length, `${tab.key}: duplicate column key`);
+    }
+
+    assert.deepEqual(
+      tab.header
+        .filter(({ adjustable }) => adjustable)
+        .map(({ key, minWidth }) => [key, minWidth]),
+      Object.entries(EXPECTED_ADJUSTABLE_COLUMNS[tab.key]),
+      `${tab.key}: adjustable full columns or minima drifted`,
+    );
+    assert.ok(
+      tab.compactHeader.every(({ adjustable }) => !adjustable),
+      `${tab.key}: compact columns must remain locked`,
+    );
+  }
+});
+
+test("width selection exposes the exact adjustable inventory for every tab", () => {
+  for (const tab of TABS) {
+    assert.deepEqual(
+      adjustableWidthKeys(tab),
+      Object.keys(EXPECTED_ADJUSTABLE_COLUMNS[tab.key]),
+      `${tab.key}: width-mode inventory drifted`,
+    );
+  }
+});
+
+test("width selection starts at the first adjustable key and remembers a valid key per tab", () => {
+  const remembered = {
+    actions: "time",
+    issues: "label",
+    prs: "updated",
+    security: "age",
+  };
+
+  for (const tab of TABS) {
+    const first = Object.keys(EXPECTED_ADJUSTABLE_COLUMNS[tab.key])[0];
+    assert.equal(selectWidthKey(tab), first, `${tab.key}: first adjustable key`);
+    assert.equal(
+      selectWidthKey(tab, remembered[tab.key]),
+      remembered[tab.key],
+      `${tab.key}: remembered selection`,
+    );
+    assert.equal(
+      selectWidthKey(tab, "status"),
+      first,
+      `${tab.key}: locked remembered key must fall back`,
+    );
+    assert.equal(
+      selectWidthKey(tab, "missing"),
+      first,
+      `${tab.key}: missing remembered key must fall back`,
+    );
+  }
+
+  assert.equal(selectWidthKey({ key: "compact", header: actionsTab.compactHeader }), null);
+});
+
+test("Tab and Shift+Tab width selection wrap only over adjustable keys", () => {
+  for (const tab of TABS) {
+    const keys = Object.keys(EXPECTED_ADJUSTABLE_COLUMNS[tab.key]);
+    assert.equal(cycleWidthKey(tab, keys.at(-1), 1), keys[0], `${tab.key}: forward wrap`);
+    assert.equal(cycleWidthKey(tab, keys[0], -1), keys.at(-1), `${tab.key}: reverse wrap`);
+    for (let index = 0; index < keys.length; index += 1) {
+      assert.equal(
+        cycleWidthKey(tab, keys[index], 1),
+        keys[(index + 1) % keys.length],
+        `${tab.key}: forward from ${keys[index]}`,
+      );
+      assert.equal(
+        cycleWidthKey(tab, keys[index], -1),
+        keys[(index - 1 + keys.length) % keys.length],
+        `${tab.key}: reverse from ${keys[index]}`,
+      );
+    }
+  }
+
+  const compactTab = { key: "compact", header: actionsTab.compactHeader };
+  assert.equal(cycleWidthKey(compactTab, null, 1), null);
+  assert.equal(cycleWidthKey(compactTab, null, -1), null);
+});
+
+test("empty overrides preserve the established full and compact geometry", () => {
+  for (const tab of TABS) {
+    const resolved = resolveHeader(tab.header, {});
+    assert.deepEqual(geometry(resolved), EXPECTED_COLUMN_GEOMETRY[tab.key].full);
+    assert.deepEqual(geometry(tab.compactHeader), EXPECTED_COLUMN_GEOMETRY[tab.key].compact);
+    resolved.forEach((column, index) => {
+      assert.strictEqual(column, tab.header[index], `${tab.key}.${column.key} was copied needlessly`);
+    });
+  }
+});
+
+test("resolving an override replaces only its adjustable descriptor", () => {
+  const base = actionsHeader;
+  const overrides = { branch: 18 };
+  const resolved = resolveHeader(base, overrides);
+  const branchIndex = base.findIndex(({ key }) => key === "branch");
+
+  assert.deepEqual(columnProps(resolved, "branch"), { width: 18 });
+  assert.notStrictEqual(resolved[branchIndex], base[branchIndex]);
+  assert.notStrictEqual(resolved[branchIndex].props, base[branchIndex].props);
+  resolved.forEach((column, index) => {
+    if (index !== branchIndex) assert.strictEqual(column, base[index]);
+  });
+  assert.deepEqual(overrides, { branch: 18 });
+});
+
+test("locked and invalid overrides cannot escape the width contract", () => {
+  const base = actionsHeader;
+
+  for (const overrides of [
+    { status: 20 },
+    { title: 20 },
+    { missing: 20 },
+    { branch: 12.5 },
+    { branch: Number.NaN },
+    { branch: Number.POSITIVE_INFINITY },
+  ]) {
+    const resolved = resolveHeader(base, overrides);
+    assert.deepEqual(geometry(resolved), EXPECTED_COLUMN_GEOMETRY.actions.full);
+    resolved.forEach((column, index) => assert.strictEqual(column, base[index]));
+  }
+
+  for (const tab of TABS) {
+    for (const [key, minWidth] of Object.entries(EXPECTED_ADJUSTABLE_COLUMNS[tab.key])) {
+      assert.equal(columnProps(resolveHeader(tab.header, { [key]: 1 }), key).width, minWidth);
+    }
+  }
+});
+
+test("width helpers do not mutate descriptors, props, arrays, or overrides", () => {
+  const base = actionsHeader;
+  const baseBefore = structuredClone(base);
+  const overrides = Object.freeze({ workflow: 12, branch: 18 });
+  const overridesBefore = structuredClone(overrides);
+  const preferred = resolveHeader(base, overrides);
+  const preferredBefore = structuredClone(preferred);
+
+  fitHeaderToFrame(preferred, base, 59);
+  adjustWidth({ header: preferred, key: "branch", delta: 3, frameCols: 70 });
+
+  assert.deepEqual(base, baseBefore);
+  assert.deepEqual(preferred, preferredBefore);
+  assert.deepEqual(overrides, overridesBefore);
+});
+
+const ROW_FIXTURES = {
+  actions: {
+    item: {
+      status: "completed",
+      conclusion: "success",
+      startedAt: "2026-08-10T10:00:00Z",
+      updatedAt: "2026-08-10T10:01:00Z",
+      displayTitle: "Ship widths",
+      number: 101,
+      workflowName: "CI",
+      headBranch: "develop",
+    },
+    spin: null,
+  },
+  issues: {
+    item: {
+      number: 102,
+      title: "Resizable columns",
+      author: "octocat",
+      label: "enhancement",
+      updatedAt: "2026-08-10T10:01:00Z",
+    },
+  },
+  prs: {
+    item: {
+      number: 103,
+      title: "Use descriptor widths",
+      author: "octocat",
+      headRefName: "feature/widths",
+      reviewDecision: "APPROVED",
+      updatedAt: "2026-08-10T10:01:00Z",
+      isDraft: false,
+    },
+  },
+  security: {
+    item: {
+      severity: "high",
+      detail: "ink",
+      kind: "dependabot",
+      title: "Update dependency",
+      createdAt: "2026-08-10T10:01:00Z",
+    },
+  },
+};
+
+test("every full and compact row consumes the selected descriptor geometry", () => {
+  for (const tab of TABS) {
+    for (const [layout, baseColumns] of [
+      ["full", tab.header],
+      ["compact", tab.compactHeader],
+    ]) {
+      const columns = baseColumns.map((column, index) => ({
+        ...column,
+        props: { width: 31 + index },
+      }));
+      const rendered = tab.Row.type({
+        ...ROW_FIXTURES[tab.key],
+        now: new Date("2026-08-10T10:02:00Z"),
+        compact: layout === "compact",
+        cursor: false,
+        columns,
+      });
+      const children = Array.isArray(rendered.props.children)
+        ? rendered.props.children
+        : [rendered.props.children];
+
+      assert.deepEqual(
+        children.map(({ props }) => props.width),
+        columns.map(({ props }) => props.width),
+        `${tab.key}.${layout}: row geometry did not come from the selected descriptors`,
+      );
+      assert.ok(
+        children.every(({ props }) => props.grow === undefined),
+        `${tab.key}.${layout}: a private grow literal escaped the descriptor model`,
+      );
+    }
+  }
+});
+
+test("resolved fixed widths remain the single source for the minimum-width guard", () => {
+  const base = actionsHeader;
+  const wider = resolveHeader(base, { branch: 18 });
+
+  assert.equal(minimumWidthFor(base), 56);
+  assert.equal(minimumWidthFor(wider), minimumWidthFor(base) + 4);
+});
+
+test("width adjustment clamps to the semantic minimum and current frame budget", () => {
+  const base = actionsHeader;
+  const atMinimum = adjustWidth({ header: base, key: "branch", delta: -100, frameCols: 80 });
+  const atMaximum = adjustWidth({ header: base, key: "branch", delta: 100, frameCols: 60 });
+
+  assert.equal(columnProps(atMinimum, "branch").width, 6);
+  assert.equal(columnProps(atMaximum, "branch").width, 18);
+  assert.equal(minimumWidthFor(atMaximum), 60, "the four-cell grow budget must remain intact");
+  assert.strictEqual(
+    adjustWidth({ header: atMinimum, key: "branch", delta: -1, frameCols: 80 }),
+    atMinimum,
+  );
+  assert.strictEqual(
+    adjustWidth({ header: atMaximum, key: "branch", delta: 1, frameCols: 60 }),
+    atMaximum,
+  );
+  assert.strictEqual(adjustWidth({ header: base, key: "branch", delta: 0, frameCols: 80 }), base);
+  assert.strictEqual(adjustWidth({ header: base, key: "title", delta: 1, frameCols: 80 }), base);
+});
+
+test("one-cell and five-cell width updates use the shared clamp and normalize deviations", () => {
+  for (const delta of [1, 5, -1, -5]) {
+    const effectiveHeader = actionsTab.header;
+    const adjusted = adjustWidth({
+      header: effectiveHeader,
+      key: "workflow",
+      delta,
+      frameCols: 79,
+    });
+    const nextWidth = columnProps(adjusted, "workflow").width;
+    const updated = updateWidthPreference({
+      overrides: {},
+      tab: actionsTab,
+      key: "workflow",
+      nextWidth,
+      effectiveHeader,
+      frameCols: 79,
+    });
+
+    assert.deepEqual(
+      updated,
+      nextWidth === columnProps(actionsTab.header, "workflow").width
+        ? {}
+        : { actions: { workflow: nextWidth } },
+      `delta ${delta}`,
+    );
+  }
+
+  const clampedHigh = updateWidthPreference({
+    overrides: {},
+    tab: actionsTab,
+    key: "workflow",
+    nextWidth: 100,
+    effectiveHeader: actionsTab.header,
+    frameCols: 60,
+  });
+  assert.deepEqual(clampedHigh, { actions: { workflow: 14 } });
+
+  const clampedLow = updateWidthPreference({
+    overrides: {},
+    tab: actionsTab,
+    key: "workflow",
+    nextWidth: -100,
+    effectiveHeader: actionsTab.header,
+    frameCols: 79,
+  });
+  assert.deepEqual(clampedLow, { actions: { workflow: 5 } });
+});
+
+test("width preference updates delete defaults and preserve unrelated deviations", () => {
+  const issues = Object.freeze({ author: 9 });
+  const overrides = Object.freeze({
+    actions: Object.freeze({ workflow: 15, branch: 18 }),
+    issues,
+  });
+  const effectiveHeader = resolveHeader(actionsTab.header, overrides.actions);
+
+  const updated = updateWidthPreference({
+    overrides,
+    tab: actionsTab,
+    key: "workflow",
+    nextWidth: 10,
+    effectiveHeader,
+    frameCols: 79,
+  });
+
+  assert.deepEqual(updated, {
+    actions: { branch: 18 },
+    issues: { author: 9 },
+  });
+  assert.strictEqual(updated.issues, issues, "an untouched tab must retain nested identity");
+  assert.deepEqual(overrides, {
+    actions: { workflow: 15, branch: 18 },
+    issues: { author: 9 },
+  });
+
+  const lastDeviation = updateWidthPreference({
+    overrides: { actions: { workflow: 15 }, issues },
+    tab: actionsTab,
+    key: "workflow",
+    nextWidth: 10,
+    effectiveHeader: resolveHeader(actionsTab.header, { workflow: 15 }),
+    frameCols: 79,
+  });
+  assert.deepEqual(lastDeviation, { issues: { author: 9 } });
+  assert.strictEqual(lastDeviation.issues, issues);
+});
+
+test("selected and tab resets remove only their intended deviations", () => {
+  const issues = Object.freeze({ author: 9 });
+  const overrides = Object.freeze({
+    actions: Object.freeze({ workflow: 15, branch: 18 }),
+    issues,
+  });
+
+  const selectedReset = resetWidthPreference(overrides, "actions", "workflow");
+  assert.deepEqual(selectedReset, {
+    actions: { branch: 18 },
+    issues: { author: 9 },
+  });
+  assert.strictEqual(selectedReset.issues, issues);
+
+  const lastSelectedReset = resetWidthPreference(selectedReset, "actions", "branch");
+  assert.deepEqual(lastSelectedReset, { issues: { author: 9 } });
+  assert.strictEqual(lastSelectedReset.issues, issues);
+
+  const tabReset = resetTabWidthPreferences(overrides, "actions");
+  assert.deepEqual(tabReset, { issues: { author: 9 } });
+  assert.strictEqual(tabReset.issues, issues);
+  assert.deepEqual(overrides, {
+    actions: { workflow: 15, branch: 18 },
+    issues: { author: 9 },
+  });
+});
+
+test("locked, compact, missing, unsafe, and clamped width operations preserve identity", () => {
+  const overrides = Object.freeze({ actions: Object.freeze({ workflow: 5 }) });
+  const atMinimum = resolveHeader(actionsTab.header, overrides.actions);
+
+  for (const operation of [
+    () =>
+      updateWidthPreference({
+        overrides,
+        tab: actionsTab,
+        key: "status",
+        nextWidth: 20,
+        effectiveHeader: atMinimum,
+        frameCols: 79,
+      }),
+    () =>
+      updateWidthPreference({
+        overrides,
+        tab: actionsTab,
+        key: "missing",
+        nextWidth: 20,
+        effectiveHeader: atMinimum,
+        frameCols: 79,
+      }),
+    () =>
+      updateWidthPreference({
+        overrides,
+        tab: actionsTab,
+        key: "workflow",
+        nextWidth: 4,
+        effectiveHeader: atMinimum,
+        frameCols: 79,
+      }),
+    () =>
+      updateWidthPreference({
+        overrides,
+        tab: actionsTab,
+        key: "workflow",
+        nextWidth: 5.5,
+        effectiveHeader: atMinimum,
+        frameCols: 79,
+      }),
+    () =>
+      updateWidthPreference({
+        overrides,
+        tab: actionsTab,
+        key: "workflow",
+        nextWidth: 20,
+        effectiveHeader: actionsTab.compactHeader,
+        frameCols: 44,
+      }),
+    () => resetWidthPreference(overrides, "actions", "status"),
+    () => resetWidthPreference(overrides, "actions", "missing"),
+    () => resetWidthPreference(overrides, "issues", "author"),
+    () => resetTabWidthPreferences(overrides, "issues"),
+    () => resetTabWidthPreferences(overrides, "missing"),
+  ]) {
+    assert.strictEqual(operation(), overrides);
+  }
+});
+
+test("fitting preserves preferred identity, shrinks above defaults in order, or returns null", () => {
+  const defaults = actionsHeader;
+  const preferred = resolveHeader(defaults, { workflow: 12, branch: 18 });
+
+  assert.strictEqual(fitHeaderToFrame(preferred, defaults, 62), preferred);
+
+  const fitted = fitHeaderToFrame(preferred, defaults, 59);
+  assert.equal(minimumWidthFor(fitted), 59);
+  assert.equal(columnProps(fitted, "workflow").width, 10);
+  assert.equal(columnProps(fitted, "branch").width, 17);
+  assert.deepEqual(
+    geometry(fitHeaderToFrame(preferred, defaults, 56)),
+    EXPECTED_COLUMN_GEOMETRY.actions.full,
+  );
+  assert.equal(fitHeaderToFrame(preferred, defaults, 55), null);
+});
+
+test("fitting never widens a preference below its default", () => {
+  const defaults = actionsHeader;
+  const preferred = resolveHeader(defaults, { workflow: 20, branch: 8 });
+  const fitted = fitHeaderToFrame(preferred, defaults, 58);
+
+  assert.equal(minimumWidthFor(fitted), 58);
+  assert.equal(columnProps(fitted, "workflow").width, 18);
+  assert.equal(columnProps(fitted, "branch").width, 8);
+});
+
+test("width-mode status variants stay bounded and use ASCII control glyphs", () => {
+  for (const cols of [79, 60, 44, 32, 20, 8, 1, 0]) {
+    const status = widthStatusText({ label: "WORKFLOW", width: 11, cols });
+    assert.ok([...status].length <= Math.max(0, cols), `${cols}: ${JSON.stringify(status)}`);
+    assert.match(status, /^[\x20-\x7e]*$/, `${cols}: status must be ASCII-only`);
+    assert.ok(!/[←→↑↓]/.test(status), `${cols}: ambiguous-width arrow escaped`);
+  }
+
+  for (const cols of [79, 60, 44]) {
+    const status = widthStatusText({ label: "WORKFLOW", width: 11, cols });
+    assert.match(status, /WORKFLOW/);
+    assert.match(status, /11/);
+    assert.match(status, /<-/);
+    assert.match(status, /->/);
+    assert.match(status, /\br\b/);
+    assert.match(status, /Esc/);
+  }
+});
+
+test("width-mode status surfaces a bounded nonfatal save warning", () => {
+  for (const cols of [79, 60, 44, 20, 8, 1, 0]) {
+    const status = widthStatusText({
+      label: "PACKAGE / FILE",
+      width: 16,
+      cols,
+      saveError: new Error("read-only filesystem"),
+    });
+    assert.ok([...status].length <= Math.max(0, cols), `${cols}: ${JSON.stringify(status)}`);
+    assert.match(status, /^[\x20-\x7e]*$/, `${cols}: warning must be ASCII-only`);
+    if (cols >= "Widths not saved".length) assert.match(status, /Widths not saved/);
+  }
+});
+
+const EXPECTED_HEADER_GUTTER_OWNERS = {
+  actions: [null, "workflow", "branch", "time", "updated", null],
+  issues: [null, "author", "label", "updated", null],
+  prs: [null, "author", "branch", "review", "updated", null],
+  security: [null, null, "package", "age", null],
+};
+
+test("header gutters belong to the adjustable edge facing the grow reservoir", () => {
+  for (const tab of TABS) {
+    assert.deepEqual(
+      tab.header.map((_, index) => headerGutterKey(tab.header, index)),
+      EXPECTED_HEADER_GUTTER_OWNERS[tab.key],
+      tab.key,
+    );
+    assert.deepEqual(
+      tab.compactHeader.map((_, index) => headerGutterKey(tab.compactHeader, index)),
+      tab.compactHeader.map(() => null),
+      `${tab.key}: compact gutters must stay locked`,
+    );
+  }
+});
+
+test("HeaderCells draws grips inside the existing one-cell gutters without changing geometry", () => {
+  for (const tab of TABS) {
+    const selectedWidthKey = adjustableWidthKeys(tab)[0];
+    const rendered = HeaderCells({ cells: tab.header, selectedWidthKey });
+    const children = Array.isArray(rendered.props.children)
+      ? rendered.props.children
+      : [rendered.props.children];
+
+    assert.equal(children.length, tab.header.length * 2, `${tab.key}: content/gutter pairs`);
+    let expectedFixedWidth = 0;
+    let renderedFixedWidth = 0;
+    for (let index = 0; index < tab.header.length; index += 1) {
+      const descriptor = tab.header[index];
+      const content = children[index * 2];
+      const gutter = children[index * 2 + 1];
+      const owner = headerGutterKey(tab.header, index);
+      const gutterText = gutter.props.children;
+
+      assert.deepEqual(
+        { width: content.props.width, grow: content.props.grow },
+        { width: descriptor.props.width, grow: descriptor.props.grow },
+        `${tab.key}.${descriptor.key}: content geometry`,
+      );
+      assert.equal([...gutterText].length, 1, `${tab.key}.${descriptor.key}: gutter width`);
+      assert.equal(gutterText, owner === null ? " " : "│", `${tab.key}.${descriptor.key}: grip`);
+      assert.equal(
+        Boolean(gutter.props.bold),
+        owner === selectedWidthKey,
+        `${tab.key}.${descriptor.key}: selected grip styling`,
+      );
+
+      expectedFixedWidth += (descriptor.props.width ?? 0) + 1;
+      renderedFixedWidth += (content.props.width ?? 0) + [...gutterText].length;
+    }
+    assert.equal(renderedFixedWidth, expectedFixedWidth, `${tab.key}: fixed geometry changed`);
+
+    const compactRendered = HeaderCells({
+      cells: tab.compactHeader,
+      selectedWidthKey,
+    });
+    const compactChildren = Array.isArray(compactRendered.props.children)
+      ? compactRendered.props.children
+      : [compactRendered.props.children];
+    assert.equal(compactChildren.length, tab.compactHeader.length * 2);
+    assert.ok(
+      compactChildren
+        .filter((_, index) => index % 2 === 1)
+        .every((gutter) => gutter.props.children === " "),
+      `${tab.key}: compact header unexpectedly rendered a grip`,
+    );
+  }
+});
+
+test("SGR mouse parsing accepts only unmodified left-button press, drag, and release reports", () => {
+  assert.deepEqual(parseSgrMouse("[<0;1;1M"), { x: 0, y: 0, action: "press" });
+  assert.deepEqual(parseSgrMouse("[<32;41;7M"), { x: 40, y: 6, action: "drag" });
+  assert.deepEqual(parseSgrMouse("[<0;41;7m"), { x: 40, y: 6, action: "release" });
+
+  for (const input of [
+    "",
+    "mouse",
+    `${ESC}[<0;1;1M`,
+    "[<0;0;1M",
+    "[<0;1;0M",
+    "[<0;-1;1M",
+    "[<0;1;-1M",
+    "[<0;1;1",
+    "[<0;1;1X",
+    "[<0;1.5;1M",
+    "[<0;1;1.5M",
+    "[<1;1;1M",
+    "[<2;1;1M",
+    "[<4;1;1M",
+    "[<8;1;1M",
+    "[<16;1;1M",
+    "[<33;1;1M",
+    "[<36;1;1M",
+    "[<64;1;1M",
+    "[<65;1;1M",
+    "[<9007199254740992;1;1M",
+    "[<0;9007199254740992;1M",
+    "[<0;1;9007199254740992M",
+  ]) {
+    assert.equal(parseSgrMouse(input), null, input);
+  }
+});
+
+test("divider handles follow live header geometry and each adjustable gutter's ownership", () => {
+  assert.deepEqual(
+    actionsDividerHandles,
+    [
+      { key: "workflow", x: 41, yStart: 7, yEnd: 9, width: 10, direction: -1 },
+      { key: "branch", x: 52, yStart: 7, yEnd: 9, width: 14, direction: -1 },
+      { key: "time", x: 67, yStart: 7, yEnd: 9, width: 7, direction: -1 },
+      { key: "updated", x: 75, yStart: 7, yEnd: 9, width: 8, direction: -1 },
+    ],
+  );
+
+  const securityHeader = TABS.find(({ key }) => key === "security").header;
+  assert.deepEqual(
+    dividerHandles({
+      header: securityHeader,
+      metrics: { x: 5, y: 11, width: 60, height: 2 },
+    }),
+    [
+      { key: "package", x: 30, yStart: 11, yEnd: 13, width: 16, direction: 1 },
+      { key: "age", x: 55, yStart: 11, yEnd: 13, width: 8, direction: -1 },
+    ],
+  );
+
+  assert.deepEqual(
+    dividerHandles({
+      header: actionsTab.compactHeader,
+      metrics: { x: 0, y: 0, width: 45, height: 2 },
+    }),
+    [],
+  );
+  for (const metrics of [null, {}, { x: 0, y: 0, width: 0, height: 2 }]) {
+    assert.deepEqual(dividerHandles({ header: actionsHeader, metrics }), []);
+  }
+});
+
+test("divider hit-testing is bounded, tolerant, and deterministically chooses the nearest handle", () => {
+  const workflow = actionsDividerHandles[0];
+
+  for (const x of [workflow.x - 1, workflow.x, workflow.x + 1]) {
+    assert.equal(hitDivider(actionsDividerHandles, { x, y: 7 }), workflow);
+    assert.equal(hitDivider(actionsDividerHandles, { x, y: 8 }), workflow);
+  }
+  assert.equal(hitDivider(actionsDividerHandles, { x: workflow.x - 2, y: 7 }), null);
+  assert.equal(hitDivider(actionsDividerHandles, { x: workflow.x + 2, y: 7 }), null);
+  assert.equal(hitDivider(actionsDividerHandles, { x: workflow.x, y: 6 }), null);
+  assert.equal(hitDivider(actionsDividerHandles, { x: workflow.x, y: 9 }), null);
+  assert.equal(hitDivider(actionsDividerHandles, { x: workflow.x + 2, y: 7 }, 2), workflow);
+
+  const tied = [
+    { key: "right", x: 12, yStart: 2, yEnd: 4, width: 5, direction: -1 },
+    { key: "left", x: 10, yStart: 2, yEnd: 4, width: 5, direction: -1 },
+  ];
+  assert.equal(hitDivider(tied, { x: 11, y: 2 }).key, "left");
+  assert.equal(hitDivider([], { x: 0, y: 0 }), null);
+  assert.equal(hitDivider(actionsDividerHandles, null), null);
+});
+
+test("a divider press snapshots the drag origin and rejects unsupported starts", () => {
+  assert.deepEqual(
+    beginDividerDrag({
+      event: { x: 41, y: 7, action: "press" },
+      handles: actionsDividerHandles,
+      tabKey: "actions",
+    }),
+    {
+      tabKey: "actions",
+      key: "workflow",
+      startX: 41,
+      startWidth: 10,
+      direction: -1,
+    },
+  );
+  assert.deepEqual(
+    beginDividerDrag({
+      event: { x: 43, y: 7, action: "press" },
+      handles: actionsDividerHandles,
+      tabKey: "actions",
+      tolerance: 2,
+    }),
+    {
+      tabKey: "actions",
+      key: "workflow",
+      startX: 43,
+      startWidth: 10,
+      direction: -1,
+    },
+  );
+
+  for (const event of [
+    null,
+    { x: 41, y: 7, action: "drag" },
+    { x: 41, y: 7, action: "release" },
+    { x: 0, y: 0, action: "press" },
+  ]) {
+    assert.equal(
+      beginDividerDrag({ event, handles: actionsDividerHandles, tabKey: "actions" }),
+      null,
+    );
+  }
+});
+
+test("drag widths derive from the press snapshot and the divider growth direction", () => {
+  const afterGrow = {
+    tabKey: "actions",
+    key: "workflow",
+    startX: 41,
+    startWidth: 10,
+    direction: -1,
+  };
+  assert.deepEqual(
+    draggedWidth({
+      drag: afterGrow,
+      event: { x: 44, y: 7, action: "drag" },
+      tabKey: "actions",
+      fullHeaderVisible: true,
+    }),
+    { key: "workflow", nextWidth: 7 },
+  );
+  assert.deepEqual(
+    draggedWidth({
+      drag: afterGrow,
+      event: { x: 38, y: 7, action: "drag" },
+      tabKey: "actions",
+      fullHeaderVisible: true,
+    }),
+    { key: "workflow", nextWidth: 13 },
+  );
+  assert.deepEqual(
+    draggedWidth({
+      drag: afterGrow,
+      event: { x: 43, y: 7, action: "drag" },
+      tabKey: "actions",
+      fullHeaderVisible: true,
+    }),
+    { key: "workflow", nextWidth: 8 },
+    "repeated reports must remain relative to the original press snapshot",
+  );
+
+  const beforeGrow = {
+    tabKey: "security",
+    key: "package",
+    startX: 30,
+    startWidth: 16,
+    direction: 1,
+  };
+  assert.deepEqual(
+    draggedWidth({
+      drag: beforeGrow,
+      event: { x: 33, y: 11, action: "drag" },
+      tabKey: "security",
+      fullHeaderVisible: true,
+    }),
+    { key: "package", nextWidth: 19 },
+  );
+
+  for (const input of [
+    { drag: null, event: { x: 44, y: 7, action: "drag" }, tabKey: "actions", fullHeaderVisible: true },
+    { drag: afterGrow, event: null, tabKey: "actions", fullHeaderVisible: true },
+    { drag: afterGrow, event: { x: 44, y: 7, action: "press" }, tabKey: "actions", fullHeaderVisible: true },
+    { drag: afterGrow, event: { x: 44, y: 7, action: "release" }, tabKey: "actions", fullHeaderVisible: true },
+    { drag: afterGrow, event: { x: 44, y: 7, action: "drag" }, tabKey: "issues", fullHeaderVisible: true },
+    { drag: afterGrow, event: { x: 44, y: 7, action: "drag" }, tabKey: "actions", fullHeaderVisible: false },
+    { drag: afterGrow, event: { x: 44, y: 7, action: "drag" }, tabKey: "actions", fullHeaderVisible: true, layoutValid: false },
+  ]) {
+    assert.equal(draggedWidth(input), null);
+  }
+});
+
+test("terminal mouse lifecycle transitions are idempotent and restore disables reporting first", () => {
+  const writes = [];
+  const terminal = createTerminalLifecycle((chunk) => writes.push(chunk));
+
+  assert.equal(terminal.isMouseReportingEnabled(), false);
+  assert.equal(terminal.disableMouseReporting(), false);
+  assert.equal(writes.join(""), "");
+
+  assert.equal(terminal.enableMouseReporting(), true);
+  assert.equal(terminal.enableMouseReporting(), false);
+  assert.equal(terminal.isMouseReportingEnabled(), true);
+  assert.equal(writes.join(""), `${ESC}[?1002h${ESC}[?1006h`);
+
+  assert.equal(terminal.disableMouseReporting(), true);
+  assert.equal(terminal.disableMouseReporting(), false);
+  assert.equal(terminal.isMouseReportingEnabled(), false);
+  assert.equal(
+    writes.join(""),
+    `${ESC}[?1002h${ESC}[?1006h${ESC}[?1002l${ESC}[?1006l`,
+  );
+
+  assert.equal(terminal.enableMouseReporting(), true);
+  assert.equal(terminal.restoreScreen(), true);
+  assert.equal(terminal.restoreScreen(), false);
+  assert.equal(terminal.enableMouseReporting(), false);
+  assert.equal(terminal.isMouseReportingEnabled(), false);
+  assert.equal(
+    writes.join(""),
+    `${ESC}[?1002h${ESC}[?1006h${ESC}[?1002l${ESC}[?1006l` +
+      `${ESC}[?1002h${ESC}[?1006h${ESC}[?1002l${ESC}[?1006l${ESC}[?25h${ESC}[?1049l`,
+  );
+});
+
+test("width preference paths prefer an absolute XDG root on every supported platform", () => {
+  const root = join("/tmp", "gh-glance-xdg");
+  const expected = join(root, "gh-glance", "preferences.json");
+
+  for (const platform of ["darwin", "linux"]) {
+    assert.equal(
+      widthPreferencesPath({
+        env: { XDG_CONFIG_HOME: root },
+        platform,
+        home: join("/home", "ignored"),
+      }),
+      expected,
+    );
+  }
+});
+
+test("width preference paths use platform fallbacks for empty or relative XDG roots", () => {
+  const macHome = join("/Users", "octocat");
+  const linuxHome = join("/home", "octocat");
+
+  for (const xdg of [undefined, "", "relative/config"]) {
+    const env = xdg === undefined ? {} : { XDG_CONFIG_HOME: xdg };
+    assert.equal(
+      widthPreferencesPath({ env, platform: "darwin", home: macHome }),
+      join(macHome, "Library", "Application Support", "gh-glance", "preferences.json"),
+    );
+    assert.equal(
+      widthPreferencesPath({ env, platform: "linux", home: linuxHome }),
+      join(linuxHome, ".config", "gh-glance", "preferences.json"),
+    );
+  }
+});
+
+test("width preference parsing accepts only known versioned adjustable widths", () => {
+  const parsed = parseWidthPreferences(`{
+    "version": ${WIDTH_PREFERENCES_VERSION},
+    "tabs": {
+      "security": {"package": 20, "age": 5, "severity": 30, "constructor": 30},
+      "actions": {"workflow": 5, "branch": 18, "time": 4, "status": 30, "__proto__": 30},
+      "issues": {"author": 6, "label": 6, "updated": 9007199254740992},
+      "prs": {"review": 7, "branch": 6.5},
+      "unknown": {"branch": 99},
+      "__proto__": {"branch": 99}
+    }
+  }`);
+
+  assert.deepEqual(parsed, {
+    actions: { workflow: 5, branch: 18 },
+    issues: { author: 6, label: 6 },
+    prs: { review: 7 },
+    security: { package: 20 },
+  });
+  assert.equal(Object.hasOwn(parsed, "__proto__"), false);
+  assert.equal(Object.hasOwn(parsed.actions, "__proto__"), false);
+});
+
+test("width preference parsing treats malformed, unknown, and wrong-shaped documents as empty", () => {
+  for (const raw of [
+    "not json",
+    "null",
+    "[]",
+    "{}",
+    '{"version":2,"tabs":{"actions":{"branch":18}}}',
+    '{"version":1,"tabs":null}',
+    '{"version":1,"tabs":[]}',
+    '{"version":1,"tabs":{"actions":null}}',
+    '{"version":1,"tabs":{"actions":[]}}',
+    '{"version":1,"tabs":{"actions":{"branch":"18"}}}',
+  ]) {
+    assert.deepEqual(parseWidthPreferences(raw), {}, raw);
+  }
+});
+
+test("width preference serialization stores only ordered deviations and a trailing newline", () => {
+  const overrides = Object.freeze({
+    security: Object.freeze({ package: 16, age: 9 }),
+    unknown: Object.freeze({ branch: 99 }),
+    issues: Object.freeze({ author: 5, updated: 8, label: 6 }),
+    actions: Object.freeze({
+      workflow: 10,
+      updated: 9,
+      branch: 18,
+      time: Number.NaN,
+      title: 30,
+    }),
+  });
+
+  assert.equal(
+    serializeWidthPreferences(overrides),
+    `{
+  "version": 1,
+  "tabs": {
+    "actions": {
+      "branch": 18,
+      "updated": 9
+    },
+    "issues": {
+      "label": 6
+    },
+    "security": {
+      "age": 9
+    }
+  }
+}
+`,
+  );
+});
+
+test("width preference parse and serialization round-trip stably without mutation", () => {
+  const overrides = Object.freeze({
+    actions: Object.freeze({ workflow: 7, branch: 18 }),
+    issues: Object.freeze({ author: 9 }),
+  });
+  const before = structuredClone(overrides);
+
+  const serialized = serializeWidthPreferences(overrides);
+  const parsed = parseWidthPreferences(serialized);
+
+  assert.deepEqual(parsed, before);
+  assert.equal(serializeWidthPreferences(parsed), serialized);
+  assert.deepEqual(overrides, before);
+});
+
+test("width preference writer coalesces trailing schedules to the latest state", async () => {
+  const writes = [];
+  const completed = deferred();
+  const writer = createWidthPreferenceWriter({
+    delay: 5,
+    write: (value) => {
+      writes.push(value);
+      return { ok: true };
+    },
+    onResult: completed.resolve,
+  });
+  const first = { actions: { branch: 15 } };
+  const latest = { actions: { branch: 18 } };
+
+  writer.schedule(first);
+  writer.schedule(latest);
+  assert.deepEqual(await within(completed.promise), { ok: true });
+  assert.deepEqual(writes, [latest]);
+
+  await writer.dispose();
+  assert.deepEqual(writes, [latest], "dispose must not repeat an already-clean write");
+});
+
+test("width preference writer flushes latest state once and dispose flushes dirty state", async () => {
+  const writes = [];
+  const results = [];
+  const writer = createWidthPreferenceWriter({
+    delay: 60_000,
+    write: (value) => {
+      writes.push(value);
+      return { ok: true };
+    },
+    onResult: (result) => results.push(result),
+  });
+  const first = { actions: { workflow: 11 } };
+  const latest = { actions: { workflow: 12 } };
+
+  writer.schedule(first);
+  writer.schedule(latest);
+  await writer.flush();
+  await writer.flush();
+  assert.deepEqual(writes, [latest]);
+  assert.deepEqual(results, [{ ok: true }]);
+
+  const disposeWriter = createWidthPreferenceWriter({
+    delay: 60_000,
+    write: (value) => {
+      writes.push(value);
+      return { ok: true };
+    },
+    onResult: (result) => results.push(result),
+  });
+  const onDispose = { security: { package: 20 } };
+  disposeWriter.schedule(onDispose);
+  await disposeWriter.dispose();
+  assert.deepEqual(writes, [latest, onDispose]);
+  assert.deepEqual(results, [{ ok: true }, { ok: true }]);
+});
+
+test("width preference writer converts synchronous throws and rejections into result state", async () => {
+  for (const [label, write] of [
+    [
+      "throw",
+      () => {
+        throw new Error("disk threw");
+      },
+    ],
+    ["rejection", async () => Promise.reject(new Error("disk rejected"))],
+  ]) {
+    const results = [];
+    const writer = createWidthPreferenceWriter({
+      delay: 60_000,
+      write,
+      onResult: (result) => results.push(result),
+    });
+    writer.schedule({ actions: { branch: 18 } });
+
+    await writer.flush();
+
+    assert.equal(results.length, 1, label);
+    assert.equal(results[0].ok, false, label);
+    assert.ok(results[0].error instanceof Error, label);
+    await writer.dispose();
+  }
+});
+
+test("a failed width preference flush remains pending for a later retry", async () => {
+  const value = { actions: { branch: 18 } };
+  const writes = [];
+  const results = [];
+  const failure = new Error("temporary write failure");
+  const writer = createWidthPreferenceWriter({
+    delay: 60_000,
+    write: (received) => {
+      writes.push(received);
+      return writes.length === 1 ? { ok: false, error: failure } : { ok: true };
+    },
+    onResult: (result) => results.push(result),
+  });
+
+  writer.schedule(value);
+  assert.deepEqual(await writer.flush(), { ok: false, error: failure });
+  assert.deepEqual(await writer.flush(), { ok: true });
+
+  assert.deepEqual(writes, [value, value]);
+  assert.deepEqual(results, [{ ok: false, error: failure }, { ok: true }]);
+  await writer.dispose();
+  assert.deepEqual(writes, [value, value], "a successful retry must leave the writer clean");
+});
+
+test("dispose retries the latest state after an earlier write failure", async () => {
+  const initial = { actions: { branch: 18 } };
+  const latest = { actions: { branch: 20 } };
+  const writes = [];
+  const results = [];
+  const failure = new Error("first write failed");
+  const writer = createWidthPreferenceWriter({
+    delay: 60_000,
+    write: (value) => {
+      writes.push(value);
+      return writes.length === 1 ? { ok: false, error: failure } : { ok: true };
+    },
+    onResult: (result) => results.push(result),
+  });
+
+  writer.schedule(initial);
+  await writer.flush();
+  writer.schedule(latest);
+  await writer.dispose();
+
+  assert.deepEqual(writes, [initial, latest]);
+  assert.deepEqual(results, [{ ok: false, error: failure }, { ok: true }]);
+});
+
+test("overlapping asynchronous width preference writes are serialized in schedule order", async () => {
+  const first = deferred();
+  const second = deferred();
+  const initial = { actions: { branch: 18 } };
+  const latest = { actions: { branch: 20 } };
+  const writes = [];
+  const results = [];
+  const writer = createWidthPreferenceWriter({
+    delay: 60_000,
+    write: (value) => {
+      writes.push(value);
+      return writes.length === 1 ? first.promise : second.promise;
+    },
+    onResult: (result) => results.push(result),
+  });
+
+  writer.schedule(initial);
+  const firstFlush = writer.flush();
+  writer.schedule(latest);
+  const overlappingFlush = writer.flush();
+
+  assert.deepEqual(writes, [initial], "the second write must wait for the first to settle");
+  assert.deepEqual(results, []);
+
+  first.resolve({ ok: true, id: "initial" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(writes, [initial, latest]);
+  assert.deepEqual(results, [], "a superseded completion must not report stale result state");
+
+  second.resolve({ ok: true, id: "latest" });
+  await within(Promise.all([firstFlush, overlappingFlush]));
+  assert.deepEqual(results, [{ ok: true, id: "latest" }]);
+  await writer.dispose();
+});
+
+test("concurrent width preference flushes share one in-flight write", async () => {
+  const pending = deferred();
+  const value = { issues: { author: 9 } };
+  const writes = [];
+  const results = [];
+  const writer = createWidthPreferenceWriter({
+    delay: 60_000,
+    write: (received) => {
+      writes.push(received);
+      return pending.promise;
+    },
+    onResult: (result) => results.push(result),
+  });
+
+  writer.schedule(value);
+  const flushes = [writer.flush(), writer.flush(), writer.flush()];
+  assert.deepEqual(writes, [value]);
+
+  pending.resolve({ ok: true });
+  const flushResults = await within(Promise.all(flushes));
+
+  assert.deepEqual(writes, [value]);
+  assert.deepEqual(results, [{ ok: true }]);
+  assert.deepEqual(flushResults, [{ ok: true }, { ok: true }, { ok: true }]);
+  await writer.dispose();
+});
+
 test("importing the app selects React's production build", async () => {
   // Guards a fix that already cost one fatal OOM. React's development build
   // records a PerformanceMeasure on every render and never releases them, which
@@ -811,6 +2072,237 @@ test("every verdict with a remedy also has a backoff ladder, and vice versa", ()
   assert.ok(RATE_LIMIT_RETRY_MS[0] <= BACKOFF_STEPS_MS[0]);
 });
 
+test("the per-fetch cost tables cover every tab and nothing else", () => {
+  assert.deepEqual(Object.keys(REST_PER_FETCH).sort(), [...TAB_KEYS].sort());
+  assert.deepEqual(Object.keys(GRAPHQL_PER_FETCH).sort(), [...TAB_KEYS].sort());
+});
+
+test("an actions fetch costs two REST calls", () => {
+  // Measured 2026-08-10: gh run list issues /actions/runs and
+  // /actions/workflows. Pinned because the adaptive throttle budgets against it.
+  assert.equal(REST_PER_FETCH.actions, 2);
+});
+
+test("issues and prs cost no REST and two GraphQL, because --search routes them", () => {
+  for (const key of ["issues", "prs"]) {
+    assert.equal(REST_PER_FETCH[key], 0, key);
+    assert.equal(GRAPHQL_PER_FETCH[key], 2, key);
+  }
+});
+
+test("security costs one REST per alert source", () => {
+  assert.equal(REST_PER_FETCH.security, ALERT_SOURCES.length);
+});
+
+test("projected hourly cost, per active tab, at the default refresh", () => {
+  // runtime.refreshMs is REFRESH_MS on an imported module (the argv block is
+  // gated on IS_MAIN), so these are the default-refresh figures.
+  assert.deepEqual(projectedHourlyCost("actions"), { rest: 1620, graphql: 240 });
+  assert.deepEqual(projectedHourlyCost("issues"), { rest: 300, graphql: 1560 });
+  assert.deepEqual(projectedHourlyCost("prs"), { rest: 300, graphql: 1560 });
+  assert.deepEqual(projectedHourlyCost("security"), { rest: 2280, graphql: 240 });
+});
+
+// The control law. These assertions are the specification -- the function is
+// pure, so the rubric can be stated exactly rather than observed through a
+// timer. Expected intervals are derived, not guessed: with
+// restPerTick("actions") = 2 + 3/12 = 2.25 and a fresh window (5000 remaining,
+// resetting in an hour), affordable = 5000/3600 * 0.8 = 1.111 calls/sec.
+function assertClose(actual, expected, tolerance) {
+  assert.ok(
+    Math.abs(actual - expected) <= tolerance,
+    `expected ${actual} within ${tolerance} of ${expected}`,
+  );
+}
+
+const FRESH = { remaining: 5000, limit: 5000, resetMs: 3_600_000 };
+// `budget` is merged onto FRESH *after* the general spread: a row that overrides
+// only `remaining` must keep the fresh window's resetMs, or secondsToReset goes
+// NaN and the case silently stops testing what it names.
+const at = (over) => ({
+  nowMs: 0,
+  restPerTick: 2.25,
+  floorMs: 5000,
+  ...over,
+  budget: { ...FRESH, ...over?.budget },
+});
+const sample = (mine, global) => ({ myRestCalls: mine, globalUsed: global });
+
+test("a single instance stays at the configured floor", () => {
+  // required = 2.25 / 1.111 = 2.03s, below the 5s floor. This is the property
+  // that keeps adaptation from being a regression for ordinary single-pane use.
+  assert.equal(adaptiveRefreshMs(at({ sample: sample(100, 100) })), 5000);
+});
+
+test("three panes sit just above the floor", () => {
+  assertClose(adaptiveRefreshMs(at({ sample: sample(100, 300) })), 6075, 200);
+});
+
+test("seven panes widen to about 14 seconds", () => {
+  assertClose(adaptiveRefreshMs(at({ sample: sample(100, 700) })), 14175, 500);
+});
+
+test("ten panes widen to about 20 seconds", () => {
+  assertClose(adaptiveRefreshMs(at({ sample: sample(100, 1000) })), 20250, 500);
+});
+
+test("the aggregate of N adapted panes lands near the safety target", () => {
+  // The property that matters, asserted directly rather than inferred from the
+  // intervals: N panes each polling at the computed interval spend at most
+  // BUDGET_SAFETY of the hourly limit, leaving the rest for the user's own gh.
+  for (const n of [1, 3, 7, 10, 20]) {
+    const ms = adaptiveRefreshMs(at({ sample: sample(100, 100 * n) }));
+    const aggregate = n * (3_600_000 / ms) * 2.25;
+    assert.ok(aggregate <= 5000 * BUDGET_SAFETY + 1, `n=${n} spent ${aggregate}`);
+  }
+});
+
+test("an exhausted budget goes straight to the cap", () => {
+  assert.equal(
+    adaptiveRefreshMs(at({ budget: { remaining: 0 }, sample: sample(100, 700) })),
+    MAX_ADAPTIVE_REFRESH_MS,
+  );
+});
+
+test("widening is capped", () => {
+  assert.equal(
+    adaptiveRefreshMs(at({ budget: { remaining: 10 }, sample: sample(100, 9000) })),
+    MAX_ADAPTIVE_REFRESH_MS,
+  );
+});
+
+test("too small a sample declines to infer a share", () => {
+  // Floor, not a wild extrapolation: one call against a global delta of one
+  // reads as "we are the only consumer" whether or not that is true. Floor
+  // specifically because there is no earlier measurement to hold -- see below.
+  assert.equal(adaptiveRefreshMs(at({ sample: sample(MIN_SAMPLE_CALLS - 1, 5000) })), 5000);
+});
+
+test("an unmeasurable window holds the widened interval, not the floor", () => {
+  // The same rubric row as "seven panes", reached with a window too small to
+  // re-measure. Dropping to the floor here is the flap: a pane wide enough to
+  // need throttling is, by construction, too quiet to keep proving it.
+  assertClose(adaptiveRefreshMs(at({ sample: sample(2, 700), lastShare: 7 })), 14175, 500);
+});
+
+test("inferShare holds the last measurement when the window cannot be measured", () => {
+  assert.equal(inferShare(sample(100, 700)), 7);
+  assert.equal(inferShare(sample(2, 700), 7), 7);
+  assert.equal(inferShare(null, 7), 7);
+  // Never below 1, from either source: fewer than one consumer is not a thing,
+  // and a share under 1 would compute an interval tighter than the floor.
+  assert.equal(inferShare(sample(100, 50)), 1);
+  assert.equal(inferShare(null, 0.2), 1);
+});
+
+test("an unmeasurable probe window stays open instead of restarting", () => {
+  const first = nextProbeWindow(null, { used: 100 }, 0);
+  assert.equal(first.sample, null, "the first probe has no window to measure over");
+  assert.deepEqual(first.next, { used: 100, spent: 0 });
+
+  // Two of our own calls, below MIN_SAMPLE_CALLS: the baseline must not advance,
+  // or the next window starts equally short and the pane can never re-measure.
+  const small = nextProbeWindow(first.next, { used: 140 }, 2);
+  assert.equal(sampleIsUsable(small.sample), false);
+  assert.deepEqual(small.next, first.next);
+
+  // One probe later the accumulated window is measurable -- and both halves of
+  // the ratio span the whole stretch, not just the last minute of it.
+  const grown = nextProbeWindow(small.next, { used: 200 }, 6);
+  assert.deepEqual(grown.sample, { globalUsed: 100, myRestCalls: 6 });
+  assert.deepEqual(grown.next, { used: 200, spent: 6 });
+});
+
+test("a rate-limit window reset restarts the probe window", () => {
+  // `used` falling means the hour rolled over. The span before the reset cannot
+  // be compared against the counter after it, so this cycle infers nothing
+  // rather than reporting a negative delta.
+  const { sample: s, next } = nextProbeWindow({ used: 4000, spent: 900 }, { used: 12 }, 950);
+  assert.equal(s, null);
+  assert.deepEqual(next, { used: 12, spent: 950 });
+});
+
+test("a throttled pane does not flap back to the floor between measurable windows", () => {
+  // The closed-loop property the rubric above cannot see, because every row
+  // there is handed its sample. Twenty panes widen to ~40s, at which point one
+  // probe window holds ~3 of this pane's calls -- under MIN_SAMPLE_CALLS. If the
+  // loop re-measured from scratch it would read "no other consumers", snap to
+  // the floor, spend enough to measure again, and re-throttle: a two-minute flap
+  // at exactly the instance count the widening exists for.
+  //
+  // The budget is held healthy on purpose. That is the trap: once the panes have
+  // throttled, nothing about `remaining` says they must stay throttled, and the
+  // inferred share is the only thing holding them there.
+  const PANES = 20;
+  let applied = 5000;
+  let spent = 0;
+  let used = 0;
+  let probeWindow = null;
+  let share = 1;
+  const settled = [];
+
+  for (let probe = 0; probe < 12; probe++) {
+    const mine = (60_000 / applied) * 2.25; // one probe window at the current interval
+    spent += mine;
+    used += mine * PANES;
+    const budget = { ...FRESH, used };
+
+    const step = nextProbeWindow(probeWindow, budget, spent);
+    probeWindow = step.next;
+    share = inferShare(step.sample, share);
+    const target = adaptiveRefreshMs(at({ budget, sample: step.sample, lastShare: share }));
+    if (adaptiveChangeWorthApplying(applied, target)) applied = target;
+
+    if (probe >= 2) settled.push(applied);
+  }
+
+  assert.ok(Math.min(...settled) > 5000, `returned to the floor: ${settled.join(", ")}`);
+  assertClose(applied, 40_500, 2000);
+});
+
+test("a missing or unreadable budget returns the floor unchanged", () => {
+  for (const budget of [null, undefined, { remaining: NaN }]) {
+    assert.equal(adaptiveRefreshMs({ ...at(), budget, sample: sample(100, 700) }), 5000);
+  }
+});
+
+test("the configured floor is never tightened, even above the cap", () => {
+  const ms = adaptiveRefreshMs({ ...at({ sample: sample(100, 100) }), floorMs: 120_000 });
+  assert.equal(ms, 120_000);
+});
+
+test("hysteresis suppresses small moves and admits large ones", () => {
+  assert.equal(adaptiveChangeWorthApplying(10_000, 11_000), false); // +10%
+  assert.equal(adaptiveChangeWorthApplying(10_000, 9_500), false); // -5%
+  assert.equal(adaptiveChangeWorthApplying(10_000, 13_000), true); // +30%
+  assert.equal(adaptiveChangeWorthApplying(10_000, 7_000), true); // -30%
+  assert.equal(adaptiveChangeWorthApplying(0, 5_000), true); // first apply
+});
+
+test("restPerTick amortises the background tabs", () => {
+  // Close rather than exact: the function accumulates one division per
+  // background tab, so 0 + 2/12 + 3/12 is not bit-identical to 5/12.
+  assertClose(restPerTick("actions"), 2 + 3 / BACKGROUND_EVERY, 1e-12);
+  assertClose(restPerTick("security"), 3 + 2 / BACKGROUND_EVERY, 1e-12);
+  assertClose(restPerTick("issues"), (2 + 3) / BACKGROUND_EVERY, 1e-12);
+});
+
+test("every tab's fetcher has a spend to report from the cost table", () => {
+  // Guards the drift this design is built to prevent: the meter bills from the
+  // same table the projection reads, so a tab with no entry would silently bill
+  // nothing and make the inferred share wrong. The richer attribution
+  // assertions live in the pty layer, because the fetchers need a `gh` to run.
+  for (const key of TAB_KEYS) assert.equal(typeof REST_PER_FETCH[key], "number");
+});
+
+test("restPerTick and projectedHourlyCost agree", () => {
+  // Two derivations of the same quantity; if they drift, one of them is wrong.
+  for (const key of TAB_KEYS) {
+    const perHour = restPerTick(key) * (3_600_000 / REFRESH_MS);
+    assertClose(perHour, projectedHourlyCost(key).rest, 1);
+  }
+});
+
 test("the status bar hints are a subset of the documented key table", () => {
   // KEY_TABLE feeds both --help and the `?` overlay; KEY_HINTS is the short
   // subset shown on the status bar. Nothing else enforces that they agree.
@@ -825,6 +2317,13 @@ test("the status bar hints are a subset of the documented key table", () => {
       `status bar advertises "${hint.label}" but the key table documents no such action`,
     );
   }
+  assert.deepEqual(KEY_HINTS, [
+    { label: "Move", keys: "↑↓" },
+    { label: "Open", keys: "Ent" },
+    { label: "Refresh", keys: "r" },
+    { label: "Width", keys: "w" },
+    { label: "Quit", keys: "q" },
+  ]);
   assert.ok(
     KEY_TABLE.some(([keys]) => keys === "?"),
     "the overlay's own key must be listed in the table it renders",

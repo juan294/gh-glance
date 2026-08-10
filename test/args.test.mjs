@@ -19,6 +19,9 @@ import {
 } from "../index.mjs";
 
 const parse = (argv) => validateArgs(parseArgs(argv), TAB_KEYS);
+// The real shape parseArgs hands validateArgs, so a field added there cannot go
+// missing here and leave these tests exercising a stale literal.
+const defaults = parseArgs([]);
 
 test("no arguments keeps every default", () => {
   const opts = parse([]);
@@ -139,6 +142,26 @@ test("--refresh rejects values that would silently not be honoured", () => {
   for (const bad of ["1", "0", "-5", "abc", "2.5", "", "Infinity", "1e9"]) {
     assert.throws(() => parse(["--refresh", bad]), /--refresh/, JSON.stringify(bad));
   }
+});
+
+test("refreshSource renames the bounds messages without duplicating them", () => {
+  // Same validator, same bounds; all that changes is which surface is named.
+  assert.throws(
+    () => validateArgs({ ...defaults, refresh: "1", refreshSource: "GH_GLANCE_REFRESH" }, TAB_KEYS),
+    new RegExp(
+      `GH_GLANCE_REFRESH must be between ${MIN_REFRESH_SECONDS} and ${MAX_REFRESH_SECONDS} seconds, got: 1`,
+    ),
+  );
+  assert.throws(
+    () =>
+      validateArgs({ ...defaults, refresh: "abc", refreshSource: "GH_GLANCE_REFRESH" }, TAB_KEYS),
+    /GH_GLANCE_REFRESH must be a whole number of seconds/,
+  );
+});
+
+test("without a source the messages still name the flag", () => {
+  assert.throws(() => parse(["--refresh", "1"]), /--refresh must be between/);
+  assert.throws(() => parse(["--refresh", "abc"]), /--refresh must be a whole number/);
 });
 
 test("--tab accepts exactly the four tab keys", () => {

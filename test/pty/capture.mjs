@@ -12,9 +12,9 @@
 //      terminal, so a width check that does not skip them fails on Linux only.
 
 import { execFileSync } from "node:child_process";
-import { readFileSync, existsSync, rmSync } from "node:fs";
+import { readFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { tmpdir } from "node:os";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -23,8 +23,13 @@ const RUN = join(HERE, "run.sh");
 const ESC = String.fromCharCode(27);
 const ALT_ENTER = `${ESC}[?1049h`;
 const ALT_EXIT = `${ESC}[?1049l`;
+const MOUSE_1002_ENTER = `${ESC}[?1002h`;
+const MOUSE_1002_EXIT = `${ESC}[?1002l`;
+const MOUSE_1006_ENTER = `${ESC}[?1006h`;
+const MOUSE_1006_EXIT = `${ESC}[?1006l`;
 
 const OSC = new RegExp(`${ESC}\\][^\\x07${ESC}]*(?:\\x07|${ESC}\\\\)`, "g");
+const SGR_MOUSE = new RegExp(`${ESC}\\[<[0-9]+;[0-9]+;[0-9]+[Mm]`, "g");
 const CSI = new RegExp(`${ESC}\\[[0-9;?]*[A-Za-z]`, "g");
 const CHARSET = new RegExp(`${ESC}[()][A-Za-z0-9]`, "g");
 // Any of these can begin a repaint, so the last one marks the start of the
@@ -33,7 +38,12 @@ const FRAME_BOUNDARY = new RegExp(`${ESC}\\[[0-9]*A|${ESC}\\[2J|${ESC}\\[H`, "g"
 const SCRIPT_BANNER = /^Script (started|done) on /;
 
 function stripEscapes(text) {
-  return text.replace(OSC, "").replace(CSI, "").replace(CHARSET, "").replace(/\r/g, "");
+  return text
+    .replace(OSC, "")
+    .replace(SGR_MOUSE, "")
+    .replace(CSI, "")
+    .replace(CHARSET, "")
+    .replace(/\r/g, "");
 }
 
 function countOf(text, needle) {
@@ -46,6 +56,29 @@ function countOf(text, needle) {
   return n;
 }
 
+function positionsOf(text, needle) {
+  const positions = [];
+  let i = text.indexOf(needle);
+  while (i !== -1) {
+    positions.push(i);
+    i = text.indexOf(needle, i + needle.length);
+  }
+  return positions;
+}
+
+function lastBefore(positions, boundary) {
+  let last = -1;
+  for (const position of positions) {
+    if (position >= boundary) break;
+    last = position;
+  }
+  return last;
+}
+
+function lastPosition(positions) {
+  return positions.at(-1) ?? -1;
+}
+
 function visibleLines(text) {
   return stripEscapes(text)
     .split("\n")
@@ -53,6 +86,25 @@ function visibleLines(text) {
 }
 
 export function parseCapture(raw) {
+  const visibleRaw = stripEscapes(raw);
+  const altExitPositions = positionsOf(raw, ALT_EXIT);
+  const mouse1002EnterPositions = positionsOf(raw, MOUSE_1002_ENTER);
+  const mouse1002ExitPositions = positionsOf(raw, MOUSE_1002_EXIT);
+  const mouse1006EnterPositions = positionsOf(raw, MOUSE_1006_ENTER);
+  const mouse1006ExitPositions = positionsOf(raw, MOUSE_1006_EXIT);
+  const mouseDisableBeforeAltExit =
+    altExitPositions.length > 0 &&
+    altExitPositions.every((position) => {
+      const last1002Enter = lastBefore(mouse1002EnterPositions, position);
+      const last1002Exit = lastBefore(mouse1002ExitPositions, position);
+      const last1006Enter = lastBefore(mouse1006EnterPositions, position);
+      const last1006Exit = lastBefore(mouse1006ExitPositions, position);
+      return last1002Exit > last1002Enter && last1006Exit > last1006Enter;
+    });
+  const mouseReportingEnabled =
+    lastPosition(mouse1002EnterPositions) > lastPosition(mouse1002ExitPositions) ||
+    lastPosition(mouse1006EnterPositions) > lastPosition(mouse1006ExitPositions);
+
   // Everything after the LAST frame boundary is the frame left on screen.
   let lastBoundaryEnd = 0;
   for (const match of raw.matchAll(FRAME_BOUNDARY)) {
@@ -88,9 +140,18 @@ export function parseCapture(raw) {
     raw,
     exitCode: exitMatch ? Number(exitMatch[1]) : null,
     altEnter: countOf(raw, ALT_ENTER),
-    altExit: countOf(raw, ALT_EXIT),
+    altExit: altExitPositions.length,
     cursorShows: countOf(raw, `${ESC}[?25h`),
     fullClears: countOf(raw, `${ESC}[2J`),
+    mouse1002Enter: mouse1002EnterPositions.length,
+    mouse1002Exit: mouse1002ExitPositions.length,
+    mouse1006Enter: mouse1006EnterPositions.length,
+    mouse1006Exit: mouse1006ExitPositions.length,
+    mouse1002EnterPositions,
+    mouse1002ExitPositions,
+    mouse1006EnterPositions,
+    mouse1006ExitPositions,
+    mouseDisableBeforeAltExit,
     finalFrame: {
       lines: finalFrameLines,
       widest: finalFrameLines.reduce((max, line) => Math.max(max, [...line].length), 0),
@@ -100,12 +161,13 @@ export function parseCapture(raw) {
       visible: afterRestoreVisible,
       hasClear: tail.includes(`${ESC}[2J`),
       hasScrollbackErase: tail.includes(`${ESC}[3J`),
+      mouseReportingEnabled,
     },
     // Chrome presence only. Cell contents are deliberately never asserted: a
     // copy change would red the build for no defect.
-    hasPanelFrame: /[╭╰╮╯]/.test(stripEscapes(raw)),
-    hasTabBar: /1:(Actions|Act)/.test(stripEscapes(raw)),
-    hasFullKeyHints: /Move:/.test(stripEscapes(raw)),
+    hasPanelFrame: /[╭╰╮╯]/.test(visibleRaw),
+    hasTabBar: /1:(Actions|Act)/.test(visibleRaw),
+    hasFullKeyHints: /Move:/.test(visibleRaw),
   };
 }
 
@@ -123,6 +185,8 @@ let captureSeq = 0;
  * @param {string} [options.stdin]  shell snippet whose stdout is fed to the pty
  * @param {string} [options.args]   flags handed to index.mjs, space-separated
  * @param {object} [options.env]    environment overrides for the fixture run
+ * @param {string} [options.configHome] caller-owned absolute config root; when
+ *                                      omitted, capture creates and cleans one
  */
 export function capture({
   cols,
@@ -132,9 +196,18 @@ export function capture({
   stdin = "",
   args = "",
   env = {},
+  configHome,
 }) {
+  if (configHome != null && (!isAbsolute(configHome) || configHome.length === 0)) {
+    throw new TypeError("configHome must be an absolute path");
+  }
+
   captureSeq += 1;
   const out = join(tmpdir(), `gh-glance-pty-${process.pid}-${captureSeq}.txt`);
+  const ownsConfigHome = configHome == null;
+  const effectiveConfigHome = ownsConfigHome
+    ? mkdtempSync(join(tmpdir(), "gh-glance-pty-config-"))
+    : configHome;
   try {
     execFileSync(
       "/bin/sh",
@@ -142,7 +215,10 @@ export function capture({
       {
         stdio: "ignore",
         timeout: (settle + 25) * 1000,
-        env: { ...process.env, ...env },
+        // Isolation wins over caller-supplied environment overrides: every PTY
+        // run must be unable to observe the developer's real preferences. A
+        // caller that needs restart persistence supplies configHome explicitly.
+        env: { ...process.env, ...env, XDG_CONFIG_HOME: effectiveConfigHome },
       },
     );
     const parsed = parseCapture(readFileSync(out, "utf8"));
@@ -155,5 +231,6 @@ export function capture({
     for (const path of [out, `${out}.calls`]) {
       if (existsSync(path)) rmSync(path, { force: true });
     }
+    if (ownsConfigHome) rmSync(effectiveConfigHome, { recursive: true, force: true });
   }
 }

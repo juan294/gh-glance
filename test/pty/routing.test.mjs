@@ -24,7 +24,12 @@ const slugOnly = capture({ cols: 80, rows: 24, args: "--repo acme/widget" });
 const hostQualified = capture({ cols: 80, rows: 24, args: `--repo ${HOST}/acme/widget` });
 
 const listCalls = (result) => result.fixtureCalls.filter((call) => /^(run|issue|pr) /.test(call));
-const apiCalls = (result) => result.fixtureCalls.filter((call) => call.startsWith("api "));
+// The alert endpoints only. `api rate_limit` is the adaptive throttle's budget
+// probe: it is host-routed like these are, but it addresses no repository, so it
+// fails the request-path assertions below. It gets its own test instead.
+const apiCalls = (result) =>
+  result.fixtureCalls.filter((call) => call.startsWith("api ") && !call.startsWith("api rate_limit"));
+const probeCalls = (result) => result.fixtureCalls.filter((call) => call.startsWith("api rate_limit"));
 
 function assertReachedTheDataLayer(result, label) {
   assert.ok(result.fixtureCalls.length > 0, `${label}: the fixture gh was never invoked`);
@@ -70,5 +75,18 @@ test("a host-qualified --repo routes BOTH halves to the host", () => {
     // path -- only the validated owner/name slug is.
     assert.ok(call.includes("repos/acme/widget/"), call);
     assert.ok(!call.includes(`repos/${HOST}/`), `the host reached a request path: ${call}`);
+  }
+});
+
+test("the budget probe is routed to the host too", () => {
+  // A rate limit is per token *per server*. Unrouted, the adaptive throttle
+  // reads github.com's budget while the pane spends against the tenant, and then
+  // throttles -- or fails to -- against a number from an unrelated limit.
+  // `--repo host/owner/name` is the case that needs the flag: it sets the host
+  // without setting GH_HOST, which `gh` would otherwise have honoured on its own.
+  const probes = probeCalls(hostQualified);
+  assert.ok(probes.length > 0, "the budget probe never ran on the host-qualified target");
+  for (const call of probes) {
+    assert.ok(call.includes(`--hostname ${HOST}`), `budget probe not routed to the host: ${call}`);
   }
 });

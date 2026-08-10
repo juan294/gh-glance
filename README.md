@@ -21,16 +21,16 @@ without switching to the browser.
 [1:Actions (4)]   2:Issues (3)    3:PRs (2)    4:Security (0)
 ────────────────────────────────────────────────────────────────────────────
 ╭─ Actions ────────────────────────────────────────────────────────────────╮
-│     TITLE                    WORKFLOW   BRANCH         TIME    UPDATED   │
+│     TITLE                   │WORKFLOW  │BRANCH        │TIME   │UPDATED   │
 │ ──────────────────────────────────────────────────────────────────────── │
-│ >+  ci: pin actions to comm… #443 CI    develop        1m20s   2d ago    │
-│  x  fix: restore the primar… #442 Code… develop        1m28s   2d ago    │
-│  !  chore: bump dependencies #441 CI    dependa…int-10 56h49m  2d ago    │
-│  -  docs: update the readme  #440 CI    develop        15s     3d ago    │
+│ >+  ci: pin actions to comm… #443 CI    develop        1m20s   9d ago    │
+│  x  fix: restore the primar… #442 Code… develop        1m28s   9d ago    │
+│  !  chore: bump dependencies #441 CI    dependa…int-10 222h8m  9d ago    │
+│  -  docs: update the readme  #440 CI    develop        15s     10d ago   │
 │                                                                          │
 │                                                                          │
 ╰───────────────────────────────────────────────────────────────── 4 of 4 ─╯
-⣾ Fetching  Move: ↑↓ | Open: Ent | Refresh: r | Quit: q
+⣾ Fetching  Move: ↑↓ | Open: Ent | Refresh: r | Width: w | Quit: q     0.7.0
 ```
 
 > Captured from a real run at 76 columns with `GH_GLANCE_ICONS=unicode`, so the
@@ -73,6 +73,8 @@ current.
   that have GitHub Advanced Security enabled -- see [Limitations](#limitations).
 - Tab bar with live counts, pinned to the top of the pane above a divider,
   switchable via `1`-`4`, arrow keys, or `Tab`/`Shift+Tab`
+- Adjustable full-table columns, with visible header grips, a keyboard width
+  mode, and preferences kept separately for each tab
 - `lazygit`-style panel frame: the tab name sits in the top border, the
   visible-of-total row count in the bottom
 - A `Fetching` indicator that brightens on every refresh and animates during the
@@ -230,8 +232,42 @@ stdout isn't a terminal rather than streaming redraw frames into a pipe.
 | `PgUp` / `PgDn` | Move a page at a time |
 | `Enter` | Open the selected item, or accept an onboarding prompt |
 | `r` | Refresh the current tab now |
+| `w` | Adjust table column widths |
 | `?` | Show the keys without leaving the dashboard (any key closes it) |
-| `q` / `Esc` / `Ctrl+C` | Quit |
+| `q` / `Esc` / `Ctrl+C` | Quit (`Esc` leaves width mode) |
+
+### Adjusting column widths
+
+Press `w` to adjust the named fixed-width columns in the visible full table.
+The flexible **TITLE** or **SUMMARY** column, status and severity cells, and
+compact layouts are not adjustable. Outside width mode, the normal arrow,
+`Tab`, `Enter`, and refresh meanings above are unchanged.
+
+| Key | In width mode |
+|---|---|
+| `Tab` / `Shift+Tab` | Select the next / previous adjustable column |
+| `←` / `→` | Resize the selected column by one cell |
+| `Shift+←` / `Shift+→` | Resize the selected column by five cells |
+| `r` | Reset the selected column to its default |
+| `R` | Reset every width on the active tab |
+| `Enter` / `Esc` / `w` | Finish and leave width mode |
+| `q` / `Ctrl+C` | Quit globally |
+
+While the mode is active, the ordinary status hints are replaced by a bounded
+line such as:
+
+```text
+Width: BRANCH 14  Tab select  <- -> resize  r reset  Esc done
+```
+
+In an interactive terminal, you can also left-drag a visible `│` header grip.
+Pressing a grip selects its column and enters width mode; releasing the button,
+including outside the header, ends the drag. Row clicking, hover behavior, and
+pointer-shape changes are not supported. Mouse resizing has the same interactive
+terminal requirement as keyboard input.
+
+While gh-glance is running, terminal-native text selection may require your
+terminal's mouse-reporting bypass modifier, commonly `Shift`.
 
 The cursor tracks the *item*, not the row position, so it stays on what you
 selected as new rows arrive above it. `Enter` works on Actions, Issues and Pull
@@ -278,10 +314,35 @@ Environment variables work too, and the flags take precedence:
 | `GH_REPO=owner/name` | Watch a specific repository instead of the current directory's. A host-qualified `GH_REPO` does **not** route the security-alert endpoints -- use `GH_HOST` or `--repo host/owner/name` for that |
 | `GH_HOST=<host>` | Send every call to a GitHub Enterprise or EMU host instead of `github.com`. Routes both the list commands and the alert endpoints |
 | `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GH_CONFIG_DIR` | Not read by `gh-glance` -- passed through to `gh` untouched, along with the proxy variables. `gh-glance` handles no credentials of its own. Separate `GH_CONFIG_DIR` values can isolate simultaneous panes on different accounts; see [No account pinning](#limitations) |
+| `GH_GLANCE_REFRESH=<seconds>` | Active-tab poll interval, 2-3600. Sets it once for every pane in a shell; `--refresh` takes precedence. This is a floor -- see [Rate limit](#rate-limit) |
 | `GH_GLANCE_ICONS=unicode` | Plain ASCII status icons, for terminals without a Nerd Font |
 | `GH_GLANCE_NO_ANIMATION=1` | Freeze the spinner — no motion at all |
 | `NO_COLOR=1` | Disable colour. Status stays readable: severity has its own column, a failing newest run puts a `!` on the Actions tab, and the active tab is bracketed. Note that run-state glyphs are not all distinct -- see the feature list above |
 | `INK_SCREEN_READER=true` | Switch the renderer to a linear, unthrottled mode. The status icons carry text labels for it, but this path has not been tested against a real screen reader — treat it as unverified rather than supported. |
+
+### Saved column widths
+
+Width choices are saved automatically, globally for the current user and
+separately for each tab. They are not repository-specific. Only deviations from
+the built-in defaults are stored: `r` removes the selected column's deviation,
+and `R` removes every deviation for the active tab.
+
+The versioned preference file is resolved in this order:
+
+```text
+$XDG_CONFIG_HOME/gh-glance/preferences.json              absolute XDG root
+~/Library/Application Support/gh-glance/preferences.json macOS fallback
+~/.config/gh-glance/preferences.json                     Linux fallback
+```
+
+`XDG_CONFIG_HOME` is used only when it is a non-empty absolute path. An unknown
+file version or a corrupt, malformed, or unreadable document falls back to the
+built-in defaults rather than preventing the dashboard from starting. Within an
+otherwise valid document, unknown or invalid entries are ignored individually
+while valid deviations still load. If a write fails, resizing still works for
+the live session and width mode reports `Widths not saved`; a later successful
+write clears the warning. The UI owns this file, so direct editing is not the
+primary configuration workflow.
 
 ## GitHub Enterprise and EMU
 
@@ -363,15 +424,17 @@ through GraphQL instead — a separate 5,000/hour allowance. With the default
 
 | Visible tab | REST / hour | GraphQL / hour |
 |---|---|---|
-| Actions | ~900 | ~240 |
-| Issues or Pull Requests | ~240 | ~1,560 |
-| Security | ~2,220 | ~240 |
+| Actions | ~1,620 | ~240 |
+| Issues or Pull Requests | ~300 | ~1,560 |
+| Security | ~2,280 | ~240 |
 
-Security is the expensive one because it is three endpoints rather than one,
-and watching it costs just under half the REST budget. You do not have to take
-these figures on trust: `gh-glance --doctor` reports your actual remaining
-budget alongside what your configuration projects, which matters on a GitHub
-Enterprise tenant where the ceiling may not be 5,000 at all.
+Security is the most expensive, because it is three endpoints rather than one,
+and watching it costs just under half the REST budget. But Actions is not cheap
+either -- it is a third of the budget, and it is the tab every pane opens on,
+because one `gh run list` issues two REST requests rather than one. You do not
+have to take these figures on trust: `gh-glance --doctor` reports your actual
+remaining budget alongside what your configuration projects, which matters on a
+GitHub Enterprise tenant where the ceiling may not be 5,000 at all.
 
 Two things pull the real number down. Any endpoint that fails in a way
 `gh-glance` recognises backs off instead of being re-asked every tick — a
@@ -380,9 +443,18 @@ hour, an authorization failure every 30 seconds, a rate limit every minute.
 Pressing `r` clears that backoff and retries immediately. And `--refresh`
 scales the whole figure: doubling the interval halves it.
 
-So a pane left open all day shares the budget with your other `gh` commands
-rather than exhausting it, but it is not free, and parking it on the Security
-tab is the case worth knowing about.
+One pane on Actions costs about a third of an hourly REST budget, so roughly
+three panes fill it. Past that, `gh-glance` widens its own poll interval: it
+reads your remaining budget once a minute, works out how much of it belongs to
+this pane by comparing its own spend against the token's total, and slows down
+to fit -- up to a 60-second ceiling. The status bar says `throttled 18s` while
+that is in effect, and `r` still refreshes immediately. Nothing is shared
+between panes: the token's own counter is what they all read, so it also notices
+a `gh pr checks --watch` or anything else spending on the same token.
+
+`GH_GLANCE_REFRESH=30` sets a wider floor for every pane in a shell; `--refresh`
+still wins per pane. The adaptive interval only ever widens from that floor, so
+a single pane on a healthy budget stays at 5 seconds and shows no badge.
 
 ## Limitations
 
@@ -406,13 +478,21 @@ tab is the case worth knowing about.
   runs requested -- so scrolling that tab has little to move through. The count
   in the bottom edge always says how much you are seeing out of how much was
   fetched.
-- **Minimum width.** Each tab drops to a compact layout (icon, title, and one
-  other column) at its own threshold, so a narrow pane keeps as much as that
-  particular tab can fit: Security holds its full set down to 44 columns,
-  Issues to 50, Actions to 56, Pull Requests to 61. Below 24 columns nothing
-  useful fits, so the pane says `too narrow` and keeps the frame, tab bar and
-  quit hint; widening it recovers immediately. The status bar has its own
-  breakpoint and drops to bare keys (`↑↓ Ent r q`) rather than truncating.
+- **Minimum width and compact layout.** Compact descriptors remain fixed and
+  non-adjustable. With the built-in full widths, Security fits down to 44
+  columns, Issues to 50, Actions to 56, and Pull Requests to 61. A narrower
+  preference can lower the active tab's full-layout floor. An oversized
+  preference is fitted temporarily toward the defaults as the pane narrows, so
+  it never forces compact while the stock full table still fits. The saved width
+  itself is not changed, and widening restores it. When no eligible full layout
+  fits, the active tab uses its fixed compact layout. Below 24 columns the pane
+  says `too narrow` and keeps the frame, tab bar and quit hint. The status bar
+  has its own breakpoint and drops to bare keys (`↑↓ Ent r q`) rather than
+  truncating.
+- **Mouse reporting lifecycle.** Interactive sessions enable terminal mouse
+  reporting for header drags and disable it before handing the terminal back.
+  See [Adjusting column widths](#adjusting-column-widths) for text-selection
+  behavior while it is active.
 - Issues and pull requests are fetched 150 at a time and alerts 100 at a time.
   A count is shown as `n+` when it was truncated, so the number is never
   presented as exact when it is not.

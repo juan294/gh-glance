@@ -12,9 +12,9 @@ documentation, contributions are welcome.
 ### Contributions We'd Love
 
 - More tabs (e.g. discussions, releases)
-- Configurable columns / widths
-- A config file or flags for refresh interval, tab order, or target repository
-  (see [#35](https://github.com/juan294/gh-glance/issues/35))
+- Configurable column visibility / ordering
+- A config file for defaults such as refresh interval, tab order, or repository
+  targets (see [#35](https://github.com/juan294/gh-glance/issues/35))
 
 ## Prerequisites
 
@@ -53,8 +53,8 @@ launching the dashboard -- please keep that guard intact.
 `npm run test:pty` runs `test/pty/`. It launches the real `index.mjs` inside a
 pseudo-terminal with a fixture `gh` on `PATH`, then asserts over the captured
 bytes. It covers what unit tests structurally cannot: rendered frame geometry,
-terminal state on exit, and the key handlers. It found the scrollback bug fixed
-in `0.3.0`.
+terminal state on exit, keyboard handlers, and direct SGR mouse input. It found
+the scrollback bug fixed in `0.3.0`.
 
 It is a separate script from `npm test` on purpose. The unit run is fast and is
 required everywhere; the pty run is slow and timing-sensitive, so it reports on
@@ -63,10 +63,19 @@ it gates the release and nothing else. It was advisory until 2026-08-04 and was
 promoted after 38 consecutive runs without a failure. If you make it flake, the
 right response is to delete the offending assertion, not to add retries.
 
-One rule keeps it worth having: **assert structure, never cell contents.** Line
-counts, widths, escape-sequence balance and exit codes survive a copy change.
-The text inside a cell does not, and asserting it would turn every wording
-change into a red build.
+One rule keeps it worth having: **assert structure, never dashboard cell
+contents.** Line counts, widths, escape-sequence balance and ordering, and exit
+codes survive a copy change. The text inside a cell does not, and asserting it
+would turn every wording change into a red build.
+
+Direct SGR mouse tests must send each logical report through the foreground pty
+as its own timed write, plus one intentionally split report that exercises the
+pending token boundary. Assert that both mouse modes are balanced and disabled
+before the alternate screen exits. When a path intentionally writes on the
+primary buffer -- a crash diagnostic or an interactive child handoff -- that
+transcript is not dashboard frame geometry; assert its after-restore tail
+separately. For an interactive child, synchronize input with an explicit
+fixture-ready marker instead of guessing when the child owns the terminal.
 
 Two things to know before editing it:
 

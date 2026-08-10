@@ -205,3 +205,28 @@ test("--doctor reports the host-qualified target it was given", async () => {
   assert.match(out, /argv {8}gh api repos\/acme\/widget\/.*--hostname tenant\.ghe\.com/);
   assert.ok(!out.includes("repos/tenant.ghe.com/"), out);
 });
+
+// GH_GLANCE_REFRESH is substituted in the IS_MAIN entry block, so unlike the
+// --refresh flag it cannot be reached by calling validateArgs directly. These
+// spawn a real child, which is the wiring under test.
+test("GH_GLANCE_REFRESH sets the interval and is reported by name", async () => {
+  const report = await doctor({ env: { GH_GLANCE_REFRESH: "30" } });
+  assert.match(report, /GH_GLANCE_REFRESH\s+30/);
+  assert.match(report, /this config spends .*refresh 30s/);
+  // 1620 REST/hour at the default 5s, so a sixth of it at 30s.
+  assert.match(report, /~270 REST/);
+});
+
+test("--refresh beats GH_GLANCE_REFRESH", async () => {
+  const report = await doctor({ env: { GH_GLANCE_REFRESH: "30" }, args: ["--refresh", "10"] });
+  assert.match(report, /this config spends .*refresh 10s/);
+});
+
+test("an out-of-range GH_GLANCE_REFRESH exits 2 naming the variable", async () => {
+  // The same exit code and the same two messages a bad --refresh gets: a value
+  // that arrived by environment must not fail more quietly than one typed.
+  await assert.rejects(
+    () => doctor({ env: { GH_GLANCE_REFRESH: "1" } }),
+    (err) => err.code === 2 && /GH_GLANCE_REFRESH must be between/.test(err.stderr),
+  );
+});
