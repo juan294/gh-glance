@@ -2317,6 +2317,13 @@ test("the status bar hints are a subset of the documented key table", () => {
       `status bar advertises "${hint.label}" but the key table documents no such action`,
     );
   }
+  assert.deepEqual(KEY_HINTS, [
+    { label: "Move", keys: "↑↓" },
+    { label: "Open", keys: "Ent" },
+    { label: "Refresh", keys: "r" },
+    { label: "Width", keys: "w" },
+    { label: "Quit", keys: "q" },
+  ]);
   assert.ok(
     KEY_TABLE.some(([keys]) => keys === "?"),
     "the overlay's own key must be listed in the table it renders",

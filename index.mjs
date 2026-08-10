@@ -3171,6 +3171,7 @@ const KEY_HINTS = [
   { label: "Move", keys: "↑↓" },
   { label: "Open", keys: "Ent" },
   { label: "Refresh", keys: "r" },
+  { label: "Width", keys: "w" },
   { label: "Quit", keys: "q" },
 ];
 
