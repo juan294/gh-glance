@@ -34,6 +34,55 @@ Chose: kept the pointer comment at `BACKGROUND_EVERY` (as specified), dropped th
 trailing clause from the table block.
 Why: two copies of a placement rationale drift the first time the tables move.
 
+### Phase 2
+
+**`doctor()` test helper left unchanged.**
+Plan said: "`doctor()` currently returns only `stdout` and throws on non-zero
+exit; the third test needs `stderr` and `code`, so extend the helper to surface
+them rather than adding a second spawner."
+Found: no extension is needed. Node's `util.promisify(execFile)` already attaches
+`code`, `stdout` and `stderr` to the rejected `Error`, so the existing helper's
+rejection path exposes both (verified directly, not assumed).
+Chose: left the helper alone; the spec's test body works verbatim.
+Why: widening it would have added an unused return shape to eight existing
+callers to re-expose what the rejection already carries.
+
+**Doctor env-line assertion relaxed from `{2,}` to `\s+`.**
+Plan said: `assert.match(report, /GH_GLANCE_REFRESH {2,}30/)`.
+Found: `field()` pads labels to `DOCTOR_LABEL_WIDTH` (`index.mjs:1290-1291`).
+`GH_GLANCE_REFRESH` is 17 characters and the column is 18, so the report emits
+exactly **one** space. The plan's `{2,}` would have failed against correct output.
+Chose: `/GH_GLANCE_REFRESH\s+30/`.
+Why: the assertion is about the variable being reported with its value, not about
+a column width that `field()` already owns and tests elsewhere.
+
+**Bounds-message rationale stated once, not three times.**
+Plan said: comment the entry-block substitution, the `refreshLabel` line, and the
+new args test each with the "rather than a second copy of the bounds" reasoning.
+Found: written as specified, that fact appears three times across two files.
+Chose: kept it at the entry block (where the placement decision is actually made)
+and shortened the other two.
+Why: three copies of one rationale drift the first time one is edited — the same
+failure mode the tables in Phase 1 exist to prevent.
+
+**Corrected an overclaim in the entry-block comment.**
+Plan said: the env fallback uses "the same precedence GH_REPO has".
+Found: the *precedence* matches, the *mechanism* does not. `GH_REPO` is read
+directly at each use site (`index.mjs:1157`, `:1307`, `:3087`) and never passes
+through `parseArgs`, because `gh` honours it natively and a slug needs no
+validation. An interval does, so it must be resolved once, before the bounds check.
+Chose: comment now states the precedence match and names the difference.
+Why: a future reader will trust "the same as GH_REPO" literally and go looking for
+a shared helper that does not exist.
+
+**Not changed, but worth recording.** The `/simplify` altitude pass argued the env
+substitution belongs inside `parseArgs` rather than the `IS_MAIN` entry block, so
+that the variable is reachable from unit tests and from any future embedder that
+imports `parseArgs`/`validateArgs`. The plan specifies the entry block explicitly
+("let `parseArgs` keep returning only what argv said") and builds its test split
+around it, so this was followed as written. The consequence is real: three
+`doctor.test.mjs` tests spawn a child process to cover the substitution.
+
 ### Process (all phases)
 
 **No worktree.**

@@ -1184,6 +1184,7 @@ const DOCTOR_ENV_PLAIN = [
   "NO_PROXY",
   "GH_GLANCE_ICONS",
   "GH_GLANCE_NO_ANIMATION",
+  "GH_GLANCE_REFRESH",
   "NO_COLOR",
   "NODE_ENV",
 ];
@@ -1509,6 +1510,11 @@ function parseArgs(argv) {
     doctor: false,
     repo: null,
     refresh: null,
+    // Which surface supplied `refresh`, so validateArgs can name it in the
+    // bounds messages. argv never sets it -- the entry block does, when it
+    // falls back to GH_GLANCE_REFRESH -- but it is declared here so the shape
+    // parseArgs returns stays stated in one place.
+    refreshSource: null,
     tab: null,
     verbose: false,
   };
@@ -1551,13 +1557,16 @@ function validateArgs(opts, tabKeys) {
 
   let refreshMs = null;
   if (opts.refresh !== null) {
+    // Named so the message points at whichever surface supplied the value: the
+    // interval can now come from GH_GLANCE_REFRESH as well as --refresh.
+    const refreshLabel = opts.refreshSource ?? "--refresh";
     const seconds = Number(opts.refresh);
     if (!Number.isFinite(seconds) || !Number.isInteger(seconds)) {
-      throw new Error(`--refresh must be a whole number of seconds, got: ${opts.refresh}`);
+      throw new Error(`${refreshLabel} must be a whole number of seconds, got: ${opts.refresh}`);
     }
     if (seconds < MIN_REFRESH_SECONDS || seconds > MAX_REFRESH_SECONDS) {
       throw new Error(
-        `--refresh must be between ${MIN_REFRESH_SECONDS} and ${MAX_REFRESH_SECONDS} seconds, got: ${seconds}`,
+        `${refreshLabel} must be between ${MIN_REFRESH_SECONDS} and ${MAX_REFRESH_SECONDS} seconds, got: ${seconds}`,
       );
     }
     refreshMs = seconds * 1000;
@@ -1657,6 +1666,9 @@ Environment:
   GH_HOST=host              GitHub Enterprise or EMU host to send every call to.
                             A host-qualified GH_REPO does not route \`gh api\`;
                             this and --repo host/owner/name both do.
+  GH_GLANCE_REFRESH=<seconds>
+                            Active-tab poll interval, ${MIN_REFRESH_SECONDS}-${MAX_REFRESH_SECONDS}
+                            (--refresh takes precedence)
   GH_GLANCE_ICONS=unicode   Plain-unicode status icons (no Nerd Font needed)
   GH_GLANCE_NO_ANIMATION=1  Freeze the spinner (no motion)
   NO_COLOR=1                Disable colour (status stays readable)
@@ -1674,7 +1686,20 @@ Environment:
 if (IS_MAIN) {
   let opts;
   try {
-    opts = validateArgs(parseArgs(process.argv.slice(2)), TAB_KEYS);
+    const argvOpts = parseArgs(process.argv.slice(2));
+    // The flag wins, which is the precedence GH_REPO already advertises -- but
+    // not its mechanism: GH_REPO is read at each use site, because `gh` honours
+    // it natively and a repo slug needs no validation. An interval does, so it
+    // is resolved once, here, and substituted before validation -- an
+    // out-of-range GH_GLANCE_REFRESH is then refused by the same two messages
+    // an out-of-range --refresh gets, rather than by a second copy of the
+    // bounds. It still reaches runtime through the one write site below rather
+    // than being assigned beside it.
+    if (argvOpts.refresh === null && process.env.GH_GLANCE_REFRESH) {
+      argvOpts.refresh = process.env.GH_GLANCE_REFRESH;
+      argvOpts.refreshSource = "GH_GLANCE_REFRESH";
+    }
+    opts = validateArgs(argvOpts, TAB_KEYS);
   } catch (err) {
     // Exit 2 for every argv problem, unchanged from when the only possible
     // problem was an unrecognised flag. CI asserts this code.
