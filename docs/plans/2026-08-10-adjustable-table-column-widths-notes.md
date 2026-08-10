@@ -70,5 +70,11 @@
 
 ### External gate
 
-- Ubuntu GNU `script(1)` CI is pending because this implementation remains
-  local and unpushed; no GitHub operation was authorized for this run.
+- Ubuntu GNU `script(1)` CI passed. `develop` was pushed after the local run
+  recorded above, and the CI workflow is green on the exact Phase 5 candidate
+  `2e88afd` -- Lint, Smoke (Node 22/24), PTY, and Test (Node 22/24) all
+  succeeded, alongside the Coverage and CodeQL workflows.
+- Re-verified on 2026-08-10 against `develop` @ `8a8aef2`, which carries three
+  later commits from the adaptive rate-limit plan. The full local gate is green
+  there too (153 unit and 42 PTY tests, up from the 139/37 recorded above
+  because of that unrelated work), and CI is green on that head as well.
