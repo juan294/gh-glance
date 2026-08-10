@@ -1783,10 +1783,10 @@ if (IS_MAIN) {
 }
 
 const ReactModule = await import("react");
-const { render, Box, Text, useStdout, useInput, useStdin, useApp } = await import("ink");
+const { render, measureElement, Box, Text, useStdout, useInput, useStdin, useApp } = await import("ink");
 
 const React = ReactModule.default;
-const { useState, useEffect, useMemo, useRef } = ReactModule;
+const { useState, useEffect, useMemo, useRef, useCallback } = ReactModule;
 const e = React.createElement;
 
 // The NODE_ENV escape hatch above is genuinely useful -- React's warnings are
@@ -1924,11 +1924,12 @@ function headerGutterKey(cells, index) {
   return headerGutterKeyAt(cells, index, growIndex);
 }
 
-function HeaderCells({ cells, selectedWidthKey = null }) {
+function HeaderCells({ cells, selectedWidthKey = null, headerRef = null }) {
   const growIndex = cells.findIndex((column) => column.props?.grow);
   return e(
     Box,
     {
+      ref: headerRef,
       flexDirection: "row",
       borderStyle: "single",
       borderTop: false,
@@ -1962,6 +1963,174 @@ function HeaderCells({ cells, selectedWidthKey = null }) {
 }
 
 const MemoHeaderCells = React.memo(HeaderCells);
+
+function parseSgrMouse(input) {
+  if (typeof input !== "string") return null;
+  const match = /^\[<(\d+);(\d+);(\d+)([Mm])$/.exec(input);
+  if (!match) return null;
+
+  const code = Number(match[1]);
+  const encodedX = Number(match[2]);
+  const encodedY = Number(match[3]);
+  if (
+    !Number.isSafeInteger(code) ||
+    !Number.isSafeInteger(encodedX) ||
+    !Number.isSafeInteger(encodedY) ||
+    encodedX < 1 ||
+    encodedY < 1 ||
+    (code !== 0 && code !== 32)
+  ) {
+    return null;
+  }
+
+  return {
+    x: encodedX - 1,
+    y: encodedY - 1,
+    action: match[4] === "m" ? "release" : code === 32 ? "drag" : "press",
+  };
+}
+
+function dividerHandles({ header, metrics }) {
+  if (
+    !Array.isArray(header) ||
+    !metrics ||
+    !Number.isSafeInteger(metrics.x) ||
+    !Number.isSafeInteger(metrics.y) ||
+    !Number.isSafeInteger(metrics.width) ||
+    !Number.isSafeInteger(metrics.height) ||
+    metrics.x < 0 ||
+    metrics.y < 0 ||
+    metrics.width < 1 ||
+    metrics.height < 1
+  ) {
+    return [];
+  }
+
+  const growIndexes = header
+    .map((column, index) => column.props?.grow ? index : -1)
+    .filter((index) => index >= 0);
+  if (growIndexes.length !== 1) return [];
+  const growIndex = growIndexes[0];
+  const fixedWidth = header.reduce((sum, column, index) => {
+    if (index === growIndex) return sum;
+    return Number.isSafeInteger(column.props?.width) && column.props.width >= 0
+      ? sum + column.props.width
+      : Number.NaN;
+  }, 0);
+  const growWidth = metrics.width - header.length - fixedWidth;
+  const yEnd = metrics.y + metrics.height;
+  if (!Number.isSafeInteger(growWidth) || growWidth < 0 || !Number.isSafeInteger(yEnd)) return [];
+
+  const handles = [];
+  let x = metrics.x;
+  for (let index = 0; index < header.length; index += 1) {
+    const contentWidth = index === growIndex ? growWidth : header[index].props.width;
+    const gutterX = x + contentWidth;
+    const key = headerGutterKeyAt(header, index, growIndex);
+    if (key !== null) {
+      const ownerIndex = index < growIndex ? index : index + 1;
+      const owner = header[ownerIndex];
+      if (!isAdjustableWidthColumn(owner) || owner.key !== key) return [];
+      handles.push({
+        key,
+        x: gutterX,
+        yStart: metrics.y,
+        yEnd,
+        width: owner.props.width,
+        direction: ownerIndex < growIndex ? 1 : -1,
+      });
+    }
+    x = gutterX + 1;
+  }
+  return handles;
+}
+
+function hitDivider(handles, point, tolerance = 1) {
+  if (
+    !Array.isArray(handles) ||
+    !point ||
+    !Number.isSafeInteger(point.x) ||
+    !Number.isSafeInteger(point.y) ||
+    !Number.isSafeInteger(tolerance) ||
+    tolerance < 0
+  ) {
+    return null;
+  }
+
+  let nearest = null;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  for (const handle of handles) {
+    if (
+      !Number.isSafeInteger(handle?.x) ||
+      !Number.isSafeInteger(handle.yStart) ||
+      !Number.isSafeInteger(handle.yEnd) ||
+      point.y < handle.yStart ||
+      point.y >= handle.yEnd
+    ) {
+      continue;
+    }
+    const distance = Math.abs(point.x - handle.x);
+    if (
+      distance <= tolerance &&
+      (distance < nearestDistance ||
+        (distance === nearestDistance && (nearest === null || handle.x < nearest.x)))
+    ) {
+      nearest = handle;
+      nearestDistance = distance;
+    }
+  }
+  return nearest;
+}
+
+function beginDividerDrag({ event, handles, tabKey, tolerance = 1 }) {
+  if (event?.action !== "press" || typeof tabKey !== "string" || tabKey.length === 0) {
+    return null;
+  }
+  const handle = hitDivider(handles, event, tolerance);
+  if (!handle) return null;
+  return {
+    tabKey,
+    key: handle.key,
+    startX: event.x,
+    startWidth: handle.width,
+    direction: handle.direction,
+  };
+}
+
+function draggedWidth({
+  drag,
+  event,
+  tabKey,
+  fullHeaderVisible,
+  layoutValid = true,
+}) {
+  if (
+    !drag ||
+    event?.action !== "drag" ||
+    drag.tabKey !== tabKey ||
+    fullHeaderVisible !== true ||
+    layoutValid !== true ||
+    !Number.isSafeInteger(drag.startX) ||
+    !Number.isSafeInteger(drag.startWidth) ||
+    (drag.direction !== 1 && drag.direction !== -1) ||
+    !Number.isSafeInteger(event.x)
+  ) {
+    return null;
+  }
+  const nextWidth = drag.startWidth + drag.direction * (event.x - drag.startX);
+  return Number.isSafeInteger(nextWidth) ? { key: drag.key, nextWidth } : null;
+}
+
+function sameElementMetrics(left, right) {
+  return (
+    left != null &&
+    right != null &&
+    left.x === right.x &&
+    left.y === right.y &&
+    left.width === right.width &&
+    left.height === right.height
+  );
+}
 
 // ---------- Panel frame ----------
 
@@ -3161,6 +3330,8 @@ function App({ onCreateRemote = () => {} } = {}) {
   showHelpRef.current = showHelp;
   const remoteSetupRef = useRef(false);
   remoteSetupRef.current = remoteSetup;
+  const headerRef = useRef(null);
+  const dragRef = useRef(null);
   const resizeRef = useRef({
     active: false,
     tabKey: "actions",
@@ -3170,6 +3341,15 @@ function App({ onCreateRemote = () => {} } = {}) {
     compact: true,
     fullHeaderVisible: false,
   });
+
+  useEffect(() => {
+    if (!interactive) return;
+    enableMouseReporting();
+    return () => {
+      dragRef.current = null;
+      disableMouseReporting();
+    };
+  }, [interactive]);
 
   function applyWidthOverrides(next) {
     const current = widthOverridesRef.current;
@@ -3202,6 +3382,7 @@ function App({ onCreateRemote = () => {} } = {}) {
   }
 
   function leaveWidthMode() {
+    dragRef.current = null;
     resizeRef.current = { ...resizeRef.current, active: false };
     setWidthMode(false);
     flushWidthPreferences();
@@ -3216,15 +3397,16 @@ function App({ onCreateRemote = () => {} } = {}) {
     );
   }
 
-  function enterWidthMode() {
+  function enterWidthMode(requestedKey = null) {
     const geometry = resizeRef.current;
-    if (!geometry.fullHeaderVisible || geometry.compact) return;
+    if (!geometry.fullHeaderVisible || geometry.compact) return false;
     const activeTab = tabForKey(geometry.tabKey);
-    const selectedKey = selectWidthKey(activeTab, geometry.selectedKey);
-    if (selectedKey === null) return;
+    const selectedKey = selectWidthKey(activeTab, requestedKey ?? geometry.selectedKey);
+    if (selectedKey === null) return false;
     rememberWidthSelection(selectedKey);
     resizeRef.current = { ...resizeRef.current, active: true, selectedKey };
     setWidthMode(true);
+    return true;
   }
 
   function resizeSelectedWidth(delta) {
@@ -3247,15 +3429,85 @@ function App({ onCreateRemote = () => {} } = {}) {
   }
 
   function resetSelectedWidth() {
+    dragRef.current = null;
     const { tabKey, selectedKey } = resizeRef.current;
     applyWidthOverrides(resetWidthPreference(widthOverridesRef.current, tabKey, selectedKey));
     flushWidthPreferences();
   }
 
   function resetActiveTabWidths() {
+    dragRef.current = null;
     const { tabKey } = resizeRef.current;
     applyWidthOverrides(resetTabWidthPreferences(widthOverridesRef.current, tabKey));
     flushWidthPreferences();
+  }
+
+  const cancelWidthDrag = useCallback(() => {
+    if (dragRef.current === null) return false;
+    dragRef.current = null;
+    void widthPreferenceWriter.flush();
+    return true;
+  }, [widthPreferenceWriter]);
+
+  const measuredHeader = useCallback(() => {
+    return headerRef.current ? measureElement(headerRef.current) : null;
+  }, []);
+
+  function handleSgrMouse(event) {
+    if (event.action === "release") {
+      dragRef.current = null;
+      flushWidthPreferences();
+      return;
+    }
+
+    const geometry = resizeRef.current;
+    if (event.action === "press") {
+      if (!interactive || !geometry.fullHeaderVisible || geometry.compact) return;
+      const metrics = measuredHeader();
+      if (!metrics) return;
+      const drag = beginDividerDrag({
+        event,
+        handles: dividerHandles({ header: geometry.effectiveHeader, metrics }),
+        tabKey: geometry.tabKey,
+      });
+      if (!drag || !enterWidthMode(drag.key)) return;
+      dragRef.current = { ...drag, metrics };
+      return;
+    }
+
+    const drag = dragRef.current;
+    if (!drag) return;
+    const metrics = measuredHeader();
+    const layoutValid = sameElementMetrics(drag.metrics, metrics);
+    const proposal = draggedWidth({
+      drag,
+      event,
+      tabKey: geometry.tabKey,
+      fullHeaderVisible: geometry.fullHeaderVisible,
+      layoutValid,
+    });
+    if (!proposal) {
+      if (!layoutValid || drag.tabKey !== geometry.tabKey || !geometry.fullHeaderVisible) {
+        cancelWidthDrag();
+      }
+      return;
+    }
+
+    const activeTab = tabForKey(geometry.tabKey);
+    if (!activeTab) {
+      cancelWidthDrag();
+      return;
+    }
+    applyWidthOverrides(
+      updateWidthPreference({
+        overrides: widthOverridesRef.current,
+        tab: activeTab,
+        key: proposal.key,
+        nextWidth: proposal.nextWidth,
+        effectiveHeader: geometry.effectiveHeader,
+        frameCols: geometry.frameCols,
+      }),
+    );
   }
 
   function moveSelection(delta) {
@@ -3332,6 +3584,14 @@ function App({ onCreateRemote = () => {} } = {}) {
 
   useInput(
     (input, key) => {
+      // Ink delivers a complete unrecognised CSI token with its leading Escape
+      // removed. Consume the whole SGR namespace here, including unsupported
+      // buttons/modifiers, so no report can fall through to keyboard bindings.
+      if (input.startsWith("[<")) {
+        const mouse = parseSgrMouse(input);
+        if (mouse) handleSgrMouse(mouse);
+        return;
+      }
       if (input === "q" || (input === "c" && key.ctrl)) {
         flushWidthPreferences();
         exit();
@@ -3789,10 +4049,31 @@ function App({ onCreateRemote = () => {} } = {}) {
   // header without a keypress. Stop owning input immediately through resizeRef,
   // then settle the visible mode state and durable write in the effect.
   useEffect(() => {
+    let flushed = false;
+    const drag = dragRef.current;
+    if (drag) {
+      const metrics = measuredHeader();
+      if (
+        drag.tabKey !== tab.key ||
+        !fullHeaderVisible ||
+        !sameElementMetrics(drag.metrics, metrics)
+      ) {
+        flushed = cancelWidthDrag();
+      }
+    }
     if (!widthMode || fullHeaderVisible) return;
     setWidthMode(false);
-    void widthPreferenceWriter.flush();
-  }, [widthMode, fullHeaderVisible, widthPreferenceWriter]);
+    if (!flushed) void widthPreferenceWriter.flush();
+  }, [
+    widthMode,
+    fullHeaderVisible,
+    tab.key,
+    frameCols,
+    extraLines,
+    cancelWidthDrag,
+    measuredHeader,
+    widthPreferenceWriter,
+  ]);
 
   return e(
     Box,
@@ -3875,6 +4156,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         e(MemoHeaderCells, {
           cells: header,
           selectedWidthKey: resizeRef.current.active ? selectedWidthKey : null,
+          headerRef,
         }),
       ...(tooNarrow || showHelp || remoteSetup ? [] : visibleItems).map((item) => {
         const key = itemKey(item);
@@ -3955,16 +4237,58 @@ function enterAlternateScreen() {
   process.stdout.write("\x1b[?1049h\x1b[2J\x1b[H");
 }
 
-// Idempotent by construction: writing the exit sequence while already on the
-// primary buffer is a no-op, which matters because this runs both from the
-// crash handlers and from the `exit` listener. `?25h` is here because ink only
-// restores cursor visibility through its own unmount path, which an explicit
-// process.exit() skips.
-let screenRestored = false;
+function createTerminalLifecycle(write) {
+  if (typeof write !== "function") throw new TypeError("write must be a function");
+  let mouseReportingEnabled = false;
+  let screenRestored = false;
+
+  function enableMouseReporting() {
+    if (mouseReportingEnabled || screenRestored) return false;
+    write("\x1b[?1002h\x1b[?1006h");
+    mouseReportingEnabled = true;
+    return true;
+  }
+
+  function disableMouseReporting() {
+    if (!mouseReportingEnabled) return false;
+    write("\x1b[?1002l\x1b[?1006l");
+    mouseReportingEnabled = false;
+    return true;
+  }
+
+  function restoreScreen() {
+    if (screenRestored) return false;
+    disableMouseReporting();
+    screenRestored = true;
+    // Ink restores the cursor only through its own unmount path, which an
+    // explicit process.exit() skips.
+    write("\x1b[?25h\x1b[?1049l");
+    return true;
+  }
+
+  return {
+    enableMouseReporting,
+    disableMouseReporting,
+    restoreScreen,
+    isMouseReportingEnabled: () => mouseReportingEnabled,
+  };
+}
+
+const terminalLifecycle = createTerminalLifecycle((output) => process.stdout.write(output));
+
+function enableMouseReporting() {
+  return terminalLifecycle.enableMouseReporting();
+}
+
+function disableMouseReporting() {
+  return terminalLifecycle.disableMouseReporting();
+}
+
+// Idempotent because both the lifecycle controller and this process-level
+// wrapper share one restored state. Mouse modes are always disabled before the
+// alternate buffer is released, including when this is only the exit backstop.
 function restoreScreen() {
-  if (screenRestored) return;
-  screenRestored = true;
-  process.stdout.write("\x1b[?25h\x1b[?1049l");
+  return terminalLifecycle.restoreScreen();
 }
 
 // A crash used to be indistinguishable from a clean quit. Ink catches render
@@ -3973,18 +4297,18 @@ function restoreScreen() {
 // simply vanished and any wrapper saw success. Restore the primary buffer
 // *first*, then write, or the fix reproduces the problem it is fixing.
 //
-// Aborting in-flight `gh` children is the poll effect's job on every other exit
-// path, but its cleanup only runs through ink's unmount -- which an explicit
-// process.exit() skips. Without this, a crash orphaned up to six subprocesses
-// for the length of GH_TIMEOUT_MS. The abort runs *after* restoreScreen() and is
-// wrapped, because an exception thrown here would replace the stack trace this
-// handler exists to print with an unrelated one.
+// Unmount before restore so Ink's final repaint stays in the alternate buffer.
+// A crash before app assignment, or another failure during unmount, can skip the
+// poll effect's cleanup, so abortLiveRequests() remains an explicit backstop.
+// It runs *after* restoreScreen() and is wrapped because an exception there must
+// not replace the stack trace this handler exists to print.
 //
 // Both messages go through redact(): a stack can carry a URL with inline
 // credentials, and this output is what a user pastes into a bug report -- the
 // same reasoning --doctor already applies to its own report.
-function installCrashHandlers() {
+function installCrashHandlers(unmountApp) {
   const fail = (label) => (err) => {
+    unmountApp();
     restoreScreen();
     try {
       abortLiveRequests();
@@ -4000,8 +4324,16 @@ function installCrashHandlers() {
 }
 
 if (IS_MAIN) {
+  let app;
+  const unmountApp = () => {
+    try {
+      app?.unmount();
+    } catch {
+      // Teardown is best effort. Every caller still restores the terminal.
+    }
+  };
   disarmDevBuildLeak();
-  installCrashHandlers();
+  installCrashHandlers(unmountApp);
   enterAlternateScreen();
   process.on("exit", restoreScreen);
 
@@ -4015,39 +4347,39 @@ if (IS_MAIN) {
   // root box is the terminal height. Windows is already documented as untested
   // (README Limitations), and the pty harness covers the two platforms that are
   // supported, so the flag is verified where it is claimed to work.
-  let app;
   let remoteSetupStarted = false;
   const createRemote = () => {
     if (remoteSetupStarted) return;
     remoteSetupStarted = true;
-    try {
-      app?.unmount();
-    } catch {
-      // The interactive gh flow matters more than a best-effort final repaint.
-    }
+    unmountApp();
     restoreScreen();
     abortLiveRequests();
 
-    // Plain `gh repo create` is the interactive form. Supplying --source here
-    // would switch gh to non-interactive mode and require gh-glance to choose a
-    // visibility on the user's behalf, which this consent boundary must never
-    // do. The prompt tells the user which interactive path matches this folder.
-    const child = spawn("gh", ["repo", "create"], {
-      stdio: "inherit",
-      env: process.env,
-    });
-    setupChild = child;
-    child.once("error", (err) => {
-      if (setupChild === child) setupChild = null;
-      console.error(`gh-glance: could not start repository setup: ${redact(shortErr(err))}`);
-      process.exitCode = 1;
-    });
-    child.once("exit", (code, signal) => {
-      if (setupChild === child) setupChild = null;
-      process.exitCode = signal ? 1 : (code ?? 1);
-      if (code === 0) {
-        console.log("gh repo create finished. Run gh-glance again when this folder has a remote.");
-      }
+    // Let Ink finish the input dispatch that selected setup before the child
+    // inherits stdin. Otherwise that dispatch can consume the first bytes meant
+    // for gh even though the app has already unmounted and restored the screen.
+    setImmediate(() => {
+      // Plain `gh repo create` is the interactive form. Supplying --source here
+      // would switch gh to non-interactive mode and require gh-glance to choose a
+      // visibility on the user's behalf, which this consent boundary must never
+      // do. The prompt tells the user which interactive path matches this folder.
+      const child = spawn("gh", ["repo", "create"], {
+        stdio: "inherit",
+        env: process.env,
+      });
+      setupChild = child;
+      child.once("error", (err) => {
+        if (setupChild === child) setupChild = null;
+        console.error(`gh-glance: could not start repository setup: ${redact(shortErr(err))}`);
+        process.exitCode = 1;
+      });
+      child.once("exit", (code, signal) => {
+        if (setupChild === child) setupChild = null;
+        process.exitCode = signal ? 1 : (code ?? 1);
+        if (code === 0) {
+          console.log("gh repo create finished. Run gh-glance again when this folder has a remote.");
+        }
+      });
     });
   };
   app = render(e(App, { onCreateRemote: createRemote }), { incrementalRendering: true });
@@ -4078,12 +4410,7 @@ if (IS_MAIN) {
     if (signalExitStarted) return;
     signalExitStarted = true;
     const finish = () => {
-      try {
-        app.unmount();
-      } catch {
-        // Teardown is best effort. restoreScreen below, and the `exit` listener
-        // above, both still run, so the terminal is handed back either way.
-      }
+      unmountApp();
       restoreScreen();
       process.exit(code);
     };
@@ -4178,6 +4505,12 @@ export {
   widthStatusText,
   headerGutterKey,
   HeaderCells,
+  parseSgrMouse,
+  dividerHandles,
+  hitDivider,
+  beginDividerDrag,
+  draggedWidth,
+  createTerminalLifecycle,
   REMOTE_SETUP_HINTS,
   REMOTE_SETUP_LINES,
   REMOTE_SETUP_NONINTERACTIVE_LINES,

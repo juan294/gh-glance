@@ -48,6 +48,12 @@ import {
   resetTabWidthPreferences,
   widthStatusText,
   headerGutterKey,
+  parseSgrMouse,
+  dividerHandles,
+  hitDivider,
+  beginDividerDrag,
+  draggedWidth,
+  createTerminalLifecycle,
   HeaderCells,
   minimumWidthFor,
   WIDTH_PREFERENCES_VERSION,
@@ -828,6 +834,11 @@ const EXPECTED_ADJUSTABLE_COLUMNS = {
 
 const actionsHeader = TABS.find(({ key }) => key === "actions").header;
 const actionsTab = TABS.find(({ key }) => key === "actions");
+const actionsDividerMetrics = { x: 10, y: 7, width: 75, height: 2 };
+const actionsDividerHandles = dividerHandles({
+  header: actionsHeader,
+  metrics: actionsDividerMetrics,
+});
 
 function geometry(columns) {
   return columns.map(({ key, props }) => [key, props]);
@@ -1402,6 +1413,241 @@ test("HeaderCells draws grips inside the existing one-cell gutters without chang
       `${tab.key}: compact header unexpectedly rendered a grip`,
     );
   }
+});
+
+test("SGR mouse parsing accepts only unmodified left-button press, drag, and release reports", () => {
+  assert.deepEqual(parseSgrMouse("[<0;1;1M"), { x: 0, y: 0, action: "press" });
+  assert.deepEqual(parseSgrMouse("[<32;41;7M"), { x: 40, y: 6, action: "drag" });
+  assert.deepEqual(parseSgrMouse("[<0;41;7m"), { x: 40, y: 6, action: "release" });
+
+  for (const input of [
+    "",
+    "mouse",
+    `${ESC}[<0;1;1M`,
+    "[<0;0;1M",
+    "[<0;1;0M",
+    "[<0;-1;1M",
+    "[<0;1;-1M",
+    "[<0;1;1",
+    "[<0;1;1X",
+    "[<0;1.5;1M",
+    "[<0;1;1.5M",
+    "[<1;1;1M",
+    "[<2;1;1M",
+    "[<4;1;1M",
+    "[<8;1;1M",
+    "[<16;1;1M",
+    "[<33;1;1M",
+    "[<36;1;1M",
+    "[<64;1;1M",
+    "[<65;1;1M",
+    "[<9007199254740992;1;1M",
+    "[<0;9007199254740992;1M",
+    "[<0;1;9007199254740992M",
+  ]) {
+    assert.equal(parseSgrMouse(input), null, input);
+  }
+});
+
+test("divider handles follow live header geometry and each adjustable gutter's ownership", () => {
+  assert.deepEqual(
+    actionsDividerHandles,
+    [
+      { key: "workflow", x: 41, yStart: 7, yEnd: 9, width: 10, direction: -1 },
+      { key: "branch", x: 52, yStart: 7, yEnd: 9, width: 14, direction: -1 },
+      { key: "time", x: 67, yStart: 7, yEnd: 9, width: 7, direction: -1 },
+      { key: "updated", x: 75, yStart: 7, yEnd: 9, width: 8, direction: -1 },
+    ],
+  );
+
+  const securityHeader = TABS.find(({ key }) => key === "security").header;
+  assert.deepEqual(
+    dividerHandles({
+      header: securityHeader,
+      metrics: { x: 5, y: 11, width: 60, height: 2 },
+    }),
+    [
+      { key: "package", x: 30, yStart: 11, yEnd: 13, width: 16, direction: 1 },
+      { key: "age", x: 55, yStart: 11, yEnd: 13, width: 8, direction: -1 },
+    ],
+  );
+
+  assert.deepEqual(
+    dividerHandles({
+      header: actionsTab.compactHeader,
+      metrics: { x: 0, y: 0, width: 45, height: 2 },
+    }),
+    [],
+  );
+  for (const metrics of [null, {}, { x: 0, y: 0, width: 0, height: 2 }]) {
+    assert.deepEqual(dividerHandles({ header: actionsHeader, metrics }), []);
+  }
+});
+
+test("divider hit-testing is bounded, tolerant, and deterministically chooses the nearest handle", () => {
+  const workflow = actionsDividerHandles[0];
+
+  for (const x of [workflow.x - 1, workflow.x, workflow.x + 1]) {
+    assert.equal(hitDivider(actionsDividerHandles, { x, y: 7 }), workflow);
+    assert.equal(hitDivider(actionsDividerHandles, { x, y: 8 }), workflow);
+  }
+  assert.equal(hitDivider(actionsDividerHandles, { x: workflow.x - 2, y: 7 }), null);
+  assert.equal(hitDivider(actionsDividerHandles, { x: workflow.x + 2, y: 7 }), null);
+  assert.equal(hitDivider(actionsDividerHandles, { x: workflow.x, y: 6 }), null);
+  assert.equal(hitDivider(actionsDividerHandles, { x: workflow.x, y: 9 }), null);
+  assert.equal(hitDivider(actionsDividerHandles, { x: workflow.x + 2, y: 7 }, 2), workflow);
+
+  const tied = [
+    { key: "right", x: 12, yStart: 2, yEnd: 4, width: 5, direction: -1 },
+    { key: "left", x: 10, yStart: 2, yEnd: 4, width: 5, direction: -1 },
+  ];
+  assert.equal(hitDivider(tied, { x: 11, y: 2 }).key, "left");
+  assert.equal(hitDivider([], { x: 0, y: 0 }), null);
+  assert.equal(hitDivider(actionsDividerHandles, null), null);
+});
+
+test("a divider press snapshots the drag origin and rejects unsupported starts", () => {
+  assert.deepEqual(
+    beginDividerDrag({
+      event: { x: 41, y: 7, action: "press" },
+      handles: actionsDividerHandles,
+      tabKey: "actions",
+    }),
+    {
+      tabKey: "actions",
+      key: "workflow",
+      startX: 41,
+      startWidth: 10,
+      direction: -1,
+    },
+  );
+  assert.deepEqual(
+    beginDividerDrag({
+      event: { x: 43, y: 7, action: "press" },
+      handles: actionsDividerHandles,
+      tabKey: "actions",
+      tolerance: 2,
+    }),
+    {
+      tabKey: "actions",
+      key: "workflow",
+      startX: 43,
+      startWidth: 10,
+      direction: -1,
+    },
+  );
+
+  for (const event of [
+    null,
+    { x: 41, y: 7, action: "drag" },
+    { x: 41, y: 7, action: "release" },
+    { x: 0, y: 0, action: "press" },
+  ]) {
+    assert.equal(
+      beginDividerDrag({ event, handles: actionsDividerHandles, tabKey: "actions" }),
+      null,
+    );
+  }
+});
+
+test("drag widths derive from the press snapshot and the divider growth direction", () => {
+  const afterGrow = {
+    tabKey: "actions",
+    key: "workflow",
+    startX: 41,
+    startWidth: 10,
+    direction: -1,
+  };
+  assert.deepEqual(
+    draggedWidth({
+      drag: afterGrow,
+      event: { x: 44, y: 7, action: "drag" },
+      tabKey: "actions",
+      fullHeaderVisible: true,
+    }),
+    { key: "workflow", nextWidth: 7 },
+  );
+  assert.deepEqual(
+    draggedWidth({
+      drag: afterGrow,
+      event: { x: 38, y: 7, action: "drag" },
+      tabKey: "actions",
+      fullHeaderVisible: true,
+    }),
+    { key: "workflow", nextWidth: 13 },
+  );
+  assert.deepEqual(
+    draggedWidth({
+      drag: afterGrow,
+      event: { x: 43, y: 7, action: "drag" },
+      tabKey: "actions",
+      fullHeaderVisible: true,
+    }),
+    { key: "workflow", nextWidth: 8 },
+    "repeated reports must remain relative to the original press snapshot",
+  );
+
+  const beforeGrow = {
+    tabKey: "security",
+    key: "package",
+    startX: 30,
+    startWidth: 16,
+    direction: 1,
+  };
+  assert.deepEqual(
+    draggedWidth({
+      drag: beforeGrow,
+      event: { x: 33, y: 11, action: "drag" },
+      tabKey: "security",
+      fullHeaderVisible: true,
+    }),
+    { key: "package", nextWidth: 19 },
+  );
+
+  for (const input of [
+    { drag: null, event: { x: 44, y: 7, action: "drag" }, tabKey: "actions", fullHeaderVisible: true },
+    { drag: afterGrow, event: null, tabKey: "actions", fullHeaderVisible: true },
+    { drag: afterGrow, event: { x: 44, y: 7, action: "press" }, tabKey: "actions", fullHeaderVisible: true },
+    { drag: afterGrow, event: { x: 44, y: 7, action: "release" }, tabKey: "actions", fullHeaderVisible: true },
+    { drag: afterGrow, event: { x: 44, y: 7, action: "drag" }, tabKey: "issues", fullHeaderVisible: true },
+    { drag: afterGrow, event: { x: 44, y: 7, action: "drag" }, tabKey: "actions", fullHeaderVisible: false },
+    { drag: afterGrow, event: { x: 44, y: 7, action: "drag" }, tabKey: "actions", fullHeaderVisible: true, layoutValid: false },
+  ]) {
+    assert.equal(draggedWidth(input), null);
+  }
+});
+
+test("terminal mouse lifecycle transitions are idempotent and restore disables reporting first", () => {
+  const writes = [];
+  const terminal = createTerminalLifecycle((chunk) => writes.push(chunk));
+
+  assert.equal(terminal.isMouseReportingEnabled(), false);
+  assert.equal(terminal.disableMouseReporting(), false);
+  assert.equal(writes.join(""), "");
+
+  assert.equal(terminal.enableMouseReporting(), true);
+  assert.equal(terminal.enableMouseReporting(), false);
+  assert.equal(terminal.isMouseReportingEnabled(), true);
+  assert.equal(writes.join(""), `${ESC}[?1002h${ESC}[?1006h`);
+
+  assert.equal(terminal.disableMouseReporting(), true);
+  assert.equal(terminal.disableMouseReporting(), false);
+  assert.equal(terminal.isMouseReportingEnabled(), false);
+  assert.equal(
+    writes.join(""),
+    `${ESC}[?1002h${ESC}[?1006h${ESC}[?1002l${ESC}[?1006l`,
+  );
+
+  assert.equal(terminal.enableMouseReporting(), true);
+  assert.equal(terminal.restoreScreen(), true);
+  assert.equal(terminal.restoreScreen(), false);
+  assert.equal(terminal.enableMouseReporting(), false);
+  assert.equal(terminal.isMouseReportingEnabled(), false);
+  assert.equal(
+    writes.join(""),
+    `${ESC}[?1002h${ESC}[?1006h${ESC}[?1002l${ESC}[?1006l` +
+      `${ESC}[?1002h${ESC}[?1006h${ESC}[?1002l${ESC}[?1006l${ESC}[?25h${ESC}[?1049l`,
+  );
 });
 
 test("width preference paths prefer an absolute XDG root on every supported platform", () => {
