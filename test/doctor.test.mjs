@@ -109,8 +109,8 @@ test("--doctor exits 0 through a pipe and prints a complete report", async () =>
   assert.match(out, /Environment/);
   assert.match(out, /Endpoint probes/);
   assert.match(out, /^ {2}Repository access$/m);
-  // One block per diagnostic probe, including failure-triggered repository access.
-  assert.equal(out.match(/^ {2}classified {2}/gm)?.length, 7, out);
+  // One block per diagnostic request, including the bounded Security priority lanes.
+  assert.equal(out.match(/^ {2}classified {2}/gm)?.length, 10, out);
 });
 
 test("--doctor never prints a token that was planted in its environment", async () => {
@@ -213,8 +213,8 @@ test("GH_GLANCE_REFRESH sets the interval and is reported by name", async () => 
   const report = await doctor({ env: { GH_GLANCE_REFRESH: "30" } });
   assert.match(report, /GH_GLANCE_REFRESH\s+30/);
   assert.match(report, /this config spends .*refresh 30s/);
-  // 1620 REST/hour at the default 5s, so a sixth of it at 30s.
-  assert.match(report, /~270 REST/);
+  // 1800 REST/hour at the default 5s, so a sixth of it at 30s.
+  assert.match(report, /~300 REST/);
 });
 
 test("--refresh beats GH_GLANCE_REFRESH", async () => {

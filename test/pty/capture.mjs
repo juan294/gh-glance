@@ -133,10 +133,7 @@ function replayTerminal(raw, cols, rows) {
     if (!inAlternateScreen) return;
     const plain = screen.map((line) => line.join("").trimEnd());
     const statusLines = plain.filter((line) => STATUS_LINE.test(line)).length;
-    if (
-      plain.some((line) => TAB_BAR.test(line)) &&
-      statusLines > 0
-    ) {
+    if (plain.some((line) => TAB_BAR.test(line))) {
       lastDashboardScreen = plain;
       maxStatusLines = Math.max(maxStatusLines, statusLines);
     }

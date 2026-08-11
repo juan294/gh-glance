@@ -23,12 +23,16 @@
 process.env.NODE_ENV ??= "production";
 
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   mkdirSync,
+  openSync,
   readFileSync,
   realpathSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -442,6 +446,13 @@ const VERDICT_REMEDY = {
     "Repository not found or inaccessible to the active `gh` account -- check `gh auth status` and the repository target",
 };
 
+const NARROW_VERDICT_REMEDY = {
+  "auth-problem": "Run: gh auth status (login required)",
+  "rate-limited": "Wait: GitHub rate limit; retrying",
+  unavailable: "Run: gh-glance --doctor (repo unavailable)",
+  "no-remote": "Run: gh-glance --repo owner/name",
+};
+
 function toTabError(err) {
   return { kind: "fetch", verdict: classify(err), raw: shortErr(err) };
 }
@@ -502,6 +513,16 @@ function formatTabError(error, failureContext = null) {
     return unavailableRemedy(failureContext?.accounts, failureContext?.targetHost);
   }
   return pick(VERDICT_REMEDY, error.verdict, null) ?? error.raw;
+}
+
+function formatTabErrorForWidth(error, failureContext = null, width = MAX_ERR_LENGTH) {
+  const budget = Number.isSafeInteger(width) ? Math.max(0, width) : MAX_ERR_LENGTH;
+  const full = formatTabError(error, failureContext) ?? "";
+  const candidate =
+    budget < 60 && error?.kind === "fetch"
+      ? (pick(NARROW_VERDICT_REMEDY, error.verdict, null) ?? `Run: gh-glance --doctor (${full})`)
+      : full;
+  return candidate.length <= budget ? candidate : `${candidate.slice(0, Math.max(0, budget - 1))}…`;
 }
 
 // Some pty wrappers (and a terminal mid-resize) report a size of 0 or
@@ -809,6 +830,7 @@ async function fetchActions(limit, signal) {
     // re-derived from the argv shape -- a second copy of the cost model is the
     // drift this file warns about repeatedly.
     restSpent: REST_PER_FETCH.actions,
+    graphqlSpent: GRAPHQL_PER_FETCH.actions,
     parse: () =>
       JSON.parse(raw).map((r) => ({
         databaseId: r.databaseId,
@@ -857,6 +879,7 @@ async function fetchIssues(signal) {
     // Stated rather than omitted so the zero is visibly deliberate: SORT_RECENT's
     // --search routes this through GraphQL, which is a separate budget.
     restSpent: REST_PER_FETCH.issues,
+    graphqlSpent: GRAPHQL_PER_FETCH.issues,
     parse: () =>
       JSON.parse(raw).map((i) => ({
         number: i.number,
@@ -890,6 +913,7 @@ async function fetchPRs(signal) {
     limit: LIST_LIMIT,
     // Zero for the same reason as issues: --search makes this a GraphQL call.
     restSpent: REST_PER_FETCH.prs,
+    graphqlSpent: GRAPHQL_PER_FETCH.prs,
     parse: () =>
       JSON.parse(raw).map((p) => ({
         number: p.number,
@@ -922,6 +946,7 @@ const ALERT_SOURCES = [
     key: "dependabot",
     name: "Dependabot alerts",
     path: `repos/{owner}/{repo}/dependabot/alerts${ALERT_QUERY}`,
+    priorityQueries: ["severity=critical,high"],
     jq: "[.[] | {number, state, created_at, severity: .security_advisory.severity, title: .security_advisory.summary, detail: .dependency.package.name}]",
     unavailable: "Dependabot alerts: unavailable (not enabled for this repository)",
     map: (a) => ({
@@ -937,6 +962,7 @@ const ALERT_SOURCES = [
     key: "codeScanning",
     name: "Code scanning",
     path: `repos/{owner}/{repo}/code-scanning/alerts${ALERT_QUERY}`,
+    priorityQueries: ["severity=critical", "severity=high"],
     jq: "[.[] | {number, state, created_at, severity: (.rule.security_severity_level // .rule.severity), title: (.rule.description // .rule.name), detail: .most_recent_instance.location.path}]",
     unavailable: "Code scanning: not enabled (needs GitHub Advanced Security)",
     map: (a) => ({
@@ -952,6 +978,7 @@ const ALERT_SOURCES = [
     key: "secretScanning",
     name: "Secret scanning",
     path: `repos/{owner}/{repo}/secret-scanning/alerts${ALERT_QUERY}`,
+    priorityQueries: [],
     jq: "[.[] | {number, state, created_at, title: (.secret_type_display_name // .secret_type)}]",
     unavailable: "Secret scanning: not enabled for this repository",
     map: (a) => ({
@@ -978,7 +1005,11 @@ const ALERT_SOURCES = [
 //
 // issues and prs are 0 REST because SORT_RECENT's --search routes both through
 // GraphQL entirely (2 POSTs each, confirmed by the same measurement).
-const REST_PER_FETCH = { actions: 2, issues: 0, prs: 0, security: ALERT_SOURCES.length };
+const SECURITY_REQUESTS_PER_FETCH = ALERT_SOURCES.reduce(
+  (total, source) => total + 1 + source.priorityQueries.length,
+  0,
+);
+const REST_PER_FETCH = { actions: 2, issues: 0, prs: 0, security: SECURITY_REQUESTS_PER_FETCH };
 const GRAPHQL_PER_FETCH = { actions: 0, issues: 2, prs: 2, security: 0 };
 
 // Ceiling on adaptive widening. An adaptive interval needs one: a minute is
@@ -1013,7 +1044,7 @@ const ADAPTIVE_HYSTERESIS = 1.25;
 // that feeds it must agree on the answer: the law uses it to decide whether to
 // infer, and the loop uses it to decide whether the window may be closed.
 function sampleIsUsable(sample) {
-  return Boolean(sample) && sample.myRestCalls >= MIN_SAMPLE_CALLS && sample.globalUsed > 0;
+  return Boolean(sample) && sample.myCalls >= MIN_SAMPLE_CALLS && sample.globalUsed > 0;
 }
 
 // How many equivalent consumers are on this token, from one probe window.
@@ -1028,7 +1059,7 @@ function sampleIsUsable(sample) {
 // where it is until a window is long enough to say otherwise.
 function inferShare(sample, lastShare = 1) {
   return sampleIsUsable(sample)
-    ? Math.max(1, sample.globalUsed / sample.myRestCalls)
+    ? Math.max(1, sample.globalUsed / sample.myCalls)
     : Math.max(1, lastShare);
 }
 
@@ -1051,7 +1082,7 @@ function nextProbeWindow(prev, budget, spentTotal) {
   }
   const sample = {
     globalUsed: budget.used - prev.used,
-    myRestCalls: spentTotal - prev.spent,
+    myCalls: spentTotal - prev.spent,
   };
   return { sample, next: sampleIsUsable(sample) ? { used: budget.used, spent: spentTotal } : prev };
 }
@@ -1102,15 +1133,63 @@ function adaptiveChangeWorthApplying(appliedMs, targetMs) {
 // other three amortised over BACKGROUND_EVERY. Same table and same shape as
 // projectedHourlyCost, so the controller and the report cannot disagree.
 function restPerTick(activeKey) {
-  let cost = REST_PER_FETCH[activeKey] ?? 0;
+  return resourcePerTick(REST_PER_FETCH, activeKey);
+}
+
+function resourcePerTick(table, activeKey) {
+  let cost = table[activeKey] ?? 0;
   for (const key of TAB_KEYS) {
-    if (key !== activeKey) cost += (REST_PER_FETCH[key] ?? 0) / BACKGROUND_EVERY;
+    if (key !== activeKey) cost += (table[key] ?? 0) / BACKGROUND_EVERY;
   }
   return cost;
 }
 
-function alertArgs(source) {
-  return ["api", apiPath(source.path), ...apiHostArgs(), "--jq", source.jq];
+function nextBudgetTargets({ budgets, samples, shares, previous, activeKey, floorMs, nowMs }) {
+  const targets = { core: floorMs, graphql: floorMs, ...previous };
+  for (const [resource, table] of [
+    ["core", REST_PER_FETCH],
+    ["graphql", GRAPHQL_PER_FETCH],
+  ]) {
+    const callsPerTick = resourcePerTick(table, activeKey);
+    if (callsPerTick <= 0 || !budgets?.[resource]) continue;
+    targets[resource] = adaptiveRefreshMs({
+      budget: budgets[resource],
+      sample: samples?.[resource] ?? null,
+      lastShare: shares?.[resource] ?? 1,
+      floorMs,
+      nowMs,
+      restPerTick: callsPerTick,
+    });
+  }
+  return { targets, targetMs: Math.max(floorMs, ...Object.values(targets)) };
+}
+
+function alertArgs(source, path = source.path) {
+  return ["api", apiPath(path), ...apiHostArgs(), "--jq", source.jq];
+}
+
+function alertRequestArgs(source) {
+  if (!source || typeof source.path !== "string" || !Array.isArray(source.priorityQueries)) {
+    return [];
+  }
+  return [
+    alertArgs(source),
+    ...source.priorityQueries.map((query) => alertArgs(source, `${source.path}&${query}`)),
+  ];
+}
+
+function mergeAlertRows(groups) {
+  const seen = new Set();
+  const merged = [];
+  for (const rows of groups) {
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const key = row?.number ?? row?.id;
+      if (key == null || seen.has(key)) continue;
+      seen.add(key);
+      merged.push(row);
+    }
+  }
+  return merged;
 }
 
 // Per-source backoff. Keyed by source so one unavailable endpoint cannot slow
@@ -1128,7 +1207,7 @@ const alertBackoff = new Map();
 // Under-reporting our own spend makes the inferred share *larger* and so
 // throttles slightly harder than strictly necessary -- the safe direction to err
 // in, which is why the imprecision is tolerated rather than chased.
-let restSpentTotal = 0;
+const spentTotal = { core: 0, graphql: 0 };
 
 function backoffActive(key, now) {
   const state = alertBackoff.get(key);
@@ -1159,6 +1238,13 @@ function clearBackoff(key) {
   alertBackoff.delete(key);
 }
 
+function forcedBackoffKeys(key) {
+  return [
+    `tab:${key}`,
+    ...(key === "security" ? ALERT_SOURCES.map((source) => source.key) : []),
+  ];
+}
+
 async function fetchAlertSource(source, signal, now) {
   if (backoffActive(source.key, now)) {
     const { note, verdict } = alertBackoff.get(source.key);
@@ -1173,19 +1259,26 @@ async function fetchAlertSource(source, signal, now) {
       parse: () => ({ alerts: [], note, verdict, truncated: false }),
     };
   }
+  let spent = 0;
   try {
-    const raw = await runGh(alertArgs(source), { signal });
+    const payloads = [];
+    for (const args of alertRequestArgs(source)) {
+      spent += 1;
+      payloads.push(await runGh(args, { signal }));
+    }
+    const raw = payloads.join("\0");
     clearBackoff(source.key);
     return {
       raw,
-      spent: 1,
+      spent,
       parse: () => {
-        const rows = JSON.parse(raw).filter((a) => a.state === "open");
+        const groups = payloads.map((payload) => JSON.parse(payload).filter((a) => a.state === "open"));
+        const rows = mergeAlertRows(groups);
         return {
           alerts: rows.map(source.map),
           note: null,
           verdict: "ok",
-          truncated: rows.length >= ALERT_PER_PAGE,
+          truncated: groups.some((group) => group.length >= ALERT_PER_PAGE),
         };
       },
     };
@@ -1205,7 +1298,7 @@ async function fetchAlertSource(source, signal, now) {
       raw: `unavailable:${note}`,
       // A failed call still bills: the request reached GitHub and was counted
       // whether it returned data, `[]`, or a 403.
-      spent: 1,
+      spent,
       parse: () => ({ alerts: [], note, verdict, truncated: false }),
     };
   }
@@ -1243,6 +1336,7 @@ async function fetchSecurity(signal) {
     // ALERT_SOURCES.length: a source held off by backoff spawned nothing and
     // must not be billed for it.
     restSpent: parts.reduce((n, p) => n + p.spent, 0),
+    graphqlSpent: 0,
     parse: () => {
       const parsed = parts.map((p) => p.parse());
       const alerts = parsed.flatMap((p) => p.alerts);
@@ -1279,6 +1373,19 @@ function itemKey(item) {
   return item?.id ?? item?.databaseId ?? item?.number ?? null;
 }
 
+function reconcileSelectionViewport({ items, key, offset = 0, rows = 1 }) {
+  const list = Array.isArray(items) ? items : [];
+  const rowCount = Math.max(1, Number.isSafeInteger(rows) ? rows : 1);
+  const maxOffset = Math.max(0, list.length - rowCount);
+  let nextOffset = Math.min(Math.max(0, Number.isSafeInteger(offset) ? offset : 0), maxOffset);
+  if (key == null) return { key: null, offset: nextOffset };
+  const index = list.findIndex((item) => itemKey(item) === key);
+  if (index < 0) return { key: null, offset: nextOffset };
+  if (index < nextOffset) nextOffset = index;
+  else if (index >= nextOffset + rowCount) nextOffset = index - rowCount + 1;
+  return { key, offset: nextOffset };
+}
+
 // `gh <kind> view --web` for the tabs that have a per-item command. The Security
 // tab is absent on purpose: alerts have no `gh` view subcommand, so there is
 // nothing honest to open.
@@ -1299,6 +1406,30 @@ async function openInBrowser(tabKey, item, signal) {
   const id = kind === "run" ? (item?.databaseId ?? item?.number) : (item?.number ?? item?.databaseId);
   if (!kind || id == null) return;
   await runGh([kind, "view", ...repoArgs(), String(id), "--web"], { signal });
+}
+
+function createOpenRequestRegistry() {
+  const requests = new Map();
+  return {
+    start(key, run) {
+      if (requests.has(key)) return null;
+      const controller = new AbortController();
+      requests.set(key, { controller, promise: null });
+      let started;
+      try {
+        started = run({ signal: controller.signal });
+      } catch (error) {
+        started = Promise.reject(error);
+      }
+      const promise = Promise.resolve(started).finally(() => requests.delete(key));
+      requests.set(key, { controller, promise });
+      return promise;
+    },
+    abortAll() {
+      for (const { controller } of requests.values()) controller.abort();
+    },
+    size: () => requests.size,
+  };
 }
 
 // ---------- Startup preflight ----------
@@ -1395,6 +1526,20 @@ function doctorEnvNames() {
   return [...named, ...extra];
 }
 
+function summarizeDoctorEnv(name, value, { home = homedir() } = {}) {
+  if (!value) return NOT_SET;
+  if (name === "NO_PROXY") {
+    const entries = String(value).split(",").map((entry) => entry.trim()).filter(Boolean).length;
+    return `set (${entries} ${entries === 1 ? "entry" : "entries"})`;
+  }
+  if (name === "GH_CONFIG_DIR") {
+    const text = String(value);
+    const prefix = `${home}/`;
+    return text === home ? "~" : text.startsWith(prefix) ? `~/${text.slice(prefix.length)}` : `…/${text.split(/[\\/]/).filter(Boolean).at(-1) ?? "gh"}`;
+  }
+  return String(value);
+}
+
 // Presence-only is the DEFAULT; printing a value is the opt-in, and the opt-in
 // list is curated above. This was the other way round -- print unless the *name*
 // ended in _TOKEN/_SECRET/_PASSWORD/_KEY -- which meant the discovery loop above
@@ -1408,7 +1553,7 @@ function envValue(name) {
   const value = process.env[name];
   if (!value) return NOT_SET;
   if (DOCTOR_ENV_PROXY.includes(name)) return proxySummary(value);
-  if (DOCTOR_ENV_PLAIN.includes(name)) return value;
+  if (DOCTOR_ENV_PLAIN.includes(name)) return summarizeDoctorEnv(name, value);
   return "set";
 }
 
@@ -1522,20 +1667,35 @@ async function rateBudget() {
 // Safe to run on a timer for the same reason it is safe on the diagnostic path:
 // `gh api rate_limit` is documented as not counting against the limit, and it
 // measures as free (verified: delta 0).
-async function readCoreBudget(signal) {
+function normalizeRateBudget(resource) {
+  if (
+    !resource ||
+    !Number.isFinite(resource.remaining) ||
+    !Number.isFinite(resource.limit) ||
+    !Number.isFinite(resource.used) ||
+    !Number.isFinite(resource.reset)
+  ) {
+    return null;
+  }
+  return {
+    remaining: resource.remaining,
+    limit: resource.limit,
+    used: resource.used,
+    resetMs: resource.reset * 1000,
+  };
+}
+
+async function readRateBudgets(signal) {
   try {
     // apiHostArgs() for the same reason the alert endpoints carry it: --repo
     // host/owner/name sets runtime.host without setting GH_HOST, so without the
     // flag this reads github.com's budget while the pane spends against the
     // tenant -- and then throttles, or fails to, against an unrelated number.
     const raw = await runGh(["api", "rate_limit", ...apiHostArgs()], { signal });
-    const core = JSON.parse(raw)?.resources?.core;
-    if (!core || !Number.isFinite(core.remaining)) return null;
+    const resources = JSON.parse(raw)?.resources;
     return {
-      remaining: core.remaining,
-      limit: core.limit,
-      used: core.used,
-      resetMs: core.reset * 1000,
+      core: normalizeRateBudget(resources?.core),
+      graphql: normalizeRateBudget(resources?.graphql),
     };
   } catch {
     // A probe failure must never be louder than the pane's own data: the loop
@@ -1574,11 +1734,16 @@ async function runDoctor() {
     ["Actions (run list)", actionsArgs(MIN_RUN_LIMIT)],
     ["Issues (issue list)", issuesArgs()],
     ["Pull requests (pr list)", prsArgs()],
-    ...ALERT_SOURCES.map((source) => [source.name, alertArgs(source)]),
+    ...ALERT_SOURCES.flatMap((source) =>
+      alertRequestArgs(source).map((args, index) => [
+        index === 0 ? source.name : `${source.name} (priority ${index})`,
+        args,
+      ]),
+    ),
   ];
 
   // allSettled, and every probe already resolves rather than rejects, so one
-  // slow endpoint cannot suppress the other six. runGh's own GH_TIMEOUT_MS
+  // slow endpoint cannot suppress the other probes. runGh's own GH_TIMEOUT_MS
   // bounds each one.
   const [ghVersion, authStatus, remote, budget, results] = await Promise.all([
     captureGh(["--version"]),
@@ -1816,6 +1981,17 @@ const KEY_TABLE = [
 ];
 const KEY_COL = Math.max(...KEY_TABLE.map(([k]) => k.length)) + 3;
 const keyTableLines = () => KEY_TABLE.map(([k, d]) => `${k.padEnd(KEY_COL)}${d}`);
+
+function helpLines(maxRows) {
+  const rows = Math.max(1, Number.isSafeInteger(maxRows) ? maxRows : 1);
+  const all = keyTableLines();
+  if (all.length <= rows) return all;
+  if (rows === 1) return [`… ${all.length} keys: gh-glance --help`];
+  const priority = [9, 6, 5, 3, 0, 7, 8, 1, 2, 4]
+    .slice(0, rows - 1)
+    .map((index) => all[index]);
+  return [...priority, `… ${all.length - priority.length} more: gh-glance --help`];
+}
 
 const HELP = `gh-glance ${version} -- a live-refreshing GitHub dashboard for a narrow terminal pane.
 
@@ -2098,6 +2274,10 @@ function Column({ width, grow, children, bold, color, dim, wrap, label, marginRi
   );
 }
 
+function selectionLabel(label, selected) {
+  return selected ? `selected, ${label}` : label;
+}
+
 // Each descriptor still owns one gutter cell, but an adjustable column owns
 // the edge that faces the flexible TITLE/SUMMARY reservoir. Fixed columns after
 // the grow cell therefore use the preceding descriptor's trailing gutter;
@@ -2329,6 +2509,10 @@ function sameElementMetrics(left, right) {
   );
 }
 
+function shouldEnableMouseReporting({ interactive, widthMode }) {
+  return Boolean(interactive && widthMode);
+}
+
 // ---------- Panel frame ----------
 
 // Ink can draw a border but not label one, so the horizontal edges are plain
@@ -2472,7 +2656,7 @@ function ActionsRow({ item, now, spin, compact, cursor, columns }) {
     return e(
       Box,
       { flexDirection: "row" },
-      e(Column, { ...columnProps(columns, "status"), color, label }, `${cursor ? ">" : " "}${icon}`),
+      e(Column, { ...columnProps(columns, "status"), color, label: selectionLabel(label, cursor) }, `${cursor ? ">" : " "}${icon}`),
       e(Column, columnProps(columns, "title"), item.displayTitle),
       e(Column, { ...columnProps(columns, "updated"), dim: true }, formatAge(new Date(item.updatedAt), now)),
     );
@@ -2480,7 +2664,7 @@ function ActionsRow({ item, now, spin, compact, cursor, columns }) {
   return e(
     Box,
     { flexDirection: "row" },
-    e(Column, { ...columnProps(columns, "status"), color, label }, `${cursor ? ">" : " "}${icon}`),
+    e(Column, { ...columnProps(columns, "status"), color, label: selectionLabel(label, cursor) }, `${cursor ? ">" : " "}${icon}`),
     e(Column, columnProps(columns, "title"), item.displayTitle),
     // The run number is the actionable half and used to be the first thing
     // truncation ate, since it sat at the tail of a 10-column cell.
@@ -2509,7 +2693,7 @@ const ISSUES_HEADER_COMPACT = [
 
 function IssueRow({ item, now, compact, cursor, columns }) {
   const cells = [
-    e(Column, { key: "status", ...columnProps(columns, "status"), color: OK, label: "open issue" }, `${cursor ? ">" : " "}${OCT.issueOpened}`),
+    e(Column, { key: "status", ...columnProps(columns, "status"), color: OK, label: selectionLabel("open issue", cursor) }, `${cursor ? ">" : " "}${OCT.issueOpened}`),
     e(Column, { key: "title", ...columnProps(columns, "title") }, `#${item.number} ${item.title}`),
   ];
   if (!compact) {
@@ -2552,7 +2736,7 @@ function PRRow({ item, now, compact, cursor, columns }) {
     : { icon: OCT.pullRequest, color: OK, label: "open pull request" };
   const review = pick(REVIEW_LABEL, item.reviewDecision, REVIEW_NONE);
   const cells = [
-    e(Column, { key: "status", ...columnProps(columns, "status"), color: prIcon.color, label: prIcon.label }, `${cursor ? ">" : " "}${prIcon.icon}`),
+    e(Column, { key: "status", ...columnProps(columns, "status"), color: prIcon.color, label: selectionLabel(prIcon.label, cursor) }, `${cursor ? ">" : " "}${prIcon.icon}`),
     e(Column, { key: "title", ...columnProps(columns, "title") }, `#${item.number} ${item.title}`),
   ];
   if (!compact) {
@@ -2606,7 +2790,7 @@ const SEVERITY_UNKNOWN = SEVERITY_STYLE.unknown;
 function SecurityRow({ item, now, compact, cursor, columns }) {
   const sev = pick(SEVERITY_STYLE, item.severity, SEVERITY_UNKNOWN);
   const cells = [
-    e(Column, { key: "status", ...columnProps(columns, "status"), color: sev.color, label: `${sev.short} severity` }, `${cursor ? ">" : " "}${OCT.shield}`),
+    e(Column, { key: "status", ...columnProps(columns, "status"), color: sev.color, label: selectionLabel(`${sev.short} severity`, cursor) }, `${cursor ? ">" : " "}${OCT.shield}`),
     e(Column, { key: "severity", ...columnProps(columns, "severity"), color: sev.color }, sev.short),
   ];
   if (!compact) {
@@ -2888,6 +3072,85 @@ function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+const persistenceWaitCell = new Int32Array(new SharedArrayBuffer(4));
+const PERSISTENCE_LOCK_WAIT_MS = 250;
+const PERSISTENCE_STALE_LOCK_MS = 5000;
+
+function withPersistenceLock(path, operation) {
+  const lockPath = `${path}.lock`;
+  const deadline = Date.now() + PERSISTENCE_LOCK_WAIT_MS;
+  let descriptor = null;
+  while (descriptor === null) {
+    try {
+      descriptor = openSync(lockPath, "wx", 0o600);
+    } catch (error) {
+      if (error?.code !== "EEXIST") return { ok: false, error };
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs > PERSISTENCE_STALE_LOCK_MS) {
+          unlinkSync(lockPath);
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() >= deadline) return { ok: false, busy: true, error };
+      Atomics.wait(persistenceWaitCell, 0, 0, 10);
+    }
+  }
+  try {
+    return operation();
+  } finally {
+    try {
+      closeSync(descriptor);
+    } finally {
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        // The lock is advisory; failure to remove it is recovered as stale.
+      }
+    }
+  }
+}
+
+function samePersistedValue(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function mergeWidthPreferenceSnapshots(base, disk, next) {
+  const merged = isRecord(disk) ? structuredClone(disk) : {};
+  const base_ = isRecord(base) ? base : {};
+  const next_ = isRecord(next) ? next : {};
+  const tabKeys = new Set([...Object.keys(base_), ...Object.keys(next_)]);
+  for (const tabKey of tabKeys) {
+    const baseTab = isRecord(base_[tabKey]) ? base_[tabKey] : {};
+    const nextTab = isRecord(next_[tabKey]) ? next_[tabKey] : {};
+    const columnKeys = new Set([...Object.keys(baseTab), ...Object.keys(nextTab)]);
+    for (const key of columnKeys) {
+      if (samePersistedValue(baseTab[key], nextTab[key])) continue;
+      if (!Object.hasOwn(nextTab, key)) {
+        if (isRecord(merged[tabKey])) delete merged[tabKey][key];
+      } else {
+        merged[tabKey] = isRecord(merged[tabKey]) ? merged[tabKey] : {};
+        merged[tabKey][key] = nextTab[key];
+      }
+    }
+    if (isRecord(merged[tabKey]) && Object.keys(merged[tabKey]).length === 0) delete merged[tabKey];
+  }
+  return merged;
+}
+
+function mergeDashboardCacheSnapshots(base, disk, next) {
+  const merged = isRecord(disk) ? structuredClone(disk) : {};
+  const base_ = isRecord(base) ? base : {};
+  const next_ = isRecord(next) ? next : {};
+  for (const target of new Set([...Object.keys(base_), ...Object.keys(next_)])) {
+    if (samePersistedValue(base_[target], next_[target])) continue;
+    if (Object.hasOwn(next_, target)) merged[target] = next_[target];
+    else delete merged[target];
+  }
+  return merged;
+}
+
 function normalizeWidthOverrides(overrides, tabs = TABS, { omitDefaults = false } = {}) {
   if (!isRecord(overrides)) return {};
 
@@ -2954,30 +3217,39 @@ function loadWidthPreferences(path, tabs = TABS) {
   return decodeWidthPreferences(raw, tabs);
 }
 
-function saveWidthPreferences(path, overrides, tabs = TABS) {
-  let tempPath = null;
+function saveWidthPreferences(path, overrides, tabs = TABS, { base = null } = {}) {
   try {
-    const payload = serializeWidthPreferences(overrides, tabs);
     const parent = dirname(path);
     mkdirSync(parent, { recursive: true, mode: 0o700 });
-    widthPreferenceTempSequence += 1;
-    tempPath = `${path}.${process.pid}.${Date.now()}.${widthPreferenceTempSequence}.tmp`;
-    writeFileSync(tempPath, payload, {
-      encoding: "utf8",
-      mode: 0o600,
-      flag: "wx",
-    });
-    renameSync(tempPath, path);
-    return { ok: true };
-  } catch (error) {
-    if (tempPath !== null) {
+    return withPersistenceLock(path, () => {
+      let tempPath = null;
       try {
-        unlinkSync(tempPath);
-      } catch {
-        // The write may have failed before creating it. Cleanup is best effort
-        // and deliberately targets only this operation's exact temporary file.
+        const disk = base === null ? {} : loadWidthPreferences(path, tabs).preferences;
+        const merged = base === null
+          ? overrides
+          : mergeWidthPreferenceSnapshots(base, disk, overrides);
+        const payload = serializeWidthPreferences(merged, tabs);
+        widthPreferenceTempSequence += 1;
+        tempPath = `${path}.${process.pid}.${Date.now()}.${widthPreferenceTempSequence}.tmp`;
+        writeFileSync(tempPath, payload, {
+          encoding: "utf8",
+          mode: 0o600,
+          flag: "wx",
+        });
+        renameSync(tempPath, path);
+        return { ok: true, persisted: normalizeWidthOverrides(merged, tabs) };
+      } catch (error) {
+        if (tempPath !== null) {
+          try {
+            unlinkSync(tempPath);
+          } catch {
+            // Cleanup targets only this operation's exact temporary file.
+          }
+        }
+        return { ok: false, error };
       }
-    }
+    });
+  } catch (error) {
     return { ok: false, error };
   }
 }
@@ -3088,7 +3360,7 @@ const createWidthPreferenceWriter = createCoalescedWriter;
 
 // ---------- Last-known-good dashboard cache ----------
 
-const DASHBOARD_CACHE_VERSION = 1;
+const DASHBOARD_CACHE_VERSION = 2;
 const MAX_DASHBOARD_CACHE_TARGETS = 5;
 const MAX_DASHBOARD_CACHE_ROWS_PER_TAB = 60;
 let dashboardCacheTempSequence = 0;
@@ -3097,15 +3369,63 @@ function dashboardCachePath(options = {}) {
   return join(dirname(widthPreferencesPath(options)), "dashboard-cache.json");
 }
 
+function effectiveGhConfigDir({ env = process.env, platform = process.platform, home = homedir() } = {}) {
+  if (env?.GH_CONFIG_DIR) return String(env.GH_CONFIG_DIR);
+  if (env?.XDG_CONFIG_HOME && isAbsolute(env.XDG_CONFIG_HOME)) return join(env.XDG_CONFIG_HOME, "gh");
+  if (platform === "win32" && env?.APPDATA) return join(env.APPDATA, "GitHub CLI");
+  return join(home, ".config", "gh");
+}
+
+function authCacheIdentity({
+  env = process.env,
+  platform = process.platform,
+  home = homedir(),
+  stat,
+} = {}) {
+  const configDir = effectiveGhConfigDir({ env, platform, home });
+  let configStat = stat;
+  if (configStat === undefined) {
+    try {
+      configStat = statSync(join(configDir, "hosts.yml"));
+    } catch {
+      configStat = null;
+    }
+  }
+  const tokenName = ["GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_TOKEN"].find((name) => env?.[name]);
+  const tokenDigest = tokenName
+    ? createHash("sha256").update(String(env[tokenName])).digest("hex")
+    : null;
+  const payload = {
+    configDir,
+    configStat: configStat
+      ? {
+          dev: Number(configStat.dev),
+          ino: Number(configStat.ino),
+          size: Number(configStat.size),
+          mtimeMs: Math.trunc(Number(configStat.mtimeMs)),
+        }
+      : null,
+    tokenName: tokenName ?? null,
+    tokenDigest,
+  };
+  return createHash("sha256").update(JSON.stringify(payload)).digest("hex").slice(0, 24);
+}
+
 // Explicit targets are stable across working directories. In inferred mode the
 // directory is the only repository identity available without making another
 // GitHub call -- exactly the call that cannot succeed when this cache is needed.
 // JSON encoding avoids delimiter ambiguity in host, repo, and path strings.
-function dashboardCacheTarget({ repo = null, ghRepo = null, host = null, cwd = process.cwd() } = {}) {
+function dashboardCacheTarget({
+  repo = null,
+  ghRepo = null,
+  host = null,
+  cwd = process.cwd(),
+  account = authCacheIdentity(),
+} = {}) {
   const target = repo || ghRepo;
   return target
-    ? JSON.stringify({ kind: "repo", host: String(host ?? ""), repo: String(target) })
-    : JSON.stringify({ kind: "cwd", host: String(host ?? ""), cwd: String(cwd) });
+    ? JSON.stringify({ kind: "repo", host: String(host ?? ""), repo: String(target), account })
+    : JSON.stringify({ kind: "cwd", host: String(host ?? ""), cwd: String(cwd), account });
 }
 
 function cacheTimestamp(value) {
@@ -3273,29 +3593,39 @@ function loadDashboardCache(path, target) {
   };
 }
 
-function saveDashboardCache(path, cache, { normalized = false } = {}) {
-  let tempPath = null;
+function saveDashboardCache(path, cache, { normalized = false, base = null } = {}) {
   try {
     const parent = dirname(path);
     mkdirSync(parent, { recursive: true, mode: 0o700 });
     if (process.platform !== "win32") chmodSync(parent, 0o700);
-    dashboardCacheTempSequence += 1;
-    tempPath = `${path}.${process.pid}.${Date.now()}.${dashboardCacheTempSequence}.tmp`;
-    writeFileSync(tempPath, serializeDashboardCache(cache, { normalized }), {
-      encoding: "utf8",
-      mode: 0o600,
-      flag: "wx",
-    });
-    renameSync(tempPath, path);
-    return { ok: true };
-  } catch (error) {
-    if (tempPath !== null) {
+    return withPersistenceLock(path, () => {
+      let tempPath = null;
       try {
-        unlinkSync(tempPath);
-      } catch {
-        // The write may have failed before creating this exact temporary file.
+        const disk = base === null ? {} : loadDashboardCache(path, "").cache;
+        const merged = base === null
+          ? cache
+          : limitDashboardCache(mergeDashboardCacheSnapshots(base, disk, cache));
+        dashboardCacheTempSequence += 1;
+        tempPath = `${path}.${process.pid}.${Date.now()}.${dashboardCacheTempSequence}.tmp`;
+        writeFileSync(tempPath, serializeDashboardCache(merged, { normalized }), {
+          encoding: "utf8",
+          mode: 0o600,
+          flag: "wx",
+        });
+        renameSync(tempPath, path);
+        return { ok: true, persisted: normalizeDashboardCache(merged) };
+      } catch (error) {
+        if (tempPath !== null) {
+          try {
+            unlinkSync(tempPath);
+          } catch {
+            // Cleanup targets only this operation's exact temporary file.
+          }
+        }
+        return { ok: false, error };
       }
-    }
+    });
+  } catch (error) {
     return { ok: false, error };
   }
 }
@@ -3303,6 +3633,54 @@ function saveDashboardCache(path, cache, { normalized = false } = {}) {
 function nextSecurityRaw(previousRaw, raw, blind) {
   if (blind === true) return null;
   return previousRaw === raw ? previousRaw : raw;
+}
+
+const CACHE_FRESHNESS_CHECKPOINT_MS = 60_000;
+const SECURITY_UNCHANGED_POLL_MS = 60_000;
+
+function shouldCheckpointFreshness({ persistedAt, completedAt }) {
+  return !Number.isFinite(persistedAt) || completedAt - persistedAt >= CACHE_FRESHNESS_CHECKPOINT_MS;
+}
+
+function securityPollDelay({ unchangedPolls, floorMs, force = false }) {
+  if (force) return 0;
+  return unchangedPolls > 0 ? Math.max(floorMs, SECURITY_UNCHANGED_POLL_MS) : floorMs;
+}
+
+function shouldShowFetchLoading({ hasData, force }) {
+  return !hasData || force === true;
+}
+
+function pollTickKeys({ ticks, activeKey }) {
+  return {
+    due: ticks % BACKGROUND_EVERY === 0 ? [...TAB_KEYS] : [activeKey],
+    nextTicks: ticks + 1,
+  };
+}
+
+function pollResultTransition({ key, previousRaw, raw, parse, limit, completedAt }) {
+  if (previousRaw === raw) return { kind: "unchanged", completedAt };
+  const value = parse();
+  if (key === "security" && value?.blind) {
+    return {
+      kind: "blind",
+      nextRaw: nextSecurityRaw(previousRaw, raw, true),
+      notes: value.notes ?? [],
+      blind: true,
+    };
+  }
+  const data = value?.alerts ?? value;
+  return {
+    kind: "changed",
+    nextRaw: key === "security" ? nextSecurityRaw(previousRaw, raw, false) : raw,
+    data,
+    meta: {
+      at: completedAt,
+      truncated: value?.truncated ?? data.length >= limit,
+    },
+    notes: value?.notes,
+    blind: Boolean(value?.blind),
+  };
 }
 
 // Below this the full column set cannot render without its fixed columns
@@ -3323,6 +3701,11 @@ const MIN_COMPACT_WIDTH = Math.max(...TABS.map((t) => minimumWidthFor(t.compactH
 const TAB_LABEL_FULL_WIDTH = 78;
 const TAB_LABEL_HYSTERESIS = 4;
 
+function tabFailureSuffix({ count, failed, brokenCI }) {
+  if (count == null) return failed ? " x" : "";
+  return ` (${count}${brokenCI ? "!" : ""}${failed ? "x" : ""})`;
+}
+
 function TabBar({ activeIndex, counts, brokenCI, firstLoad, failed, spin, useShort }) {
   return e(
     Box,
@@ -3336,8 +3719,12 @@ function TabBar({ activeIndex, counts, brokenCI, firstLoad, failed, spin, useSho
         count == null
           ? firstLoad[tab.key]
             ? ` ${spin}`
-            : ""
-          : ` (${count}${brokenCI[tab.key] ? "!" : ""})`;
+            : tabFailureSuffix({ count, failed: failed[tab.key], brokenCI: false })
+          : tabFailureSuffix({
+              count,
+              failed: failed[tab.key],
+              brokenCI: brokenCI[tab.key],
+            });
       const name = useShort ? tab.short : tab.label;
       // Bold and inverse are both stripped at chalk level 0 (NO_COLOR, or a
       // dumb terminal), which left no indication at all of which tab was
@@ -3396,6 +3783,23 @@ const KEY_HINTS = [
   { label: "Width", keys: "w" },
   { label: "Quit", keys: "q" },
 ];
+
+function activeKeyHints({
+  interactive,
+  remoteSetup = false,
+  canMove = false,
+  canOpen = false,
+  canResize = false,
+}) {
+  if (!interactive) return [{ label: "Quit", keys: "^C" }];
+  if (remoteSetup) return REMOTE_SETUP_HINTS;
+  return KEY_HINTS.filter((hint) => {
+    if (hint.label === "Move") return canMove;
+    if (hint.label === "Open") return canOpen;
+    if (hint.label === "Width") return canResize;
+    return true;
+  });
+}
 
 const REMOTE_SETUP_HINTS = [
   { label: "Create remote", keys: "Ent" },
@@ -3467,6 +3871,9 @@ function StatusBar({
   widthMode = false,
   widthColumn = null,
   widthSaveError = null,
+  canMove = false,
+  canOpen = false,
+  canResize = false,
 }) {
   // Width mode owns the whole bar, so the throttle badge is deliberately not
   // shown here: this state is transient and explicitly entered, and the widened
@@ -3490,11 +3897,7 @@ function StatusBar({
   // Without raw mode none of the key handlers run, so advertising them would be
   // telling the user something untrue about what the app can do. Ctrl+C still
   // works there, because the tty delivers a real SIGINT.
-  const hints = interactive
-    ? remoteSetup
-      ? REMOTE_SETUP_HINTS
-      : KEY_HINTS
-    : [{ label: "Quit", keys: "^C" }];
+  const hints = activeKeyHints({ interactive, remoteSetup, canMove, canOpen, canResize });
   const hintsFullWidth =
     hints.reduce((sum, hint) => sum + hint.label.length + 2 + [...hint.keys].length, 0) +
     (hints.length - 1) * 3;
@@ -3601,16 +4004,22 @@ function App({ onCreateRemote = () => {} } = {}) {
   const { exit, suspendTerminal } = useApp();
   const [activeIndex, setActiveIndex] = useState(runtime.initialTabIndex);
   const [preferencePath] = useState(() => widthPreferencesPath());
-  const [widthOverrides, setWidthOverrides] = useState(
-    () => loadWidthPreferences(preferencePath).preferences,
-  );
+  const [loadedWidthPreferences] = useState(() => loadWidthPreferences(preferencePath));
+  const [widthOverrides, setWidthOverrides] = useState(() => loadedWidthPreferences.preferences);
   const widthOverridesRef = useRef(widthOverrides);
   widthOverridesRef.current = widthOverrides;
+  const widthPersistedRef = useRef(loadedWidthPreferences.preferences);
   const [widthSaveError, setWidthSaveError] = useState(null);
   const widthPreferencesMountedRef = useRef(true);
   const [widthPreferenceWriter] = useState(() =>
     createWidthPreferenceWriter({
-      write: (overrides) => saveWidthPreferences(preferencePath, overrides),
+      write: (overrides) => {
+        const result = saveWidthPreferences(preferencePath, overrides, TABS, {
+          base: widthPersistedRef.current,
+        });
+        if (result.ok) widthPersistedRef.current = result.persisted;
+        return result;
+      },
       onResult: (result) => {
         if (!widthPreferencesMountedRef.current) return;
         setWidthSaveError(
@@ -3642,10 +4051,18 @@ function App({ onCreateRemote = () => {} } = {}) {
   );
   const [loadedCache] = useState(() => loadDashboardCache(cachePath, cacheTarget));
   const dashboardCacheRef = useRef(loadedCache.cache);
+  const dashboardCachePersistedRef = useRef(loadedCache.cache);
   const dashboardCacheTargetRef = useRef(cacheTarget);
   const [dashboardCacheWriter] = useState(() =>
     createCoalescedWriter({
-      write: (cache) => saveDashboardCache(cachePath, cache, { normalized: true }),
+      write: (cache) => {
+        const result = saveDashboardCache(cachePath, cache, {
+          normalized: true,
+          base: dashboardCachePersistedRef.current,
+        });
+        if (result.ok) dashboardCachePersistedRef.current = result.persisted;
+        return result;
+      },
     }),
   );
   useEffect(() => () => {
@@ -3660,13 +4077,21 @@ function App({ onCreateRemote = () => {} } = {}) {
   const [data, setData] = useState(() =>
     Object.fromEntries(TABS.map((candidate) => [candidate.key, cachedEntry?.tabs[candidate.key]?.data ?? null])),
   );
+  const dataRef = useRef(data);
+  dataRef.current = data;
   const [meta, setMeta] = useState(() =>
     Object.fromEntries(TABS.map((candidate) => [candidate.key, cachedEntry?.tabs[candidate.key]?.meta ?? null])),
   );
+  const metaRef = useRef(meta);
+  metaRef.current = meta;
   const [securityNotes, setSecurityNotes] = useState(() => cachedEntry?.securityNotes ?? []);
+  const securityNotesRef = useRef(securityNotes);
+  securityNotesRef.current = securityNotes;
   // Whether the Security tab is currently unable to see its endpoints, as
   // opposed to seeing that they are switched off. Drives the count marker.
   const [securityBlind, setSecurityBlind] = useState(() => cachedEntry?.securityBlind ?? false);
+  const securityBlindRef = useRef(securityBlind);
+  securityBlindRef.current = securityBlind;
   // The `?` overlay. Renders only on a keypress, so consecutive idle frames are
   // still byte-identical and the redraw suppression is untouched.
   const [showHelp, setShowHelp] = useState(false);
@@ -3804,13 +4229,16 @@ function App({ onCreateRemote = () => {} } = {}) {
   });
 
   useEffect(() => {
-    if (!interactive) return;
+    if (!shouldEnableMouseReporting({ interactive, widthMode })) {
+      disableMouseReporting();
+      return;
+    }
     enableMouseReporting();
     return () => {
       dragRef.current = null;
       disableMouseReporting();
     };
-  }, [interactive]);
+  }, [interactive, widthMode]);
 
   function applyWidthOverrides(next) {
     const current = widthOverridesRef.current;
@@ -3923,7 +4351,7 @@ function App({ onCreateRemote = () => {} } = {}) {
 
     const geometry = resizeRef.current;
     if (event.action === "press") {
-      if (!interactive || !geometry.fullHeaderVisible || geometry.compact) return;
+      if (!interactive || !geometry.active || !geometry.fullHeaderVisible || geometry.compact) return;
       const metrics = measuredHeader();
       if (!metrics) return;
       const drag = beginDividerDrag({
@@ -4022,24 +4450,22 @@ function App({ onCreateRemote = () => {} } = {}) {
   // rather than by tab so that moving to a different row and opening it
   // immediately still works -- selection does not move on Enter, so a second
   // press within the window is always a duplicate of the first.
-  const openingRef = useRef({});
+  const [openRequests] = useState(() => createOpenRequestRegistry());
+  useEffect(() => () => openRequests.abortAll(), [openRequests]);
 
   function openSelected() {
     const { items, key: currentKey, tabKey } = navRef.current;
     const item = items.find((i) => itemKey(i) === currentKey);
     if (!item) return;
     const guard = `${tabKey}:${itemKey(item)}`;
-    if (openingRef.current[guard]) return;
-    openingRef.current[guard] = true;
     // Fire and forget: a browser launch must not block the render loop, and a
     // failure surfaces through the tab's normal error line rather than as an
     // unhandled rejection.
-    openInBrowser(tabKey, item)
-      .catch((err) => {
+    openRequests
+      .start(guard, ({ signal }) => openInBrowser(tabKey, item, signal))
+      ?.catch((err) => {
+        if (err?.name === "AbortError") return;
         setErrors((x) => ({ ...x, [tabKey]: textTabError(err) }));
-      })
-      .finally(() => {
-        delete openingRef.current[guard];
       });
   }
 
@@ -4054,6 +4480,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         return;
       }
       if (input === "q" || (input === "c" && key.ctrl)) {
+        openRequests.abortAll();
         flushWidthPreferences();
         exit();
       } else if (resizeRef.current.active) {
@@ -4076,6 +4503,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         // Width mode owns every other key. In particular, digits, arrows, Tab,
         // Enter and r must never fall through to their ordinary meanings.
       } else if (key.escape) {
+        openRequests.abortAll();
         flushWidthPreferences();
         exit();
       } else if (showHelpRef.current) {
@@ -4196,19 +4624,30 @@ function App({ onCreateRemote = () => {} } = {}) {
     // a Promise.allSettled barrier. Actions is by far the slowest fetch, so
     // barrelling everything together meant the three fast tabs sat invisible
     // behind it and nothing at all appeared until the slowest call returned.
-    function commit(key, run) {
+    let securityUnchangedPolls = 0;
+    let securityNextPollAt = 0;
+
+    function commit(key, run, { force = false } = {}) {
       // Per-tab rather than one flag for the whole tick, so switching tabs can
       // refresh the tab you just landed on without waiting on an unrelated
       // background fetch -- and so a slow repo can't stack refreshes.
       if (inFlightRef.current[key]) return Promise.resolve();
       inFlightRef.current[key] = true;
-      setLoading((l) => (l[key] ? l : { ...l, [key]: true }));
+      if (force) {
+        for (const backoffKey of forcedBackoffKeys(key)) clearBackoff(backoffKey);
+      }
+      const visibleLoading = shouldShowFetchLoading({
+        hasData: dataRef.current[key] !== null,
+        force,
+      });
+      if (visibleLoading) setLoading((l) => (l[key] ? l : { ...l, [key]: true }));
       return run()
         .then((result) => {
           // Billed before the `cancelled` early return: the requests were made
           // and counted by GitHub whether or not this process still wants the
           // answer.
-          restSpentTotal += result?.restSpent ?? 0;
+          spentTotal.core += result?.restSpent ?? 0;
+          spentTotal.graphql += result?.graphqlSpent ?? 0;
           if (cancelled) return;
           const { raw, parse, limit } = result;
           // Identical payload: skip the parse *and* the state update. Returning
@@ -4231,48 +4670,77 @@ function App({ onCreateRemote = () => {} } = {}) {
           // would allocate a new object every tick and permanently defeat the
           // React bail-out this early return exists to preserve.
           const completedAt = Date.now();
-          if (rawRef.current[key] === raw) {
+          const transition = pollResultTransition({
+            key,
+            previousRaw: rawRef.current[key],
+            raw,
+            parse,
+            limit,
+            completedAt,
+          });
+          if (key === "security") {
+            securityUnchangedPolls = transition.kind === "unchanged" ? securityUnchangedPolls + 1 : 0;
+            securityNextPollAt =
+              performance.now() +
+              securityPollDelay({
+                unchangedPolls: securityUnchangedPolls,
+                floorMs: runtime.refreshMs,
+                force,
+              });
+          }
+          if (transition.kind === "unchanged") {
             lastOkRef.current[key] = completedAt;
             // Clear on the first success or a single failure latches the ladder.
             clearBackoff(`tab:${key}`);
             setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
+            const cachedTab = pick(
+              pick(dashboardCacheRef.current, dashboardCacheTargetRef.current, null)?.tabs ?? {},
+              key,
+              null,
+            );
+            if (
+              cachedTab &&
+              shouldCheckpointFreshness({ persistedAt: cachedTab.lastOk, completedAt })
+            ) {
+              cacheSuccessfulTab(
+                key,
+                dataRef.current[key],
+                metaRef.current[key],
+                completedAt,
+                key === "security"
+                  ? { notes: securityNotesRef.current, blind: securityBlindRef.current }
+                  : {},
+              );
+            }
             return;
           }
-          const value = parse();
           // Security fetches resolve each source independently so their notes
           // remain visible. A blind result is still a failed observation: it
           // must not replace known alerts with a false empty state or advance
           // freshness. Do not retain its raw value either, so the next source
           // retry is parsed instead of taking the identical-payload fast path.
-          if (key === "security" && value.blind) {
-            rawRef.current[key] = nextSecurityRaw(rawRef.current[key], raw, true);
+          if (transition.kind === "blind") {
+            rawRef.current[key] = transition.nextRaw;
             setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
-            setSecurityNotes(value.notes ?? []);
+            setSecurityNotes(transition.notes);
             setSecurityBlind(true);
             return;
           }
-          const tabData = value.alerts ?? value;
-          const tabMeta = {
-            at: completedAt,
-            // Compare against the limit this payload was actually fetched
-            // with. Comparing against the live pane-height ref made the "n+"
-            // marker lie for one cycle after every resize.
-            truncated: value.truncated ?? tabData.length >= limit,
-          };
+          const tabData = transition.data;
+          const tabMeta = transition.meta;
           lastOkRef.current[key] = completedAt;
           clearBackoff(`tab:${key}`);
-          rawRef.current[key] =
-            key === "security" ? nextSecurityRaw(rawRef.current[key], raw, false) : raw;
+          rawRef.current[key] = transition.nextRaw;
           setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
           setData((d) => ({ ...d, [key]: tabData }));
           setMeta((m) => ({ ...m, [key]: tabMeta }));
-          if (value.notes) setSecurityNotes(value.notes);
+          if (transition.notes) setSecurityNotes(transition.notes);
           if (key === "security") {
-            setSecurityBlind((b) => (b === Boolean(value.blind) ? b : Boolean(value.blind)));
+            setSecurityBlind((b) => (b === transition.blind ? b : transition.blind));
           }
           cacheSuccessfulTab(key, tabData, tabMeta, completedAt, {
-            notes: value.notes,
-            blind: value.blind,
+            notes: transition.notes,
+            blind: transition.blind,
           });
         })
         .catch((err) => {
@@ -4280,7 +4748,8 @@ function App({ onCreateRemote = () => {} } = {}) {
           // here; bill the tab's table cost instead. A request that failed after
           // reaching GitHub still counted, and over-billing by an aborted call
           // errs toward throttling harder, which is the safe direction.
-          restSpentTotal += REST_PER_FETCH[key] ?? 0;
+          spentTotal.core += REST_PER_FETCH[key] ?? 0;
+          spentTotal.graphql += GRAPHQL_PER_FETCH[key] ?? 0;
           if (cancelled || err?.name === "AbortError") return;
           // Preserve both the verdict and the bounded raw error in state. The
           // renderer translates recognized verdicts at draw time, which lets a
@@ -4300,7 +4769,9 @@ function App({ onCreateRemote = () => {} } = {}) {
         })
         .finally(() => {
           inFlightRef.current[key] = false;
-          if (!cancelled) setLoading((l) => (l[key] ? { ...l, [key]: false } : l));
+          if (!cancelled && visibleLoading) {
+            setLoading((l) => (l[key] ? { ...l, [key]: false } : l));
+          }
         });
     }
 
@@ -4311,12 +4782,17 @@ function App({ onCreateRemote = () => {} } = {}) {
     function fetchTab(key, { force = false } = {}) {
       const signal = controller.signal;
       const descriptor = tabForKey(key);
-      if (!force && backoffActive(`tab:${key}`, performance.now())) return Promise.resolve();
-      if (force) clearBackoff(`tab:${key}`);
+      const now_ = performance.now();
+      if (!force && backoffActive(`tab:${key}`, now_)) return Promise.resolve();
+      if (!force && key === "security" && now_ < securityNextPollAt) return Promise.resolve();
       // Every tab carries its own fetcher on the registry, so adding a tab is a
       // TABS entry plus a fetcher rather than an entry plus an edit to a chain
       // in a different part of the file.
-      return commit(key, () => descriptor.fetch({ signal, runLimit: runLimitRef.current }));
+      return commit(
+        key,
+        () => descriptor.fetch({ signal, runLimit: runLimitRef.current }),
+        { force },
+      );
     }
     fetchTabRef.current = fetchTab;
 
@@ -4335,8 +4811,9 @@ function App({ onCreateRemote = () => {} } = {}) {
       // being a minute behind -- so they refresh every BACKGROUND_EVERY ticks
       // instead, which is what keeps steady-state API usage off the rate limit.
       const active = TABS[activeIndexRef.current].key;
-      const due = ticks % BACKGROUND_EVERY === 0 ? TABS.map((t) => t.key) : [active];
-      ticks += 1;
+      const planned = pollTickKeys({ ticks, activeKey: active });
+      const due = planned.due;
+      ticks = planned.nextTicks;
       // Mapped explicitly rather than passing fetchTab by reference: Array.map
       // hands the callback an index as its second argument, which would land in
       // the options bag and make every background tab look force-refreshed.
@@ -4362,8 +4839,9 @@ function App({ onCreateRemote = () => {} } = {}) {
     // The open probe window, and the last share it was able to measure. Both are
     // carried by nextProbeWindow/inferShare rather than reset every probe -- see
     // those functions for why a throttled pane must not re-measure from scratch.
-    let probeWindow = null;
-    let lastShare = 1;
+    const probeWindows = { core: null, graphql: null };
+    const lastShares = { core: 1, graphql: 1 };
+    let resourceTargets = { core: runtime.refreshMs, graphql: runtime.refreshMs };
 
     function rearm(ms) {
       appliedMs = ms;
@@ -4377,23 +4855,28 @@ function App({ onCreateRemote = () => {} } = {}) {
       try {
         // `controller` is this effect's own AbortController, so a probe still in
         // flight at unmount is killed along with everything else.
-        const budget = await readCoreBudget(controller.signal);
-        if (cancelled || !budget) return;
-        const { sample, next } = nextProbeWindow(probeWindow, budget, restSpentTotal);
-        probeWindow = next;
-        // Updated before the law reads it. inferShare is idempotent, so passing
-        // the already-updated value cannot change the answer -- it just keeps
-        // one variable holding the current share rather than two.
-        lastShare = inferShare(sample, lastShare);
-
-        const target = adaptiveRefreshMs({
-          budget,
-          sample,
-          lastShare,
+        const budgets = await readRateBudgets(controller.signal);
+        if (cancelled || !budgets) return;
+        const samples = { core: null, graphql: null };
+        for (const resource of ["core", "graphql"]) {
+          const budget = budgets[resource];
+          if (!budget) continue;
+          const step = nextProbeWindow(probeWindows[resource], budget, spentTotal[resource]);
+          probeWindows[resource] = step.next;
+          samples[resource] = step.sample;
+          lastShares[resource] = inferShare(step.sample, lastShares[resource]);
+        }
+        const nextTargets = nextBudgetTargets({
+          budgets,
+          samples,
+          shares: lastShares,
+          previous: resourceTargets,
+          activeKey: TABS[activeIndexRef.current].key,
           floorMs: runtime.refreshMs,
           nowMs: Date.now(),
-          restPerTick: restPerTick(TABS[activeIndexRef.current].key),
         });
+        resourceTargets = nextTargets.targets;
+        const target = nextTargets.targetMs;
         if (adaptiveChangeWorthApplying(appliedMs, target)) {
           rearm(target);
           setThrottleMs(target > runtime.refreshMs ? target : null);
@@ -4471,7 +4954,7 @@ function App({ onCreateRemote = () => {} } = {}) {
   }, [anyFirstLoad, iconHintDue]);
 
   const items = data[tab.key];
-  const displayError = formatTabError(tabError, failureContext);
+  const displayError = formatTabErrorForWidth(tabError, failureContext, Math.max(1, cols - 5));
   const spin = SPINNER[frame % SPINNER.length];
 
   const counts = Object.fromEntries(
@@ -4531,11 +5014,18 @@ function App({ onCreateRemote = () => {} } = {}) {
 
   const allItems = items ?? [];
   const tabOffsetRaw = offset[tab.key] ?? 0;
+  const selectedKey = selected[tab.key] ?? null;
   // Re-clamped on every render rather than only on resize: the payload can
   // shrink under us between ticks, and a stale offset would render an empty
   // body while the count in the frame said otherwise.
   const maxOffset = Math.max(0, allItems.length - bodyRows);
-  const tabOffset = Math.min(tabOffsetRaw, maxOffset);
+  const reconciledSelection = reconcileSelectionViewport({
+    items: allItems,
+    key: selectedKey,
+    offset: Math.min(tabOffsetRaw, maxOffset),
+    rows: bodyRows,
+  });
+  const tabOffset = reconciledSelection.offset;
   const visibleItems = allItems.slice(tabOffset, tabOffset + bodyRows);
 
   // Matched by key, never by position. If the selected item is gone -- closed,
@@ -4543,7 +5033,22 @@ function App({ onCreateRemote = () => {} } = {}) {
   // highlighted, which is the honest state; the next arrow key selects from the
   // top again. Resolving to a neighbouring index instead would silently move
   // the cursor onto an unrelated row.
-  const selectedKey = selected[tab.key] ?? null;
+  useEffect(() => {
+    if (reconciledSelection.key !== selectedKey) {
+      setSelected((current) => {
+        if (reconciledSelection.key !== null) {
+          return { ...current, [tab.key]: reconciledSelection.key };
+        }
+        if (!Object.hasOwn(current, tab.key)) return current;
+        const next = { ...current };
+        delete next[tab.key];
+        return next;
+      });
+    }
+    if (reconciledSelection.offset !== tabOffsetRaw) {
+      setOffset((current) => ({ ...current, [tab.key]: reconciledSelection.offset }));
+    }
+  }, [reconciledSelection.key, reconciledSelection.offset, selectedKey, tabOffsetRaw, tab.key]);
   // Bottom-right of the frame, lazygit style: how much of the tab you can
   // currently see out of how much there is.
   const countLabel =
@@ -4702,8 +5207,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       // truncate-end so it degrades rather than wraps in a narrow pane. Every
       // glyph in KEY_TABLE is plain ASCII, which is what keeps it safe here.
       showHelp &&
-        keyTableLines()
-          .slice(0, bodyRows)
+        helpLines(bodyRows)
           .map((line, i) => e(Text, { key: `help${i}`, wrap: "truncate-end" }, line)),
       !showHelp &&
         tooNarrow &&
@@ -4749,7 +5253,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         const key = itemKey(item);
         return e(
           RowBoundary,
-          { key, resetKey: key },
+          { key, resetKey: item },
           e(tab.Row, {
             item,
             now,
@@ -4812,6 +5316,12 @@ function App({ onCreateRemote = () => {} } = {}) {
       widthMode: resizeRef.current.active,
       widthColumn: selectedWidthColumn,
       widthSaveError,
+      canMove: allItems.length > 0,
+      canOpen:
+        selectedKey !== null &&
+        Object.hasOwn(OPENABLE, tab.key) &&
+        allItems.some((item) => itemKey(item) === selectedKey),
+      canResize: fullHeaderVisible,
     }),
   );
 }
@@ -5071,6 +5581,7 @@ export {
   REFRESH_MS,
   BACKGROUND_EVERY,
   adaptiveRefreshMs,
+  nextBudgetTargets,
   adaptiveChangeWorthApplying,
   sampleIsUsable,
   inferShare,
@@ -5095,6 +5606,7 @@ export {
   failureTargetHost,
   unavailableRemedy,
   createFailureContextCoordinator,
+  createOpenRequestRegistry,
   AUTH_RETRY_MS,
   BACKOFF_STEPS_MS,
   redact,
@@ -5122,13 +5634,25 @@ export {
   loadWidthPreferences,
   saveWidthPreferences,
   createWidthPreferenceWriter,
+  mergeWidthPreferenceSnapshots,
   DASHBOARD_CACHE_VERSION,
   dashboardCachePath,
   dashboardCacheTarget,
+  authCacheIdentity,
   serializeDashboardCache,
   loadDashboardCache,
   saveDashboardCache,
+  mergeDashboardCacheSnapshots,
   nextSecurityRaw,
+  shouldCheckpointFreshness,
+  securityPollDelay,
+  shouldShowFetchLoading,
+  pollTickKeys,
+  pollResultTransition,
+  forcedBackoffKeys,
+  alertRequestArgs,
+  mergeAlertRows,
+  reconcileSelectionViewport,
   runStatusIcon,
   RUN_STATUS_ICON,
   SEVERITY_STYLE,
@@ -5140,6 +5664,12 @@ export {
   OCT_UNICODE,
   KEY_TABLE,
   KEY_HINTS,
+  activeKeyHints,
+  tabFailureSuffix,
+  formatTabErrorForWidth,
+  selectionLabel,
+  helpLines,
+  summarizeDoctorEnv,
   widthStatusText,
   headerGutterKey,
   HeaderCells,
@@ -5148,7 +5678,9 @@ export {
   hitDivider,
   beginDividerDrag,
   draggedWidth,
+  shouldEnableMouseReporting,
   createTerminalLifecycle,
+  RowBoundary,
   REMOTE_SETUP_HINTS,
   REMOTE_SETUP_LINES,
   REMOTE_SETUP_NONINTERACTIVE_LINES,

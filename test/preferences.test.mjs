@@ -104,6 +104,27 @@ test("repeated saves atomically replace content without leaving a temp file", ()
   });
 });
 
+test("stale writers merge unrelated width changes from another process", () => {
+  withTemporaryRoot((root) => {
+    const path = preferencePath(root);
+    const sharedBase = {};
+
+    assert.equal(
+      saveWidthPreferences(path, { actions: { branch: 18 } }, undefined, { base: sharedBase }).ok,
+      true,
+    );
+    assert.equal(
+      saveWidthPreferences(path, { issues: { author: 9 } }, undefined, { base: sharedBase }).ok,
+      true,
+    );
+
+    assert.deepEqual(loadWidthPreferences(path).preferences, {
+      actions: { branch: 18 },
+      issues: { author: 9 },
+    });
+  });
+});
+
 test("a file used as the preference parent is a nonfatal save failure", () => {
   withTemporaryRoot((root) => {
     const blockedParent = join(root, "not-a-directory");

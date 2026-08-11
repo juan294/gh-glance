@@ -2090,23 +2090,24 @@ test("issues and prs cost no REST and two GraphQL, because --search routes them"
   }
 });
 
-test("security costs one REST per alert source", () => {
-  assert.equal(REST_PER_FETCH.security, ALERT_SOURCES.length);
+test("security costs one bounded request per newest and priority lane", () => {
+  assert.equal(REST_PER_FETCH.security, 6);
+  assert.ok(REST_PER_FETCH.security > ALERT_SOURCES.length);
 });
 
 test("projected hourly cost, per active tab, at the default refresh", () => {
   // runtime.refreshMs is REFRESH_MS on an imported module (the argv block is
   // gated on IS_MAIN), so these are the default-refresh figures.
-  assert.deepEqual(projectedHourlyCost("actions"), { rest: 1620, graphql: 240 });
-  assert.deepEqual(projectedHourlyCost("issues"), { rest: 300, graphql: 1560 });
-  assert.deepEqual(projectedHourlyCost("prs"), { rest: 300, graphql: 1560 });
-  assert.deepEqual(projectedHourlyCost("security"), { rest: 2280, graphql: 240 });
+  assert.deepEqual(projectedHourlyCost("actions"), { rest: 1800, graphql: 240 });
+  assert.deepEqual(projectedHourlyCost("issues"), { rest: 480, graphql: 1560 });
+  assert.deepEqual(projectedHourlyCost("prs"), { rest: 480, graphql: 1560 });
+  assert.deepEqual(projectedHourlyCost("security"), { rest: 4440, graphql: 240 });
 });
 
 // The control law. These assertions are the specification -- the function is
 // pure, so the rubric can be stated exactly rather than observed through a
 // timer. Expected intervals are derived, not guessed: with
-// restPerTick("actions") = 2 + 3/12 = 2.25 and a fresh window (5000 remaining,
+// restPerTick("actions") = 2 + 6/12 = 2.5 and a fresh window (5000 remaining,
 // resetting in an hour), affordable = 5000/3600 * 0.8 = 1.111 calls/sec.
 function assertClose(actual, expected, tolerance) {
   assert.ok(
@@ -2121,12 +2122,12 @@ const FRESH = { remaining: 5000, limit: 5000, resetMs: 3_600_000 };
 // NaN and the case silently stops testing what it names.
 const at = (over) => ({
   nowMs: 0,
-  restPerTick: 2.25,
+  restPerTick: 2.5,
   floorMs: 5000,
   ...over,
   budget: { ...FRESH, ...over?.budget },
 });
-const sample = (mine, global) => ({ myRestCalls: mine, globalUsed: global });
+const sample = (mine, global) => ({ myCalls: mine, globalUsed: global });
 
 test("a single instance stays at the configured floor", () => {
   // required = 2.25 / 1.111 = 2.03s, below the 5s floor. This is the property
@@ -2134,16 +2135,16 @@ test("a single instance stays at the configured floor", () => {
   assert.equal(adaptiveRefreshMs(at({ sample: sample(100, 100) })), 5000);
 });
 
-test("three panes sit just above the floor", () => {
-  assertClose(adaptiveRefreshMs(at({ sample: sample(100, 300) })), 6075, 200);
+test("three panes widen to about 7 seconds", () => {
+  assertClose(adaptiveRefreshMs(at({ sample: sample(100, 300) })), 6750, 200);
 });
 
-test("seven panes widen to about 14 seconds", () => {
-  assertClose(adaptiveRefreshMs(at({ sample: sample(100, 700) })), 14175, 500);
+test("seven panes widen to about 16 seconds", () => {
+  assertClose(adaptiveRefreshMs(at({ sample: sample(100, 700) })), 15_750, 500);
 });
 
-test("ten panes widen to about 20 seconds", () => {
-  assertClose(adaptiveRefreshMs(at({ sample: sample(100, 1000) })), 20250, 500);
+test("ten panes widen to about 23 seconds", () => {
+  assertClose(adaptiveRefreshMs(at({ sample: sample(100, 1000) })), 22_500, 500);
 });
 
 test("the aggregate of N adapted panes lands near the safety target", () => {
@@ -2152,7 +2153,7 @@ test("the aggregate of N adapted panes lands near the safety target", () => {
   // BUDGET_SAFETY of the hourly limit, leaving the rest for the user's own gh.
   for (const n of [1, 3, 7, 10, 20]) {
     const ms = adaptiveRefreshMs(at({ sample: sample(100, 100 * n) }));
-    const aggregate = n * (3_600_000 / ms) * 2.25;
+    const aggregate = n * (3_600_000 / ms) * 2.5;
     assert.ok(aggregate <= 5000 * BUDGET_SAFETY + 1, `n=${n} spent ${aggregate}`);
   }
 });
@@ -2182,7 +2183,7 @@ test("an unmeasurable window holds the widened interval, not the floor", () => {
   // The same rubric row as "seven panes", reached with a window too small to
   // re-measure. Dropping to the floor here is the flap: a pane wide enough to
   // need throttling is, by construction, too quiet to keep proving it.
-  assertClose(adaptiveRefreshMs(at({ sample: sample(2, 700), lastShare: 7 })), 14175, 500);
+  assertClose(adaptiveRefreshMs(at({ sample: sample(2, 700), lastShare: 7 })), 15_750, 500);
 });
 
 test("inferShare holds the last measurement when the window cannot be measured", () => {
@@ -2209,7 +2210,7 @@ test("an unmeasurable probe window stays open instead of restarting", () => {
   // One probe later the accumulated window is measurable -- and both halves of
   // the ratio span the whole stretch, not just the last minute of it.
   const grown = nextProbeWindow(small.next, { used: 200 }, 6);
-  assert.deepEqual(grown.sample, { globalUsed: 100, myRestCalls: 6 });
+  assert.deepEqual(grown.sample, { globalUsed: 100, myCalls: 6 });
   assert.deepEqual(grown.next, { used: 200, spent: 6 });
 });
 
@@ -2242,7 +2243,7 @@ test("a throttled pane does not flap back to the floor between measurable window
   const settled = [];
 
   for (let probe = 0; probe < 12; probe++) {
-    const mine = (60_000 / applied) * 2.25; // one probe window at the current interval
+    const mine = (60_000 / applied) * 2.5; // one probe window at the current interval
     spent += mine;
     used += mine * PANES;
     const budget = { ...FRESH, used };
@@ -2257,7 +2258,7 @@ test("a throttled pane does not flap back to the floor between measurable window
   }
 
   assert.ok(Math.min(...settled) > 5000, `returned to the floor: ${settled.join(", ")}`);
-  assertClose(applied, 40_500, 2000);
+  assertClose(applied, 45_000, 2000);
 });
 
 test("a missing or unreadable budget returns the floor unchanged", () => {
@@ -2282,9 +2283,9 @@ test("hysteresis suppresses small moves and admits large ones", () => {
 test("restPerTick amortises the background tabs", () => {
   // Close rather than exact: the function accumulates one division per
   // background tab, so 0 + 2/12 + 3/12 is not bit-identical to 5/12.
-  assertClose(restPerTick("actions"), 2 + 3 / BACKGROUND_EVERY, 1e-12);
-  assertClose(restPerTick("security"), 3 + 2 / BACKGROUND_EVERY, 1e-12);
-  assertClose(restPerTick("issues"), (2 + 3) / BACKGROUND_EVERY, 1e-12);
+  assertClose(restPerTick("actions"), 2 + 6 / BACKGROUND_EVERY, 1e-12);
+  assertClose(restPerTick("security"), 6 + 2 / BACKGROUND_EVERY, 1e-12);
+  assertClose(restPerTick("issues"), (2 + 6) / BACKGROUND_EVERY, 1e-12);
 });
 
 test("every tab's fetcher has a spend to report from the cost table", () => {

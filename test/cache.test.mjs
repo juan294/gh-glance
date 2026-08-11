@@ -309,6 +309,52 @@ test("explicit repositories and inferred host-directory targets remain isolated"
   });
 });
 
+test("the same repository remains isolated across account namespaces", () => {
+  const first = dashboardCacheTarget({
+    repo: "acme/widget",
+    host: "github.com",
+    account: "account-one",
+  });
+  const second = dashboardCacheTarget({
+    repo: "acme/widget",
+    host: "github.com",
+    account: "account-two",
+  });
+
+  assert.notEqual(first, second);
+});
+
+test("stale writers merge unrelated dashboard targets from another process", () => {
+  withTemporaryRoot((root) => {
+    const path = cachePath(root);
+    const first = dashboardCacheTarget({
+      repo: "acme/one",
+      host: "github.com",
+      account: "account-one",
+    });
+    const second = dashboardCacheTarget({
+      repo: "acme/two",
+      host: "github.com",
+      account: "account-two",
+    });
+    const sharedBase = {};
+
+    assert.equal(
+      saveDashboardCache(path, cacheFor(first), { base: sharedBase }).ok,
+      true,
+    );
+    assert.equal(
+      saveDashboardCache(path, cacheFor(second, { issues: issuesTab() }), {
+        base: sharedBase,
+      }).ok,
+      true,
+    );
+
+    assert.ok(loadDashboardCache(path, first).entry);
+    assert.ok(loadDashboardCache(path, second).entry);
+  });
+});
+
 test("repeated dashboard saves atomically replace content without leaving a temp file", () => {
   withTemporaryRoot((root) => {
     const path = cachePath(root);
