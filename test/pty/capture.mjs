@@ -36,6 +36,11 @@ const CHARSET = new RegExp(`${ESC}[()][A-Za-z0-9]`, "g");
 // final frame.
 const FRAME_BOUNDARY = new RegExp(`${ESC}\\[[0-9]*A|${ESC}\\[2J|${ESC}\\[H`, "g");
 const SCRIPT_BANNER = /^Script (started|done) on /;
+const TAB_BAR = /1:(?:Actions|Act)/;
+// StatusBar always starts at column zero with one width-1 spinner cell. Panel
+// rows start with a border, so remote titles containing these words cannot be
+// mistaken for accumulated footers.
+const STATUS_LINE = /^\S (?:Fetching|Setup)(?:\s|$)/;
 
 function stripEscapes(text) {
   return text
@@ -85,7 +90,239 @@ function visibleLines(text) {
     .filter((line) => line.length > 0 && !SCRIPT_BANNER.test(line));
 }
 
-export function parseCapture(raw) {
+// Replay the control sequences Ink emits into a bounded terminal grid. The old
+// parser could only take the bytes after the final cursor movement, which
+// happened to work while fullscreen teardown repainted the whole frame. A
+// non-fullscreen incremental frame ends as a sequence of small line patches, so
+// byte slicing sees only the last patch rather than what a user saw.
+//
+// This is deliberately a terminal model, not another Ink frame parser: the bug
+// this harness exists to catch is precisely a disagreement between Ink's frame
+// and terminal cursor/scroll state. Only standard controls present in Ink's
+// output are implemented; unknown CSI/OSC controls are consumed without
+// changing the grid.
+function replayTerminal(raw, cols, rows) {
+  const blankRow = () => Array(cols).fill(" ");
+  let screen = Array.from({ length: rows }, blankRow);
+  let row = 0;
+  let col = 0;
+  let savedRow = 0;
+  let savedCol = 0;
+  let wrapPending = false;
+  let inAlternateScreen = false;
+  let lastDashboardScreen = null;
+  let maxStatusLines = 0;
+
+  function clampCursor() {
+    row = Math.max(0, Math.min(rows - 1, row));
+    col = Math.max(0, Math.min(cols - 1, col));
+    wrapPending = false;
+  }
+
+  function lineFeed() {
+    wrapPending = false;
+    if (row === rows - 1) {
+      screen.shift();
+      screen.push(blankRow());
+    } else {
+      row += 1;
+    }
+  }
+
+  function snapshotDashboard() {
+    if (!inAlternateScreen) return;
+    const plain = screen.map((line) => line.join("").trimEnd());
+    const statusLines = plain.filter((line) => STATUS_LINE.test(line)).length;
+    if (
+      plain.some((line) => TAB_BAR.test(line)) &&
+      statusLines > 0
+    ) {
+      lastDashboardScreen = plain;
+      maxStatusLines = Math.max(maxStatusLines, statusLines);
+    }
+  }
+
+  function eraseDisplay(mode) {
+    if (mode === 2 || mode === 3) {
+      screen = Array.from({ length: rows }, blankRow);
+      return;
+    }
+    if (mode === 0) {
+      screen[row].fill(" ", col);
+      for (let y = row + 1; y < rows; y += 1) screen[y].fill(" ");
+      return;
+    }
+    if (mode === 1) {
+      for (let y = 0; y < row; y += 1) screen[y].fill(" ");
+      screen[row].fill(" ", 0, col + 1);
+    }
+  }
+
+  function eraseLine(mode) {
+    if (mode === 2) screen[row].fill(" ");
+    else if (mode === 1) screen[row].fill(" ", 0, col + 1);
+    else screen[row].fill(" ", col);
+  }
+
+  function firstParam(params, fallback = 1) {
+    const value = Number(params.split(";")[0].replace(/^\?/, ""));
+    return Number.isFinite(value) && value > 0 ? value : fallback;
+  }
+
+  function applyCsi(params, final) {
+    const privateMode = params.startsWith("?");
+    const values = params.replace(/^\?/, "").split(";").map((value) => Number(value || 0));
+    const amount = firstParam(params);
+
+    if (privateMode && values[0] === 1049 && final === "h") {
+      inAlternateScreen = true;
+      screen = Array.from({ length: rows }, blankRow);
+      row = 0;
+      col = 0;
+      wrapPending = false;
+      return;
+    }
+    if (privateMode && values[0] === 1049 && final === "l") {
+      snapshotDashboard();
+      inAlternateScreen = false;
+      return;
+    }
+    if (privateMode && values[0] === 2026 && final === "l") {
+      snapshotDashboard();
+      return;
+    }
+    if (!inAlternateScreen) return;
+
+    switch (final) {
+      case "A":
+        row -= amount;
+        clampCursor();
+        break;
+      case "B":
+        row += amount;
+        clampCursor();
+        break;
+      case "C":
+        col += amount;
+        clampCursor();
+        break;
+      case "D":
+        col -= amount;
+        clampCursor();
+        break;
+      case "E":
+        row += amount;
+        col = 0;
+        clampCursor();
+        break;
+      case "F":
+        row -= amount;
+        col = 0;
+        clampCursor();
+        break;
+      case "G":
+        col = amount - 1;
+        clampCursor();
+        break;
+      case "H":
+      case "f":
+        row = Math.max(0, (values[0] || 1) - 1);
+        col = Math.max(0, (values[1] || 1) - 1);
+        clampCursor();
+        break;
+      case "J":
+        eraseDisplay(values[0] || 0);
+        wrapPending = false;
+        break;
+      case "K":
+        eraseLine(values[0] || 0);
+        wrapPending = false;
+        break;
+      case "s":
+        savedRow = row;
+        savedCol = col;
+        break;
+      case "u":
+        row = savedRow;
+        col = savedCol;
+        clampCursor();
+        break;
+      default:
+        // SGR, mode toggles, and device controls do not move the cursor.
+        break;
+    }
+  }
+
+  for (let index = 0; index < raw.length; ) {
+    const char = raw[index];
+    if (char === ESC && raw[index + 1] === "[") {
+      let end = index + 2;
+      while (end < raw.length && !/[A-Za-z]/.test(raw[end])) end += 1;
+      if (end >= raw.length) break;
+      applyCsi(raw.slice(index + 2, end), raw[end]);
+      index = end + 1;
+      continue;
+    }
+    if (char === ESC && raw[index + 1] === "]") {
+      let end = index + 2;
+      while (end < raw.length && raw[end] !== "\x07" && !(raw[end] === ESC && raw[end + 1] === "\\")) {
+        end += 1;
+      }
+      index = end < raw.length && raw[end] === ESC ? end + 2 : end + 1;
+      continue;
+    }
+    if (char === ESC) {
+      // Character-set selectors carry one extra byte; other two-byte ESC
+      // sequences are harmless to this grid.
+      index += raw[index + 1] === "(" || raw[index + 1] === ")" ? 3 : 2;
+      continue;
+    }
+    if (!inAlternateScreen) {
+      index += 1;
+      continue;
+    }
+    if (char === "\r") {
+      col = 0;
+      wrapPending = false;
+      index += 1;
+      continue;
+    }
+    if (char === "\n") {
+      lineFeed();
+      index += 1;
+      continue;
+    }
+    if (char === "\b") {
+      col = Math.max(0, col - 1);
+      wrapPending = false;
+      index += 1;
+      continue;
+    }
+    if (char < " ") {
+      index += 1;
+      continue;
+    }
+
+    if (wrapPending) {
+      col = 0;
+      lineFeed();
+    }
+    const codePoint = raw.codePointAt(index);
+    const glyph = String.fromCodePoint(codePoint);
+    screen[row][col] = glyph;
+    if (col === cols - 1) wrapPending = true;
+    else col += 1;
+    index += glyph.length;
+  }
+
+  snapshotDashboard();
+  return {
+    lines: lastDashboardScreen ?? screen.map((line) => line.join("").trimEnd()),
+    maxStatusLines,
+  };
+}
+
+export function parseCapture(raw, dimensions = null) {
   const visibleRaw = stripEscapes(raw);
   const altExitPositions = positionsOf(raw, ALT_EXIT);
   const mouse1002EnterPositions = positionsOf(raw, MOUSE_1002_ENTER);
@@ -119,9 +356,17 @@ export function parseCapture(raw) {
   // did land on its own line a leading space let it escape the filter and count
   // toward the height. Both of those feed the suite's two structural assertions,
   // so they were measuring part app and part harness.
-  const finalFrameLines = visibleLines(
+  const slicedFrameLines = visibleLines(
     raw.slice(lastBoundaryEnd).replace(/EXITCODE=\d+\s*$/, ""),
   ).filter((line) => !/^EXITCODE=/.test(line));
+  const replayed =
+    dimensions && Number.isSafeInteger(dimensions.cols) && Number.isSafeInteger(dimensions.rows)
+      ? replayTerminal(raw, dimensions.cols, dimensions.rows)
+      : null;
+  const replayedScreen = replayed?.lines ?? null;
+  const finalFrameLines = replayedScreen
+    ? [...replayedScreen].slice(0, replayedScreen.findLastIndex((line) => line.length > 0) + 1)
+    : slicedFrameLines;
 
   // Everything after the restore sequence landed on the PRIMARY buffer. This is
   // the #41 surface: the app's exit listener restores the primary buffer
@@ -156,6 +401,13 @@ export function parseCapture(raw) {
       lines: finalFrameLines,
       widest: finalFrameLines.reduce((max, line) => Math.max(max, [...line].length), 0),
     },
+    liveScreen: replayedScreen
+      ? {
+          lines: replayedScreen,
+          statusLines: replayedScreen.filter((line) => STATUS_LINE.test(line)).length,
+          maxStatusLines: replayed.maxStatusLines,
+        }
+      : null,
     afterRestore: {
       bytes: tail.length,
       visible: afterRestoreVisible,
@@ -166,7 +418,7 @@ export function parseCapture(raw) {
     // Chrome presence only. Cell contents are deliberately never asserted: a
     // copy change would red the build for no defect.
     hasPanelFrame: /[╭╰╮╯]/.test(visibleRaw),
-    hasTabBar: /1:(Actions|Act)/.test(visibleRaw),
+    hasTabBar: TAB_BAR.test(visibleRaw),
     hasFullKeyHints: /Move:/.test(visibleRaw),
   };
 }
@@ -221,7 +473,7 @@ export function capture({
         env: { ...process.env, ...env, XDG_CONFIG_HOME: effectiveConfigHome },
       },
     );
-    const parsed = parseCapture(readFileSync(out, "utf8"));
+    const parsed = parseCapture(readFileSync(out, "utf8"), { cols, rows });
     const logPath = `${out}.calls`;
     parsed.fixtureCalls = existsSync(logPath)
       ? readFileSync(logPath, "utf8").split("\n").filter(Boolean)

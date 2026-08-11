@@ -54,7 +54,7 @@ part of the contract, not an implementation detail.
 
 | # | Phase | Batch | Done |
 |---|---|---|---|
-| 1 | Give incremental rendering a physical guard row | no | [ ] |
+| 1 | Give incremental rendering a physical guard row | no | [x] |
 | 2 | Add the versioned last-known-good cache | no | [ ] |
 | 3 | Prove restart recovery end to end and document the behavior | no | [ ] |
 
@@ -104,4 +104,3 @@ PTY.
 - **Write churn.** Writes are coalesced and only scheduled after a parsed
   successful payload changes the cached state. Identical polls retain the
   current redraw and disk-write short circuit.
-

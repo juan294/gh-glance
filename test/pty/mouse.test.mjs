@@ -88,7 +88,7 @@ function assertBoundedOutput(result, { cols, label }) {
 }
 
 function assertBoundedFrame(result, { cols, rows, label }) {
-  assert.equal(result.finalFrame.lines.length, rows, `${label}: frame height`);
+  assert.equal(result.finalFrame.lines.length, rows - 1, `${label}: guarded frame height`);
   assertBoundedOutput(result, { cols, label });
 }
 

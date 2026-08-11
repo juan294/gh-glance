@@ -4358,9 +4358,19 @@ function App({ onCreateRemote = () => {} } = {}) {
     widthPreferenceWriter,
   ]);
 
+  // Keep one physical row below Ink's output, the vertical counterpart to the
+  // spare column in `frameCols`. Incremental rendering assumes its cursor still
+  // sits at the bottom of the previous frame; if dynamic content occupies the
+  // terminal's last row, a terminal scroll can invalidate that assumption and
+  // leave old status lines behind. A non-fullscreen frame gets a trailing
+  // newline from Ink, so the cursor parks on the unused guard row while the
+  // status bar remains one row above the scroll edge.
+  const liveRows = Math.min(rows, usableSize(stdout?.rows, rows));
+  const frameRows = Math.max(1, liveRows - 1);
+
   return e(
     Box,
-    { flexDirection: "column", width: frameCols, height: Math.min(rows, usableSize(stdout?.rows, rows)) },
+    { flexDirection: "column", width: frameCols, height: frameRows },
     e(TabBar, {
       activeIndex,
       counts,
