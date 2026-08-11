@@ -79,6 +79,16 @@ function assertMouseLifecycle(result, label) {
   );
 }
 
+function assertMouseNeverEnabled(result, label) {
+  assert.equal(result.altEnter, 1, `${label}: alternate-screen enter count`);
+  assert.equal(result.altExit, 1, `${label}: alternate-screen exit count`);
+  assert.equal(result.mouse1002Enter, 0, `${label}: button-event mode should stay off`);
+  assert.equal(result.mouse1002Exit, 0, `${label}: button-event mode had an unmatched disable`);
+  assert.equal(result.mouse1006Enter, 0, `${label}: SGR mode should stay off`);
+  assert.equal(result.mouse1006Exit, 0, `${label}: SGR mode had an unmatched disable`);
+  assert.equal(result.afterRestore.mouseReportingEnabled, false, `${label}: mouse remained enabled`);
+}
+
 function assertBoundedOutput(result, { cols, label }) {
   assert.ok(
     result.finalFrame.widest <= cols,
@@ -92,10 +102,11 @@ function assertBoundedFrame(result, { cols, rows, label }) {
   assertBoundedOutput(result, { cols, label });
 }
 
-function assertCleanMouseCapture(result, { cols, rows, label }) {
+function assertCleanMouseCapture(result, { cols, rows, label, active = true }) {
   assert.equal(result.exitCode, 0, `${label}: q should exit 0`);
   assertBoundedFrame(result, { cols, rows, label });
-  assertMouseLifecycle(result, label);
+  if (active) assertMouseLifecycle(result, label);
+  else assertMouseNeverEnabled(result, label);
   assert.equal(result.afterRestore.visible, "", `${label}: a dead frame remained after restore`);
 }
 
@@ -124,7 +135,7 @@ test("a split press stops resizing after an outside-header release", () => {
       settle: 14,
       configHome,
       stdin:
-        `sleep 3; printf '\\033[<0;${PRESS_X};'; sleep 0.005; printf '${PRESS_Y}M'; ` +
+        `sleep 4; printf 'w'; sleep 1; printf '\\033[<0;${PRESS_X};'; sleep 0.005; printf '${PRESS_Y}M'; ` +
         `sleep 1; printf '\\033[<32;${DRAG_X};${PRESS_Y}M'; ` +
         `sleep 1; printf '\\033[<0;${DRAG_X};${OUTSIDE_Y}m'; ` +
         `sleep 1; printf '\\033[<32;${DRAG_X + 3};${OUTSIDE_Y}M'; ` +
@@ -156,7 +167,7 @@ if (path.basename(process.argv[1] || "") === "index.mjs") {
       rows: 24,
       signal: "none",
       settle: 10,
-      stdin: "sleep 4",
+      stdin: "sleep 1; printf 'w'; sleep 3",
     },
   );
 
@@ -179,7 +190,7 @@ if (path.basename(process.argv[1] || "") === "index.mjs") {
       rows: 24,
       signal: "none",
       settle: 10,
-      stdin: "sleep 4",
+      stdin: "sleep 1; printf 'w'; sleep 3",
     },
   );
 
@@ -227,7 +238,7 @@ test("remote setup disables mouse reporting before handing the terminal to gh", 
   // transcript and echoed interactive input after handoff, so neither its line
   // count nor its width describes the 24x80 dashboard anymore.
   assert.ok(handoff.fullClears <= 2, "remote setup: unexpected full-screen repaint count");
-  assertMouseLifecycle(handoff, "remote setup");
+  assertMouseNeverEnabled(handoff, "remote setup");
   assert.deepEqual(
     handoff.fixtureCalls.filter((call) => call === "repo create"),
     ["repo create"],
@@ -246,7 +257,7 @@ test("outside, wheel, non-left, and move-without-press reports do not persist wi
       settle: 14,
       configHome,
       stdin:
-        `sleep 3; printf '\\033[<32;${DRAG_X};${PRESS_Y}M'; ` +
+        `sleep 2; printf 'w'; sleep 1; printf '\\033[<32;${DRAG_X};${PRESS_Y}M'; ` +
         `sleep 0.5; printf '\\033[<0;10;${PRESS_Y}M'; ` +
         `sleep 0.5; printf '\\033[<0;10;${PRESS_Y}m'; ` +
         `sleep 0.5; printf '\\033[<64;${PRESS_X};${PRESS_Y}M'; ` +
@@ -283,7 +294,12 @@ test("otherwise valid mouse drags are a compact-layout persistence no-op", () =>
         "sleep 1; printf 'q'; sleep 2",
     });
 
-    assertCleanMouseCapture(compact, { cols: 45, rows: 20, label: "compact" });
+    assertCleanMouseCapture(compact, {
+      cols: 45,
+      rows: 20,
+      label: "compact",
+      active: false,
+    });
     assert.equal(
       existsSync(preferencePath),
       false,

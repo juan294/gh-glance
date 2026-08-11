@@ -30,19 +30,20 @@ without switching to the browser.
 │                                                                          │
 │                                                                          │
 ╰───────────────────────────────────────────────────────────────── 4 of 4 ─╯
-⣾ Fetching  Move: ↑↓ | Open: Ent | Refresh: r | Width: w | Quit: q     0.8.0
+⣾ Fetching  Move: ↑↓ | Open: Ent | Refresh: r | Width: w | Quit: q     0.9.0
 ```
 
 > Captured from a real run at 76 columns with `GH_GLANCE_ICONS=unicode`, so the
 > status icons render in a browser. With a Nerd Font (the default) they are
 > Octicon glyphs instead.
 >
-> The `>` on the first row is the cursor. Three more markers appear when they
+> The `>` on the first row is the cursor. Four more markers appear when they
 > apply: a `+` after a tab's count means the list was truncated by the fetch
 > limit, a `!` after the Actions count means the newest run failed — so "is CI
-> red" is answerable without switching to that tab — and a `?` in place of the
-> Security count means its endpoints could not be read, which is not the same
-> as there being nothing to report.
+> red" is answerable without switching to that tab — an `x` means the tab's
+> latest fetch failed, and a `?` in place of the Security count means its
+> endpoints could not be read, which is not the same as there being nothing to
+> report.
 
 <!-- contract:allow-emoji -- the check/cross above stand in for Nerd Font
      Octicons the app actually draws; they are literal examples, not decoration. -->
@@ -64,22 +65,23 @@ current.
 - **Issues** -- open issues: title, author, first label, age
 - **Pull Requests** -- open PRs: title, author, branch, review status
   (approved / changes requested / pending), age
-- **Security** -- open Dependabot alerts: package, summary, age, sorted with the
-  most severe first and with severity spelled out in its own column, not carried
-  by colour alone. One page of 100 newest alerts is fetched and ranked, so on a
-  repository with more open alerts than that the ranking covers the newest 100
-  rather than everything -- the `+` marker on the count is what tells you.
-  Code scanning and secret scanning alerts are included too, on repos/plans
-  that have GitHub Advanced Security enabled -- see [Limitations](#limitations).
+- **Security** -- open Dependabot, code-scanning, and secret-scanning alerts,
+  sorted with the most severe first and with severity spelled out rather than
+  carried by colour alone. Each source starts with its newest 100 open alerts.
+  When that page is full, Dependabot and code scanning also fetch bounded
+  critical/high priority lanes before merging and de-duplicating the result.
+  The `+` marker means at least one bounded lane filled, so the visible priority
+  set may still be incomplete. Code and secret scanning require GitHub Advanced
+  Security -- see [Limitations](#limitations).
 - Tab bar with live counts, pinned to the top of the pane above a divider,
   switchable via `1`-`4`, arrow keys, or `Tab`/`Shift+Tab`
 - Adjustable full-table columns, with visible header grips, a keyboard width
   mode, and preferences kept separately for each tab
 - `lazygit`-style panel frame: the tab name sits in the top border, the
   visible-of-total row count in the bottom
-- A `Fetching` indicator that brightens on every refresh and animates during the
-  first load or while a workflow run is executing, so the pane says when it's
-  working without spending a line on it
+- A `Fetching` indicator that brightens while a tab's first request is settling
+  or during a manual refresh. Settled automatic polls do not flash it; the
+  spinner still animates during first load or while a workflow run is executing
 - Status icons are real GitHub Octicons (via the Nerd Font glyph set), not emoji
   -- with a plain-ASCII fallback for terminals without one
 - Readable without colour: severity has its own column, a failing newest run puts
@@ -118,6 +120,10 @@ npm install -g gh-glance
 That is the whole install. `gh-glance` ships as a single `index.mjs` with no
 build step, so there is nothing to compile and nothing to configure -- the
 package is the source you can read in this repository.
+
+The installed package is a CLI, not a JavaScript library. The `gh-glance`
+executable is supported; package-root and deep imports are intentionally
+blocked so an internal test seam cannot become an accidental public API.
 
 Every published version is built and signed by GitHub Actions from a tagged
 commit on `main`, never from a maintainer's laptop, and carries [npm
@@ -263,14 +269,15 @@ line such as:
 Width: BRANCH 14  Tab select  <- -> resize  r reset  Esc done
 ```
 
-In an interactive terminal, you can also left-drag a visible `│` header grip.
-Pressing a grip selects its column and enters width mode; releasing the button,
-including outside the header, ends the drag. Row clicking, hover behavior, and
-pointer-shape changes are not supported. Mouse resizing has the same interactive
-terminal requirement as keyboard input.
+After pressing `w`, you can also left-drag a visible `│` header grip. Mouse
+reporting is enabled only while width mode owns the input, so a click outside
+that mode does not enter it. Releasing the button, including outside the header,
+ends the drag. Row clicking, hover behavior, and pointer-shape changes are not
+supported.
 
-While gh-glance is running, terminal-native text selection may require your
-terminal's mouse-reporting bypass modifier, commonly `Shift`.
+While width mode is active, terminal-native text selection may require your
+terminal's mouse-reporting bypass modifier, commonly `Shift`. Outside width
+mode, gh-glance leaves mouse reporting disabled.
 
 The cursor tracks the *item*, not the row position, so it stays on what you
 selected as new rows arrive above it. `Enter` works on Actions, Issues and Pull
@@ -316,12 +323,13 @@ Environment variables work too, and the flags take precedence:
 |---|---|
 | `GH_REPO=owner/name` | Watch a specific repository instead of the current directory's. A host-qualified `GH_REPO` does **not** route the security-alert endpoints -- use `GH_HOST` or `--repo host/owner/name` for that |
 | `GH_HOST=<host>` | Send every call to a GitHub Enterprise or EMU host instead of `github.com`. Routes both the list commands and the alert endpoints |
-| `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GH_CONFIG_DIR` | Not read by `gh-glance` -- passed through to `gh` untouched, along with the proxy variables. `gh-glance` handles no credentials of its own. Separate `GH_CONFIG_DIR` values can isolate simultaneous panes on different accounts; see [No account pinning](#limitations) |
+| `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN` | Used by `gh`. gh-glance never logs or stores these values, but hashes each set value locally as part of the account-scoped cache namespace so panes with different credentials cannot hydrate each other's rows. The raw values are not written to disk. |
+| `GH_CONFIG_DIR` | Selects `gh`'s account configuration and contributes its normalized identity to the cache namespace. Separate values can isolate simultaneous panes on different accounts; see [No account pinning](#limitations). |
 | `GH_GLANCE_REFRESH=<seconds>` | Active-tab poll interval, 2-3600. Sets it once for every pane in a shell; `--refresh` takes precedence. This is a floor -- see [Rate limit](#rate-limit) |
 | `GH_GLANCE_ICONS=unicode` | Plain ASCII status icons, for terminals without a Nerd Font |
 | `GH_GLANCE_NO_ANIMATION=1` | Freeze the spinner — no motion at all |
 | `NO_COLOR=1` | Disable colour. Status stays readable: severity has its own column, a failing newest run puts a `!` on the Actions tab, and the active tab is bracketed. Note that run-state glyphs are not all distinct -- see the feature list above |
-| `INK_SCREEN_READER=true` | Switch the renderer to a linear, unthrottled mode. The status icons carry text labels for it, but this path has not been tested against a real screen reader — treat it as unverified rather than supported. |
+| `INK_SCREEN_READER=true` | Switch the renderer to a linear, unthrottled mode. Automated PTY coverage checks that status and selection labels reach this Ink path, but it has not been validated with real assistive technology — treat it as automated rendering coverage, not claimed screen-reader support. |
 
 ### Saved column widths
 
@@ -358,11 +366,13 @@ $XDG_CONFIG_HOME/gh-glance/dashboard-cache.json
 ~/.config/gh-glance/dashboard-cache.json
 ```
 
-The cache is scoped to the repository and host being watched. In inferred mode,
-the host and current working directory form the identity, so rows from one
-checkout cannot appear in another. It retains at most five recent targets and
-60 rows per tab; a shortened cached tab keeps its `+` marker rather than
-presenting the saved count as complete.
+The cache is scoped to the repository, host, and effective `gh` account
+namespace. In inferred mode, the host and current working directory also form
+the identity, so rows from one checkout or credential context cannot appear in
+another. The namespace uses `GH_CONFIG_DIR`/`hosts.yml` identity plus one-way
+digests of supported token environment variables; raw credentials are never
+stored. It retains at most five recent targets and 60 rows per tab; a shortened
+cached tab keeps its `+` marker rather than presenting the saved count as exact.
 
 Only successfully parsed, non-blind observations replace saved rows. A failed
 request can add a live error or `?` marker, but it cannot turn known Security
@@ -371,7 +381,10 @@ unknown-version, or unwritable cache state is ignored rather than blocking the
 dashboard. On POSIX systems, gh-glance restricts its config directory to `0700`
 and the cache file to `0600`. The file contains repository data, including
 titles, authors, branches, and Security findings, but never GitHub credentials.
-It is recovery state owned by the UI, not a configuration interface.
+Both persistence files use a bounded advisory lock before atomic replacement.
+The cache merges independent targets and tabs, while preferences merge columns,
+so simultaneous panes do not overwrite one another's unrelated state. It is
+recovery state owned by the UI, not a configuration interface.
 
 ## GitHub Enterprise and EMU
 
@@ -416,9 +429,9 @@ Collects, in one plain-text block: the `gh-glance`, Node and `gh` versions;
 which hosts `gh` is authenticated for; how the repository target resolved and
 from where; your remaining REST and GraphQL budget plus what this configuration
 will spend per hour; the relevant environment variables; a read-only
-`Repository access` probe; and one probe per dashboard endpoint with the exact
-argv it sent, its outcome, and how any error was classified (`unavailable`,
-`rate-limited`, `auth-problem` or `other`).
+`Repository access` probe; and each bounded dashboard probe, including the
+Security priority lanes, with the exact argv it sent, its outcome, and how any
+error was classified (`unavailable`, `rate-limited`, `auth-problem` or `other`).
 
 The `Repository access` probe shows whether the target resolves for the active
 `gh` credentials. A failed GitHub resolution response cannot distinguish a
@@ -453,17 +466,18 @@ through GraphQL instead — a separate 5,000/hour allowance. With the default
 
 | Visible tab | REST / hour | GraphQL / hour |
 |---|---|---|
-| Actions | ~1,620 | ~240 |
-| Issues or Pull Requests | ~300 | ~1,560 |
-| Security | ~2,280 | ~240 |
+| Actions | up to ~1,800 | ~240 |
+| Issues or Pull Requests | up to ~480 | ~1,560 |
+| Security | ~2,280 normally; up to ~4,440 | ~240 |
 
-Security is the most expensive, because it is three endpoints rather than one,
-and watching it costs just under half the REST budget. But Actions is not cheap
-either -- it is a third of the budget, and it is the tab every pane opens on,
-because one `gh run list` issues two REST requests rather than one. You do not
-have to take these figures on trust: `gh-glance --doctor` reports your actual
-remaining budget alongside what your configuration projects, which matters on a
-GitHub Enterprise tenant where the ceiling may not be 5,000 at all.
+Security is the most expensive. A repository whose newest alert pages are not
+full uses the three base endpoint calls and lands near 2,280 REST requests per
+hour. A full page activates bounded critical/high lanes for Dependabot and code
+scanning, raising the safe projection to about 4,440. Actions is not cheap
+either: one `gh run list` issues two REST requests. `gh-glance --doctor` reports
+the conservative projection beside the server's actual REST and GraphQL
+budgets, which matters on a GitHub Enterprise tenant where the ceilings may not
+be 5,000.
 
 Two things pull the real number down. Any endpoint that fails in a way
 `gh-glance` recognises backs off instead of being re-asked every tick — a
@@ -493,7 +507,6 @@ still wins per pane. The adaptive interval only ever widens from that floor, so
 a single pane on a healthy budget stays at 5 seconds and shows no badge.
 
 ## Limitations
-
 
 - **Security tab**: code scanning and secret scanning alerts require [GitHub
   Advanced Security](https://docs.github.com/en/code-security/getting-started/github-security-features).
@@ -526,12 +539,13 @@ a single pane on a healthy budget stays at 5 seconds and shows no badge.
   has its own breakpoint and drops to bare keys (`↑↓ Ent r q`) rather than
   truncating.
 - **Mouse reporting lifecycle.** Interactive sessions enable terminal mouse
-  reporting for header drags and disable it before handing the terminal back.
-  See [Adjusting column widths](#adjusting-column-widths) for text-selection
-  behavior while it is active.
-- Issues and pull requests are fetched 150 at a time and alerts 100 at a time.
-  A count is shown as `n+` when it was truncated, so the number is never
-  presented as exact when it is not.
+  reporting only after `w` enters width mode, and disable it when that mode or
+  the app exits. See [Adjusting column widths](#adjusting-column-widths) for
+  text-selection behavior while it is active.
+- Issues and pull requests are fetched 150 at a time. Each Security source has
+  a newest-100 lane; full Dependabot and code-scanning pages activate bounded
+  priority lanes. A count is shown as `n+` when any lane fills, so the number is
+  never presented as exact when it is not.
 - The Actions **TIME** column measures from the run's start to its last update.
   `gh` exposes no completion timestamp, so a workflow that was re-run later
   reports the span up to the re-run rather than its original duration.

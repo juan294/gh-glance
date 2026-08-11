@@ -309,6 +309,88 @@ test("explicit repositories and inferred host-directory targets remain isolated"
   });
 });
 
+test("the same repository remains isolated across account namespaces", () => {
+  const first = dashboardCacheTarget({
+    repo: "acme/widget",
+    host: "github.com",
+    account: "account-one",
+  });
+  const second = dashboardCacheTarget({
+    repo: "acme/widget",
+    host: "github.com",
+    account: "account-two",
+  });
+
+  assert.notEqual(first, second);
+});
+
+test("stale writers merge unrelated dashboard targets from another process", () => {
+  withTemporaryRoot((root) => {
+    const path = cachePath(root);
+    const first = dashboardCacheTarget({
+      repo: "acme/one",
+      host: "github.com",
+      account: "account-one",
+    });
+    const second = dashboardCacheTarget({
+      repo: "acme/two",
+      host: "github.com",
+      account: "account-two",
+    });
+    const sharedBase = {};
+
+    assert.equal(
+      saveDashboardCache(path, cacheFor(first), { base: sharedBase }).ok,
+      true,
+    );
+    assert.equal(
+      saveDashboardCache(path, cacheFor(second, { issues: issuesTab() }), {
+        base: sharedBase,
+      }).ok,
+      true,
+    );
+
+    assert.ok(loadDashboardCache(path, first).entry);
+    assert.ok(loadDashboardCache(path, second).entry);
+  });
+});
+
+test("stale writers preserve same-target tabs across a later local save", () => {
+  withTemporaryRoot((root) => {
+    const path = cachePath(root);
+    const target = dashboardCacheTarget({
+      repo: "acme/one",
+      host: "github.com",
+      account: "shared-account",
+    });
+    const sharedBase = {};
+
+    const first = saveDashboardCache(path, cacheFor(target), { base: sharedBase });
+    assert.equal(first.ok, true);
+    assert.equal(
+      saveDashboardCache(path, cacheFor(target, { issues: issuesTab() }), {
+        base: sharedBase,
+      }).ok,
+      true,
+    );
+
+    const firstUpdate = structuredClone(first.persisted);
+    firstUpdate[target].tabs.actions = actionsTab("first update");
+    firstUpdate[target].updatedAt = NOW + 3;
+    const merged = saveDashboardCache(path, firstUpdate, { base: first.persisted });
+    assert.equal(merged.ok, true);
+    assert.ok(merged.persisted[target].tabs.issues);
+
+    const secondUpdate = structuredClone(merged.persisted);
+    secondUpdate[target].tabs.actions = actionsTab("second update");
+    secondUpdate[target].updatedAt = NOW + 4;
+    const saved = saveDashboardCache(path, secondUpdate, { base: merged.persisted });
+    assert.equal(saved.ok, true);
+    assert.equal(loadDashboardCache(path, target).entry.tabs.actions.data[0].displayTitle, "second update");
+    assert.ok(loadDashboardCache(path, target).entry.tabs.issues);
+  });
+});
+
 test("repeated dashboard saves atomically replace content without leaving a temp file", () => {
   withTemporaryRoot((root) => {
     const path = cachePath(root);

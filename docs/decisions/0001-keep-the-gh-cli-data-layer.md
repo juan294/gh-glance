@@ -121,3 +121,29 @@ layer is still about one request per minute, and `core`/`graphql` are still
 independent budgets.
 
 See `docs/research/2026-08-10-api-request-cost-and-rate-limit-exhaustion.md`.
+
+## Correction (2026-08-11)
+
+The pre-launch remediation changed the bounded shape and accounting again
+without changing this decision.
+
+- A normal full tick still starts six independent `gh` commands: Actions,
+  Issues, Pull Requests, and one newest-page request for each Security source.
+  That baseline spends five REST requests and four GraphQL points under the
+  current `gh` behavior.
+- When a newest Security page reaches 100 open alerts, bounded priority lanes
+  add one Dependabot request and two code-scanning requests. The worst case is
+  therefore nine `gh` commands and eight REST requests for a full tick. Small
+  repositories do not pay for those lanes.
+- The safe hourly projections at a five-second floor are now up to 1,800 REST
+  with Actions visible, 480 REST and 1,560 GraphQL with Issues or Pull Requests
+  visible, and 4,440 REST with Security visible. The ordinary non-full Security
+  case remains about 2,280 REST/hour.
+- The adaptive controller now meters and constrains REST and GraphQL
+  independently, then applies the safer interval. Moving more list work into a
+  combined GraphQL query would consume the budget that now already constrains
+  Issues and Pull Requests; it would not make the work free.
+
+Priority lanes preserve independent source completion and bounded top-N
+visibility. They do not introduce a new network client or a cross-tab barrier,
+so the accepted decision remains unchanged.

@@ -41,12 +41,16 @@ npm test          # node:test, no framework, no config
 npm run lint      # eslint, fails on warnings
 node --check index.mjs
 npm run test:pty  # end-to-end, drives the real binary under a pty (slower)
+npm run test:coverage:runtime  # informational PTY child-process function coverage
 ```
 
 Tests live in `test/` and use Node's built-in runner, so they add no build step
 and no test-framework dependency. `index.mjs` guards its entry point behind a
 main-module check, which is what makes it importable from a test without
-launching the dashboard -- please keep that guard intact.
+launching the dashboard -- please keep that guard intact. That source import is
+an internal test seam only: the installed package sets `exports: {}`, so package
+and deep imports must stay blocked and the `gh-glance` executable remains the
+only public surface.
 
 ### The pty harness
 
@@ -66,6 +70,11 @@ it gates the release and nothing else. It was advisory until 2026-08-04 and was
 promoted after 38 consecutive runs without a failure. If you make it flake, the
 right response is to delete the offending assertion, not to add retries.
 
+`npm run test:coverage:runtime` repeats the PTY suite under V8 coverage and
+summarizes observed `index.mjs` functions. It is an informational scheduled or
+manual signal, not a threshold or release gate, and is skipped by the coverage
+workflow on ordinary `develop` pushes because CI already runs the PTY suite.
+
 One default keeps it worth having: **assert structure, not incidental dashboard
 copy.** Line counts, widths, escape-sequence balance and ordering, and exit codes
 survive a wording change. The narrow exception is a semantic data-flow test
@@ -79,12 +88,13 @@ must cross a process boundary can pass one caller-owned `configHome` to several
 captures. Create it with `mkdtempSync`, keep the exact returned path, and remove
 only that path after every capture has finished.
 
-Direct SGR mouse tests must send each logical report through the foreground pty
-as its own timed write, plus one intentionally split report that exercises the
-pending token boundary. Assert that both mouse modes are balanced and disabled
-before the alternate screen exits. When a path intentionally writes on the
-primary buffer -- a crash diagnostic or an interactive child handoff -- that
-transcript is not dashboard frame geometry; assert its after-restore tail
+Direct SGR mouse tests must enter width mode before sending reports, then send
+each logical report through the foreground pty as its own timed write, plus one
+intentionally split report that exercises the pending token boundary. Assert
+that reporting is disabled before width mode, balanced while it is active, and
+disabled before the alternate screen exits. When a path intentionally writes on
+the primary buffer -- a crash diagnostic or an interactive child handoff --
+that transcript is not dashboard frame geometry; assert its after-restore tail
 separately. For an interactive child, synchronize input with an explicit
 fixture-ready marker instead of guessing when the child owns the terminal.
 
@@ -110,6 +120,10 @@ Worth knowing about the app's shape before changing it:
   last-known-good rows. A blind Security result updates its notes and `?` marker
   without clearing known alerts or advancing freshness. It also invalidates the
   raw comparison so an identical healthy response commits after recovery.
+- Persistence is account-scoped and multi-process. Keep the bounded advisory
+  lock, per-tab/per-column three-way merge, and post-save adoption of the merged
+  snapshot together; removing any one can let simultaneous panes overwrite
+  unrelated state on a later save.
 - Everything from `gh` goes through `safe()` before it is stored in memory,
   persisted, or rendered. See `SECURITY.md`.
 
@@ -171,6 +185,8 @@ refactor: extract the row-height calculation
 - No TypeScript, no build tooling, no bundler -- this project intentionally
   stays a single small script. If a change needs a build step, that's a sign
   to open an issue and discuss the tradeoff first.
+- Keep the npm package CLI-only. Do not expose the internal named test seams
+  through `exports`; use direct source imports from this repository in tests.
 - Run `npm run lint` and `npm test` before submitting a PR.
 - The sample output block in `README.md` is captured from a real run. If you
   change a column, a limit, or the status bar, regenerate it rather than editing

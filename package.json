@@ -1,11 +1,12 @@
 {
   "name": "gh-glance",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "A live-refreshing GitHub dashboard for your terminal: Actions, Issues, Pull Requests, and Security alerts in one narrow pane",
   "type": "module",
   "bin": {
     "gh-glance": "./index.mjs"
   },
+  "exports": {},
   "files": [
     "index.mjs",
     "README.md",
@@ -19,6 +20,7 @@
     "start": "node index.mjs",
     "test": "node --test test/*.test.mjs",
     "test:coverage": "node --test --experimental-test-coverage --test-coverage-include=index.mjs test/*.test.mjs",
+    "test:coverage:runtime": "node test/runtime-coverage.mjs",
     "test:pty": "node --test --test-timeout=120000 test/pty/*.test.mjs"
   },
   "keywords": [
