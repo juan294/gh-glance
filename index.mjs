@@ -101,18 +101,16 @@ const MAX_RUN_LIMIT = 60;
 // stay generous. They are also far cheaper, being bounded by what's open.
 const LIST_LIMIT = 150;
 
-// Alert endpoints are filtered server-side to open items and capped at one
-// page. The previous --paginate walked the repo's entire alert history --
-// mostly closed alerts -- and then discarded them client-side.
+// Alert endpoints are filtered server-side to open items and every lane is
+// capped at one page. The previous --paginate walked the repo's entire alert
+// history -- mostly closed alerts -- and then discarded them client-side.
 const ALERT_PER_PAGE = 100;
-// Ordering is pinned rather than left to each endpoint's default. Severity
-// sorting happens client-side over whatever this returns, so on a repo with more
-// than a page of open alerts the *page boundary* decides what can be ranked at
-// all -- a critical alert sitting 150th by some endpoint's arbitrary default was
-// simply never fetched, and the pane showed "100+" with a screen of moderates.
-// Newest-first at least makes the cut deterministic and explainable, and it
-// survives GitHub changing a default underneath us. All three endpoints accept
-// these parameters.
+// Newest-first makes the base cut deterministic. When it fills, bounded
+// critical/high lanes for the sources that support severity filtering recover
+// priority rows beyond that cut; a full lane remains explicitly incomplete.
+// Secret scanning has no severity filter and every row is critical, so its one
+// newest lane is the honest bounded shape. All three endpoints accept the base
+// parameters below.
 const ALERT_QUERY = `?state=open&per_page=${ALERT_PER_PAGE}&sort=created&direction=desc`;
 
 // Inactive tabs only feed the tab-bar counts, so they refresh every Nth tick
@@ -1201,10 +1199,10 @@ function mergeAlertRows(groups) {
 // mid-session is picked up within the hour.
 const alertBackoff = new Map();
 
-// REST calls this process has spent, ever. In-memory and per-process, in the
-// same spirit as alertBackoff above: lost on exit, and nothing depends on it
-// surviving. Only ever compared against itself between two budget probes, so it
-// needs no windowing and cannot overflow in any realistic session.
+// REST and GraphQL calls this process has spent, ever. In-memory and per-process,
+// in the same spirit as alertBackoff above: lost on exit, and nothing depends on
+// it surviving. Each counter is compared only against its matching resource
+// between two budget probes, so neither needs persistence or an extra window.
 //
 // Deliberately incomplete: openItem, preflight and resolveFailureContext also
 // spend, and are not counted, because they are occasional rather than periodic.
@@ -1636,8 +1634,9 @@ function targetSource() {
 
 // How much of the hourly API budget is left, and roughly how fast this
 // configuration spends it. The steady-state cost is not small and was invisible:
-// at the default 5s refresh with the Security tab open it is around 2,280 REST
-// requests an hour -- about 46% of a personal token's 5,000 -- and `--refresh 2`
+// at the default 5s refresh with the Security tab open the safe projection is
+// around 4,440 REST requests an hour -- about 89% of a personal token's 5,000 --
+// because a full newest page activates bounded priority lanes. `--refresh 2`
 // projects past the limit outright, so it exhausts inside the hour, every hour.
 // The budget is shared with everything else the token does, so the first symptom
 // is usually "GitHub is broken" somewhere else entirely.
@@ -1667,10 +1666,10 @@ async function rateBudget() {
   }
 }
 
-// The same probe as rateBudget, but returning `core` as data rather than a
-// sentence, because the adaptive loop has to do arithmetic on it. rateBudget
-// keeps its own shape: it formats `graphql` too, which the controller does not
-// need, and it is on the --doctor path where a string is the product.
+// The same probe as rateBudget, but returning both resources as data rather than
+// sentences, because the adaptive loop has to do arithmetic on each budget.
+// rateBudget keeps its display shape for the --doctor path, where strings are
+// the product.
 //
 // Safe to run on a timer for the same reason it is safe on the diagnostic path:
 // `gh api rate_limit` is documented as not counting against the limit, and it
@@ -4949,13 +4948,12 @@ function App({ onCreateRemote = () => {} } = {}) {
     fetchTabRef.current?.(TABS[activeIndex].key);
   }, [activeIndex]);
 
-  // Animate only when something on screen is genuinely moving. `loading` flips
-  // true then false on *every* tick, including one that changed nothing, so
-  // driving the spinner from it meant the 100ms interval restarted every 5
-  // seconds forever -- roughly 44MB of terminal writes and 27 CPU-seconds per
-  // idle hour, and the exact opposite of the redraw suppression above. The
-  // first load genuinely is worth animating, because an empty pane with no
-  // motion reads as broken; after that, only a run actually executing is.
+  // Animate only when something on screen is genuinely moving. Automatic polls
+  // with settled data deliberately leave `loading` false; otherwise this timer
+  // would restart every five seconds on an unchanged repository and undo the
+  // redraw suppression above. The first load genuinely is worth animating,
+  // because an empty pane with no motion reads as broken; after that, only a run
+  // actually executing is.
   // "Never resolved" and "never *succeeded*" are different states, and conflating
   // them pinned the spinner on forever. setData is only ever called on success,
   // so a tab whose fetch keeps failing -- offline laptop, VPN down, expired auth,
@@ -5003,9 +5001,9 @@ function App({ onCreateRemote = () => {} } = {}) {
       const list = data[t.key];
       if (list == null) return [t.key, null];
       // Every tab can be truncated, not just Actions: issues and PRs cap at
-      // LIST_LIMIT and alerts at one page of 100. Reporting those as exact made
-      // the count stop moving through a genuine change on any repo big enough
-      // for this tool to matter.
+      // LIST_LIMIT and each alert lane caps at 100. Reporting a filled newest or
+      // priority lane as exact would hide that relevant rows can remain beyond
+      // the bounded fetch.
       const suffix = meta[t.key]?.truncated ? "+" : "";
       // A blind Security tab reports "?" rather than a number it cannot stand
       // behind. Zero alerts and zero visibility look identical otherwise.
@@ -5314,8 +5312,8 @@ function App({ onCreateRemote = () => {} } = {}) {
       // Distinguishes "still fetching" from "resolved and empty" in the body,
       // which is the difference between a dashboard that looks hung and one
       // that looks correct. Driven by "never resolved" rather than by the
-      // loading flag, which toggles on every tick and made a settled-empty tab
-      // swap its message every five seconds. Suppressed entirely when a tab has
+      // loading flag, which also covers a manual refresh and made a
+      // settled-empty tab swap its message. Suppressed entirely when a tab has
       // an error and has never resolved: the error line directly above already
       // says what happened, and "no runs" underneath it reads as a fact about the
       // repository rather than the absence of an answer.

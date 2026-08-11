@@ -65,12 +65,16 @@ git pull --rebase && git push
 npm publishing -- only move it via a `develop` -> `main` PR:
 
 ```bash
-git checkout -b release/vX.Y.Z
-# bump version, update changelog, etc.
-git push -u origin release/vX.Y.Z
-gh pr create --base main --fill
-gh pr merge --squash --delete-branch   # once checks are green
+git checkout develop
+# bump version, update changelog, verify, commit, then push develop
+gh pr create --base main --head develop --title "release: vX.Y.Z"
+gh pr merge --merge --auto             # once checks are green; never delete develop
+# tag the resulting main commit, then publish the GitHub release
 ```
+
+Use a merge commit, not squash: `main` must remain a superset of the permanent
+`develop` history. Publishing the GitHub release triggers the OIDC npm workflow;
+do not run `npm publish` from a workstation.
 
 Run verification sequentially with `;` or `&&`, never as parallel Bash calls.
 

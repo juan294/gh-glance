@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Security keeps a bounded priority view when newest pages fill.** Dependabot
+  and code-scanning sources add critical/high lanes only when their newest 100
+  open alerts fill the base page, then merge and de-duplicate the result. A `+`
+  marker stays explicit when any lane fills; the app never claims an unbounded
+  repository is complete.
+- **Adaptive polling now protects both GitHub budgets.** REST and GraphQL spend
+  are measured separately, including failed calls, and the safer interval wins
+  without lowering the configured refresh floor. `--doctor` reports the same
+  conservative model.
+- **Terminal state has explicit non-colour and linear-rendering channels.** A
+  stable ASCII `x` marks fetch failure, selected rows include `selected` in
+  their accessibility label, narrow errors begin with the recovery action, and
+  short help always retains Quit, Refresh, and the full-help command.
+- **PTY child-process coverage is available as an informational signal.**
+  `npm run test:coverage:runtime` summarizes observed `index.mjs` functions on
+  scheduled/manual coverage runs without adding a threshold or release gate.
+
+### Changed
+
+- **Dashboard recovery state is account-scoped and safe across panes.** Cache
+  version 2 includes `GH_CONFIG_DIR`/`hosts.yml` identity and one-way digests of
+  supported token variables, rejects the old unscoped cache, and uses bounded
+  locked three-way merges so simultaneous panes preserve unrelated targets,
+  tabs, and width choices. Successful quiet polls checkpoint freshness on a
+  bounded cadence.
+- **Settled automatic polling is visually quiet.** `Fetching` is reserved for
+  startup/manual work, unchanged Security observations slow to a 60-second
+  cadence, and cache-hydrated tabs clear their initial loading state.
+- **Mouse reporting is opt-in through Width mode.** Press `w` before dragging a
+  header divider; outside that mode the terminal keeps ordinary mouse behavior.
+- **The npm package is explicitly CLI-only.** The executable remains supported,
+  while package-root and deep JavaScript imports now fail through `exports: {}`.
+
+### Fixed
+
+- **Manual Security refresh now clears every source backoff after the in-flight
+  guard admits the request.** Re-authenticating and pressing `r` cannot leave a
+  previously failed source silently asleep.
+- **Concurrent persistence no longer loses a later update.** Same-target tabs
+  merge independently, and both cache and width writers adopt the merged disk
+  snapshot before their next save.
+- **Selections stay attached to visible items as lists change.** Insertions
+  above a row reconcile the viewport without opening a different item; a missing
+  item clears selection instead of selecting a replacement.
+- **Quitting aborts in-flight `gh ... view --web` children.** The app no longer
+  waits for a stalled browser-open command after terminal teardown begins.
+- **Row failures reset only when row content changes.** Unchanged parent renders
+  no longer clear an error boundary, while corrected data can recover in place.
+- **Status hints now describe only controls that can act.** Empty lists do not
+  advertise movement or opening, compact layouts do not advertise width mode,
+  and Security does not advertise an unsupported open action.
+
 ## [0.8.0] - 2026-08-11
 
 ### Added

@@ -6,7 +6,8 @@ Only the current release line receives security patches.
 
 | Version | Supported           |
 | ------- | ------------------- |
-| 0.7.x   | Yes                 |
+| 0.8.x   | Yes                 |
+| 0.7.x   | No                  |
 | 0.6.x   | No                  |
 | 0.5.x   | No                  |
 | 0.4.x   | No                  |
@@ -32,6 +33,7 @@ Send a report to **juan294@gmail.com** with the subject line:
 `[gh-glance] Security vulnerability report`
 
 Include:
+
 - Description of the vulnerability
 - Steps to reproduce
 - Potential impact
@@ -96,17 +98,21 @@ Values arriving from the API are also read through an own-property check before
 being used as lookup keys, so a field whose value happens to be `constructor` or
 `__proto__` cannot return an unexpected object into the render path.
 
-Successfully parsed rows can be persisted in a target-scoped
+Successfully parsed rows can be persisted in an account-and-target-scoped
 `dashboard-cache.json` beside the width-preference file. The cache contains
 sanitized repository data such as titles, authors, branches, and Security
 findings, but it never contains a GitHub token or other credential. It retains
-at most five repository targets and 60 rows per tab. On POSIX systems,
-gh-glance restricts the parent config directory to `0700`, writes the temporary
-and final cache file as `0600`, and replaces the file atomically. Missing,
-corrupt, future-version, or unwritable cache state is advisory: it is ignored
-rather than weakening authentication or preventing startup. A failed or blind
-Security observation never replaces a last-known-good alert set with an empty
-one.
+at most five repository targets and 60 rows per tab. The account namespace is
+derived from the normalized `GH_CONFIG_DIR`/`hosts.yml` identity and one-way
+SHA-256 digests of any supported token environment variables that are set. Raw
+token values are never serialized. On POSIX systems, gh-glance restricts the
+parent config directory to `0700`, writes temporary and final files as `0600`,
+and replaces them atomically. A bounded advisory lock plus three-way merge
+preserves unrelated targets, tabs, and width choices when several panes write
+at once. Missing, corrupt, future-version, locked, or unwritable state is
+advisory: it is ignored rather than weakening authentication or preventing
+startup. A failed or blind Security observation never replaces a
+last-known-good alert set with an empty one.
 
 The repository target is the one user-supplied value that both reaches a
 subprocess argument and is interpolated into a `gh api` request path, so it is
@@ -139,13 +145,16 @@ artifacts users are invited to attach to a bug report, and `gh` error messages
 quote the URL they failed on -- which is a real path for a credential to reach
 them.
 
-gh-glance never handles GitHub credentials directly -- authentication is
-entirely delegated to your existing `gh auth login` session, including on
-GitHub Enterprise and EMU hosts. It has no network code of its own; every
-GitHub API call goes through the `gh` CLI. Failure context invokes only the
-read-only `gh auth status` and `gh repo view` commands. It never requests
-`--show-token`, invokes `gh auth token`, supplies a token argument, or
-deliberately inspects a credential value. Optional account and repository
+GitHub authentication is delegated to the existing `gh auth login` session,
+including on GitHub Enterprise and EMU hosts. gh-glance has no network code of
+its own; every GitHub API call goes through the `gh` CLI. It never requests
+`--show-token`, invokes `gh auth token`, or supplies a token argument. Its one
+credential-adjacent operation is local and non-authenticating: it hashes each
+set `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, and
+`GITHUB_ENTERPRISE_TOKEN` value into the cache namespace so different effective
+credentials cannot hydrate the same saved rows. The raw value is not retained,
+rendered, logged, or written to disk. Failure context invokes only the read-only
+`gh auth status` and `gh repo view` commands. Optional account and repository
 strings are sanitized before rendering, and doctor output remains protected by
 the presence-only and redaction rules above. Login, authorization refresh, and
 account switching remain explicit user-owned `gh` commands.

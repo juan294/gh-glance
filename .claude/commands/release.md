@@ -12,7 +12,7 @@ Gather release context before making any changes.
 
    | Check | Type | Version source | Publish action |
    |-------|------|---------------|----------------|
-   | `package.json` exists | Node/npm | `version` field in package.json | Advisory: "Ready for `npm publish`" |
+   | `package.json` exists | Node/npm | `version` field in package.json | Use the repository publisher when present; otherwise advisory only |
    | `Cargo.toml` exists | Rust | `version` field in Cargo.toml | Advisory: "Ready for `cargo publish`" |
    | `pyproject.toml` exists | Python | `version` field in pyproject.toml | Advisory: "Ready for `twine upload`" |
    | `go.mod` exists | Go | Git tags only | Advisory: "Tag pushed, consumers can `go get`" |
@@ -184,8 +184,9 @@ and published, then proceed only after approval.
    ```
 
 6. Report the result with a link to the GitHub release.
-   If the project has a registry publish step, remind the user:
-   "Release is published. When ready, run `npm publish` / `cargo publish` / etc."
+   If a repository workflow publishes the registry artifact from a GitHub
+   release, wait for that workflow and verify the registry instead of advising
+   a workstation publish.
 
 ### Feature-branch flow
 
@@ -232,8 +233,9 @@ and published, then proceed only after approval.
    ```
 
 6. Report the result with a link to the PR.
-   If the project has a registry publish step, remind the user:
-   "After PR is merged and tagged, run `npm publish` / `cargo publish` / etc."
+   If a repository workflow publishes the registry artifact from a GitHub
+   release, wait for that workflow and verify the registry instead of advising
+   a workstation publish.
 
 ### Develop-based flow
 
@@ -243,18 +245,16 @@ branch -- the integration branch already holds the changes.
 
 1. Land the release prep on the integration branch:
 
-   `develop` is protected and rejects direct pushes, so release prep lands
-   through its own PR first.
+   In this repository `develop` is the unprotected integration branch. Prepare,
+   verify, and commit the release there, then push it once. Do not create an
+   intermediate release-prep branch or PR.
 
    ```bash
-   git checkout develop && git pull --rebase
-   git checkout -b release/vX.Y.Z-prep
+   git checkout develop
    git add <changed-files>
    git commit -m "release: vX.Y.Z -- [summary from CHANGELOG]"
-   git push -u origin release/vX.Y.Z-prep
-   gh pr create --base develop --title "release: vX.Y.Z" --body "[CHANGELOG entry]"
-   gh pr merge --squash --delete-branch    # once checks are green
-   git checkout develop && git pull --rebase
+   git pull --rebase origin develop
+   git push origin develop
    ```
 
 2. Check for an existing release PR before creating one:
@@ -292,7 +292,7 @@ branch -- the integration branch already holds the changes.
    ordinary feature heads; deleting the permanent integration branch would be destructive.
 
 5. **STOP.** Wait for the PR to merge (confirm with `gh pr view --json state`). After it lands,
-   tag the squashed release commit on `main`:
+   tag the merge commit on `main`:
 
    ```bash
    git checkout main && git pull --rebase
@@ -301,9 +301,12 @@ branch -- the integration branch already holds the changes.
    gh release create vX.Y.Z --notes "[CHANGELOG entry]"
    ```
 
-6. Report the result with a link to the PR and the GitHub release.
-   If the project has a registry publish step, remind the user:
-   "After tagging, run `npm publish` / `cargo publish` / etc."
+   Publishing the GitHub release triggers this repository's OIDC npm workflow.
+   Wait for that workflow to finish, then verify the published npm version and
+   provenance from the registry. Never run `npm publish` from a workstation.
+
+6. Report the result with links to the PR, GitHub release, successful release
+   workflow, and published npm version.
 
 ## Rules
 
@@ -315,6 +318,7 @@ branch -- the integration branch already holds the changes.
 - ALWAYS verify CI after push (push accountability).
 - ALWAYS present the diff before committing (Step 2 gate).
 - ALWAYS ask for the version number -- never guess or auto-increment.
-- Registry publish (npm/cargo/twine) is ADVISORY ONLY -- tell the user it is ready, do not run it.
-  Reason: most registries require 2FA and publishing cannot be undone.
+- Never run `npm publish` manually in this repository. Publishing a GitHub
+  release triggers the OIDC trusted-publishing workflow; verify that workflow
+  and the registry artifact instead.
 - Run verification commands sequentially, never as parallel Bash calls.
