@@ -88,7 +88,7 @@ test("an inaccessible repository resolves failure context once", () => {
 });
 
 test("the failure frame preserves terminal geometry and clean teardown", () => {
-  assert.equal(inaccessibleRepository.finalFrame.lines.length, 24);
+  assert.equal(inaccessibleRepository.finalFrame.lines.length, 23);
   assert.ok(
     inaccessibleRepository.finalFrame.widest <= 80,
     `widest failure line was ${inaccessibleRepository.finalFrame.widest} in an 80-column terminal`,
@@ -105,7 +105,7 @@ test("detached missing-remote setup advertises no unavailable keys", () => {
   assert.ok(!frame.includes("Enter"), frame);
   assert.ok(!frame.includes("q/Esc"), frame);
   assert.ok(frame.includes("Ctrl+C"), frame);
-  assert.equal(missingRemoteDetached.finalFrame.lines.length, 24);
+  assert.equal(missingRemoteDetached.finalFrame.lines.length, 23);
   assert.ok(missingRemoteDetached.finalFrame.widest <= 80);
 });
 
@@ -122,11 +122,18 @@ test("the cursor is restored before exit", () => {
   assert.ok(wide.cursorShows >= 1, "the cursor was never shown again");
 });
 
-test("the final frame is exactly as tall as the terminal", () => {
-  // Output.get() pre-allocates exactly `height` rows, so any other count means
-  // the layout overflowed or collapsed.
-  assert.equal(wide.finalFrame.lines.length, 24);
-  assert.equal(narrow.finalFrame.lines.length, 20);
+test("the final frame leaves one physical terminal row as a scroll guard", () => {
+  // Dynamic content must not occupy the terminal's last row. Ink parks its
+  // cursor on that unused row, so a status-only incremental update cannot
+  // scroll the viewport and leave an old footer behind.
+  assert.equal(wide.finalFrame.lines.length, 23);
+  assert.equal(narrow.finalFrame.lines.length, 19);
+  assert.equal(wide.liveScreen.lines.at(-1), "", "wide terminal guard row was not blank");
+  assert.equal(narrow.liveScreen.lines.at(-1), "", "narrow terminal guard row was not blank");
+  assert.equal(wide.liveScreen.statusLines, 1, "wide terminal accumulated status lines");
+  assert.equal(narrow.liveScreen.statusLines, 1, "narrow terminal accumulated status lines");
+  assert.equal(wide.liveScreen.maxStatusLines, 1, "wide terminal transiently duplicated status");
+  assert.equal(narrow.liveScreen.maxStatusLines, 1, "narrow terminal transiently duplicated status");
 });
 
 test("no rendered line exceeds the terminal width", () => {

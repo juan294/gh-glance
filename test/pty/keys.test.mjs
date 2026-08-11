@@ -60,7 +60,7 @@ const remoteSetupDeclined = capture({
 
 function assertCleanInteractiveCapture(result, { cols, rows, label }) {
   assert.equal(result.exitCode, 0, `${label}: q should exit 0`);
-  assert.equal(result.finalFrame.lines.length, rows, `${label}: frame height`);
+  assert.equal(result.finalFrame.lines.length, rows - 1, `${label}: guarded frame height`);
   assert.ok(
     result.finalFrame.widest <= cols,
     `${label}: widest line was ${result.finalFrame.widest} in a ${cols}-column terminal`,

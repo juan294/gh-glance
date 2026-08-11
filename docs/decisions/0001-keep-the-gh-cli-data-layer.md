@@ -90,9 +90,12 @@ request per minute.
 
 - Six `gh` invocations per full tick remain. That is accepted, and the reasons
   are now recorded rather than rediscovered.
-- The independent per-tab `commit()` at `index.mjs:2084-2134` stays load-bearing.
+- The independent per-tab `commit()` at `index.mjs:4213-4276` stays load-bearing.
   Anything that reintroduces a barrier across tabs must clear the same bar this
   decision failed.
+- The last-known-good dashboard cache is downstream of this layer. It hydrates
+  previously parsed rows and persists only successful, non-blind observations;
+  it introduces no network client and does not bypass `gh` for fresh data.
 - If GitHub later exposes workflow runs from `Repository` in GraphQL, the
   premise changes and this decision is worth revisiting — the measurement
   method above is reusable.

@@ -82,7 +82,7 @@ test("selection does not disturb the terminal lifecycle", () => {
 test("the frame keeps its geometry while a row is selected", () => {
   // The cursor shares the existing 3-wide icon column rather than claiming a
   // new one, so nothing may grow.
-  assert.equal(moved.finalFrame.lines.length, 24);
+  assert.equal(moved.finalFrame.lines.length, 23);
   assert.ok(
     moved.finalFrame.widest <= 80,
     `widest line was ${moved.finalFrame.widest} with a row selected`,

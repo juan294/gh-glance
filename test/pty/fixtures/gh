@@ -17,12 +17,17 @@ echo "$*" >> "$GH_GLANCE_FIXTURE_LOG"
 FIXTURE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 # Lets tests drive the error classifier end to end. The selector defaults to
-# api so the original SAML fixture contract remains unchanged. Split the list
-# without shell pattern matching: an unknown selector must fail no command.
+# api so the original SAML fixture contract remains unchanged. `api-data`
+# targets alert calls while leaving `api rate_limit` readable. Split the list
+# without broad shell matching: an unknown selector must fail no command.
 if [ -n "${GH_GLANCE_FIXTURE_FAIL:-}" ]; then
   fail_on="${GH_GLANCE_FIXTURE_FAIL_ON:-api}"
   while [ -n "$fail_on" ]; do
     selector=${fail_on%%,*}
+    if [ "$selector" = "api-data" ] && [ "$1" = "api" ] && [ "${2:-}" != "rate_limit" ]; then
+      echo "$GH_GLANCE_FIXTURE_FAIL" >&2
+      exit 1
+    fi
     if [ "$1" = "$selector" ]; then
       echo "$GH_GLANCE_FIXTURE_FAIL" >&2
       exit 1
@@ -103,6 +108,14 @@ case "$1" in
         exit 0
         ;;
     esac
+    if [ -n "${GH_GLANCE_FIXTURE_SECURITY_ALERTS:-}" ]; then
+      case "${2:-}" in
+        *dependabot*)
+          echo '[{"number":1,"state":"open","created_at":"2026-08-11T05:00:00Z","severity":"high","title":"cached dependency alert","detail":"ink"}]'
+          exit 0
+          ;;
+      esac
+    fi
     # The three alert endpoints. An empty array is a *successful* fetch with no
     # alerts, which keeps the Security tab in its resolved-and-empty state
     # rather than its error state -- errors would add note lines and change the

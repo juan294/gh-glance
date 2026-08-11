@@ -30,7 +30,7 @@ without switching to the browser.
 │                                                                          │
 │                                                                          │
 ╰───────────────────────────────────────────────────────────────── 4 of 4 ─╯
-⣾ Fetching  Move: ↑↓ | Open: Ent | Refresh: r | Width: w | Quit: q     0.7.0
+⣾ Fetching  Move: ↑↓ | Open: Ent | Refresh: r | Width: w | Quit: q     0.8.0
 ```
 
 > Captured from a real run at 76 columns with `GH_GLANCE_ICONS=unicode`, so the
@@ -90,10 +90,13 @@ current.
   answers "is CI red" without colour
 - Says when it is stale rather than showing old data silently, and marks a tab
   whose last refresh failed
+- Keeps the last successfully parsed rows visible during temporary failures and
+  across a restart, scoped to the repository being watched
 - Adapts row count to the terminal pane's height live, on resize
 - Enters the terminal's alternate screen buffer on launch (like `lazygit`,
   `htop`, `vim`) so the shell prompt that launched it stays out of view, and
-  is restored cleanly on exit
+  is restored cleanly on exit without old status lines accumulating below the
+  frame
 
 ## Prerequisites
 
@@ -344,6 +347,32 @@ the live session and width mode reports `Widths not saved`; a later successful
 write clears the warning. The UI owns this file, so direct editing is not the
 primary configuration workflow.
 
+### Last-known-good dashboard cache
+
+Successfully parsed dashboard rows are also saved automatically, in
+`dashboard-cache.json` beside `preferences.json`:
+
+```text
+$XDG_CONFIG_HOME/gh-glance/dashboard-cache.json
+~/Library/Application Support/gh-glance/dashboard-cache.json
+~/.config/gh-glance/dashboard-cache.json
+```
+
+The cache is scoped to the repository and host being watched. In inferred mode,
+the host and current working directory form the identity, so rows from one
+checkout cannot appear in another. It retains at most five recent targets and
+60 rows per tab; a shortened cached tab keeps its `+` marker rather than
+presenting the saved count as complete.
+
+Only successfully parsed, non-blind observations replace saved rows. A failed
+request can add a live error or `?` marker, but it cannot turn known Security
+alerts or other last-known-good rows into an empty result. Missing, corrupt,
+unknown-version, or unwritable cache state is ignored rather than blocking the
+dashboard. On POSIX systems, gh-glance restricts its config directory to `0700`
+and the cache file to `0600`. The file contains repository data, including
+titles, authors, branches, and Security findings, but never GitHub credentials.
+It is recovery state owned by the UI, not a configuration interface.
+
 ## GitHub Enterprise and EMU
 
 **The common case needs no configuration.** Authenticate once --
@@ -442,6 +471,13 @@ feature that is not enabled for the repository retries on a ladder up to an
 hour, an authorization failure every 30 seconds, a rate limit every minute.
 Pressing `r` clears that backoff and retries immediately. And `--refresh`
 scales the whole figure: doubling the interval halves it.
+
+When a refresh fails, the last successful rows stay visible below the live
+error instead of disappearing. If gh-glance is restarted while GitHub is still
+rate-limiting, it loads the saved rows for that same target immediately. Their
+age remains explicit through the `stale` label, and the rate-limit banner still
+describes the current failed request; cached data never turns a failure into a
+false success.
 
 One pane on Actions costs about a third of an hourly REST budget, so roughly
 three panes fill it. Past that, `gh-glance` widens its own poll interval: it
@@ -544,7 +580,7 @@ in some terminals, which would shift every column to their right.
 | Security tab shows `?` instead of a number | The alert endpoints could not be read at all -- an expired SAML session, a token without `security_events`, or an org OAuth restriction. `?` means "unknown", not "zero"; run `gh-glance --doctor` to see which probe failed and how it was classified. |
 | A failing tab seems to have stopped retrying | It backs off deliberately, rather than re-spawning `gh` every five seconds against an endpoint that is refusing. Press `r` to clear the backoff and retry now. |
 | `unknown argument: -v` | `-v` used to mean `--version` and no longer does, because this CLI also has `--verbose`. Use `--version` or `--verbose` explicitly. |
-| `stale 2m` in the status bar | The visible tab has not refreshed successfully for a while — usually a network drop. |
+| `stale 2m` in the status bar | The visible tab has not refreshed successfully for a while — usually a network drop or rate limit. Last-known-good rows can remain visible, including after restart; the live error above the table explains why they are stale. |
 | It exits immediately when piped | Intentional. It is a full-screen dashboard, not a reporting command. |
 | It stopped updating and you cannot tell why | Run `gh-glance --verbose 2>gh-glance.log`, reproduce, then read the log: one line per `gh` call with its duration and outcome. It is redacted the same way `--doctor` is, so it is safe to attach to a bug report. `--doctor --verbose` logs the probes too. |
 | `--verbose` refuses to start | stderr is still your terminal, where the log would draw over the dashboard. Redirect it to a file. |

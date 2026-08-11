@@ -53,8 +53,11 @@ launching the dashboard -- please keep that guard intact.
 `npm run test:pty` runs `test/pty/`. It launches the real `index.mjs` inside a
 pseudo-terminal with a fixture `gh` on `PATH`, then asserts over the captured
 bytes. It covers what unit tests structurally cannot: rendered frame geometry,
-terminal state on exit, keyboard handlers, and direct SGR mouse input. It found
-the scrollback bug fixed in `0.3.0`.
+terminal state on exit, keyboard handlers, direct SGR mouse input, and state
+shared across real process restarts. Its capture parser replays the alternate
+screen into a bounded terminal grid, so it can detect a transient duplicate
+status line even when a later repaint is clean. It found the scrollback bug
+fixed in `0.3.0`.
 
 It is a separate script from `npm test` on purpose. The unit run is fast and is
 required everywhere; the pty run is slow and timing-sensitive, so it reports on
@@ -63,10 +66,18 @@ it gates the release and nothing else. It was advisory until 2026-08-04 and was
 promoted after 38 consecutive runs without a failure. If you make it flake, the
 right response is to delete the offending assertion, not to add retries.
 
-One rule keeps it worth having: **assert structure, never dashboard cell
-contents.** Line counts, widths, escape-sequence balance and ordering, and exit
-codes survive a copy change. The text inside a cell does not, and asserting it
-would turn every wording change into a red build.
+One default keeps it worth having: **assert structure, not incidental dashboard
+copy.** Line counts, widths, escape-sequence balance and ordering, and exit codes
+survive a wording change. The narrow exception is a semantic data-flow test
+whose subject is the fixture value itself. The restart-cache test, for example,
+asserts one stable title both positively for the same target and negatively for
+a different target; without that pair it would not prove persistence or
+isolation. Do not use that exception for ordinary rendering or copy tests.
+
+Each capture gets an isolated temporary config root by default. A test that
+must cross a process boundary can pass one caller-owned `configHome` to several
+captures. Create it with `mkdtempSync`, keep the exact returned path, and remove
+only that path after every capture has finished.
 
 Direct SGR mouse tests must send each logical report through the foreground pty
 as its own timed write, plus one intentionally split report that exercises the
@@ -95,8 +106,12 @@ Worth knowing about the app's shape before changing it:
 - `commit()` skips both the parse and the state update when the raw payload is
   unchanged, and returns the same state object, so an idle repo stops redrawing
   entirely. Anything that returns a fresh object per tick undoes that.
-- Everything from `gh` goes through `safe()` before it is stored. See
-  `SECURITY.md`.
+- Only a successfully parsed, non-blind observation can replace live or cached
+  last-known-good rows. A blind Security result updates its notes and `?` marker
+  without clearing known alerts or advancing freshness. It also invalidates the
+  raw comparison so an identical healthy response commits after recovery.
+- Everything from `gh` goes through `safe()` before it is stored in memory,
+  persisted, or rendered. See `SECURITY.md`.
 
 ## Branching Model
 
