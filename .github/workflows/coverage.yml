@@ -46,3 +46,8 @@ jobs:
           COVERAGE_WORKFLOW_REF: ${{ github.workflow_ref }}
           SOURCE_TARGET_BRANCH: develop
         run: bash scripts/report-coverage.sh
+      - name: Measure PTY child-process coverage
+        shell: bash
+        run: |
+          RUNTIME_COVERAGE_SUMMARY=runtime-coverage.md npm run test:coverage:runtime
+          cat runtime-coverage.md >> "$GITHUB_STEP_SUMMARY"
