@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-08-11
+
+### Fixed
+
+- **Package-boundary verification supports npm 12.** The release test accepts
+  both npm 11's array-shaped `npm pack --json` result and npm 12's
+  package-name-keyed result, so the existing OIDC publication workflow can
+  verify the CLI-only package boundary before publishing.
+
 ## [0.9.0] - 2026-08-11
 
 ### Added
@@ -703,7 +712,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/juan294/gh-glance/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/juan294/gh-glance/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/juan294/gh-glance/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/juan294/gh-glance/compare/v0.6.1...v0.7.0

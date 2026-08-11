@@ -17,6 +17,22 @@ async function run(command, args, options = {}) {
   });
 }
 
+function parsePackManifest(stdout, packageName) {
+  const payload = JSON.parse(stdout);
+  const manifest = Array.isArray(payload) ? payload[0] : payload?.[packageName];
+  assert.ok(manifest && typeof manifest === "object", "npm pack must report the package manifest");
+  return manifest;
+}
+
+test("npm pack manifests support npm 11 and npm 12 JSON shapes", () => {
+  const manifest = { filename: "gh-glance.tgz", files: [] };
+  assert.deepEqual(parsePackManifest(JSON.stringify([manifest]), "gh-glance"), manifest);
+  assert.deepEqual(
+    parsePackManifest(JSON.stringify({ "gh-glance": manifest }), "gh-glance"),
+    manifest,
+  );
+});
+
 test("the installed package supports only the gh-glance executable", async () => {
   const root = await mkdtemp(join(tmpdir(), "gh-glance-package-test-"));
   try {
@@ -25,7 +41,7 @@ test("the installed package supports only the gh-glance executable", async () =>
       ["pack", "--ignore-scripts", "--json", "--pack-destination", root],
       { cwd: process.cwd() },
     );
-    const [manifest] = JSON.parse(pack.stdout);
+    const manifest = parsePackManifest(pack.stdout, "gh-glance");
     const tarball = join(root, manifest.filename);
     const paths = manifest.files.map(({ path }) => path);
 
