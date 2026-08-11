@@ -125,6 +125,41 @@ test("stale writers merge unrelated width changes from another process", () => {
   });
 });
 
+test("a stale width writer preserves external columns across a later local save", () => {
+  withTemporaryRoot((root) => {
+    const path = preferencePath(root);
+    const sharedBase = {};
+    const first = saveWidthPreferences(
+      path,
+      { actions: { branch: 18 } },
+      undefined,
+      { base: sharedBase },
+    );
+    assert.equal(first.ok, true);
+    assert.equal(
+      saveWidthPreferences(path, { issues: { author: 9 } }, undefined, { base: sharedBase }).ok,
+      true,
+    );
+
+    const firstUpdate = structuredClone(first.persisted);
+    firstUpdate.actions.branch = 19;
+    const merged = saveWidthPreferences(path, firstUpdate, undefined, { base: first.persisted });
+    assert.equal(merged.ok, true);
+    assert.deepEqual(merged.persisted.issues, { author: 9 });
+
+    const secondUpdate = structuredClone(merged.persisted);
+    secondUpdate.actions.branch = 20;
+    assert.equal(
+      saveWidthPreferences(path, secondUpdate, undefined, { base: merged.persisted }).ok,
+      true,
+    );
+    assert.deepEqual(loadWidthPreferences(path).preferences, {
+      actions: { branch: 20 },
+      issues: { author: 9 },
+    });
+  });
+});
+
 test("a file used as the preference parent is a nonfatal save failure", () => {
   withTemporaryRoot((root) => {
     const blockedParent = join(root, "not-a-directory");

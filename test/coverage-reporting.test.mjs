@@ -81,6 +81,7 @@ test('coverage workflow reports PTY runtime visibility without a threshold gate'
   const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
 
   assert.equal(pkg.scripts['test:coverage:runtime'], 'node test/runtime-coverage.mjs');
+  assert.match(workflow, /if: github\.event_name != 'push'/);
   assert.match(workflow, /npm run test:coverage:runtime/);
   assert.match(workflow, /RUNTIME_COVERAGE_SUMMARY=runtime-coverage\.md/);
   assert.match(workflow, /GITHUB_STEP_SUMMARY/);

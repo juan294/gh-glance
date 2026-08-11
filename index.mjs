@@ -1178,6 +1178,10 @@ function alertRequestArgs(source) {
   ];
 }
 
+function shouldFetchAlertPriorityLanes(openCount) {
+  return openCount >= ALERT_PER_PAGE;
+}
+
 function mergeAlertRows(groups) {
   const seen = new Set();
   const merged = [];
@@ -1261,10 +1265,15 @@ async function fetchAlertSource(source, signal, now) {
   }
   let spent = 0;
   try {
+    const requests = alertRequestArgs(source);
     const payloads = [];
-    for (const args of alertRequestArgs(source)) {
+    const groups = [];
+    for (const [index, args] of requests.entries()) {
+      if (index > 0 && !shouldFetchAlertPriorityLanes(groups[0]?.length ?? 0)) break;
       spent += 1;
-      payloads.push(await runGh(args, { signal }));
+      const payload = await runGh(args, { signal });
+      payloads.push(payload);
+      groups.push(JSON.parse(payload).filter((alert) => alert.state === "open"));
     }
     const raw = payloads.join("\0");
     clearBackoff(source.key);
@@ -1272,7 +1281,6 @@ async function fetchAlertSource(source, signal, now) {
       raw,
       spent,
       parse: () => {
-        const groups = payloads.map((payload) => JSON.parse(payload).filter((a) => a.state === "open"));
         const rows = mergeAlertRows(groups);
         return {
           alerts: rows.map(source.map),
@@ -1712,16 +1720,10 @@ async function readRateBudgets(signal) {
 // two copies of them would diverge the first time one was fixed.
 function projectedHourlyCost(activeKey) {
   const perHour = 3_600_000 / runtime.refreshMs;
-  let rest = 0;
-  let graphql = 0;
-  // TAB_KEYS rather than TABS: this runs on the --doctor path, which deliberately
-  // returns before the render tree is reached, and TABS is declared down there.
-  for (const key of TAB_KEYS) {
-    const ticks = key === activeKey ? perHour : perHour / BACKGROUND_EVERY;
-    rest += ticks * REST_PER_FETCH[key];
-    graphql += ticks * GRAPHQL_PER_FETCH[key];
-  }
-  return { rest: Math.round(rest), graphql: Math.round(graphql) };
+  return {
+    rest: Math.round(resourcePerTick(REST_PER_FETCH, activeKey) * perHour),
+    graphql: Math.round(resourcePerTick(GRAPHQL_PER_FETCH, activeKey) * perHour),
+  };
 }
 
 async function runDoctor() {
@@ -3145,10 +3147,41 @@ function mergeDashboardCacheSnapshots(base, disk, next) {
   const next_ = isRecord(next) ? next : {};
   for (const target of new Set([...Object.keys(base_), ...Object.keys(next_)])) {
     if (samePersistedValue(base_[target], next_[target])) continue;
-    if (Object.hasOwn(next_, target)) merged[target] = next_[target];
-    else delete merged[target];
+    if (!Object.hasOwn(next_, target)) {
+      delete merged[target];
+      continue;
+    }
+
+    const baseEntry = isRecord(base_[target]) ? base_[target] : {};
+    const diskEntry = isRecord(merged[target]) ? merged[target] : {};
+    const nextEntry = isRecord(next_[target]) ? next_[target] : {};
+    const mergedEntry = structuredClone(diskEntry);
+    const baseTabs = isRecord(baseEntry.tabs) ? baseEntry.tabs : {};
+    const nextTabs = isRecord(nextEntry.tabs) ? nextEntry.tabs : {};
+    const mergedTabs = isRecord(mergedEntry.tabs) ? mergedEntry.tabs : {};
+    for (const tabKey of new Set([...Object.keys(baseTabs), ...Object.keys(nextTabs)])) {
+      if (samePersistedValue(baseTabs[tabKey], nextTabs[tabKey])) continue;
+      if (Object.hasOwn(nextTabs, tabKey)) mergedTabs[tabKey] = nextTabs[tabKey];
+      else delete mergedTabs[tabKey];
+    }
+    if (Object.keys(mergedTabs).length > 0) mergedEntry.tabs = mergedTabs;
+    else delete mergedEntry.tabs;
+
+    for (const field of ["securityNotes", "securityBlind", "updatedAt"]) {
+      if (samePersistedValue(baseEntry[field], nextEntry[field])) continue;
+      if (Object.hasOwn(nextEntry, field)) mergedEntry[field] = nextEntry[field];
+      else delete mergedEntry[field];
+    }
+    merged[target] = mergedEntry;
   }
   return merged;
+}
+
+function adoptPersistedSnapshot(result, persistedRef, liveRef) {
+  if (result?.ok !== true || !isRecord(result.persisted)) return false;
+  persistedRef.current = result.persisted;
+  liveRef.current = result.persisted;
+  return true;
 }
 
 function normalizeWidthOverrides(overrides, tabs = TABS, { omitDefaults = false } = {}) {
@@ -3391,10 +3424,14 @@ function authCacheIdentity({
       configStat = null;
     }
   }
-  const tokenName = ["GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_TOKEN"].find((name) => env?.[name]);
-  const tokenDigest = tokenName
-    ? createHash("sha256").update(String(env[tokenName])).digest("hex")
-    : null;
+  const tokenDigests = Object.fromEntries(
+    ["GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]
+      .filter((name) => env?.[name])
+      .map((name) => [
+        name,
+        createHash("sha256").update(String(env[name])).digest("hex"),
+      ]),
+  );
   const payload = {
     configDir,
     configStat: configStat
@@ -3405,8 +3442,7 @@ function authCacheIdentity({
           mtimeMs: Math.trunc(Number(configStat.mtimeMs)),
         }
       : null,
-    tokenName: tokenName ?? null,
-    tokenDigest,
+    tokenDigests,
   };
   return createHash("sha256").update(JSON.stringify(payload)).digest("hex").slice(0, 24);
 }
@@ -4017,11 +4053,16 @@ function App({ onCreateRemote = () => {} } = {}) {
         const result = saveWidthPreferences(preferencePath, overrides, TABS, {
           base: widthPersistedRef.current,
         });
-        if (result.ok) widthPersistedRef.current = result.persisted;
+        adoptPersistedSnapshot(result, widthPersistedRef, widthOverridesRef);
         return result;
       },
       onResult: (result) => {
         if (!widthPreferencesMountedRef.current) return;
+        if (result?.ok === true) {
+          setWidthOverrides((current) =>
+            samePersistedValue(current, result.persisted) ? current : result.persisted,
+          );
+        }
         setWidthSaveError(
           result?.ok === false
             ? (result.error ?? new Error("Width preferences could not be saved"))
@@ -4060,7 +4101,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           normalized: true,
           base: dashboardCachePersistedRef.current,
         });
-        if (result.ok) dashboardCachePersistedRef.current = result.persisted;
+        adoptPersistedSnapshot(result, dashboardCachePersistedRef, dashboardCacheRef);
         return result;
       },
     }),
@@ -4769,7 +4810,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         })
         .finally(() => {
           inFlightRef.current[key] = false;
-          if (!cancelled && visibleLoading) {
+          if (!cancelled) {
             setLoading((l) => (l[key] ? { ...l, [key]: false } : l));
           }
         });
@@ -5635,6 +5676,7 @@ export {
   saveWidthPreferences,
   createWidthPreferenceWriter,
   mergeWidthPreferenceSnapshots,
+  adoptPersistedSnapshot,
   DASHBOARD_CACHE_VERSION,
   dashboardCachePath,
   dashboardCacheTarget,
@@ -5651,6 +5693,7 @@ export {
   pollResultTransition,
   forcedBackoffKeys,
   alertRequestArgs,
+  shouldFetchAlertPriorityLanes,
   mergeAlertRows,
   reconcileSelectionViewport,
   runStatusIcon,

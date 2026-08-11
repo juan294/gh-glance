@@ -52,11 +52,14 @@ const forcedSecurity = withCounterCapture("gh-glance-security-force-", 1, (count
   }),
 );
 
+const cachedConfigHome = mkdtempSync(join(tmpdir(), "gh-glance-cached-pty-"));
+
 const screenReader = capture({
   cols: 80,
   rows: 24,
   settle: 4,
   env: { INK_SCREEN_READER: "true" },
+  configHome: cachedConfigHome,
 });
 
 const stalledStartedAt = Date.now();
@@ -106,7 +109,13 @@ const narrowAuthFailure = capture({
   },
 });
 
-const automaticPoll = capture({ cols: 80, rows: 24, settle: 12 });
+const automaticPoll = capture({
+  cols: 80,
+  rows: 24,
+  settle: 12,
+  configHome: cachedConfigHome,
+});
+rmSync(cachedConfigHome, { recursive: true, force: true });
 
 const shortHelp = capture({
   cols: 45,
@@ -168,10 +177,16 @@ test("a narrow auth failure starts with the recovery action", () => {
   assert.match(narrowAuthFailure.finalFrame.lines.join("\n"), /Run: gh auth status/);
 });
 
-test("settled automatic polls do not re-enter the Fetching state", () => {
+test("a cache-hydrated tab clears Fetching and settled polls do not re-enter it", () => {
   const runCalls = automaticPoll.fixtureCalls.filter((call) => call.startsWith("run list"));
   assert.ok(runCalls.length >= 2, `expected automatic polls, saw ${runCalls.length}`);
-  assert.equal((automaticPoll.raw.match(/Fetching/g) ?? []).length, 1);
+  const firstData = automaticPoll.raw.indexOf("ci: pin actions");
+  assert.ok(firstData >= 0, "expected the first successful Actions frame");
+  const settledFetching = `${ESC}[2m⣾ Fetching`;
+  const activeFetching = `${ESC}[96m⣾ Fetching`;
+  const settledAt = automaticPoll.raw.indexOf(settledFetching, firstData);
+  assert.ok(settledAt >= 0, "expected loading to clear after the first successful frame");
+  assert.equal(automaticPoll.raw.slice(settledAt).includes(activeFetching), false);
 });
 
 test("short help keeps essential actions and points to the full reference", () => {

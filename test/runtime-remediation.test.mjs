@@ -5,6 +5,7 @@ import {
   ALERT_SOURCES,
   RowBoundary,
   activeKeyHints,
+  adoptPersistedSnapshot,
   alertRequestArgs,
   authCacheIdentity,
   createOpenRequestRegistry,
@@ -22,6 +23,7 @@ import {
   selectionLabel,
   shouldCheckpointFreshness,
   shouldEnableMouseReporting,
+  shouldFetchAlertPriorityLanes,
   shouldShowFetchLoading,
   summarizeDoctorEnv,
   tabFailureSuffix,
@@ -64,6 +66,9 @@ test("Security requests are bounded and include explicit priority lanes", () => 
     [{ number: 2, severity: "high" }, { number: 3, severity: "critical" }],
   ]);
   assert.deepEqual(rows.map(({ number }) => number), [1, 2, 3]);
+  assert.equal(shouldFetchAlertPriorityLanes(0), false);
+  assert.equal(shouldFetchAlertPriorityLanes(99), false);
+  assert.equal(shouldFetchAlertPriorityLanes(100), true);
 });
 
 test("unchanged Security data uses a slower bounded cadence and force bypasses it", () => {
@@ -84,6 +89,17 @@ test("cache identity follows the effective gh account namespace without storing 
   assert.equal(first, authCacheIdentity(base));
   assert.notEqual(first, authCacheIdentity({ ...base, env: { ...base.env, GH_CONFIG_DIR: "/tmp/gh-b" } }));
   assert.notEqual(first, authCacheIdentity({ ...base, stat: { ...base.stat, mtimeMs: 41 } }));
+  assert.notEqual(
+    first,
+    authCacheIdentity({
+      ...base,
+      env: { ...base.env, GITHUB_ENTERPRISE_TOKEN: "enterprise-secret" },
+    }),
+  );
+  assert.notEqual(
+    authCacheIdentity({ ...base, env: { GH_TOKEN: "public", GH_ENTERPRISE_TOKEN: "first" } }),
+    authCacheIdentity({ ...base, env: { GH_TOKEN: "public", GH_ENTERPRISE_TOKEN: "second" } }),
+  );
   assert.ok(!first.includes(base.env.GH_TOKEN));
 });
 
@@ -104,13 +120,47 @@ test("three-way persistence merges concurrent unrelated changes and preserves de
     { prs: { author: 18 } },
   );
 
-  const baseCache = { one: { updatedAt: 1 } };
-  const diskCache = { one: { updatedAt: 1 }, two: { updatedAt: 2 } };
-  const nextCache = { one: { updatedAt: 3 } };
+  const baseCache = {
+    one: {
+      tabs: { actions: { data: ["old"] } },
+      securityNotes: [],
+      securityBlind: false,
+      updatedAt: 1,
+    },
+  };
+  const diskCache = {
+    one: {
+      tabs: { actions: { data: ["old"] }, issues: { data: ["external"] } },
+      securityNotes: ["external note"],
+      securityBlind: true,
+      updatedAt: 2,
+    },
+    two: { updatedAt: 2 },
+  };
+  const nextCache = {
+    one: {
+      tabs: { actions: { data: ["local"] } },
+      securityNotes: [],
+      securityBlind: false,
+      updatedAt: 3,
+    },
+  };
   assert.deepEqual(mergeDashboardCacheSnapshots(baseCache, diskCache, nextCache), {
-    one: { updatedAt: 3 },
+    one: {
+      tabs: { actions: { data: ["local"] }, issues: { data: ["external"] } },
+      securityNotes: ["external note"],
+      securityBlind: true,
+      updatedAt: 3,
+    },
     two: { updatedAt: 2 },
   });
+
+  const persistedRef = { current: baseCache };
+  const liveRef = { current: nextCache };
+  const persisted = mergeDashboardCacheSnapshots(baseCache, diskCache, nextCache);
+  assert.equal(adoptPersistedSnapshot({ ok: true, persisted }, persistedRef, liveRef), true);
+  assert.equal(persistedRef.current, persisted);
+  assert.equal(liveRef.current, persisted);
 });
 
 test("freshness checkpoints are bounded instead of writing every successful poll", () => {
