@@ -30,7 +30,7 @@ without switching to the browser.
 │                                                                          │
 │                                                                          │
 ╰───────────────────────────────────────────────────────────────── 4 of 4 ─╯
-⣾ Fetching  Move: ↑↓ | Open: Ent | Refresh: r | Width: w | Quit: q     0.9.0
+⣾ Fetching  Move: ↑↓ | Open: Ent | Refresh: r | Width: w | Quit: q     0.9.1
 ```
 
 > Captured from a real run at 76 columns with `GH_GLANCE_ICONS=unicode`, so the
