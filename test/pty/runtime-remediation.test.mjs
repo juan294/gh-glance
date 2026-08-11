@@ -10,6 +10,29 @@ const ESC = String.fromCharCode(27);
 const strip = (text) =>
   text.replace(new RegExp(`${ESC}\\[[0-9;?]*[A-Za-z]`, "g"), "").replace(/\r/g, "");
 
+function fetchingForegroundStates(text) {
+  const states = [];
+  let brightCyan = false;
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === ESC && text[index + 1] === "[") {
+      let end = index + 2;
+      while (end < text.length && !/[A-Za-z]/.test(text[end])) end += 1;
+      if (text[end] === "m") {
+        const values = text
+          .slice(index + 2, end)
+          .split(";")
+          .map((value) => Number(value || 0));
+        if (values.includes(0) || values.includes(39)) brightCyan = false;
+        if (values.includes(96)) brightCyan = true;
+      }
+      index = end;
+      continue;
+    }
+    if (text.startsWith("Fetching", index)) states.push(brightCyan);
+  }
+  return states;
+}
+
 function withCounterCapture(prefix, initial, build) {
   const root = mkdtempSync(join(tmpdir(), prefix));
   const counter = join(root, "counter");
@@ -125,6 +148,15 @@ const shortHelp = capture({
   stdin: "sleep 3; printf '?'; sleep 2; printf 'q'; sleep 2",
 });
 
+test("Fetching colour state tolerates combined and split SGR sequences", () => {
+  assert.deepEqual(
+    fetchingForegroundStates(
+      `${ESC}[96m⣾ Fetching${ESC}[39m${ESC}[2m${ESC}[39m⣾ Fetching${ESC}[0m`,
+    ),
+    [true, false],
+  );
+});
+
 test("a timer-driven list failure recovers in the same process", () => {
   const issueCalls = recovered.fixtureCalls.filter((call) => call.startsWith("issue list"));
   assert.ok(issueCalls.length >= 2, `expected a retry, saw ${issueCalls.length} issue calls`);
@@ -182,11 +214,10 @@ test("a cache-hydrated tab clears Fetching and settled polls do not re-enter it"
   assert.ok(runCalls.length >= 2, `expected automatic polls, saw ${runCalls.length}`);
   const firstData = automaticPoll.raw.indexOf("ci: pin actions");
   assert.ok(firstData >= 0, "expected the first successful Actions frame");
-  const settledFetching = `${ESC}[2m⣾ Fetching`;
-  const activeFetching = `${ESC}[96m⣾ Fetching`;
-  const settledAt = automaticPoll.raw.indexOf(settledFetching, firstData);
+  const states = fetchingForegroundStates(automaticPoll.raw.slice(firstData));
+  const settledAt = states.indexOf(false);
   assert.ok(settledAt >= 0, "expected loading to clear after the first successful frame");
-  assert.equal(automaticPoll.raw.slice(settledAt).includes(activeFetching), false);
+  assert.equal(states.slice(settledAt).includes(true), false);
 });
 
 test("short help keeps essential actions and points to the full reference", () => {
