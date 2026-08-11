@@ -90,11 +90,34 @@ that was written the same function has absorbed selection, scrolling, `--repo`
 threading and the #41 ordering fix. The right time to extract it is when it is
 next changed for a behavioural reason, not on its own.
 
+## 2026-08-11 addendum: keep incremental frames off the terminal edge
+
+The dashboard now uses Ink's incremental renderer, but terminal ownership still
+includes the physical frame boundary. A root that occupied every terminal row
+left the changing status line on the bottom edge. During a prolonged stale and
+throttled period, repeated status updates could desynchronize cursor and scroll
+state and leave old footer copies above the live line.
+
+The root therefore renders at `terminal rows - 1`. The unused physical bottom
+row is a deliberate scroll guard, not lost layout space to reclaim. It keeps
+status-only incremental updates away from the terminal's scroll boundary while
+preserving Ink's low-write diff path.
+
+The pty harness now replays cursor, erase, alternate-screen,
+synchronized-update, wrap, and scroll controls into a bounded terminal grid. It
+asserts the blank guard row and retains the maximum simultaneous status-line
+count across live updates, so a later clean repaint cannot hide a transient
+duplicate. Any change to root height, incremental rendering, or capture parsing
+must preserve those two proofs.
+
 ## Consequences
 
 - Terminal lifecycle stays explicit and stays this project's responsibility. Any
   future move to Ink's `alternateScreen` must clear the pty harness's
   primary-buffer assertions first.
+- Incremental rendering stays one row below the physical viewport. Reclaiming
+  the guard row requires equivalent live-screen evidence that status updates
+  cannot scroll or accumulate.
 - `TABS` is now a real extension point, matching what `CONTRIBUTING.md` claims.
 - `App` is smaller but still holds the fetch lifecycle. That is recorded here so
   the next reader knows it was considered rather than overlooked.

@@ -2,15 +2,17 @@
 
 ## Supported Versions
 
-Only the current major release receives security patches.
+Only the current release line receives security patches.
 
-| Version | Supported |
-|---------|-----------|
-| 0.5.x   | Yes       |
-| 0.4.x   | No        |
-| 0.3.x   | No        |
-| 0.2.x   | No        |
-| < 0.2   | No (never released)  |
+| Version | Supported           |
+| ------- | ------------------- |
+| 0.7.x   | Yes                 |
+| 0.6.x   | No                  |
+| 0.5.x   | No                  |
+| 0.4.x   | No                  |
+| 0.3.x   | No                  |
+| 0.2.x   | No                  |
+| < 0.2   | No (never released) |
 
 ## Reporting a Vulnerability
 
@@ -93,6 +95,18 @@ escape sequences on purpose so that callers can pass styled strings through.
 Values arriving from the API are also read through an own-property check before
 being used as lookup keys, so a field whose value happens to be `constructor` or
 `__proto__` cannot return an unexpected object into the render path.
+
+Successfully parsed rows can be persisted in a target-scoped
+`dashboard-cache.json` beside the width-preference file. The cache contains
+sanitized repository data such as titles, authors, branches, and Security
+findings, but it never contains a GitHub token or other credential. It retains
+at most five repository targets and 60 rows per tab. On POSIX systems,
+gh-glance restricts the parent config directory to `0700`, writes the temporary
+and final cache file as `0600`, and replaces the file atomically. Missing,
+corrupt, future-version, or unwritable cache state is advisory: it is ignored
+rather than weakening authentication or preventing startup. A failed or blind
+Security observation never replaces a last-known-good alert set with an empty
+one.
 
 The repository target is the one user-supplied value that both reaches a
 subprocess argument and is interpolated into a `gh api` request path, so it is

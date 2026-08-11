@@ -7,17 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-11
+
+### Added
+
+- **Last-known-good dashboard rows now survive process restarts.** Successfully
+  parsed Actions, Issues, Pull Requests, and Security state is stored in a
+  private, target-scoped cache. It retains five recent targets and 60 rows per
+  tab, ignores corrupt or unwritable state, and never stores credentials.
+
+### Changed
+
+- **Development tooling was refreshed.** The paired CodeQL actions now use
+  4.37.6, and the development-only `globals` lock entry is 17.9.0.
+
 ### Fixed
 
-- **Status updates no longer accumulate old footer lines during a prolonged
-  rate-limit window.** The incremental frame now leaves the terminal's physical
-  bottom row unused, so changing fetching, stale, and throttle labels cannot
-  scroll earlier copies upward through the dashboard.
-- **Last-known-good rows survive a restart while GitHub is rate-limiting.** A
-  live rate-limit banner remains visible above the cached rows, and their age is
-  reported through the existing `stale` label. The target-scoped cache lives in
-  gh-glance's user config directory beside `preferences.json`; its directory is
-  restricted to `0700` and the file to `0600` on POSIX systems.
+- **Status updates no longer accumulate old footer lines during prolonged rate
+  limiting.** The dashboard leaves the terminal's physical bottom row as a
+  scroll guard while preserving incremental rendering.
+- **Restarting during a live rate limit no longer shows an empty dashboard.**
+  Cached rows remain visible below the current error with an explicit `stale`
+  age, while repository targets remain isolated.
+- **Blind Security refreshes preserve known alerts.** A failed observation
+  cannot replace last-known-good Security rows with a false empty result, and an
+  identical healthy response clears the warning after recovery.
 
 ## [0.7.0] - 2026-08-10
 
@@ -633,7 +647,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/juan294/gh-glance/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/juan294/gh-glance/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/juan294/gh-glance/releases/tag/v0.6.1
 [0.6.0]: https://github.com/juan294/gh-glance/releases/tag/v0.6.0
