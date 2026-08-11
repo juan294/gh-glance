@@ -1,0 +1,122 @@
+// Last-known-good cache behavior across real process boundaries.
+//
+// One caller-owned config root is shared by four PTY captures: a healthy run
+// writes the cache, the same target restarts while every GitHub data call is
+// rate-limited, Security proves blind refreshes preserve known alerts, and a
+// different target proves entries never cross repositories.
+
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+
+import { capture } from "./capture.mjs";
+
+const configHome = mkdtempSync(join(tmpdir(), "gh-glance-pty-cache-"));
+const cachePath = join(configHome, "gh-glance", "dashboard-cache.json");
+const rateLimited = {
+  GH_GLANCE_FIXTURE_FAIL: "HTTP 403: API rate limit exceeded",
+  GH_GLANCE_FIXTURE_FAIL_ON: "run,issue,pr,api-data",
+};
+
+let warm;
+let recovered;
+let securityRecovered;
+let isolated;
+try {
+  warm = capture({
+    cols: 80,
+    rows: 24,
+    settle: 4,
+    args: "--repo acme/widget",
+    env: { GH_GLANCE_FIXTURE_SECURITY_ALERTS: "1" },
+    configHome,
+  });
+
+  // Make staleness deterministic without a 30-second sleep. This is the same
+  // versioned file the first real process wrote; only its success clocks move.
+  const document = JSON.parse(readFileSync(cachePath, "utf8"));
+  const old = Date.now() - 120_000;
+  for (const entry of Object.values(document.targets)) {
+    entry.updatedAt = old;
+    for (const tab of Object.values(entry.tabs)) {
+      tab.lastOk = old;
+      tab.meta.at = old;
+    }
+  }
+  writeFileSync(cachePath, `${JSON.stringify(document, null, 2)}\n`, "utf8");
+
+  recovered = capture({
+    cols: 80,
+    rows: 24,
+    settle: 12,
+    args: "--repo acme/widget",
+    env: { ...rateLimited, GH_GLANCE_FIXTURE_RATE_REMAINING: "1000" },
+    configHome,
+  });
+  securityRecovered = capture({
+    cols: 80,
+    rows: 24,
+    settle: 4,
+    args: "--repo acme/widget --tab security",
+    env: rateLimited,
+    configHome,
+  });
+  isolated = capture({
+    cols: 80,
+    rows: 24,
+    settle: 4,
+    args: "--repo acme/other",
+    env: rateLimited,
+    configHome,
+  });
+} finally {
+  // This exact directory came from the mkdtempSync call above.
+  rmSync(configHome, { recursive: true, force: true });
+}
+
+const screenOf = (result) => result.finalFrame.lines.join("\n");
+const assertTerminalContract = (result) => {
+  assert.equal(result.finalFrame.lines.length, 23);
+  assert.ok(result.finalFrame.widest <= 80);
+  assert.equal(result.liveScreen.lines.at(-1), "");
+  assert.equal(result.liveScreen.maxStatusLines, 1);
+  assert.equal(result.altEnter, 1);
+  assert.equal(result.altExit, 1);
+  assert.equal(result.afterRestore.hasScrollbackErase, false);
+  assert.equal(result.afterRestore.hasClear, false);
+  assert.equal(result.afterRestore.visible, "");
+};
+
+test("a healthy process writes dashboard state for restart", () => {
+  assert.ok(warm.fixtureCalls.some((call) => call.startsWith("run list")));
+  assert.match(screenOf(warm), /ci: pin actions to commit/);
+});
+
+test("same-target restart keeps stale Actions rows under a live rate-limit error", () => {
+  const screen = screenOf(recovered);
+  assert.ok(recovered.fixtureCalls.some((call) => call.startsWith("run list")));
+  assert.match(screen, /GitHub rate limit reached -- backing off/);
+  assert.match(screen, /stale 2m/);
+  assert.match(screen, /throttled \d+s/);
+  assert.match(screen, /ci: pin actions to commit/);
+  assert.match(screen, /4 of 4/);
+  assert.ok(recovered.fixtureCalls.some((call) => call.startsWith("api rate_limit")));
+  assertTerminalContract(recovered);
+});
+
+test("a blind Security refresh preserves cached alerts", () => {
+  const screen = screenOf(securityRecovered);
+  assert.match(screen, /cached dependency alert/);
+  assert.match(screen, /Security \(\?\)/);
+  assertTerminalContract(securityRecovered);
+});
+
+test("a different repository target never receives cached rows", () => {
+  const screen = screenOf(isolated);
+  assert.match(screen, /GitHub rate limit reached -- backing off/);
+  assert.doesNotMatch(screen, /ci: pin actions to commit/);
+  assert.doesNotMatch(screen, /4 of 4/);
+  assertTerminalContract(isolated);
+});

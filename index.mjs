@@ -3089,7 +3089,8 @@ const createWidthPreferenceWriter = createCoalescedWriter;
 // ---------- Last-known-good dashboard cache ----------
 
 const DASHBOARD_CACHE_VERSION = 1;
-const MAX_DASHBOARD_CACHE_TARGETS = 20;
+const MAX_DASHBOARD_CACHE_TARGETS = 5;
+const MAX_DASHBOARD_CACHE_ROWS_PER_TAB = 60;
 let dashboardCacheTempSequence = 0;
 
 function dashboardCachePath(options = {}) {
@@ -3179,12 +3180,16 @@ function normalizeDashboardCacheEntry(entry) {
     ) {
       continue;
     }
-    const data = tab.data.map((item) => normalizeCachedItem(tabKey, item)).filter(Boolean);
+    const normalizedData = tab.data.map((item) => normalizeCachedItem(tabKey, item)).filter(Boolean);
     // A malformed row means this tab was not written by the current schema.
     // Reject the tab rather than turning a corrupt non-empty payload into a
     // confident empty state.
-    if (data.length !== tab.data.length) continue;
-    const meta = { at: tab.meta.at, truncated: tab.meta.truncated };
+    if (normalizedData.length !== tab.data.length) continue;
+    const data = normalizedData.slice(0, MAX_DASHBOARD_CACHE_ROWS_PER_TAB);
+    const meta = {
+      at: tab.meta.at,
+      truncated: tab.meta.truncated || normalizedData.length > MAX_DASHBOARD_CACHE_ROWS_PER_TAB,
+    };
     tabs[tabKey] = { data, meta, lastOk };
   }
   if (Object.keys(tabs).length === 0) return null;
@@ -3293,6 +3298,11 @@ function saveDashboardCache(path, cache, { normalized = false } = {}) {
     }
     return { ok: false, error };
   }
+}
+
+function nextSecurityRaw(previousRaw, raw, blind) {
+  if (blind === true) return null;
+  return previousRaw === raw ? previousRaw : raw;
 }
 
 // Below this the full column set cannot render without its fixed columns
@@ -4221,14 +4231,26 @@ function App({ onCreateRemote = () => {} } = {}) {
           // would allocate a new object every tick and permanently defeat the
           // React bail-out this early return exists to preserve.
           const completedAt = Date.now();
-          lastOkRef.current[key] = completedAt;
-          // Clear on the first success or a single failure latches the ladder.
-          clearBackoff(`tab:${key}`);
           if (rawRef.current[key] === raw) {
+            lastOkRef.current[key] = completedAt;
+            // Clear on the first success or a single failure latches the ladder.
+            clearBackoff(`tab:${key}`);
             setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
             return;
           }
           const value = parse();
+          // Security fetches resolve each source independently so their notes
+          // remain visible. A blind result is still a failed observation: it
+          // must not replace known alerts with a false empty state or advance
+          // freshness. Do not retain its raw value either, so the next source
+          // retry is parsed instead of taking the identical-payload fast path.
+          if (key === "security" && value.blind) {
+            rawRef.current[key] = nextSecurityRaw(rawRef.current[key], raw, true);
+            setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
+            setSecurityNotes(value.notes ?? []);
+            setSecurityBlind(true);
+            return;
+          }
           const tabData = value.alerts ?? value;
           const tabMeta = {
             at: completedAt,
@@ -4237,7 +4259,10 @@ function App({ onCreateRemote = () => {} } = {}) {
             // marker lie for one cycle after every resize.
             truncated: value.truncated ?? tabData.length >= limit,
           };
-          rawRef.current[key] = raw;
+          lastOkRef.current[key] = completedAt;
+          clearBackoff(`tab:${key}`);
+          rawRef.current[key] =
+            key === "security" ? nextSecurityRaw(rawRef.current[key], raw, false) : raw;
           setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
           setData((d) => ({ ...d, [key]: tabData }));
           setMeta((m) => ({ ...m, [key]: tabMeta }));
@@ -5103,6 +5128,7 @@ export {
   serializeDashboardCache,
   loadDashboardCache,
   saveDashboardCache,
+  nextSecurityRaw,
   runStatusIcon,
   RUN_STATUS_ICON,
   SEVERITY_STYLE,

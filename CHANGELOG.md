@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Status updates no longer accumulate old footer lines during a prolonged
+  rate-limit window.** The incremental frame now leaves the terminal's physical
+  bottom row unused, so changing fetching, stale, and throttle labels cannot
+  scroll earlier copies upward through the dashboard.
+- **Last-known-good rows survive a restart while GitHub is rate-limiting.** A
+  live rate-limit banner remains visible above the cached rows, and their age is
+  reported through the existing `stale` label. The target-scoped cache lives in
+  gh-glance's user config directory beside `preferences.json`; its directory is
+  restricted to `0700` and the file to `0600` on POSIX systems.
+
 ## [0.7.0] - 2026-08-10
 
 ### Added

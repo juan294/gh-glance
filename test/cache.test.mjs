@@ -17,6 +17,7 @@ import {
   dashboardCachePath,
   dashboardCacheTarget,
   loadDashboardCache,
+  nextSecurityRaw,
   saveDashboardCache,
   serializeDashboardCache,
 } from "../index.mjs";
@@ -159,6 +160,48 @@ test("valid dashboard data round-trips by target and tab", () => {
     assert.deepEqual(loadDashboardCache(path, secondTarget).entry, before[secondTarget]);
     assert.deepEqual(cache, before, "cache persistence must not mutate live session state");
   });
+});
+
+test("dashboard cache bounds recent targets and rows", () => {
+  withTemporaryRoot((root) => {
+    const path = cachePath(root);
+    const targets = Array.from({ length: 6 }, (_, index) =>
+      dashboardCacheTarget({ repo: `acme/repo-${index}`, host: "github.com", cwd: root }),
+    );
+    const cache = Object.fromEntries(
+      targets.map((target, index) => {
+        const tab = actionsTab(`target ${index}`);
+        tab.data = Array.from({ length: 61 }, (_, row) => ({
+          ...tab.data[0],
+          databaseId: index * 1000 + row,
+          displayTitle: `target ${index} row ${row}`,
+        }));
+        return [
+          target,
+          {
+            tabs: { actions: tab },
+            securityNotes: [],
+            securityBlind: false,
+            updatedAt: NOW + index,
+          },
+        ];
+      }),
+    );
+
+    assert.equal(saveDashboardCache(path, cache).ok, true);
+    const document = JSON.parse(readFileSync(path, "utf8"));
+    assert.equal(Object.keys(document.targets).length, 5);
+    assert.equal(Object.hasOwn(document.targets, targets[0]), false);
+    assert.equal(document.targets[targets.at(-1)].tabs.actions.data.length, 60);
+    assert.equal(document.targets[targets.at(-1)].tabs.actions.meta.truncated, true);
+  });
+});
+
+test("a blind Security result forces an identical healthy payload to commit again", () => {
+  const healthyRaw = '[{"number":1}]';
+  const afterBlind = nextSecurityRaw(healthyRaw, "unavailable:rate limit", true);
+  assert.equal(afterBlind, null);
+  assert.equal(nextSecurityRaw(afterBlind, healthyRaw, false), healthyRaw);
 });
 
 test("invalid tabs are ignored independently", () => {
