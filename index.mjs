@@ -24,6 +24,7 @@ process.env.NODE_ENV ??= "production";
 
 import { execFile, spawn } from "node:child_process";
 import {
+  chmodSync,
   mkdirSync,
   readFileSync,
   realpathSync,
@@ -2981,8 +2982,8 @@ function saveWidthPreferences(path, overrides, tabs = TABS) {
   }
 }
 
-function createWidthPreferenceWriter({ write, delay = 200, onResult = () => {} }) {
-  let latest = EMPTY_WIDTH_OVERRIDES;
+function createCoalescedWriter({ write, delay = 200, onResult = () => {} }) {
+  let latest;
   let generation = 0;
   let persistedGeneration = 0;
   let timer = null;
@@ -3081,6 +3082,217 @@ function createWidthPreferenceWriter({ write, delay = 200, onResult = () => {} }
     flush,
     dispose: flush,
   };
+}
+
+const createWidthPreferenceWriter = createCoalescedWriter;
+
+// ---------- Last-known-good dashboard cache ----------
+
+const DASHBOARD_CACHE_VERSION = 1;
+const MAX_DASHBOARD_CACHE_TARGETS = 20;
+let dashboardCacheTempSequence = 0;
+
+function dashboardCachePath(options = {}) {
+  return join(dirname(widthPreferencesPath(options)), "dashboard-cache.json");
+}
+
+// Explicit targets are stable across working directories. In inferred mode the
+// directory is the only repository identity available without making another
+// GitHub call -- exactly the call that cannot succeed when this cache is needed.
+// JSON encoding avoids delimiter ambiguity in host, repo, and path strings.
+function dashboardCacheTarget({ repo = null, ghRepo = null, host = null, cwd = process.cwd() } = {}) {
+  const target = repo || ghRepo;
+  return target
+    ? JSON.stringify({ kind: "repo", host: String(host ?? ""), repo: String(target) })
+    : JSON.stringify({ kind: "cwd", host: String(host ?? ""), cwd: String(cwd) });
+}
+
+function cacheTimestamp(value) {
+  return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function normalizeCachedItem(tabKey, item) {
+  if (!isRecord(item)) return null;
+  if (tabKey === "actions") {
+    if (!Number.isSafeInteger(item.databaseId)) return null;
+    return {
+      databaseId: item.databaseId,
+      displayTitle: safe(item.displayTitle),
+      workflowName: safe(item.workflowName),
+      number: Number.isSafeInteger(item.number) ? item.number : null,
+      headBranch: safe(item.headBranch),
+      status: safe(item.status),
+      conclusion: item.conclusion == null ? null : safe(item.conclusion),
+      startedAt: safe(item.startedAt),
+      updatedAt: safe(item.updatedAt),
+    };
+  }
+  if (tabKey === "issues") {
+    if (!Number.isSafeInteger(item.number)) return null;
+    return {
+      number: item.number,
+      title: safe(item.title),
+      author: safe(item.author),
+      label: safe(item.label),
+      updatedAt: safe(item.updatedAt),
+    };
+  }
+  if (tabKey === "prs") {
+    if (!Number.isSafeInteger(item.number)) return null;
+    return {
+      number: item.number,
+      title: safe(item.title),
+      author: safe(item.author),
+      headRefName: safe(item.headRefName),
+      isDraft: Boolean(item.isDraft),
+      reviewDecision: safe(item.reviewDecision),
+      updatedAt: safe(item.updatedAt),
+    };
+  }
+  if (tabKey === "security") {
+    const id = safe(item.id);
+    if (!id) return null;
+    return {
+      id,
+      kind: safe(item.kind),
+      severity: safe(item.severity),
+      title: safe(item.title),
+      detail: safe(item.detail),
+      createdAt: safe(item.createdAt),
+    };
+  }
+  return null;
+}
+
+function normalizeDashboardCacheEntry(entry) {
+  if (!isRecord(entry) || !isRecord(entry.tabs)) return null;
+  const tabs = {};
+  for (const tabKey of TAB_KEYS) {
+    const tab = entry.tabs[tabKey];
+    if (!isRecord(tab) || !Array.isArray(tab.data)) continue;
+    const lastOk = cacheTimestamp(tab.lastOk);
+    if (
+      lastOk === null ||
+      !isRecord(tab.meta) ||
+      cacheTimestamp(tab.meta.at) === null ||
+      typeof tab.meta.truncated !== "boolean"
+    ) {
+      continue;
+    }
+    const data = tab.data.map((item) => normalizeCachedItem(tabKey, item)).filter(Boolean);
+    // A malformed row means this tab was not written by the current schema.
+    // Reject the tab rather than turning a corrupt non-empty payload into a
+    // confident empty state.
+    if (data.length !== tab.data.length) continue;
+    const meta = { at: tab.meta.at, truncated: tab.meta.truncated };
+    tabs[tabKey] = { data, meta, lastOk };
+  }
+  if (Object.keys(tabs).length === 0) return null;
+  const latestTab = Math.max(...Object.values(tabs).map((tab) => tab.lastOk));
+  return {
+    tabs,
+    securityNotes: Array.isArray(entry.securityNotes)
+      ? entry.securityNotes
+          .filter((note) => typeof note === "string")
+          .slice(0, ALERT_SOURCES.length)
+          .map((note) => safe(note))
+      : [],
+    securityBlind: typeof entry.securityBlind === "boolean" ? entry.securityBlind : false,
+    updatedAt: cacheTimestamp(entry.updatedAt) ?? latestTab,
+  };
+}
+
+function normalizeDashboardCache(cache) {
+  if (!isRecord(cache)) return {};
+  return limitDashboardCache(
+    Object.fromEntries(
+      Object.entries(cache)
+        .map(([target, entry]) => [target, normalizeDashboardCacheEntry(entry)])
+        .filter(([target, entry]) => target.length > 0 && entry !== null),
+    ),
+  );
+}
+
+function limitDashboardCache(cache) {
+  return Object.fromEntries(
+    Object.entries(cache)
+      .sort((left, right) => right[1].updatedAt - left[1].updatedAt)
+      .slice(0, MAX_DASHBOARD_CACHE_TARGETS),
+  );
+}
+
+function mergeDashboardCacheEntry(cache, target, entry) {
+  const normalized = normalizeDashboardCacheEntry(entry);
+  return normalized === null ? cache : limitDashboardCache({ ...cache, [target]: normalized });
+}
+
+function decodeDashboardCache(raw) {
+  let document;
+  try {
+    document = JSON.parse(raw);
+  } catch (error) {
+    return { cache: {}, error };
+  }
+  if (
+    !isRecord(document) ||
+    document.version !== DASHBOARD_CACHE_VERSION ||
+    !isRecord(document.targets)
+  ) {
+    return { cache: {}, error: new Error("Unsupported dashboard cache document") };
+  }
+  return { cache: normalizeDashboardCache(document.targets), error: null };
+}
+
+function serializeDashboardCache(cache, { normalized = false } = {}) {
+  return `${JSON.stringify(
+    { version: DASHBOARD_CACHE_VERSION, targets: normalized ? cache : normalizeDashboardCache(cache) },
+    null,
+    2,
+  )}\n`;
+}
+
+function loadDashboardCache(path, target) {
+  let raw;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    return error?.code === "ENOENT"
+      ? { cache: {}, entry: null, error: null }
+      : { cache: {}, entry: null, error };
+  }
+  const decoded = decodeDashboardCache(raw);
+  return {
+    cache: decoded.cache,
+    entry: pick(decoded.cache, target, null),
+    error: decoded.error,
+  };
+}
+
+function saveDashboardCache(path, cache, { normalized = false } = {}) {
+  let tempPath = null;
+  try {
+    const parent = dirname(path);
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    if (process.platform !== "win32") chmodSync(parent, 0o700);
+    dashboardCacheTempSequence += 1;
+    tempPath = `${path}.${process.pid}.${Date.now()}.${dashboardCacheTempSequence}.tmp`;
+    writeFileSync(tempPath, serializeDashboardCache(cache, { normalized }), {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    renameSync(tempPath, path);
+    return { ok: true };
+  } catch (error) {
+    if (tempPath !== null) {
+      try {
+        unlinkSync(tempPath);
+      } catch {
+        // The write may have failed before creating this exact temporary file.
+      }
+    }
+    return { ok: false, error };
+  }
 }
 
 // Below this the full column set cannot render without its fixed columns
@@ -3409,19 +3621,42 @@ function App({ onCreateRemote = () => {} } = {}) {
       void widthPreferenceWriter.dispose();
     };
   }, [widthPreferenceWriter]);
+  const [cachePath] = useState(() => dashboardCachePath());
+  const [cacheTarget] = useState(() =>
+    dashboardCacheTarget({
+      repo: runtime.repo,
+      ghRepo: process.env.GH_REPO,
+      host: runtime.host ?? process.env.GH_HOST,
+      cwd: process.cwd(),
+    }),
+  );
+  const [loadedCache] = useState(() => loadDashboardCache(cachePath, cacheTarget));
+  const dashboardCacheRef = useRef(loadedCache.cache);
+  const dashboardCacheTargetRef = useRef(cacheTarget);
+  const [dashboardCacheWriter] = useState(() =>
+    createCoalescedWriter({
+      write: (cache) => saveDashboardCache(cachePath, cache, { normalized: true }),
+    }),
+  );
+  useEffect(() => () => {
+    // Production writes start synchronously, so a pending latest snapshot is
+    // not lost on quit. The cache is bounded; ignoring the advisory result keeps
+    // a filesystem error from replacing terminal teardown.
+    void dashboardCacheWriter.dispose();
+  }, [dashboardCacheWriter]);
+  const cachedEntry = loadedCache.entry;
   // `null` means "never resolved" -- distinct from `[]`, which means "resolved
   // and genuinely empty". The tab bar and the body render those differently.
-  const [data, setData] = useState({ actions: null, issues: null, prs: null, security: null });
-  const [meta, setMeta] = useState({
-    actions: null,
-    issues: null,
-    prs: null,
-    security: null,
-  });
-  const [securityNotes, setSecurityNotes] = useState([]);
+  const [data, setData] = useState(() =>
+    Object.fromEntries(TABS.map((candidate) => [candidate.key, cachedEntry?.tabs[candidate.key]?.data ?? null])),
+  );
+  const [meta, setMeta] = useState(() =>
+    Object.fromEntries(TABS.map((candidate) => [candidate.key, cachedEntry?.tabs[candidate.key]?.meta ?? null])),
+  );
+  const [securityNotes, setSecurityNotes] = useState(() => cachedEntry?.securityNotes ?? []);
   // Whether the Security tab is currently unable to see its endpoints, as
   // opposed to seeing that they are switched off. Drives the count marker.
-  const [securityBlind, setSecurityBlind] = useState(false);
+  const [securityBlind, setSecurityBlind] = useState(() => cachedEntry?.securityBlind ?? false);
   // The `?` overlay. Renders only on a keypress, so consecutive idle frames are
   // still byte-identical and the redraw suppression is untouched.
   const [showHelp, setShowHelp] = useState(false);
@@ -3509,12 +3744,18 @@ function App({ onCreateRemote = () => {} } = {}) {
 
   const inFlightRef = useRef({});
   const rawRef = useRef({});
-  const cleanRef = useRef({});
   // Last *successful* poll per tab, wall-clock. Wall-clock on purpose: a laptop
   // sleeping is exactly the gap this is meant to report, and a monotonic clock
   // does not advance across suspend. Never written on the failure path, or a
   // persistently failing tab would report itself fresh forever.
-  const lastOkRef = useRef({});
+  const lastOkRef = useRef(
+    Object.fromEntries(
+      TABS.flatMap((candidate) => {
+        const lastOk = cachedEntry?.tabs[candidate.key]?.lastOk;
+        return lastOk == null ? [] : [[candidate.key, lastOk]];
+      }),
+    ),
+  );
   const fetchTabRef = useRef(null);
   const contextCoordinatorRef = useRef(null);
 
@@ -3881,10 +4122,10 @@ function App({ onCreateRemote = () => {} } = {}) {
   // -- the behaviour the per-tab guard and the fetch-time limit read were
   // written to prevent. Do not "fix" this by adding them.
   //
-  // exhaustive-deps is satisfied as written -- every captured value is either a
-  // ref or a setState function, both of which the rule treats as stable -- so
-  // this needs no suppression, and if one ever becomes necessary that is the
-  // signal that a real dependency crept in.
+  // exhaustive-deps is satisfied as written -- every captured value is a ref,
+  // a setState function, or the stable cache writer created once above. If a
+  // changing dependency ever becomes necessary, that is the signal that the
+  // mount-only contract has been broken.
   //
   // The adaptive throttle re-arms the timer, which is not a contradiction of the
   // above: `rearm` swaps the interval from *inside* this effect, so the effect
@@ -3914,6 +4155,32 @@ function App({ onCreateRemote = () => {} } = {}) {
       fallback: withTargetHost(missingFailureContext()),
     });
     contextCoordinatorRef.current = coordinator;
+
+    function cacheSuccessfulTab(key, tabData, tabMeta, lastOk, security = {}) {
+      const target = dashboardCacheTargetRef.current;
+      const currentCache = dashboardCacheRef.current;
+      const currentEntry = pick(currentCache, target, null) ?? {
+        tabs: {},
+        securityNotes: [],
+        securityBlind: false,
+        updatedAt: lastOk,
+      };
+      const nextEntry = {
+        ...currentEntry,
+        tabs: {
+          ...currentEntry.tabs,
+          [key]: { data: tabData, meta: tabMeta, lastOk },
+        },
+        securityNotes:
+          key === "security" ? (security.notes ?? []) : currentEntry.securityNotes,
+        securityBlind:
+          key === "security" ? Boolean(security.blind) : currentEntry.securityBlind,
+        updatedAt: lastOk,
+      };
+      const nextCache = mergeDashboardCacheEntry(currentCache, target, nextEntry);
+      dashboardCacheRef.current = nextCache;
+      dashboardCacheWriter.schedule(nextCache);
+    }
 
     // Each tab commits its own result the moment it lands instead of waiting on
     // a Promise.allSettled barrier. Actions is by far the slowest fetch, so
@@ -3953,32 +4220,35 @@ function App({ onCreateRemote = () => {} } = {}) {
           // completely healthy. A ref rather than state because writing state here
           // would allocate a new object every tick and permanently defeat the
           // React bail-out this early return exists to preserve.
-          lastOkRef.current[key] = Date.now();
+          const completedAt = Date.now();
+          lastOkRef.current[key] = completedAt;
           // Clear on the first success or a single failure latches the ladder.
           clearBackoff(`tab:${key}`);
-          if (rawRef.current[key] === raw && cleanRef.current[key]) {
+          if (rawRef.current[key] === raw) {
             setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
             return;
           }
           const value = parse();
+          const tabData = value.alerts ?? value;
+          const tabMeta = {
+            at: completedAt,
+            // Compare against the limit this payload was actually fetched
+            // with. Comparing against the live pane-height ref made the "n+"
+            // marker lie for one cycle after every resize.
+            truncated: value.truncated ?? tabData.length >= limit,
+          };
           rawRef.current[key] = raw;
-          cleanRef.current[key] = true;
           setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
-          setData((d) => ({ ...d, [key]: value.alerts ?? value }));
-          setMeta((m) => ({
-            ...m,
-            [key]: {
-              at: Date.now(),
-              // Compare against the limit this payload was actually fetched
-              // with. Comparing against the live pane-height ref made the "n+"
-              // marker lie for one cycle after every resize.
-              truncated: value.truncated ?? (value.alerts ?? value).length >= limit,
-            },
-          }));
+          setData((d) => ({ ...d, [key]: tabData }));
+          setMeta((m) => ({ ...m, [key]: tabMeta }));
           if (value.notes) setSecurityNotes(value.notes);
           if (key === "security") {
             setSecurityBlind((b) => (b === Boolean(value.blind) ? b : Boolean(value.blind)));
           }
+          cacheSuccessfulTab(key, tabData, tabMeta, completedAt, {
+            notes: value.notes,
+            blind: value.blind,
+          });
         })
         .catch((err) => {
           // A rejected fetch carries no result, so its own spend is unknowable
@@ -3987,7 +4257,6 @@ function App({ onCreateRemote = () => {} } = {}) {
           // errs toward throttling harder, which is the safe direction.
           restSpentTotal += REST_PER_FETCH[key] ?? 0;
           if (cancelled || err?.name === "AbortError") return;
-          cleanRef.current[key] = false;
           // Preserve both the verdict and the bounded raw error in state. The
           // renderer translates recognized verdicts at draw time, which lets a
           // later repository/account context refine the one-line remedy without
@@ -4121,7 +4390,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       // needed.
       controller.abort();
     };
-  }, []);
+  }, [dashboardCacheWriter]);
 
   // Background tabs can be up to BACKGROUND_EVERY ticks stale, so the tab you
   // switch to refreshes straight away rather than showing old data until its
@@ -4828,6 +5097,12 @@ export {
   loadWidthPreferences,
   saveWidthPreferences,
   createWidthPreferenceWriter,
+  DASHBOARD_CACHE_VERSION,
+  dashboardCachePath,
+  dashboardCacheTarget,
+  serializeDashboardCache,
+  loadDashboardCache,
+  saveDashboardCache,
   runStatusIcon,
   RUN_STATUS_ICON,
   SEVERITY_STYLE,

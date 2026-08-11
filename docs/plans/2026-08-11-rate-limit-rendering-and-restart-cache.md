@@ -55,7 +55,7 @@ part of the contract, not an implementation detail.
 | # | Phase | Batch | Done |
 |---|---|---|---|
 | 1 | Give incremental rendering a physical guard row | no | [x] |
-| 2 | Add the versioned last-known-good cache | no | [ ] |
+| 2 | Add the versioned last-known-good cache | no | [x] |
 | 3 | Prove restart recovery end to end and document the behavior | no | [ ] |
 
 No phase is `[batch-eligible]`. Phases 1 and 2 both edit `index.mjs`; Phase 3
