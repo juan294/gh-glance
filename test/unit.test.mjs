@@ -2354,6 +2354,32 @@ test("manual priority wins but never bypasses the reserve", () => {
   assert.equal(denied.denied[0].mode, "paused");
 });
 
+test("manual and diagnostic requests from several leases remain lane paced", () => {
+  const leaseIds = ["manual-a", "diagnostic-b", "manual-c", "diagnostic-d"];
+  const leases = Object.fromEntries(leaseIds.map((id) => [id, policyLease(id)]));
+  const budget = policyBudget();
+  const decision = resourceDecision({ budget, resource: "graphql", cost: 1, nowMs: POLICY_NOW });
+  const laneInterval = 1 / decision.callsPerMs;
+  const scheduled = scheduleIntents({
+    intents: leaseIds.map((leaseId, index) => ({
+      id: `priority-${index}`,
+      leaseId,
+      priority: index % 2 === 0 ? "manual" : "diagnostic",
+      costs: { core: 0, graphql: 1 },
+      expiresAt: POLICY_NOW + 10_000,
+    })),
+    leases,
+    budgets: { graphql: budget },
+    nowMs: POLICY_NOW,
+  });
+  assert.equal(scheduled.grants.length, leaseIds.length);
+  const grantTimes = scheduled.grants.map(({ notBefore }) => notBefore);
+  assert.ok(grantTimes[0] >= POLICY_NOW);
+  for (let index = 1; index < grantTimes.length; index += 1) {
+    assert.ok(grantTimes[index] - grantTimes[index - 1] >= laneInterval);
+  }
+});
+
 test("tab intents derive registry costs and reject conflicting overrides", () => {
   const result = scheduleIntents({
     intents: [

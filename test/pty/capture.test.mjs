@@ -1,7 +1,33 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { parseCapture } from "./capture.mjs";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const RUN = join(HERE, "run.sh");
+
+async function waitFor(predicate, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error("timed out waiting for PTY harness evidence");
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
 
 const ESC = "\x1b";
 const ALT_ENTER = `${ESC}[?1049h`;
@@ -67,4 +93,36 @@ test("terminal replay retains transient status accumulation evidence", () => {
 
   assert.equal(parsed.liveScreen.statusLines, 1);
   assert.equal(parsed.liveScreen.maxStatusLines, 2);
+});
+
+test("capture termination reaps the full stdin producer and script trees", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-capture-cleanup-"));
+  const out = join(root, "capture.txt");
+  const producerPath = `${out}.producer`;
+  const childPath = `${out}.producer-child`;
+  const harness = spawn("/bin/sh", [
+    RUN,
+    "60",
+    "16",
+    out,
+    "none",
+    "30",
+    `printf '%s' "$$" > "$GH_GLANCE_CAPTURE_OUT.producer"; ` +
+      `sleep 300 & child=$!; printf '%s' "$child" > "$GH_GLANCE_CAPTURE_OUT.producer-child"; wait "$child"`,
+  ], { stdio: "ignore" });
+  const tracked = [];
+  t.after(() => {
+    try { harness.kill("SIGKILL"); } catch { /* already stopped */ }
+    for (const pid of tracked) {
+      try { process.kill(pid, "SIGKILL"); } catch { /* already stopped */ }
+    }
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  await waitFor(() => existsSync(producerPath) && existsSync(childPath));
+  tracked.push(Number(readFileSync(producerPath, "utf8")), Number(readFileSync(childPath, "utf8")));
+  harness.kill("SIGTERM");
+  await new Promise((resolve) => harness.once("exit", resolve));
+  await waitFor(() => tracked.every((pid) => !processIsAlive(pid)));
+  assert.ok(tracked.every((pid) => !processIsAlive(pid)));
 });

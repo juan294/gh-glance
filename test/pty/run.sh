@@ -27,6 +27,8 @@ STDIN_SCRIPT="${6:-}"
 # exactly what the routing tests assert on.
 APP_ARGS="${7:-}"
 CAPTURE_PID=""
+STDIN_PID=""
+PIPE_ROOT=""
 
 terminate_tree() {
   for child in $(pgrep -P "$1" 2>/dev/null); do
@@ -38,6 +40,13 @@ terminate_tree() {
 cleanup_capture() {
   if [ -n "$CAPTURE_PID" ]; then
     terminate_tree "$CAPTURE_PID"
+  fi
+  if [ -n "$STDIN_PID" ]; then
+    terminate_tree "$STDIN_PID"
+  fi
+  if [ -n "$PIPE_ROOT" ]; then
+    rm -f "$PIPE_ROOT/producer.pid"
+    rmdir "$PIPE_ROOT" 2>/dev/null || true
   fi
 }
 trap cleanup_capture EXIT HUP INT TERM
@@ -92,6 +101,15 @@ else
     printf '\nEXITCODE=%s\n' \"\$?\""
 fi
 
+# Give the stdin producer and script process separate roots. A background shell
+# pipeline exposes only its final PID through `$!`; when a capture timed out that
+# left the producer (and any sleep feeding it) reparented under init. The first
+# shell records its own PID before exec while retaining the pipe input that BSD
+# script(1) requires.
+if [ -n "$STDIN_SCRIPT" ]; then
+  PIPE_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/gh-glance-pty-pipe.XXXXXX") || exit 1
+fi
+
 # The exit code is echoed into the capture rather than read from script(1),
 # because BSD propagates the child's status automatically while GNU only does so
 # with -e. Reading it in-band is identical on both.
@@ -99,7 +117,10 @@ if script --version 2>/dev/null | grep -q util-linux; then
   # GNU: command is one shell string via -c, outfile is the last positional,
   # and -e is REQUIRED for exit propagation.
   if [ -n "$STDIN_SCRIPT" ]; then
-    printf '%s' "$STDIN_SCRIPT" | GH_GLANCE_CAPTURE_OUT="$OUT" sh | script -q -e -c "$INNER" "$OUT" >/dev/null 2>&1 &
+    GH_GLANCE_CAPTURE_OUT="$OUT" GH_GLANCE_CAPTURE_STDIN="$STDIN_SCRIPT" \
+      GH_GLANCE_CAPTURE_PID_FILE="$PIPE_ROOT/producer.pid" \
+      sh -c 'printf "%s\n" "$$" > "$GH_GLANCE_CAPTURE_PID_FILE"; exec sh -c "$GH_GLANCE_CAPTURE_STDIN"' | \
+      script -q -e -c "$INNER" "$OUT" >/dev/null 2>&1 &
   else
     script -q -e -c "$INNER" "$OUT" </dev/null >/dev/null 2>&1 &
   fi
@@ -110,16 +131,32 @@ else
   # file with rc=1 -- indistinguishable from "the app never rendered" unless the
   # caller checks, which is why capture.mjs treats an empty file as an error.
   if [ -n "$STDIN_SCRIPT" ]; then
-    printf '%s' "$STDIN_SCRIPT" | GH_GLANCE_CAPTURE_OUT="$OUT" sh | script -q "$OUT" /bin/sh -c "$INNER" >/dev/null 2>&1 &
+    GH_GLANCE_CAPTURE_OUT="$OUT" GH_GLANCE_CAPTURE_STDIN="$STDIN_SCRIPT" \
+      GH_GLANCE_CAPTURE_PID_FILE="$PIPE_ROOT/producer.pid" \
+      sh -c 'printf "%s\n" "$$" > "$GH_GLANCE_CAPTURE_PID_FILE"; exec sh -c "$GH_GLANCE_CAPTURE_STDIN"' | \
+      script -q "$OUT" /bin/sh -c "$INNER" >/dev/null 2>&1 &
   else
     script -q "$OUT" /bin/sh -c "$INNER" </dev/null >/dev/null 2>&1 &
   fi
 fi
 
 CAPTURE_PID=$!
+if [ -n "$STDIN_SCRIPT" ]; then
+  while [ ! -s "$PIPE_ROOT/producer.pid" ] && kill -0 "$CAPTURE_PID" 2>/dev/null; do
+    sleep .01
+  done
+  if [ -s "$PIPE_ROOT/producer.pid" ]; then
+    STDIN_PID=$(sed -n '1p' "$PIPE_ROOT/producer.pid")
+  fi
+fi
 wait "$CAPTURE_PID"
 CAPTURE_STATUS=$?
 CAPTURE_PID=""
+if [ -n "$STDIN_PID" ]; then
+  terminate_tree "$STDIN_PID"
+  wait "$STDIN_PID" 2>/dev/null || true
+  STDIN_PID=""
+fi
 [ "$CAPTURE_STATUS" -eq 0 ] || exit "$CAPTURE_STATUS"
 
 [ -s "$OUT" ] || { echo "run.sh: capture is empty ($OUT)" >&2; exit 1; }

@@ -371,11 +371,7 @@ test("manual, diagnostic, tab-switch, active, and background requests share one 
     const operation = priority === "diagnostic" ? "doctor:repository" : "failure-context:repository";
     assert.deepEqual(OPERATION_COSTS[operation], { core: 0, graphql: 1 });
     const result = admitGovernorOperation(box.scope, leaseId, operation, priority, NOW);
-    if (["manual", "diagnostic"].includes(priority)) {
-      assert.equal(result.value.status, "started", priority);
-    } else {
-      assert.ok(["scheduled", "started"].includes(result.value.status), priority);
-    }
+    assert.ok(["scheduled", "started"].includes(result.value.status), priority);
   }
 });
 
@@ -509,7 +505,9 @@ test("abort and signal outcomes retain each operation's worst-case reservation",
   ]) {
     const at = Date.now();
     const box = sandbox(t, { authIdentity: `worst-case-${name}`, now: at });
-    const leaseId = randomUUID();
+    const epoch = `5000:${at + 3_600_000}`;
+    let leaseId = randomUUID();
+    while (governorPhaseOffset(leaseId, epoch) !== 0) leaseId = randomUUID();
     registerLease(box.scope, lease(leaseId, at));
     publishInitial(box.scope, leaseId, at, budgets(at, { remaining: 1010 }));
     const result = await runAdmittedOperation({
@@ -526,16 +524,15 @@ test("abort and signal outcomes retain each operation's worst-case reservation",
 });
 
 test("every doctor endpoint reserves its declared exact cost", (t) => {
-  const box = sandbox(t, { authIdentity: "doctor-costs" });
-  const leaseId = randomUUID();
-  registerLease(box.scope, lease(leaseId));
-  publishInitial(box.scope, leaseId);
-  for (const [name, , operation] of doctorProbePlan()) {
+  for (const [index, [name, , operation]] of doctorProbePlan().entries()) {
+    const box = sandbox(t, { authIdentity: `doctor-costs-${index}` });
+    const leaseId = randomUUID();
+    registerLease(box.scope, lease(leaseId));
+    publishInitial(box.scope, leaseId);
     const admitted = admitGovernorOperation(box.scope, leaseId, operation, "diagnostic", NOW);
-    assert.equal(admitted.value.status, "started", name);
+    assert.ok(["scheduled", "started"].includes(admitted.value.status), name);
     const reservation = inspectGovernor(box.scope, NOW).value.reservations[admitted.value.reservationId];
     assert.deepEqual(reservation.costs, operationCost(operation), name);
-    completeReservation(box.scope, admitted.value.reservationId, { outcome: "rejected" }, NOW);
   }
 });
 
@@ -734,6 +731,27 @@ test("the shared probe wrapper publishes once and failed probes pause only backg
     readBudgets: async (_signal, host) => { routedHost = host; return budgets(); },
   })).ok, true);
   assert.equal(routedHost, "tenant.ghe.com");
+
+  const inspectionBox = sandbox(t, { authIdentity: "immediate-inspection" });
+  const inspectionOwner = randomUUID();
+  const inspectionWaiter = randomUUID();
+  registerLease(inspectionBox.scope, lease(inspectionOwner));
+  registerLease(inspectionBox.scope, lease(inspectionWaiter));
+  assert.equal(claimProbe(inspectionBox.scope, inspectionOwner, NOW).value.status, "claimed");
+  let waits = 0;
+  const observedBudgets = Object.fromEntries(["core", "graphql"].map((resource) => [resource, {
+    observedAt: NOW,
+  }]));
+  const inspected = await refreshSharedBudget(inspectionBox.scope, inspectionWaiter, null, {
+    now: () => NOW,
+    wait: async () => { waits += 1; },
+    inspect: () => ({
+      ok: true,
+      value: { budgets: observedBudgets, probeOutcome: { status: "healthy" } },
+    }),
+  });
+  assert.equal(inspected.value.status, "published");
+  assert.equal(waits, 0);
 });
 
 test("probe drain and renewal failures release only their own barrier", async (t) => {

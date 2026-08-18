@@ -1507,20 +1507,14 @@ function scheduleIntents({
         continue;
       }
 
-      const phaseTimes = Object.fromEntries(resources.map((resource) => {
-        return [
-          resource,
-          intent.normalizedPriority === REQUEST_PRIORITIES.manual
-            ? nowMs
-            : governorEpochPhaseAt(intent.phaseSeed, decisions[resource]),
-        ];
-      }));
+      const phaseTimes = Object.fromEntries(resources.map((resource) => [
+        resource,
+        governorEpochPhaseAt(intent.phaseSeed, decisions[resource]),
+      ]));
       const notBefore = Math.max(
         nowMs,
         ...Object.values(phaseTimes),
-        ...(intent.normalizedPriority === REQUEST_PRIORITIES.manual
-          ? []
-          : resources.map((resource) => updatedLanes[resource]?.nextAt ?? nowMs)),
+        ...resources.map((resource) => updatedLanes[resource]?.nextAt ?? nowMs),
       );
       const expiring = resources.find((resource) => notBefore >= decisions[resource].resetMs);
       if (expiring) {
@@ -2584,7 +2578,6 @@ async function refreshSharedBudget(scope, leaseId, signal, {
     );
     let inspections = 0;
     while (!signal?.aborted && now() < deadline && inspections < 10) {
-      await wait(Math.min(100, Math.max(1, deadline - now())));
       inspections += 1;
       const snapshot = inspect(scope, now());
       if (!snapshot.ok) return snapshot;
@@ -2596,6 +2589,8 @@ async function refreshSharedBudget(scope, leaseId, signal, {
       ) {
         return { ok: true, value: { status: "published", budgets: snapshot.value.budgets } };
       }
+      if (now() >= deadline || inspections >= 10) break;
+      await wait(Math.min(100, Math.max(1, deadline - now())));
     }
     claim = claimProbe(scope, leaseId, now());
     if (!claim.ok || claim.value.status !== "claimed") return claim;
@@ -3174,12 +3169,12 @@ async function rateBudget(preloadedResources = null) {
     // Host-routed like every other `gh api` call: a budget is per token *per
     // server*, so on a GHES tenant the github.com numbers are not merely stale,
     // they belong to a different limit entirely.
-    const resources = preloadedResources ?? await readRateLimitResources();
+    const resources = normalizeRateBudgets(preloadedResources ?? await readRateLimitResources());
     // formatAge() is for timestamps in the past and returns "-" for a future one,
     // so the reset is rendered as a forward interval instead.
     const fmt = (r) => {
       if (!r) return "(absent)";
-      const inMs = r.reset * 1000 - Date.now();
+      const inMs = r.resetMs - Date.now();
       const resets = inMs > 0 ? `resets in ${formatDuration(inMs)}` : "reset due";
       return `${r.remaining}/${r.limit} left, ${resets}`;
     };
@@ -3214,6 +3209,13 @@ function normalizeRateBudget(resource) {
   };
 }
 
+function normalizeRateBudgets(resources) {
+  return Object.fromEntries(RATE_RESOURCES.map((resource) => [
+    resource,
+    normalizeRateBudget(resources?.[resource]),
+  ]));
+}
+
 async function readRateBudgets(signal, host = effectiveRuntimeHost()) {
   try {
     // apiHostArgs() for the same reason the alert endpoints carry it: --repo
@@ -3221,10 +3223,7 @@ async function readRateBudgets(signal, host = effectiveRuntimeHost()) {
     // flag this reads github.com's budget while the pane spends against the
     // tenant -- and then throttles, or fails to, against an unrelated number.
     const resources = await readRateLimitResources(signal, host);
-    return {
-      core: normalizeRateBudget(resources?.core),
-      graphql: normalizeRateBudget(resources?.graphql),
-    };
+    return normalizeRateBudgets(resources);
   } catch {
     // A probe failure must never be louder than the pane's own data: the loop
     // simply does not adapt this cycle and stays at whatever it last applied.
@@ -3260,6 +3259,37 @@ function doctorProbePlan() {
       ]),
     ),
   ];
+}
+
+async function mapAllSettledBounded(items, limit, map) {
+  const settled = Array(items.length);
+  let nextIndex = 0;
+  const worker = async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      [settled[index]] = await Promise.allSettled([map(items[index], index)]);
+    }
+  };
+  await Promise.allSettled(Array.from(
+    { length: Math.min(Math.max(1, limit), items.length) },
+    () => worker(),
+  ));
+  return settled;
+}
+
+function skippedDoctorProbe(name, args, admitted) {
+  return {
+    name,
+    args,
+    skipped: true,
+    classified: "skipped",
+    skipReason: admitted?.value?.resetMs
+      ? `budget paused; reset ${new Date(admitted.value.resetMs).toISOString()}`
+      : admitted?.value?.notBefore
+        ? `next safe slot ${new Date(admitted.value.notBefore).toISOString()}`
+        : "budget unavailable",
+  };
 }
 
 async function runDoctor() {
@@ -3298,40 +3328,44 @@ async function runDoctor() {
       demand: { core: 6, graphql: 2 },
     });
     try {
-      const normalized = resources && {
-        core: normalizeRateBudget(resources.core),
-        graphql: normalizeRateBudget(resources.graphql),
-      };
+      const normalized = resources && normalizeRateBudgets(resources);
       if (registered.ok && normalized?.core && normalized?.graphql) {
         const claim = claimProbe(scope, leaseId, nowMs);
         if (claim.value?.status === "claimed") {
           publishProbe(scope, leaseId, claim.value.nonce, normalized, nowMs);
         }
       }
-      for (const [name, args, operation] of probes) {
+      const admissionAt = Date.now();
+      const admittedProbes = probes.map(([name, args, operation], index) => {
         const admitted = registered.ok
-          ? admitGovernorOperation(scope, leaseId, operation, "diagnostic", Date.now())
+          ? admitGovernorOperation(scope, leaseId, operation, "diagnostic", admissionAt)
           : registered;
         if (!admitted?.ok || admitted.value.status !== "started") {
-          results.push({
-            name,
-            args,
-            skipped: true,
-            classified: "skipped",
-            skipReason: admitted?.value?.resetMs
-              ? `budget paused; reset ${new Date(admitted.value.resetMs).toISOString()}`
-              : admitted?.value?.notBefore
-                ? `next safe slot ${new Date(admitted.value.notBefore).toISOString()}`
-                : "budget unavailable",
-          });
-          continue;
+          return { index, skipped: skippedDoctorProbe(name, args, admitted) };
         }
-        const result = await probe(name, args, operation);
-        completeReservation(scope, admitted.value.reservationId, result.failed
+        return { index, name, args, operation, reservationId: admitted.value.reservationId };
+      });
+      results = admittedProbes.map((item) => item.skipped ?? null);
+      const runnable = admittedProbes.filter((item) => !item.skipped);
+      const settled = await mapAllSettledBounded(runnable, 4, async (item) => {
+        const result = await probe(item.name, item.args, item.operation);
+        completeReservation(scope, item.reservationId, result.failed
           ? { outcome: "rejected" }
-          : { outcome: "measured-success", actualCost: operationCost(operation) }, Date.now());
-        results.push(result);
-      }
+          : { outcome: "measured-success", actualCost: operationCost(item.operation) }, Date.now());
+        return result;
+      });
+      settled.forEach((outcome, index) => {
+        const item = runnable[index];
+        results[item.index] = outcome.status === "fulfilled"
+          ? outcome.value
+          : {
+            name: item.name,
+            args: item.args,
+            failed: true,
+            classified: "other",
+            stderr: shortErr(outcome.reason),
+          };
+      });
     } finally {
       const cleanup = { ...scope, identityProvider: null };
       releaseLease(cleanup, leaseId);
@@ -5322,7 +5356,7 @@ function pollSchedule({
     const activeHold = tabHold(activeKey, heldResources);
     if (activeHold.held) nextActiveAt = activeHold.retryAt;
     else {
-      due.push(activeKey);
+      due.push({ key: activeKey, kind: "active" });
       nextActiveAt = nowMs + floorMs;
     }
   }
@@ -5339,7 +5373,7 @@ function pollSchedule({
       }
     }
     if (selected >= 0) {
-      due.push(background[selected]);
+      due.push({ key: background[selected], kind: "background" });
       nextBackgroundIndex = (selected + 1) % background.length;
       nextBackgroundAt = nowMs + 4 * floorMs;
     } else {
@@ -5450,6 +5484,13 @@ function admitGovernorOperation(scope, leaseId, operation, priority, nowMs, inte
   return startReservation(scope, decision.value.reservationId, nowMs);
 }
 
+function governorOutcomeForError(error) {
+  if (error?.name === "AbortError") return "abort";
+  if (error?.signal) return "signal";
+  if (error?.code === "ETIMEDOUT") return "timeout";
+  return "rejected";
+}
+
 async function runAdmittedOperation({ scope, leaseId, operation, priority = "manual", signal, run }) {
   const admitted = admitGovernorOperation(scope, leaseId, operation, priority, Date.now());
   if (!admitted.ok || admitted.value.status !== "started") {
@@ -5471,10 +5512,7 @@ async function runAdmittedOperation({ scope, leaseId, operation, priority = "man
     }, Date.now());
     return { ok: true, value, reservationId };
   } catch (error) {
-    const outcome = error?.name === "AbortError"
-      ? "abort"
-      : error?.signal ? "signal" : error?.code === "ETIMEDOUT" ? "timeout" : "rejected";
-    completeReservation(scope, reservationId, { outcome }, Date.now());
+    completeReservation(scope, reservationId, { outcome: governorOutcomeForError(error) }, Date.now());
     return { ok: false, error, reservationId };
   }
 }
@@ -6569,10 +6607,9 @@ function App({ onCreateRemote = () => {} } = {}) {
           });
         })
         .catch((err) => {
-          const outcome = err?.name === "AbortError"
-            ? "abort"
-            : err?.signal ? "signal" : err?.code === "ETIMEDOUT" ? "timeout" : "rejected";
-          completeReservation(scope, reservationId, { outcome }, Date.now());
+          completeReservation(scope, reservationId, {
+            outcome: governorOutcomeForError(err),
+          }, Date.now());
           if (cancelled || err?.name === "AbortError") return;
           // Preserve both the verdict and the bounded raw error in state. The
           // renderer translates recognized verdicts at draw time, which lets a
@@ -6846,8 +6883,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       activePollAt = planned.activeAt;
       backgroundPollAt = planned.backgroundAt;
       backgroundIndex = planned.backgroundIndex;
-      await Promise.allSettled(planned.due.map((key, index) =>
-        requestTab(key, index === 0 ? "active" : "background")));
+      await Promise.allSettled(planned.due.map(({ key, kind }) => requestTab(key, kind)));
       if (!cancelled) {
         setNow((prev) =>
           hasInProgressRef.current || Date.now() - prev.getTime() >= 60_000 ? new Date() : prev,
@@ -7762,6 +7798,7 @@ export {
   forcedBackoffKeys,
   clearForcedBackoffAfterStart,
   doctorProbePlan,
+  mapAllSettledBounded,
   alertRequestArgs,
   shouldFetchAlertPriorityLanes,
   mergeAlertRows,

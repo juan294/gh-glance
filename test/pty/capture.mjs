@@ -42,6 +42,21 @@ const TAB_BAR = /1:(?:Actions|Act)/;
 // mistaken for accumulated footers.
 const STATUS_LINE = /^\S (?:Fetching|Setup)(?:\s|$)/;
 
+function readCaptureResult(out, dimensions) {
+  const parsed = parseCapture(readFileSync(out, "utf8"), dimensions);
+  const logPath = `${out}.calls`;
+  parsed.fixtureCalls = existsSync(logPath)
+    ? readFileSync(logPath, "utf8").split("\n").filter(Boolean)
+    : [];
+  return parsed;
+}
+
+function removeCaptureArtifacts(out) {
+  for (const path of [out, `${out}.calls`]) {
+    if (existsSync(path)) rmSync(path, { force: true });
+  }
+}
+
 function stripEscapes(text) {
   return text
     .replace(OSC, "")
@@ -470,16 +485,9 @@ export function capture({
         env: { ...process.env, ...env, XDG_CONFIG_HOME: effectiveConfigHome },
       },
     );
-    const parsed = parseCapture(readFileSync(out, "utf8"), { cols, rows });
-    const logPath = `${out}.calls`;
-    parsed.fixtureCalls = existsSync(logPath)
-      ? readFileSync(logPath, "utf8").split("\n").filter(Boolean)
-      : [];
-    return parsed;
+    return readCaptureResult(out, { cols, rows });
   } finally {
-    for (const path of [out, `${out}.calls`]) {
-      if (existsSync(path)) rmSync(path, { force: true });
-    }
+    removeCaptureArtifacts(out);
     if (ownsConfigHome) rmSync(effectiveConfigHome, { recursive: true, force: true });
   }
 }
@@ -512,15 +520,8 @@ export async function captureAsync(options) {
         (error) => error ? reject(error) : resolve(),
       );
     });
-    const parsed = parseCapture(readFileSync(out, "utf8"), { cols, rows });
-    const logPath = `${out}.calls`;
-    parsed.fixtureCalls = existsSync(logPath)
-      ? readFileSync(logPath, "utf8").split("\n").filter(Boolean)
-      : [];
-    return parsed;
+    return readCaptureResult(out, { cols, rows });
   } finally {
-    for (const path of [out, `${out}.calls`]) {
-      if (existsSync(path)) rmSync(path, { force: true });
-    }
+    removeCaptureArtifacts(out);
   }
 }

@@ -54,6 +54,20 @@ const dataStarts = (state) => state.events.filter((event) =>
   ),
 );
 
+function capturePanes(count, box, panePrefix, options = {}) {
+  return Promise.all(Array.from({ length: count }, (_, index) => captureAsync({
+    cols: 70,
+    rows: 20,
+    ...options,
+    configHome: box.root,
+    env: {
+      ...options.env,
+      GH_GLANCE_FIXTURE_STATE: box.statePath,
+      GH_GLANCE_FIXTURE_PANE: `${panePrefix}-${index}`,
+    },
+  })));
+}
+
 test("the shared fixture recovers a dead private lock without using governor state", (t) => {
   const box = fixture(t);
   const lockPath = `${box.statePath}.lock`;
@@ -66,6 +80,20 @@ test("the shared fixture recovers a dead private lock without using governor sta
   assert.equal(starts(box.read(), "--version").length, 1);
   assert.equal(existsSync(lockPath), false);
   assert.equal(statSync(box.statePath).mode & 0o777, 0o600);
+});
+
+test("the shared fixture recovers an exact dead recovery marker", (t) => {
+  const box = fixture(t);
+  const recoveryPath = `${box.statePath}.lock.recovery-dead-recovery`;
+  writeFileSync(recoveryPath, `${JSON.stringify({
+    pid: 99_999_999,
+    nonce: "dead-recovery",
+  })}\n`, { mode: 0o600 });
+  execFileSync(process.execPath, [STATE_HELPER, "--version"], {
+    env: { ...process.env, GH_GLANCE_FIXTURE_STATE: box.statePath },
+  });
+  assert.equal(starts(box.read(), "--version").length, 1);
+  assert.equal(existsSync(recoveryPath), false);
 });
 
 test("manual refresh bursts create one unchanged held-sample probe demand", (t) => {
@@ -118,14 +146,12 @@ test("a real reset gets one fresh probe then one phased active request per pane"
       core: { used: 0, remaining: 5000, resetOffsetMs: 3_602_000 },
     }],
   });
-  await Promise.all(Array.from({ length: 3 }, (_, index) => captureAsync({
+  await capturePanes(3, box, "reset", {
     cols: 80,
     rows: 24,
     settle: 30,
     args: "--refresh 40",
-    configHome: box.root,
-    env: { GH_GLANCE_FIXTURE_STATE: box.statePath, GH_GLANCE_FIXTURE_PANE: `reset-${index}` },
-  })));
+  });
   const state = box.read();
   const probes = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
   const runs = starts(state, "run");
@@ -142,41 +168,51 @@ test("a real reset gets one fresh probe then one phased active request per pane"
 
 test("twelve panes share probe ownership and start bounded phased work", async (t) => {
   const box = fixture(t, { delayMs: 40 });
-  await Promise.all(Array.from({ length: 12 }, (_, index) => captureAsync({
-    cols: 70,
-    rows: 20,
+  const setup = box.read();
+  const decision = resourceDecision({
+    budget: {
+      ...setup.core,
+      observedAt: setup.createdAt,
+      blockUntil: null,
+      blockReason: null,
+      laneNextAt: setup.createdAt,
+      roundRobinCursor: null,
+      lastExternalFactor: 1,
+      epoch: `${setup.core.limit}:${setup.core.resetMs}`,
+    },
+    resource: "core",
+    nowMs: setup.createdAt,
+    cost: 2,
+    chargedCost: 0,
+  });
+  const laneInterval = 2 / decision.callsPerMs;
+  await capturePanes(12, box, "pane", {
     // Five seconds of epoch phase plus one paced lane interval can place the
     // second pane just beyond an eight-second process-start observation.
     settle: 12,
-    configHome: box.root,
-    env: {
-      GH_GLANCE_FIXTURE_STATE: box.statePath,
-      GH_GLANCE_FIXTURE_PANE: `pane-${index}`,
-    },
-  })));
+  });
   const state = box.read();
   const probes = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
   const runs = starts(state, "run");
   assert.ok(probes.length >= 1 && probes.length <= 2, `shared probes: ${probes.length}`);
   assert.ok(runs.length >= 1, "no pane progressed");
   assert.ok(new Set(runs.map((event) => event.pane)).size > 1, "round-robin made no progress");
-  assert.ok(state.maxConcurrency <= 12, `unbounded fixture concurrency: ${state.maxConcurrency}`);
+  assert.equal(state.maxDataConcurrency, 1, `data requests overlapped: ${state.maxDataConcurrency}`);
+  for (let index = 1; index < runs.length; index += 1) {
+    assert.ok(
+      runs[index].at - runs[index - 1].at >= laneInterval - 250,
+      `data starts escaped lane pacing: ${JSON.stringify(runs.map(({ at, pane }) => ({ at, pane })))}`,
+    );
+  }
 });
 
 test("twelve held panes share one block probe instead of retrying per pane", async (t) => {
   const box = fixture(t, {
     core: { limit: 5000, used: 5000, remaining: 0, resetMs: Date.now() + 3_600_000 },
   });
-  await Promise.all(Array.from({ length: 12 }, (_, index) => captureAsync({
-    cols: 70,
-    rows: 20,
+  await capturePanes(12, box, "held-pane", {
     settle: 8,
-    configHome: box.root,
-    env: {
-      GH_GLANCE_FIXTURE_STATE: box.statePath,
-      GH_GLANCE_FIXTURE_PANE: `held-pane-${index}`,
-    },
-  })));
+  });
   const state = box.read();
   const probes = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
   assert.ok(probes.length >= 1 && probes.length <= 2, `shared held probes: ${probes.length}`);
@@ -237,20 +273,13 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
     } catch {
       // The first probe has not created the governor file yet.
     }
-  }, 5);
+  }, 40);
   try {
-    await Promise.all(Array.from({ length: 12 }, (_, index) => captureAsync({
-      cols: 70,
-      rows: 20,
+    await capturePanes(12, box, "blocked-minute", {
       // Leave margin after the shared 60-second probe deadline so process startup
       // cannot turn this into a boundary-timing assertion.
       settle: 75,
-      configHome: box.root,
-      env: {
-        GH_GLANCE_FIXTURE_STATE: box.statePath,
-        GH_GLANCE_FIXTURE_PANE: `blocked-minute-${index}`,
-      },
-    })));
+    });
   } finally {
     clearInterval(observer);
   }

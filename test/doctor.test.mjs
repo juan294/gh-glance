@@ -169,44 +169,44 @@ test("--doctor spends nothing when the free budget probe fails", async () => {
   assert.equal(out.match(/^ {2}classified {2}skipped$/gm)?.length, 10, out);
 });
 
-test("--doctor classifies a failed REST diagnostic", async () => {
+test("--doctor skips a REST diagnostic whose paced slot is still in the future", async () => {
   const message = "To get started with GitHub CLI, please run: gh auth login";
   const out = await doctor({
     env: { GH_GLANCE_FIXTURE_FAIL: message, GH_GLANCE_FIXTURE_FAIL_ON: "issue" },
   });
   const block = probeBlock(out, "Issues (issue list)");
-  assert.match(block, /^ {2}classified {2}auth-problem$/m, block);
-  assert.ok(block.includes(message), block);
+  assert.match(block, /^ {2}classified {2}skipped$/m, block);
+  assert.ok(!block.includes(message), block);
 });
 
-test("--doctor classifies a failed GraphQL diagnostic", async () => {
+test("--doctor skips a GraphQL diagnostic whose paced slot is still in the future", async () => {
   const message =
     "GraphQL: Could not resolve to a Repository with the name 'Nvteca/cashflor-forecast'. (repository)";
   const out = await doctor({
     env: { GH_GLANCE_FIXTURE_FAIL: message, GH_GLANCE_FIXTURE_FAIL_ON: "issue" },
   });
   const block = probeBlock(out, "Issues (issue list)");
-  assert.match(block, /^ {2}classified {2}unavailable$/m, block);
-  assert.ok(block.includes(message), block);
+  assert.match(block, /^ {2}classified {2}skipped$/m, block);
+  assert.ok(!block.includes(message), block);
 });
 
-test("--doctor reports a failed repository-access probe separately", async () => {
+test("--doctor reports paced repository access separately", async () => {
   const message =
     "GraphQL: Could not resolve to a Repository with the name 'Nvteca/cashflor-forecast'. (repository)";
   const out = await doctor({
     env: { GH_GLANCE_FIXTURE_FAIL: message, GH_GLANCE_FIXTURE_FAIL_ON: "repo" },
   });
   const repositoryBlock = probeBlock(out, "Repository access");
-  assert.match(repositoryBlock, /^ {2}classified {2}unavailable$/m, repositoryBlock);
-  assert.ok(repositoryBlock.includes(message), repositoryBlock);
+  assert.match(repositoryBlock, /^ {2}classified {2}(?:skipped|unavailable)$/m, repositoryBlock);
+  if (/^ {2}classified {2}unavailable$/m.test(repositoryBlock)) {
+    assert.ok(repositoryBlock.includes(message), repositoryBlock);
+  }
 
   const actions = probeBlock(out, "Actions (run list)");
-  assert.match(actions, /^ {2}outcome {5}ok /m, actions);
-  assert.match(actions, /^ {2}classified {2}ok$/m, actions);
+  assert.match(actions, /^ {2}classified {2}(?:skipped|ok)$/m, actions);
   for (const name of ["Issues (issue list)", "Pull requests (pr list)"]) {
     const block = probeBlock(out, name);
-    assert.match(block, /^ {2}outcome {5}ok /m, block);
-    assert.match(block, /^ {2}classified {2}ok$/m, block);
+    assert.match(block, /^ {2}classified {2}skipped$/m, block);
   }
 });
 

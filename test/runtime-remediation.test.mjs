@@ -18,6 +18,7 @@ import {
   mergeWidthPreferenceSnapshots,
   pollResultTransition,
   pollSchedule,
+  mapAllSettledBounded,
   reconcileSelectionViewport,
   resourceDecision,
   securityPollDelay,
@@ -243,7 +244,7 @@ test("the poll controller keeps unchanged, blind, and changed transitions separa
     activeAt: 0,
     backgroundAt: 20,
   });
-  assert.deepEqual(schedule.due, ["issues"]);
+  assert.deepEqual(schedule.due, [{ key: "issues", kind: "active" }]);
   const rotations = [];
   for (const nowMs of [20, 40, 60]) {
     schedule = pollSchedule({
@@ -257,9 +258,9 @@ test("the poll controller keeps unchanged, blind, and changed transitions separa
     rotations.push(schedule.due);
   }
   assert.deepEqual(rotations, [
-    ["issues", "actions"],
-    ["issues", "prs"],
-    ["issues", "security"],
+    [{ key: "issues", kind: "active" }, { key: "actions", kind: "background" }],
+    [{ key: "issues", kind: "active" }, { key: "prs", kind: "background" }],
+    [{ key: "issues", kind: "active" }, { key: "security", kind: "background" }],
   ]);
   assert.deepEqual(
     pollSchedule({
@@ -270,7 +271,19 @@ test("the poll controller keeps unchanged, blind, and changed transitions separa
       backgroundAt: 20,
       heldResources: { core: { held: true, retryAt: 100 } },
     }).due,
-    ["issues", "prs"],
+    [{ key: "issues", kind: "active" }, { key: "prs", kind: "background" }],
+  );
+
+  assert.deepEqual(
+    pollSchedule({
+      nowMs: 20,
+      floorMs: 5,
+      activeKey: "actions",
+      activeAt: 20,
+      backgroundAt: 20,
+      heldResources: { core: { held: true, retryAt: 100 } },
+    }).due,
+    [{ key: "issues", kind: "background" }],
   );
 });
 
@@ -286,6 +299,27 @@ test("manual delay preserves backoff until the reservation actually starts", () 
     true,
   );
   assert.deepEqual(cleared, forcedBackoffKeys("security"));
+});
+
+test("bounded diagnostic work settles independently and preserves result order", async () => {
+  let active = 0;
+  let maximum = 0;
+  const settled = await mapAllSettledBounded([30, 5, 15, 1], 2, async (delay, index) => {
+    active += 1;
+    maximum = Math.max(maximum, active);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    active -= 1;
+    if (index === 2) throw new Error("independent failure");
+    return index;
+  });
+  assert.equal(maximum, 2);
+  assert.deepEqual(settled.map(({ status }) => status), [
+    "fulfilled",
+    "fulfilled",
+    "rejected",
+    "fulfilled",
+  ]);
+  assert.deepEqual(settled.map((result) => result.value), [0, 1, undefined, 3]);
 });
 
 test("open request ownership preserves per-item guards and aborts every child on quit", async () => {

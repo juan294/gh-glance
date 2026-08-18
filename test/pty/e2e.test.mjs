@@ -70,7 +70,7 @@ test("healthy startup does not probe optional failure context", () => {
   );
 });
 
-test("an inaccessible repository uses free auth context and one admitted repo context", () => {
+test("an inaccessible repository uses free auth context without crossing a paced repo slot", () => {
   const calls = inaccessibleRepository.fixtureCalls;
   assert.ok(calls.some((call) => call.startsWith("issue list")), "Issues did not fail");
   assert.ok(
@@ -79,8 +79,8 @@ test("an inaccessible repository uses free auth context and one admitted repo co
   );
   assert.equal(
     calls.filter((call) => call.startsWith("repo view")).length,
-    1,
-    "repository context did not use one admitted request",
+    0,
+    "repository context crossed its future paced slot",
   );
   assert.ok(
     calls.filter((call) => call.startsWith("auth status") && call.includes("--json hosts")).length <=
