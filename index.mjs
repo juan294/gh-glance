@@ -1125,7 +1125,7 @@ function reservationCost(reservation, resource, leases, nowMs) {
   if (!reservation || ["cancelled", "reconciled"].includes(reservation.status)) return 0;
   if (reservation.status === "scheduled") {
     const lease = leaseFor(leases, reservation.leaseId);
-    if (!lease || !Number.isFinite(lease.expiresAt) || lease.expiresAt <= nowMs) return 0;
+    if (!lease || (Number.isFinite(lease.expiresAt) && lease.expiresAt <= nowMs)) return 0;
   }
   const cost = reservation.costs?.[resource] ??
     (reservation.resource === resource ? reservation.cost : 0);
@@ -1152,6 +1152,15 @@ function availableForGrant({
     return {
       mode: "paused",
       reason: budget.blockReason ?? "rate-limit",
+      resetMs: normalized.resetMs,
+      epoch,
+    };
+  }
+
+  if (chargedCost !== null && (!Number.isFinite(chargedCost) || chargedCost < 0)) {
+    return {
+      mode: "paused",
+      reason: "reservations-invalid",
       resetMs: normalized.resetMs,
       epoch,
     };

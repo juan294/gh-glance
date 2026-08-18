@@ -2208,6 +2208,30 @@ test("the hard reserve denies exhausted and reserve-crossing requests", () => {
   }).mode, "paused");
 });
 
+test("invalid precomputed reservation totals fail closed", () => {
+  const budget = policyBudget();
+  const expected = {
+    mode: "paused",
+    reason: "reservations-invalid",
+    resetMs: budget.resetMs,
+    epoch: budgetEpoch(budget),
+  };
+  for (const chargedCost of [-1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+    assert.deepEqual(availableForGrant({
+      budget: { ...budget, resource: "core" },
+      nowMs: POLICY_NOW,
+      chargedCost,
+    }), expected);
+    assert.deepEqual(resourceDecision({
+      budget,
+      resource: "core",
+      cost: 1,
+      nowMs: POLICY_NOW,
+      chargedCost,
+    }), expected);
+  }
+});
+
 test("safe pacing is not clamped at one minute", () => {
   for (const intervalMs of [59_000, 60_000, 61_000, 600_000]) {
     const spendable = (2 * 3_600_000) / intervalMs;
@@ -2455,7 +2479,7 @@ test("invalid expiry and unknown priority prune unstarted intents", () => {
   assert.equal(result.grants.length, 0);
 });
 
-test("started reservations stay charged while dead leases release unstarted work", () => {
+test("started reservations stay charged while only definitely dead leases release unstarted work", () => {
   const deadLeases = { dead: { expiresAt: POLICY_NOW - 1 } };
   const base = {
     budget: policyBudget({ remaining: 1007 }),
@@ -2477,6 +2501,32 @@ test("started reservations stay charged while dead leases release unstarted work
     leases: {},
     reservations: [{ leaseId: "missing", status: "scheduled", costs: { core: 2 } }],
   }).mode, "open");
+  for (const expiresAt of [Number.NaN, Number.POSITIVE_INFINITY, "corrupt"]) {
+    assert.equal(resourceDecision({
+      ...base,
+      leases: { corrupt: { expiresAt } },
+      reservations: [{ leaseId: "corrupt", status: "scheduled", costs: { core: 2 } }],
+    }).mode, "paused");
+  }
+});
+
+test("valid precomputed reservation totals equal reservation reduction", () => {
+  const budget = policyBudget({ remaining: 1020 });
+  const leases = { live: policyLease("live", POLICY_NOW + 60_000) };
+  const reservations = [
+    { leaseId: "live", status: "scheduled", costs: { core: 2 } },
+    { leaseId: "missing", status: "started", costs: { core: 3 } },
+  ];
+  const request = {
+    budget,
+    resource: "core",
+    cost: 6,
+    nowMs: POLICY_NOW,
+  };
+  assert.deepEqual(
+    resourceDecision({ ...request, chargedCost: 5 }),
+    resourceDecision({ ...request, reservations, leases }),
+  );
 });
 
 test("budget reset changes the epoch and deterministic lease phase", () => {
