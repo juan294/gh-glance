@@ -91,7 +91,6 @@ import {
   adaptiveRefreshMs,
   adaptiveChangeWorthApplying,
   externalSampleIsUsable,
-  inferExternalFactor,
   nextExternalSampleWindow,
   restPerTick,
   MAX_ADAPTIVE_REFRESH_MS,
@@ -2135,9 +2134,13 @@ const policyBudget = (overrides = {}) => ({
   observedAt: POLICY_NOW,
   ...overrides,
 });
-const policyLease = (phaseSeed, expiresAt = POLICY_NOW + GOVERNOR_LEASE_TTL_MS) => ({
+const policyLease = (
+  seed,
+  expiresAt = POLICY_NOW + GOVERNOR_LEASE_TTL_MS,
+  registeredAt = POLICY_NOW,
+) => ({
   expiresAt,
-  phaseSeed,
+  phaseSeed: { seed, registeredAt },
 });
 
 test("the governor timing and reserve constants pin the policy contract", () => {
@@ -2240,6 +2243,7 @@ test("tab and auxiliary operation costs have one explicit registry", () => {
     assert.deepEqual(operationCost(`tab:${tab}`), tabRequestCost(tab));
   }
   assert.equal(tabRequestCost("unknown"), null);
+  assert.equal(operationCost("__proto__"), null);
   assert.deepEqual(operationCost("tab:security"), { core: 6, graphql: 0 });
   assert.deepEqual(operationCost("failure-context:repository"), { core: 0, graphql: 1 });
   assert.deepEqual(operationCost("open:actions"), { core: 2, graphql: 0 });
@@ -2331,12 +2335,20 @@ test("tab intents derive registry costs and reject conflicting overrides", () =>
         priority: "active",
         expiresAt: POLICY_NOW + 10_000,
       },
+      {
+        id: "security-extra",
+        leaseId: "lease",
+        tab: "security",
+        costs: { core: 6, graphql: 0, search: 0 },
+        priority: "active",
+        expiresAt: POLICY_NOW + 10_000,
+      },
     ],
     leases: { lease: policyLease("security", POLICY_NOW + 10_000) },
     budgets: { core: policyBudget() },
     nowMs: POLICY_NOW,
   });
-  assert.deepEqual(result.prunedIntentIds, ["security-conflict"]);
+  assert.deepEqual(result.prunedIntentIds, ["security-conflict", "security-extra"]);
   assert.equal(result.grants.length, 1);
   assert.deepEqual(result.grants[0].costs, { core: 6, graphql: 0 });
 });
@@ -2417,6 +2429,10 @@ test("invalid expiry and unknown priority prune unstarted intents", () => {
       { id: "invalid-expiry", leaseId: "good", priority: "active", costs: { core: 1, graphql: 0 }, expiresAt: Number.NaN },
       { id: "unknown-priority", leaseId: "good", priority: "urgent", costs: { core: 1, graphql: 0 }, expiresAt: POLICY_NOW + 1000 },
       { id: "unknown-tab", leaseId: "good", priority: "active", tab: "unknown", expiresAt: POLICY_NOW + 1000 },
+      { id: "missing-cost", leaseId: "good", priority: "active", costs: { core: 1 }, expiresAt: POLICY_NOW + 1000 },
+      { id: "extra-cost", leaseId: "good", priority: "active", costs: { core: 1, graphql: 0, search: 0 }, expiresAt: POLICY_NOW + 1000 },
+      { id: "invalid-cost", leaseId: "good", priority: "active", costs: { core: Number.NaN, graphql: 0 }, expiresAt: POLICY_NOW + 1000 },
+      { id: "negative-cost", leaseId: "good", priority: "active", costs: { core: -1, graphql: 0 }, expiresAt: POLICY_NOW + 1000 },
       { id: "invalid-lease", leaseId: "invalid", priority: "active", costs: { core: 1, graphql: 0 }, expiresAt: POLICY_NOW + 1000 },
       { id: "missing-phase", leaseId: "unphased", priority: "active", costs: { core: 1, graphql: 0 }, expiresAt: POLICY_NOW + 1000 },
     ],
@@ -2429,6 +2445,10 @@ test("invalid expiry and unknown priority prune unstarted intents", () => {
     "invalid-expiry",
     "unknown-priority",
     "unknown-tab",
+    "missing-cost",
+    "extra-cost",
+    "invalid-cost",
+    "negative-cost",
     "invalid-lease",
     "missing-phase",
   ]);
@@ -2451,6 +2471,11 @@ test("started reservations stay charged while dead leases release unstarted work
   assert.equal(resourceDecision({
     ...base,
     reservations: [{ leaseId: "dead", status: "scheduled", costs: { core: 2 } }],
+  }).mode, "open");
+  assert.equal(resourceDecision({
+    ...base,
+    leases: {},
+    reservations: [{ leaseId: "missing", status: "scheduled", costs: { core: 2 } }],
   }).mode, "open");
 });
 
@@ -2501,6 +2526,38 @@ test("budget reset changes the epoch and deterministic lease phase", () => {
   assert.notEqual(resetSchedule.grants[0].notBefore, firstSchedule.grants[0].notBefore);
 });
 
+test("panes registered mid-window get distinct stable startup phases", () => {
+  const registeredAt = POLICY_NOW + 600_000;
+  const budget = policyBudget({ observedAt: registeredAt });
+  let firstSeed = "pane-a";
+  while (governorPhaseOffset(firstSeed, budgetEpoch(budget)) < 2) firstSeed += "x";
+  let secondSeed = "pane-b";
+  while (
+    governorPhaseOffset(firstSeed, budgetEpoch(budget)) ===
+    governorPhaseOffset(secondSeed, budgetEpoch(budget))
+  ) secondSeed += "x";
+
+  const phaseFor = (seed, nowMs) => scheduleIntents({
+    intents: [{
+      id: seed,
+      leaseId: seed,
+      tab: "actions",
+      priority: "active",
+      expiresAt: budget.resetMs,
+    }],
+    leases: { [seed]: policyLease(seed, budget.resetMs, registeredAt) },
+    budgets: { core: budget },
+    nowMs,
+  }).grants[0].notBefore;
+
+  const first = phaseFor(firstSeed, registeredAt);
+  const second = phaseFor(secondSeed, registeredAt);
+  assert.equal(first, registeredAt + governorPhaseOffset(firstSeed, budgetEpoch(budget)));
+  assert.equal(second, registeredAt + governorPhaseOffset(secondSeed, budgetEpoch(budget)));
+  assert.notEqual(first, second);
+  assert.equal(phaseFor(firstSeed, registeredAt + 1), first);
+});
+
 test("pacing becomes no earlier as pressure increases", () => {
   const duration = ({ budget = policyBudget(), cost = 2, factor = 1 } = {}) => {
     const decision = resourceDecision({
@@ -2532,6 +2589,32 @@ test("small external-spend samples retain the prior factor", () => {
     sharedCompletedDelta: 10,
   }), 6);
   assert.equal(nextExternalFactor({ lastExternalFactor: Number.NaN }), null);
+  assert.equal(nextExternalFactor({ globalUsedDelta: Number.NaN }), null);
+});
+
+test("scheduler keeps a 500-intent lock mutation bounded", () => {
+  const leases = Object.fromEntries(Array.from({ length: 20 }, (_, index) => [
+    `lease-${index}`,
+    policyLease(`phase-${index}`),
+  ]));
+  const intents = Array.from({ length: 500 }, (_, index) => ({
+    id: `benchmark-${index}`,
+    leaseId: `lease-${index % 20}`,
+    priority: "active",
+    costs: { core: 1, graphql: 0 },
+    requestedAt: POLICY_NOW,
+    expiresAt: POLICY_NOW + GOVERNOR_LEASE_TTL_MS,
+  }));
+  const startedAt = performance.now();
+  const result = scheduleIntents({
+    intents,
+    leases,
+    budgets: { core: policyBudget() },
+    nowMs: POLICY_NOW,
+  });
+  const elapsedMs = performance.now() - startedAt;
+  assert.equal(result.grants.length, intents.length);
+  assert.ok(elapsedMs < 2000, `500-intent schedule took ${elapsedMs.toFixed(1)}ms`);
 });
 
 test("repeated realistic demand fills but never crosses each fresh-window lane", () => {
@@ -2791,14 +2874,19 @@ test("an unmeasurable window holds the widened interval, not the floor", () => {
   );
 });
 
-test("inferExternalFactor holds the last measurement when the window cannot be measured", () => {
-  assert.equal(inferExternalFactor(sample(100, 700)), 7);
-  assert.equal(inferExternalFactor(sample(2, 700), 7), 7);
-  assert.equal(inferExternalFactor(null, 7), 7);
+test("nextExternalFactor holds the last measurement when the window cannot be measured", () => {
+  const factor = (value, lastExternalFactor = 1) => nextExternalFactor({
+    lastExternalFactor,
+    globalUsedDelta: value?.globalUsedDelta ?? 0,
+    sharedCompletedDelta: value?.sharedCompletedDelta ?? 0,
+  });
+  assert.equal(factor(sample(100, 700)), 7);
+  assert.equal(factor(sample(2, 700), 7), 7);
+  assert.equal(factor(null, 7), 7);
   // Never below 1, from either source: fewer than one consumer is not a thing,
   // and an external factor under 1 would compute an interval tighter than the floor.
-  assert.equal(inferExternalFactor(sample(100, 50)), 1);
-  assert.equal(inferExternalFactor(null, 0.2), 1);
+  assert.equal(factor(sample(100, 50)), 1);
+  assert.equal(factor(null, 0.2), null);
 });
 
 test("an unmeasurable probe window stays open instead of restarting", () => {
@@ -2859,7 +2947,11 @@ test("a throttled pane does not flap back to the floor between measurable window
 
     const step = nextExternalSampleWindow(externalSampleWindow, budget, sharedCompleted);
     externalSampleWindow = step.next;
-    externalFactor = inferExternalFactor(step.sample, externalFactor);
+    externalFactor = nextExternalFactor({
+      lastExternalFactor: externalFactor,
+      globalUsedDelta: step.sample?.globalUsedDelta ?? 0,
+      sharedCompletedDelta: step.sample?.sharedCompletedDelta ?? 0,
+    });
     const target = adaptiveRefreshMs(at({
       budget,
       sample: step.sample,

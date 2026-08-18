@@ -1018,8 +1018,8 @@ function tabRequestCost(tab) {
   return { core: REST_PER_FETCH[tab], graphql: GRAPHQL_PER_FETCH[tab] };
 }
 
-// Every gh subprocess has one declared operation. Phase 1 only defines this
-// contract; Phase 3 makes the subprocess boundary enforce it. Tab totals are
+// Every gh subprocess has one declared operation, enforced at the subprocess
+// boundary. Phase 3 uses these costs for quota admission. Tab totals are
 // derived from the fetch tables, while Security endpoint entries describe the
 // individual calls covered by the tab's six-call upfront reservation.
 const OPERATION_COSTS = Object.freeze({
@@ -1042,7 +1042,7 @@ const OPERATION_COSTS = Object.freeze({
 });
 
 function operationCost(operation) {
-  return OPERATION_COSTS[operation] ?? null;
+  return pick(OPERATION_COSTS, operation, null);
 }
 
 // Ceiling on adaptive widening. An adaptive interval needs one: a minute is
@@ -1125,14 +1125,20 @@ function reservationCost(reservation, resource, leases, nowMs) {
   if (!reservation || ["cancelled", "reconciled"].includes(reservation.status)) return 0;
   if (reservation.status === "scheduled") {
     const lease = leaseFor(leases, reservation.leaseId);
-    if (lease && Number.isFinite(lease.expiresAt) && lease.expiresAt <= nowMs) return 0;
+    if (!lease || !Number.isFinite(lease.expiresAt) || lease.expiresAt <= nowMs) return 0;
   }
   const cost = reservation.costs?.[resource] ??
     (reservation.resource === resource ? reservation.cost : 0);
   return Number.isFinite(cost) && cost > 0 ? cost : 0;
 }
 
-function availableForGrant({ budget, reservations = [], leases = {}, nowMs }) {
+function availableForGrant({
+  budget,
+  reservations = [],
+  leases = {},
+  nowMs,
+  chargedCost = null,
+}) {
   const normalized = normalizeBudgetResource(budget);
   if (!normalized) return { mode: "probe", reason: "budget-unknown" };
   if (normalized.observedAt > nowMs) return { mode: "probe", reason: "budget-future" };
@@ -1152,7 +1158,7 @@ function availableForGrant({ budget, reservations = [], leases = {}, nowMs }) {
   }
 
   const reserve = resourceReserve(normalized.limit);
-  const charged = reservations.reduce(
+  const charged = chargedCost ?? reservations.reduce(
     (total, reservation) => total + reservationCost(reservation, budget.resource, leases, nowMs),
     0,
   );
@@ -1170,9 +1176,19 @@ function nextExternalFactor({
   globalUsedDelta = 0,
   sharedCompletedDelta = 0,
 }) {
-  if (!Number.isFinite(lastExternalFactor) || lastExternalFactor < 1) return null;
-  if (sharedCompletedDelta < MIN_SAMPLE_CALLS || globalUsedDelta <= 0) return lastExternalFactor;
-  const measured = globalUsedDelta / sharedCompletedDelta;
+  if (
+    !Number.isFinite(lastExternalFactor) ||
+    lastExternalFactor < 1 ||
+    !Number.isFinite(globalUsedDelta) ||
+    globalUsedDelta < 0 ||
+    !Number.isFinite(sharedCompletedDelta) ||
+    sharedCompletedDelta < 0
+  ) {
+    return null;
+  }
+  const sample = { globalUsedDelta, sharedCompletedDelta };
+  if (!externalSampleIsUsable(sample)) return lastExternalFactor;
+  const measured = sample.globalUsedDelta / sample.sharedCompletedDelta;
   return Number.isFinite(measured) ? Math.max(1, measured) : null;
 }
 
@@ -1186,12 +1202,14 @@ function resourceDecision({
   lastExternalFactor = budget?.lastExternalFactor ?? 1,
   globalUsedDelta = 0,
   sharedCompletedDelta = 0,
+  chargedCost = null,
 }) {
   const capacity = availableForGrant({
     budget: budget && { ...budget, resource },
     reservations,
     leases,
     nowMs,
+    chargedCost,
   });
   if (capacity.mode !== "open") return capacity;
 
@@ -1239,8 +1257,8 @@ function governorPhaseOffset(phaseSeed, epoch) {
 }
 
 function governorEpochPhaseAt(phaseSeed, decision) {
-  const epochAnchor = decision.resetMs - BUDGET_WINDOW_MS;
-  return epochAnchor + governorPhaseOffset(phaseSeed, decision.epoch);
+  const epochAnchor = Math.max(phaseSeed.registeredAt, decision.resetMs - BUDGET_WINDOW_MS);
+  return epochAnchor + governorPhaseOffset(phaseSeed.seed, decision.epoch);
 }
 
 function intentPriority(intent) {
@@ -1250,55 +1268,103 @@ function intentPriority(intent) {
   return Object.values(REQUEST_PRIORITIES).includes(priority) ? priority : null;
 }
 
+const RATE_RESOURCES = ["core", "graphql"];
+
+function exactResourceCosts(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const keys = Object.keys(raw);
+  if (
+    keys.length !== RATE_RESOURCES.length ||
+    RATE_RESOURCES.some(
+      (resource) =>
+        !Object.hasOwn(raw, resource) || !Number.isFinite(raw[resource]) || raw[resource] < 0,
+    )
+  ) {
+    return null;
+  }
+  return { core: raw.core, graphql: raw.graphql };
+}
+
 function intentCosts(intent) {
-  if (intent.tab === undefined) return intent.costs ?? null;
+  if (intent.tab === undefined) return exactResourceCosts(intent.costs);
   const expected = tabRequestCost(intent.tab);
   if (!expected) return null;
-  if (
-    intent.costs &&
-    (intent.costs.core !== expected.core || intent.costs.graphql !== expected.graphql)
-  ) {
+  const supplied = intent.costs === undefined ? expected : exactResourceCosts(intent.costs);
+  if (!supplied || supplied.core !== expected.core || supplied.graphql !== expected.graphql) {
     return null;
   }
   return expected;
 }
 
-function cursorDistance(leaseId, leaseIds, cursor) {
-  const cursorIndex = leaseIds.indexOf(cursor);
-  const start = cursorIndex < 0 ? 0 : (cursorIndex + 1) % leaseIds.length;
-  return (leaseIds.indexOf(leaseId) - start + leaseIds.length) % leaseIds.length;
+function normalizePhaseSeed(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const validSeed =
+    typeof raw.seed === "string" ? raw.seed.length > 0 : Number.isFinite(raw.seed);
+  return validSeed && Number.isFinite(raw.registeredAt) && raw.registeredAt >= 0
+    ? { seed: raw.seed, registeredAt: raw.registeredAt }
+    : null;
 }
 
-function nextRoundRobinIntent(intents, cursors) {
-  const leasesByResource = Object.fromEntries(["core", "graphql"].map((resource) => [
-    resource,
-    [...new Set(
-      [
-        ...intents.filter((intent) => intent.costs[resource] > 0).map((intent) => intent.leaseId),
-        ...(cursors[resource] ? [cursors[resource]] : []),
-      ],
-    )].sort(),
-  ]));
-  return [...intents].sort((left, right) => {
-    const ranks = (intent) => ["core", "graphql"]
-      .filter((resource) => intent.costs[resource] > 0)
-      .map((resource) => cursorDistance(
-        intent.leaseId,
-        leasesByResource[resource],
-        cursors[resource],
-      ));
-    const leftRanks = ranks(left);
-    const rightRanks = ranks(right);
-    const leftMax = Math.max(0, ...leftRanks);
-    const rightMax = Math.max(0, ...rightRanks);
-    return (
-      leftMax - rightMax ||
-      leftRanks.reduce((total, rank) => total + rank, 0) -
-        rightRanks.reduce((total, rank) => total + rank, 0) ||
-      (left.requestedAt ?? 0) - (right.requestedAt ?? 0) ||
-      String(left.id).localeCompare(String(right.id))
-    );
-  })[0];
+function createRoundRobinState(intents, cursors) {
+  const state = {};
+  for (const resource of RATE_RESOURCES) {
+    const leaseIds = new Set(cursors[resource] ? [cursors[resource]] : []);
+    for (const intent of intents) {
+      if (intent.costs[resource] > 0) leaseIds.add(intent.leaseId);
+    }
+    const order = [...leaseIds].sort();
+    const index = new Map(order.map((leaseId, position) => [leaseId, position]));
+    const cursorIndex = index.get(cursors[resource]);
+    state[resource] = {
+      index,
+      size: order.length,
+      start: cursorIndex === undefined || order.length === 0
+        ? 0
+        : (cursorIndex + 1) % order.length,
+    };
+  }
+  state.multiplier = intents.length * RATE_RESOURCES.length + 1;
+  return state;
+}
+
+function fairnessScore(intent, state) {
+  let maximum = 0;
+  let total = 0;
+  for (const resource of RATE_RESOURCES) {
+    if (intent.costs[resource] <= 0) continue;
+    const lane = state[resource];
+    const position = lane.index.get(intent.leaseId);
+    const distance = (position - lane.start + lane.size) % lane.size;
+    maximum = Math.max(maximum, distance);
+    total += distance;
+  }
+  return maximum * state.multiplier + total;
+}
+
+function nextRoundRobinIndex(intents, state) {
+  let bestIndex = 0;
+  let bestScore = fairnessScore(intents[0], state);
+  for (let index = 1; index < intents.length; index += 1) {
+    const score = fairnessScore(intents[index], state);
+    const best = intents[bestIndex];
+    const candidate = intents[index];
+    if (
+      score < bestScore ||
+      (score === bestScore &&
+        ((candidate.requestedAt ?? 0) < (best.requestedAt ?? 0) ||
+          ((candidate.requestedAt ?? 0) === (best.requestedAt ?? 0) &&
+            String(candidate.id).localeCompare(String(best.id)) < 0)))
+    ) {
+      bestIndex = index;
+      bestScore = score;
+    }
+  }
+  return bestIndex;
+}
+
+function advanceRoundRobinState(state, resource, leaseId) {
+  const lane = state[resource];
+  lane.start = (lane.index.get(leaseId) + 1) % lane.size;
 }
 
 function scheduleIntents({
@@ -1316,32 +1382,32 @@ function scheduleIntents({
     const lease = leaseFor(leases, intent.leaseId);
     const costs = intentCosts(intent);
     const priority = intentPriority(intent);
-    const validPhaseSeed =
-      typeof lease?.phaseSeed === "string"
-        ? lease.phaseSeed.length > 0
-        : Number.isFinite(lease?.phaseSeed);
+    const phaseSeed = normalizePhaseSeed(lease?.phaseSeed);
     const knownTab = intent.tab === undefined || TAB_KEYS.includes(intent.tab);
-    const validCosts = costs && ["core", "graphql"].every(
-      (resource) => Number.isFinite(costs[resource] ?? 0) && (costs[resource] ?? 0) >= 0,
-    );
     if (
       !lease ||
       !Number.isFinite(lease.expiresAt) ||
       lease.expiresAt <= nowMs ||
       !Number.isFinite(intent.expiresAt) ||
       intent.expiresAt <= nowMs ||
-      !validPhaseSeed ||
+      !phaseSeed ||
       !knownTab ||
       priority === null ||
-      !validCosts
+      !costs
     ) {
       prunedIntentIds.push(intent.id);
     } else {
-      valid.push({ ...intent, costs, normalizedPriority: priority });
+      valid.push({ ...intent, costs, phaseSeed, normalizedPriority: priority });
     }
   }
 
-  const workingReservations = [...reservations];
+  const chargedTotals = Object.fromEntries(RATE_RESOURCES.map((resource) => [
+    resource,
+    reservations.reduce(
+      (total, reservation) => total + reservationCost(reservation, resource, leases, nowMs),
+      0,
+    ),
+  ]));
   const updatedLanes = structuredClone(lanes);
   const updatedCursors = { ...cursors };
   const grants = [];
@@ -1350,19 +1416,19 @@ function scheduleIntents({
 
   for (const priority of priorities) {
     const pending = valid.filter((intent) => intent.normalizedPriority === priority);
+    const roundRobinState = createRoundRobinState(pending, updatedCursors);
     while (pending.length > 0) {
-      const intent = nextRoundRobinIntent(pending, updatedCursors);
-      pending.splice(pending.indexOf(intent), 1);
-      const resources = ["core", "graphql"].filter((resource) => intent.costs[resource] > 0);
+      const intent = pending.splice(nextRoundRobinIndex(pending, roundRobinState), 1)[0];
+      const resources = RATE_RESOURCES.filter((resource) => intent.costs[resource] > 0);
       const decisions = Object.fromEntries(resources.map((resource) => [
         resource,
         resourceDecision({
           budget: budgets[resource],
           resource,
-          reservations: workingReservations,
           leases,
           nowMs,
           cost: intent.costs[resource],
+          chargedCost: chargedTotals[resource],
         }),
       ]));
       const blocked = resources.find((resource) => decisions[resource].mode !== "open");
@@ -1371,9 +1437,8 @@ function scheduleIntents({
         continue;
       }
 
-      const lease = leaseFor(leases, intent.leaseId);
       const phaseTimes = Object.fromEntries(resources.map((resource) => {
-        return [resource, governorEpochPhaseAt(lease.phaseSeed, decisions[resource])];
+        return [resource, governorEpochPhaseAt(intent.phaseSeed, decisions[resource])];
       }));
       const notBefore = Math.max(
         nowMs,
@@ -1403,14 +1468,15 @@ function scheduleIntents({
         status: "scheduled",
         epochs: Object.fromEntries(resources.map((resource) => [resource, decisions[resource].epoch])),
       };
-      workingReservations.push(reservation);
       grants.push(reservation);
       for (const resource of resources) {
+        chargedTotals[resource] += intent.costs[resource];
         updatedLanes[resource] = {
           ...updatedLanes[resource],
           nextAt: notBefore + intent.costs[resource] / decisions[resource].callsPerMs,
         };
         updatedCursors[resource] = intent.leaseId;
+        advanceRoundRobinState(roundRobinState, resource, intent.leaseId);
       }
     }
   }
@@ -1434,22 +1500,6 @@ function externalSampleIsUsable(sample) {
     sample.sharedCompletedDelta >= MIN_SAMPLE_CALLS &&
     sample.globalUsedDelta > 0
   );
-}
-
-// How many equivalent consumers are on this token, from one probe window.
-//
-// `lastExternalFactor` is what the previous measurable window said, and it is the answer
-// whenever this window is not measurable. Falling back to 1 instead would be the
-// controller starving its own input: a pane that has widened to 40s makes about
-// three REST calls per probe window, below MIN_SAMPLE_CALLS, so it would read
-// "no other consumers", snap back to the floor, spend fast enough to measure
-// again, and re-throttle -- a flap on a two-minute cycle at exactly the instance
-// counts the widening exists for. Holding the last measurement keeps the pane
-// where it is until a window is long enough to say otherwise.
-function inferExternalFactor(sample, lastExternalFactor = 1) {
-  return externalSampleIsUsable(sample)
-    ? Math.max(1, sample.globalUsedDelta / sample.sharedCompletedDelta)
-    : Math.max(1, lastExternalFactor);
 }
 
 // One probe window's bookkeeping. Pure, so the flap it prevents is testable
@@ -1517,7 +1567,12 @@ function adaptiveRefreshMs({
   const affordable = (budget.remaining / secondsToReset) * BUDGET_SAFETY;
   if (affordable <= 0) return Math.max(floorMs, MAX_ADAPTIVE_REFRESH_MS);
 
-  const mine = affordable / inferExternalFactor(sample, lastExternalFactor);
+  const externalFactor = nextExternalFactor({
+    lastExternalFactor,
+    globalUsedDelta: sample?.globalUsedDelta ?? 0,
+    sharedCompletedDelta: sample?.sharedCompletedDelta ?? 0,
+  });
+  const mine = affordable / (externalFactor ?? Math.max(1, lastExternalFactor));
   const requiredMs = (restPerTick / mine) * 1000;
   return Math.min(Math.max(floorMs, requiredMs), Math.max(floorMs, MAX_ADAPTIVE_REFRESH_MS));
 }
@@ -5293,7 +5348,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     let lastProbeAt = 0;
     let probeInFlight = false;
     // The open probe window, and the last external factor it was able to measure. Both are
-    // carried by nextExternalSampleWindow/inferExternalFactor rather than reset every probe -- see
+    // carried by nextExternalSampleWindow/nextExternalFactor rather than reset every probe -- see
     // those functions for why a throttled pane must not re-measure from scratch.
     const externalSampleWindows = { core: null, graphql: null };
     const externalFactors = { core: 1, graphql: 1 };
@@ -5324,10 +5379,11 @@ function App({ onCreateRemote = () => {} } = {}) {
           );
           externalSampleWindows[resource] = step.next;
           samples[resource] = step.sample;
-          externalFactors[resource] = inferExternalFactor(
-            step.sample,
-            externalFactors[resource],
-          );
+          externalFactors[resource] = nextExternalFactor({
+            lastExternalFactor: externalFactors[resource],
+            globalUsedDelta: step.sample?.globalUsedDelta ?? 0,
+            sharedCompletedDelta: step.sample?.sharedCompletedDelta ?? 0,
+          });
         }
         const nextTargets = nextBudgetTargets({
           budgets,
@@ -6058,7 +6114,6 @@ export {
   nextBudgetTargets,
   adaptiveChangeWorthApplying,
   externalSampleIsUsable,
-  inferExternalFactor,
   nextExternalSampleWindow,
   restPerTick,
   MAX_ADAPTIVE_REFRESH_MS,
