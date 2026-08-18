@@ -37,6 +37,16 @@ const PRESS_X = workflowHandle.x + 1;
 const PRESS_Y = workflowHandle.yStart + 1;
 const DRAG_X = PRESS_X + 3;
 const OUTSIDE_Y = workflowHandle.yEnd + 1;
+const waitForActionsCache =
+  "i=0; dashboard=\"$XDG_CONFIG_HOME/gh-glance/dashboard-cache.json\"; " +
+  "while ! grep -Eq '\"databaseId\"[[:space:]]*:[[:space:]]*101' \"$dashboard\" " +
+  "2>/dev/null && [ \"$i\" -lt 600 ]; do sleep .05; i=$((i + 1)); done; " +
+  "printf 'dashboard=%s\\n' \"$i\" > \"$XDG_CONFIG_HOME/mouse-readiness\"; sleep .2; ";
+const waitForWorkflowResize =
+  "i=0; preferences=\"$XDG_CONFIG_HOME/gh-glance/preferences.json\"; " +
+  "while ! grep -Eq '\"workflow\"[[:space:]]*:[[:space:]]*7' \"$preferences\" " +
+  "2>/dev/null && [ \"$i\" -lt 200 ]; do sleep .05; i=$((i + 1)); done; " +
+  "printf 'preference=%s\\n' \"$i\" >> \"$XDG_CONFIG_HOME/mouse-readiness\"; ";
 
 const noRemoteEnv = {
   GH_GLANCE_FIXTURE_FAIL: "failed to determine base repo: no git remotes found",
@@ -124,7 +134,7 @@ test("capture parsing strips SGR input and records mouse shutdown before screen 
   assert.equal(parsed.afterRestore.visible, "");
 });
 
-test("a split press stops resizing after an outside-header release", () => {
+test("a split press stops resizing after an outside-header release", (t) => {
   const configHome = mkdtempSync(join(tmpdir(), "gh-glance-pty-mouse-"));
   const preferencePath = join(configHome, "gh-glance", "preferences.json");
   try {
@@ -132,18 +142,21 @@ test("a split press stops resizing after an outside-header release", () => {
       cols: 80,
       rows: 24,
       signal: "none",
-      settle: 14,
+      settle: 45,
       configHome,
       stdin:
-        `sleep 4; printf 'w'; sleep 1; printf '\\033[<0;${PRESS_X};'; sleep 0.005; printf '${PRESS_Y}M'; ` +
+        waitForActionsCache +
+        `printf 'w'; sleep 1; printf '\\033[<0;${PRESS_X};'; sleep 0.005; printf '${PRESS_Y}M'; ` +
         `sleep 1; printf '\\033[<32;${DRAG_X};${PRESS_Y}M'; ` +
         `sleep 1; printf '\\033[<0;${DRAG_X};${OUTSIDE_Y}m'; ` +
         `sleep 1; printf '\\033[<32;${DRAG_X + 3};${OUTSIDE_Y}M'; ` +
-        "sleep 1; printf 'q'; sleep 2",
+        waitForWorkflowResize + "printf 'q'; sleep 2",
     });
 
     assert.equal(PRESS_X, 34, "live workflow grip encoded x coordinate changed");
     assert.equal(PRESS_Y, 4, "live Actions header encoded y coordinate changed");
+    const readiness = readFileSync(join(configHome, "mouse-readiness"), "utf8").trim();
+    t.diagnostic(`${readiness.replaceAll("\n", "; ")} (50ms polls)`);
     assertCleanMouseCapture(dragged, { cols: 80, rows: 24, label: "drag" });
     assert.deepEqual(JSON.parse(readFileSync(preferencePath, "utf8")), {
       version: 1,

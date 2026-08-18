@@ -177,23 +177,91 @@ test("a real reset gets one fresh probe then one phased active request per pane"
       core: { used: 0, remaining: 5000, resetOffsetMs: 3_602_000 },
     }],
   });
-  await capturePanes(3, box, "reset", {
+  const readyPath = join(box.root, "reset-ready");
+  const captures = capturePanes(3, box, "reset", {
     cols: 80,
     rows: 24,
-    settle: 30,
+    signal: "none",
+    settle: 45,
     args: "--refresh 40",
+    stdin:
+      "i=0; while [ ! -f \"$GH_GLANCE_FIXTURE_READY\" ] && [ \"$i\" -lt 600 ]; do " +
+      "sleep .1; i=$((i + 1)); done; printf q",
+    env: { GH_GLANCE_FIXTURE_READY: readyPath },
   });
+  const resetProbe = await observeUntil(
+    box.read,
+    (state) => starts(state, "api").filter((event) => event.argv[1] === "rate_limit").length >= 2,
+    Date.now() + 20_000,
+  );
+  const resetProbeAt = resetProbe.matched
+    ? starts(resetProbe.value, "api").filter((event) => event.argv[1] === "rate_limit")[1].at
+    : null;
+  const publication = Number.isFinite(resetProbeAt)
+    ? await observeUntil(
+      box.readGovernor,
+      (governor) => governor?.budgets?.core?.used === 0 &&
+        governor.budgets.core.observedAt >= resetProbeAt,
+      Date.now() + 10_000,
+    )
+    : null;
+  const publishedCore = publication?.matched ? publication.value.budgets.core : null;
+  const resetDecision = publishedCore && resourceDecision({
+    budget: publishedCore,
+    resource: "core",
+    nowMs: publishedCore.observedAt,
+    cost: 2,
+    chargedCost: 0,
+  });
+  const laneInterval = resetDecision?.mode === "open" ? 2 / resetDecision.callsPerMs : null;
+  const progressDeadline = Number.isFinite(laneInterval)
+    ? publishedCore.observedAt + GOVERNOR_PHASE_WINDOW_MS + 2 * laneInterval + 10_000
+    : Date.now();
+  const progress = Number.isFinite(laneInterval)
+    ? await observeUntil(
+      box.read,
+      (state) => new Set(starts(state, "run").map((event) => event.pane)).size >= 3,
+      progressDeadline,
+    )
+    : null;
+  const preReleaseGovernor = progress?.matched ? box.readGovernor() : null;
+  const plannedReservations = Object.values(preReleaseGovernor?.reservations ?? {})
+    .filter((reservation) => reservation.costs.core === 2 && reservation.costs.graphql === 0)
+    .sort((left, right) => left.notBefore - right.notBefore);
+  writeFileSync(readyPath, "ready\n", { mode: 0o600 });
+  await captures;
+
   const state = box.read();
   const probes = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
-  const runs = starts(state, "run");
+  const runs = starts(state, "run").sort((left, right) => left.at - right.at);
+  const schedulingTolerance = laneInterval * 0.15;
+  t.diagnostic(`reset publication ${publishedCore?.observedAt}; ` +
+    `slots ${plannedReservations.map(({ notBefore }) => notBefore).join(",")}; ` +
+    `starts ${runs.map(({ at }) => at).join(",")}; horizon ${progressDeadline}; ` +
+    `lane ${laneInterval}`);
+  assert.ok(publication?.matched, "the reset budget publication was not observed");
+  assert.equal(resetDecision?.mode, "open", "reset publication did not reopen the core lane");
+  assert.equal(progress?.matched, true, `three panes missed the reset horizon ${progressDeadline}`);
   assert.ok(probes.length >= 2, `expected reset probe, got ${probes.length}`);
   assert.equal(runs.length, 3, `expected one active request per pane, got ${runs.length}`);
   assert.equal(new Set(runs.map((event) => event.pane)).size, 3);
   assert.equal(dataStarts(state).length, runs.length, "background work joined the reset phase");
   assert.ok(probes[1].at <= runs[0].at, "data raced the reset publication");
   assert.equal(state.maxDataConcurrency, 1, "reset data requests overlapped");
-  for (let index = 1; index < runs.length; index += 1) {
-    assert.ok(runs[index].at - runs[index - 1].at >= 1_000, "reset requests were not phased");
+  assert.equal(plannedReservations.length, 3, "reset reservations were not retained before teardown");
+  for (let index = 1; index < plannedReservations.length; index += 1) {
+    assert.ok(
+      plannedReservations[index].notBefore - plannedReservations[index - 1].notBefore >=
+        laneInterval - schedulingTolerance,
+      `reset slots escaped the ${laneInterval}ms lane: ${JSON.stringify(plannedReservations)}`,
+    );
+  }
+  for (let index = 0; index < runs.length; index += 1) {
+    assert.ok(runs[index].at >= plannedReservations[index].notBefore - schedulingTolerance,
+      `reset request started before its due slot: ${JSON.stringify({
+        run: runs[index],
+        reservation: plannedReservations[index],
+      })}`);
   }
 });
 
@@ -317,6 +385,8 @@ test("twelve held panes share one block probe instead of retrying per pane", asy
 
 test("twelve panes preserve one runtime rate-limit block across the minute", async (t) => {
   const setupAt = Date.now();
+  const readyPath = join(tmpdir(), `gh-glance-block-ready-${process.pid}-${setupAt}`);
+  t.after(() => rmSync(readyPath, { force: true }));
   const coreLimit = 5000;
   const spendableCalls = 26;
   const coreRemaining = resourceReserve(coreLimit) + spendableCalls;
@@ -360,24 +430,39 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
       message: "HTTP 403: API rate limit exceeded",
     },
   });
-  let blockObservedAt = null;
-  const observer = setInterval(() => {
-    try {
-      if (box.readGovernor().budgets.core?.blockReason === "rate-limit") {
-        blockObservedAt ??= Date.now();
-      }
-    } catch {
-      // The first probe has not created the governor file yet.
-    }
-  }, 40);
+  const captures = capturePanes(12, box, "blocked-minute", {
+    signal: "none",
+    settle: 90,
+    stdin:
+      "i=0; while [ ! -f \"$GH_GLANCE_FIXTURE_READY\" ] && [ \"$i\" -lt 1000 ]; do " +
+      "sleep .1; i=$((i + 1)); done; printf q",
+    env: { GH_GLANCE_FIXTURE_READY: readyPath },
+  });
+  const blockResult = await observeUntil(
+    box.readGovernor,
+    (governor) => governor?.budgets?.core?.blockReason === "rate-limit" &&
+      Number.isFinite(governor?.probeOutcome?.nextAt),
+    setupAt + 20_000,
+  );
+  const blockedGovernor = blockResult.matched ? blockResult.value : null;
+  const blockObservedAt = blockResult.matched ? Date.now() : null;
+  const initialProbeNextAt = blockedGovernor?.probeOutcome?.nextAt;
+  const boundedDeadline = Math.min(
+    Number.isFinite(initialProbeNextAt) ? initialProbeNextAt + 15_000 : setupAt + 20_000,
+    setupAt + 95_000,
+  );
+  const secondProbe = blockedGovernor
+    ? await observeUntil(
+      box.read,
+      (state) => starts(state, "api").filter((event) => event.argv[1] === "rate_limit").length >= 2,
+      boundedDeadline,
+    )
+    : null;
   try {
-    await capturePanes(12, box, "blocked-minute", {
-      // Leave margin after the shared 60-second probe deadline so process startup
-      // cannot turn this into a boundary-timing assertion.
-      settle: 75,
-    });
+    writeFileSync(readyPath, "ready\n", { mode: 0o600 });
+    await captures;
   } finally {
-    clearInterval(observer);
+    rmSync(readyPath, { force: true });
   }
   const state = box.read();
   const probes = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
@@ -389,6 +474,8 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
     `unbounded initial core starts: ${JSON.stringify(coreData)}`);
   assert.ok(failureEnd, "the injected rate-limit failure never completed");
   assert.ok(Number.isFinite(blockObservedAt), "the shared rate-limit block was never observed");
+  assert.ok(Number.isFinite(initialProbeNextAt), "the startup probe did not publish its next wake");
+  assert.equal(secondProbe?.matched, true, `the shared minute probe missed ${boundedDeadline}`);
   assert.ok(failureEnd.at <= blockObservedAt, "the block preceded the injected failure completion");
   assert.ok(coreData.every((event) => event.at < blockObservedAt),
     `core data started after the shared block was classified: ${JSON.stringify(coreData)}`);
@@ -401,6 +488,8 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
       outcome: governor.probeOutcome,
       core: governor.budgets.core,
     }));
+  assert.ok(probes[1].at - probes[0].at >= 59_500,
+    `shared probe retried before one minute: ${JSON.stringify(probes)}`);
   t.diagnostic(`core starts ${coreData.length}; probes ${probes.length}; ` +
     `failure end ${failureEnd.at}; block observed ${blockObservedAt}; ` +
     `block ${governor.budgets.core.blockReason}`);
