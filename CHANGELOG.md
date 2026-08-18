@@ -9,13 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **The Fetching indicator animates again while a fetch is in flight.** The
-  status line gated its glyph on the loading flag, but the frame counter that
-  drives it was scoped to first loads and executing runs only, so a manual
-  refresh over settled data turned the slot amber and then left it parked on
-  the resting frame. The counter now also runs while a visible fetch is
-  loading. Automatic polls over unchanged data still leave the flag false, so
-  the idle redraw suppression is unaffected.
+- **Concurrent panes preserve a hard reserve instead of slowing all the way to
+  exhaustion.** Local panes on one GitHub host and account now share atomic
+  grants, worst-case reservations, and one budget probe. gh-glance starts no
+  request when its latest fresh, conservatively debited REST or GraphQL sample
+  cannot pay for it outside the final 20% of that resource. Missing, corrupt,
+  locked, or unwritable coordination fails closed. REST exhaustion does not
+  stop healthy GraphQL tabs, and manual refresh cannot bypass the hold.
+
+### Changed
+
+- **Startup, reset, polling, and status now reflect the shared safe schedule.**
+  Stable pane phases spread startup and post-reset work, active checks precede
+  one rotating background check, and the old 60-second pacing ceiling is gone.
+  The active footer says Watching, Checking, Waiting, Paused, Failed, or Limited.
+  Startup and manual Checking animate while admitted; adapted automatic checks
+  and non-working states stay static. `next HH:MM` names one current grant, not
+  a recurring interval.
 
 ## [0.9.1] - 2026-08-11
 

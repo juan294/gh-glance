@@ -72,9 +72,9 @@ cd "$REPO" || exit 1
 
 # GH_GLANCE_NO_ANIMATION removes the 100ms spinner, the single largest source of
 # frame-to-frame variance (index.mjs:120).
-# GH_GLANCE_ICONS=unicode keeps the capture ASCII: the default glyphs are Nerd
-# Font private-use codepoints, which make both the source and any capture
-# containing them register as binary to grep (index.mjs:708).
+# GH_GLANCE_ICONS=unicode keeps row icons in single-cell text and status glyphs
+# in ordinary Unicode: the defaults include Nerd Font private-use codepoints,
+# which make captures register as binary to grep (index.mjs:708).
 # CI and CONTINUOUS_INTEGRATION are BOTH unset because is-in-ci checks both
 # (node_modules/is-in-ci/index.js:3-5), and ink in CI mode defers every write to
 # unmount -- measured 992 bytes and zero synchronized-update pairs, versus 4,348

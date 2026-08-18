@@ -46,6 +46,11 @@ export function isStatusLine(line) {
   return typeof line === "string" && STATUS_LINE.test(line);
 }
 
+export function waitForAwk(path, program, attempts = 150) {
+  return `i=0; while ! awk '${program} END { exit ok ? 0 : 1 }' ${path} 2>/dev/null ` +
+    `&& [ $i -lt ${attempts} ]; do i=$((i + 1)); sleep .1; done; `;
+}
+
 function readCaptureResult(out, dimensions) {
   const parsed = parseCapture(readFileSync(out, "utf8"), dimensions);
   const logPath = `${out}.calls`;

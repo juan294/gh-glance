@@ -75,6 +75,7 @@ import {
   MIN_TABLE_WIDTH,
   OCT_NERD,
   OCT_UNICODE,
+  normalizeIconProfile,
   KEY_TABLE,
   KEY_HINTS,
   REMOTE_SETUP_HINTS,
@@ -778,6 +779,13 @@ test("the two glyph tables are key-for-key identical and width-1", () => {
   for (const [key, glyph] of Object.entries(OCT_NERD)) {
     assert.ok(glyph.length > 0, `${key} must not be empty`);
   }
+});
+
+test("icon profiles normalize once while unknown values keep the Nerd row fallback", () => {
+  assert.equal(normalizeIconProfile("unicode"), "unicode");
+  assert.equal(normalizeIconProfile("ascii"), "ascii");
+  assert.equal(normalizeIconProfile(undefined), "nerd");
+  assert.equal(normalizeIconProfile("future-profile"), "nerd");
 });
 
 test("the minimum-width guard is derived from the widest header", () => {

@@ -114,12 +114,11 @@ const ALERT_PER_PAGE = 100;
 // parameters below.
 const ALERT_QUERY = `?state=open&per_page=${ALERT_PER_PAGE}&sort=created&direction=desc`;
 
-// Inactive tabs only feed the tab-bar counts, so they refresh every Nth tick
-// rather than every tick. Raised from 4 to 12 (a 60s cycle at the default
-// refresh) because the measured steady-state cost was 1,980-2,520 REST calls
-// per hour against a 5,000/hr limit -- 40-50% of the user's entire budget for a
-// single pane. Only the tab you are looking at needs REFRESH_MS latency; the
-// other three exist to keep counts honest, which tolerates a minute.
+// Inactive tabs only feed the tab-bar counts. One rotating background tab is
+// considered every four active floors, so each inactive tab is considered
+// about every Nth floor instead of all three starting together. The shared
+// governor can schedule either active or background demand later when that is
+// the safe resource slot.
 const BACKGROUND_EVERY = 12;
 // What one fetch of each tab costs lives in REST_PER_FETCH / GRAPHQL_PER_FETCH,
 // declared with ALERT_SOURCES below because the security figure derives from it.
@@ -3277,18 +3276,17 @@ async function readRateBudgets(signal, host = effectiveRuntimeHost()) {
     const resources = await readRateLimitResources(signal, host);
     return normalizeRateBudgets(resources);
   } catch {
-    // A probe failure must never be louder than the pane's own data: the loop
-    // simply does not adapt this cycle and stays at whatever it last applied.
+    // The caller publishes a failed probe outcome and keeps data admission
+    // closed. A missing sample must never fall back to the configured floor.
     return null;
   }
 }
 
-// Requests per hour this configuration will spend once it settles, derived from
-// the same constants the poll loop uses rather than from a number written down
-// once and left to rot. The active tab refreshes every tick; the other three
-// every BACKGROUND_EVERY ticks. The per-fetch prices come from REST_PER_FETCH
-// and GRAPHQL_PER_FETCH, which are also what the spend meter bills against --
-// two copies of them would diverge the first time one was fixed.
+// Conservative unpaced demand at this configuration's floor, derived from the
+// same constants the scheduler uses rather than from a number written down once
+// and left to rot. The governor can admit less demand; this projection explains
+// pressure, not actual granted spend. The per-fetch prices come from
+// REST_PER_FETCH and GRAPHQL_PER_FETCH, which also feed the operation registry.
 function projectedHourlyCost(activeKey) {
   const perHour = 3_600_000 / runtime.refreshMs;
   return {
@@ -3662,7 +3660,7 @@ const KEY_TABLE = [
   ["Up / Down, j / k", "Move the cursor between rows"],
   ["PgUp / PgDn", "Move a page at a time"],
   ["Enter", "Open the selected item or accept a prompt"],
-  ["r", "Refresh the current tab now"],
+  ["r", "Refresh the current tab when a safe grant is available"],
   ["w", "Adjust table column widths"],
   ["?", "Show the keys (any key closes it)"],
   ["q / Esc / Ctrl+C", "Quit (Esc leaves width mode)"],
@@ -3686,7 +3684,7 @@ const HELP = `gh-glance ${version} -- a live-refreshing GitHub dashboard for a n
 Usage:
   gh-glance                     Run the dashboard in the current repository
   gh-glance --repo owner/name   Watch a specific repository instead
-  gh-glance --refresh 15        Poll the active tab every 15 seconds
+  gh-glance --refresh 15        Set a 15-second active-tab poll floor
   gh-glance --tab security      Start on a specific tab
   gh-glance --verbose 2>log     Log every gh call to a file (see below)
   gh-glance --doctor            Print a diagnostic report and exit
@@ -3701,16 +3699,18 @@ Options:
                            data-residency tenant (e.g. tenant.ghe.com/acme/api)
                            and is unnecessary when running inside a clone of
                            that repository.
-  --refresh <seconds>      Active-tab poll interval (${MIN_REFRESH_SECONDS}-${MAX_REFRESH_SECONDS},
-                           default ${REFRESH_MS / 1000}). Background tabs stay at
-                           ${BACKGROUND_EVERY}x this.
+  --refresh <seconds>      Minimum active-tab poll interval (${MIN_REFRESH_SECONDS}-${MAX_REFRESH_SECONDS},
+                           default ${REFRESH_MS / 1000}). Safe shared grants may
+                           run later; each background tab is considered about
+                           every ${BACKGROUND_EVERY} floors.
   --tab <name>             Tab to start on: ${TAB_KEYS.join(", ")}.
   --verbose                Write one line per gh invocation to stderr. stderr
                            must be redirected -- writing it to the terminal
                            would draw over the dashboard, so this refuses to
                            start otherwise.
   --doctor                 Gather versions, authenticated hosts, the resolved
-                           repo target and one probe per endpoint, then exit.
+                           repo target, API governor health and one safely
+                           admitted probe per endpoint, then exit.
                            Safe to redirect to a file and share -- tokens are
                            never printed, proxy credentials are stripped, and
                            no response bodies are included.
@@ -3719,11 +3719,14 @@ Run it from inside a locally cloned GitHub repository; the repo is inferred
 from the git remote, the same way \`gh\` does it. Requires the \`gh\` CLI
 (2.20 or newer), authenticated via \`gh auth login\`.
 
-The active tab refreshes every ${REFRESH_MS / 1000}s; the other three refresh every
-${(REFRESH_MS * BACKGROUND_EVERY) / 1000}s to keep their counts honest without spending the API rate limit.
+On a healthy single pane, the active tab is considered every ${REFRESH_MS / 1000}s and each
+background tab about every ${(REFRESH_MS * BACKGROUND_EVERY) / 1000}s. Quota-consuming calls still
+need a shared, resource-specific grant that preserves a hard reserve. Waiting
+and manual refresh do not bypass that safety check.
 
-Status icons are GitHub Octicons and need a Nerd Font. Without one, set
-GH_GLANCE_ICONS=unicode for plain-unicode equivalents.
+Row icons are GitHub Octicons and need a Nerd Font. Without one, set
+GH_GLANCE_ICONS=unicode for Unicode status glyphs and text row substitutes, or
+GH_GLANCE_ICONS=ascii for ASCII-only status and row icons.
 
 Keys:
 ${keyTableLines()
@@ -3733,15 +3736,17 @@ ${keyTableLines()
 The cursor clears itself after 60s with no movement.
 
 Environment:
-  GH_REPO=owner/name        Watch a specific repository (--repo takes precedence)
-  GH_HOST=host              GitHub Enterprise or EMU host to send every call to.
-                            A host-qualified GH_REPO does not route \`gh api\`;
-                            this and --repo host/owner/name both do.
+  GH_REPO=[host/]owner/name Watch a specific repository (--repo takes precedence)
+  GH_HOST=host              GitHub Enterprise or EMU host for every call and
+                            its account governor. A qualified GH_REPO also
+                            supplies the host; an unqualified one means github.com.
   GH_GLANCE_REFRESH=<seconds>
-                            Active-tab poll interval, ${MIN_REFRESH_SECONDS}-${MAX_REFRESH_SECONDS}
+                            Minimum active-tab poll interval, ${MIN_REFRESH_SECONDS}-${MAX_REFRESH_SECONDS};
+                            safe shared grants may run later
                             (--refresh takes precedence)
-  GH_GLANCE_ICONS=unicode   Plain-unicode status icons (no Nerd Font needed)
-  GH_GLANCE_NO_ANIMATION=1  Freeze the spinner (no motion)
+  GH_GLANCE_ICONS=unicode   Unicode status glyphs and text row substitutes
+  GH_GLANCE_ICONS=ascii     ASCII-only status and row icons
+  GH_GLANCE_NO_ANIMATION=1  Stop motion; semantic status words remain
   NO_COLOR=1                Disable colour (status stays readable)
   INK_SCREEN_READER=true    Linear, unthrottled rendering (unverified -- see README)
 `;
@@ -3914,7 +3919,13 @@ const OCT_UNICODE = {
 // blank box, which reads as "this program is broken" rather than "install a
 // font", and the remedy currently lives only in --help and the README: both of
 // which require quitting the full-screen app you are trying to evaluate.
-const USING_NERD_ICONS = process.env.GH_GLANCE_ICONS !== "unicode";
+function normalizeIconProfile(value) {
+  if (value === "unicode" || value === "ascii") return value;
+  return "nerd";
+}
+
+const ICON_PROFILE = normalizeIconProfile(process.env.GH_GLANCE_ICONS);
+const USING_NERD_ICONS = ICON_PROFILE === "nerd";
 const OCT = USING_NERD_ICONS ? OCT_NERD : OCT_UNICODE;
 
 // ---------- Shared layout primitives ----------
@@ -5813,13 +5824,12 @@ function TabBar({ activeIndex, counts, brokenCI, firstLoad, failed, spin, useSho
 
 // ---------- Status bar ----------
 
-// Every glyph here is width-1 ASCII, deliberately, with one exception: the
-// Move arrows. The return symbol and the box-drawing separator are still
-// East-Asian-Ambiguous and stay out for that reason -- ink measures them as
-// two columns in its width model, and a status bar built from them overflowed
-// an 80-column terminal by six columns once selection added a hint. Same trap
-// the unicode icon table already documents -- prefer strictly narrow ASCII
-// over pretty-but-ambiguous. The arrow pair is a deliberate exception, and it
+// Control-hint glyphs are width-1 ASCII, deliberately, with one exception: the
+// Move arrows. Semantic status glyphs come from the selected profile below.
+// The return symbol and box-drawing separator stay out because they are
+// East-Asian-Ambiguous -- ink measures them as two columns, and a status bar
+// built from them overflowed an 80-column terminal by six columns once
+// selection added a hint. The arrow pair is a deliberate exception, and it
 // is NOT covered by a width assertion -- an earlier version of this comment
 // claimed `npm run test:pty` would catch a double-width rendering, and that was
 // wrong twice over. Each hint is wrap: "truncate-end", so the failure mode is
@@ -6182,7 +6192,7 @@ function StatusBar({
     stale,
     version,
   });
-  const profile = process.env.GH_GLANCE_ICONS === "ascii" ? "ascii" : "unicode";
+  const profile = ICON_PROFILE === "ascii" ? "ascii" : "unicode";
   const glyphs = REFRESH_STATUS_GLYPHS[profile];
   const glyph = profile !== "ascii" &&
       semanticStatus.glyphKind === "checking" && semanticStatus.animate && spin
@@ -8601,6 +8611,7 @@ export {
   TABS,
   OCT_NERD,
   OCT_UNICODE,
+  normalizeIconProfile,
   KEY_TABLE,
   KEY_HINTS,
   activeKeyHints,

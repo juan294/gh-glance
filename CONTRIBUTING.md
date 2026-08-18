@@ -21,7 +21,7 @@ documentation, contributions are welcome.
 - Node.js `>=22` (Ink requires it; Node 20 is end-of-life)
 - The [`gh` CLI](https://cli.github.com/) `>=2.20`, authenticated (`gh auth login`)
 - A terminal font with [Nerd Font](https://www.nerdfonts.com/) glyphs, to see
-  the status icons correctly (see the README for the plain-unicode fallback)
+  the row icons correctly (see the README for Unicode and ASCII fallbacks)
 
 ## Local Development
 
@@ -88,6 +88,17 @@ must cross a process boundary can pass one caller-owned `configHome` to several
 captures. Create it with `mkdtempSync`, keep the exact returned path, and remove
 only that path after every capture has finished.
 
+Governor changes need both concurrency layers. `test/governor.test.mjs` launches
+12 real worker processes against one private state file and covers atomic
+grants, probe ownership, scope isolation, lock recovery, and process loss.
+`test/pty/governor.test.mjs` and `test/pty/throttle.test.mjs` launch real
+dashboard panes against the lock-safe shared fixture to prove startup, manual,
+exhaustion, resource isolation, reset, external spend, and crash behavior. The
+fixture keeps its own state and lock independent from the production governor,
+so it cannot hide a lost update in the mechanism it is validating. PTY files
+run serially; their individual cases still create the required concurrent
+panes.
+
 Direct SGR mouse tests must enter width mode before sending reports, then send
 each logical report through the foreground pty as its own timed write, plus one
 intentionally split report that exercises the pending token boundary. Assert
@@ -109,6 +120,19 @@ Two things to know before editing it:
 
 Worth knowing about the app's shape before changing it:
 
+- `OPERATION_COSTS` is the one quota-cost authority. Every `runGh()` operation
+  must have an exact REST/GraphQL vector there, and every non-free data call must
+  obtain and revalidate a governor grant before its subprocess starts. A new
+  call path is incomplete until both statements are true.
+- Budget control, data work, and lease heartbeats use independent one-shot
+  schedulers. A slow request must not suppress a probe or lease renewal, and a
+  control wake must not create an unconditional data poll.
+- Governor storage is fail-closed. A busy, corrupt, stale, or unwritable lock or
+  state file denies the call; never recover by using a process-local request
+  interval. Started, interrupted, and uncertain reservations remain charged
+  until completion evidence and a later clean probe account for them.
+- Loading and animated Checking state begin only after admission. A pending or
+  denied request is Waiting or Paused and makes no quota-consuming `gh` call.
 - The polling effect's empty dependency array is deliberate. Every value it
   needs is read through a ref precisely so the interval is created once; adding
   dependencies would rebuild it on every tab keypress and every resize and
@@ -188,9 +212,13 @@ refactor: extract the row-height calculation
 - Keep the npm package CLI-only. Do not expose the internal named test seams
   through `exports`; use direct source imports from this repository in tests.
 - Run `npm run lint` and `npm test` before submitting a PR.
-- The sample output block in `README.md` is captured from a real run. If you
-  change a column, a limit, or the status bar, regenerate it rather than editing
-  it by hand -- it drifted out of date once already.
+- The sample output block in `README.md` is generated from the real candidate
+  under the deterministic PTY fixture. If you change a column, a limit, or the
+  status bar, regenerate it rather than editing it by hand -- it drifted out of
+  date once already. Run
+  `node test/pty/readme-sample.mjs`; it executes the current `index.mjs` under a
+  76x14 PTY with deterministic fixture data and prints the exact replayed frame
+  to paste as one unchanged block.
 - Keep every call to `gh` going through the single `runGh()` seam, which uses
   `execFile` with an argument array -- never build a shell string from
   repository data. The four data-fetching functions (`fetchActions`,

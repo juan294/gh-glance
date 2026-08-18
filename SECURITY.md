@@ -115,6 +115,28 @@ advisory: it is ignored rather than weakening authentication or preventing
 startup. A failed or blind Security observation never replaces a
 last-known-good alert set with an empty one.
 
+API admission uses a separate `rate-governor-v1-<scope hash>.json` file in the
+same private directory. The SHA-256 file-name scope binds the normalized
+effective GitHub host to the existing local authentication namespace; neither
+raw value is stored in the name or canonical state. The governor contains only
+protocol data: REST/GraphQL observations and epochs, leases, intents,
+reservations, fair-lane cursors, probe state, and shared rate-limit blocks. It
+contains no token, raw host, login, account identifier, repository, working
+directory, title, author, branch, alert, or other cached row. The canonical
+state also contains no PID; an ephemeral lock-owner record contains only a PID
+and random nonce so a live or suspended owner cannot be mistaken for a dead
+one.
+
+Unlike the advisory row cache, the governor is an authorization boundary for
+quota-consuming subprocesses. Its directory is `0700`, and canonical,
+temporary, lock, recovery-marker, and quarantine files are created as `0600` on
+POSIX systems. State replacement is atomic; lock release and dead-owner
+quarantine require the exact nonce. Missing state is initialized only while the
+private lock is held. Corrupt, stale, busy, or unwritable coordination denies
+the request instead of falling back to process-local polling. Started,
+interrupted, or process-lost reservations stay charged conservatively until a
+later clean probe can account for them.
+
 The repository target is the one user-supplied value that both reaches a
 subprocess argument and is interpolated into a `gh api` request path, so it is
 validated once at the boundary. The `owner/name` half is matched against what
@@ -152,9 +174,10 @@ its own; every GitHub API call goes through the `gh` CLI. It never requests
 `--show-token`, invokes `gh auth token`, or supplies a token argument. Its one
 credential-adjacent operation is local and non-authenticating: it hashes each
 set `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, and
-`GITHUB_ENTERPRISE_TOKEN` value into the cache namespace so different effective
-credentials cannot hydrate the same saved rows. The raw value is not retained,
-rendered, logged, or written to disk. Failure context invokes only the read-only
+`GITHUB_ENTERPRISE_TOKEN` value into the cache and governor namespaces so
+different effective credentials cannot hydrate the same saved rows or share
+admission state. The raw value is not retained, rendered, logged, or written to
+disk. Failure context invokes only the read-only
 `gh auth status` and `gh repo view` commands. Optional account and repository
 strings are sanitized before rendering, and doctor output remains protected by
 the presence-only and redaction rules above. Login, authorization refresh, and

@@ -10,17 +10,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { capture, isStatusLine } from "./capture.mjs";
+import { capture, isStatusLine, waitForAwk } from "./capture.mjs";
 
 function configRoot(t, prefix) {
   const root = mkdtempSync(join(tmpdir(), prefix));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   return root;
-}
-
-function waitForAwk(path, program, attempts = 150) {
-  return `i=0; while ! awk '${program} END { exit ok ? 0 : 1 }' ${path} 2>/dev/null ` +
-    `&& [ $i -lt ${attempts} ]; do i=$((i + 1)); sleep .1; done; `;
 }
 
 function captureCount(token) {
@@ -139,6 +134,9 @@ test("ASCII profile keeps the same status label and a width-one marker", (t) => 
     configHome: configRoot(t, "gh-glance-status-ascii-"),
   });
   assert.match(statusLine(result) ?? "", /^\. (?:Watching|Waiting)/);
+  const frame = result.finalFrame.lines.join("\n");
+  assert.match(frame, /^│ {2}[+x-] {2}\S/m);
+  assert.doesNotMatch(frame, /[\uE000-\uF8FF]/);
   assert.equal(result.finalFrame.widest <= 45, true);
 });
 
