@@ -116,13 +116,17 @@ fi
 if script --version 2>/dev/null | grep -q util-linux; then
   # GNU: command is one shell string via -c, outfile is the last positional,
   # and -e is REQUIRED for exit propagation.
+  GNU_FLUSH_FLAG=""
+  if [ "${GH_GLANCE_CAPTURE_LIVE_FLUSH:-}" = "1" ]; then
+    GNU_FLUSH_FLAG="-f"
+  fi
   if [ -n "$STDIN_SCRIPT" ]; then
     GH_GLANCE_CAPTURE_OUT="$OUT" GH_GLANCE_CAPTURE_STDIN="$STDIN_SCRIPT" \
       GH_GLANCE_CAPTURE_PID_FILE="$PIPE_ROOT/producer.pid" \
       sh -c 'printf "%s\n" "$$" > "$GH_GLANCE_CAPTURE_PID_FILE"; exec sh -c "$GH_GLANCE_CAPTURE_STDIN"' | \
-      script -q -e -c "$INNER" "$OUT" >/dev/null 2>&1 &
+      script -q -e $GNU_FLUSH_FLAG -c "$INNER" "$OUT" >/dev/null 2>&1 &
   else
-    script -q -e -c "$INNER" "$OUT" </dev/null >/dev/null 2>&1 &
+    script -q -e $GNU_FLUSH_FLAG -c "$INNER" "$OUT" </dev/null >/dev/null 2>&1 &
   fi
 else
   # BSD: outfile is the FIRST positional and the command is an argv vector.
@@ -130,13 +134,17 @@ else
   # "tcgetattr/ioctl: Operation not supported on socket" and leaves a zero-byte
   # file with rc=1 -- indistinguishable from "the app never rendered" unless the
   # caller checks, which is why capture.mjs treats an empty file as an error.
+  BSD_FLUSH_FLAG=""
+  if [ "${GH_GLANCE_CAPTURE_LIVE_FLUSH:-}" = "1" ]; then
+    BSD_FLUSH_FLAG="-F"
+  fi
   if [ -n "$STDIN_SCRIPT" ]; then
     GH_GLANCE_CAPTURE_OUT="$OUT" GH_GLANCE_CAPTURE_STDIN="$STDIN_SCRIPT" \
       GH_GLANCE_CAPTURE_PID_FILE="$PIPE_ROOT/producer.pid" \
       sh -c 'printf "%s\n" "$$" > "$GH_GLANCE_CAPTURE_PID_FILE"; exec sh -c "$GH_GLANCE_CAPTURE_STDIN"' | \
-      script -q "$OUT" /bin/sh -c "$INNER" >/dev/null 2>&1 &
+      script -q $BSD_FLUSH_FLAG "$OUT" /bin/sh -c "$INNER" >/dev/null 2>&1 &
   else
-    script -q "$OUT" /bin/sh -c "$INNER" </dev/null >/dev/null 2>&1 &
+    script -q $BSD_FLUSH_FLAG "$OUT" /bin/sh -c "$INNER" </dev/null >/dev/null 2>&1 &
   fi
 fi
 

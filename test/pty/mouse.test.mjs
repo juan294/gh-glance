@@ -42,6 +42,16 @@ const waitForActionsCache =
   "while ! grep -Eq '\"databaseId\"[[:space:]]*:[[:space:]]*101' \"$dashboard\" " +
   "2>/dev/null && [ \"$i\" -lt 600 ]; do sleep .05; i=$((i + 1)); done; " +
   "printf 'dashboard=%s\\n' \"$i\" > \"$XDG_CONFIG_HOME/mouse-readiness\"; sleep .2; ";
+const waitForActionsFrame =
+  "i=0; while [ \"$i\" -lt 600 ]; do " +
+  "if LC_ALL=C grep -a -q 'WORKFLOW' \"$GH_GLANCE_CAPTURE_OUT\" 2>/dev/null && " +
+  "LC_ALL=C grep -a -q 'ci: pin actions' \"$GH_GLANCE_CAPTURE_OUT\" 2>/dev/null; " +
+  "then break; fi; sleep .05; i=$((i + 1)); done; " +
+  "printf 'frame=%s\\n' \"$i\" >> \"$XDG_CONFIG_HOME/mouse-readiness\"; ";
+const waitForWidthMode =
+  "i=0; while ! LC_ALL=C grep -a -q 'Width: WORKFLOW 10' \"$GH_GLANCE_CAPTURE_OUT\" " +
+  "2>/dev/null && [ \"$i\" -lt 200 ]; do sleep .05; i=$((i + 1)); done; " +
+  "printf 'width=%s\\n' \"$i\" >> \"$XDG_CONFIG_HOME/mouse-readiness\"; ";
 const waitForWorkflowResize =
   "i=0; preferences=\"$XDG_CONFIG_HOME/gh-glance/preferences.json\"; " +
   "while ! grep -Eq '\"workflow\"[[:space:]]*:[[:space:]]*7' \"$preferences\" " +
@@ -144,9 +154,10 @@ test("a split press stops resizing after an outside-header release", (t) => {
       signal: "none",
       settle: 45,
       configHome,
+      env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
       stdin:
-        waitForActionsCache +
-        `printf 'w'; sleep 1; printf '\\033[<0;${PRESS_X};'; sleep 0.005; printf '${PRESS_Y}M'; ` +
+        waitForActionsCache + waitForActionsFrame + "printf 'w'; " + waitForWidthMode +
+        `printf '\\033[<0;${PRESS_X};'; sleep 0.005; printf '${PRESS_Y}M'; ` +
         `sleep 1; printf '\\033[<32;${DRAG_X};${PRESS_Y}M'; ` +
         `sleep 1; printf '\\033[<0;${DRAG_X};${OUTSIDE_Y}m'; ` +
         `sleep 1; printf '\\033[<32;${DRAG_X + 3};${OUTSIDE_Y}M'; ` +
@@ -155,8 +166,16 @@ test("a split press stops resizing after an outside-header release", (t) => {
 
     assert.equal(PRESS_X, 34, "live workflow grip encoded x coordinate changed");
     assert.equal(PRESS_Y, 4, "live Actions header encoded y coordinate changed");
-    const readiness = readFileSync(join(configHome, "mouse-readiness"), "utf8").trim();
-    t.diagnostic(`${readiness.replaceAll("\n", "; ")} (50ms polls)`);
+    const readinessText = readFileSync(join(configHome, "mouse-readiness"), "utf8").trim();
+    const readiness = Object.fromEntries(readinessText.split("\n").map((line) => {
+      const [key, polls] = line.split("=");
+      return [key, Number(polls)];
+    }));
+    t.diagnostic(`${readinessText.replaceAll("\n", "; ")} (50ms polls)`);
+    assert.ok(readiness.dashboard < 600, "Actions cache readiness timed out");
+    assert.ok(readiness.frame < 600, "Actions frame readiness timed out");
+    assert.ok(readiness.width < 200, "width-mode frame readiness timed out");
+    assert.ok(readiness.preference < 200, "workflow preference readiness timed out");
     assertCleanMouseCapture(dragged, { cols: 80, rows: 24, label: "drag" });
     assert.deepEqual(JSON.parse(readFileSync(preferencePath, "utf8")), {
       version: 1,
