@@ -48,6 +48,12 @@ import {
   resetWidthPreference,
   resetTabWidthPreferences,
   widthStatusText,
+  refreshStatus,
+  statusBarLayout,
+  freshnessDeadline,
+  probingGovernorDecisions,
+  retainDeferredGovernorHold,
+  REFRESH_STATUS_GLYPHS,
   headerGutterKey,
   parseSgrMouse,
   dividerHandles,
@@ -1361,6 +1367,205 @@ test("width-mode status surfaces a bounded nonfatal save warning", () => {
     assert.match(status, /^[\x20-\x7e]*$/, `${cols}: warning must be ASCII-only`);
     if (cols >= "Widths not saved".length) assert.match(status, /Widths not saved/);
   }
+});
+
+test("refresh status pins active-tab precedence, copy, motion, and details", () => {
+  const base = {
+    widthMode: false,
+    remoteSetup: false,
+    visibleLoading: false,
+    visibleInFlight: false,
+    automaticStatusVisible: false,
+    governorDecision: null,
+    activeError: null,
+    securityIncomplete: false,
+    screenReader: false,
+  };
+  const status = (overrides) => refreshStatus({ ...base, ...overrides });
+
+  assert.deepEqual(status({}), {
+    kind: "watching", glyphKind: "watching", label: "Watching",
+    tone: "inert", animate: false, detailKind: null,
+  });
+  assert.equal(status({ remoteSetup: true, visibleLoading: true }).kind, "setup");
+  assert.equal(status({ widthMode: true, remoteSetup: true }).kind, "width");
+  assert.deepEqual(status({ visibleLoading: true }), {
+    kind: "checking", glyphKind: "checking", label: "Checking",
+    tone: "active", animate: true, detailKind: null,
+  });
+  assert.equal(status({
+    visibleInFlight: true,
+    automaticStatusVisible: true,
+  }).kind, "checking");
+  assert.equal(status({
+    visibleInFlight: true,
+    automaticStatusVisible: true,
+    screenReader: true,
+  }).kind, "watching");
+  assert.deepEqual(status({ governorDecision: { mode: "paused", resetMs: 123 } }), {
+    kind: "paused", glyphKind: "paused", label: "Paused",
+    tone: "attention", animate: false, detailKind: "reset",
+  });
+  assert.deepEqual(status({ governorDecision: { mode: "waiting", notBefore: 456 } }), {
+    kind: "waiting", glyphKind: "waiting", label: "Waiting",
+    tone: "inert", animate: false, detailKind: "next",
+  });
+  assert.equal(status({ activeError: { verdict: "other" }, securityIncomplete: true }).kind, "failed");
+  assert.equal(status({ securityIncomplete: false, securityNotes: ["Dependabot is not enabled"] }).kind, "watching");
+  assert.equal(status({ securityIncomplete: true }).kind, "limited");
+  assert.equal(status({
+    governorDecision: { mode: "paused" },
+    activeError: { verdict: "other" },
+  }).kind, "paused");
+  for (const [expected, input] of [
+    ["setup", { remoteSetup: true }],
+    ["checking", { visibleLoading: true }],
+    ["waiting", { governorDecision: { mode: "waiting" } }],
+    ["paused", { governorDecision: { mode: "paused" } }],
+    ["failed", { activeError: { verdict: "other" } }],
+    ["limited", { securityIncomplete: true }],
+  ]) {
+    assert.equal(status({ ...input, screenReader: true }).kind, expected);
+  }
+});
+
+test("refresh status markers are width one and labels do not change by profile", () => {
+  assert.deepEqual(Object.keys(REFRESH_STATUS_GLYPHS.unicode), Object.keys(REFRESH_STATUS_GLYPHS.ascii));
+  for (const profile of Object.values(REFRESH_STATUS_GLYPHS)) {
+    for (const glyph of Object.values(profile)) assert.equal([...glyph].length, 1, glyph);
+  }
+  assert.deepEqual(
+    ["setup", "checking", "paused", "waiting", "failed", "limited", "watching"]
+      .map((kind) => refreshStatus(kind === "watching" ? {} : {
+        remoteSetup: kind === "setup",
+        visibleLoading: kind === "checking",
+        governorDecision: ["paused", "waiting"].includes(kind) ? { mode: kind } : null,
+        activeError: kind === "failed" ? { verdict: "other" } : null,
+        securityIncomplete: kind === "limited",
+      }).label),
+    ["Setup", "Checking", "Paused", "Waiting", "Failed", "Limited", "Watching"],
+  );
+});
+
+test("status bar layout preserves actions before deterministic detail and optional hints", () => {
+  const hints = [
+    { label: "Move", keys: "jk" },
+    { label: "Open", keys: "Ent" },
+    { label: "Refresh", keys: "r" },
+    { label: "Width", keys: "w" },
+    { label: "Quit", keys: "q" },
+  ];
+  const status = refreshStatus({ governorDecision: { mode: "waiting", notBefore: 0 } });
+  const detail = { notBefore: new Date(2026, 7, 18, 8, 42).getTime() };
+  const layouts = Object.fromEntries([80, 60, 45, 24, 23].map((cols) => [
+    cols,
+    statusBarLayout({ cols, interactive: true, availableHints: hints, status, detail, version: "v0.9.1" }),
+  ]));
+
+  assert.deepEqual(Object.fromEntries([80, 60, 45, 24, 23].map((cols) => [cols, {
+    detail: layouts[cols].detail,
+    mandatory: layouts[cols].mandatoryHints.map((hint) => hint.text),
+    optional: layouts[cols].optionalHints.map((hint) => hint.text),
+    version: layouts[cols].version,
+  }])), {
+    80: {
+      detail: "next 08:42",
+      mandatory: ["Refresh: r", "Quit: q"],
+      optional: ["Move: jk", "Open: Ent", "Width: w"],
+      version: "v0.9.1",
+    },
+    60: {
+      detail: "next 08:42",
+      mandatory: ["Refresh: r", "Quit: q"],
+      optional: ["Move: jk", "Open: Ent"],
+      version: null,
+    },
+    45: {
+      detail: "next 08:42",
+      mandatory: ["Refresh: r", "Quit: q"],
+      optional: ["jk"],
+      version: null,
+    },
+    24: {
+      detail: null,
+      mandatory: ["Refresh: r", "q"],
+      optional: [],
+      version: null,
+    },
+    23: {
+      detail: null,
+      mandatory: ["r", "Quit: q"],
+      optional: ["w"],
+      version: null,
+    },
+  });
+
+  const paused = refreshStatus({ governorDecision: { mode: "paused", resetMs: detail.notBefore } });
+  assert.equal(statusBarLayout({
+    cols: 45,
+    interactive: true,
+    availableHints: hints,
+    status: paused,
+    detail: { resetMs: detail.notBefore },
+    version: "v0.9.1",
+  }).detail, "reset 08:42");
+  assert.equal(statusBarLayout({
+    cols: 24,
+    interactive: true,
+    availableHints: hints,
+    status: refreshStatus({ governorDecision: { mode: "waiting", probing: true } }),
+    detail: {},
+    version: "v0.9.1",
+  }).detail, null);
+});
+
+test("freshness extends only through a valid current-epoch waiting grant", () => {
+  const lastOk = 1_000_000;
+  const base = lastOk + 30_000;
+  const epochs = { core: "core:1", graphql: null };
+  assert.equal(freshnessDeadline({ lastOk, refreshMs: 5_000 }), base);
+  assert.equal(freshnessDeadline({
+    lastOk,
+    refreshMs: 5_000,
+    governorDecision: {
+      mode: "waiting",
+      notBefore: base + 10_000,
+      epochs,
+    },
+    currentEpochs: epochs,
+  }), base + 40_000);
+  for (const [governorDecision, currentEpochs] of [
+    [{ mode: "waiting", notBefore: base + 10_000, epochs }, { ...epochs, core: "core:2" }],
+    [{ mode: "waiting", notBefore: base + 10_000 }, epochs],
+    [{ mode: "paused", notBefore: base + 10_000, epochs }, epochs],
+    [{ mode: "waiting", notBefore: Number.NaN, epochs }, epochs],
+  ]) {
+    assert.equal(freshnessDeadline({
+      lastOk,
+      refreshMs: 5_000,
+      governorDecision,
+      currentEpochs,
+    }), base);
+  }
+});
+
+test("scope changes reset visible grants and screen readers retain deferred holds", () => {
+  assert.deepEqual(Object.keys(probingGovernorDecisions()), TAB_KEYS);
+  for (const decision of Object.values(probingGovernorDecisions())) {
+    assert.deepEqual(decision, { mode: "waiting", probing: true });
+  }
+  assert.equal(retainDeferredGovernorHold({
+    automaticStatusVisible: true,
+    screenReader: true,
+  }), true);
+  assert.equal(retainDeferredGovernorHold({
+    automaticStatusVisible: true,
+    screenReader: false,
+  }), false);
+  assert.equal(retainDeferredGovernorHold({
+    automaticStatusVisible: false,
+    screenReader: true,
+  }), false);
 });
 
 const EXPECTED_HEADER_GUTTER_OWNERS = {

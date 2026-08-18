@@ -1570,6 +1570,7 @@ const GOVERNOR_MAX_RESERVATIONS = 512;
 const GOVERNOR_LOCK_WAIT_MS = 250;
 const GOVERNOR_PROBE_DRAIN_MS = 30_000;
 const GOVERNOR_PUBLICATION_REINSPECT_MS = 1_000;
+const GOVERNOR_PROBE_TRANSITION_MS = 5_000;
 const GOVERNOR_MAX_FUTURE_MS = 24 * 60 * 60 * 1000;
 const GOVERNOR_OUTCOMES = new Set([
   "measured-success",
@@ -1644,6 +1645,13 @@ function createGovernorScope({
 
 function scopeNow(scope, nowMs) {
   return Number.isFinite(nowMs) ? nowMs : Number(scope?.now?.());
+}
+
+function governorEffectiveTime(scope, requestedAt) {
+  const currentAt = scopeNow(scope);
+  return Number.isFinite(currentAt) && currentAt >= 0
+    ? Math.max(requestedAt, currentAt)
+    : requestedAt;
 }
 
 function currentGovernorScope(scope) {
@@ -2089,9 +2097,14 @@ function withGovernorLock(scope, operation, {
 }
 
 function mutateGovernor(scope, nowMs, mutate) {
-  const at = scopeNow(scope, nowMs);
-  if (!Number.isFinite(at) || at < 0) return { ok: false, reason: "corrupt" };
+  const requestedAt = scopeNow(scope, nowMs);
+  if (!Number.isFinite(requestedAt) || requestedAt < 0) return { ok: false, reason: "corrupt" };
   return withGovernorLock(scope, () => {
+    // Another process can persist a lease while this caller waits for the
+    // lock. Re-read the clock after exclusivity is acquired so that valid work
+    // committed during that wait does not look future-dated to normalization.
+    // Explicit future times and injected fake clocks remain authoritative.
+    const at = governorEffectiveTime(scope, requestedAt);
     // Scope can change while this process waits for the file lock. Admission
     // must bind to the host/account identity observed while exclusivity is
     // held, immediately before it reads and mutates the shared state.
@@ -2532,9 +2545,10 @@ function releaseLease(scope, leaseId) {
 }
 
 function inspectGovernor(scope, nowMs) {
-  const at = scopeNow(scope, nowMs);
-  if (!Number.isFinite(at) || at < 0) return { ok: false, reason: "corrupt" };
+  const requestedAt = scopeNow(scope, nowMs);
+  if (!Number.isFinite(requestedAt) || requestedAt < 0) return { ok: false, reason: "corrupt" };
   return withGovernorLock(scope, () => {
+    const at = governorEffectiveTime(scope, requestedAt);
     const loaded = readGovernorState(scope.path, at);
     return loaded;
   });
@@ -2561,12 +2575,23 @@ function governorHealth(result, nowMs = Date.now()) {
   };
 }
 
+async function retryGovernorMutation(run, { now, wait, deadline, signal }) {
+  let result = run();
+  while (!result.ok && result.reason === "busy" && !signal?.aborted && now() < deadline) {
+    await wait(Math.min(100, Math.max(1, deadline - now())));
+    result = run();
+  }
+  return result;
+}
+
 async function refreshSharedBudget(scope, leaseId, signal, {
   readBudgets = readRateBudgets,
   now = () => scopeNow(scope),
   wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   inspect = inspectGovernor,
   renew = renewProbeClaim,
+  publish = publishProbe,
+  fail = failProbeClaim,
 } = {}) {
   let claim = claimProbe(scope, leaseId, now());
   if (!claim.ok) return claim;
@@ -2611,7 +2636,15 @@ async function refreshSharedBudget(scope, leaseId, signal, {
     }
     await wait(Math.min(100, Math.max(1, drainUntil - now())));
   }
-  const renewed = renew(scope, leaseId, nonce, now());
+  const renewalStartedAt = now();
+  const renewalDeadline = Math.min(
+    claim.value.leaseUntil,
+    renewalStartedAt + GOVERNOR_PROBE_TRANSITION_MS,
+  );
+  const renewed = await retryGovernorMutation(
+    () => renew(scope, leaseId, nonce, now()),
+    { now, wait, deadline: renewalDeadline, signal },
+  );
   if (!renewed.ok) {
     failProbeClaim(scope, leaseId, nonce, now());
     return renewed;
@@ -2623,11 +2656,30 @@ async function refreshSharedBudget(scope, leaseId, signal, {
     budgets = null;
   }
   if (!budgets) {
-    failProbeClaim(scope, leaseId, nonce, now());
+    const failureDeadline = Math.min(
+      renewed.value.leaseUntil ?? Number.POSITIVE_INFINITY,
+      now() + GOVERNOR_PROBE_TRANSITION_MS,
+    );
+    await retryGovernorMutation(
+      () => fail(scope, leaseId, nonce, now()),
+      { now, wait, deadline: failureDeadline, signal },
+    );
     return { ok: false, reason: "stale" };
   }
-  const published = publishProbe(scope, leaseId, nonce, budgets, now());
-  if (!published.ok) failProbeClaim(scope, leaseId, nonce, now());
+  const transitionDeadline = Math.min(
+    renewed.value.leaseUntil ?? Number.POSITIVE_INFINITY,
+    now() + GOVERNOR_PROBE_TRANSITION_MS,
+  );
+  const published = await retryGovernorMutation(
+    () => publish(scope, leaseId, nonce, budgets, now()),
+    { now, wait, deadline: transitionDeadline, signal },
+  );
+  if (!published.ok) {
+    await retryGovernorMutation(
+      () => fail(scope, leaseId, nonce, now()),
+      { now, wait, deadline: transitionDeadline, signal },
+    );
+  }
   return published;
 }
 
@@ -5392,6 +5444,31 @@ function pollSchedule({
   };
 }
 
+function retryPollAfterAdmissionFailure({
+  kind,
+  retryAt,
+  activeAt,
+  backgroundAt,
+  backgroundIndex,
+  previousBackgroundIndex,
+}) {
+  if (kind === "active") {
+    return {
+      activeAt: Math.min(activeAt, retryAt),
+      backgroundAt,
+      backgroundIndex,
+    };
+  }
+  if (kind === "background") {
+    return {
+      activeAt,
+      backgroundAt: Math.min(backgroundAt, retryAt),
+      backgroundIndex: previousBackgroundIndex,
+    };
+  }
+  return { activeAt, backgroundAt, backgroundIndex };
+}
+
 function governorWakeTimes(state, nowMs, floorMs, leaseId = null) {
   const budgets = Object.values(state?.budgets ?? {});
   const observedCandidates = state?.probeOutcome?.status === "failed"
@@ -5458,11 +5535,46 @@ function createWakeScheduler({
       return true;
     },
     clearAll() {
-      for (const kind of [...entries.keys()]) this.clear(kind);
+      for (const entry of entries.values()) clear(entry.id);
+      entries.clear();
     },
     at: (kind) => entries.get(kind)?.at ?? Number.POSITIVE_INFINITY,
     size: () => entries.size,
   };
+}
+
+function createSingleFlightWake(run, onSettled = () => {}) {
+  let running = false;
+  let pendingArgs = null;
+  return async (...args) => {
+    if (running) {
+      pendingArgs = args;
+      return false;
+    }
+    running = true;
+    try {
+      let nextArgs = args;
+      do {
+        pendingArgs = null;
+        await run(...nextArgs);
+        nextArgs = pendingArgs;
+      } while (nextArgs !== null);
+      return true;
+    } finally {
+      running = false;
+      onSettled();
+    }
+  };
+}
+
+function pendingFailureIsTerminal(reason) {
+  return reason === "stale";
+}
+
+function runtimeIntentGate(liveScheduling, { force = false } = {}) {
+  return liveScheduling
+    ? { registerIntent: true, requestProbe: false }
+    : { registerIntent: false, requestProbe: force === true };
 }
 
 function admitGovernorOperation(scope, leaseId, operation, priority, nowMs, intentId = governorId()) {
@@ -5480,8 +5592,9 @@ function admitGovernorOperation(scope, leaseId, operation, priority, nowMs, inte
     expiresAt: nowMs + GOVERNOR_LEASE_TTL_MS,
   });
   if (!decision.ok || decision.value.status !== "scheduled") return decision;
-  if (decision.value.notBefore > nowMs) return decision;
-  return startReservation(scope, decision.value.reservationId, nowMs);
+  const startAt = governorEffectiveTime(scope, nowMs);
+  if (decision.value.notBefore > startAt) return decision;
+  return startReservation(scope, decision.value.reservationId, startAt);
 }
 
 function governorOutcomeForError(error) {
@@ -5489,6 +5602,91 @@ function governorOutcomeForError(error) {
   if (error?.signal) return "signal";
   if (error?.code === "ETIMEDOUT") return "timeout";
   return "rejected";
+}
+
+function rateLimitBlockDecision(results, resetMs) {
+  const publications = Array.isArray(results) ? results : [];
+  const failure = publications.find((result) => result?.ok !== true);
+  if (publications.length === 0 || failure || !Number.isFinite(resetMs)) {
+    return {
+      mode: "paused",
+      reason: failure?.reason ?? "block-unpublished",
+      coordinationError: true,
+      failClosed: true,
+    };
+  }
+  return {
+    mode: "paused",
+    reason: "rate-limit",
+    resetMs,
+    coordinationError: false,
+    failClosed: false,
+  };
+}
+
+function retryRateLimitBlockPublication(pending, nowMs, publish) {
+  const blocks = Array.isArray(pending?.blocks) ? pending.blocks : [];
+  if (blocks.length === 0 || blocks.some((block) =>
+    !Number.isFinite(block.resetMs) || block.resetMs <= nowMs)) {
+    return { status: "probe", pending };
+  }
+  const results = blocks.map((block) => publish(block.resource, block.resetMs));
+  const resetMs = Math.min(...blocks.map((block) => block.resetMs));
+  const decision = rateLimitBlockDecision(results, resetMs);
+  return decision.failClosed
+    ? { status: "waiting", pending: { ...pending, reason: decision.reason } }
+    : { status: "published", pending: null, decision };
+}
+
+function mergeRateLimitBlockPublications(current, key, blocks, nowMs) {
+  const merged = new Map(current);
+  for (const block of Array.isArray(blocks) ? blocks : []) {
+    if (!RATE_RESOURCES.includes(block?.resource)) continue;
+    const previous = merged.get(block.resource);
+    const previousBlock = previous?.blocks?.[0];
+    merged.set(block.resource, {
+      key,
+      failedAt: Math.min(previous?.failedAt ?? nowMs, nowMs),
+      reason: previous?.reason ?? "block-unpublished",
+      blocks: [{
+        resource: block.resource,
+        resetMs: Number.isFinite(previousBlock?.resetMs)
+          ? previousBlock.resetMs
+          : block.resetMs,
+        epoch: validGovernorEpoch(previousBlock?.epoch)
+          ? previousBlock.epoch
+          : block.epoch,
+      }],
+    });
+  }
+  return merged;
+}
+
+function hydrateRateLimitBlockPublication(pending, state) {
+  const blocks = Array.isArray(pending?.blocks) ? pending.blocks : [];
+  return {
+    ...pending,
+    blocks: blocks.map((block) => {
+      const budget = state?.budgets?.[block.resource];
+      if (!budget || budget.observedAt <= pending.failedAt) return block;
+      return {
+        ...block,
+        resetMs: Number.isFinite(block.resetMs) ? block.resetMs : budget.resetMs,
+        epoch: validGovernorEpoch(block.epoch) ? block.epoch : budget.epoch,
+      };
+    }),
+  };
+}
+
+function rateLimitBlockProbeRecovered(pending, state, nowMs) {
+  const blocks = Array.isArray(pending?.blocks) ? pending.blocks : [];
+  return blocks.length > 0 && blocks.every((block) => {
+    const budget = state?.budgets?.[block.resource];
+    if (!budget || budget.observedAt <= pending.failedAt) return false;
+    if (!validGovernorEpoch(block.epoch)) return false;
+    if (budget.epoch === block.epoch) return false;
+    return !Number.isFinite(block.resetMs) || nowMs >= block.resetMs;
+  });
 }
 
 async function runAdmittedOperation({ scope, leaseId, operation, priority = "manual", signal, run }) {
@@ -5679,9 +5877,226 @@ const REMOTE_SETUP_NONINTERACTIVE_LINES = [
   "Or use `gh-glance --repo owner/name`; Ctrl+C quits.",
 ];
 
-// Reserved so the hints don't shift sideways every time a refresh starts and
-// finishes. Wide enough for the spinner, a space and "Fetching".
-const FETCHING_WIDTH = 12;
+// Reserved so the hints never shift when the active tab changes state. Every
+// status label below fits this fixed cell in both icon profiles.
+const REFRESH_STATUS_WIDTH = 12;
+
+const REFRESH_STATUS_GLYPHS = Object.freeze({
+  unicode: Object.freeze({
+    setup: "·",
+    checking: SPINNER[0],
+    paused: "‖",
+    waiting: "·",
+    failed: "!",
+    limited: "?",
+    watching: "·",
+  }),
+  ascii: Object.freeze({
+    setup: ".",
+    checking: ".",
+    paused: "|",
+    waiting: ".",
+    failed: "!",
+    limited: "?",
+    watching: ".",
+  }),
+});
+
+function isMandatoryHint(hint) {
+  return hint?.label === "Refresh" || hint?.label === "Quit";
+}
+
+function refreshStatus({
+  widthMode = false,
+  remoteSetup = false,
+  visibleLoading = false,
+  visibleInFlight = false,
+  automaticStatusVisible = false,
+  governorDecision = null,
+  activeError = null,
+  securityIncomplete = false,
+  screenReader = false,
+} = {}) {
+  const status = (kind, glyphKind, label, tone, animate = false, detailKind = null) => ({
+    kind,
+    glyphKind,
+    label,
+    tone,
+    animate,
+    detailKind,
+  });
+  if (widthMode) return status("width", null, "Width", "normal");
+  if (remoteSetup) return status("setup", "setup", "Setup", "inert");
+  if (visibleLoading) return status("checking", "checking", "Checking", "active", true);
+  if (visibleInFlight && automaticStatusVisible && !screenReader) {
+    return status("checking", "checking", "Checking", "active");
+  }
+
+  const mode = governorDecision?.mode ?? governorDecision?.status ?? null;
+  const detailKind = governorDecision?.detailKind ?? (
+    Number.isFinite(governorDecision?.resetMs)
+      ? "reset"
+      : governorDecision?.probing
+        ? "probing"
+        : null
+  );
+  if (mode === "paused" || activeError?.verdict === "rate-limited") {
+    return status("paused", "paused", "Paused", "attention", false, detailKind);
+  }
+  if (["waiting", "pending", "probe"].includes(mode)) {
+    const waitingDetail = Number.isFinite(governorDecision?.notBefore)
+      ? "next"
+      : detailKind;
+    return status("waiting", "waiting", "Waiting", "inert", false, waitingDetail);
+  }
+  if (activeError) return status("failed", "failed", "Failed", "attention");
+  if (securityIncomplete) return status("limited", "limited", "Limited", "attention");
+  return status("watching", "watching", "Watching", "inert");
+}
+
+function statusTime(at) {
+  if (!Number.isFinite(at)) return null;
+  const date = new Date(at);
+  if (!Number.isFinite(date.getTime())) return null;
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+function statusDetailVariants(status, detail) {
+  if (!status?.detailKind) return [];
+  if (status.detailKind === "probing") return ["probing"];
+  const at = status.detailKind === "next" ? detail?.notBefore : detail?.resetMs;
+  const time = statusTime(at);
+  if (!time) return [];
+  return [`${status.detailKind} ${time}`, time];
+}
+
+function statusBarLayout({
+  cols,
+  interactive,
+  availableHints,
+  status,
+  detail = null,
+  stale = null,
+  version: currentVersion = "",
+} = {}) {
+  const width = Number.isSafeInteger(cols) ? Math.max(0, cols) : 0;
+  const hints = Array.isArray(availableHints) ? availableHints : [];
+  const mandatory = hints.filter(isMandatoryHint);
+  const optional = hints.filter((hint) => !isMandatoryHint(hint));
+  let used = Math.min(width, REFRESH_STATUS_WIDTH);
+  const selectedHints = [];
+  const separatorWidth = () => selectedHints.length > 0 ? 1 : 0;
+  const addHint = (hint, showLabel) => {
+    const text = showLabel ? `${hint.label}: ${hint.keys}` : hint.keys;
+    const cost = separatorWidth() + [...text].length;
+    if (used + cost > width) return false;
+    selectedHints.push({ ...hint, showLabel, text });
+    used += cost;
+    return true;
+  };
+
+  for (const [index, hint] of mandatory.entries()) {
+    // A full label is optional; every essential key is not. Reserve one
+    // separator and the key itself for each action still to come before taking
+    // the current action's long form. This keeps both r and q at the 24-column
+    // terminal minimum, whose drawable frame is 23 cells wide.
+    const remainingMinimum = mandatory.slice(index + 1).reduce(
+      (total, candidate) => total + 1 + [...candidate.keys].length,
+      0,
+    );
+    const fullText = `${hint.label}: ${hint.keys}`;
+    const fullCost = separatorWidth() + [...fullText].length;
+    if (used + fullCost + remainingMinimum <= width) addHint(hint, true);
+    else addHint(hint, false);
+  }
+
+  let selectedDetail = null;
+  for (const candidate of statusDetailVariants(status, detail)) {
+    const cost = (selectedHints.length > 0 ? 1 : 0) + candidate.length;
+    if (used + cost <= width) {
+      selectedDetail = candidate;
+      used += cost;
+      break;
+    }
+  }
+
+  const staleText = typeof stale === "string" ? stale : null;
+  const selectedStale = staleText && used + 1 + staleText.length <= width ? staleText : null;
+  if (selectedStale) used += 1 + selectedStale.length;
+
+  for (const hint of optional) {
+    if (!addHint(hint, true)) addHint(hint, false);
+  }
+
+  const versionText = String(currentVersion ?? "");
+  const showVersion = versionText.length > 0 && used + 1 + versionText.length <= width;
+  return {
+    statusWidth: Math.min(width, REFRESH_STATUS_WIDTH),
+    hints: selectedHints,
+    mandatoryHints: selectedHints.filter(isMandatoryHint),
+    optionalHints: selectedHints.filter((hint) => !isMandatoryHint(hint)),
+    detail: selectedDetail,
+    stale: selectedStale,
+    version: showVersion ? versionText : null,
+    interactive: Boolean(interactive),
+  };
+}
+
+function freshnessDeadline({
+  lastOk,
+  refreshMs,
+  governorDecision = null,
+  currentEpochs = null,
+} = {}) {
+  if (!Number.isFinite(lastOk) || !Number.isFinite(refreshMs) || refreshMs < 0) return null;
+  const baseDeadline = lastOk + Math.max(STALE_AFTER_MS, refreshMs * 6);
+  const decisionEpochs = governorDecision?.epochs;
+  const chargedEpochs = isRecord(decisionEpochs)
+    ? Object.entries(decisionEpochs).filter(([, epoch]) => epoch !== null)
+    : [];
+  const validWaitingGrant =
+    (governorDecision?.mode ?? governorDecision?.status) === "waiting" &&
+    Number.isFinite(governorDecision.notBefore) &&
+    chargedEpochs.length > 0 &&
+    isRecord(currentEpochs) &&
+    chargedEpochs.every(([resource, epoch]) => currentEpochs[resource] === epoch);
+  return validWaitingGrant
+    ? Math.max(baseDeadline, governorDecision.notBefore + GH_TIMEOUT_MS)
+    : baseDeadline;
+}
+
+function probingGovernorDecisions() {
+  return Object.fromEntries(TABS.map((candidate) => [candidate.key, {
+    mode: "waiting",
+    probing: true,
+  }]));
+}
+
+function retainDeferredGovernorHold({ automaticStatusVisible, screenReader }) {
+  return automaticStatusVisible === true && screenReader === true;
+}
+
+function sameVisibleGovernorDecision(left, right) {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  for (const key of [
+    "mode",
+    "status",
+    "reason",
+    "resetMs",
+    "retryAt",
+    "notBefore",
+    "resource",
+    "probing",
+    "detailKind",
+    "coordinationError",
+    "reservationId",
+  ]) {
+    if (left[key] !== right[key]) return false;
+  }
+  return left.epochs?.core === right.epochs?.core &&
+    left.epochs?.graphql === right.epochs?.graphql;
+}
 
 function widthStatusText({ label, width, cols, saveError = false }) {
   const budget = Number.isSafeInteger(cols) ? Math.max(0, cols) : 0;
@@ -5720,10 +6135,10 @@ function widthStatusText({ label, width, cols, saveError = false }) {
 // them stay dim. The accent is the panel-title cyan rather than the amber used
 // for in-progress status, so amber means exactly one thing across the product.
 function StatusBar({
-  fetching,
+  status,
+  detail,
   spin,
   stale,
-  throttle,
   interactive,
   cols,
   remoteSetup = false,
@@ -5734,9 +6149,9 @@ function StatusBar({
   canOpen = false,
   canResize = false,
 }) {
-  // Width mode owns the whole bar, so the throttle badge is deliberately not
-  // shown here: this state is transient and explicitly entered, and the widened
-  // interval is still reported the moment the user leaves it.
+  // Width mode owns the whole bar, so coordination detail is deliberately not
+  // shown here. This state is transient and explicitly entered; the active-tab
+  // refresh state returns as soon as the user leaves it.
   if (widthMode && widthColumn) {
     return e(
       Box,
@@ -5757,58 +6172,59 @@ function StatusBar({
   // telling the user something untrue about what the app can do. Ctrl+C still
   // works there, because the tty delivers a real SIGINT.
   const hints = activeKeyHints({ interactive, remoteSetup, canMove, canOpen, canResize });
-  const hintsFullWidth =
-    hints.reduce((sum, hint) => sum + hint.label.length + 2 + [...hint.keys].length, 0) +
-    (hints.length - 1) * 3;
-  // Measured against the active full set even when a compact one is rendered.
-  const compact = interactive && cols < FETCHING_WIDTH + hintsFullWidth;
+  const semanticStatus = status ?? refreshStatus({ remoteSetup });
+  const layout = statusBarLayout({
+    cols,
+    interactive,
+    availableHints: hints,
+    status: semanticStatus,
+    detail,
+    stale,
+    version,
+  });
+  const profile = process.env.GH_GLANCE_ICONS === "ascii" ? "ascii" : "unicode";
+  const glyphs = REFRESH_STATUS_GLYPHS[profile];
+  const glyph = profile !== "ascii" &&
+      semanticStatus.glyphKind === "checking" && semanticStatus.animate && spin
+    ? spin
+    : glyphs[semanticStatus.glyphKind] ?? glyphs.watching;
+  const statusColor = semanticStatus.tone === "active"
+    ? TITLE_COLOR
+    : semanticStatus.tone === "attention"
+      ? ATTENTION
+      : undefined;
+  const renderHint = (hint, index, group) => [
+    (index > 0 || group === "optional") &&
+      e(Text, { key: `${group}:sep:${hint.label}`, color: BORDER_COLOR }, " "),
+    e(
+      Text,
+      { key: `${group}:${hint.label}`, wrap: "truncate-end" },
+      hint.showLabel ? e(Text, { dimColor: true }, `${hint.label}: `) : null,
+      e(Text, { color: TITLE_COLOR, bold: true }, hint.keys),
+    ),
+  ].filter(Boolean);
   return e(
     Box,
     { flexDirection: "row" },
     e(
       Box,
-      { width: FETCHING_WIDTH, flexShrink: 0 },
-      // Pinned to the resting frame when idle: the counter also drives the run
-      // icons, so borrowing it here would set this turning while a workflow
-      // executes -- saying "fetching" at a moment when nothing is being
-      // fetched.
+      { width: layout.statusWidth, flexShrink: 0 },
       e(
         Text,
-        { color: fetching ? TITLE_COLOR : undefined, dimColor: !fetching },
-        remoteSetup ? `${SPINNER[0]} Setup` : `${fetching && spin ? spin : SPINNER[0]} Fetching`,
+        { color: statusColor, dimColor: semanticStatus.tone === "inert", wrap: "truncate-end" },
+        `${glyph} ${semanticStatus.label}`,
       ),
     ),
-    // No reserved width here, unlike the fetching slot above: this only
-    // toggles on a real problem (a stalled poll, a laptop that just woke up),
-    // not every refresh cycle, so letting the hints shift on that rare event
-    // is worth getting the column back for the other 99% of the time.
-    stale
-      ? e(Box, { marginRight: 1, flexShrink: 0 }, e(Text, { color: ATTENTION }, stale))
+    ...layout.mandatoryHints.flatMap((hint, index) => renderHint(hint, index, "mandatory")),
+    layout.detail
+      ? e(Box, { marginLeft: 1, flexShrink: 0 }, e(Text, { dimColor: true }, layout.detail))
       : null,
-    // Same free-slot treatment as `stale` above. Dim rather than ATTENTION: a
-    // widened interval is the throttle working, not a failure, and colouring it
-    // like a problem would send the user looking for one.
-    throttle
-      ? e(Box, { marginRight: 1, flexShrink: 0 }, e(Text, { dimColor: true }, throttle))
+    layout.stale
+      ? e(Box, { marginLeft: 1, flexShrink: 0 }, e(Text, { color: ATTENTION }, layout.stale))
       : null,
-    ...hints
-      .flatMap((hint, i) => [
-        i > 0 &&
-          e(Text, { key: `sep${i}`, color: BORDER_COLOR }, compact ? " " : " | "),
-        e(
-          Text,
-          { key: hint.label, wrap: "truncate-end" },
-          compact ? null : e(Text, { dimColor: true }, `${hint.label}: `),
-          e(Text, { color: TITLE_COLOR, bold: true }, hint.keys),
-        ),
-      ])
-      .filter(Boolean),
-    // Right-aligned, like lazygit's footer. Dropped in compact mode rather than
-    // left to shrink alongside the hints: it would compete for the same shrink
-    // budget as "Quit", the one hint the comment above already fought to keep
-    // on screen down to 45 columns, and version digits are not worth that.
-    !compact && e(Box, { flexGrow: 1 }),
-    !compact && e(Text, { key: "version", dimColor: true, wrap: "truncate-end" }, version),
+    ...layout.optionalHints.flatMap((hint, index) => renderHint(hint, index, "optional")),
+    layout.version && e(Box, { flexGrow: 1 }),
+    layout.version && e(Text, { key: "version", dimColor: true, wrap: "truncate-end" }, layout.version),
   );
 }
 
@@ -5858,6 +6274,7 @@ function useTerminalSize(stdout) {
 // ---------- App ----------
 
 function App({ onCreateRemote = () => {} } = {}) {
+  const screenReader = process.env.INK_SCREEN_READER === "true";
   const { stdout } = useStdout();
   const { isRawModeSupported } = useStdin();
   const { exit, suspendTerminal } = useApp();
@@ -5967,8 +6384,11 @@ function App({ onCreateRemote = () => {} } = {}) {
   const [failureContext, setFailureContext] = useState(null);
   const [loading, setLoading] = useState({ actions: false, issues: false, prs: false, security: false });
   const [waiting, setWaiting] = useState({ actions: true, issues: true, prs: true, security: true });
-  // The current governor wake delay, or null at the configured refresh.
-  const [throttleMs, setThrottleMs] = useState(null);
+  const [governorDecisions, setGovernorDecisions] = useState(probingGovernorDecisions);
+  const [governorEpochs, setGovernorEpochs] = useState(null);
+  const [requestStatuses, setRequestStatuses] = useState(() =>
+    Object.fromEntries(TABS.map((candidate) => [candidate.key, null])),
+  );
   const [now, setNow] = useState(new Date());
   const { rows, cols, useShortLabels } = useTerminalSize(stdout);
   const [frame, setFrame] = useState(0);
@@ -5982,6 +6402,8 @@ function App({ onCreateRemote = () => {} } = {}) {
 
   const tab = TABS[activeIndex];
   const tabError = errors[tab.key];
+  const activeGovernorDecision = governorDecisions[tab.key];
+  const activeRequestStatus = requestStatuses[tab.key];
   // Once any endpoint proves the folder has no remote, the whole dashboard is
   // in setup mode. Keeping this tab-local made a quick tab switch replace the
   // onboarding prompt with a second raw fetch failure while another command
@@ -6012,6 +6434,7 @@ function App({ onCreateRemote = () => {} } = {}) {
   // wrong by one row is what makes ink repaint the whole frame.
   const extraLines =
     (tabError && !remoteSetup ? 1 : 0) +
+    (activeGovernorDecision?.coordinationError && !remoteSetup ? 1 : 0) +
     (tab.key === "security" && !remoteSetup ? securityLines.length : 0);
   // Reserve lines for: the tab bar and the divider under it (2), the panel's
   // top and bottom edges (2), the column header and its separator (2), and
@@ -6482,7 +6905,121 @@ function App({ onCreateRemote = () => {} } = {}) {
     let securityUnchangedPolls = 0;
     let securityNextPollAt = 0;
 
-    function commit(key, run, { force = false, scope, reservationId, onSettled } = {}) {
+    function setTabGovernorDecision(key, decision) {
+      setGovernorDecisions((current) => sameVisibleGovernorDecision(current[key], decision)
+        ? current
+        : { ...current, [key]: decision });
+    }
+
+    function setTabWaiting(key, value) {
+      setWaiting((current) => current[key] === value
+        ? current
+        : { ...current, [key]: value });
+    }
+
+    function publishGovernorEpochs(snapshot) {
+      const epochs = snapshot?.value?.epochs;
+      if (!isRecord(epochs)) return;
+      setGovernorEpochs((current) =>
+        current?.core === epochs.core && current?.graphql === epochs.graphql
+          ? current
+          : { core: epochs.core ?? null, graphql: epochs.graphql ?? null });
+    }
+
+    function visibleGovernorDecision(decision) {
+      const mode = decision?.mode ?? decision?.status ?? "pending";
+      if (mode === "paused" || decision?.reason === "reset") {
+        return {
+          ...decision,
+          mode: "paused",
+          detailKind: Number.isFinite(decision?.resetMs) ? "reset" : decision?.detailKind,
+        };
+      }
+      if (["waiting", "pending", "probe"].includes(mode) ||
+        mode === "scheduled" && Number.isFinite(decision?.notBefore)) {
+        return {
+          ...decision,
+          mode: "waiting",
+          probing: mode === "probe" || decision?.reason === "budget-unknown",
+        };
+      }
+      return null;
+    }
+
+    function pauseCoordination(key, reason) {
+      setTabGovernorDecision(key, {
+        mode: "paused",
+        reason: reason ?? "unavailable",
+        coordinationError: true,
+      });
+    }
+
+    function publishControlStatus(key, refreshed, snapshot, nowMs) {
+      if (pendingBlockPublications.size > 0) {
+        pauseCoordination(key, "block-unpublished");
+        return;
+      }
+      if (!refreshed?.ok) {
+        pauseCoordination(key, refreshed?.reason);
+        return;
+      }
+      if (!snapshot?.ok) {
+        pauseCoordination(key, snapshot?.reason);
+        return;
+      }
+      publishGovernorEpochs(snapshot);
+      if (refreshed.value?.status === "waiting") {
+        setTabGovernorDecision(key, { mode: "waiting", probing: true });
+        return;
+      }
+      if (screenReader && inFlightRef.current[key]) return;
+      const pendingIntent = pending.get(key);
+      const reservation = pendingIntent
+        ? snapshot.value.reservations[`reservation:${pendingIntent.intentId}`]
+        : null;
+      if (reservation?.status === "scheduled" && reservation.notBefore > nowMs) {
+        setTabGovernorDecision(key, visibleGovernorDecision({
+          status: "scheduled",
+          reservationId: `reservation:${pendingIntent.intentId}`,
+          ...reservation,
+        }));
+        return;
+      }
+      const costs = tabRequestCost(key);
+      for (const resource of RATE_RESOURCES) {
+        if (costs[resource] <= 0) continue;
+        const budget = snapshot.value.budgets[resource];
+        const decision = budget
+          ? resourceDecision({
+              budget,
+              resource,
+              leases: snapshot.value.leases,
+              reservations: Object.values(snapshot.value.reservations),
+              nowMs,
+              cost: costs[resource],
+            })
+          : { mode: "probe", reason: "budget-unknown" };
+        if (decision.mode === "open") continue;
+        const resetHold = ["budget-reset", "reset", "rate-limit"].includes(decision.reason) ||
+          budget?.blockUntil > nowMs;
+        setTabGovernorDecision(key, {
+          mode: resetHold || decision.mode === "paused" ? "paused" : "waiting",
+          reason: decision.reason,
+          resetMs: budget?.resetMs ?? decision.resetMs ?? null,
+          probing: decision.mode === "probe" && !resetHold,
+        });
+        return;
+      }
+      setTabGovernorDecision(key, null);
+    }
+
+    function commit(key, run, {
+      force = false,
+      scope,
+      reservationId,
+      onSettled,
+      automaticStatusVisible = false,
+    } = {}) {
       // Per-tab rather than one flag for the whole tick, so switching tabs can
       // refresh the tab you just landed on without waiting on an unrelated
       // background fetch -- and so a slow repo can't stack refreshes.
@@ -6494,6 +7031,19 @@ function App({ onCreateRemote = () => {} } = {}) {
         force,
       });
       if (visibleLoading) setLoading((l) => (l[key] ? l : { ...l, [key]: true }));
+      const retainDeferredHold = retainDeferredGovernorHold({
+        automaticStatusVisible,
+        screenReader,
+      });
+      if (!retainDeferredHold) setTabGovernorDecision(key, null);
+      const publishRequestStatus = visibleLoading ||
+        (automaticStatusVisible && !screenReader);
+      if (publishRequestStatus) {
+        setRequestStatuses((current) => ({
+          ...current,
+          [key]: { automaticStatusVisible },
+        }));
+      }
       return run()
         .then((result) => {
           completeReservation(scope, reservationId, result?.measuredSuccess === false
@@ -6506,10 +7056,13 @@ function App({ onCreateRemote = () => {} } = {}) {
                 },
               }, Date.now());
           if (result?.rateLimited) {
-            const resetMs = inspectGovernor(scope, Date.now()).value?.budgets?.core?.resetMs;
-            if (Number.isFinite(resetMs) && resetMs > Date.now()) {
-              recordResourceBlock(scope, "core", resetMs, "rate-limit");
-            }
+            const blockAt = Date.now();
+            const budget = inspectGovernor(scope, blockAt).value?.budgets?.core;
+            handleRateLimitBlocks(key, [{
+              resource: "core",
+              resetMs: Number.isFinite(budget?.resetMs) ? budget.resetMs : null,
+              epoch: budget?.epoch ?? null,
+            }], blockAt);
           }
           if (cancelled) return;
           const { raw, parse, limit } = result;
@@ -6629,12 +7182,17 @@ function App({ onCreateRemote = () => {} } = {}) {
           if (verdict === "rate-limited") {
             const snapshot = inspectGovernor(scope, Date.now());
             const costs = tabRequestCost(key);
+            const blocks = [];
             for (const resource of RATE_RESOURCES) {
-              const resetMs = snapshot.value?.budgets?.[resource]?.resetMs;
-              if (costs[resource] > 0 && Number.isFinite(resetMs) && resetMs > Date.now()) {
-                recordResourceBlock(scope, resource, resetMs, "rate-limit");
-              }
+              if (costs[resource] <= 0) continue;
+              const resourceResetMs = snapshot.value?.budgets?.[resource]?.resetMs;
+              blocks.push({
+                resource,
+                resetMs: Number.isFinite(resourceResetMs) ? resourceResetMs : null,
+                epoch: snapshot.value?.budgets?.[resource]?.epoch ?? null,
+              });
             }
+            handleRateLimitBlocks(key, blocks, Date.now());
           }
         })
         .finally(() => {
@@ -6642,6 +7200,17 @@ function App({ onCreateRemote = () => {} } = {}) {
           onSettled?.();
           if (!cancelled) {
             setLoading((l) => (l[key] ? { ...l, [key]: false } : l));
+            if (publishRequestStatus) {
+              setRequestStatuses((current) => current[key] === null
+                ? current
+                : { ...current, [key]: null });
+            }
+            if (retainDeferredHold) {
+              setGovernorDecisions((current) =>
+                current[key]?.reservationId === reservationId
+                  ? { ...current, [key]: null }
+                  : current);
+            }
           }
         });
     }
@@ -6657,9 +7226,65 @@ function App({ onCreateRemote = () => {} } = {}) {
     let activePollAt = Number.POSITIVE_INFINITY;
     let backgroundPollAt = Number.POSITIVE_INFINITY;
     let backgroundIndex = 0;
+    let pendingBlockPublications = new Map();
 
     function armWake(kind, at, run) {
       if (!cancelled) wakeScheduler.arm(kind, at, run);
+    }
+
+    function failClosedRateLimit(key, reason) {
+      liveScheduling = false;
+      activePollAt = Number.POSITIVE_INFINITY;
+      backgroundPollAt = Number.POSITIVE_INFINITY;
+      wakeScheduler.clear("data");
+      pauseCoordination(key, reason);
+      armWake("control", governorControlRetryAt(Date.now(), runtime.refreshMs), controlWake);
+    }
+
+    function attemptPendingBlockPublications(currentScope, nowMs, state = null, requestProbe = false) {
+      for (const [resource, original] of [...pendingBlockPublications]) {
+        if (state && rateLimitBlockProbeRecovered(original, state, nowMs)) {
+          pendingBlockPublications.delete(resource);
+          continue;
+        }
+        const candidate = state
+          ? hydrateRateLimitBlockPublication(original, state)
+          : original;
+        const attempt = retryRateLimitBlockPublication(
+          candidate,
+          nowMs,
+          (name, resetMs) => recordResourceBlock(currentScope, name, resetMs, "rate-limit"),
+        );
+        if (attempt.status === "published") {
+          pendingBlockPublications.delete(resource);
+          setTabGovernorDecision(candidate.key, attempt.decision);
+          continue;
+        }
+        pendingBlockPublications.set(resource, attempt.pending);
+        if (attempt.status === "probe" && requestProbe) {
+          const budget = state?.budgets?.[resource];
+          if (budget) requestManualProbe(
+            currentScope,
+            leaseId,
+            budget.epoch,
+            budget.observedAt,
+            nowMs,
+          );
+        }
+      }
+    }
+
+    function handleRateLimitBlocks(key, blocks, nowMs) {
+      pendingBlockPublications = mergeRateLimitBlockPublications(
+        pendingBlockPublications,
+        key,
+        blocks,
+        nowMs,
+      );
+      attemptPendingBlockPublications(scope, nowMs);
+      if (pendingBlockPublications.size > 0) {
+        failClosedRateLimit(key, pendingBlockPublications.values().next().value?.reason);
+      }
     }
 
     function identity() {
@@ -6669,10 +7294,39 @@ function App({ onCreateRemote = () => {} } = {}) {
       };
     }
 
+    function resetVisibleScope(nowMs, { immediate = false } = {}) {
+      pending.clear();
+      pendingBlockPublications.clear();
+      liveScheduling = false;
+      activePollAt = Number.POSITIVE_INFINITY;
+      backgroundPollAt = Number.POSITIVE_INFINITY;
+      wakeScheduler.clear("data");
+      wakeScheduler.clear("heartbeat");
+      wakeScheduler.clear("control");
+      setGovernorEpochs(null);
+      setGovernorDecisions(probingGovernorDecisions());
+      armWake(
+        "control",
+        immediate ? nowMs + 1 : governorControlRetryAt(nowMs, runtime.refreshMs),
+        controlWake,
+      );
+    }
+
     function ensureScope(nowMs = Date.now(), { maintain = false } = {}) {
       const current = identity();
       const nextHash = governorScopeHash(current.effectiveHost, current.authIdentity);
-      if (!nextHash) return null;
+      if (!nextHash) {
+        if (scope !== null) {
+          if (cleanupScope && registeredScopeHash) releaseLease(cleanupScope, leaseId);
+          registeredScopeHash = null;
+          if (governorRef.current?.leaseId === leaseId) governorRef.current = null;
+          scope = null;
+          cleanupScope = null;
+          resetVisibleScope(nowMs);
+        }
+        return null;
+      }
+      const migrating = scope !== null && scope.hash !== nextHash;
       if (scope?.hash === nextHash && registeredScopeHash === nextHash) {
         if (!maintain) return scope;
         const activeTab = TABS[activeIndexRef.current].key;
@@ -6685,6 +7339,13 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (scope?.hash !== nextHash) {
         if (cleanupScope && registeredScopeHash) releaseLease(cleanupScope, leaseId);
         registeredScopeHash = null;
+        if (migrating) {
+          // The failed publication belonged to the old account scope. Releasing
+          // that lease guarantees this process will start no more work there;
+          // the new scope must establish its own authoritative budget instead
+          // of inheriting an unrelated account's local hold.
+          resetVisibleScope(nowMs, { immediate: true });
+        }
         const created = createGovernorScope({ ...current, identityProvider: identity });
         if (!created.ok) return null;
         scope = created.value;
@@ -6713,15 +7374,15 @@ function App({ onCreateRemote = () => {} } = {}) {
       }
       const snapshot = inspectGovernor(scope, nowMs);
       if (!snapshot.ok) {
+        pauseCoordination(TABS[activeIndexRef.current].key, snapshot.reason);
         armWake("control", governorControlRetryAt(nowMs, runtime.refreshMs), controlWake);
         return;
       }
+      publishGovernorEpochs(snapshot);
       const wakes = governorWakeTimes(snapshot.value, nowMs, runtime.refreshMs, leaseId);
       armWake("control", wakes.controlAt, controlWake);
       const nextDataAt = Math.min(wakes.dataAt, activePollAt, backgroundPollAt);
       if (liveScheduling) armWake("data", nextDataAt, dataWake);
-      const delay = Math.max(0, Math.min(nextDataAt, wakes.controlAt) - nowMs);
-      setThrottleMs(delay > runtime.refreshMs ? delay : null);
     }
 
     function finishPending(key, intentId) {
@@ -6733,15 +7394,44 @@ function App({ onCreateRemote = () => {} } = {}) {
       const signal = controller.signal;
       const descriptor = tabForKey(key);
       const monotonicNow = performance.now();
-      if (inFlightRef.current[key]) return Promise.resolve();
-      if (!force && backoffActive(`tab:${key}`, monotonicNow)) return Promise.resolve();
-      if (!force && key === "security" && monotonicNow < securityNextPollAt) return Promise.resolve();
+      if (pendingBlockPublications.size > 0) {
+        pauseCoordination(key, "block-unpublished");
+        return Promise.resolve({ persisted: false, retry: false, kind });
+      }
+      if (inFlightRef.current[key]) return Promise.resolve({ persisted: false, retry: false, kind });
+      if (!force && backoffActive(`tab:${key}`, monotonicNow)) {
+        return Promise.resolve({ persisted: false, retry: false, kind });
+      }
+      if (!force && key === "security" && monotonicNow < securityNextPollAt) {
+        return Promise.resolve({ persisted: false, retry: false, kind });
+      }
       const nowMs = Date.now();
       const currentScope = ensureScope(nowMs);
-      if (!currentScope) return Promise.resolve();
+      if (!currentScope) {
+        pauseCoordination(key, "unknown-scope");
+        return Promise.resolve({ persisted: false, retry: true, kind });
+      }
+      const intentGate = runtimeIntentGate(liveScheduling, { force });
+      if (!intentGate.registerIntent) {
+        setTabGovernorDecision(key, { mode: "waiting", probing: true });
+        setTabWaiting(key, true);
+        if (intentGate.requestProbe) {
+          const snapshot = inspectGovernor(currentScope, nowMs);
+          const costs = tabRequestCost(key);
+          for (const resource of RATE_RESOURCES) {
+            const budget = snapshot.value?.budgets?.[resource];
+            if (costs[resource] > 0 && budget) {
+              requestManualProbe(currentScope, leaseId, budget.epoch, budget.observedAt, nowMs);
+            }
+          }
+        }
+        return Promise.resolve({ persisted: false, retry: false, kind });
+      }
       const existing = pending.get(key);
       if (existing) {
-        if (!force || existing.kind === "manual") return Promise.resolve();
+        if (!force || existing.kind === "manual") {
+          return Promise.resolve({ persisted: true, retry: false, kind });
+        }
         cancelIntent(currentScope, existing.intentId, nowMs);
         pending.delete(key);
       }
@@ -6756,29 +7446,43 @@ function App({ onCreateRemote = () => {} } = {}) {
         expiresAt: nowMs + GOVERNOR_LEASE_TTL_MS,
       };
       const registered = registerIntent(currentScope, request);
-      if (!registered.ok) return Promise.resolve();
-      pending.set(key, { intentId, kind, force });
+      if (!registered.ok) {
+        pauseCoordination(key, registered.reason);
+        return Promise.resolve({ persisted: false, retry: true, kind });
+      }
+      pending.set(key, { intentId, kind, force, wasDeferred: false });
       const decision = registered.value;
       if (decision.status !== "scheduled" || decision.notBefore > nowMs) {
-        setWaiting((current) => current[key] ? current : { ...current, [key]: true });
+        const item = pending.get(key);
+        if (item) item.wasDeferred = true;
+        setTabGovernorDecision(key, visibleGovernorDecision(decision));
+        setTabWaiting(key, true);
         if (force && decision.resource) {
           const budget = inspectGovernor(currentScope, nowMs).value?.budgets?.[decision.resource];
           if (budget) requestManualProbe(currentScope, leaseId, budget.epoch, budget.observedAt, nowMs);
         }
         armWake("data", decision.retryAt ?? decision.notBefore ?? nowMs + runtime.refreshMs, dataWake);
         armFromState(nowMs);
-        return Promise.resolve();
+        return Promise.resolve({ persisted: true, retry: false, kind });
       }
       const started = startReservation(currentScope, decision.reservationId, nowMs);
       if (!started.ok) {
-        finishPending(key, intentId);
-        return Promise.resolve();
+        pauseCoordination(key, started.reason);
+        if (pendingFailureIsTerminal(started.reason)) finishPending(key, intentId);
+        else armWake("data", governorControlRetryAt(nowMs, runtime.refreshMs), dataWake);
+        return Promise.resolve({ persisted: true, retry: false, kind });
       }
       if (started.value.status !== "started") {
+        const item = pending.get(key);
+        if (item) item.wasDeferred = true;
+        setTabGovernorDecision(key, visibleGovernorDecision({
+          ...decision,
+          ...started.value,
+        }));
         armWake("data", started.value.notBefore ?? nowMs + runtime.refreshMs, dataWake);
-        return Promise.resolve();
+        return Promise.resolve({ persisted: true, retry: false, kind });
       }
-      setWaiting((current) => current[key] ? { ...current, [key]: false } : current);
+      setTabWaiting(key, false);
       if (force) coordinator.invalidate();
       return commit(
         key,
@@ -6787,9 +7491,10 @@ function App({ onCreateRemote = () => {} } = {}) {
           force,
           scope: currentScope,
           reservationId: decision.reservationId,
+          automaticStatusVisible: false,
           onSettled: () => finishPending(key, intentId),
         },
-      );
+      ).then(() => ({ persisted: true, retry: false, kind }));
     }
     fetchTabRef.current = (key, { force = false, kind = force ? "manual" : "active" } = {}) => {
       const requestedAt = Date.now();
@@ -6816,25 +7521,36 @@ function App({ onCreateRemote = () => {} } = {}) {
         if (!currentScope) continue;
         const decision = readIntentDecision(currentScope, item.intentId, nowMs);
         if (!decision.ok) {
-          pending.delete(key);
+          pauseCoordination(key, decision.reason);
+          if (pendingFailureIsTerminal(decision.reason)) pending.delete(key);
+          else armWake("data", governorControlRetryAt(nowMs, runtime.refreshMs), dataWake);
           continue;
         }
         if (decision.value.status !== "scheduled" || decision.value.notBefore > nowMs) {
-          setWaiting((current) => current[key] ? current : { ...current, [key]: true });
+          item.wasDeferred = true;
+          setTabGovernorDecision(key, visibleGovernorDecision(decision.value));
+          setTabWaiting(key, true);
           armWake("data", decision.value.retryAt ?? decision.value.notBefore ?? nowMs + runtime.refreshMs, dataWake);
           continue;
         }
         const started = startReservation(currentScope, decision.value.reservationId, nowMs);
         if (!started.ok) {
-          pending.delete(key);
+          pauseCoordination(key, started.reason);
+          if (pendingFailureIsTerminal(started.reason)) pending.delete(key);
+          else armWake("data", governorControlRetryAt(nowMs, runtime.refreshMs), dataWake);
           armFromState(nowMs);
           continue;
         }
         if (started.value.status !== "started") {
+          item.wasDeferred = true;
+          setTabGovernorDecision(key, visibleGovernorDecision({
+            ...decision.value,
+            ...started.value,
+          }));
           armWake("data", started.value.notBefore ?? nowMs + runtime.refreshMs, dataWake);
           continue;
         }
-        setWaiting((current) => current[key] ? { ...current, [key]: false } : current);
+        setTabWaiting(key, false);
         if (item.force) coordinator.invalidate();
         const descriptor = tabForKey(key);
         void commit(
@@ -6844,22 +7560,21 @@ function App({ onCreateRemote = () => {} } = {}) {
             force: item.force,
             scope: currentScope,
             reservationId: decision.value.reservationId,
+            automaticStatusVisible: item.wasDeferred && !item.force,
             onSettled: () => finishPending(key, item.intentId),
           },
         );
       }
     }
 
-    async function dataWake() {
+    async function runDataWake() {
       if (cancelled || remoteSetupRef.current) return;
       const nowMs = Date.now();
       await resumePending(nowMs);
       const currentScope = ensureScope(nowMs);
       const snapshot = currentScope ? inspectGovernor(currentScope, nowMs) : null;
-      if (!snapshot?.ok) {
-        armFromState(nowMs);
-        return;
-      }
+      if (!snapshot?.ok) return;
+      publishGovernorEpochs(snapshot);
       const wakes = governorWakeTimes(snapshot.value, nowMs, runtime.refreshMs, leaseId);
       const heldResources = Object.fromEntries(RATE_RESOURCES.map((resource) => {
         const budget = snapshot.value.budgets[resource];
@@ -6871,6 +7586,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         return [resource, { held, retryAt }];
       }));
       const active = TABS[activeIndexRef.current].key;
+      const previousBackgroundIndex = backgroundIndex;
       const planned = pollSchedule({
         nowMs,
         floorMs: runtime.refreshMs,
@@ -6883,29 +7599,69 @@ function App({ onCreateRemote = () => {} } = {}) {
       activePollAt = planned.activeAt;
       backgroundPollAt = planned.backgroundAt;
       backgroundIndex = planned.backgroundIndex;
-      await Promise.allSettled(planned.due.map(({ key, kind }) => requestTab(key, kind)));
+      const outcomes = await Promise.allSettled(
+        planned.due.map(({ key, kind }) => requestTab(key, kind)),
+      );
+      const retryAt = governorControlRetryAt(Date.now(), runtime.refreshMs);
+      let retryNeeded = false;
+      for (const outcome of outcomes) {
+        if (outcome.status !== "fulfilled" || outcome.value?.retry !== true) continue;
+        ({ activeAt: activePollAt, backgroundAt: backgroundPollAt, backgroundIndex } =
+          retryPollAfterAdmissionFailure({
+            kind: outcome.value.kind,
+            retryAt,
+            activeAt: activePollAt,
+            backgroundAt: backgroundPollAt,
+            backgroundIndex,
+            previousBackgroundIndex,
+          }));
+        retryNeeded = true;
+      }
+      if (retryNeeded) armWake("data", retryAt, dataWake);
       if (!cancelled) {
         setNow((prev) =>
           hasInProgressRef.current || Date.now() - prev.getTime() >= 60_000 ? new Date() : prev,
         );
-        armFromState(Date.now());
       }
     }
+
+    // A reset can make the old reservation wake and the control wake due in
+    // the same turn. Both may arm `data` before either async callback reaches
+    // pollSchedule(). Let one callback own that transition; the settled hook
+    // retains every later useful wake. Without this guard one pane could
+    // consume two freshly opened lane slots while another pane received none.
+    const dataWake = createSingleFlightWake(runDataWake, () => {
+      if (!cancelled) armFromState(Date.now());
+    });
 
     async function controlWake() {
       if (cancelled) return;
       const nowMs = Date.now();
       const currentScope = ensureScope(nowMs, { maintain: true });
+      if (currentScope && pendingBlockPublications.size > 0) {
+        const beforeProbe = inspectGovernor(currentScope, nowMs);
+        attemptPendingBlockPublications(
+          currentScope,
+          nowMs,
+          beforeProbe.ok ? beforeProbe.value : null,
+          true,
+        );
+      }
       const refreshed = currentScope
         ? await refreshSharedBudget(currentScope, leaseId, controller.signal)
         : { ok: false, reason: "stale" };
       if (cancelled) return;
       const checkedAt = Date.now();
       const snapshot = currentScope ? inspectGovernor(currentScope, checkedAt) : refreshed;
-      if (!liveScheduling && governorDataReady(
+      const activeKey = TABS[activeIndexRef.current].key;
+      if (currentScope && snapshot.ok && pendingBlockPublications.size > 0) {
+        attemptPendingBlockPublications(currentScope, checkedAt, snapshot.value);
+      }
+      publishControlStatus(activeKey, refreshed, snapshot, checkedAt);
+      if (pendingBlockPublications.size === 0 && !liveScheduling && governorDataReady(
         refreshed,
         snapshot,
-        TABS[activeIndexRef.current].key,
+        activeKey,
         checkedAt,
       )) {
         liveScheduling = true;
@@ -6916,6 +7672,10 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (!refreshed.ok) {
         armWake("control", governorControlRetryAt(checkedAt, runtime.refreshMs), controlWake);
       }
+      if (pendingBlockPublications.size > 0) {
+        armWake("control", governorControlRetryAt(checkedAt, runtime.refreshMs), controlWake);
+      }
+      setNow((previous) => checkedAt - previous.getTime() >= 60_000 ? new Date(checkedAt) : previous);
       armFromState(checkedAt);
     }
 
@@ -6934,6 +7694,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (cancelled) return;
       const currentScope = ensureScope(Date.now());
       if (!currentScope) {
+        pauseCoordination(TABS[activeIndexRef.current].key, "unknown-scope");
         armWake("control", governorControlRetryAt(Date.now(), runtime.refreshMs), controlWake);
         return;
       }
@@ -6941,10 +7702,12 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (cancelled) return;
       const checkedAt = Date.now();
       const snapshot = inspectGovernor(currentScope, checkedAt);
+      const activeKey = TABS[activeIndexRef.current].key;
+      publishControlStatus(activeKey, refreshed, snapshot, checkedAt);
       if (governorDataReady(
         refreshed,
         snapshot,
-        TABS[activeIndexRef.current].key,
+        activeKey,
         checkedAt,
       )) {
         liveScheduling = true;
@@ -6972,7 +7735,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       // needed.
       controller.abort();
     };
-  }, [dashboardCacheWriter]);
+  }, [dashboardCacheWriter, screenReader]);
 
   // Background tabs can be up to BACKGROUND_EVERY ticks stale, so the tab you
   // switch to refreshes straight away rather than showing old data until its
@@ -7001,16 +7764,19 @@ function App({ onCreateRemote = () => {} } = {}) {
     TABS.map((t) => [t.key, data[t.key] == null && !errors[t.key] && loading[t.key]]),
   );
   const anyFirstLoad = Object.values(firstLoad).some(Boolean);
-  // A visible fetch is the third thing worth animating, and the status line
-  // already gates its glyph on this exact flag -- without it in the condition
-  // here the frame counter never advances during a manual refresh, so the slot
-  // turned amber and then sat still on frame 0. `loading` is deliberately left
-  // false by automatic polls over settled data (see shouldShowFetchLoading), so
-  // this cannot restart the timer every five seconds on a quiet repository:
-  // it runs for the length of a first load or an `r`, and stops.
-  const anyLoading = Object.values(loading).some(Boolean);
-  const showSpinner =
-    !remoteSetup && ANIMATE && (anyFirstLoad || hasRunningVisible || anyLoading);
+  const semanticStatus = refreshStatus({
+    widthMode: resizeRef.current.active,
+    remoteSetup,
+    visibleLoading: Boolean(loading[tab.key]),
+    visibleInFlight: Boolean(activeRequestStatus),
+    automaticStatusVisible: Boolean(activeRequestStatus?.automaticStatusVisible),
+    governorDecision: activeGovernorDecision,
+    activeError: tabError,
+    securityIncomplete:
+      tab.key === "security" && securityBlind,
+    screenReader,
+  });
+  const showSpinner = !remoteSetup && ANIMATE && (semanticStatus.animate || hasRunningVisible);
   useEffect(() => {
     if (!showSpinner) {
       // Park on a fixed frame rather than freezing wherever the animation
@@ -7088,9 +7854,14 @@ function App({ onCreateRemote = () => {} } = {}) {
   // its own and the label is minute-granular by design.
   const lastOk = lastOkRef.current[tab.key];
   const staleFor = lastOk == null ? null : now.getTime() - lastOk;
-  const staleThreshold = Math.max(STALE_AFTER_MS, runtime.refreshMs * 6);
+  const staleAt = freshnessDeadline({
+    lastOk,
+    refreshMs: runtime.refreshMs,
+    governorDecision: activeGovernorDecision,
+    currentEpochs: governorEpochs,
+  });
   const staleLabel =
-    staleFor != null && staleFor > staleThreshold
+    staleFor != null && staleAt != null && now.getTime() > staleAt
       ? `stale ${formatDuration(Math.min(staleFor, 359_999_000))}`
       : null;
 
@@ -7297,6 +8068,15 @@ function App({ onCreateRemote = () => {} } = {}) {
       !showHelp &&
         !tooNarrow &&
         !remoteSetup &&
+        activeGovernorDecision?.coordinationError &&
+        e(
+          Text,
+          { color: ATTENTION, wrap: "truncate-end" },
+          `API coordination unavailable (${activeGovernorDecision.reason}); retrying safely`,
+        ),
+      !showHelp &&
+        !tooNarrow &&
+        !remoteSetup &&
         displayError &&
         e(Text, { color: ERROR_TEXT, wrap: "truncate-end" }, displayError),
       !showHelp &&
@@ -7377,7 +8157,7 @@ function App({ onCreateRemote = () => {} } = {}) {
               // Suppressed once icons are already ASCII, since then there is
               // nothing to fix.
               (USING_NERD_ICONS && iconHintDue ? "   (icons blank? GH_GLANCE_ICONS=unicode)" : "")
-            : waiting[tab.key]
+            : ["waiting", "paused"].includes(semanticStatus.kind) || waiting[tab.key]
               ? "waiting for API budget…"
             : tab.key === "security" && securityNotes.length === ALERT_SOURCES.length
               ? "no alert sources available"
@@ -7390,10 +8170,10 @@ function App({ onCreateRemote = () => {} } = {}) {
     ),
     e(PanelEdge, { width: frameCols, top: false, label: countLabel, labelColor: BORDER_COLOR }),
     e(StatusBar, {
-      fetching: anyLoading,
+      status: semanticStatus,
+      detail: activeGovernorDecision,
       spin: showSpinner ? spin : null,
       stale: staleLabel,
-      throttle: throttleMs ? `throttled ${Math.round(throttleMs / 1000)}s` : null,
       interactive,
       cols: frameCols,
       remoteSetup,
@@ -7788,10 +8568,19 @@ export {
   securityPollDelay,
   shouldShowFetchLoading,
   pollSchedule,
+  retryPollAfterAdmissionFailure,
   governorWakeTimes,
   governorDataReady,
   governorControlRetryAt,
   createWakeScheduler,
+  createSingleFlightWake,
+  pendingFailureIsTerminal,
+  runtimeIntentGate,
+  rateLimitBlockDecision,
+  mergeRateLimitBlockPublications,
+  hydrateRateLimitBlockPublication,
+  retryRateLimitBlockPublication,
+  rateLimitBlockProbeRecovered,
   admitGovernorOperation,
   runAdmittedOperation,
   pollResultTransition,
@@ -7821,6 +8610,12 @@ export {
   helpLines,
   summarizeDoctorEnv,
   widthStatusText,
+  refreshStatus,
+  statusBarLayout,
+  freshnessDeadline,
+  probingGovernorDecisions,
+  retainDeferredGovernorHold,
+  REFRESH_STATUS_GLYPHS,
   headerGutterKey,
   HeaderCells,
   parseSgrMouse,

@@ -121,6 +121,14 @@ test("same-target restart keeps stale Actions rows under a live rate-limit error
   assert.match(screen, /stale 2m/);
   assert.match(screen, /ci: pin actions to commit/);
   assert.match(screen, /4 of 4/);
+  assert.match(screen, /‖ Paused.*reset \d\d:\d\d/);
+  const pausedAt = recovered.liveScreen.statusHistory.findLastIndex((line) => / Paused(?:\s|$)/.test(line));
+  assert.ok(pausedAt >= 0, recovered.liveScreen.statusHistory.join(" -> "));
+  assert.equal(
+    recovered.liveScreen.statusHistory.slice(pausedAt + 1)
+      .some((line) => / Checking(?:\s|$)/.test(line)),
+    false,
+  );
   assertTerminalContract(recovered);
 });
 

@@ -387,7 +387,7 @@ coordination get no extension, so old cached rows become visibly stale.
 | 1 | Define hard-reserve policy, resource decisions, and grant scheduling as pure tested behavior | no | [x] |
 | 2 | Build the private account governor, shared probe ownership, and process-concurrency tests | no | [x] |
 | 3 | Route every fetch path through grants and reshape startup, reset, and background scheduling | no | [x] |
-| 4 | Add the truthful footer model and end-to-end multi-pane terminal evidence | no | [ ] |
+| 4 | Add the truthful footer model and end-to-end multi-pane terminal evidence | no | [x] |
 | 5 | Record the architecture, update user guidance, and validate the complete candidate | no | [ ] |
 
 Phase files:

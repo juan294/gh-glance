@@ -49,7 +49,19 @@ cleanup_capture() {
     rmdir "$PIPE_ROOT" 2>/dev/null || true
   fi
 }
-trap cleanup_capture EXIT HUP INT TERM
+
+abort_capture() {
+  # A signal handler that returns resumes the interrupted `wait` on BSD sh.
+  # That kept the harness alive until a producer's long sleep ended even after
+  # its children had been signalled. Exit after the scoped tree cleanup so the
+  # caller regains control immediately.
+  trap - EXIT HUP INT TERM
+  cleanup_capture
+  exit 143
+}
+
+trap cleanup_capture EXIT
+trap abort_capture HUP INT TERM
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO=$(CDPATH= cd -- "$HERE/../.." && pwd)
@@ -68,10 +80,16 @@ cd "$REPO" || exit 1
 # unmount -- measured 992 bytes and zero synchronized-update pairs, versus 4,348
 # bytes and three pairs interactively. Unsetting them makes the harness exercise
 # the path real users get, including when it runs inside GitHub Actions.
+if [ "${GH_GLANCE_CAPTURE_ANIMATION:-0}" = "1" ]; then
+  ANIMATION_COMMAND="unset GH_GLANCE_NO_ANIMATION;"
+else
+  ANIMATION_COMMAND="export GH_GLANCE_NO_ANIMATION=1;"
+fi
+ICON_PROFILE="${GH_GLANCE_CAPTURE_ICONS:-unicode}"
 ENV_PREFIX="export PATH=\"$HERE/fixtures:\$PATH\";
   export GH_GLANCE_FIXTURE_LOG=\"$LOG\";
-  export GH_GLANCE_NO_ANIMATION=1;
-  export GH_GLANCE_ICONS=unicode;"
+  $ANIMATION_COMMAND
+  export GH_GLANCE_ICONS=\"$ICON_PROFILE\";"
 
 # A pty has no controlling terminal here, so it defaults to 0x0 -- exactly the
 # input usableSize() guards (index.mjs:244-246). COLUMNS/LINES are ignored

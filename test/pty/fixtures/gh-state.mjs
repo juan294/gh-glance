@@ -14,6 +14,7 @@ const statePath = process.env.GH_GLANCE_FIXTURE_STATE;
 const args = process.argv.slice(2);
 const fixtures = dirname(new URL(import.meta.url).pathname);
 const waitCell = new Int32Array(new SharedArrayBuffer(4));
+const RATE_RESOURCES = ["core", "graphql"];
 
 function writeExclusive(path, contents) {
   const candidate = `${path}.candidate-${process.pid}-${randomUUID()}`;
@@ -198,8 +199,8 @@ function commandDelay(state, command) {
   return 0;
 }
 
-function resourceSnapshot(state) {
-  return Object.fromEntries(["core", "graphql"].map((resource) => {
+function resourceSnapshot(state, resources = RATE_RESOURCES) {
+  return Object.fromEntries(resources.map((resource) => {
     const budget = state[resource];
     return [resource, budget ? {
       limit: budget.limit,
@@ -212,18 +213,25 @@ function resourceSnapshot(state) {
 
 function pruneDeadInflight(state) {
   state.inFlight ??= {};
+  let active = 0;
+  let dataActive = 0;
   for (const [id, item] of Object.entries(state.inFlight)) {
-    if (pidIsDead(item?.pid)) delete state.inFlight[id];
+    if (pidIsDead(item?.pid)) {
+      delete state.inFlight[id];
+      continue;
+    }
+    active += 1;
+    if (item.isData) dataActive += 1;
   }
-  state.active = Object.keys(state.inFlight).length;
-  state.dataActive = Object.values(state.inFlight).filter((item) => item.isData).length;
+  state.active = active;
+  state.dataActive = dataActive;
 }
 
 function applyResetSequence(state, now) {
   const elapsed = now - (state.createdAt ?? now);
   for (const step of state.resetSequence ?? []) {
     if (step.offsetMs <= elapsed && !step.applied) {
-      for (const resource of ["core", "graphql"]) {
+      for (const resource of RATE_RESOURCES) {
         if (!step[resource]) continue;
         const { resetOffsetMs, ...budget } = step[resource];
         Object.assign(state[resource], budget);
@@ -250,7 +258,7 @@ if (args[0] === "--fixture-burn") {
     state.sequence = (state.sequence ?? 0) + 1;
     pruneDeadInflight(state);
     applyResetSequence(state, now);
-    const before = resourceSnapshot(state);
+    const before = resourceSnapshot(state, [resource]);
     const budget = state[resource];
     if (!budget) throw new Error(`missing fixture ${resource} budget`);
     budget.used += amount;
@@ -265,7 +273,7 @@ if (args[0] === "--fixture-burn") {
       resource,
       amount,
       before,
-      after: resourceSnapshot(state),
+      after: resourceSnapshot(state, [resource]),
     };
     state.events.push(burn);
     return burn;
@@ -279,7 +287,7 @@ const started = withLock((state) => {
   const isRateProbe = args[0] === "api" && args[1] === "rate_limit";
   if (state.anchorAtFirstProbe === true && isRateProbe && !Number.isFinite(state.createdAt)) {
     state.createdAt = now;
-    for (const resource of ["core", "graphql"]) {
+    for (const resource of RATE_RESOURCES) {
       const resetOffsetMs = state[resource]?.resetOffsetMs;
       if (!Number.isFinite(resetOffsetMs)) continue;
       state[resource].resetMs = now + resetOffsetMs;
@@ -300,19 +308,20 @@ const started = withLock((state) => {
     isData,
     startedAt: now,
   };
-  state.active = Object.keys(state.inFlight).length;
+  state.active += 1;
+  if (isData) state.dataActive += 1;
   state.maxConcurrency = Math.max(state.maxConcurrency ?? 0, state.active);
   applyResetSequence(state, now);
-  const before = resourceSnapshot(state);
-  for (const resource of ["core", "graphql"]) {
+  const chargedResources = RATE_RESOURCES.filter((resource) => debit[resource] > 0);
+  const before = isData ? resourceSnapshot(state, chargedResources) : null;
+  for (const resource of RATE_RESOURCES) {
     const budget = state[resource];
     if (!budget || debit[resource] === 0) continue;
     budget.used += debit[resource];
     budget.remaining = Math.max(0, budget.remaining - debit[resource]);
   }
-  const after = resourceSnapshot(state);
+  const after = isData ? resourceSnapshot(state, chargedResources) : null;
   if (isData) {
-    state.dataActive = Object.values(state.inFlight).filter((item) => item.isData).length;
     state.maxDataConcurrency = Math.max(state.maxDataConcurrency ?? 0, state.dataActive);
   }
   const failure = state.failure;
@@ -327,8 +336,7 @@ const started = withLock((state) => {
     pane: process.env.GH_GLANCE_FIXTURE_PANE ?? null,
     argv: args,
     cost: debit,
-    before,
-    after,
+    ...(isData ? { before, after } : {}),
   });
   return {
     sequence,

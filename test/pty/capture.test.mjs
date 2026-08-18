@@ -39,26 +39,27 @@ test("terminal replay preserves a compact dashboard and its guard row", () => {
   const raw =
     ALT_ENTER +
     SYNC_START +
-    "[1:Act]\r\nbody\r\n⣾ Fetching\r\n" +
+    "[1:Act]\r\nbody\r\n⣾ Checking\r\n" +
     SYNC_END +
     ALT_EXIT;
 
   const parsed = parseCapture(raw, { cols: 20, rows: 5 });
 
-  assert.deepEqual(parsed.finalFrame.lines, ["[1:Act]", "body", "⣾ Fetching"]);
+  assert.deepEqual(parsed.finalFrame.lines, ["[1:Act]", "body", "⣾ Checking"]);
   assert.equal(parsed.liveScreen.lines.length, 5);
   assert.equal(parsed.liveScreen.lines.at(-1), "");
   assert.equal(parsed.liveScreen.statusLines, 1);
   assert.equal(parsed.liveScreen.maxStatusLines, 1);
+  assert.deepEqual(parsed.liveScreen.statusHistory, ["⣾ Checking"]);
 });
 
 test("terminal replay applies incremental cursor updates without accumulating status lines", () => {
-  const initial = "[1:Actions]\r\nbody\r\n⣾ Fetching\r\n";
+  const initial = "[1:Actions]\r\nbody\r\n⣾ Checking\r\n";
   const update =
     `${ESC}[3A` +
     `${ESC}[E` +
     `${ESC}[E` +
-    `${ESC}[G⣾ Fetching stale 1m${ESC}[K\r\n`;
+    `${ESC}[G· Watching stale 1m${ESC}[K\r\n`;
   const raw =
     ALT_ENTER +
     SYNC_START +
@@ -71,21 +72,22 @@ test("terminal replay applies incremental cursor updates without accumulating st
 
   const parsed = parseCapture(raw, { cols: 24, rows: 5 });
 
-  assert.equal(parsed.finalFrame.lines[2], "⣾ Fetching stale 1m");
+  assert.equal(parsed.finalFrame.lines[2], "· Watching stale 1m");
   assert.equal(parsed.liveScreen.statusLines, 1);
   assert.equal(parsed.liveScreen.maxStatusLines, 1);
   assert.equal(parsed.liveScreen.lines.at(-1), "");
+  assert.deepEqual(parsed.liveScreen.statusHistory, ["⣾ Checking", "· Watching stale 1m"]);
 });
 
 test("terminal replay retains transient status accumulation evidence", () => {
   const raw =
     ALT_ENTER +
     SYNC_START +
-    "[1:Actions]\r\n⣾ Fetching old\r\n⣾ Fetching new\r\n" +
+    "[1:Actions]\r\n· Waiting old\r\n⣾ Checking new\r\n" +
     SYNC_END +
     SYNC_START +
     `${ESC}[2J${ESC}[H` +
-    "[1:Actions]\r\nbody\r\n⣾ Fetching\r\n" +
+    "[1:Actions]\r\nbody\r\n· Watching\r\n" +
     SYNC_END +
     ALT_EXIT;
 
@@ -93,6 +95,7 @@ test("terminal replay retains transient status accumulation evidence", () => {
 
   assert.equal(parsed.liveScreen.statusLines, 1);
   assert.equal(parsed.liveScreen.maxStatusLines, 2);
+  assert.deepEqual(parsed.liveScreen.statusHistory, ["· Waiting old", "⣾ Checking new", "· Watching"]);
 });
 
 test("capture termination reaps the full stdin producer and script trees", async (t) => {
@@ -121,8 +124,10 @@ test("capture termination reaps the full stdin producer and script trees", async
 
   await waitFor(() => existsSync(producerPath) && existsSync(childPath));
   tracked.push(Number(readFileSync(producerPath, "utf8")), Number(readFileSync(childPath, "utf8")));
+  const terminatedAt = Date.now();
   harness.kill("SIGTERM");
   await new Promise((resolve) => harness.once("exit", resolve));
   await waitFor(() => tracked.every((pid) => !processIsAlive(pid)));
+  assert.ok(Date.now() - terminatedAt < 5_000, "capture cleanup must stay below five seconds");
   assert.ok(tracked.every((pid) => !processIsAlive(pid)));
 });

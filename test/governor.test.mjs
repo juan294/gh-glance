@@ -34,6 +34,7 @@ import {
   completeReservation,
   createGovernorScope,
   createOpenRequestRegistry,
+  createSingleFlightWake,
   createWakeScheduler,
   doctorProbePlan,
   emptyGovernorState,
@@ -51,7 +52,13 @@ import {
   admitGovernorOperation,
   openInBrowser,
   operationCost,
+  pendingFailureIsTerminal,
+  pollSchedule,
   publishProbe,
+  hydrateRateLimitBlockPublication,
+  mergeRateLimitBlockPublications,
+  rateLimitBlockDecision,
+  rateLimitBlockProbeRecovered,
   readIntentDecision,
   recordResourceBlock,
   refreshSharedBudget,
@@ -61,6 +68,9 @@ import {
   releaseLease,
   renewProbeClaim,
   requestManualProbe,
+  retryPollAfterAdmissionFailure,
+  retryRateLimitBlockPublication,
+  runtimeIntentGate,
   runAdmittedOperation,
   resolveFailureContext,
   resolveEffectiveHost,
@@ -375,6 +385,30 @@ test("manual, diagnostic, tab-switch, active, and background requests share one 
   }
 });
 
+test("an immediate admitted operation revalidates with the post-registration clock", (t) => {
+  const box = sandbox(t, { authIdentity: "fresh-operation-start" });
+  const epoch = `5000:${NOW + 3_600_000}`;
+  let leaseId = randomUUID();
+  while (governorPhaseOffset(leaseId, epoch) !== 0) leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+
+  let clock = NOW;
+  box.scope.now = () => {
+    clock += 1;
+    return clock;
+  };
+  const admitted = admitGovernorOperation(
+    box.scope,
+    leaseId,
+    "open:actions",
+    "manual",
+    NOW,
+  );
+  assert.equal(admitted.ok, true);
+  assert.equal(admitted.value.status, "started");
+});
+
 test("an unsafe admitted operation performs zero calls and independent wakes remain bounded", async (t) => {
   const now = Date.now();
   const box = sandbox(t, { now, authIdentity: "seam-denial" });
@@ -591,6 +625,228 @@ test("independent wake schedulers clear every pending callback", () => {
   now = 500;
 });
 
+test("overlapping reset data wakes coalesce and retain the later reservation wake", async () => {
+  let releaseFirst;
+  const firstPending = new Promise((resolve) => { releaseFirst = resolve; });
+  let polls = 0;
+  let rearms = 0;
+  const wake = createSingleFlightWake(async () => {
+    polls += 1;
+    if (polls === 1) await firstPending;
+  }, () => { rearms += 1; });
+
+  const first = wake();
+  await Promise.resolve();
+  assert.equal(polls, 1);
+  assert.equal(await wake(), false, "the reset peer advanced while the first wake was pending");
+  assert.equal(polls, 1);
+  assert.equal(rearms, 0);
+
+  releaseFirst();
+  assert.equal(await first, true);
+  assert.equal(polls, 2, "the overlapping wake was lost after its timer entry fired");
+  assert.equal(rearms, 1, "the owning wake did not re-arm from persisted state");
+  assert.equal(await wake(), true);
+  assert.equal(polls, 3);
+  assert.equal(rearms, 2);
+});
+
+test("transient contention retains a persisted pending reservation for retry", () => {
+  for (const reason of ["busy", "corrupt", "unknown-scope"]) {
+    assert.equal(pendingFailureIsTerminal(reason), false, reason);
+  }
+  assert.equal(pendingFailureIsTerminal("stale"), true);
+});
+
+test("unsafe bootstrap tab switches update lease demand without registering intents", (t) => {
+  const box = sandbox(t, { authIdentity: "bootstrap-tab-switch" });
+  const leaseId = randomUUID();
+  assert.equal(registerLease(box.scope, lease(leaseId)).ok, true);
+  const tabSwitch = runtimeIntentGate(false);
+  assert.deepEqual(tabSwitch, { registerIntent: false, requestProbe: false });
+  assert.equal(heartbeatLease(
+    box.scope,
+    leaseId,
+    { core: 0, graphql: 2 },
+    NOW,
+    "issues",
+  ).ok, true);
+  const manual = runtimeIntentGate(false, { force: true });
+  assert.deepEqual(manual, { registerIntent: false, requestProbe: true });
+  const state = inspectGovernor(box.scope, NOW).value;
+  assert.equal(state.leases[leaseId].activeTab, "issues");
+  assert.deepEqual(state.intents, {});
+  assert.deepEqual(state.reservations, {});
+  assert.equal(runtimeIntentGate(true).registerIntent, true);
+});
+
+test("a due poll retries a pre-persistence admission failure without waiting for the floor", (t) => {
+  const box = sandbox(t);
+  const leaseId = randomUUID();
+  assert.equal(registerLease(box.scope, lease(leaseId)).ok, true);
+  publishInitial(box.scope, leaseId);
+
+  const floorMs = 40_000;
+  const first = pollSchedule({
+    nowMs: NOW,
+    floorMs,
+    activeKey: "actions",
+    activeAt: NOW,
+    backgroundAt: NOW + 4 * floorMs,
+  });
+  assert.deepEqual(first.due, [{ key: "actions", kind: "active" }]);
+  assert.equal(Object.keys(inspectGovernor(box.scope, NOW).value.reservations).length, 0);
+
+  const retryAt = governorControlRetryAt(NOW, floorMs);
+  const retry = retryPollAfterAdmissionFailure({
+    kind: "active",
+    retryAt,
+    activeAt: first.activeAt,
+    backgroundAt: first.backgroundAt,
+    backgroundIndex: first.backgroundIndex,
+    previousBackgroundIndex: 0,
+  });
+  assert.equal(retry.activeAt, retryAt);
+  assert.ok(retryAt - NOW <= 1_000);
+
+  const second = pollSchedule({
+    nowMs: retryAt,
+    floorMs,
+    activeKey: "actions",
+    ...retry,
+  });
+  assert.deepEqual(second.due, [{ key: "actions", kind: "active" }]);
+  const registered = registerIntent(box.scope, intent(randomUUID(), leaseId, retryAt, {
+    tab: "actions",
+    priority: "active",
+    costs: { core: 2, graphql: 0 },
+  }));
+  assert.equal(registered.ok, true);
+  assert.equal(Object.keys(inspectGovernor(box.scope, retryAt).value.reservations).length, 1);
+
+  const duplicate = pollSchedule({
+    nowMs: retryAt,
+    floorMs,
+    activeKey: "actions",
+    activeAt: second.activeAt,
+    backgroundAt: second.backgroundAt,
+    backgroundIndex: second.backgroundIndex,
+  });
+  assert.deepEqual(duplicate.due, []);
+  assert.equal(Object.keys(inspectGovernor(box.scope, retryAt).value.reservations).length, 1);
+});
+
+test("rate-limit status is shared only after the block is durably published", () => {
+  const resetMs = NOW + 60_000;
+  assert.deepEqual(rateLimitBlockDecision([{ ok: true }], resetMs), {
+    mode: "paused",
+    reason: "rate-limit",
+    resetMs,
+    coordinationError: false,
+    failClosed: false,
+  });
+  for (const results of [[], [{ ok: false, reason: "busy" }], [{ ok: true }, { ok: false }]]) {
+    const decision = rateLimitBlockDecision(results, resetMs);
+    assert.equal(decision.mode, "paused");
+    assert.equal(decision.coordinationError, true);
+    assert.equal(decision.failClosed, true);
+    assert.notEqual(decision.reason, "rate-limit");
+    assert.equal("resetMs" in decision, false);
+  }
+  assert.equal(rateLimitBlockDecision([{ ok: true }], Number.NaN).failClosed, true);
+});
+
+test("a busy block publication stays closed, retries, and reopens only after reset probe", () => {
+  const resetMs = NOW + 10_000;
+  const oldEpoch = `5000:${resetMs}`;
+  const newEpoch = `5000:${resetMs + 60_000}`;
+  const pending = {
+    key: "actions",
+    failedAt: NOW,
+    reason: "block-unpublished",
+    blocks: [{ resource: "core", resetMs, epoch: oldEpoch }],
+  };
+  let publications = 0;
+  const busy = retryRateLimitBlockPublication(pending, NOW, () => {
+    publications += 1;
+    return { ok: false, reason: "busy" };
+  });
+  assert.equal(busy.status, "waiting");
+  assert.equal(busy.pending.reason, "busy");
+  assert.equal(publications, 1);
+  let dataCalls = 0;
+  if (!busy.pending) dataCalls += 1;
+  assert.equal(dataCalls, 0, "data ran while the shared block write was uncertain");
+
+  const published = retryRateLimitBlockPublication(busy.pending, NOW + 500, () => {
+    publications += 1;
+    return { ok: true };
+  });
+  assert.equal(published.status, "published");
+  assert.equal(published.decision.reason, "rate-limit");
+  assert.equal(publications, 2);
+  assert.equal(rateLimitBlockProbeRecovered(pending, {
+    budgets: { core: { observedAt: NOW + 1, epoch: newEpoch } },
+  }, resetMs - 1), false);
+  assert.equal(rateLimitBlockProbeRecovered(pending, {
+    budgets: { core: { observedAt: resetMs + 1, epoch: oldEpoch } },
+  }, resetMs + 1), false);
+  assert.equal(rateLimitBlockProbeRecovered(pending, {
+    budgets: { core: { observedAt: resetMs + 1, epoch: newEpoch } },
+  }, resetMs + 1), true);
+  dataCalls += 1;
+  assert.equal(dataCalls, 1, "fresh post-reset evidence did not allow later work");
+});
+
+test("cross-resource block failures stay independent and unknown evidence must publish", () => {
+  let pendingByResource = mergeRateLimitBlockPublications(new Map(), "actions", [{
+    resource: "core",
+    resetMs: null,
+    epoch: null,
+  }], NOW);
+  pendingByResource = mergeRateLimitBlockPublications(pendingByResource, "issues", [{
+    resource: "graphql",
+    resetMs: NOW + 20_000,
+    epoch: `5000:${NOW + 20_000}`,
+  }], NOW + 1);
+  assert.equal(pendingByResource.size, 2);
+  assert.equal(pendingByResource.get("core").key, "actions");
+  assert.equal(pendingByResource.get("graphql").key, "issues");
+
+  const unknown = pendingByResource.get("core");
+  const freshBudget = {
+    budgets: { core: {
+      observedAt: NOW + 100,
+      resetMs: NOW + 30_000,
+      epoch: `5000:${NOW + 30_000}`,
+    } },
+  };
+  assert.equal(
+    rateLimitBlockProbeRecovered(unknown, freshBudget, NOW + 100),
+    false,
+    "an unknown prior epoch was treated as a proven reset",
+  );
+  const derived = hydrateRateLimitBlockPublication(unknown, freshBudget);
+  assert.deepEqual(derived.blocks, [{
+    resource: "core",
+    resetMs: NOW + 30_000,
+    epoch: `5000:${NOW + 30_000}`,
+  }]);
+  const busy = retryRateLimitBlockPublication(
+    derived,
+    NOW + 100,
+    () => ({ ok: false, reason: "busy" }),
+  );
+  assert.equal(busy.status, "waiting");
+  const published = retryRateLimitBlockPublication(
+    busy.pending,
+    NOW + 200,
+    () => ({ ok: true }),
+  );
+  assert.equal(published.status, "published");
+  assert.equal(published.decision.reason, "rate-limit");
+});
+
 test("a lease migrates into a new auth scope without sharing old state", (t) => {
   const box = sandbox(t, { authIdentity: "cleanup-only" });
   let identity = { effectiveHost: "github.com", authIdentity: "auth-before" };
@@ -752,6 +1008,76 @@ test("the shared probe wrapper publishes once and failed probes pause only backg
   });
   assert.equal(inspected.value.status, "published");
   assert.equal(waits, 0);
+});
+
+test("a probe owner retries nonce-safe renew, publish, and fail mutations without another API read", async (t) => {
+  const publishBox = sandbox(t, { authIdentity: "publish-contention" });
+  const publishLeaseId = randomUUID();
+  registerLease(publishBox.scope, lease(publishLeaseId));
+  let clock = NOW;
+  let reads = 0;
+  let renewAttempts = 0;
+  let publishAttempts = 0;
+  const published = await refreshSharedBudget(publishBox.scope, publishLeaseId, null, {
+    now: () => clock,
+    wait: async (ms) => { clock += ms; publishBox.setNow(clock); },
+    readBudgets: async () => { reads += 1; return budgets(clock); },
+    renew: (...args) => {
+      renewAttempts += 1;
+      return renewAttempts < 3 ? { ok: false, reason: "busy" } : renewProbeClaim(...args);
+    },
+    publish: (...args) => {
+      publishAttempts += 1;
+      return publishAttempts < 3 ? { ok: false, reason: "busy" } : publishProbe(...args);
+    },
+  });
+  assert.equal(published.ok, true);
+  assert.equal(renewAttempts, 3);
+  assert.equal(reads, 1, "lock contention reran the external rate_limit probe");
+  assert.equal(publishAttempts, 3);
+  assert.equal(inspectGovernor(publishBox.scope, clock).value.probeClaim, null);
+
+  const failBox = sandbox(t, { authIdentity: "fail-contention" });
+  const failLeaseId = randomUUID();
+  registerLease(failBox.scope, lease(failLeaseId));
+  clock = NOW;
+  let failAttempts = 0;
+  const failed = await refreshSharedBudget(failBox.scope, failLeaseId, null, {
+    now: () => clock,
+    wait: async (ms) => { clock += ms; failBox.setNow(clock); },
+    readBudgets: async () => null,
+    fail: (...args) => {
+      failAttempts += 1;
+      return failAttempts < 3 ? { ok: false, reason: "busy" } : failProbeClaim(...args);
+    },
+  });
+  assert.equal(failed.reason, "stale");
+  assert.equal(failAttempts, 3);
+  const failedState = inspectGovernor(failBox.scope, clock).value;
+  assert.equal(failedState.probeClaim, null);
+  assert.equal(failedState.probeOutcome.status, "failed");
+});
+
+test("governor readers and mutators refresh time after a concurrent locked write", (t) => {
+  const box = sandbox(t, { authIdentity: "locked-time" });
+  const ownerId = randomUUID();
+  const laterId = randomUUID();
+  registerLease(box.scope, lease(ownerId));
+  const claim = claimProbe(box.scope, ownerId, NOW);
+  assert.equal(claim.value.status, "claimed");
+
+  // Model a caller that captured NOW before waiting for the lock. By the time
+  // it acquires the lock, another process has persisted a lease at the newer
+  // shared clock. Both a read and a mutation must validate against that fresh
+  // locked time instead of rejecting the valid lease as future-dated.
+  const committedAt = NOW + 25;
+  box.setNow(committedAt);
+  assert.equal(registerLease(box.scope, lease(laterId, committedAt)).ok, true);
+
+  const inspected = inspectGovernor(box.scope, NOW);
+  assert.equal(inspected.ok, true);
+  assert.deepEqual(Object.keys(inspected.value.leases).sort(), [laterId, ownerId].sort());
+  assert.equal(renewProbeClaim(box.scope, ownerId, claim.value.nonce, NOW).ok, true);
 });
 
 test("probe drain and renewal failures release only their own barrier", async (t) => {
