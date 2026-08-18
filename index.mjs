@@ -812,13 +812,13 @@ function buildFailureContext(repoSettlement, authSettlement) {
   return { repo, accounts };
 }
 
-async function resolveFailureContext(signal, governor = null) {
+async function resolveFailureContext(signal, governor = null, { run = runGh } = {}) {
   const repoCall = governor
     ? runAdmittedOperation({
         ...governor,
         operation: "failure-context:repository",
         signal,
-        run: (admittedSignal) => runGh(repoContextArgs(), {
+        run: (admittedSignal) => run(repoContextArgs(), {
           signal: admittedSignal,
           operation: "failure-context:repository",
         }),
@@ -826,7 +826,7 @@ async function resolveFailureContext(signal, governor = null) {
     : Promise.reject(new Error("API budget unavailable"));
   const [repo, auth] = await Promise.allSettled([
     repoCall,
-    runGh(authContextArgs(), { signal, operation: "failure-context:auth" }),
+    run(authContextArgs(), { signal, operation: "failure-context:auth" }),
   ]);
   return buildFailureContext(repo, auth);
 }
@@ -1082,7 +1082,7 @@ function tabRequestCost(tab) {
 }
 
 // Every gh subprocess has one declared operation, enforced at the subprocess
-// boundary. Phase 3 uses these costs for quota admission. Tab totals are
+// boundary. The shared governor uses these costs for quota admission. Tab totals are
 // derived from the fetch tables, while Security endpoint entries describe the
 // individual calls covered by the tab's six-call upfront reservation.
 const OPERATION_COSTS = Object.freeze({
@@ -2708,6 +2708,12 @@ function forcedBackoffKeys(key) {
   ];
 }
 
+function clearForcedBackoffAfterStart(key, force, status, clear = clearBackoff) {
+  if (!force || status !== "started") return false;
+  for (const backoffKey of forcedBackoffKeys(key)) clear(backoffKey);
+  return true;
+}
+
 async function fetchAlertSource(source, signal, now) {
   if (backoffActive(source.key, now)) {
     const { note, verdict } = alertBackoff.get(source.key);
@@ -2873,7 +2879,7 @@ const OPENABLE = { actions: "run", issues: "issue", prs: "pr" };
 // almost never a valid databaseId elsewhere and 404s. `gh issue view` and
 // `gh pr view` are the opposite: they take the issue/PR number, and neither
 // row shape carries a databaseId to prefer instead.
-async function openInBrowser(tabKey, item, signal, governor = null) {
+async function openInBrowser(tabKey, item, signal, governor = null, { run = runGh } = {}) {
   const kind = pick(OPENABLE, tabKey, null);
   const id = kind === "run" ? (item?.databaseId ?? item?.number) : (item?.number ?? item?.databaseId);
   if (!kind || id == null) return;
@@ -2882,7 +2888,7 @@ async function openInBrowser(tabKey, item, signal, governor = null) {
     ...governor,
     operation: `open:${tabKey}`,
     signal,
-    run: (admittedSignal) => runGh([kind, "view", ...repoArgs(), String(id), "--web"], {
+    run: (admittedSignal) => run([kind, "view", ...repoArgs(), String(id), "--web"], {
       signal: admittedSignal,
       operation: `open:${tabKey}`,
     }),
@@ -3222,12 +3228,8 @@ function projectedHourlyCost(activeKey) {
   };
 }
 
-async function runDoctor() {
-  // A live backoff would make an alert probe silently skip and report nothing,
-  // which is the opposite of what a diagnostic run is for.
-  alertBackoff.clear();
-
-  const probes = [
+function doctorProbePlan() {
+  return [
     ["Repository access", repoContextArgs(), "doctor:repository"],
     ["Actions (run list)", actionsArgs(MIN_RUN_LIMIT), "doctor:actions"],
     ["Issues (issue list)", issuesArgs(), "doctor:issues"],
@@ -3240,6 +3242,14 @@ async function runDoctor() {
       ]),
     ),
   ];
+}
+
+async function runDoctor() {
+  // A live backoff would make an alert probe silently skip and report nothing,
+  // which is the opposite of what a diagnostic run is for.
+  alertBackoff.clear();
+
+  const probes = doctorProbePlan();
 
   // Free checks run first. In particular the one rate_limit read both renders
   // the budget and seeds admission; diagnostics never spend before that proof.
@@ -5260,37 +5270,146 @@ function shouldShowFetchLoading({ hasData, force }) {
   return !hasData || force === true;
 }
 
-function tabHeld(tab, heldResources = {}) {
+function tabHold(tab, heldResources = {}) {
   const costs = tabRequestCost(tab);
-  return RATE_RESOURCES.some((resource) => costs[resource] > 0 && heldResources[resource]);
+  const holds = RATE_RESOURCES.flatMap((resource) => {
+    if (costs[resource] <= 0) return [];
+    const value = heldResources[resource];
+    if (value === true) return [{ retryAt: Number.POSITIVE_INFINITY }];
+    return value?.held ? [value] : [];
+  });
+  return {
+    held: holds.length > 0,
+    retryAt: holds.reduce(
+      (latest, hold) => Math.max(latest, hold.retryAt ?? Number.POSITIVE_INFINITY),
+      0,
+    ),
+  };
 }
 
-function pollSchedule({ ticks, activeKey, heldResources = {} }) {
+function pollSchedule({
+  nowMs,
+  floorMs,
+  activeKey,
+  activeAt = nowMs,
+  backgroundAt = nowMs + 4 * floorMs,
+  backgroundIndex = 0,
+  heldResources = {},
+}) {
   const due = [];
-  if (!tabHeld(activeKey, heldResources)) due.push(activeKey);
-  // Three inactive tabs share one background slot every four foreground ticks.
-  // Thus each is observed once per twelve healthy ticks, without a startup fanout.
-  if (ticks > 0 && ticks % 4 === 0) {
-    const background = TAB_KEYS.filter((key) => key !== activeKey);
-    const candidate = background[(ticks / 4 - 1) % background.length];
-    if (!tabHeld(candidate, heldResources)) due.push(candidate);
+  let nextActiveAt = activeAt;
+  let nextBackgroundAt = backgroundAt;
+  let nextBackgroundIndex = backgroundIndex;
+  if (activeAt <= nowMs) {
+    const activeHold = tabHold(activeKey, heldResources);
+    if (activeHold.held) nextActiveAt = activeHold.retryAt;
+    else {
+      due.push(activeKey);
+      nextActiveAt = nowMs + floorMs;
+    }
   }
-  return { due, nextTicks: ticks + 1 };
+  // Three inactive tabs share one background slot every four active periods.
+  // Select at most one usable tab and retain the cursor for the next slot.
+  if (backgroundAt <= nowMs) {
+    const background = TAB_KEYS.filter((key) => key !== activeKey);
+    let selected = -1;
+    for (let offset = 0; offset < background.length; offset += 1) {
+      const index = (backgroundIndex + offset) % background.length;
+      if (!tabHold(background[index], heldResources).held) {
+        selected = index;
+        break;
+      }
+    }
+    if (selected >= 0) {
+      due.push(background[selected]);
+      nextBackgroundIndex = (selected + 1) % background.length;
+      nextBackgroundAt = nowMs + 4 * floorMs;
+    } else {
+      nextBackgroundAt = background.reduce(
+        (earliest, key) => Math.min(earliest, tabHold(key, heldResources).retryAt),
+        Number.POSITIVE_INFINITY,
+      );
+    }
+  }
+  return {
+    due,
+    activeAt: nextActiveAt,
+    backgroundAt: nextBackgroundAt,
+    backgroundIndex: nextBackgroundIndex,
+    nextAt: Math.min(nextActiveAt, nextBackgroundAt),
+  };
 }
 
-function governorWakeTimes(state, nowMs, floorMs) {
+function governorWakeTimes(state, nowMs, floorMs, leaseId = null) {
   const budgets = Object.values(state?.budgets ?? {});
+  const observedCandidates = state?.probeOutcome?.status === "failed"
+    ? []
+    : budgets.map((budget) => budget.observedAt + BUDGET_PROBE_MS);
   const controlAt = Math.min(
-    ...budgets.map((budget) => budget.observedAt + BUDGET_PROBE_MS),
+    ...observedCandidates,
     ...budgets.map((budget) => budget.resetMs + BUDGET_RESET_GRACE_MS),
     state?.probeClaim?.leaseUntil ?? Number.POSITIVE_INFINITY,
+    state?.probeOutcome?.nextAt ?? Number.POSITIVE_INFINITY,
   );
   const reservationAt = Object.values(state?.reservations ?? {})
-    .filter((reservation) => reservation.status === "scheduled")
+    .filter((reservation) => reservation.status === "scheduled" &&
+      (leaseId == null || reservation.leaseId === leaseId))
     .reduce((earliest, reservation) => Math.min(earliest, reservation.notBefore), Number.POSITIVE_INFINITY);
   return {
     controlAt: Number.isFinite(controlAt) ? Math.max(nowMs + 1, controlAt) : nowMs + floorMs,
-    dataAt: Number.isFinite(reservationAt) ? Math.max(nowMs + 1, reservationAt) : nowMs + floorMs,
+    dataAt: Number.isFinite(reservationAt) ? Math.max(nowMs + 1, reservationAt) : Number.POSITIVE_INFINITY,
+  };
+}
+
+function governorDataReady(refreshResult, snapshot, activeKey, nowMs) {
+  if (!refreshResult?.ok || !snapshot?.ok) return false;
+  if (["waiting", "paused", "probe"].includes(refreshResult.value?.status)) return false;
+  if (snapshot.value.probeClaim || snapshot.value.probeOutcome?.status !== "healthy") return false;
+  const costs = tabRequestCost(activeKey);
+  return RATE_RESOURCES.every((resource) => {
+    if (costs[resource] <= 0) return true;
+    const budget = snapshot.value.budgets[resource];
+    return budget && nowMs - budget.observedAt <= BUDGET_SNAPSHOT_TTL_MS &&
+      budget.blockUntil <= nowMs && availableForGrant({ budget, nowMs }).mode === "open";
+  });
+}
+
+function governorControlRetryAt(nowMs, floorMs) {
+  return nowMs + Math.min(floorMs, 1000);
+}
+
+function createWakeScheduler({
+  now = Date.now,
+  set = setTimeout,
+  clear = clearTimeout,
+} = {}) {
+  const entries = new Map();
+  return {
+    arm(kind, at, run) {
+      if (!Number.isFinite(at) || at >= (entries.get(kind)?.at ?? Number.POSITIVE_INFINITY)) return false;
+      const previous = entries.get(kind);
+      if (previous) clear(previous.id);
+      const entry = { at, id: null };
+      entry.id = set(() => {
+        if (entries.get(kind) !== entry) return;
+        entries.delete(kind);
+        void run();
+      }, Math.max(0, at - now()));
+      entries.set(kind, entry);
+      return true;
+    },
+    clear(kind) {
+      const entry = entries.get(kind);
+      if (!entry) return false;
+      clear(entry.id);
+      entries.delete(kind);
+      return true;
+    },
+    clearAll() {
+      for (const kind of [...entries.keys()]) this.clear(kind);
+    },
+    at: (kind) => entries.get(kind)?.at ?? Number.POSITIVE_INFINITY,
+    size: () => entries.size,
   };
 }
 
@@ -6254,7 +6373,6 @@ function App({ onCreateRemote = () => {} } = {}) {
   // timers. Each callback computes and arms its next wake inside this effect.
   useEffect(() => {
     let cancelled = false;
-    let ticks = 0;
     const controller = new AbortController();
     registerLiveAbort(controller);
     const withTargetHost = (context) => ({
@@ -6314,9 +6432,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       // background fetch -- and so a slow repo can't stack refreshes.
       if (inFlightRef.current[key]) return Promise.resolve();
       inFlightRef.current[key] = true;
-      if (force) {
-        for (const backoffKey of forcedBackoffKeys(key)) clearBackoff(backoffKey);
-      }
+      clearForcedBackoffAfterStart(key, force, "started");
       const visibleLoading = shouldShowFetchLoading({
         hasData: dataRef.current[key] !== null,
         force,
@@ -6477,41 +6593,18 @@ function App({ onCreateRemote = () => {} } = {}) {
 
     const leaseId = governorId();
     const pending = new Map();
+    const wakeScheduler = createWakeScheduler();
     let scope = null;
     let cleanupScope = null;
+    let registeredScopeHash = null;
     let remoteUrls = [];
-    let dataTimeout = null;
-    let controlTimeout = null;
-    let heartbeatTimeout = null;
-    let dataAt = Number.POSITIVE_INFINITY;
-    let controlAt = Number.POSITIVE_INFINITY;
-    let heartbeatAt = Number.POSITIVE_INFINITY;
-
-    function clearWake(kind) {
-      const id = kind === "data" ? dataTimeout : kind === "control" ? controlTimeout : heartbeatTimeout;
-      if (id) clearTimeout(id);
-      if (kind === "data") dataTimeout = null;
-      else if (kind === "control") controlTimeout = null;
-      else heartbeatTimeout = null;
-    }
+    let liveScheduling = false;
+    let activePollAt = Number.POSITIVE_INFINITY;
+    let backgroundPollAt = Number.POSITIVE_INFINITY;
+    let backgroundIndex = 0;
 
     function armWake(kind, at, run) {
-      if (cancelled || !Number.isFinite(at)) return;
-      const currentAt = kind === "data" ? dataAt : kind === "control" ? controlAt : heartbeatAt;
-      if (at >= currentAt) return;
-      clearWake(kind);
-      if (kind === "data") dataAt = at;
-      else if (kind === "control") controlAt = at;
-      else heartbeatAt = at;
-      const timeout = setTimeout(() => {
-        if (kind === "data") dataAt = Number.POSITIVE_INFINITY;
-        else if (kind === "control") controlAt = Number.POSITIVE_INFINITY;
-        else heartbeatAt = Number.POSITIVE_INFINITY;
-        void run();
-      }, Math.max(0, at - Date.now()));
-      if (kind === "data") dataTimeout = timeout;
-      else if (kind === "control") controlTimeout = timeout;
-      else heartbeatTimeout = timeout;
+      if (!cancelled) wakeScheduler.arm(kind, at, run);
     }
 
     function identity() {
@@ -6525,13 +6618,15 @@ function App({ onCreateRemote = () => {} } = {}) {
       const current = identity();
       const nextHash = governorScopeHash(current.effectiveHost, current.authIdentity);
       if (!nextHash) return null;
-      if (scope?.hash === nextHash) return scope;
-      if (cleanupScope) releaseLease(cleanupScope, leaseId);
-      const created = createGovernorScope({ ...current, identityProvider: identity });
-      if (!created.ok) return null;
-      scope = created.value;
-      cleanupScope = { ...scope, identityProvider: null };
-      governorRef.current = { scope, leaseId };
+      if (scope?.hash === nextHash && registeredScopeHash === nextHash) return scope;
+      if (scope?.hash !== nextHash) {
+        if (cleanupScope && registeredScopeHash) releaseLease(cleanupScope, leaseId);
+        registeredScopeHash = null;
+        const created = createGovernorScope({ ...current, identityProvider: identity });
+        if (!created.ok) return null;
+        scope = created.value;
+        cleanupScope = { ...scope, identityProvider: null };
+      }
       const activeTab = TABS[activeIndexRef.current].key;
       const registered = registerLease(scope, {
         id: leaseId,
@@ -6541,20 +6636,28 @@ function App({ onCreateRemote = () => {} } = {}) {
         phaseSeed: { seed: leaseId, registeredAt: nowMs },
         demand: tabRequestCost(activeTab),
       });
-      return registered.ok ? scope : null;
+      if (!registered.ok) return null;
+      registeredScopeHash = nextHash;
+      governorRef.current = { scope, leaseId };
+      return scope;
     }
 
     function armFromState(nowMs = Date.now()) {
       if (!scope) return;
-      const snapshot = inspectGovernor(scope, nowMs);
-      if (!snapshot.ok) {
-        armWake("control", nowMs + runtime.refreshMs, controlWake);
+      if (!registeredScopeHash) {
+        armWake("control", governorControlRetryAt(nowMs, runtime.refreshMs), controlWake);
         return;
       }
-      const wakes = governorWakeTimes(snapshot.value, nowMs, runtime.refreshMs);
+      const snapshot = inspectGovernor(scope, nowMs);
+      if (!snapshot.ok) {
+        armWake("control", governorControlRetryAt(nowMs, runtime.refreshMs), controlWake);
+        return;
+      }
+      const wakes = governorWakeTimes(snapshot.value, nowMs, runtime.refreshMs, leaseId);
       armWake("control", wakes.controlAt, controlWake);
-      armWake("data", Math.min(wakes.dataAt, nowMs + runtime.refreshMs), dataWake);
-      const delay = Math.max(0, Math.min(wakes.dataAt, wakes.controlAt) - nowMs);
+      const nextDataAt = Math.min(wakes.dataAt, activePollAt, backgroundPollAt);
+      if (liveScheduling) armWake("data", nextDataAt, dataWake);
+      const delay = Math.max(0, Math.min(nextDataAt, wakes.controlAt) - nowMs);
       setThrottleMs(delay > runtime.refreshMs ? delay : null);
     }
 
@@ -6600,7 +6703,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           if (budget) requestManualProbe(currentScope, leaseId, budget.epoch, budget.observedAt, nowMs);
         }
         armWake("data", decision.retryAt ?? decision.notBefore ?? nowMs + runtime.refreshMs, dataWake);
-        armWake("control", nowMs + 1, controlWake);
+        armFromState(nowMs);
         return Promise.resolve();
       }
       const started = startReservation(currentScope, decision.reservationId, nowMs);
@@ -6613,10 +6716,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         return Promise.resolve();
       }
       setWaiting((current) => current[key] ? { ...current, [key]: false } : current);
-      if (force) {
-        coordinator.invalidate();
-        for (const backoffKey of forcedBackoffKeys(key)) clearBackoff(backoffKey);
-      }
+      if (force) coordinator.invalidate();
       return commit(
         key,
         () => descriptor.fetch({ signal, runLimit: runLimitRef.current }),
@@ -6629,13 +6729,15 @@ function App({ onCreateRemote = () => {} } = {}) {
       );
     }
     fetchTabRef.current = (key, { force = false, kind = force ? "manual" : "active" } = {}) => {
-      const currentScope = ensureScope(Date.now());
+      const requestedAt = Date.now();
+      if (kind === "tab-switch") activePollAt = requestedAt + runtime.refreshMs;
+      const currentScope = ensureScope(requestedAt);
       if (currentScope) {
-        heartbeatLease(currentScope, leaseId, tabRequestCost(key), Date.now(), key);
+        heartbeatLease(currentScope, leaseId, tabRequestCost(key), requestedAt, key);
         if (kind === "tab-switch") {
           for (const [pendingKey, item] of [...pending]) {
             if (pendingKey !== key && ["active", "tab-switch"].includes(item.kind)) {
-              cancelIntent(currentScope, item.intentId, Date.now());
+              cancelIntent(currentScope, item.intentId, requestedAt);
               pending.delete(pendingKey);
             }
           }
@@ -6670,10 +6772,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           continue;
         }
         setWaiting((current) => current[key] ? { ...current, [key]: false } : current);
-        if (item.force) {
-          coordinator.invalidate();
-          for (const backoffKey of forcedBackoffKeys(key)) clearBackoff(backoffKey);
-        }
+        if (item.force) coordinator.invalidate();
         const descriptor = tabForKey(key);
         void commit(
           key,
@@ -6694,21 +6793,40 @@ function App({ onCreateRemote = () => {} } = {}) {
       await resumePending(nowMs);
       const currentScope = ensureScope(nowMs);
       const snapshot = currentScope ? inspectGovernor(currentScope, nowMs) : null;
+      if (!snapshot?.ok) {
+        armFromState(nowMs);
+        return;
+      }
+      const wakes = governorWakeTimes(snapshot.value, nowMs, runtime.refreshMs, leaseId);
       const heldResources = Object.fromEntries(RATE_RESOURCES.map((resource) => {
-        const budget = snapshot?.value?.budgets?.[resource];
-        return [resource, !budget || budget.blockUntil > nowMs ||
-          availableForGrant({ budget, nowMs }).mode !== "open"];
+        const budget = snapshot.value.budgets[resource];
+        const decision = budget ? availableForGrant({ budget, nowMs }) : { mode: "paused" };
+        const held = !budget || budget.blockUntil > nowMs || decision.mode !== "open";
+        const retryAt = budget?.blockUntil > nowMs
+          ? budget.blockUntil
+          : decision.retryAt ?? wakes.controlAt;
+        return [resource, { held, retryAt }];
       }));
       const active = TABS[activeIndexRef.current].key;
-      const planned = pollSchedule({ ticks, activeKey: active, heldResources });
-      ticks = planned.nextTicks;
+      const planned = pollSchedule({
+        nowMs,
+        floorMs: runtime.refreshMs,
+        activeKey: active,
+        activeAt: activePollAt,
+        backgroundAt: backgroundPollAt,
+        backgroundIndex,
+        heldResources,
+      });
+      activePollAt = planned.activeAt;
+      backgroundPollAt = planned.backgroundAt;
+      backgroundIndex = planned.backgroundIndex;
       await Promise.allSettled(planned.due.map((key, index) =>
         requestTab(key, index === 0 ? "active" : "background")));
       if (!cancelled) {
         setNow((prev) =>
           hasInProgressRef.current || Date.now() - prev.getTime() >= 60_000 ? new Date() : prev,
         );
-        armWake("data", Date.now() + runtime.refreshMs, dataWake);
+        armFromState(Date.now());
       }
     }
 
@@ -6716,8 +6834,27 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (cancelled) return;
       const nowMs = Date.now();
       const currentScope = ensureScope(nowMs);
-      if (currentScope) await refreshSharedBudget(currentScope, leaseId, controller.signal);
-      if (!cancelled) armFromState(Date.now());
+      const refreshed = currentScope
+        ? await refreshSharedBudget(currentScope, leaseId, controller.signal)
+        : { ok: false, reason: "stale" };
+      if (cancelled) return;
+      const checkedAt = Date.now();
+      const snapshot = currentScope ? inspectGovernor(currentScope, checkedAt) : refreshed;
+      if (!liveScheduling && governorDataReady(
+        refreshed,
+        snapshot,
+        TABS[activeIndexRef.current].key,
+        checkedAt,
+      )) {
+        liveScheduling = true;
+        activePollAt = checkedAt + 1;
+        backgroundPollAt = checkedAt + 4 * runtime.refreshMs;
+        armWake("heartbeat", checkedAt + GOVERNOR_HEARTBEAT_MS, heartbeatWake);
+      }
+      if (!refreshed.ok) {
+        armWake("control", governorControlRetryAt(checkedAt, runtime.refreshMs), controlWake);
+      }
+      armFromState(checkedAt);
     }
 
     function heartbeatWake() {
@@ -6735,24 +6872,36 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (cancelled) return;
       const currentScope = ensureScope(Date.now());
       if (!currentScope) {
-        armWake("control", Date.now() + runtime.refreshMs, controlWake);
+        armWake("control", governorControlRetryAt(Date.now(), runtime.refreshMs), controlWake);
         return;
       }
-      await refreshSharedBudget(currentScope, leaseId, controller.signal);
+      const refreshed = await refreshSharedBudget(currentScope, leaseId, controller.signal);
       if (cancelled) return;
-      armWake("heartbeat", Date.now() + GOVERNOR_HEARTBEAT_MS, heartbeatWake);
-      armFromState(Date.now());
-      armWake("data", Date.now() + 1, dataWake);
+      const checkedAt = Date.now();
+      const snapshot = inspectGovernor(currentScope, checkedAt);
+      if (governorDataReady(
+        refreshed,
+        snapshot,
+        TABS[activeIndexRef.current].key,
+        checkedAt,
+      )) {
+        liveScheduling = true;
+        activePollAt = checkedAt + 1;
+        backgroundPollAt = checkedAt + 4 * runtime.refreshMs;
+        armWake("heartbeat", checkedAt + GOVERNOR_HEARTBEAT_MS, heartbeatWake);
+      }
+      if (!refreshed.ok) {
+        armWake("control", governorControlRetryAt(checkedAt, runtime.refreshMs), controlWake);
+      }
+      armFromState(checkedAt);
     }
 
     void bootstrap();
     return () => {
       cancelled = true;
-      clearWake("data");
-      clearWake("control");
-      clearWake("heartbeat");
+      wakeScheduler.clearAll();
       for (const item of pending.values()) cancelIntent(cleanupScope, item.intentId, Date.now());
-      if (cleanupScope) releaseLease(cleanupScope, leaseId);
+      if (cleanupScope && registeredScopeHash) releaseLease(cleanupScope, leaseId);
       if (governorRef.current?.leaseId === leaseId) governorRef.current = null;
       if (contextCoordinatorRef.current === coordinator) contextCoordinatorRef.current = null;
       // `cancelled` stops state updates from a promise that already resolved;
@@ -7528,10 +7677,12 @@ export {
   parseRepoContext,
   parseAuthContext,
   buildFailureContext,
+  resolveFailureContext,
   failureTargetHost,
   unavailableRemedy,
   createFailureContextCoordinator,
   createOpenRequestRegistry,
+  openInBrowser,
   AUTH_RETRY_MS,
   BACKOFF_STEPS_MS,
   redact,
@@ -7575,10 +7726,15 @@ export {
   shouldShowFetchLoading,
   pollSchedule,
   governorWakeTimes,
+  governorDataReady,
+  governorControlRetryAt,
+  createWakeScheduler,
   admitGovernorOperation,
   runAdmittedOperation,
   pollResultTransition,
   forcedBackoffKeys,
+  clearForcedBackoffAfterStart,
+  doctorProbePlan,
   alertRequestArgs,
   shouldFetchAlertPriorityLanes,
   mergeAlertRows,

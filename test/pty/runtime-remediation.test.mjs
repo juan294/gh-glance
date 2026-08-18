@@ -98,15 +98,21 @@ const stalledElapsedMs = Date.now() - stalledStartedAt;
 
 const insertedAbove = withCounterCapture("gh-glance-run-sequence-", 0, (counter) => {
   const waitForFirstList =
-    `while [ "$(sed -n '1p' '${counter}')" -lt 1 ]; do sleep .1; done; sleep 2; `;
+    "tries=0; while ! grep -q 'docs: update the readme' \"$GH_GLANCE_CAPTURE_OUT\" " +
+    "2>/dev/null && [ $tries -lt 200 ]; do tries=$((tries + 1)); sleep .1; done; ";
+  const waitForExpandedList =
+    "tries=0; while ! grep -q 'new run one' \"$GH_GLANCE_CAPTURE_OUT\" " +
+    "2>/dev/null && [ $tries -lt 200 ]; do tries=$((tries + 1)); sleep .1; done; ";
   return capture({
     cols: 80,
     rows: 12,
     signal: "none",
-    settle: 20,
+    settle: 30,
+    args: "--refresh 40",
     stdin:
       waitForFirstList + "printf 'j'; sleep .2; printf 'j'; sleep .2; printf 'j'; " +
-      "sleep .2; printf 'j'; sleep 6; printf '\\r'; sleep 1; printf 'q'; sleep 2",
+      "sleep .2; printf 'j'; sleep 1; printf 'r'; " + waitForExpandedList +
+      "printf '\\r'; sleep 1; printf 'q'; sleep 2",
     env: { GH_GLANCE_FIXTURE_RUN_SEQUENCE_FILE: counter },
   });
 });

@@ -35,7 +35,7 @@ const hostQualified = capture({
 });
 
 const listCalls = (result) => result.fixtureCalls.filter((call) => /^(run|issue|pr) /.test(call));
-// The alert endpoints only. `api rate_limit` is the adaptive throttle's budget
+// The alert endpoints only. `api rate_limit` is the shared governor's budget
 // probe: it is host-routed like these are, but it addresses no repository, so it
 // fails the request-path assertions below. It gets its own test instead.
 const apiCalls = (result) =>
@@ -86,7 +86,7 @@ test("a host-qualified --repo routes BOTH halves to the host", () => {
 });
 
 test("the budget probe is routed to the host too", () => {
-  // A rate limit is per token *per server*. Unrouted, the adaptive throttle
+  // A rate limit is per token *per server*. Unrouted, the shared governor
   // reads github.com's budget while the pane spends against the tenant, and then
   // throttles -- or fails to -- against a number from an unrelated limit.
   // `--repo host/owner/name` is the case that needs the flag: it sets the host

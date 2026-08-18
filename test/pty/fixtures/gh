@@ -155,8 +155,8 @@ case "$1" in
     ;;
   api)
     # Budget probe, matched before the alert paths below. Remaining is injectable
-    # so a capture can drive the adaptive throttle; the default is a healthy
-    # budget, i.e. no adaptation and no badge.
+    # so a capture can drive the shared governor; the default is a healthy
+    # budget with no admission hold.
     : "${GH_GLANCE_FIXTURE_RATE_REMAINING:=5000}"
     case "${2:-}" in
       rate_limit)

@@ -33,7 +33,13 @@ import {
   cancelIntent,
   completeReservation,
   createGovernorScope,
+  createOpenRequestRegistry,
+  createWakeScheduler,
+  doctorProbePlan,
   emptyGovernorState,
+  failProbeClaim,
+  governorDataReady,
+  governorControlRetryAt,
   governorHealth,
   governorWakeTimes,
   governorPhaseOffset,
@@ -42,6 +48,8 @@ import {
   heartbeatLease,
   inspectGovernor,
   admitGovernorOperation,
+  openInBrowser,
+  operationCost,
   publishProbe,
   readIntentDecision,
   recordResourceBlock,
@@ -53,6 +61,7 @@ import {
   renewProbeClaim,
   requestManualProbe,
   runAdmittedOperation,
+  resolveFailureContext,
   resolveEffectiveHost,
   startReservation,
   withGovernorLock,
@@ -389,6 +398,159 @@ test("an unsafe admitted operation performs zero calls and independent wakes rem
   const wakes = governorWakeTimes(state, now, 5000);
   assert.ok(wakes.controlAt > now);
   assert.ok(wakes.dataAt > now);
+});
+
+test("failed probes wait for their persisted retry instead of spinning on an old sample", (t) => {
+  const box = sandbox(t, { authIdentity: "failed-probe-wake" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId, NOW, {
+    expiresAt: NOW + BUDGET_PROBE_MS + GOVERNOR_LEASE_TTL_MS,
+  }));
+  publishInitial(box.scope, leaseId);
+  const failedAt = NOW + BUDGET_PROBE_MS + 1;
+  box.setNow(failedAt);
+  const claim = claimNow(box.scope, leaseId, failedAt);
+  assert.equal(failProbeClaim(box.scope, leaseId, claim.value.nonce, failedAt).ok, true);
+  const state = inspectGovernor(box.scope, failedAt).value;
+  const expected = failedAt + BUDGET_PROBE_MS;
+  assert.equal(state.probeOutcome.nextAt, expected);
+  const callerWakes = Array.from({ length: 12 }, () =>
+    governorWakeTimes(state, failedAt + 10_000, 5000).controlAt);
+  assert.deepEqual([...new Set(callerWakes)], [expected]);
+  assert.equal(governorWakeTimes(state, failedAt, 5000).controlAt, expected);
+});
+
+test("data wakes follow the current lease reservation instead of another pane", () => {
+  const state = {
+    budgets: {},
+    reservations: {
+      "reservation:first": {
+        leaseId: "lease-a",
+        status: "scheduled",
+        notBefore: NOW + 100,
+      },
+      "reservation:second": {
+        leaseId: "lease-b",
+        status: "scheduled",
+        notBefore: NOW + 300,
+      },
+    },
+  };
+  assert.equal(governorWakeTimes(state, NOW, 5000).dataAt, NOW + 100);
+  assert.equal(governorWakeTimes(state, NOW, 5000, "lease-b").dataAt, NOW + 300);
+  assert.equal(governorWakeTimes(state, NOW, 5000, "lease-c").dataAt, Number.POSITIVE_INFINITY);
+});
+
+test("bootstrap readiness requires a successful publication and a safe active resource", (t) => {
+  const box = sandbox(t, { authIdentity: "bootstrap-readiness" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const snapshot = inspectGovernor(box.scope, NOW);
+  assert.equal(governorDataReady({ ok: true, value: {} }, snapshot, "actions", NOW), true);
+  assert.equal(
+    governorDataReady({ ok: true, value: { status: "waiting" } }, snapshot, "actions", NOW),
+    false,
+  );
+  assert.equal(governorDataReady({ ok: false, reason: "stale" }, snapshot, "actions", NOW), false);
+  recordResourceBlock(box.scope, "core", NOW + 30_000, "rate-limit");
+  const blocked = inspectGovernor(box.scope, NOW);
+  assert.equal(governorDataReady({ ok: true, value: {} }, blocked, "actions", NOW), false);
+  assert.equal(governorDataReady({ ok: true, value: {} }, blocked, "issues", NOW), true);
+  assert.equal(governorControlRetryAt(NOW, 40_000), NOW + 1000);
+  assert.equal(governorControlRetryAt(NOW, 500), NOW + 500);
+});
+
+test("abort and signal outcomes retain each operation's worst-case reservation", async (t) => {
+  for (const [name, error] of [
+    ["abort", Object.assign(new Error("aborted"), { name: "AbortError" })],
+    ["signal", Object.assign(new Error("terminated"), { signal: "SIGTERM" })],
+  ]) {
+    const at = Date.now();
+    const box = sandbox(t, { authIdentity: `worst-case-${name}`, now: at });
+    const leaseId = randomUUID();
+    registerLease(box.scope, lease(leaseId, at));
+    publishInitial(box.scope, leaseId, at, budgets(at, { remaining: 1010 }));
+    const result = await runAdmittedOperation({
+      scope: box.scope,
+      leaseId,
+      operation: "doctor:security-endpoint",
+      run: async () => { throw error; },
+    });
+    assert.equal(result.ok, false);
+    const reservation = inspectGovernor(box.scope, Date.now()).value.reservations[result.reservationId];
+    assert.equal(reservation.outcome, name);
+    assert.deepEqual(reservation.actualCosts, operationCost("doctor:security-endpoint"));
+  }
+});
+
+test("every doctor endpoint reserves its declared exact cost", (t) => {
+  const box = sandbox(t, { authIdentity: "doctor-costs" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  for (const [name, , operation] of doctorProbePlan()) {
+    const admitted = admitGovernorOperation(box.scope, leaseId, operation, "diagnostic", NOW);
+    assert.equal(admitted.value.status, "started", name);
+    const reservation = inspectGovernor(box.scope, NOW).value.reservations[admitted.value.reservationId];
+    assert.deepEqual(reservation.costs, operationCost(operation), name);
+    completeReservation(box.scope, admitted.value.reservationId, { outcome: "rejected" }, NOW);
+  }
+});
+
+test("unsafe failure context and open requests run no quota call and suppress repeats", async (t) => {
+  const box = sandbox(t, { authIdentity: "unsafe-auxiliary" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId, NOW, budgets(NOW, { remaining: 1000 }));
+  let repoCalls = 0;
+  let authCalls = 0;
+  const runner = async (args) => {
+    if (args[0] === "auth") {
+      authCalls += 1;
+      return '{"hosts":{}}';
+    }
+    repoCalls += 1;
+    return "{}";
+  };
+  const governor = { scope: box.scope, leaseId };
+  const context = await resolveFailureContext(undefined, governor, { run: runner });
+  assert.equal(context.repo.ok, false);
+  assert.equal(authCalls, 1);
+  assert.equal(repoCalls, 0);
+
+  const registry = createOpenRequestRegistry();
+  const first = registry.start("actions:7", ({ signal }) =>
+    openInBrowser("actions", { databaseId: 7 }, signal, governor, { run: runner }));
+  assert.equal(registry.start("actions:7", async () => {}), null);
+  await assert.rejects(first, /API budget paused/);
+  assert.equal(repoCalls, 0);
+  assert.equal(registry.size(), 0);
+});
+
+test("independent wake schedulers clear every pending callback", () => {
+  let now = 100;
+  let nextId = 0;
+  const pending = new Map();
+  const cleared = [];
+  const scheduler = createWakeScheduler({
+    now: () => now,
+    set: (run, delay) => {
+      const id = ++nextId;
+      pending.set(id, { run, delay });
+      return id;
+    },
+    clear: (id) => { cleared.push(id); pending.delete(id); },
+  });
+  scheduler.arm("control", 200, () => {});
+  scheduler.arm("data", 300, () => {});
+  scheduler.arm("heartbeat", 400, () => {});
+  assert.deepEqual([...pending.values()].map(({ delay }) => delay), [100, 200, 300]);
+  assert.equal(scheduler.size(), 3);
+  scheduler.clearAll();
+  assert.equal(scheduler.size(), 0);
+  assert.deepEqual(cleared, [1, 2, 3]);
+  now = 500;
 });
 
 test("a lease migrates into a new auth scope without sharing old state", (t) => {

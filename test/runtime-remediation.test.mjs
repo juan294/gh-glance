@@ -8,6 +8,7 @@ import {
   adoptPersistedSnapshot,
   alertRequestArgs,
   authCacheIdentity,
+  clearForcedBackoffAfterStart,
   createOpenRequestRegistry,
   forcedBackoffKeys,
   formatTabErrorForWidth,
@@ -235,16 +236,56 @@ test("the poll controller keeps unchanged, blind, and changed transitions separa
   assert.equal(blind.kind, "blind");
   assert.equal(blind.nextRaw, null);
 
-  assert.deepEqual(pollSchedule({ ticks: 0, activeKey: "issues" }).due, ["issues"]);
-  assert.deepEqual(pollSchedule({ ticks: 1, activeKey: "issues" }).due, ["issues"]);
+  let schedule = pollSchedule({
+    nowMs: 0,
+    floorMs: 5,
+    activeKey: "issues",
+    activeAt: 0,
+    backgroundAt: 20,
+  });
+  assert.deepEqual(schedule.due, ["issues"]);
+  const rotations = [];
+  for (const nowMs of [20, 40, 60]) {
+    schedule = pollSchedule({
+      nowMs,
+      floorMs: 5,
+      activeKey: "issues",
+      activeAt: nowMs,
+      backgroundAt: nowMs,
+      backgroundIndex: schedule.backgroundIndex,
+    });
+    rotations.push(schedule.due);
+  }
+  assert.deepEqual(rotations, [
+    ["issues", "actions"],
+    ["issues", "prs"],
+    ["issues", "security"],
+  ]);
   assert.deepEqual(
-    [4, 8, 12].map((ticks) => pollSchedule({ ticks, activeKey: "issues" }).due),
-    [["issues", "actions"], ["issues", "prs"], ["issues", "security"]],
+    pollSchedule({
+      nowMs: 20,
+      floorMs: 5,
+      activeKey: "issues",
+      activeAt: 20,
+      backgroundAt: 20,
+      heldResources: { core: { held: true, retryAt: 100 } },
+    }).due,
+    ["issues", "prs"],
   );
-  assert.deepEqual(
-    pollSchedule({ ticks: 4, activeKey: "issues", heldResources: { core: true } }).due,
-    ["issues"],
+});
+
+test("manual delay preserves backoff until the reservation actually starts", () => {
+  const cleared = [];
+  assert.equal(
+    clearForcedBackoffAfterStart("security", true, "scheduled", (key) => cleared.push(key)),
+    false,
   );
+  assert.deepEqual(cleared, []);
+  assert.equal(
+    clearForcedBackoffAfterStart("security", true, "started", (key) => cleared.push(key)),
+    true,
+  );
+  assert.deepEqual(cleared, forcedBackoffKeys("security"));
 });
 
 test("open request ownership preserves per-item guards and aborts every child on quit", async () => {

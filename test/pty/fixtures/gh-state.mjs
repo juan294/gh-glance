@@ -1,5 +1,13 @@
 #!/usr/bin/env node
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  linkSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 
 const statePath = process.env.GH_GLANCE_FIXTURE_STATE;
@@ -7,17 +15,94 @@ const args = process.argv.slice(2);
 const fixtures = dirname(new URL(import.meta.url).pathname);
 const waitCell = new Int32Array(new SharedArrayBuffer(4));
 
-function withLock(run) {
+function writeExclusive(path, contents) {
+  const candidate = `${path}.candidate-${process.pid}-${randomUUID()}`;
+  try {
+    writeFileSync(candidate, contents, { mode: 0o600 });
+    linkSync(candidate, path);
+  } finally {
+    rmSync(candidate, { force: true });
+  }
+}
+
+function ownerIsAlive(owner) {
+  if (!Number.isSafeInteger(owner?.pid) || owner.pid <= 0) return true;
+  try {
+    process.kill(owner.pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function removeOwned(path, nonce) {
+  try {
+    if (JSON.parse(readFileSync(path, "utf8")).nonce === nonce) rmSync(path);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+function acquireLock() {
   const lock = `${statePath}.lock`;
+  const recovery = `${lock}.recovery`;
   for (;;) {
+    if (existsSync(recovery)) {
+      Atomics.wait(waitCell, 0, 0, 5);
+      continue;
+    }
+    const owner = { pid: process.pid, nonce: randomUUID() };
+    const serialized = `${JSON.stringify(owner)}\n`;
     try {
-      mkdirSync(lock, { mode: 0o700 });
-      break;
+      writeExclusive(lock, serialized);
+      if (existsSync(recovery)) {
+        removeOwned(lock, owner.nonce);
+        Atomics.wait(waitCell, 0, 0, 5);
+        continue;
+      }
+      return { lock, owner };
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+
+    let observed;
+    let parsed;
+    try {
+      observed = readFileSync(lock, "utf8");
+      parsed = JSON.parse(observed);
+    } catch (error) {
+      if (error?.code !== "ENOENT") Atomics.wait(waitCell, 0, 0, 5);
+      continue;
+    }
+    if (ownerIsAlive(parsed)) {
+      Atomics.wait(waitCell, 0, 0, 5);
+      continue;
+    }
+
+    const recoveryOwner = { pid: process.pid, nonce: randomUUID() };
+    try {
+      writeExclusive(recovery, `${JSON.stringify(recoveryOwner)}\n`);
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
       Atomics.wait(waitCell, 0, 0, 5);
+      continue;
+    }
+    try {
+      if (readFileSync(lock, "utf8") === observed) {
+        const quarantine = `${lock}.quarantine-${recoveryOwner.nonce}`;
+        renameSync(lock, quarantine);
+        rmSync(quarantine, { force: true });
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    } finally {
+      removeOwned(recovery, recoveryOwner.nonce);
     }
   }
+}
+
+function withLock(run) {
+  const acquired = acquireLock();
   try {
     const state = JSON.parse(readFileSync(statePath, "utf8"));
     const value = run(state);
@@ -26,7 +111,7 @@ function withLock(run) {
     renameSync(temporary, statePath);
     return value;
   } finally {
-    rmSync(lock, { recursive: true, force: true });
+    removeOwned(acquired.lock, acquired.owner.nonce);
   }
 }
 

@@ -99,7 +99,7 @@ if script --version 2>/dev/null | grep -q util-linux; then
   # GNU: command is one shell string via -c, outfile is the last positional,
   # and -e is REQUIRED for exit propagation.
   if [ -n "$STDIN_SCRIPT" ]; then
-    printf '%s' "$STDIN_SCRIPT" | sh | script -q -e -c "$INNER" "$OUT" >/dev/null 2>&1 &
+    printf '%s' "$STDIN_SCRIPT" | GH_GLANCE_CAPTURE_OUT="$OUT" sh | script -q -e -c "$INNER" "$OUT" >/dev/null 2>&1 &
   else
     script -q -e -c "$INNER" "$OUT" </dev/null >/dev/null 2>&1 &
   fi
@@ -110,7 +110,7 @@ else
   # file with rc=1 -- indistinguishable from "the app never rendered" unless the
   # caller checks, which is why capture.mjs treats an empty file as an error.
   if [ -n "$STDIN_SCRIPT" ]; then
-    printf '%s' "$STDIN_SCRIPT" | sh | script -q "$OUT" /bin/sh -c "$INNER" >/dev/null 2>&1 &
+    printf '%s' "$STDIN_SCRIPT" | GH_GLANCE_CAPTURE_OUT="$OUT" sh | script -q "$OUT" /bin/sh -c "$INNER" >/dev/null 2>&1 &
   else
     script -q "$OUT" /bin/sh -c "$INNER" </dev/null >/dev/null 2>&1 &
   fi

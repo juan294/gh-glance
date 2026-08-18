@@ -2090,7 +2090,7 @@ test("the per-fetch cost tables cover every tab and nothing else", () => {
 
 test("an actions fetch costs two REST calls", () => {
   // Measured 2026-08-10: gh run list issues /actions/runs and
-  // /actions/workflows. Pinned because the adaptive throttle budgets against it.
+  // /actions/workflows. Pinned because the shared governor reserves this cost.
   assert.equal(REST_PER_FETCH.actions, 2);
 });
 
