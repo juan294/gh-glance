@@ -90,9 +90,9 @@ import {
   BACKGROUND_EVERY,
   adaptiveRefreshMs,
   adaptiveChangeWorthApplying,
-  sampleIsUsable,
-  inferShare,
-  nextProbeWindow,
+  externalSampleIsUsable,
+  inferExternalFactor,
+  nextExternalSampleWindow,
   restPerTick,
   MAX_ADAPTIVE_REFRESH_MS,
   BUDGET_SAFETY,
@@ -2257,7 +2257,23 @@ test("every production runGh call site declares a registry operation", () => {
   for (const { index } of calls) {
     const declaration = lines.slice(index, index + 5).join("\n");
     assert.match(declaration, /operation(?::|\s*})/);
+    const literal = /operation:\s*"([^"]+)"/.exec(declaration)?.[1];
+    if (literal) assert.notEqual(operationCost(literal), null, literal);
+    if (declaration.includes("`open:${tabKey}`")) {
+      for (const tab of ["actions", "issues", "prs"]) {
+        assert.notEqual(operationCost(`open:${tab}`), null, `open:${tab}`);
+      }
+    }
   }
+  for (const delegated of [
+    "version",
+    "auth-status",
+    "doctor:repository",
+    "doctor:actions",
+    "doctor:issues",
+    "doctor:prs",
+    "doctor:security-endpoint",
+  ]) assert.notEqual(operationCost(delegated), null, delegated);
   assert.ok(Object.isFrozen(OPERATION_COSTS));
 });
 
@@ -2312,6 +2328,73 @@ test("equal-priority leases rotate fairly and deterministically", () => {
   assert.equal(result.cursors.core, "a");
 });
 
+test("active intents consume constrained capacity before background intents", () => {
+  const leases = {
+    active: { expiresAt: POLICY_NOW + 10_000 },
+    background: { expiresAt: POLICY_NOW + 10_000 },
+  };
+  const result = scheduleIntents({
+    intents: [
+      { id: "background", leaseId: "background", priority: "background", costs: { core: 2, graphql: 0 }, expiresAt: POLICY_NOW + 1000 },
+      { id: "active", leaseId: "active", priority: "active", costs: { core: 2, graphql: 0 }, expiresAt: POLICY_NOW + 1000 },
+    ],
+    leases,
+    budgets: { core: policyBudget({ remaining: 1002 }) },
+    nowMs: POLICY_NOW,
+  });
+  assert.deepEqual(result.grants.map(({ intentId }) => intentId), ["active"]);
+  assert.equal(result.denied[0].intentId, "background");
+});
+
+test("mixed-resource queues honor each resource cursor", () => {
+  const leases = Object.fromEntries(["a", "b", "c"].map((id) => [
+    id,
+    { expiresAt: POLICY_NOW + 10_000 },
+  ]));
+  const result = scheduleIntents({
+    intents: [
+      { id: "1-core", leaseId: "b", priority: "active", costs: { core: 1, graphql: 0 }, expiresAt: POLICY_NOW + 1000 },
+      { id: "2-graphql", leaseId: "a", priority: "active", costs: { core: 0, graphql: 1 }, expiresAt: POLICY_NOW + 1000 },
+      { id: "3-both", leaseId: "c", priority: "active", costs: { core: 1, graphql: 1 }, expiresAt: POLICY_NOW + 1000 },
+    ],
+    leases,
+    budgets: { core: policyBudget(), graphql: policyBudget() },
+    cursors: { core: "a", graphql: "c" },
+    nowMs: POLICY_NOW,
+  });
+  assert.deepEqual(result.grants.map(({ intentId }) => intentId), [
+    "1-core",
+    "2-graphql",
+    "3-both",
+  ]);
+  assert.deepEqual(result.cursors, { core: "c", graphql: "c" });
+});
+
+test("invalid expiry and unknown priority prune unstarted intents", () => {
+  const leases = {
+    good: { expiresAt: POLICY_NOW + 10_000 },
+    invalid: { expiresAt: Number.NaN },
+  };
+  const result = scheduleIntents({
+    intents: [
+      { id: "missing-expiry", leaseId: "good", priority: "active", costs: { core: 1, graphql: 0 } },
+      { id: "invalid-expiry", leaseId: "good", priority: "active", costs: { core: 1, graphql: 0 }, expiresAt: Number.NaN },
+      { id: "unknown-priority", leaseId: "good", priority: "urgent", costs: { core: 1, graphql: 0 }, expiresAt: POLICY_NOW + 1000 },
+      { id: "invalid-lease", leaseId: "invalid", priority: "active", costs: { core: 1, graphql: 0 }, expiresAt: POLICY_NOW + 1000 },
+    ],
+    leases,
+    budgets: { core: policyBudget() },
+    nowMs: POLICY_NOW,
+  });
+  assert.deepEqual(result.prunedIntentIds, [
+    "missing-expiry",
+    "invalid-expiry",
+    "unknown-priority",
+    "invalid-lease",
+  ]);
+  assert.equal(result.grants.length, 0);
+});
+
 test("started reservations stay charged while dead leases release unstarted work", () => {
   const deadLeases = { dead: { expiresAt: POLICY_NOW - 1 } };
   const base = {
@@ -2337,6 +2420,28 @@ test("budget reset changes the epoch and deterministic lease phase", () => {
   assert.notEqual(budgetEpoch(first), budgetEpoch(second));
   assert.equal(governorPhaseOffset("lease-a", budgetEpoch(first)), governorPhaseOffset("lease-a", budgetEpoch(first)));
   assert.notEqual(governorPhaseOffset("lease-a", budgetEpoch(first)), governorPhaseOffset("lease-a", budgetEpoch(second)));
+
+  const intent = {
+    id: "phase",
+    leaseId: "lease-a",
+    priority: "active",
+    costs: { core: 1, graphql: 1 },
+    expiresAt: POLICY_NOW + 10_000,
+  };
+  const scheduled = scheduleIntents({
+    intents: [intent],
+    leases: { "lease-a": { expiresAt: POLICY_NOW + 10_000 } },
+    budgets: { core: first, graphql: second },
+    nowMs: POLICY_NOW,
+  });
+  assert.equal(scheduled.grants[0].notBefore, POLICY_NOW + Math.max(
+    governorPhaseOffset("lease-a", budgetEpoch(first)),
+    governorPhaseOffset("lease-a", budgetEpoch(second)),
+  ));
+  assert.deepEqual(scheduled.leases["lease-a"].phaseEpochs, {
+    core: budgetEpoch(first),
+    graphql: budgetEpoch(second),
+  });
 });
 
 test("pacing becomes no earlier as pressure increases", () => {
@@ -2396,6 +2501,35 @@ test("fresh-window lane scheduling stays inside the spendable budget", () => {
   }
 });
 
+test("a fresh multi-resource lane spans the complete 4,000-call window", () => {
+  const intent = {
+    id: "full-window",
+    leaseId: "lease",
+    priority: "active",
+    costs: { core: 4000, graphql: 4000 },
+    expiresAt: POLICY_NOW + 10_000,
+  };
+  const result = scheduleIntents({
+    intents: [intent],
+    leases: { lease: { expiresAt: POLICY_NOW + 10_000 } },
+    budgets: { core: policyBudget(), graphql: policyBudget() },
+    nowMs: POLICY_NOW,
+  });
+  assert.equal(result.grants.length, 1);
+  assertClose(result.lanes.core.nextAt, policyBudget().resetMs, 1e-6);
+  assertClose(result.lanes.graphql.nextAt, policyBudget().resetMs, 1e-6);
+
+  for (const resource of ["core", "graphql"]) {
+    const capacity = availableForGrant({
+      budget: { ...policyBudget(), resource },
+      reservations: result.grants,
+      leases: result.leases,
+      nowMs: POLICY_NOW,
+    });
+    assert.equal(capacity.spendable, 0);
+  }
+});
+
 test("a lane at reset waits without reserving the old epoch", () => {
   const resetMs = POLICY_NOW + 1000;
   const result = scheduleIntents({
@@ -2418,11 +2552,12 @@ test("deterministic closed-loop governor simulation preserves both reserves", ()
     graphql: policyBudget({ resetMs }),
   };
   let lanes = {};
-  const leases = {};
+  let leases = {};
   const received = new Set();
   const mixes = ["actions", "issues", "prs", "security"];
+  let crossedReset = false;
 
-  for (let step = 0; step < 60; step += 1) {
+  for (let step = 0; step < 75; step += 1) {
     if (step === 0) leases["lease-0"] = { expiresAt: nowMs + GOVERNOR_LEASE_TTL_MS };
     if (step === 5) {
       for (let index = 1; index < 7; index += 1) leases[`lease-${index}`] = { expiresAt: nowMs + GOVERNOR_LEASE_TTL_MS };
@@ -2439,7 +2574,8 @@ test("deterministic closed-loop governor simulation preserves both reserves", ()
       budgets.graphql.remaining -= 200;
       budgets.graphql.used += 200;
     }
-    if (step === 30) {
+    if (nowMs >= resetMs) {
+      crossedReset = true;
       resetMs += 3_600_000;
       budgets = {
         core: policyBudget({ resetMs, observedAt: nowMs }),
@@ -2471,6 +2607,7 @@ test("deterministic closed-loop governor simulation preserves both reserves", ()
       lanes,
       nowMs,
     });
+    leases = result.leases;
     lanes = result.lanes;
 
     for (const resource of ["core", "graphql"]) {
@@ -2486,6 +2623,7 @@ test("deterministic closed-loop governor simulation preserves both reserves", ()
     nowMs += 60_000;
   }
 
+  assert.equal(crossedReset, true);
   for (const leaseId of Object.keys(leases)) assert.ok(received.has(leaseId), leaseId);
 });
 
@@ -2512,7 +2650,10 @@ const at = (over) => ({
   ...over,
   budget: { ...FRESH, ...over?.budget },
 });
-const sample = (mine, global) => ({ myCalls: mine, globalUsed: global });
+const sample = (sharedCompleted, globalUsedDelta) => ({
+  sharedCompletedDelta: sharedCompleted,
+  globalUsedDelta,
+});
 
 test("a single instance stays at the configured floor", () => {
   // required = 2.25 / 1.111 = 2.03s, below the 5s floor. This is the property
@@ -2539,25 +2680,27 @@ test("the aggregate of N adapted panes lands near the safety target", () => {
   for (const n of [1, 3, 7, 10, 20]) {
     const ms = adaptiveRefreshMs(at({ sample: sample(100, 100 * n) }));
     const aggregate = n * (3_600_000 / ms) * 2.5;
-    assert.ok(aggregate <= 5000 * BUDGET_SAFETY + 1, `n=${n} spent ${aggregate}`);
+    assert.ok(aggregate <= 5000 * BUDGET_SAFETY + 1, `n=${n} completed ${aggregate}`);
   }
 });
 
-test("an exhausted budget goes straight to the cap", () => {
+// Phase 3 removes this unsafe legacy adapter assertion with its runtime caller.
+test("legacy adapter: exhausted budget goes straight to the cap [remove in Phase 3]", () => {
   assert.equal(
     adaptiveRefreshMs(at({ budget: { remaining: 0 }, sample: sample(100, 700) })),
     MAX_ADAPTIVE_REFRESH_MS,
   );
 });
 
-test("widening is capped", () => {
+// Phase 3 removes the unsafe one-minute clamp after governor admission is live.
+test("legacy adapter: widening is capped [remove in Phase 3]", () => {
   assert.equal(
     adaptiveRefreshMs(at({ budget: { remaining: 10 }, sample: sample(100, 9000) })),
     MAX_ADAPTIVE_REFRESH_MS,
   );
 });
 
-test("too small a sample declines to infer a share", () => {
+test("too small a sample declines to infer an external factor", () => {
   // Floor, not a wild extrapolation: one call against a global delta of one
   // reads as "we are the only consumer" whether or not that is true. Floor
   // specifically because there is no earlier measurement to hold -- see below.
@@ -2568,44 +2711,52 @@ test("an unmeasurable window holds the widened interval, not the floor", () => {
   // The same rubric row as "seven panes", reached with a window too small to
   // re-measure. Dropping to the floor here is the flap: a pane wide enough to
   // need throttling is, by construction, too quiet to keep proving it.
-  assertClose(adaptiveRefreshMs(at({ sample: sample(2, 700), lastShare: 7 })), 15_750, 500);
+  assertClose(
+    adaptiveRefreshMs(at({ sample: sample(2, 700), lastExternalFactor: 7 })),
+    15_750,
+    500,
+  );
 });
 
-test("inferShare holds the last measurement when the window cannot be measured", () => {
-  assert.equal(inferShare(sample(100, 700)), 7);
-  assert.equal(inferShare(sample(2, 700), 7), 7);
-  assert.equal(inferShare(null, 7), 7);
+test("inferExternalFactor holds the last measurement when the window cannot be measured", () => {
+  assert.equal(inferExternalFactor(sample(100, 700)), 7);
+  assert.equal(inferExternalFactor(sample(2, 700), 7), 7);
+  assert.equal(inferExternalFactor(null, 7), 7);
   // Never below 1, from either source: fewer than one consumer is not a thing,
-  // and a share under 1 would compute an interval tighter than the floor.
-  assert.equal(inferShare(sample(100, 50)), 1);
-  assert.equal(inferShare(null, 0.2), 1);
+  // and an external factor under 1 would compute an interval tighter than the floor.
+  assert.equal(inferExternalFactor(sample(100, 50)), 1);
+  assert.equal(inferExternalFactor(null, 0.2), 1);
 });
 
 test("an unmeasurable probe window stays open instead of restarting", () => {
-  const first = nextProbeWindow(null, { used: 100 }, 0);
+  const first = nextExternalSampleWindow(null, { used: 100 }, 0);
   assert.equal(first.sample, null, "the first probe has no window to measure over");
-  assert.deepEqual(first.next, { used: 100, spent: 0 });
+  assert.deepEqual(first.next, { used: 100, sharedCompleted: 0 });
 
-  // Two of our own calls, below MIN_SAMPLE_CALLS: the baseline must not advance,
+  // Two completed shared calls, below MIN_SAMPLE_CALLS: the baseline must not advance,
   // or the next window starts equally short and the pane can never re-measure.
-  const small = nextProbeWindow(first.next, { used: 140 }, 2);
-  assert.equal(sampleIsUsable(small.sample), false);
+  const small = nextExternalSampleWindow(first.next, { used: 140 }, 2);
+  assert.equal(externalSampleIsUsable(small.sample), false);
   assert.deepEqual(small.next, first.next);
 
   // One probe later the accumulated window is measurable -- and both halves of
   // the ratio span the whole stretch, not just the last minute of it.
-  const grown = nextProbeWindow(small.next, { used: 200 }, 6);
-  assert.deepEqual(grown.sample, { globalUsed: 100, myCalls: 6 });
-  assert.deepEqual(grown.next, { used: 200, spent: 6 });
+  const grown = nextExternalSampleWindow(small.next, { used: 200 }, 6);
+  assert.deepEqual(grown.sample, { globalUsedDelta: 100, sharedCompletedDelta: 6 });
+  assert.deepEqual(grown.next, { used: 200, sharedCompleted: 6 });
 });
 
 test("a rate-limit window reset restarts the probe window", () => {
   // `used` falling means the hour rolled over. The span before the reset cannot
   // be compared against the counter after it, so this cycle infers nothing
   // rather than reporting a negative delta.
-  const { sample: s, next } = nextProbeWindow({ used: 4000, spent: 900 }, { used: 12 }, 950);
+  const { sample: s, next } = nextExternalSampleWindow(
+    { used: 4000, sharedCompleted: 900 },
+    { used: 12 },
+    950,
+  );
   assert.equal(s, null);
-  assert.deepEqual(next, { used: 12, spent: 950 });
+  assert.deepEqual(next, { used: 12, sharedCompleted: 950 });
 });
 
 test("a throttled pane does not flap back to the floor between measurable windows", () => {
@@ -2618,25 +2769,29 @@ test("a throttled pane does not flap back to the floor between measurable window
   //
   // The budget is held healthy on purpose. That is the trap: once the panes have
   // throttled, nothing about `remaining` says they must stay throttled, and the
-  // inferred share is the only thing holding them there.
+  // inferred external factor is the only thing holding them there.
   const PANES = 20;
   let applied = 5000;
-  let spent = 0;
+  let sharedCompleted = 0;
   let used = 0;
-  let probeWindow = null;
-  let share = 1;
+  let externalSampleWindow = null;
+  let externalFactor = 1;
   const settled = [];
 
   for (let probe = 0; probe < 12; probe++) {
     const mine = (60_000 / applied) * 2.5; // one probe window at the current interval
-    spent += mine;
+    sharedCompleted += mine;
     used += mine * PANES;
     const budget = { ...FRESH, used };
 
-    const step = nextProbeWindow(probeWindow, budget, spent);
-    probeWindow = step.next;
-    share = inferShare(step.sample, share);
-    const target = adaptiveRefreshMs(at({ budget, sample: step.sample, lastShare: share }));
+    const step = nextExternalSampleWindow(externalSampleWindow, budget, sharedCompleted);
+    externalSampleWindow = step.next;
+    externalFactor = inferExternalFactor(step.sample, externalFactor);
+    const target = adaptiveRefreshMs(at({
+      budget,
+      sample: step.sample,
+      lastExternalFactor: externalFactor,
+    }));
     if (adaptiveChangeWorthApplying(applied, target)) applied = target;
 
     if (probe >= 2) settled.push(applied);
@@ -2646,7 +2801,8 @@ test("a throttled pane does not flap back to the floor between measurable window
   assertClose(applied, 45_000, 2000);
 });
 
-test("a missing or unreadable budget returns the floor unchanged", () => {
+// Phase 3 removes this unsafe fail-open fallback with the legacy adapter.
+test("legacy adapter: missing budget returns the floor [remove in Phase 3]", () => {
   for (const budget of [null, undefined, { remaining: NaN }]) {
     assert.equal(adaptiveRefreshMs({ ...at(), budget, sample: sample(100, 700) }), 5000);
   }
@@ -2676,7 +2832,7 @@ test("restPerTick amortises the background tabs", () => {
 test("every tab's fetcher has a spend to report from the cost table", () => {
   // Guards the drift this design is built to prevent: the meter bills from the
   // same table the projection reads, so a tab with no entry would silently bill
-  // nothing and make the inferred share wrong. The richer attribution
+  // nothing and make the inferred external factor wrong. The richer attribution
   // assertions live in the pty layer, because the fetchers need a `gh` to run.
   for (const key of TAB_KEYS) assert.equal(typeof REST_PER_FETCH[key], "number");
 });

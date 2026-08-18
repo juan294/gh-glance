@@ -611,7 +611,10 @@ function forwardSignalToChild(child, signal) {
   return child.kill(signal);
 }
 
-async function runGh(args, { signal, operation: _operation } = {}) {
+async function runGh(args, { signal, operation } = {}) {
+  if (operationCost(operation) === null) {
+    throw new Error(`undeclared gh operation: ${operation ?? "missing"}`);
+  }
   const startedAt = Date.now();
   try {
     const { stdout } = await execFileAsync("gh", args, {
@@ -1065,10 +1068,8 @@ const GOVERNOR_PHASE_WINDOW_MS = 5_000;
 // the scale of minutes.
 const BUDGET_PROBE_MS = 60_000;
 
-// Below this many of our own REST calls in a probe window, the share inference
-// is noise -- one call against a global delta of one reads as "we are the only
-// consumer" whether or not that is true. Under the threshold the loop declines
-// to infer a new share rather than guessing.
+// Below this many completed shared calls in a probe window, external-spend
+// inference is noise. Under the threshold the loop retains the previous factor.
 const MIN_SAMPLE_CALLS = 5;
 
 // Only move the applied interval when the target differs by more than this
@@ -1236,40 +1237,57 @@ function governorPhaseOffset(leaseId, epoch) {
 }
 
 function intentPriority(intent) {
-  return Number.isInteger(intent.priority)
+  const priority = Number.isInteger(intent.priority)
     ? intent.priority
-    : (REQUEST_PRIORITIES[intent.priority] ?? Number.MAX_SAFE_INTEGER);
+    : REQUEST_PRIORITIES[intent.priority];
+  return Object.values(REQUEST_PRIORITIES).includes(priority) ? priority : null;
 }
 
 function intentCosts(intent) {
   return intent.costs ?? (intent.tab ? tabRequestCost(intent.tab) : null);
 }
 
-function roundRobinOrder(intents, cursor) {
-  const queues = new Map();
-  for (const intent of intents) {
-    const queue = queues.get(intent.leaseId) ?? [];
-    queue.push(intent);
-    queues.set(intent.leaseId, queue);
-  }
-  for (const queue of queues.values()) {
-    queue.sort((left, right) =>
-      (left.requestedAt ?? 0) - (right.requestedAt ?? 0) || String(left.id).localeCompare(String(right.id))
-    );
-  }
-  const leaseIds = [...queues.keys()].sort();
+function cursorDistance(leaseId, leaseIds, cursor) {
   const cursorIndex = leaseIds.indexOf(cursor);
-  const rotated = cursorIndex < 0
-    ? leaseIds
-    : [...leaseIds.slice(cursorIndex + 1), ...leaseIds.slice(0, cursorIndex + 1)];
-  const ordered = [];
-  while (ordered.length < intents.length) {
-    for (const leaseId of rotated) {
-      const next = queues.get(leaseId).shift();
-      if (next) ordered.push(next);
-    }
-  }
-  return ordered;
+  const start = cursorIndex < 0 ? 0 : (cursorIndex + 1) % leaseIds.length;
+  return (leaseIds.indexOf(leaseId) - start + leaseIds.length) % leaseIds.length;
+}
+
+function nextRoundRobinIntent(intents, cursors) {
+  const leasesByResource = Object.fromEntries(["core", "graphql"].map((resource) => [
+    resource,
+    [...new Set(
+      [
+        ...intents.filter((intent) => intent.costs[resource] > 0).map((intent) => intent.leaseId),
+        ...(cursors[resource] ? [cursors[resource]] : []),
+      ],
+    )].sort(),
+  ]));
+  return [...intents].sort((left, right) => {
+    const ranks = (intent) => ["core", "graphql"]
+      .filter((resource) => intent.costs[resource] > 0)
+      .map((resource) => cursorDistance(
+        intent.leaseId,
+        leasesByResource[resource],
+        cursors[resource],
+      ));
+    const leftRanks = ranks(left);
+    const rightRanks = ranks(right);
+    const leftMax = Math.max(0, ...leftRanks);
+    const rightMax = Math.max(0, ...rightRanks);
+    return (
+      leftMax - rightMax ||
+      leftRanks.reduce((total, rank) => total + rank, 0) -
+        rightRanks.reduce((total, rank) => total + rank, 0) ||
+      (left.requestedAt ?? 0) - (right.requestedAt ?? 0) ||
+      String(left.id).localeCompare(String(right.id))
+    );
+  })[0];
+}
+
+function setLease(leases, leaseId, lease) {
+  if (leases instanceof Map) leases.set(leaseId, lease);
+  else leases[leaseId] = lease;
 }
 
 function scheduleIntents({
@@ -1286,29 +1304,38 @@ function scheduleIntents({
   for (const intent of intents) {
     const lease = leaseFor(leases, intent.leaseId);
     const costs = intentCosts(intent);
+    const priority = intentPriority(intent);
     const validCosts = costs && ["core", "graphql"].every(
       (resource) => Number.isFinite(costs[resource] ?? 0) && (costs[resource] ?? 0) >= 0,
     );
-    if (!lease || lease.expiresAt <= nowMs || intent.expiresAt <= nowMs || !validCosts) {
+    if (
+      !lease ||
+      !Number.isFinite(lease.expiresAt) ||
+      lease.expiresAt <= nowMs ||
+      !Number.isFinite(intent.expiresAt) ||
+      intent.expiresAt <= nowMs ||
+      priority === null ||
+      !validCosts
+    ) {
       prunedIntentIds.push(intent.id);
     } else {
-      valid.push({ ...intent, costs });
+      valid.push({ ...intent, costs, normalizedPriority: priority });
     }
   }
 
   const workingReservations = [...reservations];
+  const updatedLeases = structuredClone(leases);
   const updatedLanes = structuredClone(lanes);
   const updatedCursors = { ...cursors };
   const grants = [];
   const denied = [];
-  const priorities = [...new Set(valid.map(intentPriority))].sort((a, b) => a - b);
+  const priorities = [...new Set(valid.map((intent) => intent.normalizedPriority))].sort((a, b) => a - b);
 
   for (const priority of priorities) {
-    const group = valid.filter((intent) => intentPriority(intent) === priority);
-    const firstResource = ["core", "graphql"].find((resource) =>
-      group.some((intent) => intent.costs[resource] > 0)
-    );
-    for (const intent of roundRobinOrder(group, updatedCursors[firstResource])) {
+    const pending = valid.filter((intent) => intent.normalizedPriority === priority);
+    while (pending.length > 0) {
+      const intent = nextRoundRobinIntent(pending, updatedCursors);
+      pending.splice(pending.indexOf(intent), 1);
       const resources = ["core", "graphql"].filter((resource) => intent.costs[resource] > 0);
       const decisions = Object.fromEntries(resources.map((resource) => [
         resource,
@@ -1316,7 +1343,7 @@ function scheduleIntents({
           budget: budgets[resource],
           resource,
           reservations: workingReservations,
-          leases,
+          leases: updatedLeases,
           nowMs,
           cost: intent.costs[resource],
         }),
@@ -1327,10 +1354,20 @@ function scheduleIntents({
         continue;
       }
 
-      const lease = leaseFor(leases, intent.leaseId);
+      const lease = leaseFor(updatedLeases, intent.leaseId);
+      const phaseTimes = Object.fromEntries(resources.map((resource) => {
+        const epoch = decisions[resource].epoch;
+        const alreadyPhased = lease.phaseEpochs?.[resource] === epoch;
+        return [
+          resource,
+          alreadyPhased && Number.isFinite(lease.phaseAt?.[resource])
+            ? lease.phaseAt[resource]
+            : nowMs + governorPhaseOffset(intent.leaseId, epoch),
+        ];
+      }));
       const notBefore = Math.max(
         nowMs,
-        Number.isFinite(lease.phaseAt) ? lease.phaseAt : nowMs,
+        ...Object.values(phaseTimes),
         ...resources.map((resource) => updatedLanes[resource]?.nextAt ?? nowMs),
       );
       const expiring = resources.find((resource) => notBefore >= decisions[resource].resetMs);
@@ -1358,30 +1395,53 @@ function scheduleIntents({
       };
       workingReservations.push(reservation);
       grants.push(reservation);
+      setLease(updatedLeases, intent.leaseId, {
+        ...lease,
+        phaseEpochs: {
+          ...lease.phaseEpochs,
+          ...Object.fromEntries(resources.map((resource) => [resource, decisions[resource].epoch])),
+        },
+        phaseAt: { ...lease.phaseAt, ...phaseTimes },
+      });
       for (const resource of resources) {
+        const callsPerMs =
+          decisions[resource].spendable /
+          (decisions[resource].resetMs - notBefore) /
+          decisions[resource].externalFactor;
         updatedLanes[resource] = {
           ...updatedLanes[resource],
-          nextAt: notBefore + intent.costs[resource] / decisions[resource].callsPerMs,
+          nextAt: notBefore + intent.costs[resource] / callsPerMs,
         };
         updatedCursors[resource] = intent.leaseId;
       }
     }
   }
 
-  return { grants, lanes: updatedLanes, cursors: updatedCursors, denied, prunedIntentIds };
+  return {
+    grants,
+    leases: updatedLeases,
+    lanes: updatedLanes,
+    cursors: updatedCursors,
+    denied,
+    prunedIntentIds,
+  };
 }
 
-// Whether a probe window holds enough of our own calls for the ratio below to
+// Whether a probe window holds enough completed shared calls for the ratio below to
 // mean anything. Named rather than inlined because the control law and the loop
 // that feeds it must agree on the answer: the law uses it to decide whether to
 // infer, and the loop uses it to decide whether the window may be closed.
-function sampleIsUsable(sample) {
-  return Boolean(sample) && sample.myCalls >= MIN_SAMPLE_CALLS && sample.globalUsed > 0;
+function externalSampleIsUsable(sample) {
+  return (
+    Boolean(sample) &&
+    sample.sharedCompletedDelta >= MIN_SAMPLE_CALLS &&
+    sample.globalUsedDelta > 0
+  );
 }
 
 // How many equivalent consumers are on this token, from one probe window.
 //
-// `lastShare` is what the previous measurable window said, and it is the answer
+// `lastExternalFactor` is what the previous measurable window said, and it is the answer
 // whenever this window is not measurable. Falling back to 1 instead would be the
 // controller starving its own input: a pane that has widened to 40s makes about
 // three REST calls per probe window, below MIN_SAMPLE_CALLS, so it would read
@@ -1389,42 +1449,46 @@ function sampleIsUsable(sample) {
 // again, and re-throttle -- a flap on a two-minute cycle at exactly the instance
 // counts the widening exists for. Holding the last measurement keeps the pane
 // where it is until a window is long enough to say otherwise.
-function inferShare(sample, lastShare = 1) {
-  return sampleIsUsable(sample)
-    ? Math.max(1, sample.globalUsed / sample.myCalls)
-    : Math.max(1, lastShare);
+function inferExternalFactor(sample, lastExternalFactor = 1) {
+  return externalSampleIsUsable(sample)
+    ? Math.max(1, sample.globalUsedDelta / sample.sharedCompletedDelta)
+    : Math.max(1, lastExternalFactor);
 }
 
 // One probe window's bookkeeping. Pure, so the flap it prevents is testable
-// without a timer: `prev` is `{ used, spent }` from the last window that could
+// without a timer: `prev` is `{ used, sharedCompleted }` from the last window that could
 // be measured, or null before the first probe.
 //
 // The baseline only advances when the window was usable, so an unmeasurable
 // window is not thrown away -- it grows until it holds MIN_SAMPLE_CALLS of our
-// own calls, with both halves of the ratio still spanning the same stretch of
+  // completed shared calls, with both halves of the ratio spanning the same stretch of
 // time. The cost is latency, not accuracy: a pane at the 60s cap needs two or
 // three probes rather than one to notice that the other panes have exited.
-function nextProbeWindow(prev, budget, spentTotal) {
+function nextExternalSampleWindow(prev, budget, sharedCompletedTotal) {
   // A window reset makes `used` fall. The span before the reset cannot be
   // compared against the counter after it, so the window restarts here and this
-  // cycle infers nothing -- the caller keeps the share it last measured, which
+  // cycle infers nothing -- the caller keeps the external factor it last measured, which
   // is the one direction that cannot spike the poll rate at the top of an hour.
   if (prev === null || budget.used < prev.used) {
-    return { sample: null, next: { used: budget.used, spent: spentTotal } };
+    return { sample: null, next: { used: budget.used, sharedCompleted: sharedCompletedTotal } };
   }
   const sample = {
-    globalUsed: budget.used - prev.used,
-    myCalls: spentTotal - prev.spent,
+    globalUsedDelta: budget.used - prev.used,
+    sharedCompletedDelta: sharedCompletedTotal - prev.sharedCompleted,
   };
-  return { sample, next: sampleIsUsable(sample) ? { used: budget.used, spent: spentTotal } : prev };
+  return {
+    sample,
+    next: externalSampleIsUsable(sample)
+      ? { used: budget.used, sharedCompleted: sharedCompletedTotal }
+      : prev,
+  };
 }
 
-// How wide the active-tab interval has to be for this instance to fit its share
+// How wide the active-tab interval has to be for this instance to fit its inferred external factor
 // of the token's remaining budget.
 //
-// The share is *inferred*, not configured: this instance knows exactly how many
-// REST calls it has spent since the last probe, and `rate_limit` reports how
-// many the token spent in total over the same window. The ratio is how many
+// The external factor is *inferred*, not configured: completed shared calls are
+// compared with how many calls the token used over the same window. The ratio is how many
 // equivalent consumers are on this token -- other panes, a `gh pr checks
 // --watch`, an agent shelling out to `gh`. That is why no IPC and no on-disk
 // registry is needed: the token's own counter is the shared channel, and it
@@ -1439,9 +1503,16 @@ function nextProbeWindow(prev, budget, spentTotal) {
 // MAX_ADAPTIVE_REFRESH_MS is wrapped in Math.max(floorMs, ...) at every exit, so
 // a user who configures a refresh wider than the cap is never silently sped up.
 //
-// `lastShare` defaults to 1, so a caller with no history behaves exactly as this
+// `lastExternalFactor` defaults to 1, so a caller with no history behaves exactly as this
 // did before it existed: one instance, no adaptation.
-function adaptiveRefreshMs({ budget, sample, restPerTick, floorMs, nowMs, lastShare = 1 }) {
+function adaptiveRefreshMs({
+  budget,
+  sample,
+  restPerTick,
+  floorMs,
+  nowMs,
+  lastExternalFactor = 1,
+}) {
   if (!budget || !Number.isFinite(budget.remaining) || restPerTick <= 0) return floorMs;
   if (budget.remaining <= 0) return Math.max(floorMs, MAX_ADAPTIVE_REFRESH_MS);
 
@@ -1449,7 +1520,7 @@ function adaptiveRefreshMs({ budget, sample, restPerTick, floorMs, nowMs, lastSh
   const affordable = (budget.remaining / secondsToReset) * BUDGET_SAFETY;
   if (affordable <= 0) return Math.max(floorMs, MAX_ADAPTIVE_REFRESH_MS);
 
-  const mine = affordable / inferShare(sample, lastShare);
+  const mine = affordable / inferExternalFactor(sample, lastExternalFactor);
   const requiredMs = (restPerTick / mine) * 1000;
   return Math.min(Math.max(floorMs, requiredMs), Math.max(floorMs, MAX_ADAPTIVE_REFRESH_MS));
 }
@@ -1476,7 +1547,15 @@ function resourcePerTick(table, activeKey) {
   return cost;
 }
 
-function nextBudgetTargets({ budgets, samples, shares, previous, activeKey, floorMs, nowMs }) {
+function nextBudgetTargets({
+  budgets,
+  samples,
+  externalFactors,
+  previous,
+  activeKey,
+  floorMs,
+  nowMs,
+}) {
   const targets = { core: floorMs, graphql: floorMs, ...previous };
   for (const [resource, table] of [
     ["core", REST_PER_FETCH],
@@ -1487,7 +1566,7 @@ function nextBudgetTargets({ budgets, samples, shares, previous, activeKey, floo
     targets[resource] = adaptiveRefreshMs({
       budget: budgets[resource],
       sample: samples?.[resource] ?? null,
-      lastShare: shares?.[resource] ?? 1,
+      lastExternalFactor: externalFactors?.[resource] ?? 1,
       floorMs,
       nowMs,
       restPerTick: callsPerTick,
@@ -1533,17 +1612,16 @@ function mergeAlertRows(groups) {
 // mid-session is picked up within the hour.
 const alertBackoff = new Map();
 
-// REST and GraphQL calls this process has spent, ever. In-memory and per-process,
-// in the same spirit as alertBackoff above: lost on exit, and nothing depends on
-// it surviving. Each counter is compared only against its matching resource
-// between two budget probes, so neither needs persistence or an extra window.
+// Completed REST and GraphQL calls supplied to the external-factor sample.
+// Phase 1 keeps the legacy in-memory producer, so these counters are lost on exit;
+// the shared governor replaces that producer when Phase 3 changes live admission.
 //
 // Deliberately incomplete: openItem, preflight and resolveFailureContext also
 // spend, and are not counted, because they are occasional rather than periodic.
-// Under-reporting our own spend makes the inferred share *larger* and so
+// Under-reporting completed calls makes the inferred external factor *larger* and so
 // throttles slightly harder than strictly necessary -- the safe direction to err
 // in, which is why the imprecision is tolerated rather than chased.
-const spentTotal = { core: 0, graphql: 0 };
+const sharedCompletedTotals = { core: 0, graphql: 0 };
 
 function backoffActive(key, now) {
   const state = alertBackoff.get(key);
@@ -1591,18 +1669,18 @@ async function fetchAlertSource(source, signal, now) {
     // the meter is fed by the fetchers rather than by counting ticks.
     return {
       raw: `backoff:${note}`,
-      spent: 0,
+      completedCalls: 0,
       parse: () => ({ alerts: [], note, verdict, truncated: false }),
     };
   }
-  let spent = 0;
+  let completedCalls = 0;
   try {
     const requests = alertRequestArgs(source);
     const payloads = [];
     const groups = [];
     for (const [index, args] of requests.entries()) {
       if (index > 0 && !shouldFetchAlertPriorityLanes(groups[0]?.length ?? 0)) break;
-      spent += 1;
+      completedCalls += 1;
       const payload = await runGh(args, { signal, operation: "tab:security-endpoint" });
       payloads.push(payload);
       groups.push(JSON.parse(payload).filter((alert) => alert.state === "open"));
@@ -1611,7 +1689,7 @@ async function fetchAlertSource(source, signal, now) {
     clearBackoff(source.key);
     return {
       raw,
-      spent,
+      completedCalls,
       parse: () => {
         const rows = mergeAlertRows(groups);
         return {
@@ -1638,7 +1716,7 @@ async function fetchAlertSource(source, signal, now) {
       raw: `unavailable:${note}`,
       // A failed call still bills: the request reached GitHub and was counted
       // whether it returned data, `[]`, or a 403.
-      spent,
+      completedCalls,
       parse: () => ({ alerts: [], note, verdict, truncated: false }),
     };
   }
@@ -1675,7 +1753,7 @@ async function fetchSecurity(signal) {
     // Summed from what each source reported rather than assumed to be
     // ALERT_SOURCES.length: a source held off by backoff spawned nothing and
     // must not be billed for it.
-    restSpent: parts.reduce((n, p) => n + p.spent, 0),
+    restSpent: parts.reduce((total, part) => total + part.completedCalls, 0),
     graphqlSpent: 0,
     parse: () => {
       const parsed = parts.map((p) => p.parse());
@@ -5027,8 +5105,8 @@ function App({ onCreateRemote = () => {} } = {}) {
           // Billed before the `cancelled` early return: the requests were made
           // and counted by GitHub whether or not this process still wants the
           // answer.
-          spentTotal.core += result?.restSpent ?? 0;
-          spentTotal.graphql += result?.graphqlSpent ?? 0;
+          sharedCompletedTotals.core += result?.restSpent ?? 0;
+          sharedCompletedTotals.graphql += result?.graphqlSpent ?? 0;
           if (cancelled) return;
           const { raw, parse, limit } = result;
           // Identical payload: skip the parse *and* the state update. Returning
@@ -5129,8 +5207,8 @@ function App({ onCreateRemote = () => {} } = {}) {
           // here; bill the tab's table cost instead. A request that failed after
           // reaching GitHub still counted, and over-billing by an aborted call
           // errs toward throttling harder, which is the safe direction.
-          spentTotal.core += REST_PER_FETCH[key] ?? 0;
-          spentTotal.graphql += GRAPHQL_PER_FETCH[key] ?? 0;
+          sharedCompletedTotals.core += REST_PER_FETCH[key] ?? 0;
+          sharedCompletedTotals.graphql += GRAPHQL_PER_FETCH[key] ?? 0;
           if (cancelled || err?.name === "AbortError") return;
           // Preserve both the verdict and the bounded raw error in state. The
           // renderer translates recognized verdicts at draw time, which lets a
@@ -5217,11 +5295,11 @@ function App({ onCreateRemote = () => {} } = {}) {
     // minute at full rate first.
     let lastProbeAt = 0;
     let probeInFlight = false;
-    // The open probe window, and the last share it was able to measure. Both are
-    // carried by nextProbeWindow/inferShare rather than reset every probe -- see
+    // The open probe window, and the last external factor it was able to measure. Both are
+    // carried by nextExternalSampleWindow/inferExternalFactor rather than reset every probe -- see
     // those functions for why a throttled pane must not re-measure from scratch.
-    const probeWindows = { core: null, graphql: null };
-    const lastShares = { core: 1, graphql: 1 };
+    const externalSampleWindows = { core: null, graphql: null };
+    const externalFactors = { core: 1, graphql: 1 };
     let resourceTargets = { core: runtime.refreshMs, graphql: runtime.refreshMs };
 
     function rearm(ms) {
@@ -5242,15 +5320,22 @@ function App({ onCreateRemote = () => {} } = {}) {
         for (const resource of ["core", "graphql"]) {
           const budget = budgets[resource];
           if (!budget) continue;
-          const step = nextProbeWindow(probeWindows[resource], budget, spentTotal[resource]);
-          probeWindows[resource] = step.next;
+          const step = nextExternalSampleWindow(
+            externalSampleWindows[resource],
+            budget,
+            sharedCompletedTotals[resource],
+          );
+          externalSampleWindows[resource] = step.next;
           samples[resource] = step.sample;
-          lastShares[resource] = inferShare(step.sample, lastShares[resource]);
+          externalFactors[resource] = inferExternalFactor(
+            step.sample,
+            externalFactors[resource],
+          );
         }
         const nextTargets = nextBudgetTargets({
           budgets,
           samples,
-          shares: lastShares,
+          externalFactors,
           previous: resourceTargets,
           activeKey: TABS[activeIndexRef.current].key,
           floorMs: runtime.refreshMs,
@@ -5975,9 +6060,9 @@ export {
   adaptiveRefreshMs,
   nextBudgetTargets,
   adaptiveChangeWorthApplying,
-  sampleIsUsable,
-  inferShare,
-  nextProbeWindow,
+  externalSampleIsUsable,
+  inferExternalFactor,
+  nextExternalSampleWindow,
   restPerTick,
   MAX_ADAPTIVE_REFRESH_MS,
   BUDGET_SAFETY,
