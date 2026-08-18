@@ -1014,7 +1014,8 @@ const REST_PER_FETCH = { actions: 2, issues: 0, prs: 0, security: SECURITY_REQUE
 const GRAPHQL_PER_FETCH = { actions: 0, issues: 2, prs: 2, security: 0 };
 
 function tabRequestCost(tab) {
-  return { core: REST_PER_FETCH[tab] ?? 0, graphql: GRAPHQL_PER_FETCH[tab] ?? 0 };
+  if (!TAB_KEYS.includes(tab)) return null;
+  return { core: REST_PER_FETCH[tab], graphql: GRAPHQL_PER_FETCH[tab] };
 }
 
 // Every gh subprocess has one declared operation. Phase 1 only defines this
@@ -1226,8 +1227,8 @@ function resourceDecision({
   return { ...capacity, callsPerMs, externalFactor };
 }
 
-function governorPhaseOffset(leaseId, epoch) {
-  const text = `${leaseId}:${epoch}`;
+function governorPhaseOffset(phaseSeed, epoch) {
+  const text = `${phaseSeed}:${epoch}`;
   let hash = 2166136261;
   for (let index = 0; index < text.length; index += 1) {
     hash ^= text.charCodeAt(index);
@@ -1285,11 +1286,6 @@ function nextRoundRobinIntent(intents, cursors) {
   })[0];
 }
 
-function setLease(leases, leaseId, lease) {
-  if (leases instanceof Map) leases.set(leaseId, lease);
-  else leases[leaseId] = lease;
-}
-
 function scheduleIntents({
   intents = [],
   leases = {},
@@ -1305,6 +1301,11 @@ function scheduleIntents({
     const lease = leaseFor(leases, intent.leaseId);
     const costs = intentCosts(intent);
     const priority = intentPriority(intent);
+    const validPhaseSeed =
+      typeof lease?.phaseSeed === "string"
+        ? lease.phaseSeed.length > 0
+        : Number.isFinite(lease?.phaseSeed);
+    const knownTab = intent.tab === undefined || TAB_KEYS.includes(intent.tab);
     const validCosts = costs && ["core", "graphql"].every(
       (resource) => Number.isFinite(costs[resource] ?? 0) && (costs[resource] ?? 0) >= 0,
     );
@@ -1314,6 +1315,8 @@ function scheduleIntents({
       lease.expiresAt <= nowMs ||
       !Number.isFinite(intent.expiresAt) ||
       intent.expiresAt <= nowMs ||
+      !validPhaseSeed ||
+      !knownTab ||
       priority === null ||
       !validCosts
     ) {
@@ -1324,7 +1327,6 @@ function scheduleIntents({
   }
 
   const workingReservations = [...reservations];
-  const updatedLeases = structuredClone(leases);
   const updatedLanes = structuredClone(lanes);
   const updatedCursors = { ...cursors };
   const grants = [];
@@ -1343,7 +1345,7 @@ function scheduleIntents({
           budget: budgets[resource],
           resource,
           reservations: workingReservations,
-          leases: updatedLeases,
+          leases,
           nowMs,
           cost: intent.costs[resource],
         }),
@@ -1354,16 +1356,10 @@ function scheduleIntents({
         continue;
       }
 
-      const lease = leaseFor(updatedLeases, intent.leaseId);
+      const lease = leaseFor(leases, intent.leaseId);
       const phaseTimes = Object.fromEntries(resources.map((resource) => {
         const epoch = decisions[resource].epoch;
-        const alreadyPhased = lease.phaseEpochs?.[resource] === epoch;
-        return [
-          resource,
-          alreadyPhased && Number.isFinite(lease.phaseAt?.[resource])
-            ? lease.phaseAt[resource]
-            : nowMs + governorPhaseOffset(intent.leaseId, epoch),
-        ];
+        return [resource, nowMs + governorPhaseOffset(lease.phaseSeed, epoch)];
       }));
       const notBefore = Math.max(
         nowMs,
@@ -1395,22 +1391,10 @@ function scheduleIntents({
       };
       workingReservations.push(reservation);
       grants.push(reservation);
-      setLease(updatedLeases, intent.leaseId, {
-        ...lease,
-        phaseEpochs: {
-          ...lease.phaseEpochs,
-          ...Object.fromEntries(resources.map((resource) => [resource, decisions[resource].epoch])),
-        },
-        phaseAt: { ...lease.phaseAt, ...phaseTimes },
-      });
       for (const resource of resources) {
-        const callsPerMs =
-          decisions[resource].spendable /
-          (decisions[resource].resetMs - notBefore) /
-          decisions[resource].externalFactor;
         updatedLanes[resource] = {
           ...updatedLanes[resource],
-          nextAt: notBefore + intent.costs[resource] / callsPerMs,
+          nextAt: notBefore + intent.costs[resource] / decisions[resource].callsPerMs,
         };
         updatedCursors[resource] = intent.leaseId;
       }
@@ -1419,7 +1403,6 @@ function scheduleIntents({
 
   return {
     grants,
-    leases: updatedLeases,
     lanes: updatedLanes,
     cursors: updatedCursors,
     denied,

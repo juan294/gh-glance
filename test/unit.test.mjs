@@ -2135,6 +2135,10 @@ const policyBudget = (overrides = {}) => ({
   observedAt: POLICY_NOW,
   ...overrides,
 });
+const policyLease = (phaseSeed, expiresAt = POLICY_NOW + GOVERNOR_LEASE_TTL_MS) => ({
+  expiresAt,
+  phaseSeed,
+});
 
 test("the governor timing and reserve constants pin the policy contract", () => {
   assert.equal(BUDGET_RESERVE_FRACTION, 1 - BUDGET_SAFETY);
@@ -2235,6 +2239,7 @@ test("tab and auxiliary operation costs have one explicit registry", () => {
     });
     assert.deepEqual(operationCost(`tab:${tab}`), tabRequestCost(tab));
   }
+  assert.equal(tabRequestCost("unknown"), null);
   assert.deepEqual(operationCost("tab:security"), { core: 6, graphql: 0 });
   assert.deepEqual(operationCost("failure-context:repository"), { core: 0, graphql: 1 });
   assert.deepEqual(operationCost("open:actions"), { core: 2, graphql: 0 });
@@ -2284,8 +2289,8 @@ test("manual priority wins but never bypasses the reserve", () => {
   assert.ok(REQUEST_PRIORITIES.active < REQUEST_PRIORITIES.background);
 
   const leases = {
-    a: { expiresAt: POLICY_NOW + GOVERNOR_LEASE_TTL_MS },
-    b: { expiresAt: POLICY_NOW + GOVERNOR_LEASE_TTL_MS },
+    a: policyLease("a"),
+    b: policyLease("b"),
   };
   const scheduled = scheduleIntents({
     intents: [
@@ -2309,7 +2314,9 @@ test("manual priority wins but never bypasses the reserve", () => {
 });
 
 test("equal-priority leases rotate fairly and deterministically", () => {
-  const leases = Object.fromEntries(["a", "b", "c"].map((id) => [id, { expiresAt: POLICY_NOW + 1000 }]));
+  const leases = Object.fromEntries(
+    ["a", "b", "c"].map((id) => [id, policyLease(id, POLICY_NOW + 1000)]),
+  );
   const result = scheduleIntents({
     intents: ["a", "b", "c"].map((leaseId) => ({
       id: leaseId,
@@ -2330,8 +2337,8 @@ test("equal-priority leases rotate fairly and deterministically", () => {
 
 test("active intents consume constrained capacity before background intents", () => {
   const leases = {
-    active: { expiresAt: POLICY_NOW + 10_000 },
-    background: { expiresAt: POLICY_NOW + 10_000 },
+    active: policyLease("active", POLICY_NOW + 10_000),
+    background: policyLease("background", POLICY_NOW + 10_000),
   };
   const result = scheduleIntents({
     intents: [
@@ -2349,7 +2356,7 @@ test("active intents consume constrained capacity before background intents", ()
 test("mixed-resource queues honor each resource cursor", () => {
   const leases = Object.fromEntries(["a", "b", "c"].map((id) => [
     id,
-    { expiresAt: POLICY_NOW + 10_000 },
+    policyLease(id, POLICY_NOW + 10_000),
   ]));
   const result = scheduleIntents({
     intents: [
@@ -2372,15 +2379,18 @@ test("mixed-resource queues honor each resource cursor", () => {
 
 test("invalid expiry and unknown priority prune unstarted intents", () => {
   const leases = {
-    good: { expiresAt: POLICY_NOW + 10_000 },
-    invalid: { expiresAt: Number.NaN },
+    good: policyLease("good", POLICY_NOW + 10_000),
+    invalid: policyLease("invalid", Number.NaN),
+    unphased: { expiresAt: POLICY_NOW + 10_000 },
   };
   const result = scheduleIntents({
     intents: [
       { id: "missing-expiry", leaseId: "good", priority: "active", costs: { core: 1, graphql: 0 } },
       { id: "invalid-expiry", leaseId: "good", priority: "active", costs: { core: 1, graphql: 0 }, expiresAt: Number.NaN },
       { id: "unknown-priority", leaseId: "good", priority: "urgent", costs: { core: 1, graphql: 0 }, expiresAt: POLICY_NOW + 1000 },
+      { id: "unknown-tab", leaseId: "good", priority: "active", tab: "unknown", expiresAt: POLICY_NOW + 1000 },
       { id: "invalid-lease", leaseId: "invalid", priority: "active", costs: { core: 1, graphql: 0 }, expiresAt: POLICY_NOW + 1000 },
+      { id: "missing-phase", leaseId: "unphased", priority: "active", costs: { core: 1, graphql: 0 }, expiresAt: POLICY_NOW + 1000 },
     ],
     leases,
     budgets: { core: policyBudget() },
@@ -2390,7 +2400,9 @@ test("invalid expiry and unknown priority prune unstarted intents", () => {
     "missing-expiry",
     "invalid-expiry",
     "unknown-priority",
+    "unknown-tab",
     "invalid-lease",
+    "missing-phase",
   ]);
   assert.equal(result.grants.length, 0);
 });
@@ -2417,9 +2429,16 @@ test("started reservations stay charged while dead leases release unstarted work
 test("budget reset changes the epoch and deterministic lease phase", () => {
   const first = policyBudget();
   const second = policyBudget({ resetMs: first.resetMs + 3_600_000 });
+  const phaseSeed = "stable-seed";
   assert.notEqual(budgetEpoch(first), budgetEpoch(second));
-  assert.equal(governorPhaseOffset("lease-a", budgetEpoch(first)), governorPhaseOffset("lease-a", budgetEpoch(first)));
-  assert.notEqual(governorPhaseOffset("lease-a", budgetEpoch(first)), governorPhaseOffset("lease-a", budgetEpoch(second)));
+  assert.equal(
+    governorPhaseOffset(phaseSeed, budgetEpoch(first)),
+    governorPhaseOffset(phaseSeed, budgetEpoch(first)),
+  );
+  assert.notEqual(
+    governorPhaseOffset(phaseSeed, budgetEpoch(first)),
+    governorPhaseOffset(phaseSeed, budgetEpoch(second)),
+  );
 
   const intent = {
     id: "phase",
@@ -2430,18 +2449,15 @@ test("budget reset changes the epoch and deterministic lease phase", () => {
   };
   const scheduled = scheduleIntents({
     intents: [intent],
-    leases: { "lease-a": { expiresAt: POLICY_NOW + 10_000 } },
+    leases: { "lease-a": policyLease(phaseSeed, POLICY_NOW + 10_000) },
     budgets: { core: first, graphql: second },
     nowMs: POLICY_NOW,
   });
   assert.equal(scheduled.grants[0].notBefore, POLICY_NOW + Math.max(
-    governorPhaseOffset("lease-a", budgetEpoch(first)),
-    governorPhaseOffset("lease-a", budgetEpoch(second)),
+    governorPhaseOffset(phaseSeed, budgetEpoch(first)),
+    governorPhaseOffset(phaseSeed, budgetEpoch(second)),
   ));
-  assert.deepEqual(scheduled.leases["lease-a"].phaseEpochs, {
-    core: budgetEpoch(first),
-    graphql: budgetEpoch(second),
-  });
+  assert.equal(Object.hasOwn(scheduled, "leases"), false);
 });
 
 test("pacing becomes no earlier as pressure increases", () => {
@@ -2477,56 +2493,69 @@ test("small external-spend samples retain the prior factor", () => {
   assert.equal(nextExternalFactor({ lastExternalFactor: Number.NaN }), null);
 });
 
-test("fresh-window lane scheduling stays inside the spendable budget", () => {
+test("repeated realistic demand fills but never crosses each fresh-window lane", () => {
   for (const count of [1, 3, 7, 12, 20]) {
+    let nowMs = POLICY_NOW;
+    const resetMs = POLICY_NOW + 3_600_000;
+    const budgets = {
+      core: policyBudget({ resetMs }),
+      graphql: policyBudget({ resetMs }),
+    };
     const leases = Object.fromEntries(Array.from({ length: count }, (_, index) => [
       `lease-${index}`,
-      { expiresAt: POLICY_NOW + GOVERNOR_LEASE_TTL_MS },
+      policyLease(`phase-${index}`, resetMs + GOVERNOR_LEASE_TTL_MS),
     ]));
-    const result = scheduleIntents({
-      intents: Object.keys(leases).map((leaseId) => ({
-        id: `intent-${leaseId}`,
-        leaseId,
-        priority: "active",
-        costs: { core: 6, graphql: 0 },
-        expiresAt: POLICY_NOW + GOVERNOR_LEASE_TTL_MS,
-      })),
-      leases,
-      budgets: { core: policyBudget() },
-      nowMs: POLICY_NOW,
-    });
-    assert.equal(result.grants.length, count);
-    assert.ok(result.grants.reduce((total, grant) => total + grant.costs.core, 0) <= 4000);
-    assert.ok(result.lanes.core.nextAt < policyBudget().resetMs);
-  }
-});
+    const totals = { core: 0, graphql: 0 };
+    const progressed = new Set();
+    let lanes = {};
+    let reachedBoundary = false;
 
-test("a fresh multi-resource lane spans the complete 4,000-call window", () => {
-  const intent = {
-    id: "full-window",
-    leaseId: "lease",
-    priority: "active",
-    costs: { core: 4000, graphql: 4000 },
-    expiresAt: POLICY_NOW + 10_000,
-  };
-  const result = scheduleIntents({
-    intents: [intent],
-    leases: { lease: { expiresAt: POLICY_NOW + 10_000 } },
-    budgets: { core: policyBudget(), graphql: policyBudget() },
-    nowMs: POLICY_NOW,
-  });
-  assert.equal(result.grants.length, 1);
-  assertClose(result.lanes.core.nextAt, policyBudget().resetMs, 1e-6);
-  assertClose(result.lanes.graphql.nextAt, policyBudget().resetMs, 1e-6);
+    for (let batch = 0; batch < 200 && nowMs < resetMs; batch += 1) {
+      const cycles = Math.max(1, Math.ceil(12 / count));
+      const tabs = ["actions", "security", "issues", "prs", "issues", "prs"];
+      const intents = [];
+      for (const [leaseIndex, leaseId] of Object.keys(leases).entries()) {
+        for (let cycle = 0; cycle < cycles; cycle += 1) {
+          for (const [tabIndex, tab] of tabs.entries()) {
+            intents.push({
+              id: `${count}:${batch}:${leaseId}:${cycle}:${tabIndex}:${tab}`,
+              leaseId,
+              tab,
+              priority: cycle === 0 && tabIndex === leaseIndex % tabs.length
+                ? "active"
+                : "background",
+              requestedAt: nowMs,
+              expiresAt: resetMs + GOVERNOR_LEASE_TTL_MS,
+            });
+          }
+        }
+      }
 
-  for (const resource of ["core", "graphql"]) {
-    const capacity = availableForGrant({
-      budget: { ...policyBudget(), resource },
-      reservations: result.grants,
-      leases: result.leases,
-      nowMs: POLICY_NOW,
-    });
-    assert.equal(capacity.spendable, 0);
+      const result = scheduleIntents({ intents, leases, budgets, lanes, nowMs });
+      lanes = result.lanes;
+      for (const resource of ["core", "graphql"]) {
+        const granted = result.grants.reduce(
+          (total, grant) => total + grant.costs[resource],
+          0,
+        );
+        totals[resource] += granted;
+        assert.ok(totals[resource] <= 4000, `${count} leases crossed ${resource} reserve`);
+        budgets[resource].remaining -= granted;
+        budgets[resource].used += granted;
+      }
+      for (const grant of result.grants) progressed.add(grant.leaseId);
+      reachedBoundary ||=
+        Object.values(lanes).some(({ nextAt }) => nextAt >= resetMs) ||
+        result.denied.some(({ mode, reason }) => mode === "waiting" && reason === "reset");
+      if (result.grants.length === 0) break;
+      nowMs = Math.ceil(Math.max(nowMs + 1, ...result.grants.map(({ notBefore }) => notBefore)));
+      for (const budget of Object.values(budgets)) budget.observedAt = nowMs;
+    }
+
+    assert.ok(totals.core >= 3900, `${count} leases exercised only ${totals.core} core calls`);
+    assert.ok(totals.graphql >= 3900, `${count} leases exercised only ${totals.graphql} GraphQL calls`);
+    assert.equal(reachedBoundary, true, `${count} leases never reached a lane boundary`);
+    assert.deepEqual([...progressed].sort(), Object.keys(leases).sort());
   }
 });
 
@@ -2534,7 +2563,7 @@ test("a lane at reset waits without reserving the old epoch", () => {
   const resetMs = POLICY_NOW + 1000;
   const result = scheduleIntents({
     intents: [{ id: "late", leaseId: "a", priority: "active", costs: { core: 2, graphql: 0 }, expiresAt: resetMs + 1000 }],
-    leases: { a: { expiresAt: resetMs + 1000 } },
+    leases: { a: policyLease("a", resetMs + 1000) },
     budgets: { core: policyBudget({ resetMs }) },
     lanes: { core: { nextAt: resetMs } },
     nowMs: POLICY_NOW,
@@ -2558,12 +2587,16 @@ test("deterministic closed-loop governor simulation preserves both reserves", ()
   let crossedReset = false;
 
   for (let step = 0; step < 75; step += 1) {
-    if (step === 0) leases["lease-0"] = { expiresAt: nowMs + GOVERNOR_LEASE_TTL_MS };
+    if (step === 0) leases["lease-0"] = policyLease("phase-0", nowMs + GOVERNOR_LEASE_TTL_MS);
     if (step === 5) {
-      for (let index = 1; index < 7; index += 1) leases[`lease-${index}`] = { expiresAt: nowMs + GOVERNOR_LEASE_TTL_MS };
+      for (let index = 1; index < 7; index += 1) {
+        leases[`lease-${index}`] = policyLease(`phase-${index}`, nowMs + GOVERNOR_LEASE_TTL_MS);
+      }
     }
     if (step === 10) {
-      for (let index = 7; index < 12; index += 1) leases[`lease-${index}`] = { expiresAt: nowMs + GOVERNOR_LEASE_TTL_MS };
+      for (let index = 7; index < 12; index += 1) {
+        leases[`lease-${index}`] = policyLease(`phase-${index}`, nowMs + GOVERNOR_LEASE_TTL_MS);
+      }
     }
     if (step === 20) {
       delete leases["lease-1"];
@@ -2607,7 +2640,6 @@ test("deterministic closed-loop governor simulation preserves both reserves", ()
       lanes,
       nowMs,
     });
-    leases = result.leases;
     lanes = result.lanes;
 
     for (const resource of ["core", "graphql"]) {
