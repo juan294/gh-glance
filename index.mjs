@@ -4967,7 +4967,16 @@ function App({ onCreateRemote = () => {} } = {}) {
     TABS.map((t) => [t.key, data[t.key] == null && !errors[t.key]]),
   );
   const anyFirstLoad = Object.values(firstLoad).some(Boolean);
-  const showSpinner = !remoteSetup && ANIMATE && (anyFirstLoad || hasRunningVisible);
+  // A visible fetch is the third thing worth animating, and the status line
+  // already gates its glyph on this exact flag -- without it in the condition
+  // here the frame counter never advances during a manual refresh, so the slot
+  // turned amber and then sat still on frame 0. `loading` is deliberately left
+  // false by automatic polls over settled data (see shouldShowFetchLoading), so
+  // this cannot restart the timer every five seconds on a quiet repository:
+  // it runs for the length of a first load or an `r`, and stops.
+  const anyLoading = Object.values(loading).some(Boolean);
+  const showSpinner =
+    !remoteSetup && ANIMATE && (anyFirstLoad || hasRunningVisible || anyLoading);
   useEffect(() => {
     if (!showSpinner) {
       // Park on a fixed frame rather than freezing wherever the animation
@@ -5345,7 +5354,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     ),
     e(PanelEdge, { width: frameCols, top: false, label: countLabel, labelColor: BORDER_COLOR }),
     e(StatusBar, {
-      fetching: Object.values(loading).some(Boolean),
+      fetching: anyLoading,
       spin: showSpinner ? spin : null,
       stale: staleLabel,
       throttle: throttleMs ? `throttled ${Math.round(throttleMs / 1000)}s` : null,

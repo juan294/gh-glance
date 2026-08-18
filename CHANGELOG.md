@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The Fetching indicator animates again while a fetch is in flight.** The
+  status line gated its glyph on the loading flag, but the frame counter that
+  drives it was scoped to first loads and executing runs only, so a manual
+  refresh over settled data turned the slot amber and then left it parked on
+  the resting frame. The counter now also runs while a visible fetch is
+  loading. Automatic polls over unchanged data still leave the flag false, so
+  the idle redraw suppression is unaffected.
+
 ## [0.9.1] - 2026-08-11
 
 ### Fixed
