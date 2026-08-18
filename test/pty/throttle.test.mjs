@@ -14,7 +14,11 @@ import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { resourceDecision, resourceReserve } from "../../index.mjs";
+import {
+  GOVERNOR_PHASE_WINDOW_MS,
+  resourceDecision,
+  resourceReserve,
+} from "../../index.mjs";
 import { capture, captureAsync } from "./capture.mjs";
 
 const STATE_HELPER = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "gh-state.mjs");
@@ -66,6 +70,33 @@ function capturePanes(count, box, panePrefix, options = {}) {
       GH_GLANCE_FIXTURE_PANE: `${panePrefix}-${index}`,
     },
   })));
+}
+
+async function observeUntil(read, predicate, deadlineAt) {
+  let value = null;
+  while (Date.now() < deadlineAt) {
+    try {
+      value = read();
+      if (predicate(value)) return { matched: true, value };
+    } catch {
+      // The governor directory and atomic fixture state can be between writes.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  }
+  return { matched: false, value };
+}
+
+function readFixtureLockArtifacts(root) {
+  const artifacts = {};
+  for (const name of readdirSync(root)) {
+    if (!name.startsWith("fixture.json.lock")) continue;
+    try {
+      artifacts[name] = readFileSync(join(root, name), "utf8");
+    } catch {
+      artifacts[name] = "(disappeared during inspection)";
+    }
+  }
+  return artifacts;
 }
 
 test("the shared fixture recovers a dead private lock without using governor state", (t) => {
@@ -168,6 +199,7 @@ test("a real reset gets one fresh probe then one phased active request per pane"
 
 test("twelve panes share probe ownership and start bounded phased work", async (t) => {
   const box = fixture(t, { delayMs: 40 });
+  const readyPath = join(box.root, "healthy-ready");
   const setup = box.read();
   const decision = resourceDecision({
     budget: {
@@ -186,16 +218,80 @@ test("twelve panes share probe ownership and start bounded phased work", async (
     chargedCost: 0,
   });
   const laneInterval = 2 / decision.callsPerMs;
-  await capturePanes(12, box, "pane", {
-    // Five seconds of epoch phase plus one paced lane interval can place the
-    // second pane just beyond an eight-second process-start observation.
-    settle: 12,
+  const captures = capturePanes(12, box, "pane", {
+    signal: "none",
+    settle: 35,
+    stdin:
+      "i=0; while [ ! -f \"$GH_GLANCE_FIXTURE_READY\" ] && [ \"$i\" -lt 500 ]; do " +
+      "sleep .1; i=$((i + 1)); done; printf q",
+    env: { GH_GLANCE_FIXTURE_READY: readyPath },
   });
+
+  const publicationResult = await observeUntil(
+    box.readGovernor,
+    (governor) => Number.isFinite(governor?.budgets?.core?.observedAt),
+    Date.now() + 20_000,
+  );
+  const publication = publicationResult.matched ? publicationResult.value : null;
+  const registered = publication
+    ? await observeUntil(
+      box.readGovernor,
+      (governor) => Object.keys(governor?.leases ?? {}).length >= 2,
+      Date.now() + 10_000,
+    )
+    : null;
+  const registeredGovernor = registered?.matched ? registered.value : null;
+  const registeredAts = Object.values(registeredGovernor?.leases ?? {})
+    .map((lease) => lease.phaseSeed.registeredAt)
+    .sort((left, right) => left - right);
+  const publicationAt = publication?.budgets?.core?.observedAt;
+  const phaseAnchor = Math.max(publicationAt ?? Date.now(), registeredAts[1] ?? 0);
+  const processStartMarginMs = 3_000;
+  const progressHorizonAt = phaseAnchor + GOVERNOR_PHASE_WINDOW_MS + laneInterval +
+    processStartMarginMs;
+  const progress = publication && registeredGovernor
+    ? await observeUntil(
+      box.read,
+      (state) => new Set(starts(state, "run").map((event) => event.pane)).size >= 2,
+      progressHorizonAt,
+    )
+    : null;
+  const preReleaseState = box.read();
+  const fixtureLockArtifacts = readFixtureLockArtifacts(box.root);
+  writeFileSync(readyPath, "ready\n", { mode: 0o600 });
+  await captures;
+
   const state = box.read();
+  const governor = box.readGovernor();
   const probes = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
-  const runs = starts(state, "run");
+  const runs = starts(state, "run").sort((left, right) => left.at - right.at);
+  t.diagnostic(JSON.stringify({
+    publicationAt,
+    progressHorizonAt,
+    laneInterval,
+    progressObserved: Boolean(progress?.matched && new Set(
+      starts(progress.value, "run").map((event) => event.pane),
+    ).size >= 2),
+    preReleaseActive: preReleaseState.active,
+    preReleaseEvents: preReleaseState.events,
+    fixtureLockArtifacts,
+    probes: probes.map(({ at, pane }) => ({ at, pane })),
+    runs: runs.map(({ at, pane }) => ({ at, pane })),
+    maxDataConcurrency: state.maxDataConcurrency,
+    leases: Object.fromEntries(Object.entries(governor.leases).map(([id, lease]) => [id, {
+      registeredAt: lease.phaseSeed.registeredAt,
+      activeTab: lease.activeTab,
+    }])),
+    intents: governor.intents,
+    reservations: Object.fromEntries(Object.entries(governor.reservations).map(([id, item]) => [
+      id,
+      { leaseId: item.leaseId, status: item.status, notBefore: item.notBefore },
+    ])),
+  }));
+  assert.ok(publication, "the shared budget publication was not observed");
+  assert.ok(registeredAts.length >= 2, "fewer than two live leases registered after publication");
   assert.ok(probes.length >= 1 && probes.length <= 2, `shared probes: ${probes.length}`);
-  assert.ok(runs.length >= 1, "no pane progressed");
+  assert.ok(runs.length >= 2, "fewer than two panes progressed within the policy horizon");
   assert.ok(new Set(runs.map((event) => event.pane)).size > 1, "round-robin made no progress");
   assert.equal(state.maxDataConcurrency, 1, `data requests overlapped: ${state.maxDataConcurrency}`);
   for (let index = 1; index < runs.length; index += 1) {

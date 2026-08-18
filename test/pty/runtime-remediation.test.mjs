@@ -86,12 +86,25 @@ const screenReader = capture({
 });
 
 const stalledStartedAt = Date.now();
+const waitForStalledRow =
+  "tries=0; cache=\"$XDG_CONFIG_HOME/gh-glance/dashboard-cache.json\"; " +
+  "while ! grep -Eq '\"databaseId\"[[:space:]]*:[[:space:]]*101' \"$cache\" " +
+  "2>/dev/null && [ $tries -lt 150 ]; do " +
+  // The initial two-call Actions reservation advances the full-budget lane by
+  // 1.8s. Wait through that slot so this abort test does not depend on a race
+  // with an unrelated automatic poll.
+  "tries=$((tries + 1)); sleep .1; done; sleep 2; ";
+const waitForStalledOpen =
+  "tries=0; while ! grep -q '^run view ' \"$GH_GLANCE_CAPTURE_OUT.calls\" " +
+  "2>/dev/null && [ $tries -lt 100 ]; do tries=$((tries + 1)); sleep .1; done; ";
 const stalledOpen = capture({
   cols: 80,
   rows: 24,
   signal: "none",
   settle: 15,
-  stdin: "sleep 7; printf 'j'; sleep 1; printf '\\r'; sleep 1; printf 'q'; sleep 2",
+  args: "--refresh 40",
+  stdin: waitForStalledRow + "printf 'j'; sleep 1; printf '\\r'; " +
+    waitForStalledOpen + "printf 'q'; sleep 2",
   env: { GH_GLANCE_FIXTURE_STALL_VIEW: "1" },
 });
 const stalledElapsedMs = Date.now() - stalledStartedAt;
