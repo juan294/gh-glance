@@ -51,6 +51,10 @@ function ownerIsDead(owner) {
   }
 }
 
+function pidIsDead(pid) {
+  return ownerIsDead({ pid, nonce: "fixture-process" });
+}
+
 function removeOwned(path, nonce) {
   try {
     if (lockOwner(path)?.nonce === nonce) rmSync(path);
@@ -180,6 +184,41 @@ function cost() {
   return { core: 0, graphql: 0 };
 }
 
+function commandDelay(state, command) {
+  const configured = state.delayByCommand?.[command] ?? state.delayMs ?? 0;
+  if (typeof configured === "number") return configured;
+  if (
+    configured && typeof configured === "object" &&
+    Number.isFinite(configured.ms) && configured.ms >= 0 &&
+    Number.isSafeInteger(configured.remaining) && configured.remaining > 0
+  ) {
+    configured.remaining -= 1;
+    return configured.ms;
+  }
+  return 0;
+}
+
+function resourceSnapshot(state) {
+  return Object.fromEntries(["core", "graphql"].map((resource) => {
+    const budget = state[resource];
+    return [resource, budget ? {
+      limit: budget.limit,
+      used: budget.used,
+      remaining: budget.remaining,
+      resetMs: budget.resetMs,
+    } : null];
+  }));
+}
+
+function pruneDeadInflight(state) {
+  state.inFlight ??= {};
+  for (const [id, item] of Object.entries(state.inFlight)) {
+    if (pidIsDead(item?.pid)) delete state.inFlight[id];
+  }
+  state.active = Object.keys(state.inFlight).length;
+  state.dataActive = Object.values(state.inFlight).filter((item) => item.isData).length;
+}
+
 function applyResetSequence(state, now) {
   const elapsed = now - (state.createdAt ?? now);
   for (const step of state.resetSequence ?? []) {
@@ -197,6 +236,44 @@ function applyResetSequence(state, now) {
   }
 }
 
+if (args[0] === "--fixture-burn") {
+  const resource = args[1];
+  const amount = Number(args[2]);
+  if (!["core", "graphql"].includes(resource) || !Number.isSafeInteger(amount) || amount <= 0) {
+    process.stderr.write("usage: gh-state.mjs --fixture-burn <core|graphql> <positive integer>\n");
+    process.exit(2);
+  }
+  const event = withLock((state) => {
+    const now = Date.now();
+    state.createdAt ??= now;
+    state.events ??= [];
+    state.sequence = (state.sequence ?? 0) + 1;
+    pruneDeadInflight(state);
+    applyResetSequence(state, now);
+    const before = resourceSnapshot(state);
+    const budget = state[resource];
+    if (!budget) throw new Error(`missing fixture ${resource} budget`);
+    budget.used += amount;
+    budget.remaining = Math.max(0, budget.remaining - amount);
+    const burn = {
+      sequence: state.sequence,
+      type: "external-burn",
+      at: now,
+      pid: process.pid,
+      ownerPid: process.ppid,
+      pane: process.env.GH_GLANCE_FIXTURE_PANE ?? null,
+      resource,
+      amount,
+      before,
+      after: resourceSnapshot(state),
+    };
+    state.events.push(burn);
+    return burn;
+  });
+  process.stdout.write(`${JSON.stringify(event)}\n`);
+  process.exit(0);
+}
+
 const started = withLock((state) => {
   const now = Date.now();
   const isRateProbe = args[0] === "api" && args[1] === "rate_limit";
@@ -212,36 +289,50 @@ const started = withLock((state) => {
   if (state.anchorAtFirstProbe !== true) state.createdAt ??= now;
   state.events ??= [];
   state.sequence = (state.sequence ?? 0) + 1;
-  state.active = (state.active ?? 0) + 1;
+  pruneDeadInflight(state);
+  const sequence = state.sequence;
+  const debit = cost();
+  const isData = debit.core > 0 || debit.graphql > 0;
+  state.inFlight[sequence] = {
+    pid: process.pid,
+    ownerPid: process.ppid,
+    pane: process.env.GH_GLANCE_FIXTURE_PANE ?? null,
+    isData,
+    startedAt: now,
+  };
+  state.active = Object.keys(state.inFlight).length;
   state.maxConcurrency = Math.max(state.maxConcurrency ?? 0, state.active);
   applyResetSequence(state, now);
-  const debit = cost();
+  const before = resourceSnapshot(state);
   for (const resource of ["core", "graphql"]) {
     const budget = state[resource];
     if (!budget || debit[resource] === 0) continue;
     budget.used += debit[resource];
     budget.remaining = Math.max(0, budget.remaining - debit[resource]);
   }
-  const isData = debit.core > 0 || debit.graphql > 0;
+  const after = resourceSnapshot(state);
   if (isData) {
-    state.dataActive = (state.dataActive ?? 0) + 1;
+    state.dataActive = Object.values(state.inFlight).filter((item) => item.isData).length;
     state.maxDataConcurrency = Math.max(state.maxDataConcurrency ?? 0, state.dataActive);
   }
   const failure = state.failure;
   const fail = failure && failure.remaining > 0 && failure.selector === selector();
   if (fail) failure.remaining -= 1;
   state.events.push({
-    sequence: state.sequence,
+    sequence,
     type: "start",
     at: now,
     pid: process.pid,
+    ownerPid: process.ppid,
     pane: process.env.GH_GLANCE_FIXTURE_PANE ?? null,
     argv: args,
     cost: debit,
+    before,
+    after,
   });
   return {
-    sequence: state.sequence,
-    delayMs: state.delayByCommand?.[selector()] ?? state.delayMs ?? 0,
+    sequence,
+    delayMs: commandDelay(state, selector()),
     fail,
     message: failure?.message ?? "fixture failure",
     budgets: { core: state.core, graphql: state.graphql },
@@ -252,13 +343,15 @@ const started = withLock((state) => {
 if (started.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, started.delayMs));
 
 withLock((state) => {
-  state.active = Math.max(0, (state.active ?? 1) - 1);
-  if (started.isData) state.dataActive = Math.max(0, (state.dataActive ?? 1) - 1);
+  state.inFlight ??= {};
+  delete state.inFlight[started.sequence];
+  pruneDeadInflight(state);
   state.events.push({
     sequence: started.sequence,
     type: "end",
     at: Date.now(),
     pid: process.pid,
+    ownerPid: process.ppid,
     pane: process.env.GH_GLANCE_FIXTURE_PANE ?? null,
     argv: args,
     failed: started.fail,
