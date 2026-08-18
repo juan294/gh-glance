@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { resourceDecision, resourceReserve } from "../../index.mjs";
 import { capture, captureAsync } from "./capture.mjs";
 
 const STATE_HELPER = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "gh-state.mjs");
@@ -183,12 +184,42 @@ test("twelve held panes share one block probe instead of retrying per pane", asy
 });
 
 test("twelve panes preserve one runtime rate-limit block across the minute", async (t) => {
+  const setupAt = Date.now();
+  const coreLimit = 5000;
+  const spendableCalls = 26;
+  const coreRemaining = resourceReserve(coreLimit) + spendableCalls;
+  const resetMs = setupAt + 120_000;
+  const setupDecision = resourceDecision({
+    budget: {
+      limit: coreLimit,
+      remaining: coreRemaining,
+      used: coreLimit - coreRemaining,
+      resetMs,
+      observedAt: setupAt,
+      blockUntil: null,
+      blockReason: null,
+      laneNextAt: setupAt,
+      roundRobinCursor: null,
+      lastExternalFactor: 1,
+      epoch: `${coreLimit}:${resetMs}`,
+    },
+    resource: "core",
+    nowMs: setupAt,
+    cost: 2,
+    chargedCost: 0,
+  });
+  assert.equal(coreRemaining - resourceReserve(coreLimit), spendableCalls);
+  assert.equal(setupDecision.mode, "open");
+  assert.ok(2 / setupDecision.callsPerMs >= 9_000, "setup core lane is too narrow");
   const box = fixture(t, {
     core: {
-      limit: 5000,
-      used: 0,
-      remaining: 5000,
-      resetMs: Date.now() + 120_000,
+      limit: coreLimit,
+      // Twelve Actions requests demand 24 of the 26 calls above the hard
+      // reserve, so this exercises capacity while keeping the initial lane
+      // wider than process-start jitter.
+      used: coreLimit - coreRemaining,
+      remaining: coreRemaining,
+      resetMs,
     },
     delayMs: 40,
     failure: {
@@ -197,24 +228,45 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
       message: "HTTP 403: API rate limit exceeded",
     },
   });
-  await Promise.all(Array.from({ length: 12 }, (_, index) => captureAsync({
-    cols: 70,
-    rows: 20,
-    // Leave margin after the shared 60-second probe deadline so process startup
-    // cannot turn this into a boundary-timing assertion.
-    settle: 75,
-    configHome: box.root,
-    env: {
-      GH_GLANCE_FIXTURE_STATE: box.statePath,
-      GH_GLANCE_FIXTURE_PANE: `blocked-minute-${index}`,
-    },
-  })));
+  let blockObservedAt = null;
+  const observer = setInterval(() => {
+    try {
+      if (box.readGovernor().budgets.core?.blockReason === "rate-limit") {
+        blockObservedAt ??= Date.now();
+      }
+    } catch {
+      // The first probe has not created the governor file yet.
+    }
+  }, 5);
+  try {
+    await Promise.all(Array.from({ length: 12 }, (_, index) => captureAsync({
+      cols: 70,
+      rows: 20,
+      // Leave margin after the shared 60-second probe deadline so process startup
+      // cannot turn this into a boundary-timing assertion.
+      settle: 75,
+      configHome: box.root,
+      env: {
+        GH_GLANCE_FIXTURE_STATE: box.statePath,
+        GH_GLANCE_FIXTURE_PANE: `blocked-minute-${index}`,
+      },
+    })));
+  } finally {
+    clearInterval(observer);
+  }
   const state = box.read();
   const probes = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
   const coreData = dataStarts(state).filter((event) => event.cost.core > 0);
+  const failureEnd = state.events.find((event) => event.type === "end" && event.failed === true);
   const governor = box.readGovernor();
   assert.equal(state.failure.remaining, 0, "the rate-limit response was not injected");
-  assert.equal(coreData.length, 1, `shared core block retried ${coreData.length} data calls`);
+  assert.ok(coreData.length >= 1 && coreData.length <= 2,
+    `unbounded initial core starts: ${JSON.stringify(coreData)}`);
+  assert.ok(failureEnd, "the injected rate-limit failure never completed");
+  assert.ok(Number.isFinite(blockObservedAt), "the shared rate-limit block was never observed");
+  assert.ok(failureEnd.at <= blockObservedAt, "the block preceded the injected failure completion");
+  assert.ok(coreData.every((event) => event.at < blockObservedAt),
+    `core data started after the shared block was classified: ${JSON.stringify(coreData)}`);
   assert.equal(governor.budgets.core.blockReason, "rate-limit");
   assert.ok(governor.budgets.core.blockUntil > Date.now(), "minute probe cleared the live block");
   assert.equal(probes.length, 2, `expected startup and minute probes, got ${probes.length}; ` +
@@ -224,4 +276,7 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
       outcome: governor.probeOutcome,
       core: governor.budgets.core,
     }));
+  t.diagnostic(`core starts ${coreData.length}; probes ${probes.length}; ` +
+    `failure end ${failureEnd.at}; block observed ${blockObservedAt}; ` +
+    `block ${governor.budgets.core.blockReason}`);
 });

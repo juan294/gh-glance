@@ -20,6 +20,13 @@ const rateLimited = {
   GH_GLANCE_FIXTURE_FAIL_ON: "run,issue,pr,api-data",
 };
 
+function quitAfterCached(tab) {
+  return "tries=0; while ! grep -q '\"" + tab + "\"' " +
+    '"$XDG_CONFIG_HOME/gh-glance/dashboard-cache.json" 2>/dev/null; do ' +
+    'tries=$((tries + 1)); if [ "$tries" -ge 200 ]; then printf q; exit 0; fi; ' +
+    "sleep .1; done; printf q";
+}
+
 let warm;
 let warmSecurity;
 let recovered;
@@ -29,7 +36,9 @@ try {
   warm = capture({
     cols: 80,
     rows: 24,
-    settle: 4,
+    signal: "none",
+    settle: 20,
+    stdin: quitAfterCached("actions"),
     args: "--repo acme/widget",
     env: { GH_GLANCE_FIXTURE_SECURITY_ALERTS: "1" },
     configHome,
@@ -37,7 +46,9 @@ try {
   warmSecurity = capture({
     cols: 80,
     rows: 24,
-    settle: 7,
+    signal: "none",
+    settle: 20,
+    stdin: quitAfterCached("security"),
     args: "--repo acme/widget --tab security",
     env: { GH_GLANCE_FIXTURE_SECURITY_ALERTS: "1" },
     configHome,

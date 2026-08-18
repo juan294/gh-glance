@@ -211,6 +211,7 @@ withLock((state) => {
     pid: process.pid,
     pane: process.env.GH_GLANCE_FIXTURE_PANE ?? null,
     argv: args,
+    failed: started.fail,
   });
 });
 
