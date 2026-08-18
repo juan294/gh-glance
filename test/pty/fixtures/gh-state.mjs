@@ -172,6 +172,11 @@ const started = withLock((state) => {
     budget.used += debit[resource];
     budget.remaining = Math.max(0, budget.remaining - debit[resource]);
   }
+  const isData = debit.core > 0 || debit.graphql > 0;
+  if (isData) {
+    state.dataActive = (state.dataActive ?? 0) + 1;
+    state.maxDataConcurrency = Math.max(state.maxDataConcurrency ?? 0, state.dataActive);
+  }
   const failure = state.failure;
   const fail = failure && failure.remaining > 0 && failure.selector === selector();
   if (fail) failure.remaining -= 1;
@@ -190,6 +195,7 @@ const started = withLock((state) => {
     fail,
     message: failure?.message ?? "fixture failure",
     budgets: { core: state.core, graphql: state.graphql },
+    isData,
   };
 });
 
@@ -197,6 +203,7 @@ if (started.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, star
 
 withLock((state) => {
   state.active = Math.max(0, (state.active ?? 1) - 1);
+  if (started.isData) state.dataActive = Math.max(0, (state.dataActive ?? 1) - 1);
   state.events.push({
     sequence: started.sequence,
     type: "end",

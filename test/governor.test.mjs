@@ -47,6 +47,7 @@ import {
   governorScopeHash,
   heartbeatLease,
   inspectGovernor,
+  maintainControlLease,
   admitGovernorOperation,
   openInBrowser,
   operationCost,
@@ -459,6 +460,46 @@ test("bootstrap readiness requires a successful publication and a safe active re
   assert.equal(governorDataReady({ ok: true, value: {} }, blocked, "issues", NOW), true);
   assert.equal(governorControlRetryAt(NOW, 40_000), NOW + 1000);
   assert.equal(governorControlRetryAt(NOW, 500), NOW + 500);
+});
+
+test("control-only wakes keep a held lease live through the t=120 probe", (t) => {
+  const box = sandbox(t, { authIdentity: "held-control-liveness" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId, NOW, budgets(NOW, { remaining: 0 }));
+
+  for (const at of [NOW + BUDGET_PROBE_MS, NOW + 2 * BUDGET_PROBE_MS]) {
+    box.setNow(at);
+    const maintained = maintainControlLease(box.scope, leaseId, 5000, "actions", at);
+    assert.equal(maintained.ok, true);
+    assert.equal(maintained.value.status, "renewed");
+    const claim = claimProbe(box.scope, leaseId, at);
+    assert.equal(claim.ok, true);
+    assert.equal(claim.value.status, "claimed");
+    assert.equal(publishProbe(
+      box.scope,
+      leaseId,
+      claim.value.nonce,
+      budgets(at, { remaining: 0, resetMs: NOW + 3_600_000 }),
+      at,
+    ).ok, true);
+    const snapshot = inspectGovernor(box.scope, at).value;
+    assert.equal(snapshot.probeOutcome.status, "healthy");
+    assert.equal(snapshot.leases[leaseId].expiresAt, at + GOVERNOR_LEASE_TTL_MS);
+    assert.deepEqual(snapshot.intents, {});
+    assert.deepEqual(snapshot.reservations, {});
+  }
+
+  const expiredBox = sandbox(t, { authIdentity: "held-control-reregister" });
+  const expiredLeaseId = randomUUID();
+  registerLease(expiredBox.scope, lease(expiredLeaseId));
+  publishInitial(expiredBox.scope, expiredLeaseId, NOW, budgets(NOW, { remaining: 0 }));
+  const late = NOW + 2 * BUDGET_PROBE_MS;
+  expiredBox.setNow(late);
+  const registered = maintainControlLease(expiredBox.scope, expiredLeaseId, 5000, "actions", late);
+  assert.equal(registered.ok, true);
+  assert.equal(registered.value.status, "registered");
+  assert.equal(claimProbe(expiredBox.scope, expiredLeaseId, late).value.status, "claimed");
 });
 
 test("abort and signal outcomes retain each operation's worst-case reservation", async (t) => {

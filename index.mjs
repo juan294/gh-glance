@@ -2216,6 +2216,24 @@ function heartbeatLease(scope, leaseId, demand, nowMs, activeTab = null) {
   });
 }
 
+function maintainControlLease(scope, leaseId, floorMs, activeTab, nowMs) {
+  const demand = tabRequestCost(activeTab);
+  if (!demand) return { ok: false, reason: "corrupt" };
+  const renewed = heartbeatLease(scope, leaseId, demand, nowMs, activeTab);
+  if (renewed.ok) return { ...renewed, value: { ...renewed.value, status: "renewed" } };
+  const registered = registerLease(scope, {
+    id: leaseId,
+    expiresAt: nowMs + GOVERNOR_LEASE_TTL_MS,
+    floorMs,
+    activeTab,
+    phaseSeed: { seed: leaseId, registeredAt: nowMs },
+    demand,
+  });
+  return registered.ok
+    ? { ...registered, value: { ...registered.value, status: "registered", activeTab } }
+    : registered;
+}
+
 function claimProbe(scope, leaseId, nowMs) {
   return mutateGovernor(scope, nowMs, (state, at) => {
     if (!state.leases[leaseId]) return { ok: false, reason: "stale" };
@@ -6614,11 +6632,19 @@ function App({ onCreateRemote = () => {} } = {}) {
       };
     }
 
-    function ensureScope(nowMs = Date.now()) {
+    function ensureScope(nowMs = Date.now(), { maintain = false } = {}) {
       const current = identity();
       const nextHash = governorScopeHash(current.effectiveHost, current.authIdentity);
       if (!nextHash) return null;
-      if (scope?.hash === nextHash && registeredScopeHash === nextHash) return scope;
+      if (scope?.hash === nextHash && registeredScopeHash === nextHash) {
+        if (!maintain) return scope;
+        const activeTab = TABS[activeIndexRef.current].key;
+        const kept = maintainControlLease(scope, leaseId, runtime.refreshMs, activeTab, nowMs);
+        if (kept.ok) return scope;
+        registeredScopeHash = null;
+        if (governorRef.current?.leaseId === leaseId) governorRef.current = null;
+        return null;
+      }
       if (scope?.hash !== nextHash) {
         if (cleanupScope && registeredScopeHash) releaseLease(cleanupScope, leaseId);
         registeredScopeHash = null;
@@ -6833,7 +6859,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     async function controlWake() {
       if (cancelled) return;
       const nowMs = Date.now();
-      const currentScope = ensureScope(nowMs);
+      const currentScope = ensureScope(nowMs, { maintain: true });
       const refreshed = currentScope
         ? await refreshSharedBudget(currentScope, leaseId, controller.signal)
         : { ok: false, reason: "stale" };
@@ -7650,6 +7676,7 @@ export {
   withGovernorLock,
   registerLease,
   heartbeatLease,
+  maintainControlLease,
   claimProbe,
   renewProbeClaim,
   publishProbe,

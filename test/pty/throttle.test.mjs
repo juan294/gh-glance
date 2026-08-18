@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
@@ -23,7 +31,16 @@ function fixture(t, overrides = {}) {
     ...overrides,
   };
   writeFileSync(statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
-  return { root, statePath, read: () => JSON.parse(readFileSync(statePath, "utf8")) };
+  return {
+    root,
+    statePath,
+    read: () => JSON.parse(readFileSync(statePath, "utf8")),
+    readGovernor: () => {
+      const directory = join(root, "gh-glance");
+      const name = readdirSync(directory).find((entry) => entry.startsWith("rate-governor-v1-"));
+      return JSON.parse(readFileSync(join(directory, name), "utf8"));
+    },
+  };
 }
 
 const starts = (state, command) => state.events.filter(
@@ -116,6 +133,10 @@ test("a real reset gets one fresh probe then one phased active request per pane"
   assert.equal(new Set(runs.map((event) => event.pane)).size, 3);
   assert.equal(dataStarts(state).length, runs.length, "background work joined the reset phase");
   assert.ok(probes[1].at <= runs[0].at, "data raced the reset publication");
+  assert.equal(state.maxDataConcurrency, 1, "reset data requests overlapped");
+  for (let index = 1; index < runs.length; index += 1) {
+    assert.ok(runs[index].at - runs[index - 1].at >= 1_000, "reset requests were not phased");
+  }
 });
 
 test("twelve panes share probe ownership and start bounded phased work", async (t) => {
@@ -159,4 +180,48 @@ test("twelve held panes share one block probe instead of retrying per pane", asy
   const probes = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
   assert.ok(probes.length >= 1 && probes.length <= 2, `shared held probes: ${probes.length}`);
   assert.equal(dataStarts(state).length, 0);
+});
+
+test("twelve panes preserve one runtime rate-limit block across the minute", async (t) => {
+  const box = fixture(t, {
+    core: {
+      limit: 5000,
+      used: 0,
+      remaining: 5000,
+      resetMs: Date.now() + 120_000,
+    },
+    delayMs: 40,
+    failure: {
+      selector: "run",
+      remaining: 1,
+      message: "HTTP 403: API rate limit exceeded",
+    },
+  });
+  await Promise.all(Array.from({ length: 12 }, (_, index) => captureAsync({
+    cols: 70,
+    rows: 20,
+    // Leave margin after the shared 60-second probe deadline so process startup
+    // cannot turn this into a boundary-timing assertion.
+    settle: 75,
+    configHome: box.root,
+    env: {
+      GH_GLANCE_FIXTURE_STATE: box.statePath,
+      GH_GLANCE_FIXTURE_PANE: `blocked-minute-${index}`,
+    },
+  })));
+  const state = box.read();
+  const probes = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
+  const coreData = dataStarts(state).filter((event) => event.cost.core > 0);
+  const governor = box.readGovernor();
+  assert.equal(state.failure.remaining, 0, "the rate-limit response was not injected");
+  assert.equal(coreData.length, 1, `shared core block retried ${coreData.length} data calls`);
+  assert.equal(governor.budgets.core.blockReason, "rate-limit");
+  assert.ok(governor.budgets.core.blockUntil > Date.now(), "minute probe cleared the live block");
+  assert.equal(probes.length, 2, `expected startup and minute probes, got ${probes.length}; ` +
+    JSON.stringify({
+      createdAt: state.createdAt,
+      probeTimes: probes.map(({ at }) => at),
+      outcome: governor.probeOutcome,
+      core: governor.budgets.core,
+    }));
 });
