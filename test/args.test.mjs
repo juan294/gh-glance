@@ -16,6 +16,8 @@ import {
   MIN_REFRESH_SECONDS,
   MAX_REFRESH_SECONDS,
   TAB_KEYS,
+  remoteHost,
+  resolveEffectiveHost,
 } from "../index.mjs";
 
 const parse = (argv) => validateArgs(parseArgs(argv), TAB_KEYS);
@@ -89,6 +91,37 @@ test("--repo accepts the host-qualified form gh itself accepts", () => {
   assert.equal(opts.host, "tenant.ghe.com");
   assert.equal(parse(["--repo", "acme/widget"]).host, null);
   assert.equal(parse([]).host, null);
+});
+
+test("effective host resolution keeps explicit --repo authoritative", () => {
+  assert.equal(resolveEffectiveHost({
+    runtimeRepo: "acme/widget",
+    repoExplicit: true,
+    ghHost: "enterprise.example.com",
+    ghRepo: "other.example.com/other/repo",
+  }), "github.com");
+  assert.equal(resolveEffectiveHost({
+    runtimeHost: "tenant.ghe.com",
+    runtimeRepo: "acme/widget",
+    repoExplicit: true,
+    ghHost: "github.com",
+  }), "tenant.ghe.com");
+});
+
+test("environment and local remote hosts resolve only when unambiguous", () => {
+  assert.equal(resolveEffectiveHost({ ghHost: "Tenant.GHE.com" }), "tenant.ghe.com");
+  assert.equal(resolveEffectiveHost({ ghRepo: "tenant.ghe.com/acme/widget" }), "tenant.ghe.com");
+  assert.equal(resolveEffectiveHost({ ghRepo: "acme/widget" }), "github.com");
+  assert.equal(resolveEffectiveHost({ remoteUrls: [
+    "git@github.com:acme/widget.git",
+    "https://github.com/acme/other.git",
+  ] }), "github.com");
+  assert.equal(resolveEffectiveHost({ remoteUrls: [
+    "git@github.com:acme/widget.git",
+    "ssh://git@tenant.ghe.com/acme/widget.git",
+  ] }), null);
+  assert.equal(resolveEffectiveHost({ remoteUrls: [] }), null);
+  assert.equal(remoteHost("git@tenant.ghe.com:acme/widget.git"), "tenant.ghe.com");
 });
 
 test("a host-qualified --repo still rejects everything the two-part form rejects", () => {

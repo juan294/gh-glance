@@ -12,6 +12,8 @@ import { execFile } from "node:child_process";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 
 import { redact, classify } from "../index.mjs";
@@ -111,6 +113,19 @@ test("--doctor exits 0 through a pipe and prints a complete report", async () =>
   assert.match(out, /^ {2}Repository access$/m);
   // One block per diagnostic request, including the bounded Security priority lanes.
   assert.equal(out.match(/^ {2}classified {2}/gm)?.length, 10, out);
+});
+
+test("--doctor reports governor health without a raw scope identifier", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-governor-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const out = await doctor({
+    env: { XDG_CONFIG_HOME: root },
+    args: ["--repo", "acme/widget"],
+  });
+  assert.match(out, /API governor\n------------/);
+  assert.match(out, /^status {12}stale$/m);
+  assert.match(out, /^live leases {7}0$/m);
+  assert.ok(!/rate-governor-v1-|[0-9a-f]{64}/.test(out), out);
 });
 
 test("--doctor never prints a token that was planted in its environment", async () => {

@@ -20,7 +20,12 @@ const HOST = "tenant.ghe.com";
 
 // Captures cost several seconds each, so each is taken once at module scope.
 const inferred = capture({ cols: 80, rows: 24 });
-const slugOnly = capture({ cols: 80, rows: 24, args: "--repo acme/widget" });
+const slugOnly = capture({
+  cols: 80,
+  rows: 24,
+  args: "--repo acme/widget",
+  env: { GH_HOST: HOST, GH_REPO: `${HOST}/other/repo` },
+});
 const hostQualified = capture({ cols: 80, rows: 24, args: `--repo ${HOST}/acme/widget` });
 
 const listCalls = (result) => result.fixtureCalls.filter((call) => /^(run|issue|pr) /.test(call));
@@ -48,13 +53,13 @@ test("with no --repo, the argv vector is byte-identical to the default", () => {
   }
 });
 
-test("a two-part --repo passes --repo and never --hostname", () => {
+test("a two-part --repo pins github.com despite conflicting environment targets", () => {
   assertReachedTheDataLayer(slugOnly, "slug-only");
   for (const call of listCalls(slugOnly)) {
-    assert.ok(call.includes("--repo acme/widget"), call);
+    assert.ok(call.includes("--repo github.com/acme/widget"), call);
   }
-  for (const call of slugOnly.fixtureCalls) {
-    assert.ok(!call.includes("--hostname"), `--hostname on a default-host target: ${call}`);
+  for (const call of apiCalls(slugOnly)) {
+    assert.ok(call.includes("--hostname github.com"), `default host was not explicit: ${call}`);
   }
   for (const call of apiCalls(slugOnly)) {
     assert.ok(call.includes("repos/acme/widget/"), call);

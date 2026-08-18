@@ -23,7 +23,7 @@
 process.env.NODE_ENV ??= "production";
 
 import { execFile, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -182,6 +182,7 @@ const runtime = {
   // `gh api` calls get it as --hostname, because gh api has no --repo and would
   // otherwise silently query github.com while the other tabs read the tenant.
   host: null,
+  repoExplicit: false,
   refreshMs: REFRESH_MS,
   verbose: false,
   initialTabIndex: 0,
@@ -636,7 +637,65 @@ async function runGh(args, { signal, operation } = {}) {
 // slug otherwise -- which is exactly the [HOST/]OWNER/REPO form `gh --repo`
 // documents.
 function qualifiedRepo() {
-  return runtime.host ? `${runtime.host}/${runtime.repo}` : runtime.repo;
+  const host = runtime.repoExplicit ? effectiveRuntimeHost() : runtime.host;
+  return host ? `${host}/${runtime.repo}` : runtime.repo;
+}
+
+function normalizeHost(value) {
+  if (typeof value !== "string") return null;
+  const host = value.trim().toLowerCase();
+  return HOST_PATTERN.test(host) ? host : null;
+}
+
+function remoteHost(value) {
+  if (typeof value !== "string" || value.length === 0) return null;
+  try {
+    if (value.includes("://")) return normalizeHost(new URL(value).hostname);
+  } catch {
+    return null;
+  }
+  const scp = /^(?:[^@\s]+@)?([^:/\s]+):[^\s]+$/.exec(value);
+  return scp ? normalizeHost(scp[1]) : null;
+}
+
+// One resolver governs both the rate-limit route and the account coordinator.
+// Explicit --repo is intentionally authoritative: a qualified value names its
+// host, while an unqualified value means github.com even when GH_HOST or
+// GH_REPO is also present. This is the approved Phase 2 precedence deviation.
+function resolveEffectiveHost({
+  runtimeHost = null,
+  runtimeRepo = null,
+  repoExplicit = false,
+  ghHost = null,
+  ghRepo = null,
+  remoteUrls = [],
+} = {}) {
+  if (repoExplicit && runtimeRepo) return normalizeHost(runtimeHost) ?? "github.com";
+  const explicitRuntimeHost = normalizeHost(runtimeHost);
+  if (explicitRuntimeHost) return explicitRuntimeHost;
+  const environmentHost = normalizeHost(ghHost);
+  if (environmentHost) return environmentHost;
+  if (ghRepo) {
+    try {
+      const target = parseRepoTarget(ghRepo);
+      return normalizeHost(target.host) ?? "github.com";
+    } catch {
+      return null;
+    }
+  }
+  const hosts = new Set(remoteUrls.map(remoteHost).filter(Boolean));
+  return hosts.size === 1 ? [...hosts][0] : null;
+}
+
+function effectiveRuntimeHost(options = {}) {
+  return resolveEffectiveHost({
+    runtimeHost: runtime.host,
+    runtimeRepo: runtime.repo,
+    repoExplicit: runtime.repoExplicit,
+    ghHost: process.env.GH_HOST,
+    ghRepo: process.env.GH_REPO,
+    ...options,
+  });
 }
 
 // `--repo` for the list subcommands. Empty when unset, so the argv vector stays
@@ -652,7 +711,8 @@ function repoArgs() {
 // talking to. --hostname is the flag gh api does have. Empty when no host was
 // given, so the default argv vector is unchanged.
 function apiHostArgs() {
-  return runtime.host ? ["--hostname", runtime.host] : [];
+  const host = effectiveRuntimeHost();
+  return host ? ["--hostname", host] : [];
 }
 
 // `gh api` has no --repo; it resolves the {owner}/{repo} placeholder from the
@@ -1108,7 +1168,10 @@ function normalizeBudgetResource(raw, observedAt = raw?.observedAt) {
 
 function budgetEpoch(resource) {
   const normalized = normalizeBudgetResource(resource);
-  return normalized ? `${normalized.limit}:${normalized.resetMs}` : null;
+  if (!normalized) return null;
+  return typeof resource?.epoch === "string" && resource.epoch.length > 0
+    ? resource.epoch
+    : `${normalized.limit}:${normalized.resetMs}`;
 }
 
 function resourceReserve(limit) {
@@ -1127,7 +1190,11 @@ function reservationCost(reservation, resource, leases, nowMs) {
     const lease = leaseFor(leases, reservation.leaseId);
     if (!lease || (Number.isFinite(lease.expiresAt) && lease.expiresAt <= nowMs)) return 0;
   }
-  const cost = reservation.costs?.[resource] ??
+  const chargedCosts = reservation.status === "completed" &&
+      reservation.outcome === "measured-success" && reservation.actualCosts
+    ? reservation.actualCosts
+    : reservation.costs;
+  const cost = chargedCosts?.[resource] ??
     (reservation.resource === resource ? reservation.cost : 0);
   return Number.isFinite(cost) && cost > 0 ? cost : 0;
 }
@@ -1497,6 +1564,875 @@ function scheduleIntents({
     denied,
     prunedIntentIds,
   };
+}
+
+// ---------- Shared account governor ----------
+
+const GOVERNOR_STATE_VERSION = 1;
+const GOVERNOR_MAX_LEASES = 128;
+const GOVERNOR_MAX_INTENTS = 512;
+const GOVERNOR_MAX_RESERVATIONS = 512;
+const GOVERNOR_LOCK_WAIT_MS = 250;
+const GOVERNOR_PROBE_DRAIN_MS = 30_000;
+const GOVERNOR_MAX_FUTURE_MS = 24 * 60 * 60 * 1000;
+const GOVERNOR_OUTCOMES = new Set([
+  "measured-success",
+  "rejected",
+  "timeout",
+  "signal",
+  "abort",
+  "process-loss",
+]);
+const GOVERNOR_RESERVATION_STATUSES = new Set([
+  "scheduled",
+  "started",
+  "completed",
+  "cancelled",
+]);
+const GOVERNOR_PROBE_STATUSES = new Set(["idle", "waiting", "healthy", "failed"]);
+const GOVERNOR_BLOCK_REASONS = new Set(["rate-limit", "secondary-rate-limit", "abuse-limit"]);
+const GOVERNOR_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function governorId() {
+  return randomUUID();
+}
+
+function validGovernorId(value) {
+  return typeof value === "string" && GOVERNOR_ID_PATTERN.test(value);
+}
+
+function validGovernorEpoch(value) {
+  return typeof value === "string" && /^[0-9:.]+$/.test(value);
+}
+
+function governorScopeHash(effectiveHost, authIdentity) {
+  const host = normalizeHost(effectiveHost);
+  if (!host || typeof authIdentity !== "string" || authIdentity.length === 0) return null;
+  return createHash("sha256")
+    .update(JSON.stringify({ version: GOVERNOR_STATE_VERSION, effectiveHost: host, authCacheIdentity: authIdentity }))
+    .digest("hex");
+}
+
+function governorPath(scopeHash, options = {}) {
+  return join(dirname(widthPreferencesPath(options)), `rate-governor-v1-${scopeHash}.json`);
+}
+
+function createGovernorScope({
+  effectiveHost,
+  authIdentity,
+  identityProvider = null,
+  now = Date.now,
+  kill = process.kill.bind(process),
+  ...pathOptions
+} = {}) {
+  const host = normalizeHost(effectiveHost);
+  const resolvedAuthIdentity = authIdentity ?? authCacheIdentity(pathOptions);
+  const hash = governorScopeHash(host, resolvedAuthIdentity);
+  if (!hash) return { ok: false, reason: "unknown-host" };
+  const currentIdentity = identityProvider ?? (authIdentity === undefined
+    ? () => ({ effectiveHost: host, authIdentity: authCacheIdentity(pathOptions) })
+    : null);
+  return {
+    ok: true,
+    value: {
+      hash,
+      path: governorPath(hash, pathOptions),
+      host,
+      authIdentity: resolvedAuthIdentity,
+      identityProvider: currentIdentity,
+      now,
+      kill,
+    },
+  };
+}
+
+function scopeNow(scope, nowMs) {
+  return Number.isFinite(nowMs) ? nowMs : Number(scope?.now?.());
+}
+
+function currentGovernorScope(scope) {
+  if (!scope || typeof scope.path !== "string" || !scope.hash || !normalizeHost(scope.host)) {
+    return { ok: false, reason: "unknown-host" };
+  }
+  if (typeof scope.identityProvider !== "function") return { ok: true, value: scope };
+  let current;
+  try {
+    current = scope.identityProvider();
+  } catch {
+    return { ok: false, reason: "stale" };
+  }
+  const hash = governorScopeHash(current?.effectiveHost, current?.authIdentity);
+  return hash === scope.hash ? { ok: true, value: scope } : { ok: false, reason: "stale" };
+}
+
+function emptyGovernorState() {
+  return {
+    version: GOVERNOR_STATE_VERSION,
+    epochs: { core: null, graphql: null },
+    budgets: {},
+    probeClaim: null,
+    probeOutcome: { status: "idle", at: 0, nextAt: 0 },
+    leases: {},
+    intents: {},
+    reservations: {},
+    manualProbe: null,
+  };
+}
+
+function finiteTimestamp(value, nowMs, { nullable = false, future = GOVERNOR_MAX_FUTURE_MS } = {}) {
+  if (nullable && value === null) return null;
+  return Number.isFinite(value) && value >= 0 && value <= nowMs + future ? value : undefined;
+}
+
+function exactKeys(value, keys) {
+  return isRecord(value) &&
+    Object.keys(value).length === keys.length &&
+    keys.every((key) => Object.hasOwn(value, key));
+}
+
+function normalizeGovernorBudget(raw, nowMs) {
+  if (!exactKeys(raw, [
+    "limit", "remaining", "used", "resetMs", "observedAt", "blockUntil",
+    "blockReason", "laneNextAt", "roundRobinCursor", "lastExternalFactor", "epoch",
+  ])) return null;
+  const normalized = normalizeBudgetResource(raw);
+  if (
+    !normalized ||
+    normalized.observedAt > nowMs ||
+    finiteTimestamp(normalized.resetMs, nowMs) === undefined ||
+    finiteTimestamp(raw.blockUntil, nowMs, { nullable: true }) === undefined ||
+    finiteTimestamp(raw.laneNextAt, nowMs) === undefined ||
+    (raw.blockReason !== null && !GOVERNOR_BLOCK_REASONS.has(raw.blockReason)) ||
+    (raw.roundRobinCursor !== null && !validGovernorId(raw.roundRobinCursor)) ||
+    !Number.isFinite(raw.lastExternalFactor) || raw.lastExternalFactor < 1 ||
+    !validGovernorEpoch(raw.epoch)
+  ) return null;
+  return {
+    ...normalized,
+    blockUntil: raw.blockUntil,
+    blockReason: raw.blockReason,
+    laneNextAt: raw.laneNextAt,
+    roundRobinCursor: raw.roundRobinCursor,
+    lastExternalFactor: raw.lastExternalFactor,
+    epoch: raw.epoch,
+  };
+}
+
+function normalizeGovernorLease(raw, nowMs) {
+  if (!exactKeys(raw, ["expiresAt", "floorMs", "activeTab", "phaseSeed", "demand"])) return null;
+  const phaseSeed = normalizePhaseSeed(raw.phaseSeed);
+  const demand = exactResourceCosts(raw.demand);
+  if (
+    finiteTimestamp(raw.expiresAt, nowMs) === undefined ||
+    !Number.isFinite(raw.floorMs) || raw.floorMs < MIN_REFRESH_SECONDS * 1000 ||
+    !TAB_KEYS.includes(raw.activeTab) ||
+    !phaseSeed || !validGovernorId(phaseSeed.seed) || phaseSeed.registeredAt > nowMs ||
+    !demand
+  ) return null;
+  return { expiresAt: raw.expiresAt, floorMs: raw.floorMs, activeTab: raw.activeTab, phaseSeed, demand };
+}
+
+function normalizeGovernorIntent(raw, nowMs) {
+  if (!exactKeys(raw, ["leaseId", "tab", "priority", "costs", "requestedAt", "expiresAt"])) return null;
+  const expectedCosts = TAB_KEYS.includes(raw.tab)
+    ? tabRequestCost(raw.tab)
+    : operationCost(raw.tab);
+  const suppliedCosts = exactResourceCosts(raw.costs);
+  const costs = expectedCosts && suppliedCosts &&
+    RATE_RESOURCES.every((resource) => expectedCosts[resource] === suppliedCosts[resource])
+    ? expectedCosts
+    : null;
+  if (
+    !validGovernorId(raw.leaseId) ||
+    typeof raw.tab !== "string" || intentPriority(raw) === null || !costs ||
+    finiteTimestamp(raw.requestedAt, nowMs) === undefined || raw.requestedAt > nowMs ||
+    finiteTimestamp(raw.expiresAt, nowMs) === undefined
+  ) return null;
+  return { ...raw, costs };
+}
+
+function normalizeGovernorReservation(raw, nowMs) {
+  if (!exactKeys(raw, [
+    "leaseId", "intentId", "costs", "actualCosts", "notBefore", "status", "epochs",
+    "startedAt", "completedAt", "outcome",
+  ])) return null;
+  const costs = exactResourceCosts(raw.costs);
+  const actualCosts = raw.actualCosts === null ? null : exactResourceCosts(raw.actualCosts);
+  const epochs = exactKeys(raw.epochs, RATE_RESOURCES) &&
+    RATE_RESOURCES.every((resource) => raw.epochs[resource] === null || validGovernorEpoch(raw.epochs[resource]))
+    ? { ...raw.epochs }
+    : null;
+  if (
+    !validGovernorId(raw.leaseId) || !validGovernorId(raw.intentId) ||
+    !costs || actualCosts === null && raw.actualCosts !== null || !epochs ||
+    finiteTimestamp(raw.notBefore, nowMs) === undefined ||
+    !GOVERNOR_RESERVATION_STATUSES.has(raw.status) ||
+    finiteTimestamp(raw.startedAt, nowMs, { nullable: true }) === undefined ||
+    finiteTimestamp(raw.completedAt, nowMs, { nullable: true }) === undefined ||
+    (raw.startedAt !== null && raw.startedAt > nowMs) ||
+    (raw.completedAt !== null && raw.completedAt > nowMs) ||
+    (raw.outcome !== null && !GOVERNOR_OUTCOMES.has(raw.outcome))
+  ) return null;
+  if (actualCosts && RATE_RESOURCES.some((resource) => actualCosts[resource] > costs[resource])) return null;
+  return { ...raw, costs, actualCosts, epochs };
+}
+
+function normalizeProbeClaim(raw, nowMs) {
+  if (raw === null) return null;
+  if (!exactKeys(raw, ["ownerLeaseId", "nonce", "leaseUntil", "nextAt", "claimAt", "startedReservationIds"])) {
+    return undefined;
+  }
+  if (
+    !validGovernorId(raw.ownerLeaseId) || !validGovernorId(raw.nonce) ||
+    finiteTimestamp(raw.leaseUntil, nowMs) === undefined ||
+    finiteTimestamp(raw.nextAt, nowMs) === undefined ||
+    finiteTimestamp(raw.claimAt, nowMs) === undefined || raw.claimAt > nowMs ||
+    !Array.isArray(raw.startedReservationIds) || raw.startedReservationIds.length > GOVERNOR_MAX_RESERVATIONS ||
+    raw.startedReservationIds.some((id) => !id.startsWith("reservation:") || !validGovernorId(id.slice(12)))
+  ) return undefined;
+  return { ...raw, startedReservationIds: [...new Set(raw.startedReservationIds)] };
+}
+
+function normalizeManualProbe(raw, nowMs) {
+  if (raw === null) return null;
+  if (!exactKeys(raw, ["requestedEpoch", "baselineObservedAt", "satisfiedAt"])) return undefined;
+  if (
+    !validGovernorEpoch(raw.requestedEpoch) ||
+    finiteTimestamp(raw.baselineObservedAt, nowMs) === undefined || raw.baselineObservedAt > nowMs ||
+    finiteTimestamp(raw.satisfiedAt, nowMs, { nullable: true }) === undefined ||
+    (raw.satisfiedAt !== null && raw.satisfiedAt > nowMs)
+  ) return undefined;
+  return { ...raw };
+}
+
+function normalizeGovernorState(raw, nowMs, { prune = true } = {}) {
+  if (!exactKeys(raw, [
+    "version", "epochs", "budgets", "probeClaim", "probeOutcome", "leases",
+    "intents", "reservations", "manualProbe",
+  ]) || raw.version !== GOVERNOR_STATE_VERSION) return null;
+  if (
+    !exactKeys(raw.epochs, RATE_RESOURCES) ||
+    RATE_RESOURCES.some((resource) => raw.epochs[resource] !== null && !validGovernorEpoch(raw.epochs[resource])) ||
+    !isRecord(raw.budgets) || Object.keys(raw.budgets).some((resource) => !RATE_RESOURCES.includes(resource)) ||
+    !isRecord(raw.leases) || !isRecord(raw.intents) || !isRecord(raw.reservations) ||
+    !exactKeys(raw.probeOutcome, ["status", "at", "nextAt"]) ||
+    !GOVERNOR_PROBE_STATUSES.has(raw.probeOutcome.status) ||
+    finiteTimestamp(raw.probeOutcome.at, nowMs) === undefined ||
+    raw.probeOutcome.at > nowMs ||
+    finiteTimestamp(raw.probeOutcome.nextAt, nowMs) === undefined
+  ) return null;
+
+  const state = emptyGovernorState();
+  state.epochs = { ...raw.epochs };
+  state.probeOutcome = { ...raw.probeOutcome };
+  for (const resource of Object.keys(raw.budgets)) {
+    const budget = normalizeGovernorBudget(raw.budgets[resource], nowMs);
+    if (!budget) return null;
+    state.budgets[resource] = budget;
+  }
+  for (const [id, rawLease] of Object.entries(raw.leases)) {
+    if (!validGovernorId(id)) return null;
+    const lease = normalizeGovernorLease(rawLease, nowMs);
+    if (!lease || lease.phaseSeed.seed !== id) return null;
+    if (!prune || lease.expiresAt > nowMs) state.leases[id] = lease;
+  }
+  if (Object.keys(state.leases).length > GOVERNOR_MAX_LEASES) return null;
+  for (const [id, rawIntent] of Object.entries(raw.intents)) {
+    if (!validGovernorId(id)) return null;
+    const intent = normalizeGovernorIntent(rawIntent, nowMs);
+    if (!intent) return null;
+    if (!prune || (intent.expiresAt > nowMs && state.leases[intent.leaseId])) state.intents[id] = intent;
+  }
+  if (Object.keys(state.intents).length > GOVERNOR_MAX_INTENTS) return null;
+  for (const [id, rawReservation] of Object.entries(raw.reservations)) {
+    if (!id.startsWith("reservation:") || !validGovernorId(id.slice(12))) return null;
+    const reservation = normalizeGovernorReservation(rawReservation, nowMs);
+    if (!reservation) return null;
+    if (
+      !prune || reservation.status === "started" || reservation.status === "completed" ||
+      (reservation.status === "scheduled" && state.leases[reservation.leaseId])
+    ) state.reservations[id] = reservation;
+  }
+  if (Object.keys(state.reservations).length > GOVERNOR_MAX_RESERVATIONS) return null;
+  state.probeClaim = normalizeProbeClaim(raw.probeClaim, nowMs);
+  if (state.probeClaim === undefined) return null;
+  if (state.probeClaim?.leaseUntil <= nowMs) state.probeClaim = null;
+  state.manualProbe = normalizeManualProbe(raw.manualProbe, nowMs);
+  if (state.manualProbe === undefined) return null;
+  return state;
+}
+
+function serializeGovernorState(state) {
+  return `${JSON.stringify(state, null, 2)}\n`;
+}
+
+function readGovernorState(path, nowMs) {
+  let raw;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    return error?.code === "ENOENT"
+      ? { ok: true, value: emptyGovernorState(), missing: true }
+      : { ok: false, reason: "unwritable" };
+  }
+  try {
+    const value = normalizeGovernorState(JSON.parse(raw), nowMs);
+    return value ? { ok: true, value } : { ok: false, reason: "corrupt" };
+  } catch {
+    return { ok: false, reason: "corrupt" };
+  }
+}
+
+function writeGovernorState(path, state) {
+  const parent = dirname(path);
+  let tempPath = null;
+  try {
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    chmodSync(parent, 0o700);
+    tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(tempPath, serializeGovernorState(state), { encoding: "utf8", mode: 0o600, flag: "wx" });
+    chmodSync(tempPath, 0o600);
+    renameSync(tempPath, path);
+    chmodSync(path, 0o600);
+    return { ok: true };
+  } catch {
+    if (tempPath !== null) {
+      try { unlinkSync(tempPath); } catch { /* exact private temporary file only */ }
+    }
+    return { ok: false, reason: "unwritable" };
+  }
+}
+
+function lockOwner(path) {
+  try {
+    const owner = JSON.parse(readFileSync(path, "utf8"));
+    return exactKeys(owner, ["pid", "nonce"]) && Number.isSafeInteger(owner.pid) && owner.pid > 0 &&
+      typeof owner.nonce === "string" && owner.nonce.length > 0 ? owner : null;
+  } catch {
+    return null;
+  }
+}
+
+function pidIsDead(pid, kill = process.kill.bind(process)) {
+  try {
+    kill(pid, 0);
+    return false;
+  } catch (error) {
+    if (error?.code === "ESRCH") return true;
+    return false;
+  }
+}
+
+function releaseGovernorLock(lockPath, nonce) {
+  const owner = lockOwner(lockPath);
+  if (!owner || owner.nonce !== nonce) return false;
+  const releasePath = `${lockPath}.release-${nonce}`;
+  try {
+    renameSync(lockPath, releasePath);
+    unlinkSync(releasePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function withGovernorLock(scope, operation, {
+  pid = process.pid,
+  nonce = randomUUID(),
+  waitMs = GOVERNOR_LOCK_WAIT_MS,
+  kill = scope?.kill ?? process.kill.bind(process),
+} = {}) {
+  const current = currentGovernorScope(scope);
+  if (!current.ok) return current;
+  const lockPath = `${scope.path}.lock`;
+  const deadline = Date.now() + waitMs;
+  try {
+    mkdirSync(dirname(scope.path), { recursive: true, mode: 0o700 });
+    chmodSync(dirname(scope.path), 0o700);
+  } catch {
+    return { ok: false, reason: "unwritable" };
+  }
+  for (;;) {
+    try {
+      const descriptor = openSync(lockPath, "wx", 0o600);
+      try {
+        writeFileSync(descriptor, JSON.stringify({ pid, nonce }), "utf8");
+      } finally {
+        closeSync(descriptor);
+      }
+      chmodSync(lockPath, 0o600);
+      try {
+        return operation();
+      } finally {
+        releaseGovernorLock(lockPath, nonce);
+      }
+    } catch (error) {
+      if (error?.code !== "EEXIST") return { ok: false, reason: "unwritable" };
+      const owner = lockOwner(lockPath);
+      // The creator owns the canonical path as soon as open("wx") succeeds,
+      // before its small JSON owner record is fully visible. Treat an unreadable
+      // record as owned during the bounded wait; stealing it could overlap the
+      // creator, while returning busy is always fail-closed.
+      if (!owner) {
+        if (Date.now() >= deadline) return { ok: false, reason: "busy" };
+        Atomics.wait(persistenceWaitCell, 0, 0, 5);
+        continue;
+      }
+      if (pidIsDead(owner.pid, kill)) {
+        const quarantinePath = `${lockPath}.quarantine-${randomUUID()}`;
+        try {
+          renameSync(lockPath, quarantinePath);
+          try { unlinkSync(quarantinePath); } catch { /* quarantine remains private and inert */ }
+          continue;
+        } catch (quarantineError) {
+          if (quarantineError?.code === "ENOENT") continue;
+          return { ok: false, reason: "busy" };
+        }
+      }
+      if (Date.now() >= deadline) return { ok: false, reason: "busy" };
+      Atomics.wait(persistenceWaitCell, 0, 0, 5);
+    }
+  }
+}
+
+function mutateGovernor(scope, nowMs, mutate) {
+  const at = scopeNow(scope, nowMs);
+  if (!Number.isFinite(at) || at < 0) return { ok: false, reason: "corrupt" };
+  return withGovernorLock(scope, () => {
+    const loaded = readGovernorState(scope.path, at);
+    if (!loaded.ok) return loaded;
+    const state = loaded.value;
+    const value = mutate(state, at);
+    if (value?.ok === false && value.write !== true) return value;
+    const normalized = normalizeGovernorState(state, at);
+    if (!normalized) return { ok: false, reason: "corrupt" };
+    const written = writeGovernorState(scope.path, normalized);
+    if (!written.ok) return written;
+    return value?.ok === false ? { ok: false, reason: value.reason } : { ok: true, value: value?.value };
+  });
+}
+
+function scheduleGovernorState(state, nowMs) {
+  if (Object.keys(state.intents).length === 0) return { grants: [], denied: [] };
+  const lanes = Object.fromEntries(RATE_RESOURCES.flatMap((resource) =>
+    state.budgets[resource] ? [[resource, { nextAt: state.budgets[resource].laneNextAt }]] : [],
+  ));
+  const cursors = Object.fromEntries(RATE_RESOURCES.flatMap((resource) =>
+    state.budgets[resource]?.roundRobinCursor
+      ? [[resource, state.budgets[resource].roundRobinCursor]]
+      : [],
+  ));
+  const deferredBackground = state.probeOutcome.status === "failed"
+    ? Object.entries(state.intents)
+      .filter(([, intent]) => intentPriority(intent) === REQUEST_PRIORITIES.background)
+      .map(([id]) => id)
+    : [];
+  const deferred = new Set(deferredBackground);
+  const result = scheduleIntents({
+    intents: Object.entries(state.intents)
+      .filter(([id]) => !deferred.has(id))
+      .map(([id, intent]) => ({
+        id,
+        ...intent,
+        tab: TAB_KEYS.includes(intent.tab) ? intent.tab : undefined,
+      })),
+    leases: state.leases,
+    budgets: state.budgets,
+    reservations: Object.entries(state.reservations).map(([id, reservation]) => ({ id, ...reservation })),
+    lanes,
+    cursors,
+    nowMs,
+  });
+  result.denied.push(...deferredBackground.map((intentId) => ({
+    intentId,
+    mode: "paused",
+    reason: "probe-failed",
+  })));
+  for (const id of result.prunedIntentIds) delete state.intents[id];
+  for (const grant of result.grants) {
+    if (Object.keys(state.reservations).length >= GOVERNOR_MAX_RESERVATIONS) break;
+    state.reservations[grant.id] = {
+      leaseId: grant.leaseId,
+      intentId: grant.intentId,
+      costs: grant.costs,
+      actualCosts: null,
+      notBefore: grant.notBefore,
+      status: "scheduled",
+      epochs: { core: grant.epochs.core ?? null, graphql: grant.epochs.graphql ?? null },
+      startedAt: null,
+      completedAt: null,
+      outcome: null,
+    };
+    delete state.intents[grant.intentId];
+  }
+  for (const resource of RATE_RESOURCES) {
+    if (!state.budgets[resource]) continue;
+    state.budgets[resource].laneNextAt = result.lanes[resource]?.nextAt ?? state.budgets[resource].laneNextAt;
+    state.budgets[resource].roundRobinCursor = result.cursors[resource] ?? state.budgets[resource].roundRobinCursor;
+  }
+  return result;
+}
+
+function registerLease(scope, lease) {
+  return mutateGovernor(scope, lease?.phaseSeed?.registeredAt, (state, nowMs) => {
+    if (!isRecord(lease) || !validGovernorId(lease.id) || lease.phaseSeed?.seed !== lease.id) {
+      return { ok: false, reason: "corrupt" };
+    }
+    const normalized = normalizeGovernorLease({
+      expiresAt: lease.expiresAt,
+      floorMs: lease.floorMs,
+      activeTab: lease.activeTab,
+      phaseSeed: lease.phaseSeed,
+      demand: lease.demand,
+    }, nowMs);
+    if (!normalized || normalized.expiresAt <= nowMs) return { ok: false, reason: "stale" };
+    if (!state.leases[lease.id] && Object.keys(state.leases).length >= GOVERNOR_MAX_LEASES) {
+      return { ok: false, reason: "busy" };
+    }
+    state.leases[lease.id] = normalized;
+    return { value: { leaseId: lease.id, expiresAt: normalized.expiresAt } };
+  });
+}
+
+function heartbeatLease(scope, leaseId, demand, nowMs) {
+  return mutateGovernor(scope, nowMs, (state, at) => {
+    const lease = state.leases[leaseId];
+    const costs = exactResourceCosts(demand);
+    if (!lease || !costs) return { ok: false, reason: "stale" };
+    lease.expiresAt = at + GOVERNOR_LEASE_TTL_MS;
+    lease.demand = costs;
+    scheduleGovernorState(state, at);
+    return { value: { leaseId, expiresAt: lease.expiresAt } };
+  });
+}
+
+function claimProbe(scope, leaseId, nowMs) {
+  return mutateGovernor(scope, nowMs, (state, at) => {
+    if (!state.leases[leaseId]) return { ok: false, reason: "stale" };
+    if (state.probeClaim && state.probeClaim.leaseUntil > at) {
+      return { value: { status: "waiting", leaseUntil: state.probeClaim.leaseUntil } };
+    }
+    const nonce = randomUUID();
+    const startedReservationIds = Object.entries(state.reservations)
+      .filter(([, reservation]) => reservation.status === "started")
+      .map(([id]) => id);
+    state.probeClaim = {
+      ownerLeaseId: leaseId,
+      nonce,
+      leaseUntil: at + GOVERNOR_PROBE_LEASE_MS,
+      nextAt: at,
+      claimAt: at,
+      startedReservationIds,
+    };
+    state.probeOutcome = { status: "waiting", at, nextAt: at + GOVERNOR_PROBE_LEASE_MS };
+    return { value: { status: "claimed", nonce, leaseUntil: state.probeClaim.leaseUntil, startedReservationIds } };
+  });
+}
+
+function renewProbeClaim(scope, leaseId, nonce, nowMs) {
+  return mutateGovernor(scope, nowMs, (state, at) => {
+    const claim = state.probeClaim;
+    if (!claim || claim.ownerLeaseId !== leaseId || claim.nonce !== nonce || claim.leaseUntil <= at) {
+      return { ok: false, reason: "stale" };
+    }
+    claim.leaseUntil = at + GOVERNOR_ACTIVE_PROBE_LEASE_MS;
+    return { value: { nonce, leaseUntil: claim.leaseUntil } };
+  });
+}
+
+function budgetFromProbe(raw, previous, nowMs) {
+  const normalized = normalizeBudgetResource({ ...raw, observedAt: nowMs });
+  if (!normalized || normalized.resetMs <= nowMs) return null;
+  const baseEpoch = `${normalized.limit}:${normalized.resetMs}`;
+  const epoch = previous && previous.resetMs === normalized.resetMs && previous.used <= normalized.used
+    ? previous.epoch
+    : previous && previous.resetMs === normalized.resetMs && normalized.used < previous.used
+      ? `${baseEpoch}:${nowMs}`
+      : baseEpoch;
+  return {
+    ...normalized,
+    blockUntil: null,
+    blockReason: null,
+    laneNextAt: previous?.laneNextAt ?? nowMs,
+    roundRobinCursor: previous?.roundRobinCursor ?? null,
+    lastExternalFactor: previous?.lastExternalFactor ?? 1,
+    epoch,
+  };
+}
+
+function publishProbe(scope, leaseId, nonce, budgets, nowMs) {
+  return mutateGovernor(scope, nowMs, (state, at) => {
+    const claim = state.probeClaim;
+    if (!claim || claim.ownerLeaseId !== leaseId || claim.nonce !== nonce || claim.leaseUntil <= at) {
+      return { ok: false, reason: "stale" };
+    }
+    const nextBudgets = {};
+    for (const resource of RATE_RESOURCES) {
+      nextBudgets[resource] = budgetFromProbe(budgets?.[resource], state.budgets[resource], at);
+      if (!nextBudgets[resource]) return { ok: false, reason: "corrupt" };
+    }
+    const nextEpochs = Object.fromEntries(RATE_RESOURCES.map((resource) => [
+      resource,
+      budgetEpoch(nextBudgets[resource]),
+    ]));
+    for (const resource of RATE_RESOURCES) {
+      const previous = state.budgets[resource];
+      if (!previous || nextBudgets[resource].used < previous.used) continue;
+      const sharedCompletedDelta = Object.values(state.reservations)
+        .filter((reservation) => reservation.status === "completed" && reservation.completedAt <= claim.claimAt)
+        .reduce((total, reservation) => total + reservationCost(reservation, resource, state.leases, at), 0);
+      const factor = nextExternalFactor({
+        lastExternalFactor: previous.lastExternalFactor,
+        globalUsedDelta: nextBudgets[resource].used - previous.used,
+        sharedCompletedDelta,
+      });
+      if (factor === null) return { ok: false, reason: "corrupt" };
+      nextBudgets[resource].lastExternalFactor = factor;
+    }
+    const resetChanged = RATE_RESOURCES.some((resource) =>
+      state.epochs[resource] !== null && state.epochs[resource] !== nextEpochs[resource],
+    );
+    for (const [id, reservation] of Object.entries(state.reservations)) {
+      if (reservation.status === "completed" && reservation.completedAt <= claim.claimAt) {
+        delete state.reservations[id];
+      }
+    }
+    state.budgets = nextBudgets;
+    state.epochs = nextEpochs;
+    state.probeClaim = null;
+    state.probeOutcome = { status: "healthy", at, nextAt: at + BUDGET_PROBE_MS };
+    if (resetChanged) state.manualProbe = null;
+    else if (state.manualProbe &&
+      Object.values(nextEpochs).includes(state.manualProbe.requestedEpoch) &&
+      RATE_RESOURCES.some((resource) => availableForGrant({ budget: nextBudgets[resource], nowMs: at }).spendable === 0)) {
+      state.manualProbe.satisfiedAt = at;
+    }
+    scheduleGovernorState(state, at);
+    return { value: { epochs: nextEpochs, retiredThrough: claim.claimAt } };
+  });
+}
+
+function failProbeClaim(scope, leaseId, nonce, nowMs) {
+  return mutateGovernor(scope, nowMs, (state, at) => {
+    const claim = state.probeClaim;
+    if (!claim || claim.ownerLeaseId !== leaseId || claim.nonce !== nonce) {
+      return { ok: false, reason: "stale" };
+    }
+    state.probeClaim = null;
+    state.probeOutcome = { status: "failed", at, nextAt: at + BUDGET_PROBE_MS };
+    return { value: { retryAt: state.probeOutcome.nextAt } };
+  });
+}
+
+function requestManualProbe(scope, leaseId, epoch, observedAt, nowMs) {
+  return mutateGovernor(scope, nowMs, (state, at) => {
+    if (!state.leases[leaseId] || typeof epoch !== "string" || !Number.isFinite(observedAt)) {
+      return { ok: false, reason: "stale" };
+    }
+    if (state.manualProbe?.requestedEpoch === epoch && state.manualProbe.baselineObservedAt === observedAt) {
+      return { value: { status: state.manualProbe.satisfiedAt === null ? "pending" : "satisfied", ...state.manualProbe } };
+    }
+    state.manualProbe = { requestedEpoch: epoch, baselineObservedAt: observedAt, satisfiedAt: null };
+    state.probeOutcome.nextAt = Math.min(state.probeOutcome.nextAt || at, at);
+    return { value: { status: "pending", ...state.manualProbe } };
+  });
+}
+
+function registerIntent(scope, intent) {
+  return mutateGovernor(scope, intent?.requestedAt, (state, nowMs) => {
+    if (!isRecord(intent) || !validGovernorId(intent.id)) {
+      return { ok: false, reason: "corrupt" };
+    }
+    const normalized = normalizeGovernorIntent({
+      leaseId: intent.leaseId,
+      tab: intent.tab,
+      priority: intent.priority,
+      costs: intent.costs ?? tabRequestCost(intent.tab),
+      requestedAt: intent.requestedAt,
+      expiresAt: intent.expiresAt,
+    }, nowMs);
+    if (!normalized) return { ok: false, reason: "corrupt" };
+    if (normalized.expiresAt <= nowMs || !state.leases[normalized.leaseId]) {
+      return { ok: false, reason: "stale" };
+    }
+    const duplicate = Object.entries(state.intents).find(([, pending]) =>
+      pending.leaseId === normalized.leaseId && pending.tab === normalized.tab &&
+      pending.priority === normalized.priority,
+    );
+    if (duplicate) return { value: { status: "pending", intentId: duplicate[0], coalesced: true } };
+    const existingReservation = Object.entries(state.reservations).find(([, reservation]) =>
+      reservation.intentId === intent.id,
+    );
+    if (existingReservation) return { value: { status: existingReservation[1].status, reservationId: existingReservation[0] } };
+    if (!state.intents[intent.id] && Object.keys(state.intents).length >= GOVERNOR_MAX_INTENTS) {
+      return { ok: false, reason: "busy" };
+    }
+    state.intents[intent.id] = normalized;
+    const scheduled = scheduleGovernorState(state, nowMs);
+    const reservation = Object.entries(state.reservations).find(([, item]) => item.intentId === intent.id);
+    const denial = scheduled.denied.find((item) => item.intentId === intent.id);
+    return { value: reservation
+      ? { status: "scheduled", reservationId: reservation[0], ...reservation[1] }
+      : { status: denial?.mode ?? "pending", intentId: intent.id, reason: denial?.reason ?? "budget-unknown" } };
+  });
+}
+
+function readIntentDecision(scope, intentId, nowMs) {
+  return mutateGovernor(scope, nowMs, (state, at) => {
+    const scheduled = scheduleGovernorState(state, at);
+    const reservation = Object.entries(state.reservations).find(([, item]) => item.intentId === intentId);
+    if (reservation) return { value: { status: reservation[1].status, reservationId: reservation[0], ...reservation[1] } };
+    if (!state.intents[intentId]) return { ok: false, reason: "stale" };
+    const denial = scheduled.denied.find((item) => item.intentId === intentId);
+    return { value: { status: denial?.mode ?? "pending", reason: denial?.reason ?? "budget-unknown" } };
+  });
+}
+
+function startReservation(scope, reservationId, nowMs) {
+  return mutateGovernor(scope, nowMs, (state, at) => {
+    const reservation = state.reservations[reservationId];
+    const lease = reservation && state.leases[reservation.leaseId];
+    if (!reservation || reservation.status !== "scheduled" || !lease || lease.expiresAt <= at) {
+      if (reservation?.status === "scheduled") reservation.status = "cancelled";
+      return { ok: false, reason: "stale", write: Boolean(reservation) };
+    }
+    if (reservation.notBefore > at) return { value: { status: "waiting", notBefore: reservation.notBefore } };
+    if (state.probeClaim && state.probeClaim.leaseUntil > at) {
+      return { value: { status: "waiting", reason: "probe", notBefore: state.probeClaim.leaseUntil } };
+    }
+    for (const resource of RATE_RESOURCES.filter((name) => reservation.costs[name] > 0)) {
+      const budget = state.budgets[resource];
+      if (
+        !budget || at - budget.observedAt > BUDGET_SNAPSHOT_TTL_MS || at >= budget.resetMs ||
+        state.epochs[resource] !== reservation.epochs[resource] ||
+        (Number.isFinite(budget.blockUntil) && budget.blockUntil > at)
+      ) {
+        reservation.status = "cancelled";
+        return { ok: false, reason: "stale", write: true };
+      }
+      const charged = Object.values(state.reservations).reduce(
+        (total, item) => total + reservationCost(item, resource, state.leases, at),
+        0,
+      );
+      if (budget.remaining - resourceReserve(budget.limit) - charged < 0) {
+        reservation.status = "cancelled";
+        return { ok: false, reason: "stale", write: true };
+      }
+    }
+    reservation.status = "started";
+    reservation.startedAt = at;
+    return { value: { status: "started", reservationId } };
+  });
+}
+
+function completeReservation(scope, reservationId, completion, nowMs) {
+  return mutateGovernor(scope, nowMs, (state, at) => {
+    const reservation = state.reservations[reservationId];
+    if (!reservation || reservation.status !== "started" || !GOVERNOR_OUTCOMES.has(completion?.outcome)) {
+      return { ok: false, reason: "stale" };
+    }
+    const measured = completion.outcome === "measured-success"
+      ? exactResourceCosts(completion.actualCost)
+      : reservation.costs;
+    if (!measured || RATE_RESOURCES.some((resource) => measured[resource] > reservation.costs[resource])) {
+      return { ok: false, reason: "corrupt" };
+    }
+    reservation.status = "completed";
+    reservation.completedAt = at;
+    reservation.outcome = completion.outcome;
+    reservation.actualCosts = { ...measured };
+    return { value: { status: "completed", actualCosts: reservation.actualCosts } };
+  });
+}
+
+function recordResourceBlock(scope, resource, resetMs, reason) {
+  return mutateGovernor(scope, undefined, (state, nowMs) => {
+    const budget = state.budgets[resource];
+    if (!budget || !RATE_RESOURCES.includes(resource) || !Number.isFinite(resetMs) || resetMs <= nowMs ||
+      !GOVERNOR_BLOCK_REASONS.has(reason)) return { ok: false, reason: "corrupt" };
+    budget.blockUntil = resetMs;
+    budget.blockReason = reason;
+    return { value: { resource, resetMs, reason } };
+  });
+}
+
+function releaseLease(scope, leaseId) {
+  return mutateGovernor(scope, undefined, (state) => {
+    if (!state.leases[leaseId]) return { ok: false, reason: "stale" };
+    delete state.leases[leaseId];
+    for (const [id, intent] of Object.entries(state.intents)) {
+      if (intent.leaseId === leaseId) delete state.intents[id];
+    }
+    for (const [id, reservation] of Object.entries(state.reservations)) {
+      if (reservation.leaseId === leaseId && reservation.status === "scheduled") delete state.reservations[id];
+    }
+    return { value: { released: leaseId } };
+  });
+}
+
+function inspectGovernor(scope, nowMs) {
+  const at = scopeNow(scope, nowMs);
+  if (!Number.isFinite(at) || at < 0) return { ok: false, reason: "corrupt" };
+  return withGovernorLock(scope, () => {
+    const loaded = readGovernorState(scope.path, at);
+    return loaded.ok ? { ok: true, value: structuredClone(loaded.value) } : loaded;
+  });
+}
+
+function governorHealth(result, nowMs = Date.now()) {
+  if (!result?.ok) return { status: "unavailable", leases: 0, resources: {} };
+  const state = result.value;
+  let status = "healthy";
+  if (state.probeClaim?.leaseUntil > nowMs) status = "waiting for probe";
+  else if (RATE_RESOURCES.some((resource) => !state.budgets[resource] || nowMs - state.budgets[resource].observedAt > BUDGET_SNAPSHOT_TTL_MS)) status = "stale";
+  else if (RATE_RESOURCES.some((resource) => state.budgets[resource].blockUntil > nowMs)) status = "blocked";
+  return {
+    status,
+    leases: Object.keys(state.leases).length,
+    resources: Object.fromEntries(RATE_RESOURCES.flatMap((resource) => {
+      const budget = state.budgets[resource];
+      return budget ? [[resource, {
+        reserve: resourceReserve(budget.limit),
+        remaining: budget.remaining,
+        resetMs: budget.resetMs,
+      }]] : [];
+    })),
+  };
+}
+
+async function refreshSharedBudget(scope, leaseId, signal, {
+  readBudgets = readRateBudgets,
+  now = () => scopeNow(scope),
+  wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+} = {}) {
+  const claim = claimProbe(scope, leaseId, now());
+  if (!claim.ok || claim.value.status !== "claimed") return claim;
+  const { nonce, startedReservationIds } = claim.value;
+  const drainUntil = now() + GOVERNOR_PROBE_DRAIN_MS;
+  while (startedReservationIds.length > 0 && now() < drainUntil) {
+    const snapshot = inspectGovernor(scope, now());
+    if (!snapshot.ok) return snapshot;
+    const stillStarted = startedReservationIds.some((id) => snapshot.value.reservations[id]?.status === "started");
+    if (!stillStarted) break;
+    if (signal?.aborted) {
+      failProbeClaim(scope, leaseId, nonce, now());
+      return { ok: false, reason: "stale" };
+    }
+    await wait(Math.min(25, Math.max(1, drainUntil - now())));
+  }
+  const renewed = renewProbeClaim(scope, leaseId, nonce, now());
+  if (!renewed.ok) return renewed;
+  let budgets;
+  try {
+    budgets = await readBudgets(signal);
+  } catch {
+    budgets = null;
+  }
+  if (!budgets) {
+    failProbeClaim(scope, leaseId, nonce, now());
+    return { ok: false, reason: "stale" };
+  }
+  return publishProbe(scope, leaseId, nonce, budgets, now());
 }
 
 // Whether a probe window holds enough completed shared calls for the ratio below to
@@ -2233,6 +3169,12 @@ async function runDoctor() {
     rateBudget(),
     Promise.all(probes.map(([name, args, operation]) => probe(name, args, operation))),
   ]);
+  const effectiveHost = effectiveRuntimeHost({ remoteUrls: [remote] });
+  const scopeResult = createGovernorScope({ effectiveHost });
+  const governor = governorHealth(
+    scopeResult.ok ? inspectGovernor(scopeResult.value, Date.now()) : scopeResult,
+    Date.now(),
+  );
 
   const lines = [
     "gh-glance doctor",
@@ -2246,7 +3188,7 @@ async function runDoctor() {
     "",
     ...section("Repository target"),
     field("source", targetSource()),
-    field("host", runtime.host ?? "(default -- gh infers it)"),
+    field("host", effectiveHost ?? "(unresolved)"),
     field("slug", runtime.repo ?? "(inferred from the working directory)"),
     field("git remote", remote),
     "",
@@ -2261,6 +3203,19 @@ async function runDoctor() {
         return `~${rest} REST + ~${graphql} GraphQL per hour (refresh ${runtime.refreshMs / 1000}s, "${active}" active)`;
       })(),
     ),
+    "",
+    ...section("API governor"),
+    field("status", governor.status),
+    field("live leases", governor.leases),
+    ...RATE_RESOURCES.map((resource) => {
+      const detail = governor.resources[resource];
+      return field(
+        resource,
+        detail
+          ? `${detail.remaining} remaining, ${detail.reserve} reserved, reset ${new Date(detail.resetMs).toISOString()}`
+          : "unavailable",
+      );
+    }),
     "",
     ...section("Environment"),
     ...doctorEnvNames().map((name) => field(name, envValue(name))),
@@ -2581,6 +3536,7 @@ if (IS_MAIN) {
   // doctor branch on purpose, since that combination is useful and harmless.
   runtime.repo = opts.repo;
   runtime.host = opts.host;
+  runtime.repoExplicit = opts.repo !== null;
   runtime.verbose = opts.verbose;
   if (opts.refreshMs !== null) runtime.refreshMs = opts.refreshMs;
   if (opts.tabKey !== null) runtime.initialTabIndex = TAB_KEYS.indexOf(opts.tabKey);
@@ -6147,6 +7103,44 @@ export {
   resourceDecision,
   governorPhaseOffset,
   scheduleIntents,
+  GOVERNOR_STATE_VERSION,
+  GOVERNOR_MAX_LEASES,
+  GOVERNOR_MAX_INTENTS,
+  GOVERNOR_MAX_RESERVATIONS,
+  GOVERNOR_LOCK_WAIT_MS,
+  GOVERNOR_PROBE_DRAIN_MS,
+  GOVERNOR_ID_PATTERN,
+  governorId,
+  normalizeHost,
+  remoteHost,
+  resolveEffectiveHost,
+  governorScopeHash,
+  governorPath,
+  createGovernorScope,
+  emptyGovernorState,
+  normalizeGovernorState,
+  serializeGovernorState,
+  readGovernorState,
+  writeGovernorState,
+  pidIsDead,
+  releaseGovernorLock,
+  withGovernorLock,
+  registerLease,
+  heartbeatLease,
+  claimProbe,
+  renewProbeClaim,
+  publishProbe,
+  failProbeClaim,
+  requestManualProbe,
+  registerIntent,
+  readIntentDecision,
+  startReservation,
+  completeReservation,
+  recordResourceBlock,
+  releaseLease,
+  inspectGovernor,
+  governorHealth,
+  refreshSharedBudget,
   safe,
   shortErr,
   isUnavailable,
