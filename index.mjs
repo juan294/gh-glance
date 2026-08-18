@@ -1849,7 +1849,7 @@ function normalizeGovernorState(raw, nowMs, { prune = true } = {}) {
   for (const [id, rawReservation] of Object.entries(raw.reservations)) {
     if (!id.startsWith("reservation:") || !validGovernorId(id.slice(12))) return null;
     const reservation = normalizeGovernorReservation(rawReservation, nowMs);
-    if (!reservation) return null;
+    if (!reservation || id !== `reservation:${reservation.intentId}`) return null;
     if (
       !prune || reservation.status === "started" || reservation.status === "completed" ||
       (reservation.status === "scheduled" && state.leases[reservation.leaseId])

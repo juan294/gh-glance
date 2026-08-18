@@ -810,6 +810,33 @@ test("schema, bounds, corrupt data, and future timestamps fail closed", (t) => {
   writeGovernorState(scope.path, future);
   assert.equal(inspectGovernor(scope, NOW).reason, "corrupt");
 
+  const mismatched = emptyGovernorState();
+  const mismatchedLeaseId = randomUUID();
+  const mismatchedLease = lease(mismatchedLeaseId);
+  delete mismatchedLease.id;
+  mismatched.leases[mismatchedLeaseId] = mismatchedLease;
+  const intendedIntentId = randomUUID();
+  const differentIntentId = randomUUID();
+  const mismatchedReservationId = `reservation:${differentIntentId}`;
+  mismatched.reservations[mismatchedReservationId] = {
+    leaseId: mismatchedLeaseId,
+    intentId: intendedIntentId,
+    costs: { core: 2, graphql: 0 },
+    actualCosts: null,
+    notBefore: NOW,
+    status: "scheduled",
+    epochs: { core: null, graphql: null },
+    startedAt: null,
+    completedAt: null,
+    outcome: null,
+  };
+  writeGovernorState(scope.path, mismatched);
+  assert.equal(inspectGovernor(scope, NOW).reason, "corrupt");
+  assert.equal(registerIntent(scope, intent(intendedIntentId, mismatchedLeaseId)).reason, "corrupt");
+  assert.deepEqual(Object.keys(JSON.parse(readFileSync(scope.path, "utf8")).reservations), [
+    mismatchedReservationId,
+  ]);
+
   const oversized = emptyGovernorState();
   for (let index = 0; index < GOVERNOR_MAX_LEASES + 1; index += 1) {
     const id = randomUUID();
