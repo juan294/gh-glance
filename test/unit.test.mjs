@@ -2313,6 +2313,34 @@ test("manual priority wins but never bypasses the reserve", () => {
   assert.equal(denied.denied[0].mode, "paused");
 });
 
+test("tab intents derive registry costs and reject conflicting overrides", () => {
+  const result = scheduleIntents({
+    intents: [
+      {
+        id: "security-conflict",
+        leaseId: "lease",
+        tab: "security",
+        costs: { core: 1, graphql: 0 },
+        priority: "active",
+        expiresAt: POLICY_NOW + 10_000,
+      },
+      {
+        id: "security-derived",
+        leaseId: "lease",
+        tab: "security",
+        priority: "active",
+        expiresAt: POLICY_NOW + 10_000,
+      },
+    ],
+    leases: { lease: policyLease("security", POLICY_NOW + 10_000) },
+    budgets: { core: policyBudget() },
+    nowMs: POLICY_NOW,
+  });
+  assert.deepEqual(result.prunedIntentIds, ["security-conflict"]);
+  assert.equal(result.grants.length, 1);
+  assert.deepEqual(result.grants[0].costs, { core: 6, graphql: 0 });
+});
+
 test("equal-priority leases rotate fairly and deterministically", () => {
   const leases = Object.fromEntries(
     ["a", "b", "c"].map((id) => [id, policyLease(id, POLICY_NOW + 1000)]),
@@ -2428,36 +2456,49 @@ test("started reservations stay charged while dead leases release unstarted work
 
 test("budget reset changes the epoch and deterministic lease phase", () => {
   const first = policyBudget();
-  const second = policyBudget({ resetMs: first.resetMs + 3_600_000 });
-  const phaseSeed = "stable-seed";
-  assert.notEqual(budgetEpoch(first), budgetEpoch(second));
-  assert.equal(
-    governorPhaseOffset(phaseSeed, budgetEpoch(first)),
-    governorPhaseOffset(phaseSeed, budgetEpoch(first)),
-  );
-  assert.notEqual(
-    governorPhaseOffset(phaseSeed, budgetEpoch(first)),
-    governorPhaseOffset(phaseSeed, budgetEpoch(second)),
-  );
-
+  let phaseSeed = "stable-seed";
+  while (governorPhaseOffset(phaseSeed, budgetEpoch(first)) < 2) phaseSeed += "x";
+  const offset = governorPhaseOffset(phaseSeed, budgetEpoch(first));
   const intent = {
     id: "phase",
     leaseId: "lease-a",
     priority: "active",
-    costs: { core: 1, graphql: 1 },
-    expiresAt: POLICY_NOW + 10_000,
+    costs: { core: 1, graphql: 0 },
+    expiresAt: POLICY_NOW + 7_200_000,
   };
-  const scheduled = scheduleIntents({
+  const leases = { "lease-a": policyLease(phaseSeed, POLICY_NOW + 7_200_000) };
+  const firstSchedule = scheduleIntents({
     intents: [intent],
-    leases: { "lease-a": policyLease(phaseSeed, POLICY_NOW + 10_000) },
-    budgets: { core: first, graphql: second },
+    leases,
+    budgets: { core: first },
     nowMs: POLICY_NOW,
   });
-  assert.equal(scheduled.grants[0].notBefore, POLICY_NOW + Math.max(
-    governorPhaseOffset(phaseSeed, budgetEpoch(first)),
-    governorPhaseOffset(phaseSeed, budgetEpoch(second)),
-  ));
-  assert.equal(Object.hasOwn(scheduled, "leases"), false);
+  const repeatedSchedule = scheduleIntents({
+    intents: [intent],
+    leases,
+    budgets: { core: first },
+    nowMs: POLICY_NOW + Math.floor(offset / 2),
+  });
+  assert.equal(firstSchedule.grants[0].notBefore, POLICY_NOW + offset);
+  assert.equal(repeatedSchedule.grants[0].notBefore, firstSchedule.grants[0].notBefore);
+
+  const nextAnchor = first.resetMs;
+  const second = policyBudget({
+    resetMs: nextAnchor + 3_600_000,
+    observedAt: nextAnchor,
+  });
+  assert.notEqual(budgetEpoch(first), budgetEpoch(second));
+  const resetSchedule = scheduleIntents({
+    intents: [intent],
+    leases,
+    budgets: { core: second },
+    nowMs: nextAnchor,
+  });
+  assert.equal(
+    resetSchedule.grants[0].notBefore,
+    nextAnchor + governorPhaseOffset(phaseSeed, budgetEpoch(second)),
+  );
+  assert.notEqual(resetSchedule.grants[0].notBefore, firstSchedule.grants[0].notBefore);
 });
 
 test("pacing becomes no earlier as pressure increases", () => {

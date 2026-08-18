@@ -1062,6 +1062,7 @@ const GOVERNOR_PROBE_LEASE_MS = 70_000;
 const GOVERNOR_ACTIVE_PROBE_LEASE_MS = 35_000;
 const BUDGET_RESET_GRACE_MS = 2_000;
 const GOVERNOR_PHASE_WINDOW_MS = 5_000;
+const BUDGET_WINDOW_MS = 3_600_000;
 
 // How often to re-read the budget. `gh api rate_limit` does not count against
 // the limit (verified, delta 0 -- see rateBudget) but it is still a subprocess,
@@ -1237,6 +1238,11 @@ function governorPhaseOffset(phaseSeed, epoch) {
   return (hash >>> 0) % (GOVERNOR_PHASE_WINDOW_MS + 1);
 }
 
+function governorEpochPhaseAt(phaseSeed, decision) {
+  const epochAnchor = decision.resetMs - BUDGET_WINDOW_MS;
+  return epochAnchor + governorPhaseOffset(phaseSeed, decision.epoch);
+}
+
 function intentPriority(intent) {
   const priority = Number.isInteger(intent.priority)
     ? intent.priority
@@ -1245,7 +1251,16 @@ function intentPriority(intent) {
 }
 
 function intentCosts(intent) {
-  return intent.costs ?? (intent.tab ? tabRequestCost(intent.tab) : null);
+  if (intent.tab === undefined) return intent.costs ?? null;
+  const expected = tabRequestCost(intent.tab);
+  if (!expected) return null;
+  if (
+    intent.costs &&
+    (intent.costs.core !== expected.core || intent.costs.graphql !== expected.graphql)
+  ) {
+    return null;
+  }
+  return expected;
 }
 
 function cursorDistance(leaseId, leaseIds, cursor) {
@@ -1358,8 +1373,7 @@ function scheduleIntents({
 
       const lease = leaseFor(leases, intent.leaseId);
       const phaseTimes = Object.fromEntries(resources.map((resource) => {
-        const epoch = decisions[resource].epoch;
-        return [resource, nowMs + governorPhaseOffset(lease.phaseSeed, epoch)];
+        return [resource, governorEpochPhaseAt(lease.phaseSeed, decisions[resource])];
       }));
       const notBefore = Math.max(
         nowMs,
