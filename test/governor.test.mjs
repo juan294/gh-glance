@@ -19,6 +19,8 @@ import { test } from "node:test";
 
 import {
   BUDGET_SNAPSHOT_TTL_MS,
+  BUDGET_PROBE_MS,
+  BUDGET_RESET_GRACE_MS,
   GOVERNOR_ACTIVE_PROBE_LEASE_MS,
   GOVERNOR_LEASE_TTL_MS,
   GOVERNOR_MAX_LEASES,
@@ -104,6 +106,20 @@ function publishInitial(scope, leaseId, now = NOW, values = budgets(now)) {
   return published.value;
 }
 
+function makeProbeDue(scope, leaseId, now) {
+  const state = inspectGovernor(scope, now).value;
+  const resource = state.budgets.core ?? state.budgets.graphql;
+  assert.ok(resource, "a manual probe needs a published budget epoch");
+  assert.equal(requestManualProbe(scope, leaseId, resource.epoch, now, now).ok, true);
+}
+
+function claimNow(scope, leaseId, now) {
+  makeProbeDue(scope, leaseId, now);
+  const claim = claimProbe(scope, leaseId, now);
+  assert.equal(claim.value.status, "claimed");
+  return claim;
+}
+
 function intent(id, leaseId, now = NOW, overrides = {}) {
   return {
     id,
@@ -187,8 +203,7 @@ test("lease, probe, intent, reservation, completion, and reconciliation form one
   assert.deepEqual(completed.value.actualCosts, { core: 1, graphql: 0 });
 
   const reconcileAt = registered.value.notBefore + 2;
-  const reconcile = claimProbe(scope, leaseId, reconcileAt);
-  assert.equal(reconcile.value.status, "claimed");
+  const reconcile = claimNow(scope, leaseId, reconcileAt);
   assert.equal(publishProbe(scope, leaseId, reconcile.value.nonce, budgets(reconcileAt), reconcileAt).ok, true);
   assert.equal(inspectGovernor(scope, reconcileAt).value.reservations[reservationId], undefined);
 
@@ -212,7 +227,7 @@ test("pending intents coalesce while persisted priorities compete", (t) => {
   registerLease(box.scope, lease(backgroundLeaseId));
   registerLease(box.scope, lease(activeLeaseId));
   publishInitial(box.scope, backgroundLeaseId);
-  assert.equal(recordResourceBlock(box.scope, "core", NOW + 60_000, "rate-limit").ok, true);
+  assert.equal(recordResourceBlock(box.scope, "core", NOW + 1, "rate-limit").ok, true);
 
   const backgroundId = randomUUID();
   const background = registerIntent(box.scope, intent(backgroundId, backgroundLeaseId, NOW, {
@@ -237,7 +252,7 @@ test("pending intents coalesce while persisted priorities compete", (t) => {
   assert.equal(pending[activeId].priority, "active");
 
   box.setNow(NOW + 1);
-  const claim = claimProbe(box.scope, backgroundLeaseId, NOW + 1);
+  const claim = claimNow(box.scope, backgroundLeaseId, NOW + 1);
   assert.equal(publishProbe(box.scope, backgroundLeaseId, claim.value.nonce, budgets(NOW + 1, {
     resetMs: NOW + 3_600_000,
   }), NOW + 1).ok, true);
@@ -295,7 +310,7 @@ test("heartbeats extend leases while release and expiry prune only unstarted wor
 
   const deadId = randomUUID();
   registerLease(box.scope, lease(deadId, NOW + 20_001));
-  const deadClaim = claimProbe(box.scope, deadId, NOW + 20_001);
+  const deadClaim = claimNow(box.scope, deadId, NOW + 20_001);
   publishProbe(box.scope, deadId, deadClaim.value.nonce, budgets(NOW + 20_001), NOW + 20_001);
   const started = registerIntent(box.scope, intent(randomUUID(), deadId, NOW + 20_001)).value;
   startReservation(box.scope, started.reservationId, started.notBefore);
@@ -347,10 +362,50 @@ test("probe barriers, nonce renewal, and expired claimant takeover are bounded",
   const claim = claimProbe(box.scope, first, NOW);
   assert.equal(renewProbeClaim(box.scope, first, claim.value.nonce, NOW + 29_999).value.leaseUntil, NOW + 29_999 + GOVERNOR_ACTIVE_PROBE_LEASE_MS);
   assert.equal(claimProbe(box.scope, second, NOW + 60_000).value.status, "waiting");
-  const takeoverAt = NOW + 29_999 + GOVERNOR_ACTIVE_PROBE_LEASE_MS + 1;
+  const takeoverAt = NOW + GOVERNOR_PROBE_LEASE_MS + 1;
   const takeover = claimProbe(box.scope, second, takeoverAt);
   assert.equal(takeover.value.status, "claimed");
   assert.notEqual(takeover.value.nonce, claim.value.nonce);
+});
+
+test("probe cadence is shared while manual demand and reset make it due sooner", (t) => {
+  const box = sandbox(t, { authIdentity: "probe-cadence" });
+  const leaseIds = [randomUUID(), randomUUID(), randomUUID()];
+  for (const leaseId of leaseIds) registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseIds[0]);
+
+  const expectedNextAt = NOW + BUDGET_PROBE_MS;
+  for (const leaseId of leaseIds) {
+    assert.deepEqual(claimProbe(box.scope, leaseId, NOW + 1).value, {
+      status: "waiting",
+      nextAt: expectedNextAt,
+    });
+  }
+  makeProbeDue(box.scope, leaseIds[1], NOW + 2);
+  const manualWinner = claimProbe(box.scope, leaseIds[1], NOW + 2);
+  assert.equal(manualWinner.value.status, "claimed");
+  for (const leaseId of [leaseIds[0], leaseIds[2]]) {
+    assert.equal(claimProbe(box.scope, leaseId, NOW + 2).value.status, "waiting");
+  }
+
+  const resetBox = sandbox(t, { authIdentity: "probe-reset" });
+  const resetLeaseId = randomUUID();
+  const resetAt = NOW + 10_000;
+  registerLease(resetBox.scope, lease(resetLeaseId));
+  publishInitial(resetBox.scope, resetLeaseId, NOW, budgets(NOW, { resetMs: resetAt }));
+  assert.deepEqual(claimProbe(
+    resetBox.scope,
+    resetLeaseId,
+    resetAt + BUDGET_RESET_GRACE_MS - 1,
+  ).value, {
+    status: "waiting",
+    nextAt: resetAt + BUDGET_RESET_GRACE_MS,
+  });
+  assert.equal(claimProbe(
+    resetBox.scope,
+    resetLeaseId,
+    resetAt + BUDGET_RESET_GRACE_MS,
+  ).value.status, "claimed");
 });
 
 test("the shared probe wrapper publishes once and failed probes pause only background work", async (t) => {
@@ -365,6 +420,7 @@ test("the shared probe wrapper publishes once and failed probes pause only backg
   assert.equal(refreshed.ok, true);
   assert.equal(reads, 1);
 
+  makeProbeDue(scope, leaseId, NOW + 1);
   const failed = await refreshSharedBudget(scope, leaseId, null, {
     now: () => NOW + 1,
     readBudgets: async () => null,
@@ -394,6 +450,16 @@ test("the shared probe wrapper publishes once and failed probes pause only backg
   const malformedState = inspectGovernor(malformedBox.scope, NOW).value;
   assert.equal(malformedState.probeClaim, null);
   assert.equal(malformedState.probeOutcome.status, "failed");
+
+  const routedBox = sandbox(t, { host: "tenant.ghe.com", authIdentity: "host-route" });
+  const routedLeaseId = randomUUID();
+  registerLease(routedBox.scope, lease(routedLeaseId));
+  let routedHost = null;
+  assert.equal((await refreshSharedBudget(routedBox.scope, routedLeaseId, null, {
+    now: () => NOW,
+    readBudgets: async (_signal, host) => { routedHost = host; return budgets(); },
+  })).ok, true);
+  assert.equal(routedHost, "tenant.ghe.com");
 });
 
 test("probe drain and renewal failures release only their own barrier", async (t) => {
@@ -403,6 +469,7 @@ test("probe drain and renewal failures release only their own barrier", async (t
   publishInitial(drainBox.scope, drainLeaseId);
   const grant = registerIntent(drainBox.scope, intent(randomUUID(), drainLeaseId)).value;
   startReservation(drainBox.scope, grant.reservationId, grant.notBefore);
+  makeProbeDue(drainBox.scope, drainLeaseId, grant.notBefore + 1);
   let readAfterDrainFailure = false;
   const drainFailure = await refreshSharedBudget(drainBox.scope, drainLeaseId, null, {
     now: () => grant.notBefore + 1,
@@ -464,9 +531,47 @@ test("manual probe demand coalesces until reset changes the epoch", (t) => {
   assert.equal(requestManualProbe(scope, leaseId, epoch, NOW, NOW + 1).value.status, "satisfied");
 
   const resetAt = NOW + 3_600_000;
-  const resetClaim = claimProbe(scope, leaseId, NOW + 2);
+  const resetClaim = claimNow(scope, leaseId, NOW + 2);
   publishProbe(scope, leaseId, resetClaim.value.nonce, budgets(NOW + 2, { remaining: 5000, resetMs: resetAt + 3_600_000 }), NOW + 2);
   assert.equal(inspectGovernor(scope, NOW + 2).value.manualProbe, null);
+});
+
+test("successful probes preserve live same-epoch blocks and clear proven ones", (t) => {
+  const box = sandbox(t, { authIdentity: "block-persistence" });
+  const leaseId = randomUUID();
+  const resetMs = NOW + 3_600_000;
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId, NOW, budgets(NOW, { resetMs }));
+
+  const blockUntil = NOW + 30_000;
+  assert.equal(recordResourceBlock(box.scope, "core", blockUntil, "rate-limit").ok, true);
+  const sameEpochClaim = claimNow(box.scope, leaseId, NOW + 1);
+  assert.equal(publishProbe(box.scope, leaseId, sameEpochClaim.value.nonce, budgets(NOW + 1, {
+    resetMs,
+  }), NOW + 1).ok, true);
+  let state = inspectGovernor(box.scope, NOW + 1).value;
+  assert.equal(state.budgets.core.blockUntil, blockUntil);
+  assert.equal(state.budgets.core.blockReason, "rate-limit");
+  assert.equal(registerIntent(box.scope, intent(randomUUID(), leaseId, NOW + 1)).value.reason, "rate-limit");
+
+  box.setNow(blockUntil);
+  const expiredClaim = claimNow(box.scope, leaseId, blockUntil);
+  assert.equal(publishProbe(box.scope, leaseId, expiredClaim.value.nonce, budgets(blockUntil, {
+    resetMs,
+  }), blockUntil).ok, true);
+  state = inspectGovernor(box.scope, blockUntil).value;
+  assert.equal(state.budgets.core.blockUntil, null);
+  assert.equal(state.budgets.core.blockReason, null);
+
+  const secondBlockUntil = blockUntil + 30_000;
+  assert.equal(recordResourceBlock(box.scope, "core", secondBlockUntil, "abuse-limit").ok, true);
+  const resetClaim = claimNow(box.scope, leaseId, blockUntil + 1);
+  assert.equal(publishProbe(box.scope, leaseId, resetClaim.value.nonce, budgets(blockUntil + 1, {
+    resetMs: resetMs + 3_600_000,
+  }), blockUntil + 1).ok, true);
+  state = inspectGovernor(box.scope, blockUntil + 1).value;
+  assert.equal(state.budgets.core.blockUntil, null);
+  assert.equal(state.budgets.core.blockReason, null);
 });
 
 test("planned-to-start revalidation fails closed after stale budget, block, or scope migration", (t) => {
@@ -520,15 +625,14 @@ test("planned reservations revalidate expiry, epoch, probe barrier, and capacity
   );
 
   const epoch = planned("epoch");
-  const epochClaim = claimProbe(epoch.scope, epoch.leaseId, NOW + 1);
+  const epochClaim = claimNow(epoch.scope, epoch.leaseId, NOW + 1);
   assert.equal(publishProbe(epoch.scope, epoch.leaseId, epochClaim.value.nonce, budgets(NOW + 1, {
     resetMs: NOW + 7_200_000,
   }), NOW + 1).ok, true);
   assert.equal(startReservation(epoch.scope, epoch.grant.reservationId, epoch.grant.notBefore).reason, "stale");
 
   const barrier = planned("barrier");
-  const barrierClaim = claimProbe(barrier.scope, barrier.leaseId, NOW + 1);
-  assert.equal(barrierClaim.value.status, "claimed");
+  claimNow(barrier.scope, barrier.leaseId, NOW + 1);
   const barred = startReservation(barrier.scope, barrier.grant.reservationId, barrier.grant.notBefore);
   assert.equal(barred.value.status, "waiting");
   assert.equal(barred.value.reason, "probe");
@@ -538,7 +642,7 @@ test("planned reservations revalidate expiry, epoch, probe barrier, and capacity
   );
 
   const capacity = planned("capacity");
-  const capacityClaim = claimProbe(capacity.scope, capacity.leaseId, NOW + 1);
+  const capacityClaim = claimNow(capacity.scope, capacity.leaseId, NOW + 1);
   assert.equal(publishProbe(capacity.scope, capacity.leaseId, capacityClaim.value.nonce, budgets(NOW + 1, {
     remaining: 1001,
   }), NOW + 1).ok, true);
@@ -577,14 +681,14 @@ test("probe watermark retires only completions whose ordering is certain", (t) =
   startReservation(scope, before.reservationId, before.notBefore);
   completeReservation(scope, before.reservationId, { outcome: "measured-success", actualCost: { core: 2, graphql: 0 } }, before.notBefore + 1);
   const claimAt = before.notBefore + 2;
-  const claim = claimProbe(scope, leaseId, claimAt);
+  const claim = claimNow(scope, leaseId, claimAt);
 
   assert.equal(publishProbe(scope, leaseId, claim.value.nonce, budgets(claimAt), claimAt + 1).ok, true);
   assert.equal(inspectGovernor(scope, claimAt + 1).value.reservations[before.reservationId], undefined);
 
   const overlap = registerIntent(scope, intent(randomUUID(), leaseId, claimAt + 1)).value;
   startReservation(scope, overlap.reservationId, overlap.notBefore);
-  const overlapClaim = claimProbe(scope, leaseId, overlap.notBefore + 1);
+  const overlapClaim = claimNow(scope, leaseId, overlap.notBefore + 1);
   completeReservation(scope, overlap.reservationId, { outcome: "timeout", actualCost: { core: 0, graphql: 0 } }, overlap.notBefore + 2);
   publishProbe(scope, leaseId, overlapClaim.value.nonce, budgets(overlap.notBefore + 2), overlap.notBefore + 2);
   assert.equal(inspectGovernor(scope, overlap.notBefore + 2).value.reservations[overlap.reservationId].status, "completed");
@@ -592,7 +696,7 @@ test("probe watermark retires only completions whose ordering is certain", (t) =
   const sameMillisecond = registerIntent(scope, intent(randomUUID(), leaseId, overlap.notBefore + 3)).value;
   startReservation(scope, sameMillisecond.reservationId, sameMillisecond.notBefore);
   const sameClaimAt = sameMillisecond.notBefore + 1;
-  const sameClaim = claimProbe(scope, leaseId, sameClaimAt);
+  const sameClaim = claimNow(scope, leaseId, sameClaimAt);
   completeReservation(scope, sameMillisecond.reservationId, {
     outcome: "measured-success",
     actualCost: { core: 2, graphql: 0 },
@@ -615,7 +719,7 @@ test("a used-counter reset starts a new epoch and carries a straddling request",
   startReservation(scope, grant.reservationId, grant.notBefore);
 
   const claimAt = grant.notBefore + 1;
-  const claim = claimProbe(scope, leaseId, claimAt);
+  const claim = claimNow(scope, leaseId, claimAt);
   const resetBudgets = {
     core: { limit: 5000, remaining: 4950, used: 50, resetMs },
     graphql: { limit: 5000, remaining: 4950, used: 50, resetMs },
@@ -625,6 +729,11 @@ test("a used-counter reset starts a new epoch and carries a straddling request",
   const carried = inspectGovernor(scope, claimAt).value.reservations[grant.reservationId];
   assert.equal(carried.status, "started");
   assert.equal(carried.epochs.core, first.epochs.core);
+
+  const rollbackGrant = registerIntent(scope, intent(randomUUID(), leaseId, claimAt)).value;
+  assert.equal(rollbackGrant.status, "scheduled");
+  assert.equal(rollbackGrant.epochs.core, published.value.epochs.core);
+  assert.equal(startReservation(scope, rollbackGrant.reservationId, rollbackGrant.notBefore).value.status, "started");
 });
 
 test("a near-timeout request drain renews one probe claimant without takeover", async (t) => {
@@ -638,10 +747,12 @@ test("a near-timeout request drain renews one probe claimant without takeover", 
   assert.equal(startReservation(scope, grant.reservationId, grant.notBefore).value.status, "started");
 
   let clock = grant.notBefore + 1;
+  let waits = 0;
+  makeProbeDue(scope, ownerId, clock);
   let probeReads = 0;
   const refreshed = await refreshSharedBudget(scope, ownerId, null, {
     now: () => clock,
-    wait: async (ms) => { clock += ms; },
+    wait: async (ms) => { waits += 1; clock += ms; },
     readBudgets: async () => {
       probeReads += 1;
       const takeover = claimProbe(scope, waiterId, clock);
@@ -653,6 +764,7 @@ test("a near-timeout request drain renews one probe claimant without takeover", 
 
   assert.equal(refreshed.ok, true);
   assert.equal(probeReads, 1);
+  assert.equal(waits, GOVERNOR_PROBE_DRAIN_MS / 100);
   assert.equal(clock, grant.notBefore + 1 + GOVERNOR_PROBE_DRAIN_MS);
   const state = inspectGovernor(scope, clock).value;
   assert.equal(state.probeClaim, null);
@@ -674,7 +786,7 @@ test("clean probe samples persist the shared external-spend factor", (t) => {
     actualCost: { core: 6, graphql: 0 },
   }, security.notBefore + 1);
   const claimAt = security.notBefore + 2;
-  const claim = claimProbe(scope, leaseId, claimAt);
+  const claim = claimNow(scope, leaseId, claimAt);
   const next = budgets(claimAt, { resetMs: NOW + 3_600_000 });
   next.core.used = 12;
   next.core.remaining = 4988;
@@ -747,12 +859,55 @@ test("schema, bounds, corrupt data, and future timestamps fail closed", (t) => {
   assert.equal(inspectGovernor(scope, NOW).reason, "corrupt");
 });
 
+test("the 511th and 512th reservations never create a ghost lane grant", (t) => {
+  const { scope } = sandbox(t, { authIdentity: "reservation-cap" });
+  const leaseId = randomUUID();
+  registerLease(scope, lease(leaseId));
+  publishInitial(scope, leaseId);
+  const state = inspectGovernor(scope, NOW).value;
+  for (let index = 0; index < GOVERNOR_MAX_RESERVATIONS - 1; index += 1) {
+    const intentId = randomUUID();
+    state.reservations[`reservation:${intentId}`] = {
+      leaseId,
+      intentId,
+      costs: { core: 0, graphql: 0 },
+      actualCosts: { core: 0, graphql: 0 },
+      notBefore: NOW,
+      status: "completed",
+      epochs: { core: null, graphql: null },
+      startedAt: NOW,
+      completedAt: NOW,
+      outcome: "measured-success",
+    };
+  }
+  assert.equal(writeGovernorState(scope.path, state).ok, true);
+
+  const firstIntentId = randomUUID();
+  const finalGrant = registerIntent(scope, intent(firstIntentId, leaseId)).value;
+  assert.equal(finalGrant.status, "scheduled");
+  let capped = inspectGovernor(scope, NOW).value;
+  assert.equal(Object.keys(capped.reservations).length, GOVERNOR_MAX_RESERVATIONS);
+  const laneAtCap = capped.budgets.core.laneNextAt;
+  const cursorAtCap = capped.budgets.core.roundRobinCursor;
+
+  const pendingIntentId = randomUUID();
+  const pending = registerIntent(scope, intent(pendingIntentId, leaseId)).value;
+  assert.equal(pending.status, "pending");
+  capped = inspectGovernor(scope, NOW).value;
+  assert.equal(Object.keys(capped.reservations).length, GOVERNOR_MAX_RESERVATIONS);
+  assert.equal(capped.intents[pendingIntentId].leaseId, leaseId);
+  assert.equal(capped.budgets.core.laneNextAt, laneAtCap);
+  assert.equal(capped.budgets.core.roundRobinCursor, cursorAtCap);
+});
+
 test("atomic storage is private and persisted JSON excludes identity and process data", (t) => {
   const { scope, root } = sandbox(t, { host: "tenant.ghe.com", authIdentity: "secret-login-token" });
   const leaseId = randomUUID();
   registerLease(scope, lease(leaseId));
   publishInitial(scope, leaseId);
   const raw = readFileSync(scope.path, "utf8");
+  assert.equal(raw.endsWith("\n"), true);
+  assert.equal(raw.includes("\n "), false, "governor JSON stays compact inside the lock");
   assert.equal(statSync(scope.path).mode & 0o777, 0o600);
   assert.equal(statSync(dirname(scope.path)).mode & 0o777, 0o700);
   for (const forbidden of ["tenant.ghe.com", "secret-login-token", process.cwd(), String(process.pid), "owner/repo", "title"]) {
@@ -929,9 +1084,10 @@ test("twelve real workers share one probe, preserve state, pace grants, and isol
   assert.ok(leaseIds.includes(state.budgets.core.roundRobinCursor));
 
   for (let round = 1; round <= 2; round += 1) {
-    const roundAt = NOW + round;
+    const roundAt = NOW + round * 2 - 1;
+    const releaseAt = roundAt + 1;
     box.setNow(roundAt);
-    assert.equal(recordResourceBlock(box.scope, "core", NOW + 60_000, "rate-limit").ok, true);
+    assert.equal(recordResourceBlock(box.scope, "core", releaseAt, "rate-limit").ok, true);
     const queued = await Promise.all(leaseIds.map((leaseId) => worker({
       ...base,
       now: roundAt,
@@ -939,14 +1095,14 @@ test("twelve real workers share one probe, preserve state, pace grants, and isol
       payload: intent(randomUUID(), leaseId, roundAt),
     })));
     assert.ok(queued.every((result) => result.value?.status === "paused"), JSON.stringify(queued));
-    const roundClaim = claimProbe(box.scope, leaseIds[0], roundAt);
-    assert.equal(roundClaim.value.status, "claimed");
+    const roundClaim = claimNow(box.scope, leaseIds[0], releaseAt);
     assert.equal(publishProbe(box.scope, leaseIds[0], roundClaim.value.nonce, budgets(roundAt, {
       resetMs: firstResetMs,
-    }), roundAt).ok, true);
+    }), releaseAt).ok, true);
   }
 
-  const progressed = inspectGovernor(box.scope, NOW + 2).value;
+  const progressedAt = NOW + 4;
+  const progressed = inspectGovernor(box.scope, progressedAt).value;
   assert.equal(Object.keys(progressed.reservations).length, 36);
   const perLease = Object.values(progressed.reservations).reduce((counts, reservation) => {
     counts[reservation.leaseId] = (counts[reservation.leaseId] ?? 0) + 1;
@@ -974,12 +1130,12 @@ test("twelve real workers share one probe, preserve state, pace grants, and isol
 
   const released = await Promise.all(leaseIds.map((leaseId) => worker({
     ...base,
-    now: NOW + 2,
+    now: progressedAt,
     operation: "releaseLease",
     leaseId,
   })));
   assert.ok(released.every((result) => result.ok), JSON.stringify(released));
-  assert.equal(Object.keys(inspectGovernor(box.scope, NOW + 2).value.reservations).length, 0);
+  assert.equal(Object.keys(inspectGovernor(box.scope, progressedAt).value.reservations).length, 0);
 
   const resetBase = { ...base, now: resetAt };
   const resetLeases = leaseIds.map((leaseId) => lease(leaseId, resetAt));

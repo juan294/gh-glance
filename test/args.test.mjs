@@ -110,6 +110,15 @@ test("effective host resolution keeps explicit --repo authoritative", () => {
 
 test("environment and local remote hosts resolve only when unambiguous", () => {
   assert.equal(resolveEffectiveHost({ ghHost: "Tenant.GHE.com" }), "tenant.ghe.com");
+  assert.equal(resolveEffectiveHost({
+    ghHost: "not a host",
+    ghRepo: "tenant.ghe.com/acme/widget",
+    remoteUrls: ["git@github.com:acme/widget.git"],
+  }), null);
+  assert.equal(resolveEffectiveHost({
+    ghHost: "",
+    remoteUrls: ["git@github.com:acme/widget.git"],
+  }), null);
   assert.equal(resolveEffectiveHost({ ghRepo: "tenant.ghe.com/acme/widget" }), "tenant.ghe.com");
   assert.equal(resolveEffectiveHost({ ghRepo: "acme/widget" }), "github.com");
   assert.equal(resolveEffectiveHost({ remoteUrls: [

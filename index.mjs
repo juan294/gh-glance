@@ -674,8 +674,7 @@ function resolveEffectiveHost({
   if (repoExplicit && runtimeRepo) return normalizeHost(runtimeHost) ?? "github.com";
   const explicitRuntimeHost = normalizeHost(runtimeHost);
   if (explicitRuntimeHost) return explicitRuntimeHost;
-  const environmentHost = normalizeHost(ghHost);
-  if (environmentHost) return environmentHost;
+  if (ghHost !== null && ghHost !== undefined) return normalizeHost(ghHost);
   if (ghRepo) {
     try {
       const target = parseRepoTarget(ghRepo);
@@ -711,8 +710,8 @@ function repoArgs() {
 // list tabs and the alert endpoints disagree about which server they are
 // talking to. --hostname is the flag gh api does have. Empty when no host was
 // given, so the default argv vector is unchanged.
-function apiHostArgs() {
-  const host = effectiveRuntimeHost();
+function apiHostArgs(host = effectiveRuntimeHost()) {
+  host = normalizeHost(host);
   return host ? ["--hostname", host] : [];
 }
 
@@ -1215,7 +1214,7 @@ function availableForGrant({
   }
   if (nowMs >= normalized.resetMs) return { mode: "probe", reason: "budget-reset" };
 
-  const epoch = budgetEpoch(normalized);
+  const epoch = budgetEpoch(budget);
   if (Number.isFinite(budget.blockUntil) && budget.blockUntil > nowMs) {
     return {
       mode: "paused",
@@ -1452,6 +1451,7 @@ function scheduleIntents({
   lanes = {},
   cursors = {},
   nowMs,
+  maxGrants = Number.POSITIVE_INFINITY,
 }) {
   const valid = [];
   const prunedIntentIds = [];
@@ -1495,6 +1495,7 @@ function scheduleIntents({
     const pending = valid.filter((intent) => intent.normalizedPriority === priority);
     const roundRobinState = createRoundRobinState(pending, updatedCursors);
     while (pending.length > 0) {
+      if (grants.length >= maxGrants) break;
       const intent = pending.splice(nextRoundRobinIndex(pending, roundRobinState), 1)[0];
       const resources = RATE_RESOURCES.filter((resource) => intent.costs[resource] > 0);
       const decisions = Object.fromEntries(resources.map((resource) => [
@@ -1864,7 +1865,7 @@ function normalizeGovernorState(raw, nowMs, { prune = true } = {}) {
 }
 
 function serializeGovernorState(state) {
-  return `${JSON.stringify(state, null, 2)}\n`;
+  return `${JSON.stringify(state)}\n`;
 }
 
 function readGovernorState(path, nowMs) {
@@ -2042,10 +2043,14 @@ function withGovernorLock(scope, operation, {
   } catch {
     return { ok: false, reason: "unwritable" };
   }
+  const waitForLock = () => {
+    if (Date.now() >= deadline) return false;
+    Atomics.wait(persistenceWaitCell, 0, 0, 5);
+    return true;
+  };
   for (;;) {
     if (governorRecoveryActive(lockPath, kill)) {
-      if (Date.now() >= deadline) return { ok: false, reason: "busy" };
-      Atomics.wait(persistenceWaitCell, 0, 0, 5);
+      if (!waitForLock()) return { ok: false, reason: "busy" };
       continue;
     }
     try {
@@ -2059,8 +2064,7 @@ function withGovernorLock(scope, operation, {
       observeGovernorArtifact(observeArtifact, "canonical", lockPath);
       if (governorRecoveryActive(lockPath, kill)) {
         releaseGovernorLock(lockPath, nonce);
-        if (Date.now() >= deadline) return { ok: false, reason: "busy" };
-        Atomics.wait(persistenceWaitCell, 0, 0, 5);
+        if (!waitForLock()) return { ok: false, reason: "busy" };
         continue;
       }
       try {
@@ -2076,19 +2080,16 @@ function withGovernorLock(scope, operation, {
       // record as owned during the bounded wait; stealing it could overlap the
       // creator, while returning busy is always fail-closed.
       if (!owner) {
-        if (Date.now() >= deadline) return { ok: false, reason: "busy" };
-        Atomics.wait(persistenceWaitCell, 0, 0, 5);
+        if (!waitForLock()) return { ok: false, reason: "busy" };
         continue;
       }
       if (pidIsDead(owner.pid, kill)) {
         const recovery = quarantineDeadGovernorLock(lockPath, owner, { pid, kill, observeArtifact });
         if (recovery === "quarantined" || recovery === "changed") continue;
-        if (Date.now() >= deadline) return { ok: false, reason: "busy" };
-        Atomics.wait(persistenceWaitCell, 0, 0, 5);
+        if (!waitForLock()) return { ok: false, reason: "busy" };
         continue;
       }
-      if (Date.now() >= deadline) return { ok: false, reason: "busy" };
-      Atomics.wait(persistenceWaitCell, 0, 0, 5);
+      if (!waitForLock()) return { ok: false, reason: "busy" };
     }
   }
 }
@@ -2117,6 +2118,7 @@ function mutateGovernor(scope, nowMs, mutate) {
 
 function scheduleGovernorState(state, nowMs) {
   if (Object.keys(state.intents).length === 0) return { grants: [], denied: [] };
+  let reservationCount = Object.keys(state.reservations).length;
   const lanes = Object.fromEntries(RATE_RESOURCES.flatMap((resource) =>
     state.budgets[resource] ? [[resource, { nextAt: state.budgets[resource].laneNextAt }]] : [],
   ));
@@ -2145,6 +2147,7 @@ function scheduleGovernorState(state, nowMs) {
     lanes,
     cursors,
     nowMs,
+    maxGrants: GOVERNOR_MAX_RESERVATIONS - reservationCount,
   });
   result.denied.push(...deferredBackground.map((intentId) => ({
     intentId,
@@ -2153,7 +2156,7 @@ function scheduleGovernorState(state, nowMs) {
   })));
   for (const id of result.prunedIntentIds) delete state.intents[id];
   for (const grant of result.grants) {
-    if (Object.keys(state.reservations).length >= GOVERNOR_MAX_RESERVATIONS) break;
+    if (reservationCount >= GOVERNOR_MAX_RESERVATIONS) break;
     state.reservations[grant.id] = {
       leaseId: grant.leaseId,
       intentId: grant.intentId,
@@ -2166,6 +2169,7 @@ function scheduleGovernorState(state, nowMs) {
       completedAt: null,
       outcome: null,
     };
+    reservationCount += 1;
     delete state.intents[grant.intentId];
   }
   for (const resource of RATE_RESOURCES) {
@@ -2215,6 +2219,11 @@ function claimProbe(scope, leaseId, nowMs) {
     if (state.probeClaim && state.probeClaim.leaseUntil > at) {
       return { value: { status: "waiting", leaseUntil: state.probeClaim.leaseUntil } };
     }
+    const resetProbeAt = Math.min(...Object.values(state.budgets).map(
+      (budget) => budget.resetMs + BUDGET_RESET_GRACE_MS,
+    ));
+    const nextAt = Math.min(state.probeOutcome.nextAt, resetProbeAt);
+    if (nextAt > at) return { value: { status: "waiting", nextAt } };
     const nonce = randomUUID();
     const startedReservationIds = Object.entries(state.reservations)
       .filter(([, reservation]) => reservation.status === "started")
@@ -2253,10 +2262,11 @@ function budgetFromProbe(raw, previous, nowMs) {
       ? `${baseEpoch}:${nowMs}`
       : baseEpoch;
   const epochChanged = !previous || previous.epoch !== epoch;
+  const blockActive = !epochChanged && Number.isFinite(previous.blockUntil) && previous.blockUntil > nowMs;
   return {
     ...normalized,
-    blockUntil: null,
-    blockReason: null,
+    blockUntil: blockActive ? previous.blockUntil : null,
+    blockReason: blockActive ? previous.blockReason : null,
     laneNextAt: epochChanged ? nowMs : previous.laneNextAt,
     roundRobinCursor: previous?.roundRobinCursor ?? null,
     lastExternalFactor: previous?.lastExternalFactor ?? 1,
@@ -2364,19 +2374,18 @@ function registerIntent(scope, intent) {
       pending.priority === normalized.priority,
     );
     if (duplicate) return { value: { status: "pending", intentId: duplicate[0], coalesced: true } };
-    const existingReservation = Object.entries(state.reservations).find(([, reservation]) =>
-      reservation.intentId === intent.id,
-    );
-    if (existingReservation) return { value: { status: existingReservation[1].status, reservationId: existingReservation[0] } };
+    const reservationId = `reservation:${intent.id}`;
+    const existingReservation = state.reservations[reservationId];
+    if (existingReservation) return { value: { status: existingReservation.status, reservationId } };
     if (!state.intents[intent.id] && Object.keys(state.intents).length >= GOVERNOR_MAX_INTENTS) {
       return { ok: false, reason: "busy" };
     }
     state.intents[intent.id] = normalized;
     const scheduled = scheduleGovernorState(state, nowMs);
-    const reservation = Object.entries(state.reservations).find(([, item]) => item.intentId === intent.id);
+    const reservation = state.reservations[reservationId];
     const denial = scheduled.denied.find((item) => item.intentId === intent.id);
     return { value: reservation
-      ? { status: "scheduled", reservationId: reservation[0], ...reservation[1] }
+      ? { status: "scheduled", reservationId, ...reservation }
       : { status: denial?.mode ?? "pending", intentId: intent.id, reason: denial?.reason ?? "budget-unknown" } };
   });
 }
@@ -2384,8 +2393,9 @@ function registerIntent(scope, intent) {
 function readIntentDecision(scope, intentId, nowMs) {
   return mutateGovernor(scope, nowMs, (state, at) => {
     const scheduled = scheduleGovernorState(state, at);
-    const reservation = Object.entries(state.reservations).find(([, item]) => item.intentId === intentId);
-    if (reservation) return { value: { status: reservation[1].status, reservationId: reservation[0], ...reservation[1] } };
+    const reservationId = `reservation:${intentId}`;
+    const reservation = state.reservations[reservationId];
+    if (reservation) return { value: { status: reservation.status, reservationId, ...reservation } };
     if (!state.intents[intentId]) return { ok: false, reason: "stale" };
     const denial = scheduled.denied.find((item) => item.intentId === intentId);
     return { value: { status: denial?.mode ?? "pending", reason: denial?.reason ?? "budget-unknown" } };
@@ -2479,7 +2489,7 @@ function inspectGovernor(scope, nowMs) {
   if (!Number.isFinite(at) || at < 0) return { ok: false, reason: "corrupt" };
   return withGovernorLock(scope, () => {
     const loaded = readGovernorState(scope.path, at);
-    return loaded.ok ? { ok: true, value: structuredClone(loaded.value) } : loaded;
+    return loaded;
   });
 }
 
@@ -2527,7 +2537,7 @@ async function refreshSharedBudget(scope, leaseId, signal, {
       failProbeClaim(scope, leaseId, nonce, now());
       return { ok: false, reason: "stale" };
     }
-    await wait(Math.min(25, Math.max(1, drainUntil - now())));
+    await wait(Math.min(100, Math.max(1, drainUntil - now())));
   }
   const renewed = renew(scope, leaseId, nonce, now());
   if (!renewed.ok) {
@@ -2536,7 +2546,7 @@ async function refreshSharedBudget(scope, leaseId, signal, {
   }
   let budgets;
   try {
-    budgets = await readBudgets(signal);
+    budgets = await readBudgets(signal, scope.host);
   } catch {
     budgets = null;
   }
@@ -3171,13 +3181,20 @@ function targetSource() {
 // measures as free (verified: delta 0), so this is safe to run on a diagnostic
 // path. GHES tenants can be configured with a different ceiling, which is
 // exactly why this reports the server's own numbers rather than asserting 5,000.
+async function readRateLimitResources(signal, host = effectiveRuntimeHost()) {
+  const raw = await runGh(["api", "rate_limit", ...apiHostArgs(host)], {
+    signal,
+    operation: "rate-limit",
+  });
+  return JSON.parse(raw)?.resources;
+}
+
 async function rateBudget() {
   try {
     // Host-routed like every other `gh api` call: a budget is per token *per
     // server*, so on a GHES tenant the github.com numbers are not merely stale,
     // they belong to a different limit entirely.
-    const raw = await runGh(["api", "rate_limit", ...apiHostArgs()], { operation: "rate-limit" });
-    const { resources } = JSON.parse(raw);
+    const resources = await readRateLimitResources();
     // formatAge() is for timestamps in the past and returns "-" for a future one,
     // so the reset is rendered as a forward interval instead.
     const fmt = (r) => {
@@ -3218,17 +3235,13 @@ function normalizeRateBudget(resource) {
   };
 }
 
-async function readRateBudgets(signal) {
+async function readRateBudgets(signal, host = effectiveRuntimeHost()) {
   try {
     // apiHostArgs() for the same reason the alert endpoints carry it: --repo
     // host/owner/name sets runtime.host without setting GH_HOST, so without the
     // flag this reads github.com's budget while the pane spends against the
     // tenant -- and then throttles, or fails to, against an unrelated number.
-    const raw = await runGh(["api", "rate_limit", ...apiHostArgs()], {
-      signal,
-      operation: "rate-limit",
-    });
-    const resources = JSON.parse(raw)?.resources;
+    const resources = await readRateLimitResources(signal, host);
     return {
       core: normalizeRateBudget(resources?.core),
       graphql: normalizeRateBudget(resources?.graphql),

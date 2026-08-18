@@ -2258,6 +2258,29 @@ test("a known shared rate block pauses until its reset", () => {
   assert.equal(decision.resetMs, POLICY_NOW + 3_600_000);
 });
 
+test("a suffixed rollback epoch survives normalization into grants", () => {
+  const epoch = `5000:${POLICY_NOW + 3_600_000}:${POLICY_NOW}`;
+  const budget = policyBudget({ epoch });
+  assert.equal(availableForGrant({ budget, nowMs: POLICY_NOW }).epoch, epoch);
+  const scheduled = scheduleIntents({
+    intents: [{
+      id: "rollback-intent",
+      leaseId: "rollback-lease",
+      tab: "actions",
+      priority: "active",
+      costs: { core: 2, graphql: 0 },
+      requestedAt: POLICY_NOW,
+      expiresAt: POLICY_NOW + 10_000,
+    }],
+    leases: { "rollback-lease": policyLease("rollback-lease") },
+    budgets: { core: budget },
+    lanes: { core: { nextAt: POLICY_NOW } },
+    nowMs: POLICY_NOW,
+  });
+  assert.equal(scheduled.grants.length, 1);
+  assert.equal(scheduled.grants[0].epochs.core, epoch);
+});
+
 test("tab and auxiliary operation costs have one explicit registry", () => {
   for (const tab of TAB_KEYS) {
     assert.deepEqual(tabRequestCost(tab), {
