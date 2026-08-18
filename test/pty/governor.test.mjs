@@ -87,18 +87,23 @@ function startPane(box, pane, {
   readyPath,
   readyAttempts = 1_000,
   settle = 45,
+  stdin = null,
+  animation = false,
+  env = {},
 } = {}) {
   return captureAsync({
     cols: 70,
     rows: 20,
     signal: "none",
     settle,
-    stdin: readyPath ? readyInput(readyPath, readyAttempts) : "sleep 120",
+    stdin: stdin ?? (readyPath ? readyInput(readyPath, readyAttempts) : "sleep 120"),
     args: `${CAPTURE_ARGS} --tab ${tab}`,
+    animation,
     configHome: box.root,
     env: {
       GH_GLANCE_FIXTURE_STATE: box.statePath,
       GH_GLANCE_FIXTURE_PANE: pane,
+      ...env,
     },
   });
 }
@@ -127,6 +132,41 @@ function assertDebitsStayOutsideReserve(events) {
   }
 }
 
+function reservationSlots(governor, resource) {
+  const epoch = governor.epochs[resource];
+  return Object.values(governor.reservations)
+    .filter((reservation) =>
+      reservation.epochs?.[resource] === epoch && reservation.costs?.[resource] > 0)
+    .map((reservation) => reservation.notBefore)
+    .sort((left, right) => left - right);
+}
+
+function reservationHorizon(governor, resource) {
+  const lastNotBefore = reservationSlots(governor, resource).at(-1);
+  assert.ok(Number.isFinite(lastNotBefore), `missing ${resource} reservation horizon`);
+  return Math.max(20_000, lastNotBefore - Date.now() + 20_000);
+}
+
+function assertPhasedStarts(governor, events, resource, expected, label) {
+  const slots = reservationSlots(governor, resource);
+  const actual = events
+    .filter((event) => event.cost?.[resource] > 0)
+    .map((event) => event.at)
+    .sort((left, right) => left - right);
+  assert.equal(slots.length, expected, `${label} persisted ${slots.length} slots`);
+  assert.equal(actual.length, expected, `${label} observed ${actual.length} starts`);
+  for (let index = 0; index < expected; index += 1) {
+    assert.ok(actual[index] >= slots[index], `${label} start ${index} preceded its persisted slot`);
+  }
+  const plannedSpan = slots.at(-1) - slots[0];
+  const actualSpan = actual.at(-1) - actual[0];
+  assert.ok(plannedSpan > 0, `${label} persisted no phase or lane spacing`);
+  assert.ok(
+    actualSpan >= Math.min(250, plannedSpan / 4),
+    `${label} starts collapsed into ${actualSpan}ms for a ${plannedSpan}ms slot span`,
+  );
+}
+
 function killRecordedProcess(event) {
   assert.ok(Number.isSafeInteger(event?.ownerPid) && event.ownerPid > 1);
   assert.notEqual(event.ownerPid, process.pid);
@@ -144,11 +184,18 @@ test("twelve real panes share one startup probe and every active pane progresses
     startPane(box, `startup-${index}`, { readyPath }));
 
   let progress;
+  let startupGovernor;
   try {
+    const scheduled = await observeUntil(
+      () => ({ fixture: box.read(), governor: box.readGovernor() }),
+      ({ governor }) => reservationSlots(governor, "core").length === 12,
+      30_000,
+    );
+    startupGovernor = scheduled.governor;
     progress = await observeUntil(
       box.read,
       (state) => new Set(dataStarts(state).map((event) => event.pane)).size === 12,
-      30_000,
+      reservationHorizon(startupGovernor, "core"),
     );
   } finally {
     await releasePanes(readyPath, captures);
@@ -160,6 +207,7 @@ test("twelve real panes share one startup probe and every active pane progresses
   assert.equal(new Set(data.map((event) => event.pane)).size, 12);
   assert.ok(data.every((event) => event.argv[0] === "run"), "a non-active tab ran at startup");
   assertDebitsStayOutsideReserve(data);
+  assertPhasedStarts(startupGovernor, data, "core", 12, "startup");
 });
 
 test("twelve mixed active panes pace core and GraphQL without consuming either reserve", async (t) => {
@@ -199,6 +247,147 @@ test("twelve mixed active panes pace core and GraphQL without consuming either r
   assertDebitsStayOutsideReserve(data);
 });
 
+test("manual refresh wins a held lane without stacking repeated requests", { timeout: 60_000 }, async (t) => {
+  const box = fixture(t, {
+    anchorAtFirstProbe: true,
+    createdAt: null,
+    core: { limit: LIMIT, used: LIMIT, remaining: 0, resetMs: 0, resetOffsetMs: 10_000 },
+    resetSequence: [{
+      offsetMs: 10_500,
+      core: { used: 0, remaining: LIMIT, resetOffsetMs: WINDOW_MS },
+    }],
+    delayByCommand: { run: 800 },
+  });
+  const competitorReady = join(box.root, "manual-competitor-ready");
+  const manualInput =
+    "i=0; while ! grep -q 'Waiting' \"$GH_GLANCE_CAPTURE_OUT\" 2>/dev/null && [ $i -lt 150 ]; " +
+    "do i=$((i + 1)); sleep .1; done; " +
+    "i=0; while [ $i -lt 8 ]; do printf r; i=$((i + 1)); sleep .03; done; " +
+    "i=0; while ! grep -Fq '\"pane\":\"manual\",\"argv\":[\"run\"' " +
+    "\"$GH_GLANCE_FIXTURE_STATE\" 2>/dev/null && [ $i -lt 300 ]; " +
+    "do i=$((i + 1)); sleep .1; done; sleep .5; printf q";
+  const captures = [startPane(box, "manual", {
+    stdin: manualInput,
+    animation: true,
+    settle: 40,
+    env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
+  })];
+
+  let held;
+  let progress;
+  let results;
+  try {
+    await observeUntil(
+      box.readGovernor,
+      (governor) => Object.values(governor.intents ?? {})
+        .some((intent) => intent.priority === "manual"),
+      15_000,
+    );
+    captures.push(startPane(box, "competitor", { readyPath: competitorReady, settle: 40 }));
+    held = await observeUntil(
+      box.readGovernor,
+      (governor) => {
+        const priorities = Object.values(governor.intents ?? {}).map((intent) => intent.priority);
+        return priorities.length === 2 && priorities.includes("manual") &&
+          priorities.some((priority) => priority !== "manual");
+      },
+      10_000,
+    );
+    progress = await observeUntil(
+      box.read,
+      (state) => new Set(dataStarts(state).map((event) => event.pane)).size === 2,
+      30_000,
+    );
+  } finally {
+    results = await releasePanes(competitorReady, captures);
+  }
+
+  assert.equal(Object.values(held.intents).filter((intent) => intent.priority === "manual").length, 1);
+  const runs = dataStarts(progress).filter((event) => event.argv[0] === "run");
+  assert.equal(runs.filter((event) => event.pane === "manual").length, 1);
+  assert.equal(runs.filter((event) => event.pane === "competitor").length, 1);
+  assert.equal(runs[0].pane, "manual", "lower-priority work started before manual refresh");
+  const manualResult = results[0];
+  const statuses = manualResult.liveScreen.statusHistory;
+  const waitingAt = statuses.findIndex((status) => / Waiting(?:\s|$)/.test(status));
+  const checkingAt = statuses.findIndex((status, index) =>
+    index > waitingAt && / Checking(?:\s|$)/.test(status));
+  assert.ok(waitingAt >= 0, statuses.join(" -> "));
+  assert.ok(checkingAt > waitingAt, statuses.join(" -> "));
+  assertDebitsStayOutsideReserve(runs);
+});
+
+test("twelve exhausted core panes share one visible hold and make no REST data calls", async (t) => {
+  const box = fixture(t, {
+    core: { limit: LIMIT, used: LIMIT, remaining: 0, resetMs: Date.now() + WINDOW_MS },
+  });
+  const readyPath = join(box.root, "exhausted-ready");
+  const captures = [startPane(box, "exhausted-0", { readyPath })];
+
+  let publication;
+  let results;
+  try {
+    publication = await observeUntil(
+      box.readGovernor,
+      (governor) => governor?.probeOutcome?.status === "healthy" &&
+        governor?.budgets?.core?.remaining === 0,
+      10_000,
+    );
+    captures.push(...Array.from({ length: 11 }, (_, offset) =>
+      startPane(box, `exhausted-${offset + 1}`, { readyPath })));
+    await observeUntil(
+      box.readGovernor,
+      (governor) => Object.keys(governor.leases ?? {}).length === 12,
+      15_000,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  } finally {
+    results = await releasePanes(readyPath, captures);
+  }
+
+  const state = box.read();
+  assert.equal(probes(state).length, 1);
+  assert.equal(publication.budgets.core.remaining, 0);
+  assert.equal(dataStarts(state).filter((event) => event.cost.core > 0).length, 0);
+  assert.equal(results.length, 12);
+  for (const [index, result] of results.entries()) {
+    assert.ok(
+      result.liveScreen.statusHistory.some((status) => / (?:Paused|Waiting)(?:\s|$)/.test(status)),
+      `pane ${index} did not render the shared hold: ${result.liveScreen.statusHistory.join(" -> ")}`,
+    );
+  }
+});
+
+test("a held core pane switches to Issues and spends only GraphQL", async (t) => {
+  const box = fixture(t, {
+    core: { limit: LIMIT, used: LIMIT, remaining: 0, resetMs: Date.now() + WINDOW_MS },
+  });
+  const input =
+    "i=0; while ! grep -q 'Paused' \"$GH_GLANCE_CAPTURE_OUT\" 2>/dev/null && [ $i -lt 150 ]; " +
+    "do i=$((i + 1)); sleep .1; done; printf 2; " +
+    "i=0; while ! grep -Fq '\"pane\":\"isolation\",\"argv\":[\"issue\"' " +
+    "\"$GH_GLANCE_FIXTURE_STATE\" 2>/dev/null && [ $i -lt 200 ]; " +
+    "do i=$((i + 1)); sleep .1; done; sleep .5; printf q";
+  const result = await startPane(box, "isolation", {
+    stdin: input,
+    settle: 30,
+    env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
+  });
+
+  const state = box.read();
+  const data = dataStarts(state, "isolation");
+  assert.equal(data.filter((event) => event.cost.core > 0).length, 0);
+  assert.equal(data.filter((event) => event.argv[0] === "issue").length, 1);
+  assert.equal(data.filter((event) => event.cost.graphql > 0).length, 1);
+  const statuses = result.liveScreen.statusHistory;
+  const pausedAt = statuses.findIndex((status) => / Paused(?:\s|$)/.test(status));
+  const progressedAt = statuses.findIndex((status, index) =>
+    index > pausedAt && / (?:Checking|Watching)(?:\s|$)/.test(status));
+  assert.ok(pausedAt >= 0, statuses.join(" -> "));
+  assert.ok(progressedAt > pausedAt, statuses.join(" -> "));
+  assertDebitsStayOutsideReserve(data);
+});
+
 test("a real reset resumes all panes, while atomic external burn limits the next epoch", async (t) => {
   const resetBox = fixture(t, {
     anchorAtFirstProbe: true,
@@ -217,6 +406,7 @@ test("a real reset resumes all panes, while atomic external burn limits the next
   })];
 
   let resetProgress;
+  let resetSchedule;
   let firstEpoch;
   try {
     const first = await observeUntil(
@@ -239,15 +429,12 @@ test("a real reset resumes all panes, while atomic external burn limits the next
         ).length === 12,
       30_000,
     );
-    const lastNotBefore = Math.max(
-      ...Object.values(scheduled.reservations).map((reservation) => reservation.notBefore),
-    );
-    const progressTimeout = Math.min(75_000, Math.max(65_000, lastNotBefore - Date.now() + 65_000));
+    resetSchedule = scheduled;
     resetProgress = await observeUntil(
       resetBox.read,
       (state) => probes(state).length === 2 &&
         new Set(dataStarts(state).map((event) => event.pane)).size === 12,
-      progressTimeout,
+      reservationHorizon(scheduled, "core"),
     );
   } finally {
     await releasePanes(resetReady, resetCaptures);
@@ -259,6 +446,7 @@ test("a real reset resumes all panes, while atomic external burn limits the next
   assert.equal(resetData.length, 12, "reset launched duplicate data work");
   assert.equal(new Set(resetData.map((event) => event.pane)).size, 12);
   assertDebitsStayOutsideReserve(resetData);
+  assertPhasedStarts(resetSchedule, resetData, "core", 12, "reset");
 
   const burnBox = fixture(t, {
     anchorAtFirstProbe: true,
