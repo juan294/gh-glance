@@ -16,6 +16,10 @@ echo "$*" >> "$GH_GLANCE_FIXTURE_LOG"
 
 FIXTURE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
+if [ -n "${GH_GLANCE_FIXTURE_STATE:-}" ]; then
+  exec node "$FIXTURE_DIR/gh-state.mjs" "$@"
+fi
+
 matches_selector() {
   wanted=$1
   if [ "$wanted" = "api-data" ]; then

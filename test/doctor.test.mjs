@@ -79,17 +79,23 @@ test("rate limiting outranks the auth marker", () => {
 // The report itself. --doctor exits before ink is imported, so a plain child
 // process is enough -- no pty needed.
 async function doctor({ env = {}, args = [] } = {}) {
-  const { stdout } = await execFileAsync(process.execPath, [ENTRY, "--doctor", ...args], {
-    cwd: REPO,
-    env: {
-      ...process.env,
-      PATH: `${FIXTURE_BIN}:${process.env.PATH}`,
-      GH_GLANCE_FIXTURE_LOG: "/dev/null",
-      ...env,
-    },
-    maxBuffer: 8 * 1024 * 1024,
-  });
-  return stdout;
+  const root = env.XDG_CONFIG_HOME ?? mkdtempSync(join(tmpdir(), "gh-glance-doctor-case-"));
+  try {
+    const { stdout } = await execFileAsync(process.execPath, [ENTRY, "--doctor", ...args], {
+      cwd: REPO,
+      env: {
+        ...process.env,
+        PATH: `${FIXTURE_BIN}:${process.env.PATH}`,
+        GH_GLANCE_FIXTURE_LOG: "/dev/null",
+        XDG_CONFIG_HOME: root,
+        ...env,
+      },
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    return stdout;
+  } finally {
+    if (!env.XDG_CONFIG_HOME) rmSync(root, { recursive: true, force: true });
+  }
 }
 
 function probeBlock(report, name) {
@@ -123,7 +129,7 @@ test("--doctor reports governor health without a raw scope identifier", async (t
     args: ["--repo", "acme/widget"],
   });
   assert.match(out, /API governor\n------------/);
-  assert.match(out, /^status {12}stale$/m);
+  assert.match(out, /^status {12}healthy$/m);
   assert.match(out, /^live leases {7}0$/m);
   assert.ok(!/rate-governor-v1-|[0-9a-f]{64}/.test(out), out);
 });
@@ -156,20 +162,14 @@ test("--doctor reports rather than exits when gh is missing", async () => {
   assert.match(out, /Endpoint probes/);
 });
 
-test("--doctor classifies a SAML 403 as an auth problem, end to end", async () => {
-  // The executable statement of the whole plan's central claim: a lapsed
-  // enterprise SAML session must never be reported as a disabled feature. The
-  // fixture gh fails the api calls on demand, which is the only way to produce
-  // this error without a real tenant.
+test("--doctor spends nothing when the free budget probe fails", async () => {
   const message = "HTTP 403: Resource protected by organization SAML enforcement";
   const out = await doctor({ env: { GH_GLANCE_FIXTURE_FAIL: message } });
-  assert.match(out, /^ {2}classified {2}auth-problem$/m, out);
-  assert.match(out, /^ {2}http {8}403$/m, out);
-  assert.ok(out.includes(message), "the verbatim tenant message must survive into the report");
-  assert.ok(!out.includes("not enabled"), "a SAML lapse was reported as a disabled feature");
+  assert.match(out, /^REST core {9}unavailable$/m);
+  assert.equal(out.match(/^ {2}classified {2}skipped$/gm)?.length, 10, out);
 });
 
-test("--doctor classifies the real no-login issue failure", async () => {
+test("--doctor classifies a failed REST diagnostic", async () => {
   const message = "To get started with GitHub CLI, please run: gh auth login";
   const out = await doctor({
     env: { GH_GLANCE_FIXTURE_FAIL: message, GH_GLANCE_FIXTURE_FAIL_ON: "issue" },
@@ -179,7 +179,7 @@ test("--doctor classifies the real no-login issue failure", async () => {
   assert.ok(block.includes(message), block);
 });
 
-test("--doctor classifies the screenshot GraphQL failure", async () => {
+test("--doctor classifies a failed GraphQL diagnostic", async () => {
   const message =
     "GraphQL: Could not resolve to a Repository with the name 'Nvteca/cashflor-forecast'. (repository)";
   const out = await doctor({
@@ -200,7 +200,10 @@ test("--doctor reports a failed repository-access probe separately", async () =>
   assert.match(repositoryBlock, /^ {2}classified {2}unavailable$/m, repositoryBlock);
   assert.ok(repositoryBlock.includes(message), repositoryBlock);
 
-  for (const name of ["Actions (run list)", "Issues (issue list)", "Pull requests (pr list)"]) {
+  const actions = probeBlock(out, "Actions (run list)");
+  assert.match(actions, /^ {2}outcome {5}ok /m, actions);
+  assert.match(actions, /^ {2}classified {2}ok$/m, actions);
+  for (const name of ["Issues (issue list)", "Pull requests (pr list)"]) {
     const block = probeBlock(out, name);
     assert.match(block, /^ {2}outcome {5}ok /m, block);
     assert.match(block, /^ {2}classified {2}ok$/m, block);

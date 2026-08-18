@@ -16,7 +16,7 @@ import {
   mergeDashboardCacheSnapshots,
   mergeWidthPreferenceSnapshots,
   pollResultTransition,
-  pollTickKeys,
+  pollSchedule,
   reconcileSelectionViewport,
   resourceDecision,
   securityPollDelay,
@@ -235,13 +235,16 @@ test("the poll controller keeps unchanged, blind, and changed transitions separa
   assert.equal(blind.kind, "blind");
   assert.equal(blind.nextRaw, null);
 
-  assert.deepEqual(pollTickKeys({ ticks: 0, activeKey: "issues" }).due, [
-    "actions",
-    "issues",
-    "prs",
-    "security",
-  ]);
-  assert.deepEqual(pollTickKeys({ ticks: 1, activeKey: "issues" }).due, ["issues"]);
+  assert.deepEqual(pollSchedule({ ticks: 0, activeKey: "issues" }).due, ["issues"]);
+  assert.deepEqual(pollSchedule({ ticks: 1, activeKey: "issues" }).due, ["issues"]);
+  assert.deepEqual(
+    [4, 8, 12].map((ticks) => pollSchedule({ ticks, activeKey: "issues" }).due),
+    [["issues", "actions"], ["issues", "prs"], ["issues", "security"]],
+  );
+  assert.deepEqual(
+    pollSchedule({ ticks: 4, activeKey: "issues", heldResources: { core: true } }).due,
+    ["issues"],
+  );
 });
 
 test("open request ownership preserves per-item guards and aborts every child on quit", async () => {

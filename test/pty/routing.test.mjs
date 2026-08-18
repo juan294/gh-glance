@@ -19,14 +19,20 @@ import { capture } from "./capture.mjs";
 const HOST = "tenant.ghe.com";
 
 // Captures cost several seconds each, so each is taken once at module scope.
-const inferred = capture({ cols: 80, rows: 24 });
+const inferred = capture({ cols: 80, rows: 24, settle: 7, args: "--tab security" });
 const slugOnly = capture({
   cols: 80,
   rows: 24,
-  args: "--repo acme/widget",
+  settle: 7,
+  args: "--repo acme/widget --tab security",
   env: { GH_HOST: HOST, GH_REPO: `${HOST}/other/repo` },
 });
-const hostQualified = capture({ cols: 80, rows: 24, args: `--repo ${HOST}/acme/widget` });
+const hostQualified = capture({
+  cols: 80,
+  rows: 24,
+  settle: 7,
+  args: `--repo ${HOST}/acme/widget --tab security`,
+});
 
 const listCalls = (result) => result.fixtureCalls.filter((call) => /^(run|issue|pr) /.test(call));
 // The alert endpoints only. `api rate_limit` is the adaptive throttle's budget
@@ -38,17 +44,13 @@ const probeCalls = (result) => result.fixtureCalls.filter((call) => call.startsW
 
 function assertReachedTheDataLayer(result, label) {
   assert.ok(result.fixtureCalls.length > 0, `${label}: the fixture gh was never invoked`);
-  assert.ok(listCalls(result).length > 0, `${label}: no list subcommand was called`);
   assert.ok(apiCalls(result).length > 0, `${label}: no alert endpoint was called`);
 }
 
-test("with no --repo, the argv vector is byte-identical to the default", () => {
-  // The regression guard for "the default path did not change". Both flags are
-  // built by functions that return an empty array when unconfigured, so an
-  // unconfigured run must produce neither.
+test("with no --repo, all-remotes inference routes API calls to github.com", () => {
   assertReachedTheDataLayer(inferred, "inferred");
-  for (const call of inferred.fixtureCalls) {
-    assert.ok(!call.includes("--hostname"), `--hostname leaked into: ${call}`);
+  for (const call of apiCalls(inferred)) {
+    assert.ok(call.includes("--hostname github.com"), call);
     assert.ok(!call.includes("--repo"), `--repo leaked into: ${call}`);
   }
 });

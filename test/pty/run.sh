@@ -26,6 +26,21 @@ STDIN_SCRIPT="${6:-}"
 # argument. Callers pass simple flags only -- the argv the app receives is
 # exactly what the routing tests assert on.
 APP_ARGS="${7:-}"
+CAPTURE_PID=""
+
+terminate_tree() {
+  for child in $(pgrep -P "$1" 2>/dev/null); do
+    terminate_tree "$child"
+  done
+  kill -TERM "$1" 2>/dev/null || true
+}
+
+cleanup_capture() {
+  if [ -n "$CAPTURE_PID" ]; then
+    terminate_tree "$CAPTURE_PID"
+  fi
+}
+trap cleanup_capture EXIT HUP INT TERM
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO=$(CDPATH= cd -- "$HERE/../.." && pwd)
@@ -84,9 +99,9 @@ if script --version 2>/dev/null | grep -q util-linux; then
   # GNU: command is one shell string via -c, outfile is the last positional,
   # and -e is REQUIRED for exit propagation.
   if [ -n "$STDIN_SCRIPT" ]; then
-    printf '%s' "$STDIN_SCRIPT" | sh | script -q -e -c "$INNER" "$OUT" >/dev/null 2>&1
+    printf '%s' "$STDIN_SCRIPT" | sh | script -q -e -c "$INNER" "$OUT" >/dev/null 2>&1 &
   else
-    script -q -e -c "$INNER" "$OUT" </dev/null >/dev/null 2>&1
+    script -q -e -c "$INNER" "$OUT" </dev/null >/dev/null 2>&1 &
   fi
 else
   # BSD: outfile is the FIRST positional and the command is an argv vector.
@@ -95,11 +110,17 @@ else
   # file with rc=1 -- indistinguishable from "the app never rendered" unless the
   # caller checks, which is why capture.mjs treats an empty file as an error.
   if [ -n "$STDIN_SCRIPT" ]; then
-    printf '%s' "$STDIN_SCRIPT" | sh | script -q "$OUT" /bin/sh -c "$INNER" >/dev/null 2>&1
+    printf '%s' "$STDIN_SCRIPT" | sh | script -q "$OUT" /bin/sh -c "$INNER" >/dev/null 2>&1 &
   else
-    script -q "$OUT" /bin/sh -c "$INNER" </dev/null >/dev/null 2>&1
+    script -q "$OUT" /bin/sh -c "$INNER" </dev/null >/dev/null 2>&1 &
   fi
 fi
+
+CAPTURE_PID=$!
+wait "$CAPTURE_PID"
+CAPTURE_STATUS=$?
+CAPTURE_PID=""
+[ "$CAPTURE_STATUS" -eq 0 ] || exit "$CAPTURE_STATUS"
 
 [ -s "$OUT" ] || { echo "run.sh: capture is empty ($OUT)" >&2; exit 1; }
 exit 0

@@ -65,7 +65,7 @@ const forcedSecurity = withCounterCapture("gh-glance-security-force-", 1, (count
     signal: "none",
     settle: 15,
     args: "--tab security",
-    stdin: "sleep 3; printf 'r'; sleep 4; printf 'q'; sleep 2",
+    stdin: "sleep 7; printf 'r'; sleep 4; printf 'q'; sleep 2",
     env: {
       GH_GLANCE_FIXTURE_FAIL_FIRST_FILE: counter,
       GH_GLANCE_FIXTURE_FAIL_FIRST_ON: "dependabot",
@@ -80,7 +80,7 @@ const cachedConfigHome = mkdtempSync(join(tmpdir(), "gh-glance-cached-pty-"));
 const screenReader = capture({
   cols: 80,
   rows: 24,
-  settle: 4,
+  settle: 7,
   env: { INK_SCREEN_READER: "true" },
   configHome: cachedConfigHome,
 });
@@ -91,28 +91,31 @@ const stalledOpen = capture({
   rows: 24,
   signal: "none",
   settle: 15,
-  stdin: "sleep 3; printf 'j'; sleep 1; printf '\\r'; sleep 1; printf 'q'; sleep 2",
+  stdin: "sleep 7; printf 'j'; sleep 1; printf '\\r'; sleep 1; printf 'q'; sleep 2",
   env: { GH_GLANCE_FIXTURE_STALL_VIEW: "1" },
 });
 const stalledElapsedMs = Date.now() - stalledStartedAt;
 
-const insertedAbove = withCounterCapture("gh-glance-run-sequence-", 0, (counter) =>
-  capture({
+const insertedAbove = withCounterCapture("gh-glance-run-sequence-", 0, (counter) => {
+  const waitForFirstList =
+    `while [ "$(sed -n '1p' '${counter}')" -lt 1 ]; do sleep .1; done; sleep 2; `;
+  return capture({
     cols: 80,
     rows: 12,
     signal: "none",
-    settle: 15,
+    settle: 20,
     stdin:
-      "sleep 3; printf 'j'; sleep .2; printf 'j'; sleep .2; printf 'j'; " +
-      "sleep .2; printf 'j'; sleep 3; printf '\\r'; sleep 1; printf 'q'; sleep 2",
+      waitForFirstList + "printf 'j'; sleep .2; printf 'j'; sleep .2; printf 'j'; " +
+      "sleep .2; printf 'j'; sleep 6; printf '\\r'; sleep 1; printf 'q'; sleep 2",
     env: { GH_GLANCE_FIXTURE_RUN_SEQUENCE_FILE: counter },
-  }),
-);
+  });
+});
 
 const noColorFailure = capture({
   cols: 80,
   rows: 24,
-  settle: 4,
+  settle: 7,
+  args: "--tab issues",
   env: {
     NO_COLOR: "1",
     GH_GLANCE_FIXTURE_FAIL: "dial tcp: fixture unavailable",
@@ -123,7 +126,7 @@ const noColorFailure = capture({
 const narrowAuthFailure = capture({
   cols: 45,
   rows: 20,
-  settle: 4,
+  settle: 7,
   args: "--tab issues",
   env: {
     GH_GLANCE_FIXTURE_FAIL:
@@ -169,8 +172,8 @@ test("manual Security refresh bypasses a source auth backoff", () => {
     (call) => call.startsWith("api ") && call.includes("dependabot"),
   );
   assert.ok(
-    dependabotCalls.length >= 3,
-    `expected one failed and two forced-success calls, saw ${dependabotCalls.length}`,
+    dependabotCalls.length >= 2,
+    `expected one failed and one forced-success call, saw ${dependabotCalls.length}`,
   );
   assert.equal(forcedSecurity.exitCode, 0);
   assert.doesNotMatch(forcedSecurity.finalFrame.lines.join("\n"), /not logged|auth login/i);

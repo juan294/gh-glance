@@ -40,7 +40,7 @@ const OUTSIDE_Y = workflowHandle.yEnd + 1;
 
 const noRemoteEnv = {
   GH_GLANCE_FIXTURE_FAIL: "failed to determine base repo: no git remotes found",
-  GH_GLANCE_FIXTURE_FAIL_ON: "run,issue,pr,api",
+  GH_GLANCE_FIXTURE_FAIL_ON: "run,issue,pr,api-data",
 };
 
 function captureWithPreloader(prefix, source, options) {
@@ -217,7 +217,7 @@ test("remote setup disables mouse reporting before handing the terminal to gh", 
       settle: 12,
       configHome,
       stdin:
-        "sleep 3; printf '\\r'; i=0; " +
+        "sleep 7; printf '\\r'; i=0; " +
         "while [ ! -f \"$GH_GLANCE_FIXTURE_READY\" ] && [ \"$i\" -lt 200 ]; " +
         "do sleep 0.05; i=$((i + 1)); done; sleep 0.2; printf 'confirm\\n'; " +
         "while :; do sleep 1; printf '\\n' || exit 0; done",

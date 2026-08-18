@@ -10,7 +10,7 @@ import { test } from "node:test";
 import { capture } from "./capture.mjs";
 
 const REFRESH_SECONDS = 5;
-const SETTLE = Math.ceil(REFRESH_SECONDS * 0.6);
+const SETTLE = Math.ceil(REFRESH_SECONDS * 1.4);
 const ESC = String.fromCharCode(27);
 
 const strip = (text) =>
@@ -41,7 +41,10 @@ const opened = capture({
   rows: 24,
   signal: "none",
   settle: 20,
-  stdin: `sleep ${SETTLE}; printf 'j'; sleep 1; printf '\\r'; sleep 1; printf 'q'; sleep 2`,
+  stdin:
+    `sleep ${SETTLE}; printf 'j'; sleep 1; ` +
+    "printf '\\r'; sleep 1; printf '\\r'; sleep 1; printf '\\r'; sleep 2; printf 'q'; sleep 2",
+  env: { GH_GLANCE_FIXTURE_STALL_VIEW: "1" },
 });
 
 test("nothing is selected until you move", () => {

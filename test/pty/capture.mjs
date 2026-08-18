@@ -11,7 +11,7 @@
 //      into the capture file even under -q. Those lines are longer than a narrow
 //      terminal, so a width check that does not skip them fails on Linux only.
 
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { readFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, isAbsolute, join } from "node:path";
@@ -481,5 +481,46 @@ export function capture({
       if (existsSync(path)) rmSync(path, { force: true });
     }
     if (ownsConfigHome) rmSync(effectiveConfigHome, { recursive: true, force: true });
+  }
+}
+
+export async function captureAsync(options) {
+  const {
+    cols,
+    rows,
+    signal = "TERM",
+    settle = 4,
+    stdin = "",
+    args = "",
+    env = {},
+    configHome,
+  } = options;
+  if (configHome == null || !isAbsolute(configHome) || configHome.length === 0) {
+    throw new TypeError("captureAsync requires a shared absolute configHome");
+  }
+  captureSeq += 1;
+  const out = join(tmpdir(), `gh-glance-pty-${process.pid}-${captureSeq}.txt`);
+  try {
+    await new Promise((resolve, reject) => {
+      execFile(
+        "/bin/sh",
+        [RUN, String(cols), String(rows), out, signal, String(settle), stdin, args],
+        {
+          timeout: (settle + 25) * 1000,
+          env: { ...process.env, ...env, XDG_CONFIG_HOME: configHome },
+        },
+        (error) => error ? reject(error) : resolve(),
+      );
+    });
+    const parsed = parseCapture(readFileSync(out, "utf8"), { cols, rows });
+    const logPath = `${out}.calls`;
+    parsed.fixtureCalls = existsSync(logPath)
+      ? readFileSync(logPath, "utf8").split("\n").filter(Boolean)
+      : [];
+    return parsed;
+  } finally {
+    for (const path of [out, `${out}.calls`]) {
+      if (existsSync(path)) rmSync(path, { force: true });
+    }
   }
 }

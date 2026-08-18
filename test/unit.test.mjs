@@ -75,7 +75,6 @@ import {
   REMOTE_SETUP_LINES,
   REMOTE_SETUP_NONINTERACTIVE_LINES,
   VERDICT_REMEDY,
-  RATE_LIMIT_RETRY_MS,
   FAILURE_LADDER,
   REPO_PATTERN,
   TAB_KEYS,
@@ -86,14 +85,6 @@ import {
   operationCost,
   tabRequestCost,
   projectedHourlyCost,
-  REFRESH_MS,
-  BACKGROUND_EVERY,
-  adaptiveRefreshMs,
-  adaptiveChangeWorthApplying,
-  externalSampleIsUsable,
-  nextExternalSampleWindow,
-  restPerTick,
-  MAX_ADAPTIVE_REFRESH_MS,
   BUDGET_SAFETY,
   BUDGET_RESERVE_FRACTION,
   BUDGET_SNAPSHOT_TTL_MS,
@@ -2077,20 +2068,19 @@ test("REPO_PATTERN rejects dot segments but keeps real repository names", () => 
   }
 });
 
-test("every verdict with a remedy also has a backoff ladder, and vice versa", () => {
+test("local failure remedies have ladders while shared rate limits do not", () => {
   // The two tables are read together on every failure: one picks what the user
   // is told, the other picks how hard we keep asking. A verdict in one and not
   // the other means a tab that either explains itself and then hammers, or backs
   // off in silence. "other" is in neither, deliberately -- an unclassified
   // failure shows its real message and retries on the next tick.
-  assert.deepEqual(Object.keys(VERDICT_REMEDY).sort(), Object.keys(FAILURE_LADDER).sort());
+  assert.deepEqual(
+    Object.keys(VERDICT_REMEDY).filter((verdict) => verdict !== "rate-limited").sort(),
+    Object.keys(FAILURE_LADDER).sort(),
+  );
   assert.ok(!("other" in VERDICT_REMEDY));
   assert.ok(!("ok" in FAILURE_LADDER));
-  // Short and flat: a rate limit clears on GitHub's own schedule, so the
-  // hour-long unavailable ladder would leave the pane blank long after the cause
-  // was gone.
-  assert.equal(RATE_LIMIT_RETRY_MS.length, 1);
-  assert.ok(RATE_LIMIT_RETRY_MS[0] <= BACKOFF_STEPS_MS[0]);
+  assert.equal("rate-limited" in FAILURE_LADDER, false);
 });
 
 test("the per-fetch cost tables cover every tab and nothing else", () => {
@@ -2242,7 +2232,7 @@ test("safe pacing is not clamped at one minute", () => {
       nowMs: POLICY_NOW,
     });
     assert.equal(decision.mode, "open");
-    assertClose(2 / decision.callsPerMs, intervalMs, 1e-6);
+    assert.ok(Math.abs(2 / decision.callsPerMs - intervalMs) <= 1e-6);
   }
 });
 
@@ -2856,231 +2846,12 @@ test("deterministic closed-loop governor simulation preserves both reserves", ()
   for (const leaseId of Object.keys(leases)) assert.ok(received.has(leaseId), leaseId);
 });
 
-// The control law. These assertions are the specification -- the function is
-// pure, so the rubric can be stated exactly rather than observed through a
-// timer. Expected intervals are derived, not guessed: with
-// restPerTick("actions") = 2 + 6/12 = 2.5 and a fresh window (5000 remaining,
-// resetting in an hour), affordable = 5000/3600 * 0.8 = 1.111 calls/sec.
-function assertClose(actual, expected, tolerance) {
-  assert.ok(
-    Math.abs(actual - expected) <= tolerance,
-    `expected ${actual} within ${tolerance} of ${expected}`,
-  );
-}
-
-const FRESH = { remaining: 5000, limit: 5000, resetMs: 3_600_000 };
-// `budget` is merged onto FRESH *after* the general spread: a row that overrides
-// only `remaining` must keep the fresh window's resetMs, or secondsToReset goes
-// NaN and the case silently stops testing what it names.
-const at = (over) => ({
-  nowMs: 0,
-  restPerTick: 2.5,
-  floorMs: 5000,
-  ...over,
-  budget: { ...FRESH, ...over?.budget },
-});
-const sample = (sharedCompleted, globalUsedDelta) => ({
-  sharedCompletedDelta: sharedCompleted,
-  globalUsedDelta,
-});
-
-test("a single instance stays at the configured floor", () => {
-  // required = 2.25 / 1.111 = 2.03s, below the 5s floor. This is the property
-  // that keeps adaptation from being a regression for ordinary single-pane use.
-  assert.equal(adaptiveRefreshMs(at({ sample: sample(100, 100) })), 5000);
-});
-
-test("three panes widen to about 7 seconds", () => {
-  assertClose(adaptiveRefreshMs(at({ sample: sample(100, 300) })), 6750, 200);
-});
-
-test("seven panes widen to about 16 seconds", () => {
-  assertClose(adaptiveRefreshMs(at({ sample: sample(100, 700) })), 15_750, 500);
-});
-
-test("ten panes widen to about 23 seconds", () => {
-  assertClose(adaptiveRefreshMs(at({ sample: sample(100, 1000) })), 22_500, 500);
-});
-
-test("the aggregate of N adapted panes lands near the safety target", () => {
-  // The property that matters, asserted directly rather than inferred from the
-  // intervals: N panes each polling at the computed interval spend at most
-  // BUDGET_SAFETY of the hourly limit, leaving the rest for the user's own gh.
-  for (const n of [1, 3, 7, 10, 20]) {
-    const ms = adaptiveRefreshMs(at({ sample: sample(100, 100 * n) }));
-    const aggregate = n * (3_600_000 / ms) * 2.5;
-    assert.ok(aggregate <= 5000 * BUDGET_SAFETY + 1, `n=${n} completed ${aggregate}`);
-  }
-});
-
-// Phase 3 removes this unsafe legacy adapter assertion with its runtime caller.
-test("legacy adapter: exhausted budget goes straight to the cap [remove in Phase 3]", () => {
-  assert.equal(
-    adaptiveRefreshMs(at({ budget: { remaining: 0 }, sample: sample(100, 700) })),
-    MAX_ADAPTIVE_REFRESH_MS,
-  );
-});
-
-// Phase 3 removes the unsafe one-minute clamp after governor admission is live.
-test("legacy adapter: widening is capped [remove in Phase 3]", () => {
-  assert.equal(
-    adaptiveRefreshMs(at({ budget: { remaining: 10 }, sample: sample(100, 9000) })),
-    MAX_ADAPTIVE_REFRESH_MS,
-  );
-});
-
-test("too small a sample declines to infer an external factor", () => {
-  // Floor, not a wild extrapolation: one call against a global delta of one
-  // reads as "we are the only consumer" whether or not that is true. Floor
-  // specifically because there is no earlier measurement to hold -- see below.
-  assert.equal(adaptiveRefreshMs(at({ sample: sample(MIN_SAMPLE_CALLS - 1, 5000) })), 5000);
-});
-
-test("an unmeasurable window holds the widened interval, not the floor", () => {
-  // The same rubric row as "seven panes", reached with a window too small to
-  // re-measure. Dropping to the floor here is the flap: a pane wide enough to
-  // need throttling is, by construction, too quiet to keep proving it.
-  assertClose(
-    adaptiveRefreshMs(at({ sample: sample(2, 700), lastExternalFactor: 7 })),
-    15_750,
-    500,
-  );
-});
-
-test("nextExternalFactor holds the last measurement when the window cannot be measured", () => {
-  const factor = (value, lastExternalFactor = 1) => nextExternalFactor({
-    lastExternalFactor,
-    globalUsedDelta: value?.globalUsedDelta ?? 0,
-    sharedCompletedDelta: value?.sharedCompletedDelta ?? 0,
-  });
-  assert.equal(factor(sample(100, 700)), 7);
-  assert.equal(factor(sample(2, 700), 7), 7);
-  assert.equal(factor(null, 7), 7);
-  // Never below 1, from either source: fewer than one consumer is not a thing,
-  // and an external factor under 1 would compute an interval tighter than the floor.
-  assert.equal(factor(sample(100, 50)), 1);
-  assert.equal(factor(null, 0.2), null);
-});
-
-test("an unmeasurable probe window stays open instead of restarting", () => {
-  const first = nextExternalSampleWindow(null, { used: 100 }, 0);
-  assert.equal(first.sample, null, "the first probe has no window to measure over");
-  assert.deepEqual(first.next, { used: 100, sharedCompleted: 0 });
-
-  // Two completed shared calls, below MIN_SAMPLE_CALLS: the baseline must not advance,
-  // or the next window starts equally short and the pane can never re-measure.
-  const small = nextExternalSampleWindow(first.next, { used: 140 }, 2);
-  assert.equal(externalSampleIsUsable(small.sample), false);
-  assert.deepEqual(small.next, first.next);
-
-  // One probe later the accumulated window is measurable -- and both halves of
-  // the ratio span the whole stretch, not just the last minute of it.
-  const grown = nextExternalSampleWindow(small.next, { used: 200 }, 6);
-  assert.deepEqual(grown.sample, { globalUsedDelta: 100, sharedCompletedDelta: 6 });
-  assert.deepEqual(grown.next, { used: 200, sharedCompleted: 6 });
-});
-
-test("a rate-limit window reset restarts the probe window", () => {
-  // `used` falling means the hour rolled over. The span before the reset cannot
-  // be compared against the counter after it, so this cycle infers nothing
-  // rather than reporting a negative delta.
-  const { sample: s, next } = nextExternalSampleWindow(
-    { used: 4000, sharedCompleted: 900 },
-    { used: 12 },
-    950,
-  );
-  assert.equal(s, null);
-  assert.deepEqual(next, { used: 12, sharedCompleted: 950 });
-});
-
-test("a throttled pane does not flap back to the floor between measurable windows", () => {
-  // The closed-loop property the rubric above cannot see, because every row
-  // there is handed its sample. Twenty panes widen to ~40s, at which point one
-  // probe window holds ~3 of this pane's calls -- under MIN_SAMPLE_CALLS. If the
-  // loop re-measured from scratch it would read "no other consumers", snap to
-  // the floor, spend enough to measure again, and re-throttle: a two-minute flap
-  // at exactly the instance count the widening exists for.
-  //
-  // The budget is held healthy on purpose. That is the trap: once the panes have
-  // throttled, nothing about `remaining` says they must stay throttled, and the
-  // inferred external factor is the only thing holding them there.
-  const PANES = 20;
-  let applied = 5000;
-  let sharedCompleted = 0;
-  let used = 0;
-  let externalSampleWindow = null;
-  let externalFactor = 1;
-  const settled = [];
-
-  for (let probe = 0; probe < 12; probe++) {
-    const mine = (60_000 / applied) * 2.5; // one probe window at the current interval
-    sharedCompleted += mine;
-    used += mine * PANES;
-    const budget = { ...FRESH, used };
-
-    const step = nextExternalSampleWindow(externalSampleWindow, budget, sharedCompleted);
-    externalSampleWindow = step.next;
-    externalFactor = nextExternalFactor({
-      lastExternalFactor: externalFactor,
-      globalUsedDelta: step.sample?.globalUsedDelta ?? 0,
-      sharedCompletedDelta: step.sample?.sharedCompletedDelta ?? 0,
-    });
-    const target = adaptiveRefreshMs(at({
-      budget,
-      sample: step.sample,
-      lastExternalFactor: externalFactor,
-    }));
-    if (adaptiveChangeWorthApplying(applied, target)) applied = target;
-
-    if (probe >= 2) settled.push(applied);
-  }
-
-  assert.ok(Math.min(...settled) > 5000, `returned to the floor: ${settled.join(", ")}`);
-  assertClose(applied, 45_000, 2000);
-});
-
-// Phase 3 removes this unsafe fail-open fallback with the legacy adapter.
-test("legacy adapter: missing budget returns the floor [remove in Phase 3]", () => {
-  for (const budget of [null, undefined, { remaining: NaN }]) {
-    assert.equal(adaptiveRefreshMs({ ...at(), budget, sample: sample(100, 700) }), 5000);
-  }
-});
-
-test("the configured floor is never tightened, even above the cap", () => {
-  const ms = adaptiveRefreshMs({ ...at({ sample: sample(100, 100) }), floorMs: 120_000 });
-  assert.equal(ms, 120_000);
-});
-
-test("hysteresis suppresses small moves and admits large ones", () => {
-  assert.equal(adaptiveChangeWorthApplying(10_000, 11_000), false); // +10%
-  assert.equal(adaptiveChangeWorthApplying(10_000, 9_500), false); // -5%
-  assert.equal(adaptiveChangeWorthApplying(10_000, 13_000), true); // +30%
-  assert.equal(adaptiveChangeWorthApplying(10_000, 7_000), true); // -30%
-  assert.equal(adaptiveChangeWorthApplying(0, 5_000), true); // first apply
-});
-
-test("restPerTick amortises the background tabs", () => {
-  // Close rather than exact: the function accumulates one division per
-  // background tab, so 0 + 2/12 + 3/12 is not bit-identical to 5/12.
-  assertClose(restPerTick("actions"), 2 + 6 / BACKGROUND_EVERY, 1e-12);
-  assertClose(restPerTick("security"), 6 + 2 / BACKGROUND_EVERY, 1e-12);
-  assertClose(restPerTick("issues"), (2 + 6) / BACKGROUND_EVERY, 1e-12);
-});
-
 test("every tab's fetcher has a spend to report from the cost table", () => {
   // Guards the drift this design is built to prevent: the meter bills from the
   // same table the projection reads, so a tab with no entry would silently bill
   // nothing and make the inferred external factor wrong. The richer attribution
   // assertions live in the pty layer, because the fetchers need a `gh` to run.
   for (const key of TAB_KEYS) assert.equal(typeof REST_PER_FETCH[key], "number");
-});
-
-test("restPerTick and projectedHourlyCost agree", () => {
-  // Two derivations of the same quantity; if they drift, one of them is wrong.
-  for (const key of TAB_KEYS) {
-    const perHour = restPerTick(key) * (3_600_000 / REFRESH_MS);
-    assertClose(perHour, projectedHourlyCost(key).rest, 1);
-  }
 });
 
 test("the status bar hints are a subset of the documented key table", () => {

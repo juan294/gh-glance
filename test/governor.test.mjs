@@ -21,6 +21,7 @@ import {
   BUDGET_SNAPSHOT_TTL_MS,
   BUDGET_PROBE_MS,
   BUDGET_RESET_GRACE_MS,
+  OPERATION_COSTS,
   GOVERNOR_ACTIVE_PROBE_LEASE_MS,
   GOVERNOR_LEASE_TTL_MS,
   GOVERNOR_MAX_LEASES,
@@ -29,15 +30,18 @@ import {
   GOVERNOR_PROBE_DRAIN_MS,
   GOVERNOR_PROBE_LEASE_MS,
   claimProbe,
+  cancelIntent,
   completeReservation,
   createGovernorScope,
   emptyGovernorState,
   governorHealth,
+  governorWakeTimes,
   governorPhaseOffset,
   governorPath,
   governorScopeHash,
   heartbeatLease,
   inspectGovernor,
+  admitGovernorOperation,
   publishProbe,
   readIntentDecision,
   recordResourceBlock,
@@ -48,6 +52,7 @@ import {
   releaseLease,
   renewProbeClaim,
   requestManualProbe,
+  runAdmittedOperation,
   resolveEffectiveHost,
   startReservation,
   withGovernorLock,
@@ -318,6 +323,72 @@ test("heartbeats extend leases while release and expiry prune only unstarted wor
   const state = inspectGovernor(box.scope, box.now()).value;
   assert.equal(state.leases[deadId], undefined);
   assert.equal(state.reservations[started.reservationId].status, "started");
+});
+
+test("heartbeat publishes active tab and cancellation stops only unstarted work", (t) => {
+  const box = sandbox(t);
+  const leaseId = randomUUID();
+  assert.equal(registerLease(box.scope, lease(leaseId)).ok, true);
+  assert.equal(
+    heartbeatLease(box.scope, leaseId, { core: 0, graphql: 2 }, NOW + 1, "issues").value.activeTab,
+    "issues",
+  );
+  assert.equal(inspectGovernor(box.scope, NOW + 1).value.leases[leaseId].activeTab, "issues");
+
+  const pendingId = randomUUID();
+  assert.equal(registerIntent(box.scope, intent(pendingId, leaseId, NOW + 1)).value.status, "probe");
+  assert.equal(cancelIntent(box.scope, pendingId, NOW + 1).value.status, "cancelled");
+
+  publishInitial(box.scope, leaseId, NOW + 1);
+  const scheduledId = randomUUID();
+  const scheduled = registerIntent(box.scope, intent(scheduledId, leaseId, NOW + 1)).value;
+  assert.equal(scheduled.status, "scheduled");
+  assert.equal(cancelIntent(box.scope, scheduledId, NOW + 1).value.status, "cancelled");
+  assert.equal(inspectGovernor(box.scope, NOW + 1).value.reservations[scheduled.reservationId], undefined);
+
+  const startedId = randomUUID();
+  const next = registerIntent(box.scope, intent(startedId, leaseId, NOW + 1)).value;
+  assert.equal(startReservation(box.scope, next.reservationId, next.notBefore).value.status, "started");
+  assert.equal(cancelIntent(box.scope, startedId, next.notBefore).reason, "stale");
+});
+
+test("manual, diagnostic, tab-switch, active, and background requests share one admission seam", (t) => {
+  for (const priority of ["manual", "diagnostic", "tab-switch", "active", "background"]) {
+    const box = sandbox(t, { authIdentity: `kind-${priority}` });
+    const leaseId = randomUUID();
+    registerLease(box.scope, lease(leaseId));
+    publishInitial(box.scope, leaseId);
+    const operation = priority === "diagnostic" ? "doctor:repository" : "failure-context:repository";
+    assert.deepEqual(OPERATION_COSTS[operation], { core: 0, graphql: 1 });
+    const result = admitGovernorOperation(box.scope, leaseId, operation, priority, NOW);
+    if (["manual", "diagnostic"].includes(priority)) {
+      assert.equal(result.value.status, "started", priority);
+    } else {
+      assert.ok(["scheduled", "started"].includes(result.value.status), priority);
+    }
+  }
+});
+
+test("an unsafe admitted operation performs zero calls and independent wakes remain bounded", async (t) => {
+  const now = Date.now();
+  const box = sandbox(t, { now, authIdentity: "seam-denial" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId, now));
+  publishInitial(box.scope, leaseId, now, budgets(now, { remaining: 1000 }));
+  let calls = 0;
+  const denied = await runAdmittedOperation({
+    scope: box.scope,
+    leaseId,
+    operation: "open:actions",
+    run: async () => { calls += 1; },
+  });
+  assert.equal(denied.skipped, true);
+  assert.equal(calls, 0);
+
+  const state = inspectGovernor(box.scope, now).value;
+  const wakes = governorWakeTimes(state, now, 5000);
+  assert.ok(wakes.controlAt > now);
+  assert.ok(wakes.dataAt > now);
 });
 
 test("a lease migrates into a new auth scope without sharing old state", (t) => {

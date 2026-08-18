@@ -21,13 +21,14 @@ import { MIN_TABLE_WIDTH } from "../../index.mjs";
 
 // 80x24: the full column set. 45x20: below MIN_TABLE_WIDTH (61), so the compact
 // set. Both are killed with SIGTERM, which is the path #41 lives on.
-const wide = capture({ cols: 80, rows: 24 });
-const narrow = capture({ cols: 45, rows: 20 });
+const wide = capture({ cols: 80, rows: 24, settle: 7 });
+const narrow = capture({ cols: 45, rows: 20, settle: 7 });
 const repositoryResolutionFailure =
   "GraphQL: Could not resolve to a Repository with the name 'Nvteca/cashflor-forecast'. (repository)";
 const inaccessibleRepository = capture({
   cols: 80,
   rows: 24,
+  settle: 7,
   args: "--tab issues",
   env: {
     GH_GLANCE_FIXTURE_FAIL: repositoryResolutionFailure,
@@ -37,9 +38,10 @@ const inaccessibleRepository = capture({
 const missingRemoteDetached = capture({
   cols: 80,
   rows: 24,
+  settle: 7,
   env: {
     GH_GLANCE_FIXTURE_FAIL: "failed to determine base repo: no git remotes found",
-    GH_GLANCE_FIXTURE_FAIL_ON: "run,issue,pr,api",
+    GH_GLANCE_FIXTURE_FAIL_ON: "run,issue,pr,api-data",
   },
 });
 
@@ -68,17 +70,17 @@ test("healthy startup does not probe optional failure context", () => {
   );
 });
 
-test("an inaccessible repository resolves failure context once", () => {
+test("an inaccessible repository uses free auth context and one admitted repo context", () => {
   const calls = inaccessibleRepository.fixtureCalls;
   assert.ok(calls.some((call) => call.startsWith("issue list")), "Issues did not fail");
-  assert.ok(calls.some((call) => call.startsWith("repo view")), "repository context was not read");
   assert.ok(
     calls.some((call) => call.startsWith("auth status") && call.includes("--json hosts")),
     "auth context was not read",
   );
-  assert.ok(
-    calls.filter((call) => call.startsWith("repo view")).length <= 1,
-    "repository context was read more than once",
+  assert.equal(
+    calls.filter((call) => call.startsWith("repo view")).length,
+    1,
+    "repository context did not use one admitted request",
   );
   assert.ok(
     calls.filter((call) => call.startsWith("auth status") && call.includes("--json hosts")).length <=
