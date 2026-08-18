@@ -19,7 +19,7 @@ import {
   resourceDecision,
   resourceReserve,
 } from "../../index.mjs";
-import { capture, captureAsync } from "./capture.mjs";
+import { captureAsync } from "./capture.mjs";
 
 const STATE_HELPER = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "gh-state.mjs");
 
@@ -127,23 +127,54 @@ test("the shared fixture recovers an exact dead recovery marker", (t) => {
   assert.equal(existsSync(recoveryPath), false);
 });
 
-test("manual refresh bursts create one unchanged held-sample probe demand", (t) => {
+test("manual refresh bursts create one unchanged held-sample probe demand", async (t) => {
+  const setupAt = Date.now();
   const box = fixture(t, {
     core: { limit: 5000, used: 5000, remaining: 0, resetMs: Date.now() + 3_600_000 },
   });
-  const result = capture({
+  const startupReadyPath = join(box.root, "manual-startup-ready");
+  const secondBurstReadyPath = join(box.root, "manual-second-burst-ready");
+  const resultPromise = captureAsync({
     cols: 80,
     rows: 24,
     signal: "none",
-    settle: 7,
+    settle: 45,
     stdin:
-      "sleep 2; printf r; sleep .2; printf r; sleep .2; printf r; " +
-      "sleep 2; printf r; sleep .2; printf r; sleep .2; printf r; sleep 1; printf q",
+      "i=0; while [ ! -f \"$GH_GLANCE_STARTUP_READY\" ] && [ \"$i\" -lt 300 ]; do " +
+      "sleep .1; i=$((i + 1)); done; printf r; sleep .2; printf r; sleep .2; printf r; " +
+      "i=0; while [ ! -f \"$GH_GLANCE_SECOND_BURST_READY\" ] && [ \"$i\" -lt 300 ]; do " +
+      "sleep .1; i=$((i + 1)); done; printf r; sleep .2; printf r; sleep .2; printf r; " +
+      "sleep 1; printf q",
     configHome: box.root,
-    env: { GH_GLANCE_FIXTURE_STATE: box.statePath, GH_GLANCE_FIXTURE_PANE: "held" },
+    env: {
+      GH_GLANCE_FIXTURE_STATE: box.statePath,
+      GH_GLANCE_FIXTURE_PANE: "held",
+      GH_GLANCE_STARTUP_READY: startupReadyPath,
+      GH_GLANCE_SECOND_BURST_READY: secondBurstReadyPath,
+    },
   });
+  const startupPublication = await observeUntil(
+    box.readGovernor,
+    (governor) => governor?.budgets?.core?.remaining === 0 &&
+      governor.budgets.core.observedAt >= setupAt,
+    setupAt + 20_000,
+  );
+  const startupObservedAt = startupPublication.matched
+    ? startupPublication.value.budgets.core.observedAt
+    : setupAt;
+  writeFileSync(startupReadyPath, "ready\n", { mode: 0o600 });
+  const manualPublication = await observeUntil(
+    box.readGovernor,
+    (governor) => governor?.budgets?.core?.remaining === 0 &&
+      governor.budgets.core.observedAt > startupObservedAt,
+    Date.now() + 20_000,
+  );
+  writeFileSync(secondBurstReadyPath, "ready\n", { mode: 0o600 });
+  const result = await resultPromise;
   const state = box.read();
   const rate = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
+  assert.equal(startupPublication.matched, true, "startup held publication was not observed");
+  assert.equal(manualPublication.matched, true, "manual held publication was not observed");
   assert.equal(rate.length, 2, `expected startup plus one manual probe, got ${rate.length}`);
   assert.equal(dataStarts(state).length, 0, "manual refresh crossed the core hold");
   assert.equal(result.exitCode, 0);
@@ -371,16 +402,42 @@ test("twelve panes share probe ownership and start bounded phased work", async (
 });
 
 test("twelve held panes share one block probe instead of retrying per pane", async (t) => {
+  const setupAt = Date.now();
   const box = fixture(t, {
     core: { limit: 5000, used: 5000, remaining: 0, resetMs: Date.now() + 3_600_000 },
   });
-  await capturePanes(12, box, "held-pane", {
-    settle: 8,
+  const readyPath = join(box.root, "held-ready");
+  const captures = capturePanes(12, box, "held-pane", {
+    signal: "none",
+    settle: 35,
+    stdin:
+      "i=0; while [ ! -f \"$GH_GLANCE_FIXTURE_READY\" ] && [ \"$i\" -lt 350 ]; do " +
+      "sleep .1; i=$((i + 1)); done; printf q",
+    env: { GH_GLANCE_FIXTURE_READY: readyPath },
   });
+  const publicationResult = await observeUntil(
+    box.readGovernor,
+    (governor) => governor?.budgets?.core?.remaining === 0 &&
+      Number.isFinite(governor.budgets.core.observedAt),
+    setupAt + 20_000,
+  );
+  const publicationAt = publicationResult.matched
+    ? publicationResult.value.budgets.core.observedAt
+    : setupAt + 20_000;
+  const releaseAt = Math.min(
+    publicationAt + GOVERNOR_PHASE_WINDOW_MS + 3_000,
+    setupAt + 30_000,
+  );
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, releaseAt - Date.now())));
+  writeFileSync(readyPath, "ready\n", { mode: 0o600 });
+  await captures;
   const state = box.read();
+  const governor = box.readGovernor();
   const probes = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
+  assert.equal(publicationResult.matched, true, "the shared held publication missed its readiness bound");
   assert.ok(probes.length >= 1 && probes.length <= 2, `shared held probes: ${probes.length}`);
   assert.equal(dataStarts(state).length, 0);
+  assert.equal(governor.budgets.core.remaining, 0, "the published core lane was not held");
 });
 
 test("twelve panes preserve one runtime rate-limit block across the minute", async (t) => {
@@ -438,11 +495,50 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
       "sleep .1; i=$((i + 1)); done; printf q",
     env: { GH_GLANCE_FIXTURE_READY: readyPath },
   });
+  const startupOuterDeadline = setupAt + 40_000;
+  const publicationResult = await observeUntil(
+    box.readGovernor,
+    (governor) => Number.isFinite(governor?.budgets?.core?.observedAt),
+    startupOuterDeadline,
+  );
+  const publicationGovernor = publicationResult.matched ? publicationResult.value : null;
+  const publicationAt = publicationGovernor?.budgets?.core?.observedAt;
+  const registeredResult = publicationGovernor
+    ? await observeUntil(
+      box.readGovernor,
+      (governor) => Object.values(governor?.reservations ?? {}).some((reservation) =>
+        reservation?.costs?.core > 0 &&
+        Number.isFinite(governor?.leases?.[reservation.leaseId]?.phaseSeed?.registeredAt)),
+      startupOuterDeadline,
+    )
+    : null;
+  const registeredGovernor = registeredResult?.matched ? registeredResult.value : null;
+  const relevantReservation = Object.values(registeredGovernor?.reservations ?? {})
+    .filter((reservation) => reservation?.costs?.core > 0)
+    .sort((left, right) => left.notBefore - right.notBefore)[0];
+  const registeredAt = registeredGovernor?.leases?.[relevantReservation?.leaseId]
+    ?.phaseSeed?.registeredAt;
+  const firstDecision = publicationGovernor && resourceDecision({
+    budget: publicationGovernor.budgets.core,
+    resource: "core",
+    nowMs: publicationAt,
+    cost: relevantReservation?.costs?.core ?? 2,
+    chargedCost: 0,
+  });
+  const firstLaneInterval = firstDecision?.mode === "open"
+    ? (relevantReservation?.costs?.core ?? 2) / firstDecision.callsPerMs
+    : null;
+  const processStartMarginMs = 3_000;
+  const firstStartHorizon = Number.isFinite(publicationAt) && Number.isFinite(registeredAt) &&
+    Number.isFinite(firstLaneInterval)
+    ? Math.max(publicationAt, registeredAt) + GOVERNOR_PHASE_WINDOW_MS + firstLaneInterval +
+      processStartMarginMs
+    : startupOuterDeadline;
   const blockResult = await observeUntil(
     box.readGovernor,
     (governor) => governor?.budgets?.core?.blockReason === "rate-limit" &&
       Number.isFinite(governor?.probeOutcome?.nextAt),
-    setupAt + 20_000,
+    Math.min(firstStartHorizon, startupOuterDeadline),
   );
   const blockedGovernor = blockResult.matched ? blockResult.value : null;
   const blockObservedAt = blockResult.matched ? Date.now() : null;
@@ -469,6 +565,16 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
   const coreData = dataStarts(state).filter((event) => event.cost.core > 0);
   const failureEnd = state.events.find((event) => event.type === "end" && event.failed === true);
   const governor = box.readGovernor();
+  t.diagnostic(`core starts ${coreData.length}; probes ${probes.length}; ` +
+    `publication ${publicationAt}; registered ${registeredAt}; ` +
+    `first horizon ${firstStartHorizon}; first lane ${firstLaneInterval}; ` +
+    `failure end ${failureEnd?.at}; block observed ${blockObservedAt}; ` +
+    `next probe ${initialProbeNextAt}; deadline ${boundedDeadline}; ` +
+    `block ${governor.budgets.core.blockReason}`);
+  assert.ok(publicationResult.matched, "the startup core publication was not observed");
+  assert.ok(registeredResult?.matched, "no core reservation registered with a live lease");
+  assert.equal(firstDecision?.mode, "open", "the published core lane was not spendable");
+  assert.ok(Number.isFinite(firstLaneInterval), "the first core lane interval was unavailable");
   assert.equal(state.failure.remaining, 0, "the rate-limit response was not injected");
   assert.ok(coreData.length >= 1 && coreData.length <= 2,
     `unbounded initial core starts: ${JSON.stringify(coreData)}`);
@@ -490,7 +596,4 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
     }));
   assert.ok(probes[1].at - probes[0].at >= 59_500,
     `shared probe retried before one minute: ${JSON.stringify(probes)}`);
-  t.diagnostic(`core starts ${coreData.length}; probes ${probes.length}; ` +
-    `failure end ${failureEnd.at}; block observed ${blockObservedAt}; ` +
-    `block ${governor.budgets.core.blockReason}`);
 });
