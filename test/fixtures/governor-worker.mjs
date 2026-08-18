@@ -72,18 +72,18 @@ switch (command.operation) {
     result = { ok: true, value: "held" };
     break;
   }
-  case "registerLease": result = registerLease(scope, command.payload); break;
-  case "heartbeatLease": result = heartbeatLease(scope, command.leaseId, command.demand, command.now); break;
-  case "claimProbe": result = claimProbe(scope, command.leaseId, command.now); break;
-  case "publishProbe": result = publishProbe(scope, command.leaseId, command.nonce, command.budgets, command.now); break;
-  case "requestManualProbe": result = requestManualProbe(scope, command.leaseId, command.epoch, command.observedAt, command.now); break;
-  case "registerIntent": result = registerIntent(scope, command.payload); break;
-  case "readIntentDecision": result = readIntentDecision(scope, command.intentId, command.now); break;
-  case "startReservation": result = startReservation(scope, command.reservationId, command.now); break;
-  case "completeReservation": result = completeReservation(scope, command.reservationId, command.completion, command.now); break;
-  case "recordResourceBlock": result = recordResourceBlock(scope, command.resource, command.resetMs, command.reason); break;
-  case "releaseLease": result = releaseLease(scope, command.leaseId); break;
-  case "inspectGovernor": result = inspectGovernor(scope, command.now); break;
+  case "registerLease": result = retryBusy(() => registerLease(scope, command.payload)); break;
+  case "heartbeatLease": result = retryBusy(() => heartbeatLease(scope, command.leaseId, command.demand, command.now)); break;
+  case "claimProbe": result = retryBusy(() => claimProbe(scope, command.leaseId, command.now)); break;
+  case "publishProbe": result = retryBusy(() => publishProbe(scope, command.leaseId, command.nonce, command.budgets, command.now)); break;
+  case "requestManualProbe": result = retryBusy(() => requestManualProbe(scope, command.leaseId, command.epoch, command.observedAt, command.now)); break;
+  case "registerIntent": result = retryBusy(() => registerIntent(scope, command.payload)); break;
+  case "readIntentDecision": result = retryBusy(() => readIntentDecision(scope, command.intentId, command.now)); break;
+  case "startReservation": result = retryBusy(() => startReservation(scope, command.reservationId, command.now)); break;
+  case "completeReservation": result = retryBusy(() => completeReservation(scope, command.reservationId, command.completion, command.now)); break;
+  case "recordResourceBlock": result = retryBusy(() => recordResourceBlock(scope, command.resource, command.resetMs, command.reason)); break;
+  case "releaseLease": result = retryBusy(() => releaseLease(scope, command.leaseId)); break;
+  case "inspectGovernor": result = retryBusy(() => inspectGovernor(scope, command.now)); break;
   case "hold-lock": {
     result = withGovernorLock(scope, () => {
       process.stdout.write("ready\n");

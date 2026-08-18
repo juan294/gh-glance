@@ -30,6 +30,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   statSync,
@@ -37,7 +38,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -1936,6 +1937,87 @@ function releaseGovernorLock(lockPath, nonce) {
   }
 }
 
+function governorRecoveryPaths(lockPath) {
+  try {
+    const prefix = `${basename(lockPath)}.recovery-`;
+    return readdirSync(dirname(lockPath))
+      .filter((name) => name.startsWith(prefix))
+      .map((name) => join(dirname(lockPath), name));
+  } catch {
+    return [];
+  }
+}
+
+function governorRecoveryActive(lockPath, kill) {
+  let active = false;
+  for (const recoveryPath of governorRecoveryPaths(lockPath)) {
+    const owner = lockOwner(recoveryPath);
+    if (!owner || !pidIsDead(owner.pid, kill)) {
+      active = true;
+      continue;
+    }
+    releaseGovernorLock(recoveryPath, owner.nonce);
+  }
+  return active || governorRecoveryPaths(lockPath).length > 0;
+}
+
+function sameLockOwner(left, right) {
+  return Boolean(left) && Boolean(right) && left.pid === right.pid && left.nonce === right.nonce;
+}
+
+function quarantineDeadGovernorLock(lockPath, expectedOwner, {
+  pid = process.pid,
+  kill = process.kill.bind(process),
+} = {}) {
+  const recoveryNonce = randomUUID();
+  const recoveryPath = `${lockPath}.recovery-${recoveryNonce}`;
+  let descriptor;
+  try {
+    descriptor = openSync(recoveryPath, "wx", 0o600);
+    try {
+      writeFileSync(descriptor, JSON.stringify({ pid, nonce: recoveryNonce }), "utf8");
+    } finally {
+      closeSync(descriptor);
+    }
+    chmodSync(recoveryPath, 0o600);
+  } catch (error) {
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor); } catch { /* descriptor was already closed */ }
+    }
+    return error?.code === "EEXIST" ? "busy" : "failed";
+  }
+
+  const quarantinePath = `${lockPath}.quarantine-${randomUUID()}`;
+  try {
+    // Unique recovery markers make every new owner recheck after acquisition.
+    // A killed recovery process leaves a uniquely named marker that another
+    // process can remove only after its PID is confirmed dead; the path can
+    // never be reused by a successor.
+    // Re-read both fields after taking that marker and again immediately before
+    // rename, so an owner that changed since the initial ESRCH result is never
+    // selected as the abandoned lock.
+    const confirmed = lockOwner(lockPath);
+    if (!sameLockOwner(confirmed, expectedOwner) || !pidIsDead(confirmed.pid, kill)) return "changed";
+    const beforeRename = lockOwner(lockPath);
+    if (!sameLockOwner(beforeRename, expectedOwner)) return "changed";
+    renameSync(lockPath, quarantinePath);
+    const quarantined = lockOwner(quarantinePath);
+    if (!sameLockOwner(quarantined, expectedOwner)) {
+      // Acquisitions that raced the recovery marker cannot enter their critical
+      // section. Restoring here preserves that successor rather than deleting
+      // or leaving it under an abandoned quarantine name.
+      renameSync(quarantinePath, lockPath);
+      return "changed";
+    }
+    unlinkSync(quarantinePath);
+    return "quarantined";
+  } catch (error) {
+    return error?.code === "ENOENT" ? "changed" : "failed";
+  } finally {
+    releaseGovernorLock(recoveryPath, recoveryNonce);
+  }
+}
+
 function withGovernorLock(scope, operation, {
   pid = process.pid,
   nonce = randomUUID(),
@@ -1953,6 +2035,11 @@ function withGovernorLock(scope, operation, {
     return { ok: false, reason: "unwritable" };
   }
   for (;;) {
+    if (governorRecoveryActive(lockPath, kill)) {
+      if (Date.now() >= deadline) return { ok: false, reason: "busy" };
+      Atomics.wait(persistenceWaitCell, 0, 0, 5);
+      continue;
+    }
     try {
       const descriptor = openSync(lockPath, "wx", 0o600);
       try {
@@ -1961,6 +2048,12 @@ function withGovernorLock(scope, operation, {
         closeSync(descriptor);
       }
       chmodSync(lockPath, 0o600);
+      if (governorRecoveryActive(lockPath, kill)) {
+        releaseGovernorLock(lockPath, nonce);
+        if (Date.now() >= deadline) return { ok: false, reason: "busy" };
+        Atomics.wait(persistenceWaitCell, 0, 0, 5);
+        continue;
+      }
       try {
         return operation();
       } finally {
@@ -1979,15 +2072,11 @@ function withGovernorLock(scope, operation, {
         continue;
       }
       if (pidIsDead(owner.pid, kill)) {
-        const quarantinePath = `${lockPath}.quarantine-${randomUUID()}`;
-        try {
-          renameSync(lockPath, quarantinePath);
-          try { unlinkSync(quarantinePath); } catch { /* quarantine remains private and inert */ }
-          continue;
-        } catch (quarantineError) {
-          if (quarantineError?.code === "ENOENT") continue;
-          return { ok: false, reason: "busy" };
-        }
+        const recovery = quarantineDeadGovernorLock(lockPath, owner, { pid, kill });
+        if (recovery === "quarantined" || recovery === "changed") continue;
+        if (Date.now() >= deadline) return { ok: false, reason: "busy" };
+        Atomics.wait(persistenceWaitCell, 0, 0, 5);
+        continue;
       }
       if (Date.now() >= deadline) return { ok: false, reason: "busy" };
       Atomics.wait(persistenceWaitCell, 0, 0, 5);
@@ -1999,6 +2088,11 @@ function mutateGovernor(scope, nowMs, mutate) {
   const at = scopeNow(scope, nowMs);
   if (!Number.isFinite(at) || at < 0) return { ok: false, reason: "corrupt" };
   return withGovernorLock(scope, () => {
+    // Scope can change while this process waits for the file lock. Admission
+    // must bind to the host/account identity observed while exclusivity is
+    // held, immediately before it reads and mutates the shared state.
+    const current = currentGovernorScope(scope);
+    if (!current.ok) return current;
     const loaded = readGovernorState(scope.path, at);
     if (!loaded.ok) return loaded;
     const state = loaded.value;
@@ -2149,11 +2243,12 @@ function budgetFromProbe(raw, previous, nowMs) {
     : previous && previous.resetMs === normalized.resetMs && normalized.used < previous.used
       ? `${baseEpoch}:${nowMs}`
       : baseEpoch;
+  const epochChanged = !previous || previous.epoch !== epoch;
   return {
     ...normalized,
     blockUntil: null,
     blockReason: null,
-    laneNextAt: previous?.laneNextAt ?? nowMs,
+    laneNextAt: epochChanged ? nowMs : previous.laneNextAt,
     roundRobinCursor: previous?.roundRobinCursor ?? null,
     lastExternalFactor: previous?.lastExternalFactor ?? 1,
     epoch,
@@ -2179,7 +2274,7 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs) {
       const previous = state.budgets[resource];
       if (!previous || nextBudgets[resource].used < previous.used) continue;
       const sharedCompletedDelta = Object.values(state.reservations)
-        .filter((reservation) => reservation.status === "completed" && reservation.completedAt <= claim.claimAt)
+        .filter((reservation) => reservation.status === "completed" && reservation.completedAt < claim.claimAt)
         .reduce((total, reservation) => total + reservationCost(reservation, resource, state.leases, at), 0);
       const factor = nextExternalFactor({
         lastExternalFactor: previous.lastExternalFactor,
@@ -2193,7 +2288,7 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs) {
       state.epochs[resource] !== null && state.epochs[resource] !== nextEpochs[resource],
     );
     for (const [id, reservation] of Object.entries(state.reservations)) {
-      if (reservation.status === "completed" && reservation.completedAt <= claim.claimAt) {
+      if (reservation.status === "completed" && reservation.completedAt < claim.claimAt) {
         delete state.reservations[id];
       }
     }
@@ -2432,7 +2527,9 @@ async function refreshSharedBudget(scope, leaseId, signal, {
     failProbeClaim(scope, leaseId, nonce, now());
     return { ok: false, reason: "stale" };
   }
-  return publishProbe(scope, leaseId, nonce, budgets, now());
+  const published = publishProbe(scope, leaseId, nonce, budgets, now());
+  if (!published.ok) failProbeClaim(scope, leaseId, nonce, now());
+  return published;
 }
 
 // Whether a probe window holds enough completed shared calls for the ratio below to
