@@ -1965,9 +1965,14 @@ function sameLockOwner(left, right) {
   return Boolean(left) && Boolean(right) && left.pid === right.pid && left.nonce === right.nonce;
 }
 
+function observeGovernorArtifact(observer, kind, path) {
+  try { observer?.(kind, path); } catch { /* test observation cannot affect locking */ }
+}
+
 function quarantineDeadGovernorLock(lockPath, expectedOwner, {
   pid = process.pid,
   kill = process.kill.bind(process),
+  observeArtifact = null,
 } = {}) {
   const recoveryNonce = randomUUID();
   const recoveryPath = `${lockPath}.recovery-${recoveryNonce}`;
@@ -1980,6 +1985,7 @@ function quarantineDeadGovernorLock(lockPath, expectedOwner, {
       closeSync(descriptor);
     }
     chmodSync(recoveryPath, 0o600);
+    observeGovernorArtifact(observeArtifact, "recovery", recoveryPath);
   } catch (error) {
     if (descriptor !== undefined) {
       try { closeSync(descriptor); } catch { /* descriptor was already closed */ }
@@ -2001,6 +2007,7 @@ function quarantineDeadGovernorLock(lockPath, expectedOwner, {
     const beforeRename = lockOwner(lockPath);
     if (!sameLockOwner(beforeRename, expectedOwner)) return "changed";
     renameSync(lockPath, quarantinePath);
+    observeGovernorArtifact(observeArtifact, "quarantine", quarantinePath);
     const quarantined = lockOwner(quarantinePath);
     if (!sameLockOwner(quarantined, expectedOwner)) {
       // Acquisitions that raced the recovery marker cannot enter their critical
@@ -2023,6 +2030,7 @@ function withGovernorLock(scope, operation, {
   nonce = randomUUID(),
   waitMs = GOVERNOR_LOCK_WAIT_MS,
   kill = scope?.kill ?? process.kill.bind(process),
+  observeArtifact = null,
 } = {}) {
   const current = currentGovernorScope(scope);
   if (!current.ok) return current;
@@ -2048,6 +2056,7 @@ function withGovernorLock(scope, operation, {
         closeSync(descriptor);
       }
       chmodSync(lockPath, 0o600);
+      observeGovernorArtifact(observeArtifact, "canonical", lockPath);
       if (governorRecoveryActive(lockPath, kill)) {
         releaseGovernorLock(lockPath, nonce);
         if (Date.now() >= deadline) return { ok: false, reason: "busy" };
@@ -2072,7 +2081,7 @@ function withGovernorLock(scope, operation, {
         continue;
       }
       if (pidIsDead(owner.pid, kill)) {
-        const recovery = quarantineDeadGovernorLock(lockPath, owner, { pid, kill });
+        const recovery = quarantineDeadGovernorLock(lockPath, owner, { pid, kill, observeArtifact });
         if (recovery === "quarantined" || recovery === "changed") continue;
         if (Date.now() >= deadline) return { ok: false, reason: "busy" };
         Atomics.wait(persistenceWaitCell, 0, 0, 5);
@@ -2499,14 +2508,19 @@ async function refreshSharedBudget(scope, leaseId, signal, {
   readBudgets = readRateBudgets,
   now = () => scopeNow(scope),
   wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  inspect = inspectGovernor,
+  renew = renewProbeClaim,
 } = {}) {
   const claim = claimProbe(scope, leaseId, now());
   if (!claim.ok || claim.value.status !== "claimed") return claim;
   const { nonce, startedReservationIds } = claim.value;
   const drainUntil = now() + GOVERNOR_PROBE_DRAIN_MS;
   while (startedReservationIds.length > 0 && now() < drainUntil) {
-    const snapshot = inspectGovernor(scope, now());
-    if (!snapshot.ok) return snapshot;
+    const snapshot = inspect(scope, now());
+    if (!snapshot.ok) {
+      failProbeClaim(scope, leaseId, nonce, now());
+      return snapshot;
+    }
     const stillStarted = startedReservationIds.some((id) => snapshot.value.reservations[id]?.status === "started");
     if (!stillStarted) break;
     if (signal?.aborted) {
@@ -2515,8 +2529,11 @@ async function refreshSharedBudget(scope, leaseId, signal, {
     }
     await wait(Math.min(25, Math.max(1, drainUntil - now())));
   }
-  const renewed = renewProbeClaim(scope, leaseId, nonce, now());
-  if (!renewed.ok) return renewed;
+  const renewed = renew(scope, leaseId, nonce, now());
+  if (!renewed.ok) {
+    failProbeClaim(scope, leaseId, nonce, now());
+    return renewed;
+  }
   let budgets;
   try {
     budgets = await readBudgets(signal);

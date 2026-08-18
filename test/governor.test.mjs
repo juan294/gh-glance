@@ -205,6 +205,48 @@ test("lease, probe, intent, reservation, completion, and reconciliation form one
   })).reason, "corrupt");
 });
 
+test("pending intents coalesce while persisted priorities compete", (t) => {
+  const box = sandbox(t, { authIdentity: "coalescing" });
+  const backgroundLeaseId = randomUUID();
+  const activeLeaseId = randomUUID();
+  registerLease(box.scope, lease(backgroundLeaseId));
+  registerLease(box.scope, lease(activeLeaseId));
+  publishInitial(box.scope, backgroundLeaseId);
+  assert.equal(recordResourceBlock(box.scope, "core", NOW + 60_000, "rate-limit").ok, true);
+
+  const backgroundId = randomUUID();
+  const background = registerIntent(box.scope, intent(backgroundId, backgroundLeaseId, NOW, {
+    priority: "background",
+  }));
+  assert.equal(background.value.status, "paused");
+  const duplicate = registerIntent(box.scope, intent(randomUUID(), backgroundLeaseId, NOW, {
+    priority: "background",
+  }));
+  assert.deepEqual(duplicate.value, {
+    status: "pending",
+    intentId: backgroundId,
+    coalesced: true,
+  });
+
+  const activeId = randomUUID();
+  const active = registerIntent(box.scope, intent(activeId, activeLeaseId));
+  assert.equal(active.value.status, "paused");
+  const pending = inspectGovernor(box.scope, NOW).value.intents;
+  assert.equal(Object.keys(pending).length, 2);
+  assert.equal(pending[backgroundId].priority, "background");
+  assert.equal(pending[activeId].priority, "active");
+
+  box.setNow(NOW + 1);
+  const claim = claimProbe(box.scope, backgroundLeaseId, NOW + 1);
+  assert.equal(publishProbe(box.scope, backgroundLeaseId, claim.value.nonce, budgets(NOW + 1, {
+    resetMs: NOW + 3_600_000,
+  }), NOW + 1).ok, true);
+  const scheduled = inspectGovernor(box.scope, NOW + 1).value.reservations;
+  const activeReservation = Object.values(scheduled).find((reservation) => reservation.intentId === activeId);
+  const backgroundReservation = Object.values(scheduled).find((reservation) => reservation.intentId === backgroundId);
+  assert.ok(activeReservation.notBefore < backgroundReservation.notBefore);
+});
+
 test("only measured success can reduce the worst-case reservation", (t) => {
   const { scope } = sandbox(t);
   const leaseId = randomUUID();
@@ -263,6 +305,39 @@ test("heartbeats extend leases while release and expiry prune only unstarted wor
   assert.equal(state.reservations[started.reservationId].status, "started");
 });
 
+test("a lease migrates into a new auth scope without sharing old state", (t) => {
+  const box = sandbox(t, { authIdentity: "cleanup-only" });
+  let identity = { effectiveHost: "github.com", authIdentity: "auth-before" };
+  const original = createGovernorScope({
+    ...identity,
+    identityProvider: () => identity,
+    env: { XDG_CONFIG_HOME: box.root },
+    now: () => NOW,
+  }).value;
+  const leaseId = randomUUID();
+  assert.equal(registerLease(original, lease(leaseId)).ok, true);
+  assert.equal(releaseLease(original, leaseId).ok, true);
+
+  identity = { effectiveHost: "github.com", authIdentity: "auth-after" };
+  assert.equal(heartbeatLease(original, leaseId, { core: 2, graphql: 0 }, NOW).reason, "stale");
+  const migrated = createGovernorScope({
+    ...identity,
+    identityProvider: () => identity,
+    env: { XDG_CONFIG_HOME: box.root },
+    now: () => NOW,
+  }).value;
+  assert.equal(registerLease(migrated, lease(leaseId)).ok, true);
+  const oldClosedScope = createGovernorScope({
+    effectiveHost: "github.com",
+    authIdentity: "auth-before",
+    env: { XDG_CONFIG_HOME: box.root },
+    now: () => NOW,
+  }).value;
+  assert.equal(Object.keys(inspectGovernor(oldClosedScope, NOW).value.leases).length, 0);
+  assert.deepEqual(Object.keys(inspectGovernor(migrated, NOW).value.leases), [leaseId]);
+  assert.notEqual(original.path, migrated.path);
+});
+
 test("probe barriers, nonce renewal, and expired claimant takeover are bounded", (t) => {
   const box = sandbox(t);
   const first = randomUUID();
@@ -319,6 +394,55 @@ test("the shared probe wrapper publishes once and failed probes pause only backg
   const malformedState = inspectGovernor(malformedBox.scope, NOW).value;
   assert.equal(malformedState.probeClaim, null);
   assert.equal(malformedState.probeOutcome.status, "failed");
+});
+
+test("probe drain and renewal failures release only their own barrier", async (t) => {
+  const drainBox = sandbox(t, { authIdentity: "drain-failure" });
+  const drainLeaseId = randomUUID();
+  registerLease(drainBox.scope, lease(drainLeaseId));
+  publishInitial(drainBox.scope, drainLeaseId);
+  const grant = registerIntent(drainBox.scope, intent(randomUUID(), drainLeaseId)).value;
+  startReservation(drainBox.scope, grant.reservationId, grant.notBefore);
+  let readAfterDrainFailure = false;
+  const drainFailure = await refreshSharedBudget(drainBox.scope, drainLeaseId, null, {
+    now: () => grant.notBefore + 1,
+    inspect: () => ({ ok: false, reason: "busy" }),
+    readBudgets: async () => { readAfterDrainFailure = true; return budgets(); },
+  });
+  assert.equal(drainFailure.reason, "busy");
+  assert.equal(readAfterDrainFailure, false);
+  const drained = inspectGovernor(drainBox.scope, grant.notBefore + 1).value;
+  assert.equal(drained.probeClaim, null);
+  assert.equal(drained.probeOutcome.status, "failed");
+
+  const renewalBox = sandbox(t, { authIdentity: "renewal-failure" });
+  const renewalLeaseId = randomUUID();
+  registerLease(renewalBox.scope, lease(renewalLeaseId));
+  const renewalFailure = await refreshSharedBudget(renewalBox.scope, renewalLeaseId, null, {
+    now: () => NOW,
+    renew: () => ({ ok: false, reason: "stale" }),
+  });
+  assert.equal(renewalFailure.reason, "stale");
+  assert.equal(inspectGovernor(renewalBox.scope, NOW).value.probeClaim, null);
+
+  const successorBox = sandbox(t, { authIdentity: "renewal-successor" });
+  const formerOwnerId = randomUUID();
+  const successorId = randomUUID();
+  registerLease(successorBox.scope, lease(formerOwnerId));
+  registerLease(successorBox.scope, lease(successorId));
+  let clock = NOW;
+  let successorClaim;
+  const superseded = await refreshSharedBudget(successorBox.scope, formerOwnerId, null, {
+    now: () => clock,
+    renew: () => {
+      clock = NOW + GOVERNOR_PROBE_LEASE_MS + 1;
+      successorClaim = claimProbe(successorBox.scope, successorId, clock);
+      return { ok: false, reason: "stale" };
+    },
+  });
+  assert.equal(superseded.reason, "stale");
+  assert.equal(successorClaim.value.status, "claimed");
+  assert.equal(inspectGovernor(successorBox.scope, clock).value.probeClaim.nonce, successorClaim.value.nonce);
 });
 
 test("manual probe demand coalesces until reset changes the epoch", (t) => {
@@ -641,6 +765,15 @@ test("lock ownership is live-PID conservative and dead owners are quarantined", 
   const { scope } = sandbox(t);
   mkdirSync(dirname(scope.path), { recursive: true, mode: 0o700 });
   const lockPath = `${scope.path}.lock`;
+  const artifactModes = {};
+  const observeArtifact = (kind, path) => {
+    artifactModes[kind] = statSync(path).mode & 0o777;
+  };
+  assert.equal(withGovernorLock(scope, () => ({ ok: true, value: "created" }), {
+    observeArtifact,
+  }).value, "created");
+  assert.equal(artifactModes.canonical, 0o600);
+
   const liveNonce = randomUUID();
   writeFileSync(lockPath, JSON.stringify({ pid: process.pid, nonce: liveNonce }), { mode: 0o600 });
   assert.equal(withGovernorLock(scope, () => ({ ok: true }), { waitMs: 0 }).reason, "busy");
@@ -653,8 +786,11 @@ test("lock ownership is live-PID conservative and dead owners are quarantined", 
   const recovered = withGovernorLock(scope, () => ({ ok: true, value: "recovered" }), {
     waitMs: 0,
     kill: () => { const error = new Error("dead"); error.code = "ESRCH"; throw error; },
+    observeArtifact,
   });
   assert.equal(recovered.value, "recovered");
+  assert.equal(artifactModes.recovery, 0o600);
+  assert.equal(artifactModes.quarantine, 0o600);
   assert.equal(readdirSync(dirname(scope.path)).some((name) => name.includes("quarantine")), false);
 
   writeFileSync(lockPath, JSON.stringify({ pid: process.pid, nonce: randomUUID() }), { mode: 0o600 });
