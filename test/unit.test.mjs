@@ -8,6 +8,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -81,6 +82,9 @@ import {
   ALERT_SOURCES,
   REST_PER_FETCH,
   GRAPHQL_PER_FETCH,
+  OPERATION_COSTS,
+  operationCost,
+  tabRequestCost,
   projectedHourlyCost,
   REFRESH_MS,
   BACKGROUND_EVERY,
@@ -92,7 +96,25 @@ import {
   restPerTick,
   MAX_ADAPTIVE_REFRESH_MS,
   BUDGET_SAFETY,
+  BUDGET_RESERVE_FRACTION,
+  BUDGET_SNAPSHOT_TTL_MS,
+  GOVERNOR_HEARTBEAT_MS,
+  GOVERNOR_LEASE_TTL_MS,
+  GOVERNOR_PROBE_LEASE_MS,
+  GOVERNOR_ACTIVE_PROBE_LEASE_MS,
+  BUDGET_RESET_GRACE_MS,
+  GOVERNOR_PHASE_WINDOW_MS,
+  BUDGET_PROBE_MS,
   MIN_SAMPLE_CALLS,
+  REQUEST_PRIORITIES,
+  normalizeBudgetResource,
+  budgetEpoch,
+  resourceReserve,
+  availableForGrant,
+  nextExternalFactor,
+  resourceDecision,
+  governorPhaseOffset,
+  scheduleIntents,
 } from "../index.mjs";
 
 const ESC = String.fromCharCode(27);
@@ -2102,6 +2124,369 @@ test("projected hourly cost, per active tab, at the default refresh", () => {
   assert.deepEqual(projectedHourlyCost("issues"), { rest: 480, graphql: 1560 });
   assert.deepEqual(projectedHourlyCost("prs"), { rest: 480, graphql: 1560 });
   assert.deepEqual(projectedHourlyCost("security"), { rest: 4440, graphql: 240 });
+});
+
+const POLICY_NOW = 1_000_000;
+const policyBudget = (overrides = {}) => ({
+  limit: 5000,
+  remaining: 5000,
+  used: 0,
+  resetMs: POLICY_NOW + 3_600_000,
+  observedAt: POLICY_NOW,
+  ...overrides,
+});
+
+test("the governor timing and reserve constants pin the policy contract", () => {
+  assert.equal(BUDGET_RESERVE_FRACTION, 1 - BUDGET_SAFETY);
+  assert.equal(BUDGET_SNAPSHOT_TTL_MS, 65_000);
+  assert.equal(GOVERNOR_HEARTBEAT_MS, 20_000);
+  assert.equal(GOVERNOR_LEASE_TTL_MS, 90_000);
+  assert.equal(GOVERNOR_PROBE_LEASE_MS, 70_000);
+  assert.equal(GOVERNOR_ACTIVE_PROBE_LEASE_MS, 35_000);
+  assert.equal(BUDGET_RESET_GRACE_MS, 2_000);
+  assert.equal(GOVERNOR_PHASE_WINDOW_MS, 5_000);
+  assert.equal(BUDGET_PROBE_MS, 60_000);
+  assert.equal(resourceReserve(5000), 1000);
+});
+
+test("budget normalization rejects malformed values", () => {
+  const valid = policyBudget();
+  assert.deepEqual(normalizeBudgetResource(valid), valid);
+  for (const bad of [
+    null,
+    { ...valid, limit: -1 },
+    { ...valid, remaining: 5001 },
+    { ...valid, used: 5001 },
+    { ...valid, resetMs: Number.NaN },
+    { ...valid, observedAt: Number.POSITIVE_INFINITY },
+  ]) {
+    assert.equal(normalizeBudgetResource(bad), null);
+  }
+});
+
+test("missing, malformed, future, stale, and reset budgets never grant", () => {
+  const rows = [
+    [null, "budget-unknown"],
+    [{ ...policyBudget(), remaining: Number.NaN }, "budget-unknown"],
+    [policyBudget({ observedAt: POLICY_NOW + 1 }), "budget-future"],
+    [policyBudget({ observedAt: POLICY_NOW - BUDGET_SNAPSHOT_TTL_MS - 1 }), "budget-stale"],
+    [policyBudget({ resetMs: POLICY_NOW }), "budget-reset"],
+  ];
+  for (const [budget, reason] of rows) {
+    assert.deepEqual(
+      resourceDecision({ budget, resource: "core", cost: 1, nowMs: POLICY_NOW }),
+      { mode: "probe", reason },
+    );
+  }
+});
+
+test("the hard reserve denies exhausted and reserve-crossing requests", () => {
+  assert.equal(availableForGrant({
+    budget: policyBudget({ remaining: 1000, used: 4000 }),
+    nowMs: POLICY_NOW,
+  }).spendable, 0);
+  for (const remaining of [1000, 999, 0]) {
+    assert.equal(resourceDecision({
+      budget: policyBudget({ remaining, used: 5000 - remaining }),
+      resource: "core",
+      cost: 1,
+      nowMs: POLICY_NOW,
+    }).mode, "paused");
+  }
+  assert.equal(resourceDecision({
+    budget: policyBudget({ remaining: 1005, used: 3995 }),
+    resource: "core",
+    cost: 6,
+    nowMs: POLICY_NOW,
+  }).mode, "paused");
+});
+
+test("safe pacing is not clamped at one minute", () => {
+  for (const intervalMs of [59_000, 60_000, 61_000, 600_000]) {
+    const spendable = (2 * 3_600_000) / intervalMs;
+    const decision = resourceDecision({
+      budget: policyBudget({ remaining: 1000 + spendable }),
+      resource: "core",
+      cost: 2,
+      nowMs: POLICY_NOW,
+    });
+    assert.equal(decision.mode, "open");
+    assertClose(2 / decision.callsPerMs, intervalMs, 1e-6);
+  }
+});
+
+test("a known shared rate block pauses until its reset", () => {
+  const decision = resourceDecision({
+    budget: policyBudget({ blockUntil: POLICY_NOW + 30_000, blockReason: "rate-limit" }),
+    resource: "core",
+    cost: 1,
+    nowMs: POLICY_NOW,
+  });
+  assert.equal(decision.mode, "paused");
+  assert.equal(decision.reason, "rate-limit");
+  assert.equal(decision.resetMs, POLICY_NOW + 3_600_000);
+});
+
+test("tab and auxiliary operation costs have one explicit registry", () => {
+  for (const tab of TAB_KEYS) {
+    assert.deepEqual(tabRequestCost(tab), {
+      core: REST_PER_FETCH[tab],
+      graphql: GRAPHQL_PER_FETCH[tab],
+    });
+    assert.deepEqual(operationCost(`tab:${tab}`), tabRequestCost(tab));
+  }
+  assert.deepEqual(operationCost("tab:security"), { core: 6, graphql: 0 });
+  assert.deepEqual(operationCost("failure-context:repository"), { core: 0, graphql: 1 });
+  assert.deepEqual(operationCost("open:actions"), { core: 2, graphql: 0 });
+  assert.deepEqual(operationCost("open:issues"), { core: 0, graphql: 2 });
+  assert.deepEqual(operationCost("open:prs"), { core: 0, graphql: 2 });
+  assert.deepEqual(operationCost("doctor:security-endpoint"), { core: 1, graphql: 0 });
+  for (const free of ["rate-limit", "version", "auth-status", "local-git", "failure-context:auth"]) {
+    assert.deepEqual(operationCost(free), { core: 0, graphql: 0 });
+  }
+  assert.equal(operationCost("undeclared"), null);
+});
+
+test("every production runGh call site declares a registry operation", () => {
+  const source = readFileSync(new URL("../index.mjs", import.meta.url), "utf8");
+  const lines = source.split("\n");
+  const calls = lines
+    .map((line, index) => ({ line, index }))
+    .filter(({ line }) => line.includes("runGh(") && !line.includes("function runGh"));
+  assert.ok(calls.length > 0);
+  for (const { index } of calls) {
+    const declaration = lines.slice(index, index + 5).join("\n");
+    assert.match(declaration, /operation(?::|\s*})/);
+  }
+  assert.ok(Object.isFrozen(OPERATION_COSTS));
+});
+
+test("manual priority wins but never bypasses the reserve", () => {
+  assert.equal(REQUEST_PRIORITIES.manual, REQUEST_PRIORITIES.diagnostic);
+  assert.ok(REQUEST_PRIORITIES.manual < REQUEST_PRIORITIES["tab-switch"]);
+  assert.ok(REQUEST_PRIORITIES["tab-switch"] < REQUEST_PRIORITIES.active);
+  assert.ok(REQUEST_PRIORITIES.active < REQUEST_PRIORITIES.background);
+
+  const leases = {
+    a: { expiresAt: POLICY_NOW + GOVERNOR_LEASE_TTL_MS },
+    b: { expiresAt: POLICY_NOW + GOVERNOR_LEASE_TTL_MS },
+  };
+  const scheduled = scheduleIntents({
+    intents: [
+      { id: "background", leaseId: "a", priority: "background", costs: { core: 2, graphql: 0 }, expiresAt: POLICY_NOW + 1000 },
+      { id: "manual", leaseId: "b", priority: "manual", costs: { core: 2, graphql: 0 }, expiresAt: POLICY_NOW + 1000 },
+    ],
+    leases,
+    budgets: { core: policyBudget() },
+    nowMs: POLICY_NOW,
+  });
+  assert.deepEqual(scheduled.grants.map(({ intentId }) => intentId), ["manual", "background"]);
+
+  const denied = scheduleIntents({
+    intents: [{ id: "manual", leaseId: "a", priority: "manual", costs: { core: 2, graphql: 0 }, expiresAt: POLICY_NOW + 1000 }],
+    leases,
+    budgets: { core: policyBudget({ remaining: 1001 }) },
+    nowMs: POLICY_NOW,
+  });
+  assert.equal(denied.grants.length, 0);
+  assert.equal(denied.denied[0].mode, "paused");
+});
+
+test("equal-priority leases rotate fairly and deterministically", () => {
+  const leases = Object.fromEntries(["a", "b", "c"].map((id) => [id, { expiresAt: POLICY_NOW + 1000 }]));
+  const result = scheduleIntents({
+    intents: ["a", "b", "c"].map((leaseId) => ({
+      id: leaseId,
+      leaseId,
+      priority: "active",
+      costs: { core: 1, graphql: 0 },
+      requestedAt: POLICY_NOW,
+      expiresAt: POLICY_NOW + 1000,
+    })),
+    leases,
+    budgets: { core: policyBudget() },
+    cursors: { core: "a" },
+    nowMs: POLICY_NOW,
+  });
+  assert.deepEqual(result.grants.map(({ leaseId }) => leaseId), ["b", "c", "a"]);
+  assert.equal(result.cursors.core, "a");
+});
+
+test("started reservations stay charged while dead leases release unstarted work", () => {
+  const deadLeases = { dead: { expiresAt: POLICY_NOW - 1 } };
+  const base = {
+    budget: policyBudget({ remaining: 1007 }),
+    resource: "core",
+    cost: 6,
+    leases: deadLeases,
+    nowMs: POLICY_NOW,
+  };
+  assert.equal(resourceDecision({
+    ...base,
+    reservations: [{ leaseId: "dead", status: "started", costs: { core: 2 } }],
+  }).mode, "paused");
+  assert.equal(resourceDecision({
+    ...base,
+    reservations: [{ leaseId: "dead", status: "scheduled", costs: { core: 2 } }],
+  }).mode, "open");
+});
+
+test("budget reset changes the epoch and deterministic lease phase", () => {
+  const first = policyBudget();
+  const second = policyBudget({ resetMs: first.resetMs + 3_600_000 });
+  assert.notEqual(budgetEpoch(first), budgetEpoch(second));
+  assert.equal(governorPhaseOffset("lease-a", budgetEpoch(first)), governorPhaseOffset("lease-a", budgetEpoch(first)));
+  assert.notEqual(governorPhaseOffset("lease-a", budgetEpoch(first)), governorPhaseOffset("lease-a", budgetEpoch(second)));
+});
+
+test("pacing becomes no earlier as pressure increases", () => {
+  const duration = ({ budget = policyBudget(), cost = 2, factor = 1 } = {}) => {
+    const decision = resourceDecision({
+      budget,
+      resource: "core",
+      cost,
+      lastExternalFactor: factor,
+      nowMs: POLICY_NOW,
+    });
+    assert.equal(decision.mode, "open");
+    return cost / decision.callsPerMs;
+  };
+  const baseline = duration();
+  assert.ok(duration({ budget: policyBudget({ remaining: 3000 }) }) >= baseline);
+  assert.ok(duration({ budget: policyBudget({ resetMs: POLICY_NOW + 7_200_000 }) }) >= baseline);
+  assert.ok(duration({ cost: 6 }) >= baseline);
+  assert.ok(duration({ factor: 4 }) >= baseline);
+});
+
+test("small external-spend samples retain the prior factor", () => {
+  assert.equal(nextExternalFactor({
+    lastExternalFactor: 7,
+    globalUsedDelta: 500,
+    sharedCompletedDelta: MIN_SAMPLE_CALLS - 1,
+  }), 7);
+  assert.equal(nextExternalFactor({
+    lastExternalFactor: 7,
+    globalUsedDelta: 60,
+    sharedCompletedDelta: 10,
+  }), 6);
+  assert.equal(nextExternalFactor({ lastExternalFactor: Number.NaN }), null);
+});
+
+test("fresh-window lane scheduling stays inside the spendable budget", () => {
+  for (const count of [1, 3, 7, 12, 20]) {
+    const leases = Object.fromEntries(Array.from({ length: count }, (_, index) => [
+      `lease-${index}`,
+      { expiresAt: POLICY_NOW + GOVERNOR_LEASE_TTL_MS },
+    ]));
+    const result = scheduleIntents({
+      intents: Object.keys(leases).map((leaseId) => ({
+        id: `intent-${leaseId}`,
+        leaseId,
+        priority: "active",
+        costs: { core: 6, graphql: 0 },
+        expiresAt: POLICY_NOW + GOVERNOR_LEASE_TTL_MS,
+      })),
+      leases,
+      budgets: { core: policyBudget() },
+      nowMs: POLICY_NOW,
+    });
+    assert.equal(result.grants.length, count);
+    assert.ok(result.grants.reduce((total, grant) => total + grant.costs.core, 0) <= 4000);
+    assert.ok(result.lanes.core.nextAt < policyBudget().resetMs);
+  }
+});
+
+test("a lane at reset waits without reserving the old epoch", () => {
+  const resetMs = POLICY_NOW + 1000;
+  const result = scheduleIntents({
+    intents: [{ id: "late", leaseId: "a", priority: "active", costs: { core: 2, graphql: 0 }, expiresAt: resetMs + 1000 }],
+    leases: { a: { expiresAt: resetMs + 1000 } },
+    budgets: { core: policyBudget({ resetMs }) },
+    lanes: { core: { nextAt: resetMs } },
+    nowMs: POLICY_NOW,
+  });
+  assert.equal(result.grants.length, 0);
+  assert.equal(result.denied[0].mode, "waiting");
+  assert.equal(result.denied[0].retryAt, resetMs + BUDGET_RESET_GRACE_MS);
+});
+
+test("deterministic closed-loop governor simulation preserves both reserves", () => {
+  let nowMs = POLICY_NOW;
+  let resetMs = nowMs + 3_600_000;
+  let budgets = {
+    core: policyBudget({ resetMs }),
+    graphql: policyBudget({ resetMs }),
+  };
+  let lanes = {};
+  const leases = {};
+  const received = new Set();
+  const mixes = ["actions", "issues", "prs", "security"];
+
+  for (let step = 0; step < 60; step += 1) {
+    if (step === 0) leases["lease-0"] = { expiresAt: nowMs + GOVERNOR_LEASE_TTL_MS };
+    if (step === 5) {
+      for (let index = 1; index < 7; index += 1) leases[`lease-${index}`] = { expiresAt: nowMs + GOVERNOR_LEASE_TTL_MS };
+    }
+    if (step === 10) {
+      for (let index = 7; index < 12; index += 1) leases[`lease-${index}`] = { expiresAt: nowMs + GOVERNOR_LEASE_TTL_MS };
+    }
+    if (step === 20) {
+      delete leases["lease-1"];
+      delete leases["lease-3"];
+      delete leases["lease-5"];
+      budgets.core.remaining -= 300;
+      budgets.core.used += 300;
+      budgets.graphql.remaining -= 200;
+      budgets.graphql.used += 200;
+    }
+    if (step === 30) {
+      resetMs += 3_600_000;
+      budgets = {
+        core: policyBudget({ resetMs, observedAt: nowMs }),
+        graphql: policyBudget({ resetMs, observedAt: nowMs }),
+      };
+    }
+
+    for (const lease of Object.values(leases)) lease.expiresAt = nowMs + GOVERNOR_LEASE_TTL_MS;
+    const active = Object.keys(leases).map((leaseId, index) => ({
+      id: `active-${step}-${leaseId}`,
+      leaseId,
+      tab: mixes[index % mixes.length],
+      priority: "active",
+      requestedAt: nowMs,
+      expiresAt: nowMs + GOVERNOR_HEARTBEAT_MS,
+    }));
+    const background = Object.keys(leases).slice(0, 3).map((leaseId, index) => ({
+      id: `background-${step}-${leaseId}`,
+      leaseId,
+      tab: mixes[(index + 1) % mixes.length],
+      priority: "background",
+      requestedAt: nowMs,
+      expiresAt: nowMs + GOVERNOR_HEARTBEAT_MS,
+    }));
+    const result = scheduleIntents({
+      intents: [...background, ...active],
+      leases,
+      budgets,
+      lanes,
+      nowMs,
+    });
+    lanes = result.lanes;
+
+    for (const resource of ["core", "graphql"]) {
+      const granted = result.grants.reduce((total, grant) => total + grant.costs[resource], 0);
+      assert.ok(budgets[resource].remaining - granted >= resourceReserve(budgets[resource].limit));
+      budgets[resource].remaining -= granted;
+      budgets[resource].used += granted;
+      budgets[resource].observedAt = nowMs;
+    }
+    for (const grant of result.grants) {
+      if (grant.intentId.startsWith("active-")) received.add(grant.leaseId);
+    }
+    nowMs += 60_000;
+  }
+
+  for (const leaseId of Object.keys(leases)) assert.ok(received.has(leaseId), leaseId);
 });
 
 // The control law. These assertions are the specification -- the function is

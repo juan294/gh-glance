@@ -611,7 +611,7 @@ function forwardSignalToChild(child, signal) {
   return child.kill(signal);
 }
 
-async function runGh(args, { signal } = {}) {
+async function runGh(args, { signal, operation: _operation } = {}) {
   const startedAt = Date.now();
   try {
     const { stdout } = await execFileAsync("gh", args, {
@@ -759,8 +759,8 @@ function buildFailureContext(repoSettlement, authSettlement) {
 
 async function resolveFailureContext(signal) {
   const [repo, auth] = await Promise.allSettled([
-    runGh(repoContextArgs(), { signal }),
-    runGh(authContextArgs(), { signal }),
+    runGh(repoContextArgs(), { signal, operation: "failure-context:repository" }),
+    runGh(authContextArgs(), { signal, operation: "failure-context:auth" }),
   ]);
   return buildFailureContext(repo, auth);
 }
@@ -820,7 +820,7 @@ function actionsArgs(limit) {
 }
 
 async function fetchActions(limit, signal) {
-  const raw = await runGh(actionsArgs(limit), { signal });
+  const raw = await runGh(actionsArgs(limit), { signal, operation: "tab:actions" });
   return {
     raw,
     limit,
@@ -870,7 +870,7 @@ function issuesArgs() {
 }
 
 async function fetchIssues(signal) {
-  const raw = await runGh(issuesArgs(), { signal });
+  const raw = await runGh(issuesArgs(), { signal, operation: "tab:issues" });
   return {
     raw,
     limit: LIST_LIMIT,
@@ -905,7 +905,7 @@ function prsArgs() {
 }
 
 async function fetchPRs(signal) {
-  const raw = await runGh(prsArgs(), { signal });
+  const raw = await runGh(prsArgs(), { signal, operation: "tab:prs" });
   return {
     raw,
     limit: LIST_LIMIT,
@@ -1010,6 +1010,37 @@ const SECURITY_REQUESTS_PER_FETCH = ALERT_SOURCES.reduce(
 const REST_PER_FETCH = { actions: 2, issues: 0, prs: 0, security: SECURITY_REQUESTS_PER_FETCH };
 const GRAPHQL_PER_FETCH = { actions: 0, issues: 2, prs: 2, security: 0 };
 
+function tabRequestCost(tab) {
+  return { core: REST_PER_FETCH[tab] ?? 0, graphql: GRAPHQL_PER_FETCH[tab] ?? 0 };
+}
+
+// Every gh subprocess has one declared operation. Phase 1 only defines this
+// contract; Phase 3 makes the subprocess boundary enforce it. Tab totals are
+// derived from the fetch tables, while Security endpoint entries describe the
+// individual calls covered by the tab's six-call upfront reservation.
+const OPERATION_COSTS = Object.freeze({
+  ...Object.fromEntries(TAB_KEYS.map((tab) => [`tab:${tab}`, tabRequestCost(tab)])),
+  "tab:security-endpoint": { core: 1, graphql: 0 },
+  "failure-context:repository": { core: 0, graphql: 1 },
+  "failure-context:auth": { core: 0, graphql: 0 },
+  "open:actions": { core: REST_PER_FETCH.actions, graphql: 0 },
+  "open:issues": { core: 0, graphql: GRAPHQL_PER_FETCH.issues },
+  "open:prs": { core: 0, graphql: GRAPHQL_PER_FETCH.prs },
+  "doctor:repository": { core: 0, graphql: 1 },
+  "doctor:actions": tabRequestCost("actions"),
+  "doctor:issues": tabRequestCost("issues"),
+  "doctor:prs": tabRequestCost("prs"),
+  "doctor:security-endpoint": { core: 1, graphql: 0 },
+  "rate-limit": { core: 0, graphql: 0 },
+  "version": { core: 0, graphql: 0 },
+  "auth-status": { core: 0, graphql: 0 },
+  "local-git": { core: 0, graphql: 0 },
+});
+
+function operationCost(operation) {
+  return OPERATION_COSTS[operation] ?? null;
+}
+
 // Ceiling on adaptive widening. An adaptive interval needs one: a minute is
 // where the pane stops being live in any useful sense, and past it the honest
 // answer is fewer panes, not a slower one.
@@ -1019,6 +1050,14 @@ const MAX_ADAPTIVE_REFRESH_MS = 60_000;
 // is for the user's own `gh` and `git` commands, which are the whole reason the
 // pane yields at all -- see RATE_LIMIT_RETRY_MS.
 const BUDGET_SAFETY = 0.8;
+const BUDGET_RESERVE_FRACTION = 1 - BUDGET_SAFETY;
+const BUDGET_SNAPSHOT_TTL_MS = 65_000;
+const GOVERNOR_HEARTBEAT_MS = 20_000;
+const GOVERNOR_LEASE_TTL_MS = 90_000;
+const GOVERNOR_PROBE_LEASE_MS = 70_000;
+const GOVERNOR_ACTIVE_PROBE_LEASE_MS = 35_000;
+const BUDGET_RESET_GRACE_MS = 2_000;
+const GOVERNOR_PHASE_WINDOW_MS = 5_000;
 
 // How often to re-read the budget. `gh api rate_limit` does not count against
 // the limit (verified, delta 0 -- see rateBudget) but it is still a subprocess,
@@ -1036,6 +1075,301 @@ const MIN_SAMPLE_CALLS = 5;
 // factor either way, so a budget wobbling around a boundary cannot make the
 // poll rate flap. Same reasoning as TAB_LABEL_HYSTERESIS.
 const ADAPTIVE_HYSTERESIS = 1.25;
+
+const REQUEST_PRIORITIES = Object.freeze({
+  manual: 0,
+  diagnostic: 0,
+  "tab-switch": 1,
+  active: 2,
+  background: 3,
+});
+
+function normalizeBudgetResource(raw, observedAt = raw?.observedAt) {
+  if (!raw || typeof raw !== "object") return null;
+  const normalized = {
+    limit: raw.limit,
+    remaining: raw.remaining,
+    used: raw.used,
+    resetMs: raw.resetMs,
+    observedAt,
+  };
+  if (
+    Object.values(normalized).some((value) => !Number.isFinite(value) || value < 0) ||
+    normalized.remaining > normalized.limit ||
+    normalized.used > normalized.limit
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
+function budgetEpoch(resource) {
+  const normalized = normalizeBudgetResource(resource);
+  return normalized ? `${normalized.limit}:${normalized.resetMs}` : null;
+}
+
+function resourceReserve(limit) {
+  return Number.isFinite(limit) && limit >= 0
+    ? Math.ceil(limit * BUDGET_RESERVE_FRACTION)
+    : null;
+}
+
+function leaseFor(leases, leaseId) {
+  return leases instanceof Map ? leases.get(leaseId) : leases?.[leaseId];
+}
+
+function reservationCost(reservation, resource, leases, nowMs) {
+  if (!reservation || ["cancelled", "reconciled"].includes(reservation.status)) return 0;
+  if (reservation.status === "scheduled") {
+    const lease = leaseFor(leases, reservation.leaseId);
+    if (lease && Number.isFinite(lease.expiresAt) && lease.expiresAt <= nowMs) return 0;
+  }
+  const cost = reservation.costs?.[resource] ??
+    (reservation.resource === resource ? reservation.cost : 0);
+  return Number.isFinite(cost) && cost > 0 ? cost : 0;
+}
+
+function availableForGrant({ budget, reservations = [], leases = {}, nowMs }) {
+  const normalized = normalizeBudgetResource(budget);
+  if (!normalized) return { mode: "probe", reason: "budget-unknown" };
+  if (normalized.observedAt > nowMs) return { mode: "probe", reason: "budget-future" };
+  if (nowMs - normalized.observedAt > BUDGET_SNAPSHOT_TTL_MS) {
+    return { mode: "probe", reason: "budget-stale" };
+  }
+  if (nowMs >= normalized.resetMs) return { mode: "probe", reason: "budget-reset" };
+
+  const epoch = budgetEpoch(normalized);
+  if (Number.isFinite(budget.blockUntil) && budget.blockUntil > nowMs) {
+    return {
+      mode: "paused",
+      reason: budget.blockReason ?? "rate-limit",
+      resetMs: normalized.resetMs,
+      epoch,
+    };
+  }
+
+  const reserve = resourceReserve(normalized.limit);
+  const charged = reservations.reduce(
+    (total, reservation) => total + reservationCost(reservation, budget.resource, leases, nowMs),
+    0,
+  );
+  return {
+    mode: "open",
+    reserve,
+    spendable: Math.max(0, normalized.remaining - reserve - charged),
+    resetMs: normalized.resetMs,
+    epoch,
+  };
+}
+
+function nextExternalFactor({
+  lastExternalFactor = 1,
+  globalUsedDelta = 0,
+  sharedCompletedDelta = 0,
+}) {
+  if (!Number.isFinite(lastExternalFactor) || lastExternalFactor < 1) return null;
+  if (sharedCompletedDelta < MIN_SAMPLE_CALLS || globalUsedDelta <= 0) return lastExternalFactor;
+  const measured = globalUsedDelta / sharedCompletedDelta;
+  return Number.isFinite(measured) ? Math.max(1, measured) : null;
+}
+
+function resourceDecision({
+  budget,
+  resource,
+  reservations = [],
+  leases = {},
+  nowMs,
+  cost = 0,
+  lastExternalFactor = budget?.lastExternalFactor ?? 1,
+  globalUsedDelta = 0,
+  sharedCompletedDelta = 0,
+}) {
+  const capacity = availableForGrant({
+    budget: budget && { ...budget, resource },
+    reservations,
+    leases,
+    nowMs,
+  });
+  if (capacity.mode !== "open") return capacity;
+
+  const externalFactor = nextExternalFactor({
+    lastExternalFactor,
+    globalUsedDelta,
+    sharedCompletedDelta,
+  });
+  if (externalFactor === null) {
+    return {
+      mode: "paused",
+      reason: "external-factor-invalid",
+      resetMs: capacity.resetMs,
+      epoch: capacity.epoch,
+    };
+  }
+  if (!Number.isFinite(cost) || cost < 0 || capacity.spendable < cost || capacity.spendable <= 0) {
+    return {
+      mode: "paused",
+      reason: "reserve",
+      resetMs: capacity.resetMs,
+      epoch: capacity.epoch,
+    };
+  }
+  const callsPerMs = capacity.spendable / (capacity.resetMs - nowMs) / externalFactor;
+  if (!Number.isFinite(callsPerMs) || callsPerMs <= 0) {
+    return {
+      mode: "paused",
+      reason: "pacing-invalid",
+      resetMs: capacity.resetMs,
+      epoch: capacity.epoch,
+    };
+  }
+  return { ...capacity, callsPerMs, externalFactor };
+}
+
+function governorPhaseOffset(leaseId, epoch) {
+  const text = `${leaseId}:${epoch}`;
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) % (GOVERNOR_PHASE_WINDOW_MS + 1);
+}
+
+function intentPriority(intent) {
+  return Number.isInteger(intent.priority)
+    ? intent.priority
+    : (REQUEST_PRIORITIES[intent.priority] ?? Number.MAX_SAFE_INTEGER);
+}
+
+function intentCosts(intent) {
+  return intent.costs ?? (intent.tab ? tabRequestCost(intent.tab) : null);
+}
+
+function roundRobinOrder(intents, cursor) {
+  const queues = new Map();
+  for (const intent of intents) {
+    const queue = queues.get(intent.leaseId) ?? [];
+    queue.push(intent);
+    queues.set(intent.leaseId, queue);
+  }
+  for (const queue of queues.values()) {
+    queue.sort((left, right) =>
+      (left.requestedAt ?? 0) - (right.requestedAt ?? 0) || String(left.id).localeCompare(String(right.id))
+    );
+  }
+  const leaseIds = [...queues.keys()].sort();
+  const cursorIndex = leaseIds.indexOf(cursor);
+  const rotated = cursorIndex < 0
+    ? leaseIds
+    : [...leaseIds.slice(cursorIndex + 1), ...leaseIds.slice(0, cursorIndex + 1)];
+  const ordered = [];
+  while (ordered.length < intents.length) {
+    for (const leaseId of rotated) {
+      const next = queues.get(leaseId).shift();
+      if (next) ordered.push(next);
+    }
+  }
+  return ordered;
+}
+
+function scheduleIntents({
+  intents = [],
+  leases = {},
+  budgets = {},
+  reservations = [],
+  lanes = {},
+  cursors = {},
+  nowMs,
+}) {
+  const valid = [];
+  const prunedIntentIds = [];
+  for (const intent of intents) {
+    const lease = leaseFor(leases, intent.leaseId);
+    const costs = intentCosts(intent);
+    const validCosts = costs && ["core", "graphql"].every(
+      (resource) => Number.isFinite(costs[resource] ?? 0) && (costs[resource] ?? 0) >= 0,
+    );
+    if (!lease || lease.expiresAt <= nowMs || intent.expiresAt <= nowMs || !validCosts) {
+      prunedIntentIds.push(intent.id);
+    } else {
+      valid.push({ ...intent, costs });
+    }
+  }
+
+  const workingReservations = [...reservations];
+  const updatedLanes = structuredClone(lanes);
+  const updatedCursors = { ...cursors };
+  const grants = [];
+  const denied = [];
+  const priorities = [...new Set(valid.map(intentPriority))].sort((a, b) => a - b);
+
+  for (const priority of priorities) {
+    const group = valid.filter((intent) => intentPriority(intent) === priority);
+    const firstResource = ["core", "graphql"].find((resource) =>
+      group.some((intent) => intent.costs[resource] > 0)
+    );
+    for (const intent of roundRobinOrder(group, updatedCursors[firstResource])) {
+      const resources = ["core", "graphql"].filter((resource) => intent.costs[resource] > 0);
+      const decisions = Object.fromEntries(resources.map((resource) => [
+        resource,
+        resourceDecision({
+          budget: budgets[resource],
+          resource,
+          reservations: workingReservations,
+          leases,
+          nowMs,
+          cost: intent.costs[resource],
+        }),
+      ]));
+      const blocked = resources.find((resource) => decisions[resource].mode !== "open");
+      if (blocked) {
+        denied.push({ intentId: intent.id, resource: blocked, ...decisions[blocked] });
+        continue;
+      }
+
+      const lease = leaseFor(leases, intent.leaseId);
+      const notBefore = Math.max(
+        nowMs,
+        Number.isFinite(lease.phaseAt) ? lease.phaseAt : nowMs,
+        ...resources.map((resource) => updatedLanes[resource]?.nextAt ?? nowMs),
+      );
+      const expiring = resources.find((resource) => notBefore >= decisions[resource].resetMs);
+      if (expiring) {
+        denied.push({
+          intentId: intent.id,
+          resource: expiring,
+          mode: "waiting",
+          reason: "reset",
+          retryAt: decisions[expiring].resetMs + BUDGET_RESET_GRACE_MS,
+          resetMs: decisions[expiring].resetMs,
+          epoch: decisions[expiring].epoch,
+        });
+        continue;
+      }
+
+      const reservation = {
+        id: `reservation:${intent.id}`,
+        intentId: intent.id,
+        leaseId: intent.leaseId,
+        costs: { ...intent.costs },
+        notBefore,
+        status: "scheduled",
+        epochs: Object.fromEntries(resources.map((resource) => [resource, decisions[resource].epoch])),
+      };
+      workingReservations.push(reservation);
+      grants.push(reservation);
+      for (const resource of resources) {
+        updatedLanes[resource] = {
+          ...updatedLanes[resource],
+          nextAt: notBefore + intent.costs[resource] / decisions[resource].callsPerMs,
+        };
+        updatedCursors[resource] = intent.leaseId;
+      }
+    }
+  }
+
+  return { grants, lanes: updatedLanes, cursors: updatedCursors, denied, prunedIntentIds };
+}
 
 // Whether a probe window holds enough of our own calls for the ratio below to
 // mean anything. Named rather than inlined because the control law and the loop
@@ -1269,7 +1603,7 @@ async function fetchAlertSource(source, signal, now) {
     for (const [index, args] of requests.entries()) {
       if (index > 0 && !shouldFetchAlertPriorityLanes(groups[0]?.length ?? 0)) break;
       spent += 1;
-      const payload = await runGh(args, { signal });
+      const payload = await runGh(args, { signal, operation: "tab:security-endpoint" });
       payloads.push(payload);
       groups.push(JSON.parse(payload).filter((alert) => alert.state === "open"));
     }
@@ -1411,7 +1745,10 @@ async function openInBrowser(tabKey, item, signal) {
   const kind = pick(OPENABLE, tabKey, null);
   const id = kind === "run" ? (item?.databaseId ?? item?.number) : (item?.number ?? item?.databaseId);
   if (!kind || id == null) return;
-  await runGh([kind, "view", ...repoArgs(), String(id), "--web"], { signal });
+  await runGh([kind, "view", ...repoArgs(), String(id), "--web"], {
+    signal,
+    operation: `open:${tabKey}`,
+  });
 }
 
 function createOpenRequestRegistry() {
@@ -1566,9 +1903,9 @@ function envValue(name) {
 // gh writes some of this to stdout and some to stderr depending on version and
 // on whether it succeeded, and a non-zero exit is itself worth reporting rather
 // than throwing. Both streams, whatever happened.
-async function captureGh(args) {
+async function captureGh(args, operation) {
   try {
-    return (await runGh(args)).trim();
+    return (await runGh(args, { operation })).trim();
   } catch (err) {
     const both = `${err?.stdout ?? ""}${err?.stderr ?? ""}`.trim();
     return both || shortErr(err);
@@ -1577,10 +1914,10 @@ async function captureGh(args) {
 
 const PROBE_STDERR_LIMIT = 400;
 
-async function probe(name, args) {
+async function probe(name, args, operation) {
   const startedAt = Date.now();
   try {
-    const stdout = await runGh(args);
+    const stdout = await runGh(args, { operation });
     return { name, args, ms: Date.now() - startedAt, bytes: stdout.length, classified: "ok" };
   } catch (err) {
     return {
@@ -1650,7 +1987,7 @@ async function rateBudget() {
     // Host-routed like every other `gh api` call: a budget is per token *per
     // server*, so on a GHES tenant the github.com numbers are not merely stale,
     // they belong to a different limit entirely.
-    const raw = await runGh(["api", "rate_limit", ...apiHostArgs()]);
+    const raw = await runGh(["api", "rate_limit", ...apiHostArgs()], { operation: "rate-limit" });
     const { resources } = JSON.parse(raw);
     // formatAge() is for timestamps in the past and returns "-" for a future one,
     // so the reset is rendered as a forward interval instead.
@@ -1698,7 +2035,10 @@ async function readRateBudgets(signal) {
     // host/owner/name sets runtime.host without setting GH_HOST, so without the
     // flag this reads github.com's budget while the pane spends against the
     // tenant -- and then throttles, or fails to, against an unrelated number.
-    const raw = await runGh(["api", "rate_limit", ...apiHostArgs()], { signal });
+    const raw = await runGh(["api", "rate_limit", ...apiHostArgs()], {
+      signal,
+      operation: "rate-limit",
+    });
     const resources = JSON.parse(raw)?.resources;
     return {
       core: normalizeRateBudget(resources?.core),
@@ -1731,14 +2071,15 @@ async function runDoctor() {
   alertBackoff.clear();
 
   const probes = [
-    ["Repository access", repoContextArgs()],
-    ["Actions (run list)", actionsArgs(MIN_RUN_LIMIT)],
-    ["Issues (issue list)", issuesArgs()],
-    ["Pull requests (pr list)", prsArgs()],
+    ["Repository access", repoContextArgs(), "doctor:repository"],
+    ["Actions (run list)", actionsArgs(MIN_RUN_LIMIT), "doctor:actions"],
+    ["Issues (issue list)", issuesArgs(), "doctor:issues"],
+    ["Pull requests (pr list)", prsArgs(), "doctor:prs"],
     ...ALERT_SOURCES.flatMap((source) =>
       alertRequestArgs(source).map((args, index) => [
         index === 0 ? source.name : `${source.name} (priority ${index})`,
         args,
+        "doctor:security-endpoint",
       ]),
     ),
   ];
@@ -1747,11 +2088,11 @@ async function runDoctor() {
   // slow endpoint cannot suppress the other probes. runGh's own GH_TIMEOUT_MS
   // bounds each one.
   const [ghVersion, authStatus, remote, budget, results] = await Promise.all([
-    captureGh(["--version"]),
-    captureGh(["auth", "status"]),
+    captureGh(["--version"], "version"),
+    captureGh(["auth", "status"], "auth-status"),
     gitRemote(),
     rateBudget(),
-    Promise.all(probes.map(([name, args]) => probe(name, args))),
+    Promise.all(probes.map(([name, args, operation]) => probe(name, args, operation))),
   ]);
 
   const lines = [
@@ -5625,6 +5966,9 @@ export {
   ALERT_SOURCES,
   REST_PER_FETCH,
   GRAPHQL_PER_FETCH,
+  OPERATION_COSTS,
+  operationCost,
+  tabRequestCost,
   projectedHourlyCost,
   REFRESH_MS,
   BACKGROUND_EVERY,
@@ -5637,8 +5981,26 @@ export {
   restPerTick,
   MAX_ADAPTIVE_REFRESH_MS,
   BUDGET_SAFETY,
+  BUDGET_RESERVE_FRACTION,
+  BUDGET_SNAPSHOT_TTL_MS,
+  GOVERNOR_HEARTBEAT_MS,
+  GOVERNOR_LEASE_TTL_MS,
+  GOVERNOR_PROBE_LEASE_MS,
+  GOVERNOR_ACTIVE_PROBE_LEASE_MS,
+  BUDGET_RESET_GRACE_MS,
+  GOVERNOR_PHASE_WINDOW_MS,
+  BUDGET_PROBE_MS,
   MIN_SAMPLE_CALLS,
   ADAPTIVE_HYSTERESIS,
+  REQUEST_PRIORITIES,
+  normalizeBudgetResource,
+  budgetEpoch,
+  resourceReserve,
+  availableForGrant,
+  nextExternalFactor,
+  resourceDecision,
+  governorPhaseOffset,
+  scheduleIntents,
   safe,
   shortErr,
   isUnavailable,

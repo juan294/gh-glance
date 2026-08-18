@@ -15,10 +15,10 @@ import {
   mergeAlertRows,
   mergeDashboardCacheSnapshots,
   mergeWidthPreferenceSnapshots,
-  nextBudgetTargets,
   pollResultTransition,
   pollTickKeys,
   reconcileSelectionViewport,
+  resourceDecision,
   securityPollDelay,
   selectionLabel,
   shouldCheckpointFreshness,
@@ -169,51 +169,29 @@ test("freshness checkpoints are bounded instead of writing every successful poll
   assert.equal(shouldCheckpointFreshness({ persistedAt: null, completedAt: 1 }), true);
 });
 
-test("GraphQL and REST budgets each constrain the adaptive interval", () => {
+test("tab resource decisions keep GraphQL and REST independent", () => {
   const nowMs = 1_000_000;
   const budgets = {
-    core: { remaining: 5000, resetMs: nowMs + 3_600_000 },
-    graphql: { remaining: 100, resetMs: nowMs + 3_600_000 },
+    core: { limit: 5000, remaining: 5000, used: 0, resetMs: nowMs + 3_600_000, observedAt: nowMs },
+    graphql: { limit: 5000, remaining: 1000, used: 4000, resetMs: nowMs + 3_600_000, observedAt: nowMs },
   };
-  const constrained = nextBudgetTargets({
-    budgets,
-    samples: { core: null, graphql: null },
-    shares: { core: 1, graphql: 1 },
-    activeKey: "issues",
-    floorMs: 5000,
+  assert.equal(resourceDecision({
+    budget: budgets.core,
+    resource: "core",
+    cost: 2,
     nowMs,
-  });
-  assert.ok(
-    constrained.targetMs > 5000,
-    `GraphQL budget did not widen the interval: ${constrained.targetMs}`,
-  );
-  const coreConstrained = nextBudgetTargets({
-    budgets: {
-      core: { remaining: 100, resetMs: nowMs + 3_600_000 },
-      graphql: { remaining: 5000, resetMs: nowMs + 3_600_000 },
-    },
-    samples: { core: null, graphql: null },
-    shares: { core: 1, graphql: 1 },
-    activeKey: "issues",
-    floorMs: 5000,
+  }).mode, "open");
+  assert.equal(resourceDecision({
+    budget: budgets.graphql,
+    resource: "graphql",
+    cost: 2,
     nowMs,
-  });
-  assert.ok(
-    coreConstrained.targetMs > 5000,
-    `REST budget did not widen the interval: ${coreConstrained.targetMs}`,
-  );
-  assert.deepEqual(
-    nextBudgetTargets({
-      budgets: { core: budgets.core, graphql: null },
-      samples: {},
-      shares: {},
-      previous: { core: 9000, graphql: 12_000 },
-      activeKey: "issues",
-      floorMs: 5000,
-      nowMs,
-    }).targets,
-    { core: 5000, graphql: 12_000 },
-  );
+  }).mode, "paused");
+
+  budgets.core = { ...budgets.core, remaining: 1000, used: 4000 };
+  budgets.graphql = { ...budgets.graphql, remaining: 5000, used: 0 };
+  assert.equal(resourceDecision({ budget: budgets.core, resource: "core", cost: 2, nowMs }).mode, "paused");
+  assert.equal(resourceDecision({ budget: budgets.graphql, resource: "graphql", cost: 2, nowMs }).mode, "open");
 });
 
 test("settled automatic polling stays invisible while first load and manual refresh stay visible", () => {
