@@ -1467,7 +1467,7 @@ test("status bar layout preserves actions before deterministic detail and option
   const detail = { notBefore: new Date(2026, 7, 18, 8, 42).getTime() };
   const layouts = Object.fromEntries([80, 60, 45, 24, 23].map((cols) => [
     cols,
-    statusBarLayout({ cols, interactive: true, availableHints: hints, status, detail, version: "v0.9.1" }),
+    statusBarLayout({ cols, interactive: true, availableHints: hints, status, detail, version: "v0.10.0" }),
   ]));
 
   assert.deepEqual(Object.fromEntries([80, 60, 45, 24, 23].map((cols) => [cols, {
@@ -1480,7 +1480,7 @@ test("status bar layout preserves actions before deterministic detail and option
       detail: "next 08:42",
       mandatory: ["Refresh: r", "Quit: q"],
       optional: ["Move: jk", "Open: Ent", "Width: w"],
-      version: "v0.9.1",
+      version: "v0.10.0",
     },
     60: {
       detail: "next 08:42",
@@ -1515,7 +1515,7 @@ test("status bar layout preserves actions before deterministic detail and option
     availableHints: hints,
     status: paused,
     detail: { resetMs: detail.notBefore },
-    version: "v0.9.1",
+    version: "v0.10.0",
   }).detail, "reset 08:42");
   assert.equal(statusBarLayout({
     cols: 24,
@@ -1523,7 +1523,7 @@ test("status bar layout preserves actions before deterministic detail and option
     availableHints: hints,
     status: refreshStatus({ governorDecision: { mode: "waiting", probing: true } }),
     detail: {},
-    version: "v0.9.1",
+    version: "v0.10.0",
   }).detail, null);
 });
 

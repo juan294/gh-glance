@@ -9,7 +9,7 @@ const SAMPLE_STATUS = "Watching";
 const waitForRenderedRows = waitForAwk(
   '"$GH_GLANCE_CAPTURE_OUT"',
   `index($0, "${SAMPLE_ROW}") { row=1 } ` +
-    `index($0, "${SAMPLE_STATUS}") { status=1 } { ok=row && status }`,
+    `row && index($0, "${SAMPLE_STATUS}") { status=1 } { ok=row && status }`,
   200,
 ) + "printf 'j'; sleep .3; printf 'q'; sleep 2";
 

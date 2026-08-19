@@ -27,12 +27,12 @@ without switching to the browser.
 │ ─────────────────────────────────────────────────────────────────────── │
 │ >+  ci: pin actions to com… #443 CI    develop        1m20s   17d ago   │
 │  x  fix: restore the prima… #442 Code… develop        1m28s   17d ago   │
-│  +  chore: bump dependenci… #441 CI    dependa…int-10 30s     17d ago   │
+│  +  chore: bump dependenci… #441 CI    dependa…int-10 30s     18d ago   │
 │  -  docs: update the readme #440 CI    develop        15s     18d ago   │
 │                                                                         │
 │                                                                         │
 ╰──────────────────────────────────────────────────────────────── 4 of 4 ─╯
-· Watching  Refresh: r Quit: q Move: ↑↓ Open: Ent Width: w            0.9.1
+· Watching  Refresh: r Quit: q Move: ↑↓ Open: Ent Width: w           0.10.0
 ```
 
 > Generated from this candidate's real binary under the repository PTY harness
