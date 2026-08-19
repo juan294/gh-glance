@@ -71,10 +71,10 @@ LOG="${OUT}.calls"
 cd "$REPO" || exit 1
 
 # GH_GLANCE_NO_ANIMATION removes the 100ms spinner, the single largest source of
-# frame-to-frame variance (index.mjs:120).
+# frame-to-frame variance (index.mjs:206).
 # GH_GLANCE_ICONS=unicode keeps row icons in single-cell text and status glyphs
 # in ordinary Unicode: the defaults include Nerd Font private-use codepoints,
-# which make captures register as binary to grep (index.mjs:708).
+# which make captures register as binary to grep (index.mjs:3879).
 # CI and CONTINUOUS_INTEGRATION are BOTH unset because is-in-ci checks both
 # (node_modules/is-in-ci/index.js:3-5), and ink in CI mode defers every write to
 # unmount -- measured 992 bytes and zero synchronized-update pairs, versus 4,348
@@ -92,7 +92,7 @@ ENV_PREFIX="export PATH=\"$HERE/fixtures:\$PATH\";
   export GH_GLANCE_ICONS=\"$ICON_PROFILE\";"
 
 # A pty has no controlling terminal here, so it defaults to 0x0 -- exactly the
-# input usableSize() guards (index.mjs:244-246). COLUMNS/LINES are ignored
+# input usableSize() guards (index.mjs:524-529). COLUMNS/LINES are ignored
 # because Node reads TIOCGWINSZ, so stty is the only mechanism that works.
 # The leading newline is load-bearing: ink's final frame ends without a
 # trailing newline, so without it EXITCODE glues onto the last visible line

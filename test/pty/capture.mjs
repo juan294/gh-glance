@@ -401,7 +401,7 @@ export function parseCapture(raw, dimensions = null) {
 
   // Everything after the restore sequence landed on the PRIMARY buffer. This is
   // the #41 surface: the app's exit listener restores the primary buffer
-  // (index.mjs:1618) and ink's unmount can then repaint onto it.
+  // (index.mjs:8237) and ink's unmount can then repaint onto it.
   const exitIndex = raw.indexOf(ALT_EXIT);
   const tail = exitIndex === -1 ? "" : raw.slice(exitIndex + ALT_EXIT.length);
   const afterRestoreVisible = visibleLines(tail)
