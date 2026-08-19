@@ -19,12 +19,23 @@ import { capture } from "./capture.mjs";
 const HOST = "tenant.ghe.com";
 
 // Captures cost several seconds each, so each is taken once at module scope.
-const inferred = capture({ cols: 80, rows: 24 });
-const slugOnly = capture({ cols: 80, rows: 24, args: "--repo acme/widget" });
-const hostQualified = capture({ cols: 80, rows: 24, args: `--repo ${HOST}/acme/widget` });
+const inferred = capture({ cols: 80, rows: 24, settle: 7, args: "--tab security" });
+const slugOnly = capture({
+  cols: 80,
+  rows: 24,
+  settle: 7,
+  args: "--repo acme/widget --tab security",
+  env: { GH_HOST: HOST, GH_REPO: `${HOST}/other/repo` },
+});
+const hostQualified = capture({
+  cols: 80,
+  rows: 24,
+  settle: 7,
+  args: `--repo ${HOST}/acme/widget --tab security`,
+});
 
 const listCalls = (result) => result.fixtureCalls.filter((call) => /^(run|issue|pr) /.test(call));
-// The alert endpoints only. `api rate_limit` is the adaptive throttle's budget
+// The alert endpoints only. `api rate_limit` is the shared governor's budget
 // probe: it is host-routed like these are, but it addresses no repository, so it
 // fails the request-path assertions below. It gets its own test instead.
 const apiCalls = (result) =>
@@ -33,28 +44,24 @@ const probeCalls = (result) => result.fixtureCalls.filter((call) => call.startsW
 
 function assertReachedTheDataLayer(result, label) {
   assert.ok(result.fixtureCalls.length > 0, `${label}: the fixture gh was never invoked`);
-  assert.ok(listCalls(result).length > 0, `${label}: no list subcommand was called`);
   assert.ok(apiCalls(result).length > 0, `${label}: no alert endpoint was called`);
 }
 
-test("with no --repo, the argv vector is byte-identical to the default", () => {
-  // The regression guard for "the default path did not change". Both flags are
-  // built by functions that return an empty array when unconfigured, so an
-  // unconfigured run must produce neither.
+test("with no --repo, all-remotes inference routes API calls to github.com", () => {
   assertReachedTheDataLayer(inferred, "inferred");
-  for (const call of inferred.fixtureCalls) {
-    assert.ok(!call.includes("--hostname"), `--hostname leaked into: ${call}`);
+  for (const call of apiCalls(inferred)) {
+    assert.ok(call.includes("--hostname github.com"), call);
     assert.ok(!call.includes("--repo"), `--repo leaked into: ${call}`);
   }
 });
 
-test("a two-part --repo passes --repo and never --hostname", () => {
+test("a two-part --repo pins github.com despite conflicting environment targets", () => {
   assertReachedTheDataLayer(slugOnly, "slug-only");
   for (const call of listCalls(slugOnly)) {
-    assert.ok(call.includes("--repo acme/widget"), call);
+    assert.ok(call.includes("--repo github.com/acme/widget"), call);
   }
-  for (const call of slugOnly.fixtureCalls) {
-    assert.ok(!call.includes("--hostname"), `--hostname on a default-host target: ${call}`);
+  for (const call of apiCalls(slugOnly)) {
+    assert.ok(call.includes("--hostname github.com"), `default host was not explicit: ${call}`);
   }
   for (const call of apiCalls(slugOnly)) {
     assert.ok(call.includes("repos/acme/widget/"), call);
@@ -79,7 +86,7 @@ test("a host-qualified --repo routes BOTH halves to the host", () => {
 });
 
 test("the budget probe is routed to the host too", () => {
-  // A rate limit is per token *per server*. Unrouted, the adaptive throttle
+  // A rate limit is per token *per server*. Unrouted, the shared governor
   // reads github.com's budget while the pane spends against the tenant, and then
   // throttles -- or fails to -- against a number from an unrelated limit.
   // `--repo host/owner/name` is the case that needs the flag: it sets the host

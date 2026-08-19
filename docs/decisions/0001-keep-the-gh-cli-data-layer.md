@@ -90,7 +90,7 @@ request per minute.
 
 - Six `gh` invocations per full tick remain. That is accepted, and the reasons
   are now recorded rather than rediscovered.
-- The independent per-tab `commit()` at `index.mjs:4213-4276` stays load-bearing.
+- The independent per-tab `commit()` at `index.mjs:7026-7226` stays load-bearing.
   Anything that reintroduces a barrier across tabs must clear the same bar this
   decision failed.
 - The last-known-good dashboard cache is downstream of this layer. It hydrates

@@ -6,7 +6,9 @@
 // survived being widened.
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   parseArgs,
@@ -16,9 +18,12 @@ import {
   MIN_REFRESH_SECONDS,
   MAX_REFRESH_SECONDS,
   TAB_KEYS,
+  remoteHost,
+  resolveEffectiveHost,
 } from "../index.mjs";
 
 const parse = (argv) => validateArgs(parseArgs(argv), TAB_KEYS);
+const ENTRY = fileURLToPath(new URL("../index.mjs", import.meta.url));
 // The real shape parseArgs hands validateArgs, so a field added there cannot go
 // missing here and leave these tests exercising a stale literal.
 const defaults = parseArgs([]);
@@ -89,6 +94,46 @@ test("--repo accepts the host-qualified form gh itself accepts", () => {
   assert.equal(opts.host, "tenant.ghe.com");
   assert.equal(parse(["--repo", "acme/widget"]).host, null);
   assert.equal(parse([]).host, null);
+});
+
+test("effective host resolution keeps explicit --repo authoritative", () => {
+  assert.equal(resolveEffectiveHost({
+    runtimeRepo: "acme/widget",
+    repoExplicit: true,
+    ghHost: "enterprise.example.com",
+    ghRepo: "other.example.com/other/repo",
+  }), "github.com");
+  assert.equal(resolveEffectiveHost({
+    runtimeHost: "tenant.ghe.com",
+    runtimeRepo: "acme/widget",
+    repoExplicit: true,
+    ghHost: "github.com",
+  }), "tenant.ghe.com");
+});
+
+test("environment and local remote hosts resolve only when unambiguous", () => {
+  assert.equal(resolveEffectiveHost({ ghHost: "Tenant.GHE.com" }), "tenant.ghe.com");
+  assert.equal(resolveEffectiveHost({
+    ghHost: "not a host",
+    ghRepo: "tenant.ghe.com/acme/widget",
+    remoteUrls: ["git@github.com:acme/widget.git"],
+  }), null);
+  assert.equal(resolveEffectiveHost({
+    ghHost: "",
+    remoteUrls: ["git@github.com:acme/widget.git"],
+  }), null);
+  assert.equal(resolveEffectiveHost({ ghRepo: "tenant.ghe.com/acme/widget" }), "tenant.ghe.com");
+  assert.equal(resolveEffectiveHost({ ghRepo: "acme/widget" }), "github.com");
+  assert.equal(resolveEffectiveHost({ remoteUrls: [
+    "git@github.com:acme/widget.git",
+    "https://github.com/acme/other.git",
+  ] }), "github.com");
+  assert.equal(resolveEffectiveHost({ remoteUrls: [
+    "git@github.com:acme/widget.git",
+    "ssh://git@tenant.ghe.com/acme/widget.git",
+  ] }), null);
+  assert.equal(resolveEffectiveHost({ remoteUrls: [] }), null);
+  assert.equal(remoteHost("git@tenant.ghe.com:acme/widget.git"), "tenant.ghe.com");
 });
 
 test("a host-qualified --repo still rejects everything the two-part form rejects", () => {
@@ -184,6 +229,20 @@ test("--help and --version survive validation", () => {
   assert.equal(parse(["--help"]).help, true);
   assert.equal(parse(["-h"]).help, true);
   assert.equal(parse(["--version"]).showVersion, true);
+});
+
+test("--help describes refresh as a shared-governor floor", () => {
+  const help = execFileSync(process.execPath, [ENTRY, "--help"], { encoding: "utf8" });
+  assert.match(help, /Set a 15-second active-tab poll floor/);
+  assert.match(help, /Safe shared grants may\n\s+run later/);
+  assert.match(help, /preserves a hard reserve/);
+  assert.match(help, /manual refresh do not bypass that safety check/);
+  assert.match(help, /A qualified GH_REPO also\n\s+supplies the host/);
+  assert.match(help, /Stop motion; semantic status words remain/);
+  assert.match(help, /^[ \t]*r[ \t]+Refresh the current tab when a safe grant is available$/m);
+  assert.match(help, /GH_GLANCE_ICONS=unicode\s+Unicode status glyphs and text row substitutes/);
+  assert.match(help, /GH_GLANCE_ICONS=ascii\s+ASCII-only status and row icons/);
+  assert.doesNotMatch(help, /other three refresh every|does not route `gh api`|Freeze the spinner/);
 });
 
 test("-v is rejected rather than silently meaning --version", () => {

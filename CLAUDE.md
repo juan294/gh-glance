@@ -38,7 +38,10 @@ node index.mjs --help
 
 Tests are `node --test` (built-in runner, no framework) in `test/`: a fast unit
 suite, plus `test/pty/` which drives the real binary under a pseudo-terminal
-against a fixture `gh`. CI also runs a smoke job (syntax check, CLI boot,
+against a fixture `gh`, one file at a time. PTY files are serialized because the
+throttle coverage already creates real concurrent panes; parallel files can
+starve independent PTY deadlines. Individual cases still exercise their required
+process concurrency. CI also runs a smoke job (syntax check, CLI boot,
 exit-code assertions) across Node 22/24.
 
 ## Git Workflow

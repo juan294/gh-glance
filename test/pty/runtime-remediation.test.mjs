@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -10,7 +10,7 @@ const ESC = String.fromCharCode(27);
 const strip = (text) =>
   text.replace(new RegExp(`${ESC}\\[[0-9;?]*[A-Za-z]`, "g"), "").replace(/\r/g, "");
 
-function fetchingForegroundStates(text) {
+function checkingForegroundStates(text) {
   const states = [];
   let brightCyan = false;
   for (let index = 0; index < text.length; index += 1) {
@@ -28,7 +28,7 @@ function fetchingForegroundStates(text) {
       index = end;
       continue;
     }
-    if (text.startsWith("Fetching", index)) states.push(brightCyan);
+    if (text.startsWith("Checking", index)) states.push(brightCyan);
   }
   return states;
 }
@@ -65,7 +65,7 @@ const forcedSecurity = withCounterCapture("gh-glance-security-force-", 1, (count
     signal: "none",
     settle: 15,
     args: "--tab security",
-    stdin: "sleep 3; printf 'r'; sleep 4; printf 'q'; sleep 2",
+    stdin: "sleep 7; printf 'r'; sleep 4; printf 'q'; sleep 2",
     env: {
       GH_GLANCE_FIXTURE_FAIL_FIRST_FILE: counter,
       GH_GLANCE_FIXTURE_FAIL_FIRST_ON: "dependabot",
@@ -80,39 +80,84 @@ const cachedConfigHome = mkdtempSync(join(tmpdir(), "gh-glance-cached-pty-"));
 const screenReader = capture({
   cols: 80,
   rows: 24,
-  settle: 4,
+  settle: 7,
   env: { INK_SCREEN_READER: "true" },
   configHome: cachedConfigHome,
 });
 
-const stalledStartedAt = Date.now();
-const stalledOpen = capture({
-  cols: 80,
-  rows: 24,
-  signal: "none",
-  settle: 15,
-  stdin: "sleep 3; printf 'j'; sleep 1; printf '\\r'; sleep 1; printf 'q'; sleep 2",
-  env: { GH_GLANCE_FIXTURE_STALL_VIEW: "1" },
-});
-const stalledElapsedMs = Date.now() - stalledStartedAt;
+const waitForStalledRow =
+  "tries=0; cache=\"$XDG_CONFIG_HOME/gh-glance/dashboard-cache.json\"; " +
+  "while ! grep -Eq '\"databaseId\"[[:space:]]*:[[:space:]]*101' \"$cache\" " +
+  "2>/dev/null && [ $tries -lt 150 ]; do " +
+  // The initial two-call Actions reservation advances the full-budget lane by
+  // 1.8s. Wait through that slot so this abort test does not depend on a race
+  // with an unrelated automatic poll.
+  "tries=$((tries + 1)); sleep .1; done; ";
+const waitForStalledRender =
+  "tries=0; while ! grep -q 'ci: pin actions to commit SHAs' \"$GH_GLANCE_CAPTURE_OUT\" " +
+  "2>/dev/null && [ $tries -lt 150 ]; do tries=$((tries + 1)); sleep .1; done; ";
+const waitForStalledLane =
+  "tries=0; governor_dir=\"$XDG_CONFIG_HOME/gh-glance\"; " +
+  "while ! node -e 'const f=require(\"fs\"),d=process.argv[1],n=f.readdirSync(d).find(" +
+  "x=>x.startsWith(\"rate-governor-v1-\"));process.exit(n&&JSON.parse(" +
+  "f.readFileSync(d+\"/\"+n)).budgets.core.laneNextAt<=Date.now()?0:1)' " +
+  "\"$governor_dir\" 2>/dev/null && [ $tries -lt 100 ]; do " +
+  "tries=$((tries + 1)); sleep .05; done; ";
+const waitForStalledOpen =
+  "tries=0; while ! grep -q '^run view ' \"$GH_GLANCE_CAPTURE_OUT.calls\" " +
+  "2>/dev/null && [ $tries -lt 100 ]; do tries=$((tries + 1)); sleep .1; done; ";
+const stalledRoot = mkdtempSync(join(tmpdir(), "gh-glance-stalled-open-"));
+const stalledMarker = join(stalledRoot, "opened-at");
+let stalledOpen;
+let stalledElapsedMs;
+try {
+  stalledOpen = capture({
+    cols: 80,
+    rows: 24,
+    signal: "none",
+    settle: 15,
+    args: "--refresh 40",
+    stdin: waitForStalledRow + waitForStalledRender + waitForStalledLane +
+      "printf 'j'; sleep 1; printf '\\r'; " + waitForStalledOpen +
+      "node -e 'require(\"fs\").writeFileSync(process.argv[1],String(Date.now()))' " +
+      "\"$GH_GLANCE_OPEN_MARKER\"; printf 'q'; sleep 2",
+    env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+      GH_GLANCE_FIXTURE_STALL_VIEW: "1",
+      GH_GLANCE_OPEN_MARKER: stalledMarker,
+    },
+  });
+  stalledElapsedMs = Date.now() - Number(readFileSync(stalledMarker, "utf8"));
+} finally {
+  rmSync(stalledRoot, { recursive: true, force: true });
+}
 
-const insertedAbove = withCounterCapture("gh-glance-run-sequence-", 0, (counter) =>
-  capture({
+const insertedAbove = withCounterCapture("gh-glance-run-sequence-", 0, (counter) => {
+  const waitForFirstList =
+    "tries=0; while ! grep -q 'docs: update the readme' \"$GH_GLANCE_CAPTURE_OUT\" " +
+    "2>/dev/null && [ $tries -lt 200 ]; do tries=$((tries + 1)); sleep .1; done; ";
+  const waitForExpandedList =
+    "tries=0; while ! grep -q 'new run one' \"$GH_GLANCE_CAPTURE_OUT\" " +
+    "2>/dev/null && [ $tries -lt 200 ]; do tries=$((tries + 1)); sleep .1; done; ";
+  return capture({
     cols: 80,
     rows: 12,
     signal: "none",
-    settle: 15,
+    settle: 30,
+    args: "--refresh 40",
     stdin:
-      "sleep 3; printf 'j'; sleep .2; printf 'j'; sleep .2; printf 'j'; " +
-      "sleep .2; printf 'j'; sleep 3; printf '\\r'; sleep 1; printf 'q'; sleep 2",
+      waitForFirstList + "printf 'j'; sleep .2; printf 'j'; sleep .2; printf 'j'; " +
+      "sleep .2; printf 'j'; sleep 1; printf 'r'; " + waitForExpandedList +
+      "printf '\\r'; sleep 1; printf 'q'; sleep 2",
     env: { GH_GLANCE_FIXTURE_RUN_SEQUENCE_FILE: counter },
-  }),
-);
+  });
+});
 
 const noColorFailure = capture({
   cols: 80,
   rows: 24,
-  settle: 4,
+  settle: 7,
+  args: "--tab issues",
   env: {
     NO_COLOR: "1",
     GH_GLANCE_FIXTURE_FAIL: "dial tcp: fixture unavailable",
@@ -123,7 +168,7 @@ const noColorFailure = capture({
 const narrowAuthFailure = capture({
   cols: 45,
   rows: 20,
-  settle: 4,
+  settle: 7,
   args: "--tab issues",
   env: {
     GH_GLANCE_FIXTURE_FAIL:
@@ -148,10 +193,10 @@ const shortHelp = capture({
   stdin: "sleep 3; printf '?'; sleep 2; printf 'q'; sleep 2",
 });
 
-test("Fetching colour state tolerates combined and split SGR sequences", () => {
+test("Checking colour state tolerates combined and split SGR sequences", () => {
   assert.deepEqual(
-    fetchingForegroundStates(
-      `${ESC}[96m⣾ Fetching${ESC}[39m${ESC}[2m${ESC}[39m⣾ Fetching${ESC}[0m`,
+    checkingForegroundStates(
+      `${ESC}[96m⣾ Checking${ESC}[39m${ESC}[2m${ESC}[39m⣾ Checking${ESC}[0m`,
     ),
     [true, false],
   );
@@ -169,8 +214,8 @@ test("manual Security refresh bypasses a source auth backoff", () => {
     (call) => call.startsWith("api ") && call.includes("dependabot"),
   );
   assert.ok(
-    dependabotCalls.length >= 3,
-    `expected one failed and two forced-success calls, saw ${dependabotCalls.length}`,
+    dependabotCalls.length >= 2,
+    `expected one failed and one forced-success call, saw ${dependabotCalls.length}`,
   );
   assert.equal(forcedSecurity.exitCode, 0);
   assert.doesNotMatch(forcedSecurity.finalFrame.lines.join("\n"), /not logged|auth login/i);
@@ -209,15 +254,21 @@ test("a narrow auth failure starts with the recovery action", () => {
   assert.match(narrowAuthFailure.finalFrame.lines.join("\n"), /Run: gh auth status/);
 });
 
-test("a cache-hydrated tab clears Fetching and settled polls do not re-enter it", () => {
+test("a cache-hydrated adapted check is static and settles before routine polls", () => {
   const runCalls = automaticPoll.fixtureCalls.filter((call) => call.startsWith("run list"));
   assert.ok(runCalls.length >= 2, `expected automatic polls, saw ${runCalls.length}`);
   const firstData = automaticPoll.raw.indexOf("ci: pin actions");
   assert.ok(firstData >= 0, "expected the first successful Actions frame");
-  const states = fetchingForegroundStates(automaticPoll.raw.slice(firstData));
-  const settledAt = states.indexOf(false);
-  assert.ok(settledAt >= 0, "expected loading to clear after the first successful frame");
-  assert.equal(states.slice(settledAt).includes(true), false);
+  const statuses = automaticPoll.liveScreen.statusHistory;
+  const lastCheckingAt = statuses.findLastIndex((status) => / Checking(?:\s|$)/.test(status));
+  const settledAt = statuses.findIndex(
+    (status, index) => index > lastCheckingAt && / Watching(?:\s|$)/.test(status),
+  );
+  assert.ok(settledAt >= 0, `expected Watching after data, saw ${statuses.join(" -> ")}`);
+  assert.equal(
+    statuses.slice(settledAt + 1).some((status) => / Checking(?:\s|$)/.test(status)),
+    false,
+  );
 });
 
 test("short help keeps essential actions and points to the full reference", () => {

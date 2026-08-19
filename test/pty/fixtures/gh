@@ -16,6 +16,10 @@ echo "$*" >> "$GH_GLANCE_FIXTURE_LOG"
 
 FIXTURE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
+if [ -n "${GH_GLANCE_FIXTURE_STATE:-}" ]; then
+  exec node "$FIXTURE_DIR/gh-state.mjs" "$@"
+fi
+
 matches_selector() {
   wanted=$1
   if [ "$wanted" = "api-data" ]; then
@@ -63,11 +67,7 @@ if [ -n "${GH_GLANCE_FIXTURE_FAIL:-}" ]; then
   fail_on="${GH_GLANCE_FIXTURE_FAIL_ON:-api}"
   while [ -n "$fail_on" ]; do
     selector=${fail_on%%,*}
-    if [ "$selector" = "api-data" ] && [ "$1" = "api" ] && [ "${2:-}" != "rate_limit" ]; then
-      echo "$GH_GLANCE_FIXTURE_FAIL" >&2
-      exit 1
-    fi
-    if [ "$1" = "$selector" ]; then
+    if matches_selector "$selector" "$1" "${2:-}"; then
       echo "$GH_GLANCE_FIXTURE_FAIL" >&2
       exit 1
     fi
@@ -151,8 +151,8 @@ case "$1" in
     ;;
   api)
     # Budget probe, matched before the alert paths below. Remaining is injectable
-    # so a capture can drive the adaptive throttle; the default is a healthy
-    # budget, i.e. no adaptation and no badge.
+    # so a capture can drive the shared governor; the default is a healthy
+    # budget with no admission hold.
     : "${GH_GLANCE_FIXTURE_RATE_REMAINING:=5000}"
     case "${2:-}" in
       rate_limit)

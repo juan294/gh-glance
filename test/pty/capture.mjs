@@ -11,7 +11,7 @@
 //      into the capture file even under -q. Those lines are longer than a narrow
 //      terminal, so a width check that does not skip them fails on Linux only.
 
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { readFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, isAbsolute, join } from "node:path";
@@ -37,10 +37,34 @@ const CHARSET = new RegExp(`${ESC}[()][A-Za-z0-9]`, "g");
 const FRAME_BOUNDARY = new RegExp(`${ESC}\\[[0-9]*A|${ESC}\\[2J|${ESC}\\[H`, "g");
 const SCRIPT_BANNER = /^Script (started|done) on /;
 const TAB_BAR = /1:(?:Actions|Act)/;
-// StatusBar always starts at column zero with one width-1 spinner cell. Panel
+// StatusBar always starts at column zero with one width-1 state marker. Panel
 // rows start with a border, so remote titles containing these words cannot be
 // mistaken for accumulated footers.
-const STATUS_LINE = /^\S (?:Fetching|Setup)(?:\s|$)/;
+const STATUS_LINE = /^\S (?:Setup|Checking|Paused|Waiting|Failed|Limited|Watching)(?:\s|$)/;
+
+export function isStatusLine(line) {
+  return typeof line === "string" && STATUS_LINE.test(line);
+}
+
+export function waitForAwk(path, program, attempts = 150) {
+  return `i=0; while ! awk '${program} END { exit ok ? 0 : 1 }' ${path} 2>/dev/null ` +
+    `&& [ $i -lt ${attempts} ]; do i=$((i + 1)); sleep .1; done; `;
+}
+
+function readCaptureResult(out, dimensions) {
+  const parsed = parseCapture(readFileSync(out, "utf8"), dimensions);
+  const logPath = `${out}.calls`;
+  parsed.fixtureCalls = existsSync(logPath)
+    ? readFileSync(logPath, "utf8").split("\n").filter(Boolean)
+    : [];
+  return parsed;
+}
+
+function removeCaptureArtifacts(out) {
+  for (const path of [out, `${out}.calls`]) {
+    if (existsSync(path)) rmSync(path, { force: true });
+  }
+}
 
 function stripEscapes(text) {
   return text
@@ -112,6 +136,7 @@ function replayTerminal(raw, cols, rows) {
   let inAlternateScreen = false;
   let lastDashboardScreen = null;
   let maxStatusLines = 0;
+  const statusHistory = [];
 
   function clampCursor() {
     row = Math.max(0, Math.min(rows - 1, row));
@@ -132,10 +157,18 @@ function replayTerminal(raw, cols, rows) {
   function snapshotDashboard() {
     if (!inAlternateScreen) return;
     const plain = screen.map((line) => line.join("").trimEnd());
-    const statusLines = plain.filter((line) => STATUS_LINE.test(line)).length;
-    if (plain.some((line) => TAB_BAR.test(line))) {
+    let hasTabBar = false;
+    const visibleStatuses = [];
+    for (const line of plain) {
+      if (TAB_BAR.test(line)) hasTabBar = true;
+      if (isStatusLine(line)) visibleStatuses.push(line);
+    }
+    if (hasTabBar) {
       lastDashboardScreen = plain;
-      maxStatusLines = Math.max(maxStatusLines, statusLines);
+      maxStatusLines = Math.max(maxStatusLines, visibleStatuses.length);
+      for (const status of visibleStatuses) {
+        if (statusHistory.at(-1) !== status) statusHistory.push(status);
+      }
     }
   }
 
@@ -316,6 +349,7 @@ function replayTerminal(raw, cols, rows) {
   return {
     lines: lastDashboardScreen ?? screen.map((line) => line.join("").trimEnd()),
     maxStatusLines,
+    statusHistory,
   };
 }
 
@@ -367,7 +401,7 @@ export function parseCapture(raw, dimensions = null) {
 
   // Everything after the restore sequence landed on the PRIMARY buffer. This is
   // the #41 surface: the app's exit listener restores the primary buffer
-  // (index.mjs:1618) and ink's unmount can then repaint onto it.
+  // (index.mjs:8237) and ink's unmount can then repaint onto it.
   const exitIndex = raw.indexOf(ALT_EXIT);
   const tail = exitIndex === -1 ? "" : raw.slice(exitIndex + ALT_EXIT.length);
   const afterRestoreVisible = visibleLines(tail)
@@ -401,8 +435,9 @@ export function parseCapture(raw, dimensions = null) {
     liveScreen: replayedScreen
       ? {
           lines: replayedScreen,
-          statusLines: replayedScreen.filter((line) => STATUS_LINE.test(line)).length,
+          statusLines: replayedScreen.filter(isStatusLine).length,
           maxStatusLines: replayed.maxStatusLines,
+          statusHistory: replayed.statusHistory,
         }
       : null,
     afterRestore: {
@@ -422,6 +457,16 @@ export function parseCapture(raw, dimensions = null) {
 
 let captureSeq = 0;
 
+function captureEnvironment(env, configHome, animation, icons) {
+  return {
+    ...process.env,
+    ...env,
+    GH_GLANCE_CAPTURE_ANIMATION: animation ? "1" : "0",
+    GH_GLANCE_CAPTURE_ICONS: icons,
+    XDG_CONFIG_HOME: configHome,
+  };
+}
+
 /**
  * Run the app under a pty and parse the result.
  *
@@ -434,6 +479,8 @@ let captureSeq = 0;
  * @param {string} [options.stdin]  shell snippet whose stdout is fed to the pty
  * @param {string} [options.args]   flags handed to index.mjs, space-separated
  * @param {object} [options.env]    environment overrides for the fixture run
+ * @param {boolean} [options.animation] opt in to real spinner motion
+ * @param {string} [options.icons] status icon profile (unicode or ascii)
  * @param {string} [options.configHome] caller-owned absolute config root; when
  *                                      omitted, capture creates and cleans one
  */
@@ -445,6 +492,8 @@ export function capture({
   stdin = "",
   args = "",
   env = {},
+  animation = false,
+  icons = "unicode",
   configHome,
 }) {
   if (configHome != null && (!isAbsolute(configHome) || configHome.length === 0)) {
@@ -467,19 +516,48 @@ export function capture({
         // Isolation wins over caller-supplied environment overrides: every PTY
         // run must be unable to observe the developer's real preferences. A
         // caller that needs restart persistence supplies configHome explicitly.
-        env: { ...process.env, ...env, XDG_CONFIG_HOME: effectiveConfigHome },
+        env: captureEnvironment(env, effectiveConfigHome, animation, icons),
       },
     );
-    const parsed = parseCapture(readFileSync(out, "utf8"), { cols, rows });
-    const logPath = `${out}.calls`;
-    parsed.fixtureCalls = existsSync(logPath)
-      ? readFileSync(logPath, "utf8").split("\n").filter(Boolean)
-      : [];
-    return parsed;
+    return readCaptureResult(out, { cols, rows });
   } finally {
-    for (const path of [out, `${out}.calls`]) {
-      if (existsSync(path)) rmSync(path, { force: true });
-    }
+    removeCaptureArtifacts(out);
     if (ownsConfigHome) rmSync(effectiveConfigHome, { recursive: true, force: true });
+  }
+}
+
+export async function captureAsync(options) {
+  const {
+    cols,
+    rows,
+    signal = "TERM",
+    settle = 4,
+    stdin = "",
+    args = "",
+    env = {},
+    animation = false,
+    icons = "unicode",
+    configHome,
+  } = options;
+  if (configHome == null || !isAbsolute(configHome) || configHome.length === 0) {
+    throw new TypeError("captureAsync requires a shared absolute configHome");
+  }
+  captureSeq += 1;
+  const out = join(tmpdir(), `gh-glance-pty-${process.pid}-${captureSeq}.txt`);
+  try {
+    await new Promise((resolve, reject) => {
+      execFile(
+        "/bin/sh",
+        [RUN, String(cols), String(rows), out, signal, String(settle), stdin, args],
+        {
+          timeout: (settle + 25) * 1000,
+          env: captureEnvironment(env, configHome, animation, icons),
+        },
+        (error) => error ? reject(error) : resolve(),
+      );
+    });
+    return readCaptureResult(out, { cols, rows });
+  } finally {
+    removeCaptureArtifacts(out);
   }
 }

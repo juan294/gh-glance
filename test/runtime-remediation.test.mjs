@@ -8,6 +8,7 @@ import {
   adoptPersistedSnapshot,
   alertRequestArgs,
   authCacheIdentity,
+  clearForcedBackoffAfterStart,
   createOpenRequestRegistry,
   forcedBackoffKeys,
   formatTabErrorForWidth,
@@ -15,10 +16,11 @@ import {
   mergeAlertRows,
   mergeDashboardCacheSnapshots,
   mergeWidthPreferenceSnapshots,
-  nextBudgetTargets,
   pollResultTransition,
-  pollTickKeys,
+  pollSchedule,
+  mapAllSettledBounded,
   reconcileSelectionViewport,
+  resourceDecision,
   securityPollDelay,
   selectionLabel,
   shouldCheckpointFreshness,
@@ -169,51 +171,29 @@ test("freshness checkpoints are bounded instead of writing every successful poll
   assert.equal(shouldCheckpointFreshness({ persistedAt: null, completedAt: 1 }), true);
 });
 
-test("GraphQL and REST budgets each constrain the adaptive interval", () => {
+test("tab resource decisions keep GraphQL and REST independent", () => {
   const nowMs = 1_000_000;
   const budgets = {
-    core: { remaining: 5000, resetMs: nowMs + 3_600_000 },
-    graphql: { remaining: 100, resetMs: nowMs + 3_600_000 },
+    core: { limit: 5000, remaining: 5000, used: 0, resetMs: nowMs + 3_600_000, observedAt: nowMs },
+    graphql: { limit: 5000, remaining: 1000, used: 4000, resetMs: nowMs + 3_600_000, observedAt: nowMs },
   };
-  const constrained = nextBudgetTargets({
-    budgets,
-    samples: { core: null, graphql: null },
-    shares: { core: 1, graphql: 1 },
-    activeKey: "issues",
-    floorMs: 5000,
+  assert.equal(resourceDecision({
+    budget: budgets.core,
+    resource: "core",
+    cost: 2,
     nowMs,
-  });
-  assert.ok(
-    constrained.targetMs > 5000,
-    `GraphQL budget did not widen the interval: ${constrained.targetMs}`,
-  );
-  const coreConstrained = nextBudgetTargets({
-    budgets: {
-      core: { remaining: 100, resetMs: nowMs + 3_600_000 },
-      graphql: { remaining: 5000, resetMs: nowMs + 3_600_000 },
-    },
-    samples: { core: null, graphql: null },
-    shares: { core: 1, graphql: 1 },
-    activeKey: "issues",
-    floorMs: 5000,
+  }).mode, "open");
+  assert.equal(resourceDecision({
+    budget: budgets.graphql,
+    resource: "graphql",
+    cost: 2,
     nowMs,
-  });
-  assert.ok(
-    coreConstrained.targetMs > 5000,
-    `REST budget did not widen the interval: ${coreConstrained.targetMs}`,
-  );
-  assert.deepEqual(
-    nextBudgetTargets({
-      budgets: { core: budgets.core, graphql: null },
-      samples: {},
-      shares: {},
-      previous: { core: 9000, graphql: 12_000 },
-      activeKey: "issues",
-      floorMs: 5000,
-      nowMs,
-    }).targets,
-    { core: 5000, graphql: 12_000 },
-  );
+  }).mode, "paused");
+
+  budgets.core = { ...budgets.core, remaining: 1000, used: 4000 };
+  budgets.graphql = { ...budgets.graphql, remaining: 5000, used: 0 };
+  assert.equal(resourceDecision({ budget: budgets.core, resource: "core", cost: 2, nowMs }).mode, "paused");
+  assert.equal(resourceDecision({ budget: budgets.graphql, resource: "graphql", cost: 2, nowMs }).mode, "open");
 });
 
 test("settled automatic polling stays invisible while first load and manual refresh stay visible", () => {
@@ -257,13 +237,89 @@ test("the poll controller keeps unchanged, blind, and changed transitions separa
   assert.equal(blind.kind, "blind");
   assert.equal(blind.nextRaw, null);
 
-  assert.deepEqual(pollTickKeys({ ticks: 0, activeKey: "issues" }).due, [
-    "actions",
-    "issues",
-    "prs",
-    "security",
+  let schedule = pollSchedule({
+    nowMs: 0,
+    floorMs: 5,
+    activeKey: "issues",
+    activeAt: 0,
+    backgroundAt: 20,
+  });
+  assert.deepEqual(schedule.due, [{ key: "issues", kind: "active" }]);
+  const rotations = [];
+  for (const nowMs of [20, 40, 60]) {
+    schedule = pollSchedule({
+      nowMs,
+      floorMs: 5,
+      activeKey: "issues",
+      activeAt: nowMs,
+      backgroundAt: nowMs,
+      backgroundIndex: schedule.backgroundIndex,
+    });
+    rotations.push(schedule.due);
+  }
+  assert.deepEqual(rotations, [
+    [{ key: "issues", kind: "active" }, { key: "actions", kind: "background" }],
+    [{ key: "issues", kind: "active" }, { key: "prs", kind: "background" }],
+    [{ key: "issues", kind: "active" }, { key: "security", kind: "background" }],
   ]);
-  assert.deepEqual(pollTickKeys({ ticks: 1, activeKey: "issues" }).due, ["issues"]);
+  assert.deepEqual(
+    pollSchedule({
+      nowMs: 20,
+      floorMs: 5,
+      activeKey: "issues",
+      activeAt: 20,
+      backgroundAt: 20,
+      heldResources: { core: { held: true, retryAt: 100 } },
+    }).due,
+    [{ key: "issues", kind: "active" }, { key: "prs", kind: "background" }],
+  );
+
+  assert.deepEqual(
+    pollSchedule({
+      nowMs: 20,
+      floorMs: 5,
+      activeKey: "actions",
+      activeAt: 20,
+      backgroundAt: 20,
+      heldResources: { core: { held: true, retryAt: 100 } },
+    }).due,
+    [{ key: "issues", kind: "background" }],
+  );
+});
+
+test("manual delay preserves backoff until the reservation actually starts", () => {
+  const cleared = [];
+  assert.equal(
+    clearForcedBackoffAfterStart("security", true, "scheduled", (key) => cleared.push(key)),
+    false,
+  );
+  assert.deepEqual(cleared, []);
+  assert.equal(
+    clearForcedBackoffAfterStart("security", true, "started", (key) => cleared.push(key)),
+    true,
+  );
+  assert.deepEqual(cleared, forcedBackoffKeys("security"));
+});
+
+test("bounded diagnostic work settles independently and preserves result order", async () => {
+  let active = 0;
+  let maximum = 0;
+  const settled = await mapAllSettledBounded([30, 5, 15, 1], 2, async (delay, index) => {
+    active += 1;
+    maximum = Math.max(maximum, active);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    active -= 1;
+    if (index === 2) throw new Error("independent failure");
+    return index;
+  });
+  assert.equal(maximum, 2);
+  assert.deepEqual(settled.map(({ status }) => status), [
+    "fulfilled",
+    "fulfilled",
+    "rejected",
+    "fulfilled",
+  ]);
+  assert.deepEqual(settled.map((result) => result.value), [0, 1, undefined, 3]);
 });
 
 test("open request ownership preserves per-item guards and aborts every child on quit", async () => {

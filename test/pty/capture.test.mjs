@@ -1,7 +1,33 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { parseCapture } from "./capture.mjs";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const RUN = join(HERE, "run.sh");
+
+async function waitFor(predicate, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error("timed out waiting for PTY harness evidence");
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
 
 const ESC = "\x1b";
 const ALT_ENTER = `${ESC}[?1049h`;
@@ -13,26 +39,27 @@ test("terminal replay preserves a compact dashboard and its guard row", () => {
   const raw =
     ALT_ENTER +
     SYNC_START +
-    "[1:Act]\r\nbody\r\n⣾ Fetching\r\n" +
+    "[1:Act]\r\nbody\r\n⣾ Checking\r\n" +
     SYNC_END +
     ALT_EXIT;
 
   const parsed = parseCapture(raw, { cols: 20, rows: 5 });
 
-  assert.deepEqual(parsed.finalFrame.lines, ["[1:Act]", "body", "⣾ Fetching"]);
+  assert.deepEqual(parsed.finalFrame.lines, ["[1:Act]", "body", "⣾ Checking"]);
   assert.equal(parsed.liveScreen.lines.length, 5);
   assert.equal(parsed.liveScreen.lines.at(-1), "");
   assert.equal(parsed.liveScreen.statusLines, 1);
   assert.equal(parsed.liveScreen.maxStatusLines, 1);
+  assert.deepEqual(parsed.liveScreen.statusHistory, ["⣾ Checking"]);
 });
 
 test("terminal replay applies incremental cursor updates without accumulating status lines", () => {
-  const initial = "[1:Actions]\r\nbody\r\n⣾ Fetching\r\n";
+  const initial = "[1:Actions]\r\nbody\r\n⣾ Checking\r\n";
   const update =
     `${ESC}[3A` +
     `${ESC}[E` +
     `${ESC}[E` +
-    `${ESC}[G⣾ Fetching stale 1m${ESC}[K\r\n`;
+    `${ESC}[G· Watching stale 1m${ESC}[K\r\n`;
   const raw =
     ALT_ENTER +
     SYNC_START +
@@ -45,21 +72,22 @@ test("terminal replay applies incremental cursor updates without accumulating st
 
   const parsed = parseCapture(raw, { cols: 24, rows: 5 });
 
-  assert.equal(parsed.finalFrame.lines[2], "⣾ Fetching stale 1m");
+  assert.equal(parsed.finalFrame.lines[2], "· Watching stale 1m");
   assert.equal(parsed.liveScreen.statusLines, 1);
   assert.equal(parsed.liveScreen.maxStatusLines, 1);
   assert.equal(parsed.liveScreen.lines.at(-1), "");
+  assert.deepEqual(parsed.liveScreen.statusHistory, ["⣾ Checking", "· Watching stale 1m"]);
 });
 
 test("terminal replay retains transient status accumulation evidence", () => {
   const raw =
     ALT_ENTER +
     SYNC_START +
-    "[1:Actions]\r\n⣾ Fetching old\r\n⣾ Fetching new\r\n" +
+    "[1:Actions]\r\n· Waiting old\r\n⣾ Checking new\r\n" +
     SYNC_END +
     SYNC_START +
     `${ESC}[2J${ESC}[H` +
-    "[1:Actions]\r\nbody\r\n⣾ Fetching\r\n" +
+    "[1:Actions]\r\nbody\r\n· Watching\r\n" +
     SYNC_END +
     ALT_EXIT;
 
@@ -67,4 +95,39 @@ test("terminal replay retains transient status accumulation evidence", () => {
 
   assert.equal(parsed.liveScreen.statusLines, 1);
   assert.equal(parsed.liveScreen.maxStatusLines, 2);
+  assert.deepEqual(parsed.liveScreen.statusHistory, ["· Waiting old", "⣾ Checking new", "· Watching"]);
+});
+
+test("capture termination reaps the full stdin producer and script trees", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-capture-cleanup-"));
+  const out = join(root, "capture.txt");
+  const producerPath = `${out}.producer`;
+  const childPath = `${out}.producer-child`;
+  const harness = spawn("/bin/sh", [
+    RUN,
+    "60",
+    "16",
+    out,
+    "none",
+    "30",
+    `printf '%s' "$$" > "$GH_GLANCE_CAPTURE_OUT.producer"; ` +
+      `sleep 300 & child=$!; printf '%s' "$child" > "$GH_GLANCE_CAPTURE_OUT.producer-child"; wait "$child"`,
+  ], { stdio: "ignore" });
+  const tracked = [];
+  t.after(() => {
+    try { harness.kill("SIGKILL"); } catch { /* already stopped */ }
+    for (const pid of tracked) {
+      try { process.kill(pid, "SIGKILL"); } catch { /* already stopped */ }
+    }
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  await waitFor(() => existsSync(producerPath) && existsSync(childPath));
+  tracked.push(Number(readFileSync(producerPath, "utf8")), Number(readFileSync(childPath, "utf8")));
+  const terminatedAt = Date.now();
+  harness.kill("SIGTERM");
+  await new Promise((resolve) => harness.once("exit", resolve));
+  await waitFor(() => tracked.every((pid) => !processIsAlive(pid)));
+  assert.ok(Date.now() - terminatedAt < 5_000, "capture cleanup must stay below five seconds");
+  assert.ok(tracked.every((pid) => !processIsAlive(pid)));
 });
