@@ -54,7 +54,7 @@ test("the app reaches the data layer at all", () => {
     `the fixture gh was never invoked -- the capture is not of a running dashboard`,
   );
   assert.ok(
-    wide.fixtureCalls.some((call) => call.startsWith("run list")),
+    wide.fixtureCalls.some((call) => call.includes("/actions/runs?")),
     "expected the Actions tab to fetch on first paint",
   );
 });

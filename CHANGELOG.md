@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Unchanged Actions and Security checks no longer consume REST quota.** The
+  dashboard now revalidates each REST endpoint with its cached ETag, while a
+  manual refresh still requests fresh data and new Actions runs still appear.
 - **The footer stays calm while checks follow their safe schedule.** Scheduler
   holds now remain Watching, grant and reset details use coarse relative
   minutes, and detail or stale text stays inside a fixed state region so key

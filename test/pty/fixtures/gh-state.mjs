@@ -7,7 +7,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 
 const statePath = process.env.GH_GLANCE_FIXTURE_STATE;
@@ -15,6 +15,85 @@ const args = process.argv.slice(2);
 const fixtures = dirname(new URL(import.meta.url).pathname);
 const waitCell = new Int32Array(new SharedArrayBuffer(4));
 const RATE_RESOURCES = ["core", "graphql"];
+
+function parseApiInvocation(argv) {
+  if (argv[0] !== "api") return null;
+  let path = null;
+  let include = false;
+  let ifNoneMatch = null;
+  for (let index = 1; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (["-i", "--include"].includes(argument)) {
+      include = true;
+      continue;
+    }
+    if (["-H", "--header"].includes(argument)) {
+      const header = argv[index + 1] ?? "";
+      index += 1;
+      const match = /^if-none-match:\s*(.+)$/i.exec(header);
+      if (match) ifNoneMatch = match[1];
+      continue;
+    }
+    const inlineHeader = /^-H(.+)$/.exec(argument);
+    if (inlineHeader) {
+      const match = /^if-none-match:\s*(.+)$/i.exec(inlineHeader[1]);
+      if (match) ifNoneMatch = match[1];
+      continue;
+    }
+    if (["--hostname", "--jq", "-X", "--method", "-f", "--raw-field", "-F", "--field", "--input"]
+      .includes(argument)) {
+      index += 1;
+      continue;
+    }
+    if (/^(?:--hostname|--jq|--method|--raw-field|--field|--input)=/.test(argument) ||
+      argument.startsWith("-")) continue;
+    if (path === null) path = argument;
+  }
+  return { path, include, ifNoneMatch };
+}
+
+const apiInvocation = parseApiInvocation(args);
+
+function bodyEtag(body) {
+  return `"fixture-${createHash("sha256").update(body).digest("hex").slice(0, 16)}"`;
+}
+
+function defaultApiBody(path) {
+  if (path?.includes("/actions/runs?")) {
+    return readFileSync(join(fixtures, "actions-runs.json"), "utf8");
+  }
+  if (path?.includes("/actions/workflows?")) {
+    return readFileSync(join(fixtures, "actions-workflows.json"), "utf8");
+  }
+  return "[]\n";
+}
+
+function apiEntity(state, path, fallback) {
+  const configured = state.apiEntities?.[path];
+  let entity = configured;
+  if (Array.isArray(configured?.sequence) && configured.sequence.length > 0) {
+    const sequenceIndex = Math.min(configured.calls ?? 0, configured.sequence.length - 1);
+    entity = configured.sequence[sequenceIndex];
+    configured.calls = (configured.calls ?? 0) + 1;
+  }
+  const configuredBody = typeof entity?.body === "string";
+  const body = configuredBody ? entity.body : fallback.body;
+  const etag = typeof entity?.etag === "string"
+    ? entity.etag
+    : configuredBody ? bodyEtag(body) : fallback.etag;
+  return {
+    status: apiInvocation?.ifNoneMatch === etag ? 304 : 200,
+    etag,
+    body,
+  };
+}
+
+const fallbackApiEntity = apiInvocation?.path && apiInvocation.path !== "rate_limit"
+  ? (() => {
+      const body = defaultApiBody(apiInvocation.path);
+      return { body, etag: bodyEtag(body) };
+    })()
+  : null;
 
 function writeExclusive(path, contents) {
   const candidate = `${path}.candidate-${process.pid}-${randomUUID()}`;
@@ -171,13 +250,15 @@ function withLock(run) {
 }
 
 function selector() {
-  if (args[0] === "api" && args[1] === "rate_limit") return "rate_limit";
+  if (args[0] === "api" && apiInvocation?.path === "rate_limit") return "rate_limit";
+  if (args[0] === "api" && apiInvocation?.path?.includes("/actions/")) return "actions";
   if (args[0] === "api") return "security";
   if (["run", "issue", "pr", "repo", "auth"].includes(args[0])) return args[0];
   return args[0] ?? "unknown";
 }
 
-function cost() {
+function cost(apiResponse = null) {
+  if (apiResponse?.status === 304) return { core: 0, graphql: 0 };
   if (args[0] === "run") return { core: 2, graphql: 0 };
   if (["issue", "pr"].includes(args[0])) return { core: 0, graphql: 2 };
   if (args[0] === "repo" && args[1] === "view") return { core: 0, graphql: 1 };
@@ -214,17 +295,17 @@ function resourceSnapshot(state, resources = RATE_RESOURCES) {
 function pruneDeadInflight(state) {
   state.inFlight ??= {};
   let active = 0;
-  let dataActive = 0;
+  const dataOwners = new Set();
   for (const [id, item] of Object.entries(state.inFlight)) {
     if (pidIsDead(item?.pid)) {
       delete state.inFlight[id];
       continue;
     }
     active += 1;
-    if (item.isData) dataActive += 1;
+    if (item.isData) dataOwners.add(item.ownerPid ?? item.pid);
   }
   state.active = active;
-  state.dataActive = dataActive;
+  state.dataActive = dataOwners.size;
 }
 
 function applyResetSequence(state, now) {
@@ -297,9 +378,12 @@ const started = withLock((state) => {
   if (state.anchorAtFirstProbe !== true) state.createdAt ??= now;
   state.events ??= [];
   state.sequence = (state.sequence ?? 0) + 1;
-  pruneDeadInflight(state);
+  state.inFlight ??= {};
   const sequence = state.sequence;
-  const debit = cost();
+  const apiResponse = selector() === "rate_limit" || apiInvocation === null
+    ? null
+    : apiEntity(state, apiInvocation.path, fallbackApiEntity);
+  const debit = cost(apiResponse);
   const isData = debit.core > 0 || debit.graphql > 0;
   state.inFlight[sequence] = {
     pid: process.pid,
@@ -308,8 +392,7 @@ const started = withLock((state) => {
     isData,
     startedAt: now,
   };
-  state.active += 1;
-  if (isData) state.dataActive += 1;
+  pruneDeadInflight(state);
   state.maxConcurrency = Math.max(state.maxConcurrency ?? 0, state.active);
   applyResetSequence(state, now);
   const chargedResources = RATE_RESOURCES.filter((resource) => debit[resource] > 0);
@@ -345,6 +428,7 @@ const started = withLock((state) => {
     message: failure?.message ?? "fixture failure",
     budgets: { core: state.core, graphql: state.graphql },
     isData,
+    apiResponse,
   };
 });
 
@@ -363,6 +447,7 @@ withLock((state) => {
     pane: process.env.GH_GLANCE_FIXTURE_PANE ?? null,
     argv: args,
     failed: started.fail,
+    ...(started.apiResponse ? { status: started.apiResponse.status } : {}),
   });
 });
 
@@ -406,5 +491,22 @@ switch (selector()) {
     process.stdout.write("gh version 2.97.0 (fixture)\n");
     break;
   default:
-    process.stdout.write("[]\n");
+    if (started.apiResponse) {
+      if (apiInvocation.include) {
+        const phrase = started.apiResponse.status === 304 ? "Not Modified" : "OK";
+        process.stdout.write(
+          `HTTP/2 ${started.apiResponse.status} ${phrase}\r\n` +
+          `etag: ${started.apiResponse.etag}\r\n` +
+          `x-ratelimit-limit: ${started.budgets.core.limit}\r\n` +
+          `x-ratelimit-used: ${started.budgets.core.used}\r\n` +
+          `x-ratelimit-remaining: ${started.budgets.core.remaining}\r\n` +
+          `x-ratelimit-reset: ${Math.floor(started.budgets.core.resetMs / 1000)}\r\n` +
+          "x-ratelimit-resource: core\r\n\r\n",
+        );
+      }
+      if (started.apiResponse.status === 200) process.stdout.write(started.apiResponse.body);
+      else process.exitCode = 1;
+    } else {
+      process.stdout.write("[]\n");
+    }
 }

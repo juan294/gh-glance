@@ -59,6 +59,16 @@ function dataStarts(state) {
     event.argv[0] === "api" && event.argv[1] !== "rate_limit");
 }
 
+function isActionsEndpoint(event) {
+  return event.argv[0] === "api" &&
+    event.argv.some((argument) => argument.includes("/actions/"));
+}
+
+function actionsRuns(state) {
+  return dataStarts(state)
+    .filter((event) => event.argv.some((argument) => argument.includes("/actions/runs?")));
+}
+
 async function observeUntil(read, predicate, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let lastValue;
@@ -203,11 +213,11 @@ test("twelve real panes share one startup probe and every active pane progresses
 
   const data = dataStarts(progress);
   assert.equal(probes(progress).length, 1, `startup probes: ${JSON.stringify(probes(progress))}`);
-  assert.equal(data.length, 12, "startup launched background or duplicate data work");
+  assert.equal(data.length, 24, "startup launched background or duplicate data work");
   assert.equal(new Set(data.map((event) => event.pane)).size, 12);
-  assert.ok(data.every((event) => event.argv[0] === "run"), "a non-active tab ran at startup");
+  assert.ok(data.every(isActionsEndpoint), "a non-active tab ran at startup");
   assertDebitsStayOutsideReserve(data);
-  assertPhasedStarts(startupGovernor, data, "core", 12, "startup");
+  assertPhasedStarts(startupGovernor, actionsRuns(progress), "core", 12, "startup");
 });
 
 test("twelve mixed active panes pace core and GraphQL without consuming either reserve", async (t) => {
@@ -239,7 +249,7 @@ test("twelve mixed active panes pace core and GraphQL without consuming either r
   assert.ok(data.some((event) => event.cost.core > 0));
   assert.ok(data.some((event) => event.cost.graphql > 0));
   for (const event of data) {
-    if (event.pane.includes("-actions-")) assert.equal(event.argv[0], "run");
+    if (event.pane.includes("-actions-")) assert.ok(isActionsEndpoint(event));
     if (event.pane.includes("-issues-")) assert.equal(event.argv[0], "issue");
     if (event.pane.includes("-prs-")) assert.equal(event.argv[0], "pr");
     if (event.pane.includes("-security-")) assert.equal(event.argv[0], "api");
@@ -256,14 +266,14 @@ test("manual refresh wins a held lane without stacking repeated requests", { tim
       offsetMs: 10_500,
       core: { used: 0, remaining: LIMIT, resetOffsetMs: WINDOW_MS },
     }],
-    delayByCommand: { run: 800 },
+    delayByCommand: { actions: 800 },
   });
   const competitorReady = join(box.root, "manual-competitor-ready");
   const manualInput =
     "i=0; while ! grep -Eq 'Watching (next|probing)' \"$GH_GLANCE_CAPTURE_OUT\" 2>/dev/null && [ $i -lt 150 ]; " +
     "do i=$((i + 1)); sleep .1; done; " +
     "i=0; while [ $i -lt 8 ]; do printf r; i=$((i + 1)); sleep .03; done; " +
-    "i=0; while ! grep -Fq '\"pane\":\"manual\",\"argv\":[\"run\"' " +
+    "i=0; while ! grep -Fq '\"pane\":\"manual\",\"argv\":[\"api\",\"-i\",\"repos/acme/widget/actions/runs?' " +
     "\"$GH_GLANCE_FIXTURE_STATE\" 2>/dev/null && [ $i -lt 300 ]; " +
     "do i=$((i + 1)); sleep .1; done; sleep .5; printf q";
   const captures = [startPane(box, "manual", {
@@ -303,7 +313,7 @@ test("manual refresh wins a held lane without stacking repeated requests", { tim
   }
 
   assert.equal(Object.values(held.intents).filter((intent) => intent.priority === "manual").length, 1);
-  const runs = dataStarts(progress).filter((event) => event.argv[0] === "run");
+  const runs = actionsRuns(progress);
   assert.equal(runs.filter((event) => event.pane === "manual").length, 1);
   assert.equal(runs.filter((event) => event.pane === "competitor").length, 1);
   assert.equal(runs[0].pane, "manual", "lower-priority work started before manual refresh");
@@ -443,10 +453,13 @@ test("a real reset resumes all panes, while atomic external burn limits the next
   assert.notEqual(resetGovernor.epochs.core, firstEpoch);
   assert.equal(probes(resetProgress).length, 2);
   const resetData = dataStarts(resetProgress);
-  assert.equal(resetData.length, 12, "reset launched duplicate data work");
+  const resetRuns = actionsRuns(resetProgress);
+  assert.equal(resetRuns.length, 12, "reset launched duplicate Actions batches");
+  assert.ok(resetData.length >= 12 && resetData.length <= 24,
+    "reset launched work outside the twelve Actions batches");
   assert.equal(new Set(resetData.map((event) => event.pane)).size, 12);
   assertDebitsStayOutsideReserve(resetData);
-  assertPhasedStarts(resetSchedule, resetData, "core", 12, "reset");
+  assertPhasedStarts(resetSchedule, resetRuns, "core", 12, "reset");
 
   const burnBox = fixture(t, {
     anchorAtFirstProbe: true,
@@ -488,9 +501,13 @@ test("a real reset resumes all panes, while atomic external burn limits the next
   const finalBurn = burnBox.read();
   const burnEvent = finalBurn.events.find((event) => event.type === "external-burn");
   const burnData = dataStarts(finalBurn);
+  const burnRuns = actionsRuns(finalBurn);
   assert.equal(burnEvent.amount, 7996);
   assert.equal(burnEvent.after.core.remaining, resourceReserve(LIMIT) + 4);
-  assert.ok(burnData.length >= 1 && burnData.length <= 2, `burn admitted ${burnData.length} calls`);
+  assert.ok(burnRuns.length >= 1 && burnRuns.length <= 2,
+    `burn admitted ${burnRuns.length} Actions batches`);
+  assert.equal(burnData.length, burnRuns.length * 2,
+    `burn admitted incomplete Actions batches: ${burnData.length} calls`);
   assert.equal(probes(burned).length, 2);
   assertDebitsStayOutsideReserve(burnData);
 });
@@ -533,7 +550,7 @@ test("probe and reservation owner crashes recover without optimistic spend", { t
   assertDebitsStayOutsideReserve(dataStarts(recoveredProbe));
 
   const reservationBox = fixture(t, {
-    delayByCommand: { run: { ms: 30_000, remaining: 1 } },
+    delayByCommand: { actions: { ms: 30_000, remaining: 1 } },
   });
   const reservationOwnerReady = join(reservationBox.root, "reservation-owner-ready");
   const crashedReservationCapture = startPane(reservationBox, "reservation-owner", {

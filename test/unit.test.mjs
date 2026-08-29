@@ -55,6 +55,13 @@ import {
   freshnessDeadline,
   nextAdmittedCadence,
   parseJsonOutput,
+  parseGhApiResponse,
+  pickRateLimit,
+  ghApi,
+  parseActionsBodies,
+  entityKey,
+  conditionalBatchResult,
+  publishStagedEntities,
   pollResultTransition,
   coordinationNotice,
   probingGovernorDecisions,
@@ -304,6 +311,125 @@ test("unusable poll output keeps prior data clocks and forces the retry to parse
     completedAt: 1_000_000,
   });
   assert.deepEqual(transition, { kind: "unusable", nextRaw: null });
+});
+
+test("gh api response prefixes parse 200, 304, 404, and malformed output without throwing", () => {
+  assert.deepEqual(
+    parseGhApiResponse(
+      "HTTP/2 200 OK\r\nETag: \"runs-v1\"\r\nX-RateLimit-Limit: 5000\r\n" +
+      "X-RateLimit-Used: 12\r\nX-RateLimit-Remaining: 4988\r\n" +
+      "X-RateLimit-Reset: 1788019200\r\nX-RateLimit-Resource: core\r\n\r\n[{\"id\":1}]\n",
+    ),
+    {
+      status: 200,
+      headers: {
+        etag: '"runs-v1"',
+        "x-ratelimit-limit": "5000",
+        "x-ratelimit-used": "12",
+        "x-ratelimit-remaining": "4988",
+        "x-ratelimit-reset": "1788019200",
+        "x-ratelimit-resource": "core",
+      },
+      body: '[{"id":1}]\n',
+    },
+  );
+  assert.deepEqual(parseGhApiResponse("HTTP/2 304 Not Modified\nETag: W/\"same\"\n\n"), {
+    status: 304,
+    headers: { etag: 'W/"same"' },
+    body: "",
+  });
+  assert.equal(parseGhApiResponse("HTTP/1.1 404 Not Found\r\ncontent-type: text/plain\r\n\r\nno").status, 404);
+  assert.deepEqual(parseGhApiResponse("not an HTTP response"), {
+    status: null,
+    headers: {},
+    body: "",
+  });
+});
+
+test("gh api recognizes a 304 even when gh reports the jq empty-body error", async () => {
+  const error = Object.assign(new Error("gh api failed"), {
+    stdout: "HTTP/2 304 Not Modified\r\nETag: \"same\"\r\n\r\n",
+    stderr: "unexpected end of JSON input",
+  });
+  const response = await ghApi(["repos/acme/widget/actions/runs", "--jq", "."], {
+    operation: "tab:actions-runs",
+    etag: '"same"',
+    run: async () => { throw error; },
+  });
+  assert.deepEqual(response, { status: 304, etag: '"same"', rateLimit: null, body: "" });
+});
+
+test("rate-limit headers are normalized without changing governor state", () => {
+  assert.deepEqual(pickRateLimit({
+    "x-ratelimit-resource": "core",
+    "x-ratelimit-limit": "5000",
+    "x-ratelimit-used": "12",
+    "x-ratelimit-remaining": "4988",
+    "x-ratelimit-reset": "1788019200",
+  }), {
+    resource: "core",
+    limit: 5000,
+    used: 12,
+    remaining: 4988,
+    resetMs: 1_788_019_200_000,
+  });
+  assert.equal(pickRateLimit({ "x-ratelimit-resource": "core" }), null);
+});
+
+test("Actions joins workflows without dropping runs whose workflow is absent", () => {
+  assert.deepEqual(parseActionsBodies(
+    JSON.stringify([
+      { databaseId: 1, displayTitle: "CI", number: 7, headBranch: "main", status: "completed", conclusion: "success", startedAt: "start", updatedAt: "end", workflowId: 10 },
+      { databaseId: 2, displayTitle: "Deleted workflow", number: 6, headBranch: "old", status: "completed", conclusion: "failure", startedAt: "start2", updatedAt: "end2", workflowId: 99 },
+    ]),
+    JSON.stringify([{ id: 10, name: "Checks" }]),
+  ), [
+    { databaseId: 1, displayTitle: "CI", workflowName: "Checks", number: 7, headBranch: "main", status: "completed", conclusion: "success", startedAt: "start", updatedAt: "end" },
+    { databaseId: 2, displayTitle: "Deleted workflow", workflowName: "", number: 6, headBranch: "old", status: "completed", conclusion: "failure", startedAt: "start2", updatedAt: "end2" },
+  ]);
+});
+
+test("entity publication rejects malformed 200 and accepts an identical 200 ETag rotation", () => {
+  const path = "repos/acme/widget/actions/runs";
+  const key = entityKey("actions", path);
+  const entities = new Map([[key, { etag: '"old"', body: "[]" }]]);
+  const malformed = conditionalBatchResult([{
+    path,
+    status: 200,
+    body: "",
+    staged: [key, { etag: '"bad"', body: "" }],
+  }], "[]");
+  const unusable = pollResultTransition({
+    key: "actions",
+    previousRaw: "[]",
+    raw: malformed.raw,
+    parse: () => parseJsonOutput(malformed.raw),
+    limit: 100,
+    completedAt: 1,
+  });
+  assert.equal(unusable.kind, "unusable");
+  assert.equal(publishStagedEntities(entities, malformed.stagedEntities, unusable.kind), false);
+  assert.deepEqual(entities.get(key), { etag: '"old"', body: "[]" });
+
+  const rotated = conditionalBatchResult([{
+    path,
+    status: 200,
+    body: "[]",
+    staged: [key, { etag: '"new"', body: "[]" }],
+  }], "[]");
+  let parses = 0;
+  const unchanged = pollResultTransition({
+    key: "actions",
+    previousRaw: "[]",
+    raw: rotated.raw,
+    parse: () => { parses += 1; return []; },
+    limit: 100,
+    completedAt: 2,
+  });
+  assert.equal(unchanged.kind, "unchanged");
+  assert.equal(parses, 0);
+  assert.equal(publishStagedEntities(entities, rotated.stagedEntities, unchanged.kind), true);
+  assert.deepEqual(entities.get(key), { etag: '"new"', body: "[]" });
 });
 
 test("coordination notices translate raw reasons without exposing internal vocabulary", () => {
@@ -2611,6 +2737,14 @@ test("tab and auxiliary operation costs have one explicit registry", () => {
   assert.equal(tabRequestCost("unknown"), null);
   assert.equal(operationCost("__proto__"), null);
   assert.deepEqual(operationCost("tab:security"), { core: 6, graphql: 0 });
+  for (const operation of [
+    "tab:actions-runs",
+    "tab:actions-workflows",
+    "doctor:actions-runs",
+    "doctor:actions-workflows",
+  ]) {
+    assert.deepEqual(operationCost(operation), { core: 1, graphql: 0 }, operation);
+  }
   assert.deepEqual(operationCost("failure-context:repository"), { core: 0, graphql: 1 });
   assert.deepEqual(operationCost("open:actions"), { core: 2, graphql: 0 });
   assert.deepEqual(operationCost("open:issues"), { core: 0, graphql: 2 });
@@ -2631,7 +2765,7 @@ test("every production runGh call site declares a registry operation", () => {
   assert.ok(calls.length > 0);
   for (const { index } of calls) {
     const declaration = lines.slice(index, index + 5).join("\n");
-    assert.match(declaration, /operation(?::|\s*})/);
+    assert.match(declaration, /operation(?::|\s*[,}])/);
     const literal = /operation:\s*"([^"]+)"/.exec(declaration)?.[1];
     if (literal) assert.notEqual(operationCost(literal), null, literal);
     if (declaration.includes("`open:${tabKey}`")) {
@@ -2644,7 +2778,8 @@ test("every production runGh call site declares a registry operation", () => {
     "version",
     "auth-status",
     "doctor:repository",
-    "doctor:actions",
+    "doctor:actions-runs",
+    "doctor:actions-workflows",
     "doctor:issues",
     "doctor:prs",
     "doctor:security-endpoint",

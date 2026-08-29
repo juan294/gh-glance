@@ -648,6 +648,78 @@ async function runGh(args, { signal, operation } = {}) {
   }
 }
 
+function parseGhApiResponse(stdout) {
+  const text = typeof stdout === "string" ? stdout : String(stdout ?? "");
+  const separator = /\r?\n\r?\n/.exec(text);
+  const prefix = separator ? text.slice(0, separator.index) : text;
+  const body = separator ? text.slice(separator.index + separator[0].length) : "";
+  const lines = prefix.split(/\r?\n/);
+  const statusMatch = /^HTTP\/\d(?:\.\d+)?\s+(\d{3})(?:\s|$)/i.exec(lines[0] ?? "");
+  const headers = {};
+  for (const line of lines.slice(1)) {
+    const colon = line.indexOf(":");
+    if (colon <= 0) continue;
+    const name = line.slice(0, colon).trim().toLowerCase();
+    if (name) headers[name] = line.slice(colon + 1).trim();
+  }
+  return {
+    status: statusMatch ? Number(statusMatch[1]) : null,
+    headers,
+    body,
+  };
+}
+
+function pickRateLimit(headers) {
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) return null;
+  const integer = (name) => {
+    const value = Number(headers[name]);
+    return Number.isSafeInteger(value) && value >= 0 ? value : null;
+  };
+  const resource = typeof headers["x-ratelimit-resource"] === "string"
+    ? headers["x-ratelimit-resource"].trim().toLowerCase()
+    : "";
+  const limit = integer("x-ratelimit-limit");
+  const used = integer("x-ratelimit-used");
+  const remaining = integer("x-ratelimit-remaining");
+  const reset = integer("x-ratelimit-reset");
+  if (!RATE_RESOURCES.includes(resource) || [limit, used, remaining, reset].includes(null)) return null;
+  return { resource, limit, used, remaining, resetMs: reset * 1000 };
+}
+
+function ghApiArgs(args, etag = null) {
+  return [
+    "api",
+    "-i",
+    ...args,
+    ...(typeof etag === "string" && etag.length > 0 ? ["-H", `If-None-Match: ${etag}`] : []),
+  ];
+}
+
+async function ghApi(args, { operation, signal, etag = null, run = runGh } = {}) {
+  const argv = ghApiArgs(args, etag);
+  try {
+    const parsed = parseGhApiResponse(await run(argv, { operation, signal }));
+    return {
+      status: parsed.status,
+      etag: parsed.headers.etag ?? null,
+      rateLimit: pickRateLimit(parsed.headers),
+      body: parsed.body,
+    };
+  } catch (error) {
+    const parsed = parseGhApiResponse(error?.stdout);
+    if (parsed.status === 304) {
+      return {
+        status: 304,
+        etag: parsed.headers.etag ?? null,
+        rateLimit: pickRateLimit(parsed.headers),
+        body: "",
+      };
+    }
+    if (parsed.status !== null) error.apiResponse = parsed;
+    throw error;
+  }
+}
+
 // The target as `gh` spells it: host-qualified when a host was given, the bare
 // slug otherwise -- which is exactly the [HOST/]OWNER/REPO form `gh --repo`
 // documents.
@@ -896,40 +968,146 @@ function createFailureContextCoordinator({ resolve, commit, fallback }) {
   return { ensure, invalidate };
 }
 
-function actionsArgs(limit) {
+function actionsRunsArgs(limit) {
   return [
-    "run",
-    "list",
-    ...repoArgs(),
-    "--limit",
-    String(limit),
-    "--json",
-    "databaseId,displayTitle,workflowName,number,headBranch,status,conclusion,startedAt,updatedAt",
+    apiPath(`repos/{owner}/{repo}/actions/runs?exclude_pull_requests=true&per_page=${limit}`),
+    ...apiHostArgs(),
+    "--jq",
+    "[.workflow_runs[] | {databaseId: .id, displayTitle: .display_title, number: .run_number, headBranch: .head_branch, status, conclusion, startedAt: .run_started_at, updatedAt: .updated_at, workflowId: .workflow_id}]",
   ];
 }
 
-async function fetchActions(limit, signal) {
-  const raw = await runGh(actionsArgs(limit), { signal, operation: "tab:actions" });
+function actionsWorkflowsArgs() {
+  return [
+    apiPath("repos/{owner}/{repo}/actions/workflows?page=1&per_page=100"),
+    ...apiHostArgs(),
+    "--jq",
+    "[.workflows[] | {id, name}]",
+  ];
+}
+
+function parseActionsBodies(runsBody, workflowsBody) {
+  const workflows = new Map(parseJsonOutput(workflowsBody).map((workflow) => [
+    workflow.id,
+    safe(workflow.name),
+  ]));
+  return parseJsonOutput(runsBody).map((run) => ({
+    databaseId: run.databaseId,
+    displayTitle: safe(run.displayTitle),
+    workflowName: workflows.get(run.workflowId) ?? "",
+    number: run.number,
+    headBranch: safe(run.headBranch),
+    status: run.status,
+    conclusion: run.conclusion,
+    startedAt: run.startedAt,
+    updatedAt: run.updatedAt,
+  }));
+}
+
+function entityKey(tab, path) {
+  return `${tab}\0${path}`;
+}
+
+function cachedEntity(entities, tab, path) {
+  const value = entities instanceof Map ? entities.get(entityKey(tab, path)) : null;
+  return typeof value?.etag === "string" && typeof value?.body === "string" ? value : null;
+}
+
+async function fetchConditionalEntity({
+  tab,
+  args,
+  operation,
+  signal,
+  force,
+  entities,
+  request = ghApi,
+}) {
+  const path = args[0];
+  const cached = cachedEntity(entities, tab, path);
+  const response = await request(args, {
+    operation,
+    signal,
+    etag: force ? null : cached?.etag ?? null,
+  });
+  if (response.status === 304) {
+    return { path, status: 304, body: cached?.body ?? null, staged: null };
+  }
   return {
-    raw,
+    path,
+    status: response.status,
+    body: response.body,
+    staged: response.status === 200
+      ? [entityKey(tab, path), typeof response.etag === "string"
+          ? { etag: response.etag, body: response.body }
+          : null]
+      : null,
+  };
+}
+
+function conditionalBatchResult(responses, previousRaw, joinedRaw = null) {
+  const list = Array.isArray(responses) ? responses : [];
+  let allNotModified = list.length > 0;
+  let restSpent = 0;
+  let stagedEntities = null;
+  for (const response of list) {
+    if (response?.status !== 304 || typeof response.body !== "string") allNotModified = false;
+    if (response?.status === 200) restSpent += 1;
+    if (!response?.staged) continue;
+    stagedEntities ??= new Map();
+    stagedEntities.set(...response.staged);
+  }
+  return {
+    raw: allNotModified
+      ? previousRaw
+      : joinedRaw ?? list.map((response) => response?.body ?? "").join("\0"),
+    allNotModified,
+    restSpent,
+    stagedEntities,
+  };
+}
+
+function publishStagedEntities(entities, staged, transitionKind) {
+  if (!(entities instanceof Map) || !(staged instanceof Map) ||
+    !["changed", "unchanged"].includes(transitionKind)) return false;
+  for (const [key, value] of staged) {
+    if (value === null) entities.delete(key);
+    else entities.set(key, value);
+  }
+  return true;
+}
+
+async function fetchActions(limit, signal, {
+  entities = new Map(),
+  force = false,
+  previousRaw = null,
+} = {}) {
+  const responses = await Promise.all([
+    fetchConditionalEntity({
+      tab: "actions",
+      args: actionsRunsArgs(limit),
+      operation: "tab:actions-runs",
+      signal,
+      force,
+      entities,
+    }),
+    fetchConditionalEntity({
+      tab: "actions",
+      args: actionsWorkflowsArgs(),
+      operation: "tab:actions-workflows",
+      signal,
+      force,
+      entities,
+    }),
+  ]);
+  const [runs, workflows] = responses;
+  const batch = conditionalBatchResult(responses, previousRaw);
+  return {
+    raw: batch.raw,
     limit,
-    // What this fetch actually cost, read from the one cost table rather than
-    // re-derived from the argv shape -- a second copy of the cost model is the
-    // drift this file warns about repeatedly.
-    restSpent: REST_PER_FETCH.actions,
+    restSpent: batch.restSpent,
     graphqlSpent: GRAPHQL_PER_FETCH.actions,
-    parse: () =>
-      parseJsonOutput(raw).map((r) => ({
-        databaseId: r.databaseId,
-        displayTitle: safe(r.displayTitle),
-        workflowName: safe(r.workflowName),
-        number: r.number,
-        headBranch: safe(r.headBranch),
-        status: r.status,
-        conclusion: r.conclusion,
-        startedAt: r.startedAt,
-        updatedAt: r.updatedAt,
-      })),
+    stagedEntities: batch.stagedEntities,
+    parse: () => parseActionsBodies(runs.body ?? "", workflows.body ?? ""),
   };
 }
 
@@ -1110,6 +1288,8 @@ function tabRequestCost(tab) {
 // individual calls covered by the tab's six-call upfront reservation.
 const OPERATION_COSTS = Object.freeze({
   ...Object.fromEntries(TAB_KEYS.map((tab) => [`tab:${tab}`, tabRequestCost(tab)])),
+  "tab:actions-runs": { core: 1, graphql: 0 },
+  "tab:actions-workflows": { core: 1, graphql: 0 },
   "tab:security-endpoint": { core: 1, graphql: 0 },
   "failure-context:repository": { core: 0, graphql: 1 },
   "failure-context:auth": { core: 0, graphql: 0 },
@@ -1117,7 +1297,8 @@ const OPERATION_COSTS = Object.freeze({
   "open:issues": { core: 0, graphql: GRAPHQL_PER_FETCH.issues },
   "open:prs": { core: 0, graphql: GRAPHQL_PER_FETCH.prs },
   "doctor:repository": { core: 0, graphql: 1 },
-  "doctor:actions": tabRequestCost("actions"),
+  "doctor:actions-runs": { core: 1, graphql: 0 },
+  "doctor:actions-workflows": { core: 1, graphql: 0 },
   "doctor:issues": tabRequestCost("issues"),
   "doctor:prs": tabRequestCost("prs"),
   "doctor:security-endpoint": { core: 1, graphql: 0 },
@@ -2728,7 +2909,7 @@ function resourcePerTick(table, activeKey) {
 }
 
 function alertArgs(source, path = source.path) {
-  return ["api", apiPath(path), ...apiHostArgs(), "--jq", source.jq];
+  return [apiPath(path), ...apiHostArgs(), "--jq", source.jq];
 }
 
 function alertRequestArgs(source) {
@@ -2803,7 +2984,11 @@ function clearForcedBackoffAfterStart(key, force, status, clear = clearBackoff) 
   return true;
 }
 
-async function fetchAlertSource(source, signal, now) {
+async function fetchAlertSource(source, signal, now, {
+  entities,
+  force = false,
+  request = fetchConditionalEntity,
+} = {}) {
   if (backoffActive(source.key, now)) {
     const { note, verdict } = alertBackoff.get(source.key);
     // The verdict is replayed alongside the note. Replaying only the note left
@@ -2815,6 +3000,8 @@ async function fetchAlertSource(source, signal, now) {
       raw: `backoff:${note}`,
       completedCalls: 0,
       verdict,
+      allNotModified: false,
+      stagedEntities: new Map(),
       parse: () => ({ alerts: [], note, verdict, truncated: false }),
     };
   }
@@ -2823,19 +3010,37 @@ async function fetchAlertSource(source, signal, now) {
     const requests = alertRequestArgs(source);
     const payloads = [];
     const groups = [];
+    const responses = [];
     for (const [index, args] of requests.entries()) {
       if (index > 0 && !shouldFetchAlertPriorityLanes(groups[0]?.length ?? 0)) break;
-      completedCalls += 1;
-      const payload = await runGh(args, { signal, operation: "tab:security-endpoint" });
-      payloads.push(payload);
-      groups.push(parseJsonOutput(payload).filter((alert) => alert.state === "open"));
+      let response = null;
+      try {
+        response = await request({
+          tab: "security",
+          args,
+          operation: "tab:security-endpoint",
+          signal,
+          force,
+          entities,
+        });
+        if (response.status === 200) completedCalls += 1;
+        responses.push(response);
+        payloads.push(response.body ?? "");
+        groups.push(parseJsonOutput(response.body ?? "").filter((alert) => alert.state === "open"));
+      } catch (error) {
+        if (response === null) completedCalls += 1;
+        throw error;
+      }
     }
     const raw = payloads.join("\0");
     clearBackoff(source.key);
+    const batch = conditionalBatchResult(responses, raw, raw);
     return {
       raw,
       completedCalls,
       verdict: "ok",
+      allNotModified: batch.allNotModified,
+      stagedEntities: batch.stagedEntities,
       parse: () => {
         const rows = mergeAlertRows(groups);
         return {
@@ -2857,6 +3062,8 @@ async function fetchAlertSource(source, signal, now) {
         raw: "unusable-output",
         completedCalls,
         verdict,
+        allNotModified: false,
+        stagedEntities: new Map(),
         parse: () => ({
           alerts: [],
           note: null,
@@ -2878,6 +3085,8 @@ async function fetchAlertSource(source, signal, now) {
       // whether it returned data, `[]`, or a 403.
       completedCalls,
       verdict,
+      allNotModified: false,
+      stagedEntities: new Map(),
       parse: () => ({ alerts: [], note, verdict, truncated: false }),
     };
   }
@@ -2895,7 +3104,11 @@ function severityRank(severity) {
   return Object.hasOwn(SEVERITY_RANK, severity) ? SEVERITY_RANK[severity] : SEVERITY_RANK.unknown;
 }
 
-async function fetchSecurity(signal) {
+async function fetchSecurity(signal, {
+  entities = new Map(),
+  force = false,
+  previousRaw = null,
+} = {}) {
   // Monotonic, not wall-clock. These deadlines measure *elapsed* time, and
   // Date.now() can jump: a laptop resume or an NTP correction stepping the clock
   // backwards would hold an alert source in backoff for up to an hour of apparent
@@ -2904,12 +3117,15 @@ async function fetchSecurity(signal) {
   // for the mirror-image reason: a sleep gap is the thing it reports, and
   // performance.now() does not advance across suspend.
   const now = performance.now();
-  const parts = await Promise.all(ALERT_SOURCES.map((s) => fetchAlertSource(s, signal, now)));
+  const parts = await Promise.all(ALERT_SOURCES.map((source) =>
+    fetchAlertSource(source, signal, now, { entities, force })));
+  const allNotModified = parts.length > 0 && parts.every((part) => part.allNotModified);
+  const stagedEntities = new Map(parts.flatMap((part) => [...part.stagedEntities]));
   return {
     // Joined with a NUL so a change in any one of the three shows up as a
     // change in the combined payload, without risk of two different splits
     // colliding on the same string.
-    raw: parts.map((p) => p.raw).join("\0"),
+    raw: allNotModified ? previousRaw : parts.map((p) => p.raw).join("\0"),
     limit: ALERT_PER_PAGE,
     // Summed from what each source reported rather than assumed to be
     // ALERT_SOURCES.length: a source held off by backoff spawned nothing and
@@ -2918,6 +3134,7 @@ async function fetchSecurity(signal) {
     graphqlSpent: 0,
     measuredSuccess: parts.every((part) => part.verdict === "ok"),
     rateLimited: parts.some((part) => part.verdict === "rate-limited"),
+    stagedEntities,
     parse: () => {
       if (parts.some((part) => part.verdict === "unusable-output")) return { unusable: true };
       const parsed = parts.map((p) => p.parse());
@@ -3339,13 +3556,14 @@ function projectedHourlyCost(activeKey) {
 function doctorProbePlan() {
   return [
     ["Repository access", repoContextArgs(), "doctor:repository"],
-    ["Actions (run list)", actionsArgs(MIN_RUN_LIMIT), "doctor:actions"],
+    ["Actions runs", ghApiArgs(actionsRunsArgs(MIN_RUN_LIMIT)), "doctor:actions-runs"],
+    ["Actions workflows", ghApiArgs(actionsWorkflowsArgs()), "doctor:actions-workflows"],
     ["Issues (issue list)", issuesArgs(), "doctor:issues"],
     ["Pull requests (pr list)", prsArgs(), "doctor:prs"],
     ...ALERT_SOURCES.flatMap((source) =>
       alertRequestArgs(source).map((args, index) => [
         index === 0 ? source.name : `${source.name} (priority ${index})`,
-        args,
+        ghApiArgs(args),
         "doctor:security-endpoint",
       ]),
     ),
@@ -4569,7 +4787,7 @@ const MemoSecurityRow = React.memo(SecurityRow);
 const TABS = [
   {
     key: "actions",
-    fetch: ({ signal, runLimit }) => fetchActions(runLimit, signal),
+    fetch: ({ signal, runLimit, ...options }) => fetchActions(runLimit, signal, options),
     label: "Actions",
     short: "Actions",
     header: ACTIONS_HEADER,
@@ -4599,7 +4817,7 @@ const TABS = [
   },
   {
     key: "security",
-    fetch: ({ signal }) => fetchSecurity(signal),
+    fetch: ({ signal, ...options }) => fetchSecurity(signal, options),
     label: "Security",
     short: "Security",
     header: SECURITY_HEADER,
@@ -6559,6 +6777,7 @@ function App({ onCreateRemote = () => {} } = {}) {
   const inFlightRef = useRef({});
   const admittedCadenceRef = useRef({});
   const rawRef = useRef({});
+  const entityRef = useRef(new Map());
   // Last *successful* poll per tab, wall-clock. Wall-clock on purpose: a laptop
   // sleeping is exactly the gap this is meant to report, and a monotonic clock
   // does not advance across suspend. Never written on the failure path, or a
@@ -7163,7 +7382,7 @@ function App({ onCreateRemote = () => {} } = {}) {
             }], blockAt);
           }
           if (cancelled) return;
-          const { raw, parse, limit } = result;
+          const { raw, parse, limit, stagedEntities } = result;
           // Identical payload: skip the parse *and* the state update. Returning
           // the same state object makes React bail out of the re-render, so an
           // idle repo stops redrawing the pane entirely.
@@ -7202,6 +7421,7 @@ function App({ onCreateRemote = () => {} } = {}) {
                 force,
               });
           }
+          publishStagedEntities(entityRef.current, stagedEntities, transition.kind);
           if (transition.kind === "unchanged") {
             lastOkRef.current[key] = completedAt;
             // Clear on the first success or a single failure latches the ladder.
@@ -7594,7 +7814,13 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (force) coordinator.invalidate();
       return commit(
         key,
-        () => descriptor.fetch({ signal, runLimit: runLimitRef.current }),
+        () => descriptor.fetch({
+          signal,
+          runLimit: runLimitRef.current,
+          entities: entityRef.current,
+          force,
+          previousRaw: rawRef.current[key] ?? null,
+        }),
         {
           force,
           scope: currentScope,
@@ -7664,7 +7890,13 @@ function App({ onCreateRemote = () => {} } = {}) {
         const descriptor = tabForKey(key);
         void commit(
           key,
-          () => descriptor.fetch({ signal: controller.signal, runLimit: runLimitRef.current }),
+          () => descriptor.fetch({
+            signal: controller.signal,
+            runLimit: runLimitRef.current,
+            entities: entityRef.current,
+            force: item.force,
+            previousRaw: rawRef.current[key] ?? null,
+          }),
           {
             force: item.force,
             scope: currentScope,
@@ -8649,6 +8881,18 @@ export {
   redact,
   classify,
   parseJsonOutput,
+  parseGhApiResponse,
+  pickRateLimit,
+  ghApiArgs,
+  ghApi,
+  actionsRunsArgs,
+  actionsWorkflowsArgs,
+  parseActionsBodies,
+  entityKey,
+  fetchConditionalEntity,
+  conditionalBatchResult,
+  publishStagedEntities,
+  fetchAlertSource,
   formatAge,
   formatDuration,
   usableSize,

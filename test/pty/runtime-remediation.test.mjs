@@ -155,7 +155,10 @@ const insertedAbove = withCounterCapture("gh-glance-run-sequence-", 0, (counter)
       waitForFirstList + "printf 'j'; sleep .2; printf 'j'; sleep .2; printf 'j'; " +
       "sleep .2; printf 'j'; sleep 1; printf 'r'; " + waitForExpandedList +
       "printf '\\r'; sleep 1; printf 'q'; sleep 2",
-    env: { GH_GLANCE_FIXTURE_RUN_SEQUENCE_FILE: counter },
+    env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+      GH_GLANCE_FIXTURE_RUN_SEQUENCE_FILE: counter,
+    },
   });
 });
 
@@ -290,7 +293,7 @@ test("manual Security refresh bypasses a source auth backoff", () => {
 
 test("Ink screen-reader rendering has a linear content smoke test", () => {
   const plain = strip(screenReader.raw);
-  assert.ok(screenReader.fixtureCalls.some((call) => call.startsWith("run list")));
+  assert.ok(screenReader.fixtureCalls.some((call) => call.includes("/actions/runs?")));
   assert.match(plain, /success ci: pin actions to commit SHAs/);
   assert.equal(screenReader.exitCode, 143);
 });
@@ -322,7 +325,7 @@ test("a narrow auth failure starts with the recovery action", () => {
 });
 
 test("a cache-hydrated adapted check is static and settles before routine polls", () => {
-  const runCalls = automaticPoll.fixtureCalls.filter((call) => call.startsWith("run list"));
+  const runCalls = automaticPoll.fixtureCalls.filter((call) => call.includes("/actions/runs?"));
   assert.ok(runCalls.length >= 2, `expected automatic polls, saw ${runCalls.length}`);
   const firstData = automaticPoll.raw.indexOf("ci: pin actions");
   assert.ok(firstData >= 0, "expected the first successful Actions frame");

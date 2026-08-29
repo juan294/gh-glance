@@ -204,3 +204,21 @@ resource identity.** The store must be keyed by path.
 
 Feeding the captured `rateLimit` into the governor --- that is Phase 5. Issues
 and PRs (GraphQL, no ETag).
+
+## Completion
+
+- [x] The fixture gate passed 2/2 before production argv changed; API path and
+  header parsing is position-independent, 200 responses spend, 304 responses
+  are free, and the `rate_limit` probe is unchanged.
+- [x] Actions uses two exact one-unit API operations under its two-unit tab
+  reservation, with matching doctor operations and field-compatible joining.
+- [x] Actions and Security stage path-keyed ETag/body pairs, publish them only
+  after accepted observations, reuse cached 304 bodies, and omit validators on
+  forced refresh.
+- [x] Quiet, changed, forced, malformed, identical-200 rotation, and Security
+  cached-primary behavior have direct automated coverage. Phase 5 response
+  observations remain unconsumed.
+- [x] Lint, 279 unit/runtime tests, syntax, all 94 PTY cases in isolated
+  sequential module runs, and diff checks pass. The aggregate-only PTY timeout
+  and exact EOF replay deviation are recorded without weakening assertions or
+  increasing timeouts.

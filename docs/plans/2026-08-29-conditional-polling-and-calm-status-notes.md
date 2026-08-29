@@ -53,3 +53,24 @@
   87 PTY cases have a passing module run for the Phase 3 candidate.
 - **Why:** This is the same aggregate local PTY process-pressure behavior from
   Phases 1 and 2, not a repeated product failure in an isolated module.
+
+### Phase 4 PTY EOF replay
+
+- **Plan said:** Keep the exact guard-row and frame-height assertions while the
+  conditional-request PTYs extend the serialized suite.
+- **Found:** In the longer full run, BSD `script` echoed its synthetic EOF as
+  the exact sequence `^D\b\b`. Terminal replay treated those driver bytes as an
+  application row. The same suite pressure also exposed one pre-existing
+  remediation wait that polled buffered capture output without enabling live
+  flushing. After that harness correction, the aggregate command still reached
+  the unchanged `spawnSync` timeout in the same top-level remediation capture;
+  the complete module passed in isolation.
+- **Chose:** Remove only `^D\b\b` from terminal replay. Keep raw capture intact,
+  preserve ordinary printable `^D`, keep both geometry assertions exact, and
+  enable the harness's existing live-flush mode for the output-driven wait. Run
+  every PTY module sequentially in its own Node process; all 94 cases passed.
+- **Why:** The replay now models the application screen instead of the PTY
+  driver's EOF echo. A capture regression distinguishes the two sequences, and
+  module isolation verifies the full product contract without weaker
+  assertions or longer timeouts. The aggregate-only failure matches the local
+  PTY process-pressure behavior recorded in Phases 1 through 3.

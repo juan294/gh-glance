@@ -57,6 +57,10 @@ const dataStarts = (state) => state.events.filter((event) =>
     event.argv[0] === "api" && event.argv[1] !== "rate_limit"
   ),
 );
+const actionsRuns = (state) => dataStarts(state)
+  .filter((event) => event.argv.some((argument) => argument.includes("/actions/runs?")));
+const actionsCalls = (state) => dataStarts(state)
+  .filter((event) => event.argv.some((argument) => argument.includes("/actions/")));
 
 function capturePanes(count, box, panePrefix, options = {}) {
   return Promise.all(Array.from({ length: count }, (_, index) => captureAsync({
@@ -193,7 +197,7 @@ test("a held core resource leaves both GraphQL tabs usable", async (t) => {
     env: { GH_GLANCE_FIXTURE_STATE: box.statePath, GH_GLANCE_FIXTURE_PANE: tab },
   })));
   const state = box.read();
-  assert.equal(starts(state, "run").length, 0);
+  assert.equal(actionsCalls(state).length, 0);
   assert.ok(starts(state, "issue").length >= 1, "Issues did not progress");
   assert.ok(starts(state, "pr").length >= 1, "pull requests did not progress");
 });
@@ -251,7 +255,7 @@ test("a real reset gets one fresh probe then one phased active request per pane"
   const progress = Number.isFinite(laneInterval)
     ? await observeUntil(
       box.read,
-      (state) => new Set(starts(state, "run").map((event) => event.pane)).size >= 3,
+      (state) => new Set(actionsRuns(state).map((event) => event.pane)).size >= 3,
       progressDeadline,
     )
     : null;
@@ -264,7 +268,7 @@ test("a real reset gets one fresh probe then one phased active request per pane"
 
   const state = box.read();
   const probes = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
-  const runs = starts(state, "run").sort((left, right) => left.at - right.at);
+  const runs = actionsRuns(state).sort((left, right) => left.at - right.at);
   const schedulingTolerance = laneInterval * 0.15;
   t.diagnostic(`reset publication ${publishedCore?.observedAt}; ` +
     `slots ${plannedReservations.map(({ notBefore }) => notBefore).join(",")}; ` +
@@ -276,9 +280,9 @@ test("a real reset gets one fresh probe then one phased active request per pane"
   assert.ok(probes.length >= 2, `expected reset probe, got ${probes.length}`);
   assert.equal(runs.length, 3, `expected one active request per pane, got ${runs.length}`);
   assert.equal(new Set(runs.map((event) => event.pane)).size, 3);
-  assert.equal(dataStarts(state).length, runs.length, "background work joined the reset phase");
+  assert.equal(dataStarts(state).length, runs.length * 2, "background work joined the reset phase");
   assert.ok(probes[1].at <= runs[0].at, "data raced the reset publication");
-  assert.equal(state.maxDataConcurrency, 1, "reset data requests overlapped");
+  assert.equal(state.maxDataConcurrency, 1, "governed Actions batches overlapped");
   assert.equal(plannedReservations.length, 3, "reset reservations were not retained before teardown");
   for (let index = 1; index < plannedReservations.length; index += 1) {
     assert.ok(
@@ -351,7 +355,7 @@ test("twelve panes share probe ownership and start bounded phased work", async (
   const progress = publication && registeredGovernor
     ? await observeUntil(
       box.read,
-      (state) => new Set(starts(state, "run").map((event) => event.pane)).size >= 2,
+      (state) => new Set(actionsRuns(state).map((event) => event.pane)).size >= 2,
       progressHorizonAt,
     )
     : null;
@@ -363,13 +367,13 @@ test("twelve panes share probe ownership and start bounded phased work", async (
   const state = box.read();
   const governor = box.readGovernor();
   const probes = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
-  const runs = starts(state, "run").sort((left, right) => left.at - right.at);
+  const runs = actionsRuns(state).sort((left, right) => left.at - right.at);
   t.diagnostic(JSON.stringify({
     publicationAt,
     progressHorizonAt,
     laneInterval,
     progressObserved: Boolean(progress?.matched && new Set(
-      starts(progress.value, "run").map((event) => event.pane),
+      actionsRuns(progress.value).map((event) => event.pane),
     ).size >= 2),
     preReleaseActive: preReleaseState.active,
     preReleaseEvents: preReleaseState.events,
@@ -392,7 +396,8 @@ test("twelve panes share probe ownership and start bounded phased work", async (
   assert.ok(probes.length >= 1 && probes.length <= 2, `shared probes: ${probes.length}`);
   assert.ok(runs.length >= 2, "fewer than two panes progressed within the policy horizon");
   assert.ok(new Set(runs.map((event) => event.pane)).size > 1, "round-robin made no progress");
-  assert.equal(state.maxDataConcurrency, 1, `data requests overlapped: ${state.maxDataConcurrency}`);
+  assert.equal(state.maxDataConcurrency, 1,
+    `governed Actions batches overlapped: ${state.maxDataConcurrency}`);
   for (let index = 1; index < runs.length; index += 1) {
     assert.ok(
       runs[index].at - runs[index - 1].at >= laneInterval - 250,
@@ -482,7 +487,7 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
     },
     delayMs: 40,
     failure: {
-      selector: "run",
+      selector: "actions",
       remaining: 1,
       message: "HTTP 403: API rate limit exceeded",
     },

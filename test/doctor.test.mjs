@@ -118,7 +118,7 @@ test("--doctor exits 0 through a pipe and prints a complete report", async () =>
   assert.match(out, /Endpoint probes/);
   assert.match(out, /^ {2}Repository access$/m);
   // One block per diagnostic request, including the bounded Security priority lanes.
-  assert.equal(out.match(/^ {2}classified {2}/gm)?.length, 10, out);
+  assert.equal(out.match(/^ {2}classified {2}/gm)?.length, 11, out);
 });
 
 test("--doctor reports governor health without a raw scope identifier", async (t) => {
@@ -189,7 +189,7 @@ test("--doctor spends nothing when the free budget probe fails", async () => {
   const message = "HTTP 403: Resource protected by organization SAML enforcement";
   const out = await doctor({ env: { GH_GLANCE_FIXTURE_FAIL: message } });
   assert.match(out, /^REST core {9}unavailable$/m);
-  assert.equal(out.match(/^ {2}classified {2}skipped$/gm)?.length, 10, out);
+  assert.equal(out.match(/^ {2}classified {2}skipped$/gm)?.length, 11, out);
 });
 
 test("--doctor skips a REST diagnostic whose paced slot is still in the future", async () => {
@@ -225,8 +225,10 @@ test("--doctor reports paced repository access separately", async () => {
     assert.ok(repositoryBlock.includes(message), repositoryBlock);
   }
 
-  const actions = probeBlock(out, "Actions (run list)");
-  assert.match(actions, /^ {2}classified {2}(?:skipped|ok)$/m, actions);
+  for (const name of ["Actions runs", "Actions workflows"]) {
+    const actions = probeBlock(out, name);
+    assert.match(actions, /^ {2}classified {2}(?:skipped|ok)$/m, actions);
+  }
   for (const name of ["Issues (issue list)", "Pull requests (pr list)"]) {
     const block = probeBlock(out, name);
     assert.match(block, /^ {2}classified {2}skipped$/m, block);
@@ -243,7 +245,7 @@ test("--doctor reports the host-qualified target it was given", async () => {
   );
   // The D2 guard, stated in the report: the host travels as --hostname and
   // never as path text.
-  assert.match(out, /argv {8}gh api repos\/acme\/widget\/.*--hostname tenant\.ghe\.com/);
+  assert.match(out, /argv {8}gh api -i repos\/acme\/widget\/.*--hostname tenant\.ghe\.com/);
   assert.ok(!out.includes("repos/tenant.ghe.com/"), out);
 });
 

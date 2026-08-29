@@ -59,6 +59,8 @@ const dataStarts = (state, pane = null) => state.events.filter((event) =>
     ["run", "issue", "pr"].includes(event.argv[0]) ||
     event.argv[0] === "api" && event.argv[1] !== "rate_limit"
   ));
+const actionsRuns = (state, pane = null) => dataStarts(state, pane)
+  .filter((event) => event.argv.some((argument) => argument.includes("/actions/runs?")));
 
 const statusLine = (result) => result.finalFrame.lines.find(isStatusLine);
 const translatedCoordinationNotice =
@@ -154,7 +156,7 @@ test("ASCII profile keeps the same status label and a width-one marker", (t) => 
 });
 
 test("delayed admitted startup animates Checking and settles to Watching", (t) => {
-  const box = sharedFixture(t, { delayByCommand: { run: 1_200 } });
+  const box = sharedFixture(t, { delayByCommand: { actions: 1_200 } });
   const result = capture({
     cols: 80,
     rows: 24,
@@ -175,7 +177,7 @@ test("a future adapted check stays still, shows next, and then settles", (t) => 
   const now = Date.now();
   const box = sharedFixture(t, {
     core: { limit: 5000, used: 3900, remaining: 1100, resetMs: now + 120_000 },
-    delayByCommand: { run: 1_200 },
+    delayByCommand: { actions: 1_200 },
   });
   capture({
     cols: 80,
@@ -258,7 +260,7 @@ test("manual refresh waits without motion and animates only after admission", (t
   const now = Date.now();
   const box = sharedFixture(t, {
     core: { limit: 5000, used: 3900, remaining: 1100, resetMs: now + 120_000 },
-    delayByCommand: { run: 3_000 },
+    delayByCommand: { actions: 3_000 },
   });
   capture({
     cols: 80,
@@ -309,7 +311,7 @@ test("manual refresh waits without motion and animates only after admission", (t
     new Set(checking.map(({ line }) => [...line][0])).size > 1,
     `manual Checking did not animate: ${statuses.join(" -> ")}`,
   );
-  assert.equal(dataStarts(box.read(), "manual").filter((event) => event.argv[0] === "run").length, 1);
+  assert.equal(actionsRuns(box.read(), "manual").length, 1);
 });
 
 test("a held core tab stays Paused while a selected GraphQL tab progresses", (t) => {
@@ -348,7 +350,7 @@ test("a held core tab stays Paused while a selected GraphQL tab progresses", (t)
   assert.ok(firstPaused >= 0, statuses.join(" -> "));
   assert.ok(independent > firstPaused, statuses.join(" -> "));
   assert.ok(finalPaused > independent, statuses.join(" -> "));
-  assert.equal(dataStarts(box.read(), "switch").filter((event) => event.argv[0] === "run").length, 0);
+  assert.equal(actionsRuns(box.read(), "switch").length, 0);
   assert.ok(dataStarts(box.read(), "switch").some((event) => event.argv[0] === "issue"));
 });
 
@@ -549,7 +551,7 @@ test("linear screen-reader polling omits adapted Checking but retains manual Che
   const now = Date.now();
   const box = sharedFixture(t, {
     core: { limit: 5000, used: 3900, remaining: 1100, resetMs: now + 120_000 },
-    delayByCommand: { run: 1_200 },
+    delayByCommand: { actions: 1_200 },
   });
   capture({
     cols: 80,
@@ -582,7 +584,7 @@ test("linear screen-reader polling omits adapted Checking but retains manual Che
       INK_SCREEN_READER: "true",
     },
   });
-  assert.ok(reader.fixtureCalls.filter((call) => call.startsWith("run list")).length >= 1);
+  assert.ok(reader.fixtureCalls.filter((call) => call.includes("/actions/runs?")).length >= 1);
   assert.doesNotMatch(reader.raw, /\bWaiting\b/);
   assert.match(reader.raw, /Watching next (?:<1m|\d+m)/);
   assert.match(reader.raw, /Watching/);
@@ -604,7 +606,7 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
   assert.match(setup.raw, /Setup/);
   assert.match(setup.raw, /No GitHub remote found/);
 
-  const startupBox = sharedFixture(t, { delayByCommand: { run: 1_200 } });
+  const startupBox = sharedFixture(t, { delayByCommand: { actions: 1_200 } });
   const startup = capture({
     cols: 80,
     rows: 24,
@@ -705,7 +707,7 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
     env: {
       INK_SCREEN_READER: "true",
       GH_GLANCE_FIXTURE_FAIL: "HTTP 403: API rate limit exceeded",
-      GH_GLANCE_FIXTURE_FAIL_ON: "run",
+      GH_GLANCE_FIXTURE_FAIL_ON: "actions",
     },
   });
   assert.match(staleError.raw, /ci: pin actions to commit/);

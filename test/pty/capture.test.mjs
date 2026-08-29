@@ -98,6 +98,20 @@ test("terminal replay retains transient status accumulation evidence", () => {
   assert.deepEqual(parsed.liveScreen.statusHistory, ["· Watching next 2m", "⣾ Checking new", "· Watching"]);
 });
 
+test("terminal replay drops only the PTY EOF echo and preserves printable caret-D text", () => {
+  const raw =
+    ALT_ENTER +
+    SYNC_START +
+    "[1:Actions]\r\nprintable ^D\r\n· Watching\r\n^D\b\b" +
+    SYNC_END +
+    ALT_EXIT;
+
+  const parsed = parseCapture(raw, { cols: 24, rows: 5 });
+
+  assert.deepEqual(parsed.finalFrame.lines, ["[1:Actions]", "printable ^D", "· Watching"]);
+  assert.equal(parsed.liveScreen.lines.at(-1), "");
+});
+
 test("capture termination reaps the full stdin producer and script trees", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "gh-glance-capture-cleanup-"));
   const out = join(root, "capture.txt");

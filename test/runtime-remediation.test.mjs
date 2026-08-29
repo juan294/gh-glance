@@ -11,6 +11,9 @@ import {
   clearForcedBackoffAfterStart,
   createOpenRequestRegistry,
   forcedBackoffKeys,
+  entityKey,
+  fetchAlertSource,
+  fetchConditionalEntity,
   formatTabErrorForWidth,
   helpLines,
   mergeAlertRows,
@@ -57,11 +60,11 @@ test("Security requests are bounded and include explicit priority lanes", () => 
   assert.ok(requests.every((args) => !args.includes("--paginate")));
   assert.ok(requests.every((args) => args.some((arg) => arg.includes("per_page=100"))));
 
-  const dependabot = requests.filter((args) => args[1].includes("dependabot"));
-  assert.ok(dependabot.some((args) => args[1].includes("severity=critical,high")));
-  const code = requests.filter((args) => args[1].includes("code-scanning"));
-  assert.ok(code.some((args) => args[1].includes("severity=critical")));
-  assert.ok(code.some((args) => args[1].includes("severity=high")));
+  const dependabot = requests.filter((args) => args[0].includes("dependabot"));
+  assert.ok(dependabot.some((args) => args[0].includes("severity=critical,high")));
+  const code = requests.filter((args) => args[0].includes("code-scanning"));
+  assert.ok(code.some((args) => args[0].includes("severity=critical")));
+  assert.ok(code.some((args) => args[0].includes("severity=high")));
 
   const rows = mergeAlertRows([
     [{ number: 1, severity: "low" }, { number: 2, severity: "high" }],
@@ -71,6 +74,46 @@ test("Security requests are bounded and include explicit priority lanes", () => 
   assert.equal(shouldFetchAlertPriorityLanes(0), false);
   assert.equal(shouldFetchAlertPriorityLanes(99), false);
   assert.equal(shouldFetchAlertPriorityLanes(100), true);
+});
+
+test("a 304 Security primary reuses its path-keyed body to decide priority work", async () => {
+  const source = {
+    key: "conditional-security-test",
+    name: "Conditional Security test",
+    path: "primary",
+    priorityQueries: ["severity=high"],
+    jq: ".",
+    unavailable: "unavailable",
+    map: (alert) => alert,
+  };
+  const primaryBody = JSON.stringify(Array.from({ length: 100 }, (_, index) => ({
+    number: index + 1,
+    state: "open",
+  })));
+  const priorityPath = "primary&severity=high";
+  const priorityBody = JSON.stringify([{ number: 101, state: "open" }]);
+  const entities = new Map([
+    [entityKey("security", source.path), { etag: '"primary"', body: primaryBody }],
+    [entityKey("security", priorityPath), { etag: '"priority"', body: priorityBody }],
+  ]);
+  const calls = [];
+  const request = (input) => fetchConditionalEntity({
+    ...input,
+    request: async (args, { etag }) => {
+      calls.push({ path: args[0], etag });
+      return { status: 304, etag, rateLimit: null, body: "" };
+    },
+  });
+
+  const result = await fetchAlertSource(source, null, performance.now(), { entities, request });
+
+  assert.deepEqual(calls, [
+    { path: source.path, etag: '"primary"' },
+    { path: priorityPath, etag: '"priority"' },
+  ]);
+  assert.equal(result.completedCalls, 0);
+  assert.equal(result.allNotModified, true);
+  assert.equal(result.parse().alerts.length, 101);
 });
 
 test("unchanged Security data uses a slower bounded cadence and force bypasses it", () => {
