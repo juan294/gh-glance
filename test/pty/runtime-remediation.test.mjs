@@ -44,6 +44,12 @@ function withCounterCapture(prefix, initial, build) {
   }
 }
 
+function quitAfterCached(tab) {
+  return 'cache="$XDG_CONFIG_HOME/gh-glance/dashboard-cache.json"; tries=0; ' +
+    `while ! grep -q '"${tab}"' "$cache" 2>/dev/null && [ $tries -lt 150 ]; do ` +
+    'tries=$((tries + 1)); sleep .1; done; sleep .3; printf q';
+}
+
 const recovered = withCounterCapture("gh-glance-recover-", 1, (counter) =>
   capture({
     cols: 80,
@@ -207,6 +213,67 @@ test("a timer-driven list failure recovers in the same process", () => {
   assert.ok(issueCalls.length >= 2, `expected a retry, saw ${issueCalls.length} issue calls`);
   assert.match(recovered.finalFrame.lines.join("\n"), /#41 SIGTERM/);
   assert.doesNotMatch(recovered.finalFrame.lines.join("\n"), /temporary network failure/i);
+});
+
+test("empty list output stays silent and retries on the next tick", () => {
+  const result = withCounterCapture("gh-glance-empty-list-", 1, (counter) =>
+    capture({
+      cols: 80,
+      rows: 24,
+      settle: 10,
+      args: "--tab issues --refresh 2",
+      env: {
+        GH_GLANCE_FIXTURE_EMPTY_FIRST_FILE: counter,
+        GH_GLANCE_FIXTURE_EMPTY_FIRST_ON: "issue",
+      },
+    }),
+  );
+  const issueCalls = result.fixtureCalls.filter((call) => call.startsWith("issue list"));
+  assert.ok(issueCalls.length >= 2, `expected an immediate retry, saw ${issueCalls.length} issue calls`);
+  assert.match(result.finalFrame.lines.join("\n"), /#41 SIGTERM/);
+  assert.doesNotMatch(result.raw, /JSON input/);
+});
+
+test("empty Security source output preserves rows and retries without an internal note", () => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-empty-security-"));
+  const counter = join(root, "empty-counter");
+  writeFileSync(counter, "1\n", "utf8");
+  try {
+    capture({
+      cols: 80,
+      rows: 24,
+      signal: "none",
+      settle: 15,
+      args: "--tab security",
+      stdin: quitAfterCached("security"),
+      configHome: root,
+      env: { GH_GLANCE_FIXTURE_SECURITY_ALERTS: "1" },
+    });
+    const result = capture({
+      cols: 80,
+      rows: 24,
+      settle: 20,
+      args: "--tab security --refresh 2",
+      configHome: root,
+      env: {
+        GH_GLANCE_FIXTURE_EMPTY_FIRST_FILE: counter,
+        GH_GLANCE_FIXTURE_EMPTY_FIRST_ON: "dependabot",
+        GH_GLANCE_FIXTURE_SECURITY_ALERTS: "1",
+      },
+    });
+    const dependabotCalls = result.fixtureCalls.filter(
+      (call) => call.startsWith("api ") && call.includes("dependabot"),
+    );
+    assert.ok(
+      dependabotCalls.length >= 2,
+      `expected an immediate Security retry, saw ${dependabotCalls.length} Dependabot calls`,
+    );
+    assert.match(result.raw, /cached dependency alert/);
+    assert.match(result.finalFrame.lines.join("\n"), /cached dependency alert/);
+    assert.doesNotMatch(result.raw, /JSON input/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("manual Security refresh bypasses a source auth backoff", () => {

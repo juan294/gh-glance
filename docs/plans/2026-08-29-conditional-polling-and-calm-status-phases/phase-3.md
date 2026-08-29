@@ -142,3 +142,16 @@ assertions are updated to the new copy.
 ## Out of scope
 
 The governor's internal reason vocabulary --- only its presentation changes.
+
+## Completion
+
+- [x] App-owned empty or truncated JSON is classified as `unusable-output`;
+  GitHub stderr remains `other`, and neither remedy nor backoff table contains
+  the transient verdict.
+- [x] List and Security transitions keep last-good rows, metadata, and
+  freshness, clear raw and visible error state, and retry on the next tick.
+- [x] Coordination notices wait 2,000 ms for one continuous condition and use
+  user-facing render-only translations while diagnostic reasons stay raw.
+- [x] Lint, 273 unit/runtime tests, syntax, all 87 isolated PTY cases, the
+  README sample check, and diff checks pass. The aggregate harness deviation is
+  recorded without weakening an assertion or timeout.

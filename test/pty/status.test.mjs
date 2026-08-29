@@ -61,6 +61,8 @@ const dataStarts = (state, pane = null) => state.events.filter((event) =>
   ));
 
 const statusLine = (result) => result.finalFrame.lines.find(isStatusLine);
+const translatedCoordinationNotice =
+  /(?:Can't coordinate API use — retrying|Coordinating with your other panes)/;
 
 test("footer layout keeps semantic status and essential actions from 80 to 24 columns", (t) => {
   for (const cols of [80, 60, 45, 24]) {
@@ -375,7 +377,7 @@ test("corrupt, live-locked, and blocked storage pause with no data calls", (t) =
   });
   writeFileSync(path, healthy, { mode: 0o600 });
   assert.match(statusLine(corrupt) ?? "", /^‖ Paused/);
-  assert.match(corrupt.finalFrame.lines.join("\n"), /API coordination unavailable/);
+  assert.match(corrupt.finalFrame.lines.join("\n"), translatedCoordinationNotice);
 
   writeFileSync(`${path}.lock`, `${JSON.stringify({ pid: process.pid, nonce: "live-test-owner" })}\n`, {
     mode: 0o600,
@@ -389,7 +391,7 @@ test("corrupt, live-locked, and blocked storage pause with no data calls", (t) =
   });
   rmSync(`${path}.lock`, { force: true });
   assert.match(statusLine(locked) ?? "", /^‖ Paused/);
-  assert.match(locked.finalFrame.lines.join("\n"), /API coordination unavailable/);
+  assert.match(locked.finalFrame.lines.join("\n"), translatedCoordinationNotice);
 
   const blocked = sharedFixture(t);
   writeFileSync(join(blocked.root, "gh-glance"), "not a directory\n", { mode: 0o600 });
@@ -401,12 +403,52 @@ test("corrupt, live-locked, and blocked storage pause with no data calls", (t) =
     env: { GH_GLANCE_FIXTURE_STATE: blocked.statePath, GH_GLANCE_FIXTURE_PANE: "blocked" },
   });
   assert.match(statusLine(unwritable) ?? "", /^‖ Paused/);
-  assert.match(unwritable.finalFrame.lines.join("\n"), /API coordination unavailable/);
+  assert.match(unwritable.finalFrame.lines.join("\n"), translatedCoordinationNotice);
   assert.equal(dataStarts(box.read()).length, before);
   assert.equal(dataStarts(blocked.read()).length, 0);
 });
 
-test("a coordination notice can appear and clear without overflowing the frame", (t) => {
+test("a sub-threshold coordination blip stays silent", (t) => {
+  const root = configRoot(t, "gh-glance-status-notice-blip-");
+  capture({
+    cols: 80,
+    rows: 12,
+    signal: "none",
+    settle: 15,
+    stdin: quitAfterCached("actions"),
+    configHome: root,
+  });
+  const noticeLock = `${governorPath(root)}.lock`;
+  const result = capture({
+    cols: 80,
+    rows: 12,
+    signal: "none",
+    settle: 25,
+    stdin:
+      waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Watching") { ok=1 }') +
+      'printf \'{"pid":%s,"nonce":"notice-blip-owner"}\\n\' "$$" > "$GH_GLANCE_NOTICE_LOCK"; ' +
+      waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Paused") { ok=1 }', 200) +
+      `watching=$(${captureCount("Watching")}); ` +
+      'rm -f "$GH_GLANCE_NOTICE_LOCK"; ' +
+      'i=0; current=$watching; while [ "$current" -le "$watching" ] && [ $i -lt 200 ]; ' +
+      `do i=$((i + 1)); sleep .1; current=$(${captureCount("Watching")}); ` +
+      'done; sleep .3; printf q',
+    configHome: root,
+    env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+      GH_GLANCE_NOTICE_LOCK: noticeLock,
+    },
+  });
+
+  assert.ok(result.liveScreen.statusHistory.some((line) => /^‖ Paused/.test(line)));
+  assert.doesNotMatch(
+    result.raw,
+    /Confirming your GitHub login|Holding until|Coordinating with your other panes|Can't coordinate/,
+  );
+  assert.match(statusLine(result) ?? "", /^· Watching/);
+});
+
+test("a sustained coordination notice can appear and clear without overflowing the frame", (t) => {
   const root = configRoot(t, "gh-glance-status-notice-transition-");
   capture({
     cols: 80,
@@ -427,7 +469,7 @@ test("a coordination notice can appear and clear without overflowing the frame",
       'printf \'{"pid":%s,"nonce":"notice-transition-owner"}\\n\' "$$" > "$GH_GLANCE_NOTICE_LOCK"; ' +
       waitForAwk(
         '"$GH_GLANCE_CAPTURE_OUT"',
-        'index($0, "API coordination unavailable") { ok=1 }',
+        'index($0, "Coordinating with your other panes") { ok=1 }',
         200,
       ) +
       `watching=$(${captureCount("Watching")}); ` +
@@ -442,8 +484,8 @@ test("a coordination notice can appear and clear without overflowing the frame",
     },
   });
 
-  assert.match(result.raw, /API coordination unavailable/);
-  assert.doesNotMatch(result.finalFrame.lines.join("\n"), /API coordination unavailable/);
+  assert.match(result.raw, /Coordinating with your other panes/);
+  assert.doesNotMatch(result.finalFrame.lines.join("\n"), /Coordinating with your other panes/);
   assert.ok(result.liveScreen.statusHistory.some((line) => /^‖ Paused/.test(line)));
   assert.match(statusLine(result) ?? "", /^· Watching/);
   assert.ok(result.fullClears <= 2, `${result.fullClears} full clears during notice transition`);

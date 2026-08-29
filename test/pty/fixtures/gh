@@ -33,29 +33,53 @@ matches_selector() {
   [ "${2:-}" = "$wanted" ]
 }
 
+consume_matching_counter() {
+  counter_file=$1
+  selectors=$2
+  shift 2
+  IFS= read -r remaining < "$counter_file" || remaining=0
+  case "$remaining" in
+    ''|*[!0-9]*) remaining=0 ;;
+  esac
+  [ "$remaining" -gt 0 ] || return 1
+  while [ -n "$selectors" ]; do
+    selector=${selectors%%,*}
+    if matches_selector "$selector" "$@"; then
+      printf '%s\n' "$((remaining - 1))" > "$counter_file"
+      return 0
+    fi
+    case "$selectors" in
+      *,*) selectors=${selectors#*,} ;;
+      *) break ;;
+    esac
+  done
+  return 1
+}
+
+# A successful process can still leave unusable stdout when it is killed after
+# starting or dies during a write. A caller-owned counter makes that boundary
+# deterministic while the next invocation returns the ordinary fixture body.
+if [ -n "${GH_GLANCE_FIXTURE_EMPTY_FIRST_FILE:-}" ] &&
+  [ -f "$GH_GLANCE_FIXTURE_EMPTY_FIRST_FILE" ]; then
+  if consume_matching_counter \
+    "$GH_GLANCE_FIXTURE_EMPTY_FIRST_FILE" \
+    "${GH_GLANCE_FIXTURE_EMPTY_FIRST_ON:-api}" \
+    "$@"; then
+    exit 0
+  fi
+fi
+
 # A caller-owned counter makes recovery deterministic without timing a race.
 # Each matching invocation consumes one failure, then the same live process sees
 # ordinary successful fixture responses.
 if [ -n "${GH_GLANCE_FIXTURE_FAIL_FIRST_FILE:-}" ] &&
   [ -f "$GH_GLANCE_FIXTURE_FAIL_FIRST_FILE" ]; then
-  remaining=$(sed -n '1p' "$GH_GLANCE_FIXTURE_FAIL_FIRST_FILE")
-  case "$remaining" in
-    ''|*[!0-9]*) remaining=0 ;;
-  esac
-  if [ "$remaining" -gt 0 ]; then
-    fail_first_on=${GH_GLANCE_FIXTURE_FAIL_FIRST_ON:-api}
-    while [ -n "$fail_first_on" ]; do
-      selector=${fail_first_on%%,*}
-      if matches_selector "$selector" "$1" "${2:-}"; then
-        printf '%s\n' "$((remaining - 1))" > "$GH_GLANCE_FIXTURE_FAIL_FIRST_FILE"
-        echo "${GH_GLANCE_FIXTURE_FAIL_FIRST_MESSAGE:-temporary fixture failure}" >&2
-        exit 1
-      fi
-      case "$fail_first_on" in
-        *,*) fail_first_on=${fail_first_on#*,} ;;
-        *) break ;;
-      esac
-    done
+  if consume_matching_counter \
+    "$GH_GLANCE_FIXTURE_FAIL_FIRST_FILE" \
+    "${GH_GLANCE_FIXTURE_FAIL_FIRST_ON:-api}" \
+    "$@"; then
+    echo "${GH_GLANCE_FIXTURE_FAIL_FIRST_MESSAGE:-temporary fixture failure}" >&2
+    exit 1
   fi
 fi
 

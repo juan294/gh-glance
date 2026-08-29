@@ -19,6 +19,7 @@ import {
   isRateLimited,
   isAuthProblem,
   isMissingRemote,
+  isUnusableOutput,
   forwardSignalToChild,
   classify,
   toTabError,
@@ -53,6 +54,9 @@ import {
   statusBarLayout,
   freshnessDeadline,
   nextAdmittedCadence,
+  parseJsonOutput,
+  pollResultTransition,
+  coordinationNotice,
   probingGovernorDecisions,
   retainDeferredGovernorHold,
   REFRESH_STATUS_GLYPHS,
@@ -271,6 +275,48 @@ test("unrelated GraphQL errors remain other", () => {
   const error = { stderr: "GraphQL: Something went wrong while executing your query" };
   assert.equal(isUnavailable(error), false);
   assert.equal(classify(error), "other");
+});
+
+test("app-owned unusable JSON output is transient while gh messages remain other", () => {
+  let parseFailure;
+  try {
+    parseJsonOutput("");
+  } catch (error) {
+    parseFailure = error;
+  }
+  assert.equal(isUnusableOutput(parseFailure), true);
+  assert.equal(classify(parseFailure), "unusable-output");
+  assert.throws(
+    () => parseJsonOutput('[{"number":41}'),
+    (error) => classify(error) === "unusable-output",
+  );
+  assert.equal(classify({ stderr: "dial tcp: lookup api.github.com: no such host" }), "other");
+  assert.equal(classify({ stderr: "Unexpected end of JSON input" }), "other");
+});
+
+test("unusable poll output keeps prior data clocks and forces the retry to parse", () => {
+  const transition = pollResultTransition({
+    key: "issues",
+    previousRaw: '[{"number":41}]',
+    raw: "",
+    parse: () => parseJsonOutput(""),
+    limit: 100,
+    completedAt: 1_000_000,
+  });
+  assert.deepEqual(transition, { kind: "unusable", nextRaw: null });
+});
+
+test("coordination notices translate raw reasons without exposing internal vocabulary", () => {
+  assert.equal(coordinationNotice("unknown-scope"), "Confirming your GitHub login…");
+  assert.equal(
+    coordinationNotice("block-unpublished"),
+    "Holding until the rate-limit block is shared",
+  );
+  assert.equal(coordinationNotice("busy"), "Coordinating with your other panes");
+  assert.equal(coordinationNotice("stale"), "Coordinating with your other panes");
+  for (const reason of ["corrupt", "unwritable", "unknown-host", "new-internal-reason"]) {
+    assert.equal(coordinationNotice(reason), "Can't coordinate API use — retrying");
+  }
 });
 
 test("structured tab errors select actionable one-line remedies", () => {
@@ -2360,6 +2406,8 @@ test("local failure remedies have ladders while shared rate limits do not", () =
     Object.keys(FAILURE_LADDER).sort(),
   );
   assert.ok(!("other" in VERDICT_REMEDY));
+  assert.ok(!("unusable-output" in VERDICT_REMEDY));
+  assert.ok(!("unusable-output" in FAILURE_LADDER));
   assert.ok(!("ok" in FAILURE_LADDER));
   assert.equal("rate-limited" in FAILURE_LADDER, false);
 });

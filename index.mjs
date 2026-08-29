@@ -162,6 +162,11 @@ const AUTH_RETRY_MS = [30_000];
 // byte-identical-idle-frame property the rest of this file works to keep.
 const STALE_AFTER_MS = 30_000;
 
+// A coordination hold must persist long enough to be meaningful before it
+// takes the notice row. Short startup and lock-contention states recover on
+// their own and should not present themselves as user-visible failures.
+const COORDINATION_NOTICE_AFTER_MS = 2_000;
+
 // Mutable because the fetchers below are defined before argv is parsed, and the
 // argv block is what fills this in. Everything here has a working default, so
 // the zero-argument invocation the README documents behaves exactly as before.
@@ -390,6 +395,24 @@ function isMissingRemote(err) {
   return /(?:failed to determine base repo:\s*)?no git remotes found/i.test(errText(err));
 }
 
+const UNUSABLE_OUTPUT_CODE = "GH_GLANCE_UNUSABLE_OUTPUT";
+
+// Only JSON parsed from a successful gh stdout stream goes through this seam.
+// Marking the SyntaxError here distinguishes our own failed parse from a gh
+// stderr message that happens to use the same words.
+function parseJsonOutput(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    if (error instanceof SyntaxError) error.code = UNUSABLE_OUTPUT_CODE;
+    throw error;
+  }
+}
+
+function isUnusableOutput(err) {
+  return err?.code === UNUSABLE_OUTPUT_CODE;
+}
+
 // The one place the three predicates are turned into a verdict. Both consumers
 // go through it -- the fetcher, to choose a note and a backoff ladder, and
 // `--doctor`, to report what gh-glance concluded -- so the report cannot claim
@@ -409,6 +432,7 @@ function classify(err) {
   if (isRateLimited(err)) return "rate-limited";
   if (isAuthProblem(err)) return "auth-problem";
   if (isUnavailable(err)) return "unavailable";
+  if (isUnusableOutput(err)) return "unusable-output";
   return "other";
 }
 
@@ -895,7 +919,7 @@ async function fetchActions(limit, signal) {
     restSpent: REST_PER_FETCH.actions,
     graphqlSpent: GRAPHQL_PER_FETCH.actions,
     parse: () =>
-      JSON.parse(raw).map((r) => ({
+      parseJsonOutput(raw).map((r) => ({
         databaseId: r.databaseId,
         displayTitle: safe(r.displayTitle),
         workflowName: safe(r.workflowName),
@@ -944,7 +968,7 @@ async function fetchIssues(signal) {
     restSpent: REST_PER_FETCH.issues,
     graphqlSpent: GRAPHQL_PER_FETCH.issues,
     parse: () =>
-      JSON.parse(raw).map((i) => ({
+      parseJsonOutput(raw).map((i) => ({
         number: i.number,
         title: safe(i.title),
         author: safe(i.author?.login ?? ""),
@@ -978,7 +1002,7 @@ async function fetchPRs(signal) {
     restSpent: REST_PER_FETCH.prs,
     graphqlSpent: GRAPHQL_PER_FETCH.prs,
     parse: () =>
-      JSON.parse(raw).map((p) => ({
+      parseJsonOutput(raw).map((p) => ({
         number: p.number,
         title: safe(p.title),
         author: safe(p.author?.login ?? ""),
@@ -2804,7 +2828,7 @@ async function fetchAlertSource(source, signal, now) {
       completedCalls += 1;
       const payload = await runGh(args, { signal, operation: "tab:security-endpoint" });
       payloads.push(payload);
-      groups.push(JSON.parse(payload).filter((alert) => alert.state === "open"));
+      groups.push(parseJsonOutput(payload).filter((alert) => alert.state === "open"));
     }
     const raw = payloads.join("\0");
     clearBackoff(source.key);
@@ -2828,6 +2852,20 @@ async function fetchAlertSource(source, signal, now) {
     // source's fixed note. Everything else -- an expired SAML session, a rate
     // limit, a network drop -- surfaces as itself.
     const verdict = classify(err);
+    if (verdict === "unusable-output") {
+      return {
+        raw: "unusable-output",
+        completedCalls,
+        verdict,
+        parse: () => ({
+          alerts: [],
+          note: null,
+          verdict,
+          truncated: false,
+          unusable: true,
+        }),
+      };
+    }
     const note = verdict === "unavailable" ? source.unavailable : `${source.name}: ${shortErr(err)}`;
     const steps = pick(FAILURE_LADDER, verdict, null);
     if (steps) {
@@ -2881,6 +2919,7 @@ async function fetchSecurity(signal) {
     measuredSuccess: parts.every((part) => part.verdict === "ok"),
     rateLimited: parts.some((part) => part.verdict === "rate-limited"),
     parse: () => {
+      if (parts.some((part) => part.verdict === "unusable-output")) return { unusable: true };
       const parsed = parts.map((p) => p.parse());
       const alerts = parsed.flatMap((p) => p.alerts);
       alerts.sort((a, b) => {
@@ -2891,6 +2930,7 @@ async function fetchSecurity(signal) {
       return {
         alerts,
         notes: parsed.map((p) => p.note).filter(Boolean),
+        unusable: parsed.some((p) => p.unusable),
         // "Blind" is not the same as "switched off", and the tab bar could not
         // tell them apart: fetchAlertSource never rejects, so a repo whose three
         // endpoints all 403'd on an expired SAML session rendered
@@ -5643,6 +5683,13 @@ function rateLimitBlockDecision(results, resetMs) {
   };
 }
 
+function coordinationNotice(reason) {
+  if (reason === "unknown-scope") return "Confirming your GitHub login…";
+  if (reason === "block-unpublished") return "Holding until the rate-limit block is shared";
+  if (reason === "busy" || reason === "stale") return "Coordinating with your other panes";
+  return "Can't coordinate API use — retrying";
+}
+
 function retryRateLimitBlockPublication(pending, nowMs, publish) {
   const blocks = Array.isArray(pending?.blocks) ? pending.blocks : [];
   if (blocks.length === 0 || blocks.some((block) =>
@@ -5736,7 +5783,14 @@ async function runAdmittedOperation({ scope, leaseId, operation, priority = "man
 
 function pollResultTransition({ key, previousRaw, raw, parse, limit, completedAt }) {
   if (previousRaw === raw) return { kind: "unchanged", completedAt };
-  const value = parse();
+  let value;
+  try {
+    value = parse();
+  } catch (error) {
+    if (isUnusableOutput(error)) return { kind: "unusable", nextRaw: null };
+    throw error;
+  }
+  if (value?.unusable) return { kind: "unusable", nextRaw: null };
   if (key === "security" && value?.blind) {
     return {
       kind: "blind",
@@ -6427,6 +6481,7 @@ function App({ onCreateRemote = () => {} } = {}) {
   const [requestStatuses, setRequestStatuses] = useState(() =>
     Object.fromEntries(TABS.map((candidate) => [candidate.key, null])),
   );
+  const [visibleCoordinationCondition, setVisibleCoordinationCondition] = useState(null);
   const [now, setNow] = useState(new Date());
   const { rows, cols, useShortLabels } = useTerminalSize(stdout);
   const [frame, setFrame] = useState(0);
@@ -7173,6 +7228,16 @@ function App({ onCreateRemote = () => {} } = {}) {
             }
             return;
           }
+          // Empty or truncated JSON is not a user-actionable fetch error. Keep
+          // the last-good rows and freshness clock, and clear the raw comparison
+          // so the next admitted tick parses its response instead of taking the
+          // identical-output fast path.
+          if (transition.kind === "unusable") {
+            if (key === "security") securityNextPollAt = 0;
+            rawRef.current[key] = transition.nextRaw;
+            setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
+            return;
+          }
           // Security fetches resolve each source independently so their notes
           // remain visible. A blind result is still a failed observation: it
           // must not replace known alerts with a false empty state or advance
@@ -7849,10 +7914,23 @@ function App({ onCreateRemote = () => {} } = {}) {
   const items = data[tab.key];
   const displayError = formatTabErrorForWidth(tabError, failureContext, Math.max(1, cols - 5));
   const coordinationError = activeGovernorDecision?.coordinationError && !remoteSetup;
-  const noticeLine = coordinationError
-    ? `API coordination unavailable (${activeGovernorDecision.reason}); retrying safely`
+  const coordinationReason = activeGovernorDecision?.reason ?? "unavailable";
+  const coordinationCondition = coordinationError ? `${tab.key}\0${coordinationReason}` : null;
+  useEffect(() => {
+    setVisibleCoordinationCondition(null);
+    if (coordinationCondition === null) return;
+    const timer = setTimeout(
+      () => setVisibleCoordinationCondition(coordinationCondition),
+      COORDINATION_NOTICE_AFTER_MS,
+    );
+    return () => clearTimeout(timer);
+  }, [coordinationCondition]);
+  const showCoordinationNotice = coordinationCondition !== null &&
+    visibleCoordinationCondition === coordinationCondition;
+  const noticeLine = showCoordinationNotice
+    ? coordinationNotice(coordinationReason)
     : !remoteSetup && displayError ? displayError : "";
-  const noticeTone = coordinationError ? ATTENTION : displayError ? ERROR_TEXT : undefined;
+  const noticeTone = showCoordinationNotice ? ATTENTION : displayError ? ERROR_TEXT : undefined;
   const spin = SPINNER[frame % SPINNER.length];
 
   const counts = Object.fromEntries(
@@ -8553,6 +8631,7 @@ export {
   isRateLimited,
   isAuthProblem,
   isMissingRemote,
+  isUnusableOutput,
   forwardSignalToChild,
   toTabError,
   formatTabError,
@@ -8569,6 +8648,7 @@ export {
   BACKOFF_STEPS_MS,
   redact,
   classify,
+  parseJsonOutput,
   formatAge,
   formatDuration,
   usableSize,
@@ -8616,6 +8696,7 @@ export {
   pendingFailureIsTerminal,
   runtimeIntentGate,
   rateLimitBlockDecision,
+  coordinationNotice,
   mergeRateLimitBlockPublications,
   hydrateRateLimitBlockPublication,
   retryRateLimitBlockPublication,
@@ -8673,4 +8754,5 @@ export {
   REMOTE_SETUP_NONINTERACTIVE_LINES,
   VERDICT_REMEDY,
   FAILURE_LADDER,
+  COORDINATION_NOTICE_AFTER_MS,
 };

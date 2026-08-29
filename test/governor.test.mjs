@@ -745,12 +745,16 @@ test("rate-limit status is shared only after the block is durably published", ()
     coordinationError: false,
     failClosed: false,
   });
-  for (const results of [[], [{ ok: false, reason: "busy" }], [{ ok: true }, { ok: false }]]) {
+  for (const [results, rawReason] of [
+    [[], "block-unpublished"],
+    [[{ ok: false, reason: "busy" }], "busy"],
+    [[{ ok: true }, { ok: false }], "block-unpublished"],
+  ]) {
     const decision = rateLimitBlockDecision(results, resetMs);
     assert.equal(decision.mode, "paused");
     assert.equal(decision.coordinationError, true);
     assert.equal(decision.failClosed, true);
-    assert.notEqual(decision.reason, "rate-limit");
+    assert.equal(decision.reason, rawReason);
     assert.equal("resetMs" in decision, false);
   }
   assert.equal(rateLimitBlockDecision([{ ok: true }], Number.NaN).failClosed, true);

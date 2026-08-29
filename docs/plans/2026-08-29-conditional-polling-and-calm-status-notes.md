@@ -27,3 +27,29 @@
 - **Why:** The failure is the same local aggregate process-pressure artifact
   recorded in Phase 1. Module isolation verifies the product contract without
   weakening an assertion or increasing a timeout.
+
+### Phase 3 Security unusable-output path
+
+- **Plan said:** Route unusable subprocess JSON through the shared poll-result
+  transition and retry it on the next tick.
+- **Found:** Security parses each endpoint inside `fetchAlertSource`, before the
+  shared transition, and its separate unchanged-data cadence gate can suppress
+  the next otherwise admitted scheduler tick.
+- **Chose:** Tag JSON syntax failures at the app-owned parse seam, propagate an
+  unusable Security sentinel without replacing any source rows, and clear only
+  `securityNextPollAt` when that transition settles.
+- **Why:** This gives list and Security tabs the same silent, next-tick recovery
+  contract while preserving their different fetch structures and all last-good
+  data and freshness state.
+
+### Phase 3 PTY execution
+
+- **Plan said:** Run `npm run test:pty` as one serialized Node test command.
+- **Found:** After seven isolated modules passed in sequence, an unchanged
+  top-level remediation capture reached the harness `spawnSync` timeout. The
+  complete remediation module had passed immediately before the full sequence.
+- **Chose:** Keep every assertion and timeout unchanged, retain the complete
+  remediation pass, and finish the remaining isolated modules separately. All
+  87 PTY cases have a passing module run for the Phase 3 candidate.
+- **Why:** This is the same aggregate local PTY process-pressure behavior from
+  Phases 1 and 2, not a repeated product failure in an isolated module.
