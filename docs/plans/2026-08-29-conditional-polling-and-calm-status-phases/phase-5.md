@@ -91,12 +91,13 @@ budgets[resource].knownLocalUsed = nonnegative integer
 observers.core = { etag: string|null, outcome, at, nextAt }
 ```
 
-`rate-limit-probe` is valid only for GraphQL. For one resource, order accepted
-samples by `(resetMs, used, receivedAt)`: a later reset wins; at the same reset,
-greater `used` wins; an exact tie uses later `receivedAt`. A same-reset lower
-`used` is an out-of-order response and is ignored, not converted into a new
-epoch. A lower reset is rejected. Core `/rate_limit` data is excluded before
-this comparison, so it cannot latch ahead of endpoint headers.
+`rate-limit-probe` is valid only for GraphQL. Only the claimed `core-observer`
+or `rate-limit-probe` owner can change its resource epoch. An endpoint response
+header is accepted only when its full `(limit, resetMs)` epoch matches the
+persisted owner epoch. Within that epoch, greater `used` wins and an exact tie
+uses later `receivedAt`; a lower `used` is an out-of-order response and is
+ignored. Core `/rate_limit` data is excluded before this comparison, so it
+cannot latch ahead of the core observer.
 
 `--doctor` reports the winning source without exposing the scope or validator.
 
@@ -168,9 +169,9 @@ overwrite the core observer.
 
 - Unit: source validation proves `/rate_limit` can update GraphQL but cannot
   update core, even when its reset is later.
-- Unit: settlement rejects a rewound reset, future observation, foreign scope,
-  wrong lease, and out-of-order same-window response; it accepts monotonic
-  samples deterministically.
+- Unit: settlement rejects a different endpoint epoch, future observation,
+  foreign scope, wrong lease, claimed-source label, and out-of-order same-epoch
+  response; it accepts same-epoch monotonic samples deterministically.
 - Unit: response settlement never clears `blockUntil` and never resolves
   `manualProbe`.
 - Governor worker test: response settlement from 12 real processes against one
@@ -217,5 +218,8 @@ GraphQL conditional requests. Removing the probe. Re-tuning cadences --- Phase 6
   slow-source claim renewal have direct automated coverage.
 - [x] The protected bootstrap, exhaustion, reset/external-burn, factor,
   crash-recovery, and block contracts pass without weaker assertions.
-- [ ] The live four-pane, out-of-band burn, and Doctor checks are pending the
-  Phase 6 real-window measurement, where their evidence will be recorded.
+- [x] Four live panes tracked authoritative core headers within one refresh,
+  tightened within one probe after two controlled burns of about 500 units,
+  and preserved the reserve. Doctor reported the winning `response-header`
+  source after matching endpoint evidence. The Phase 6 notes contain the
+  measured window and the mixed-epoch defect found before it.

@@ -57,6 +57,12 @@ bootstrap request before an authoritative core observation exists. Its first
 200 response can cost one unit and records that unit immediately. Later core
 observations are conditional and a matching 304 costs zero.
 
+Only a claimed observer can establish or change a resource epoch: conditional
+`GET /user` owns core and `rate_limit` owns GraphQL. Endpoint response headers
+can refine an absolute counter only when their full `(limit, reset)` epoch
+matches the persisted observer epoch. A cached or endpoint-specific header from
+another epoch is ignored and its request cost stays conservatively reserved.
+
 ## Protocol and recovery
 
 The governor state records resource epochs and observations, fair lane cursors,

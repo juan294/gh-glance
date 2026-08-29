@@ -108,6 +108,9 @@ import {
   BUDGET_SAFETY,
   BUDGET_RESERVE_FRACTION,
   BUDGET_SNAPSHOT_TTL_MS,
+  GRAPHQL_BUDGET_SNAPSHOT_TTL_MS,
+  budgetSnapshotTtl,
+  currentSharedLaneProvenance,
   GOVERNOR_HEARTBEAT_MS,
   GOVERNOR_LEASE_TTL_MS,
   GOVERNOR_PROBE_LEASE_MS,
@@ -1592,6 +1595,15 @@ test("refresh status pins active-tab precedence, copy, motion, and details", () 
     kind: "watching", glyphKind: "watching", label: "Watching",
     tone: "inert", animate: false, detailKind: "next",
   });
+  assert.deepEqual(status({ governorDecision: {
+    mode: "waiting",
+    notBefore: 456,
+    waitCause: "shared-lane",
+    sharingCount: 4,
+  } }), {
+    kind: "watching", glyphKind: "watching", label: "Watching",
+    tone: "inert", animate: false, detailKind: "sharing",
+  });
   assert.equal(status({ activeError: { verdict: "other" }, securityIncomplete: true }).kind, "failed");
   assert.equal(status({ securityIncomplete: false, securityNotes: ["Dependabot is not enabled"] }).kind, "watching");
   assert.equal(status({ securityIncomplete: true }).kind, "limited");
@@ -1735,6 +1747,43 @@ test("status bar layout preserves a fixed state region before deterministic hint
     nowMs,
     version: "v0.10.0",
   }).detail, null);
+
+  const sharingStatus = refreshStatus({ governorDecision: {
+    mode: "waiting",
+    notBefore: detail.notBefore,
+    waitCause: "shared-lane",
+    sharingCount: 4,
+  } });
+  const sharingLayouts = Object.fromEntries([80, 60, 45, 24, 23].map((cols) => [
+    cols,
+    statusBarLayout({
+      cols,
+      interactive: true,
+      availableHints: hints,
+      status: sharingStatus,
+      detail: { ...detail, waitCause: "shared-lane", sharingCount: 4 },
+      nowMs,
+    }),
+  ]));
+  for (const cols of [80, 60, 45]) {
+    assert.equal(sharingLayouts[cols].detail, "sharing 4");
+    assert.equal(
+      sharingLayouts[cols].mandatoryHints[0].start,
+      layouts[cols].mandatoryHints[0].start,
+    );
+  }
+  for (const cols of [24, 23]) assert.equal(sharingLayouts[cols].detail, null);
+  const staleSharing = statusBarLayout({
+    cols: 80,
+    interactive: true,
+    availableHints: hints,
+    status: sharingStatus,
+    detail: { ...detail, waitCause: "shared-lane", sharingCount: 4 },
+    stale: "stale 99h59m",
+    nowMs,
+  });
+  assert.equal(staleSharing.detail, null);
+  assert.equal(staleSharing.stale, "stale 99h59m");
 
   const steady = statusBarLayout({
     cols: 80,
@@ -2591,6 +2640,9 @@ const policyLease = (
 test("the governor timing and reserve constants pin the policy contract", () => {
   assert.equal(BUDGET_RESERVE_FRACTION, 1 - BUDGET_SAFETY);
   assert.equal(BUDGET_SNAPSHOT_TTL_MS, 65_000);
+  assert.equal(GRAPHQL_BUDGET_SNAPSHOT_TTL_MS, 2 * BUDGET_PROBE_MS + 5_000);
+  assert.equal(budgetSnapshotTtl("core"), BUDGET_SNAPSHOT_TTL_MS);
+  assert.equal(budgetSnapshotTtl("graphql"), GRAPHQL_BUDGET_SNAPSHOT_TTL_MS);
   assert.equal(GOVERNOR_HEARTBEAT_MS, 20_000);
   assert.equal(GOVERNOR_LEASE_TTL_MS, 90_000);
   assert.equal(GOVERNOR_PROBE_LEASE_MS, 70_000);
@@ -2599,6 +2651,25 @@ test("the governor timing and reserve constants pin the policy contract", () => 
   assert.equal(GOVERNOR_PHASE_WINDOW_MS, 5_000);
   assert.equal(BUDGET_PROBE_MS, 60_000);
   assert.equal(resourceReserve(5000), 1000);
+});
+
+test("GraphQL tolerates one missed observer sample but fails closed after two", () => {
+  const observedAt = POLICY_NOW - BUDGET_SNAPSHOT_TTL_MS - 1;
+  assert.equal(availableForGrant({
+    budget: policyBudget({ observedAt }),
+    resource: "core",
+    nowMs: POLICY_NOW,
+  }).reason, "budget-stale");
+  assert.equal(availableForGrant({
+    budget: policyBudget({ observedAt }),
+    resource: "graphql",
+    nowMs: POLICY_NOW,
+  }).mode, "open");
+  assert.equal(availableForGrant({
+    budget: policyBudget({ observedAt: POLICY_NOW - GRAPHQL_BUDGET_SNAPSHOT_TTL_MS - 1 }),
+    resource: "graphql",
+    nowMs: POLICY_NOW,
+  }).reason, "budget-stale");
 });
 
 test("budget normalization rejects malformed values", () => {
@@ -2635,6 +2706,7 @@ test("missing, malformed, future, stale, and reset budgets never grant", () => {
 test("the hard reserve denies exhausted and reserve-crossing requests", () => {
   assert.equal(availableForGrant({
     budget: policyBudget({ remaining: 1000, used: 4000 }),
+    resource: "core",
     nowMs: POLICY_NOW,
   }).spendable, 0);
   for (const remaining of [1000, 999, 0]) {
@@ -2663,7 +2735,8 @@ test("invalid precomputed reservation totals fail closed", () => {
   };
   for (const chargedCost of [-1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
     assert.deepEqual(availableForGrant({
-      budget: { ...budget, resource: "core" },
+      budget,
+      resource: "core",
       nowMs: POLICY_NOW,
       chargedCost,
     }), expected);
@@ -2706,7 +2779,7 @@ test("a known shared rate block pauses until its reset", () => {
 test("a suffixed rollback epoch survives normalization into grants", () => {
   const epoch = `5000:${POLICY_NOW + 3_600_000}:${POLICY_NOW}`;
   const budget = policyBudget({ epoch });
-  assert.equal(availableForGrant({ budget, nowMs: POLICY_NOW }).epoch, epoch);
+  assert.equal(availableForGrant({ budget, resource: "core", nowMs: POLICY_NOW }).epoch, epoch);
   const scheduled = scheduleIntents({
     intents: [{
       id: "rollback-intent",
@@ -2842,6 +2915,59 @@ test("manual and diagnostic requests from several leases remain lane paced", () 
   for (let index = 1; index < grantTimes.length; index += 1) {
     assert.ok(grantTimes[index] - grantTimes[index - 1] >= laneInterval);
   }
+});
+
+test("only a foreign live lane reports a transient sharing hold", () => {
+  const leases = Object.fromEntries(["a", "b", "c", "d"].map((id) => [
+    id,
+    policyLease(id, POLICY_NOW + 60_000),
+  ]));
+  const intent = {
+    id: "shared",
+    leaseId: "b",
+    priority: "active",
+    costs: { core: 1, graphql: 0 },
+    expiresAt: POLICY_NOW + 60_000,
+  };
+  const laneAt = POLICY_NOW + 10_000;
+  const schedule = (overrides = {}) => scheduleIntents({
+    intents: [intent],
+    leases,
+    budgets: { core: policyBudget() },
+    lanes: { core: { nextAt: laneAt } },
+    cursors: { core: "a" },
+    nowMs: POLICY_NOW,
+    ...overrides,
+  }).grants[0];
+
+  const shared = schedule();
+  assert.deepEqual(
+    { waitCause: shared.waitCause, sharingCount: shared.sharingCount },
+    { waitCause: "shared-lane", sharingCount: 4 },
+  );
+  assert.deepEqual(currentSharedLaneProvenance(shared, leases, POLICY_NOW), {
+    waitCause: "shared-lane",
+    sharingCount: 4,
+  });
+  assert.deepEqual(currentSharedLaneProvenance(shared, {
+    ...leases,
+    a: policyLease("a", POLICY_NOW - 1),
+  }, POLICY_NOW), {});
+  assert.deepEqual(currentSharedLaneProvenance(shared, {
+    a: leases.a,
+    b: leases.b,
+    c: leases.c,
+  }, POLICY_NOW), {});
+  assert.equal(schedule({ cursors: { core: "b" } }).waitCause, undefined);
+  assert.equal(schedule({ leases: { b: leases.b } }).waitCause, undefined);
+  assert.equal(schedule({ cursors: { core: "expired" }, leases: {
+    ...leases,
+    expired: policyLease("expired", POLICY_NOW - 1),
+  } }).waitCause, undefined);
+  assert.equal(schedule({
+    nowMs: laneAt,
+    lanes: { core: { nextAt: laneAt } },
+  }).waitCause, undefined, "an intrinsic-time tie is not a sharing hold");
 });
 
 test("tab intents derive registry costs and reject conflicting overrides", () => {

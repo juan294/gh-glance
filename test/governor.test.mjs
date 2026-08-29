@@ -1329,6 +1329,31 @@ test("planned-to-start revalidation fails closed after stale budget, block, or s
   assert.equal(inspectGovernor(migrated, freshAt).reason, "stale");
 });
 
+test("a just-created shared-lane grant reports pane count without persisting UI fields", (t) => {
+  const box = sandbox(t, { authIdentity: "transient-sharing" });
+  const leaseIds = Array.from({ length: 4 }, () => randomUUID());
+  for (const leaseId of leaseIds) assert.equal(registerLease(box.scope, lease(leaseId)).ok, true);
+  publishInitial(box.scope, leaseIds[0]);
+
+  const first = registerIntent(box.scope, intent(randomUUID(), leaseIds[0], NOW, {
+    tab: "security",
+    costs: { core: 6, graphql: 0 },
+  })).value;
+  assert.equal(first.status, "scheduled");
+  const second = registerIntent(box.scope, intent(randomUUID(), leaseIds[1])).value;
+  assert.equal(second.status, "scheduled");
+  assert.equal(second.waitCause, "shared-lane");
+  assert.equal(second.sharingCount, 4);
+  assert.deepEqual(second.sharingOwnerLeaseIds, [leaseIds[0]]);
+
+  const persisted = inspectGovernor(box.scope, NOW).value.reservations[second.reservationId];
+  assert.equal(Object.hasOwn(persisted, "waitCause"), false);
+  assert.equal(Object.hasOwn(persisted, "sharingCount"), false);
+  assert.equal(Object.hasOwn(persisted, "sharingOwnerLeaseIds"), false);
+  const reread = readIntentDecision(box.scope, second.intentId, NOW).value;
+  assert.equal(reread.waitCause, undefined, "another process gets a safe false negative");
+});
+
 test("planned reservations revalidate expiry, epoch, probe barrier, and capacity", (t) => {
   function planned(authIdentity, remaining = 5000) {
     const box = sandbox(t, { authIdentity });
@@ -1528,7 +1553,8 @@ test("rate_limit publication updates GraphQL but never overwrites authoritative 
   const before = inspectGovernor(scope, NOW).value;
   const claim = claimNow(scope, leaseId, NOW + 1);
   const laterReset = before.budgets.core.resetMs + 1;
-  const published = publishProbe(scope, leaseId, claim.value.nonce, {
+  const claimed = inspectGovernor(scope, NOW + 1).value;
+  const rejected = publishProbe(scope, leaseId, claim.value.nonce, {
     core: {
       source: "rate-limit-probe",
       budget: { limit: 5000, used: 0, remaining: 5000, resetMs: laterReset },
@@ -1538,10 +1564,32 @@ test("rate_limit publication updates GraphQL but never overwrites authoritative 
       budget: { limit: 5000, used: 20, remaining: 4980, resetMs: laterReset },
     },
   }, NOW + 1);
+  assert.equal(rejected.reason, "corrupt");
+  let state = inspectGovernor(scope, NOW + 1).value;
+  assert.deepEqual(state.observers.core, claimed.observers.core);
+  assert.deepEqual(state.budgets.graphql, claimed.budgets.graphql);
+
+  const published = publishProbe(scope, leaseId, claim.value.nonce, {
+    core: {
+      source: "core-observer",
+      budget: {
+        limit: 5000,
+        used: before.budgets.core.used,
+        remaining: before.budgets.core.remaining,
+        resetMs: before.budgets.core.resetMs,
+      },
+    },
+    graphql: {
+      source: "rate-limit-probe",
+      budget: { limit: 5000, used: 20, remaining: 4980, resetMs: laterReset },
+    },
+  }, NOW + 1);
   assert.equal(published.ok, true);
-  const state = inspectGovernor(scope, NOW + 1).value;
+  state = inspectGovernor(scope, NOW + 1).value;
   assert.equal(state.budgets.core.resetMs, before.budgets.core.resetMs);
   assert.equal(state.budgets.core.source, "core-observer");
+  assert.equal(state.observers.core.outcome, "healthy");
+  assert.equal(state.observers.core.at, NOW + 1);
   assert.equal(state.budgets.graphql.used, 20);
   assert.equal(state.budgets.graphql.source, "rate-limit-probe");
 });
@@ -1738,6 +1786,83 @@ test("response settlement ignores a rewound reset and retains its residual charg
   assert.equal(state.budgets.core.knownLocalUsed, 0);
   assert.equal(state.reservations[grant.reservationId].accountedCosts.core, 0);
   assert.equal(state.reservations[grant.reservationId].actualCosts.core, 2);
+});
+
+test("response settlement cannot advance the core epoch ahead of the claimed observer", (t) => {
+  const box = sandbox(t, { authIdentity: "endpoint-epoch-ownership" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const initial = inspectGovernor(box.scope, NOW).value.budgets.core;
+  const grant = registerIntent(box.scope, intent(randomUUID(), leaseId)).value;
+  startReservation(box.scope, grant.reservationId, grant.notBefore);
+  box.setNow(grant.notBefore);
+  const settledAt = grant.notBefore + 1;
+  recordResourceBlock(box.scope, "core", settledAt + 60_000, "rate-limit");
+  requestManualProbe(box.scope, leaseId, initial.epoch, initial.observedAt, grant.notBefore);
+
+  const endpointResetMs = initial.resetMs + 3_600_000;
+  assert.equal(settleReservationWithBudgetObservations(box.scope, leaseId, grant.reservationId, {
+    outcome: "measured-success",
+    actualCosts: { core: 1, graphql: 0 },
+    observations: [{
+      resource: "core", limit: 5000, used: 1, remaining: 4999,
+      resetMs: endpointResetMs, receivedAt: settledAt, source: "response-header", cost: 1,
+    }],
+  }, settledAt).ok, true);
+  let state = inspectGovernor(box.scope, settledAt).value;
+  assert.equal(state.budgets.core.epoch, initial.epoch);
+  assert.equal(state.budgets.core.resetMs, initial.resetMs);
+  assert.equal(state.budgets.core.used, initial.used);
+  assert.equal(state.budgets.core.source, "core-observer");
+  assert.equal(state.budgets.core.knownLocalUsed, 0);
+  assert.equal(state.budgets.core.blockReason, "rate-limit");
+  assert.equal(state.manualProbe.satisfiedAt, null);
+  assert.equal(state.reservations[grant.reservationId].accountedCosts.core, 0);
+  assert.equal(state.reservations[grant.reservationId].actualCosts.core, 1);
+
+  const ownerAt = settledAt + 1;
+  box.setNow(ownerAt);
+  const claim = claimNow(box.scope, leaseId, ownerAt);
+  const ownerResetMs = initial.resetMs + 1_800_000;
+  assert.equal(publishProbe(
+    box.scope,
+    leaseId,
+    claim.value.nonce,
+    budgets(ownerAt, { remaining: 4999, resetMs: ownerResetMs }),
+    ownerAt,
+  ).ok, true);
+  state = inspectGovernor(box.scope, ownerAt).value;
+  assert.equal(state.budgets.core.resetMs, ownerResetMs);
+  assert.equal(state.budgets.core.source, "core-observer");
+  assert.equal(state.budgets.core.blockUntil, null);
+  assert.equal(state.manualProbe, null);
+});
+
+test("response settlement rejects claimed-source labels", (t) => {
+  for (const source of ["core-observer", "rate-limit-probe"]) {
+    const box = sandbox(t, { authIdentity: `settlement-source-${source}` });
+    const leaseId = randomUUID();
+    registerLease(box.scope, lease(leaseId));
+    publishInitial(box.scope, leaseId);
+    const initial = inspectGovernor(box.scope, NOW).value.budgets.core;
+    const grant = registerIntent(box.scope, intent(randomUUID(), leaseId)).value;
+    startReservation(box.scope, grant.reservationId, grant.notBefore);
+    box.setNow(grant.notBefore);
+    const settledAt = grant.notBefore + 1;
+    assert.equal(settleReservationWithBudgetObservations(box.scope, leaseId, grant.reservationId, {
+      outcome: "measured-success",
+      actualCosts: { core: 1, graphql: 0 },
+      observations: [{
+        resource: "core", limit: 5000, used: 1, remaining: 4999,
+        resetMs: initial.resetMs, receivedAt: settledAt, source, cost: 1,
+      }],
+    }, settledAt).reason, "corrupt");
+    assert.equal(
+      inspectGovernor(box.scope, settledAt).value.reservations[grant.reservationId].status,
+      "started",
+    );
+  }
 });
 
 test("v1 governor state migrates in place without retaining its core probe sample", (t) => {

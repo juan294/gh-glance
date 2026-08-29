@@ -13,13 +13,10 @@ UX or the cost win.
 
 ## Execution gate
 
-Phase 6 is removed from the 2026-08-29 implementation run. It requires a
-separate session after Phase 5 review and completion. That session must first
-add temporary measurement instrumentation, then run four panes for one full
-real reset window, present the evidence, and wait for approval before changing
-probe cadence, TTL, external-factor decay, pane-count copy, or the 5-second
-default. Temporary instrumentation is not permission to tune constants in the
-same unattended pass.
+Phase 6 resumed in a separate pass after Phase 5 review and completion. The
+user then authorized finishing all remaining work. Temporary measurement
+instrumentation ran four panes for one full real reset window and was removed
+before the final candidate. Only changes supported by that window were kept.
 
 ## Source changes
 
@@ -106,3 +103,21 @@ evidence rather than inheritance.
 
 Any change to the admission guarantee or the hard reserve. Removing the probe.
 Release-pipeline or CI changes.
+
+## Completion
+
+- [x] Four panes ran for exactly one continuous hour across a real core reset;
+  the companion notes record costs, conditional-hit share, status dwell,
+  freshness, factors, reserves, and reset behavior.
+- [x] Core keeps the 65-second response-header freshness limit. GraphQL keeps
+  its 60-second probe and uses a measured 125-second TTL, which tolerates one
+  unusable sample and fails closed after two.
+- [x] The external factor has no added decay because it returned from 7.58 to
+  1 within 305 seconds under continued observation.
+- [x] A wait caused only by a foreign live lane reports `sharing N`. The value
+  is transient and cannot change the stored governor protocol.
+- [x] The five-second default is unchanged. The window had no changing REST
+  response, so it supports the conditional cost result but not a different
+  promise for a changing repository.
+- [x] Temporary instrumentation and its tests were removed before final
+  verification.

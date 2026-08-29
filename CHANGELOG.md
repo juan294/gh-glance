@@ -13,14 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observations come from conditional endpoint headers and one shared `/user`
   observer, while the free `rate_limit` probe remains the GraphQL authority.
   Response accounting and reservation settlement now commit atomically, so
-  concurrent panes cannot double-charge or overwrite a newer budget sample.
+  concurrent panes cannot double-charge, move an owner-established epoch, or
+  overwrite a newer budget sample.
 - **Unchanged Actions and Security checks no longer consume REST quota.** The
   dashboard now revalidates each REST endpoint with its cached ETag, while a
   manual refresh still requests fresh data and new Actions runs still appear.
 - **The footer stays calm while checks follow their safe schedule.** Scheduler
   holds now remain Watching, grant and reset details use coarse relative
-  minutes, and detail or stale text stays inside a fixed state region so key
-  hints do not move. Staleness also follows each tab's admitted request cadence.
+  minutes, and a wait caused only by other local panes says `sharing N`.
+  Detail or stale text stays inside a fixed state region so key hints do not
+  move. Staleness also follows each tab's admitted request cadence.
+- **GraphQL tolerates one unusable minute sample without a false hold.** Its
+  observation remains probe-owned and fails closed after two missed samples;
+  the response-header-backed core resource keeps its shorter freshness limit.
 
 ## [0.10.0] - 2026-08-19
 

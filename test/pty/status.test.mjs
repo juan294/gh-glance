@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { capture, isStatusLine, waitForAwk } from "./capture.mjs";
+import { capture, captureAsync, isStatusLine, waitForAwk } from "./capture.mjs";
 
 function configRoot(t, prefix) {
   const root = mkdtempSync(join(tmpdir(), prefix));
@@ -105,6 +105,74 @@ test("footer layout keeps semantic status and essential actions from 80 to 24 co
     assert.ok(result.liveScreen.maxStatusLines <= 1);
     assert.equal(result.liveScreen.lines.at(-1), "");
   }
+});
+
+test("four ample panes explain a shared lane without moving the hint group", async (t) => {
+  const box = sharedFixture(t);
+  const releasePath = join(box.root, "release-sharing-holders");
+  const holders = Array.from({ length: 3 }, (_, index) => captureAsync({
+    cols: 80,
+    rows: 20,
+    signal: "none",
+    settle: 25,
+    stdin: `i=0; while [ ! -f "${releasePath}" ] && [ "$i" -lt 400 ]; do ` +
+      "sleep .05; i=$((i + 1)); done; printf q",
+    args: "--refresh 40 --tab security",
+    configHome: box.root,
+    env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+      GH_GLANCE_FIXTURE_STATE: box.statePath,
+      GH_GLANCE_FIXTURE_PANE: `sharing-${index}`,
+    },
+  }));
+  let observer;
+  try {
+    const deadline = Date.now() + 10_000;
+    let leaseCount = 0;
+    while (Date.now() < deadline && leaseCount < 3) {
+      try {
+        const state = JSON.parse(readFileSync(governorPath(box.root), "utf8"));
+        leaseCount = Object.keys(state.leases).length;
+      } catch {
+        // The first atomic governor publication is transiently absent.
+      }
+      if (leaseCount < 3) await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    assert.equal(leaseCount, 3, "holder panes did not publish three live leases");
+    observer = await captureAsync({
+      cols: 80,
+      rows: 20,
+      signal: "none",
+      settle: 20,
+      stdin: waitForAwk(
+        '"$GH_GLANCE_CAPTURE_OUT"',
+        'index($0, "Watching sharing 4") { ok=1 }',
+        400,
+      ) + "printf q",
+      args: "--refresh 40 --tab security",
+      configHome: box.root,
+      env: {
+        GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+        GH_GLANCE_FIXTURE_STATE: box.statePath,
+        GH_GLANCE_FIXTURE_PANE: "sharing-observer",
+      },
+    });
+  } finally {
+    writeFileSync(releasePath, "release\n", { mode: 0o600 });
+    const settled = await Promise.allSettled(holders);
+    assert.equal(
+      settled.filter((result) => result.status === "rejected").length,
+      0,
+      settled.map((result) => result.reason?.message).filter(Boolean).join("\n"),
+    );
+  }
+  const statuses = observer.liveScreen.statusHistory;
+  const sharing = statuses.find((line) => /^· Watching sharing 4/.test(line));
+  const baseline = statuses.find((line) => !line.includes("sharing 4") && line.includes("Refresh"));
+  assert.ok(sharing, statuses.join(" -> "));
+  assert.ok(baseline, statuses.join(" -> "));
+  assert.ok(sharing.indexOf("Refresh") >= 0, sharing);
+  assert.equal(sharing.indexOf("Refresh"), baseline.indexOf("Refresh"));
 });
 
 test("Setup and NO_COLOR footers keep explicit semantic labels", (t) => {

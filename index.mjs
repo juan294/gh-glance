@@ -1346,7 +1346,15 @@ function operationCost(operation) {
 // is for the user's own `gh` and `git` commands.
 const BUDGET_SAFETY = 0.8;
 const BUDGET_RESERVE_FRACTION = 1 - BUDGET_SAFETY;
+// How often to re-read the budget. `gh api rate_limit` does not count against
+// the limit (verified, delta 0 -- see rateBudget) but it is still a subprocess,
+// so once a minute rather than once a tick: the quantity it measures moves on
+// the scale of minutes.
+const BUDGET_PROBE_MS = 60_000;
 const BUDGET_SNAPSHOT_TTL_MS = 65_000;
+// GraphQL has no response-header owner. One unusable minute sample must not
+// close admission, but two consecutive misses still do: 2 probes + 5s grace.
+const GRAPHQL_BUDGET_SNAPSHOT_TTL_MS = 2 * BUDGET_PROBE_MS + 5_000;
 const GOVERNOR_HEARTBEAT_MS = 20_000;
 const GOVERNOR_LEASE_TTL_MS = 90_000;
 const GOVERNOR_PROBE_LEASE_MS = 70_000;
@@ -1355,11 +1363,27 @@ const BUDGET_RESET_GRACE_MS = 2_000;
 const GOVERNOR_PHASE_WINDOW_MS = 5_000;
 const BUDGET_WINDOW_MS = 3_600_000;
 
-// How often to re-read the budget. `gh api rate_limit` does not count against
-// the limit (verified, delta 0 -- see rateBudget) but it is still a subprocess,
-// so once a minute rather than once a tick: the quantity it measures moves on
-// the scale of minutes.
-const BUDGET_PROBE_MS = 60_000;
+function budgetSnapshotTtl(resource) {
+  return resource === "graphql" ? GRAPHQL_BUDGET_SNAPSHOT_TTL_MS : BUDGET_SNAPSHOT_TTL_MS;
+}
+
+function sharedLaneProvenance(value) {
+  return value?.waitCause === "shared-lane" &&
+    Number.isSafeInteger(value?.sharingCount) && value.sharingCount > 1
+    ? { waitCause: "shared-lane", sharingCount: value.sharingCount }
+    : {};
+}
+
+function sharedLaneEvidence(value) {
+  const provenance = sharedLaneProvenance(value);
+  const ownerLeaseIds = Array.isArray(value?.sharingOwnerLeaseIds)
+    ? [...new Set(value.sharingOwnerLeaseIds.filter((leaseId) =>
+        typeof leaseId === "string" && leaseId.length > 0))]
+    : [];
+  return provenance.waitCause && ownerLeaseIds.length > 0
+    ? { ...provenance, sharingOwnerLeaseIds: ownerLeaseIds }
+    : {};
+}
 
 // Below this many completed shared calls in a probe window, external-spend
 // inference is noise. Under the threshold the loop retains the previous factor.
@@ -1410,6 +1434,23 @@ function leaseFor(leases, leaseId) {
   return leases instanceof Map ? leases.get(leaseId) : leases?.[leaseId];
 }
 
+function countLiveLeases(leases, nowMs) {
+  let count = 0;
+  const values = leases instanceof Map ? leases.values() : Object.values(leases);
+  for (const lease of values) {
+    if (Number.isFinite(lease?.expiresAt) && lease.expiresAt > nowMs) count += 1;
+  }
+  return count;
+}
+
+function currentSharedLaneProvenance(value, leases, nowMs) {
+  const evidence = sharedLaneEvidence(value);
+  if (!evidence.waitCause || countLiveLeases(leases, nowMs) !== evidence.sharingCount) return {};
+  return evidence.sharingOwnerLeaseIds.every((leaseId) => leaseFor(leases, leaseId)?.expiresAt > nowMs)
+    ? sharedLaneProvenance(evidence)
+    : {};
+}
+
 function reservationCost(reservation, resource, leases, nowMs) {
   if (!reservation || ["cancelled", "reconciled"].includes(reservation.status)) return 0;
   if (reservation.status === "scheduled") {
@@ -1428,6 +1469,7 @@ function reservationCost(reservation, resource, leases, nowMs) {
 
 function availableForGrant({
   budget,
+  resource = budget?.resource,
   reservations = [],
   leases = {},
   nowMs,
@@ -1435,8 +1477,9 @@ function availableForGrant({
 }) {
   const normalized = normalizeBudgetResource(budget);
   if (!normalized) return { mode: "probe", reason: "budget-unknown" };
+  if (!RATE_RESOURCES.includes(resource)) return { mode: "probe", reason: "budget-resource" };
   if (normalized.observedAt > nowMs) return { mode: "probe", reason: "budget-future" };
-  if (nowMs - normalized.observedAt > BUDGET_SNAPSHOT_TTL_MS) {
+  if (nowMs - normalized.observedAt > budgetSnapshotTtl(resource)) {
     return { mode: "probe", reason: "budget-stale" };
   }
   if (nowMs >= normalized.resetMs) return { mode: "probe", reason: "budget-reset" };
@@ -1462,7 +1505,7 @@ function availableForGrant({
 
   const reserve = resourceReserve(normalized.limit);
   const charged = chargedCost ?? reservations.reduce(
-    (total, reservation) => total + reservationCost(reservation, budget.resource, leases, nowMs),
+    (total, reservation) => total + reservationCost(reservation, resource, leases, nowMs),
     0,
   );
   return {
@@ -1508,7 +1551,8 @@ function resourceDecision({
   chargedCost = null,
 }) {
   const capacity = availableForGrant({
-    budget: budget && { ...budget, resource },
+    budget,
+    resource,
     reservations,
     leases,
     nowMs,
@@ -1716,6 +1760,7 @@ function scheduleIntents({
   const updatedCursors = { ...cursors };
   const grants = [];
   const denied = [];
+  const liveLeaseCount = countLiveLeases(leases, nowMs);
   const priorities = [...new Set(valid.map((intent) => intent.normalizedPriority))].sort((a, b) => a - b);
 
   for (const priority of priorities) {
@@ -1746,9 +1791,9 @@ function scheduleIntents({
         resource,
         governorEpochPhaseAt(intent.phaseSeed, decisions[resource]),
       ]));
+      const intrinsicAt = Math.max(nowMs, ...Object.values(phaseTimes));
       const notBefore = Math.max(
-        nowMs,
-        ...Object.values(phaseTimes),
+        intrinsicAt,
         ...resources.map((resource) => updatedLanes[resource]?.nextAt ?? nowMs),
       );
       const expiring = resources.find((resource) => notBefore >= decisions[resource].resetMs);
@@ -1774,6 +1819,18 @@ function scheduleIntents({
         status: "scheduled",
         epochs: Object.fromEntries(resources.map((resource) => [resource, decisions[resource].epoch])),
       };
+      const limitingLanes = resources.filter((resource) =>
+        updatedLanes[resource]?.nextAt === notBefore);
+      const sharingOwnerLeaseIds = [...new Set(limitingLanes.map((resource) =>
+        updatedCursors[resource]))];
+      const sharedLane = liveLeaseCount > 1 && notBefore > intrinsicAt &&
+        sharingOwnerLeaseIds.length > 0 && sharingOwnerLeaseIds.every((owner) =>
+          owner !== intent.leaseId && leaseFor(leases, owner)?.expiresAt > nowMs);
+      if (sharedLane) {
+        reservation.waitCause = "shared-lane";
+        reservation.sharingCount = liveLeaseCount;
+        reservation.sharingOwnerLeaseIds = sharingOwnerLeaseIds;
+      }
       grants.push(reservation);
       for (const resource of resources) {
         chargedTotals[resource] += intent.costs[resource];
@@ -2645,6 +2702,7 @@ function budgetFromObservation(raw, previous, nowMs, {
   source,
   receivedAt = nowMs,
   clearProvenBlock = false,
+  allowEpochChange = false,
 } = {}) {
   const normalized = normalizeBudgetResource({ ...raw, observedAt: receivedAt });
   if (
@@ -2653,6 +2711,13 @@ function budgetFromObservation(raw, previous, nowMs, {
     !["response-header", "core-observer", "rate-limit-probe"].includes(source) ||
     resource === "core" && source === "rate-limit-probe"
   ) return { status: "invalid" };
+  const epoch = `${normalized.limit}:${normalized.resetMs}`;
+  // Endpoint responses can carry cached or endpoint-specific rate headers.
+  // They may refine the counter inside the epoch established by its claimed
+  // observer, but only that observer may move the resource into a new epoch.
+  if (!allowEpochChange && (!previous || previous.epoch !== epoch)) {
+    return { status: "ignored", epoch };
+  }
   if (previous) {
     if (normalized.resetMs < previous.resetMs) return { status: "ignored" };
     if (normalized.resetMs === previous.resetMs && normalized.used < previous.used) {
@@ -2663,7 +2728,6 @@ function budgetFromObservation(raw, previous, nowMs, {
       receivedAt <= previous.observedAt
     ) return { status: "ignored" };
   }
-  const epoch = `${normalized.limit}:${normalized.resetMs}`;
   const epochChanged = !previous || previous.epoch !== epoch;
   const preserveBlock = !clearProvenBlock || !epochChanged;
   const blockActive = preserveBlock && Number.isFinite(previous?.blockUntil) && previous.blockUntil > nowMs;
@@ -2702,12 +2766,14 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs) {
       if (!supplied) continue;
       const raw = supplied.budget ?? supplied;
       const source = supplied.source ?? (resource === "core" ? "core-observer" : "rate-limit-probe");
-      if (resource === "core" && source === "rate-limit-probe") continue;
+      const ownerSource = resource === "core" ? "core-observer" : "rate-limit-probe";
+      if (source !== ownerSource) return { ok: false, reason: "corrupt" };
       const observed = budgetFromObservation(raw, state.budgets[resource], at, {
         resource,
         source,
         receivedAt: supplied.receivedAt ?? at,
         clearProvenBlock: true,
+        allowEpochChange: true,
       });
       if (observed.status === "invalid") return { ok: false, reason: "corrupt" };
       if (observed.status === "ignored") continue;
@@ -2780,7 +2846,11 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs) {
     if (resetResources.length > 0) state.manualProbe = null;
     else if (state.manualProbe &&
       Object.values(nextEpochs).includes(state.manualProbe.requestedEpoch) &&
-      RATE_RESOURCES.some((resource) => availableForGrant({ budget: nextBudgets[resource], nowMs: at }).spendable === 0)) {
+      RATE_RESOURCES.some((resource) => availableForGrant({
+        budget: nextBudgets[resource],
+        resource,
+        nowMs: at,
+      }).spendable === 0)) {
       state.manualProbe.satisfiedAt = at;
     }
     scheduleGovernorState(state, at);
@@ -2864,9 +2934,15 @@ function registerIntent(scope, intent) {
     state.intents[intent.id] = normalized;
     const scheduled = scheduleGovernorState(state, nowMs);
     const reservation = state.reservations[reservationId];
+    const grant = scheduled.grants.find((item) => item.id === reservationId);
     const denial = scheduled.denied.find((item) => item.intentId === intent.id);
     return { value: reservation
-      ? { status: "scheduled", reservationId, ...reservation }
+      ? {
+          status: "scheduled",
+          reservationId,
+          ...reservation,
+          ...sharedLaneEvidence(grant),
+        }
       : {
           status: denial?.mode ?? "pending",
           intentId: intent.id,
@@ -2884,7 +2960,13 @@ function readIntentDecision(scope, intentId, nowMs) {
     const scheduled = scheduleGovernorState(state, at);
     const reservationId = `reservation:${intentId}`;
     const reservation = state.reservations[reservationId];
-    if (reservation) return { value: { status: reservation.status, reservationId, ...reservation } };
+    const grant = scheduled.grants.find((item) => item.id === reservationId);
+    if (reservation) return { value: {
+      status: reservation.status,
+      reservationId,
+      ...reservation,
+      ...sharedLaneEvidence(grant),
+    } };
     if (!state.intents[intentId]) return { ok: false, reason: "stale" };
     const denial = scheduled.denied.find((item) => item.intentId === intentId);
     return { value: {
@@ -2930,7 +3012,7 @@ function startReservation(scope, reservationId, nowMs) {
     for (const resource of RATE_RESOURCES.filter((name) => reservation.costs[name] > 0)) {
       const budget = state.budgets[resource];
       if (
-        !budget || at - budget.observedAt > BUDGET_SNAPSHOT_TTL_MS || at >= budget.resetMs ||
+        !budget || at - budget.observedAt > budgetSnapshotTtl(resource) || at >= budget.resetMs ||
         state.epochs[resource] !== reservation.epochs[resource] ||
         (Number.isFinite(budget.blockUntil) && budget.blockUntil > at)
       ) {
@@ -2996,7 +3078,8 @@ function settleReservationWithBudgetObservations(
     }
     const observations = Array.isArray(completion.observations) ? completion.observations : [];
     if (observations.some((observation) =>
-      !isRecord(observation) || !Number.isFinite(observation.receivedAt) || observation.receivedAt > at)) {
+      !isRecord(observation) || observation.source !== "response-header" ||
+      !Number.isFinite(observation.receivedAt) || observation.receivedAt > at)) {
       return { ok: false, reason: "corrupt" };
     }
     const acceptedCosts = { core: 0, graphql: 0 };
@@ -3026,7 +3109,7 @@ function settleReservationWithBudgetObservations(
           }
         } else if (
           observation.source === "response-header" &&
-          state.budgets[resource]?.resetMs === observation.resetMs &&
+          state.budgets[resource]?.epoch === `${observation.limit}:${observation.resetMs}` &&
           state.budgets[resource].used >= observation.used
         ) {
           // A newer same-window counter already includes this completed call.
@@ -3119,7 +3202,8 @@ function governorHealth(result, nowMs = Date.now()) {
   const state = result.value;
   let status = "healthy";
   if (state.probeClaim?.leaseUntil > nowMs) status = "waiting for probe";
-  else if (RATE_RESOURCES.some((resource) => !state.budgets[resource] || nowMs - state.budgets[resource].observedAt > BUDGET_SNAPSHOT_TTL_MS)) status = "stale";
+  else if (RATE_RESOURCES.some((resource) => !state.budgets[resource] ||
+    nowMs - state.budgets[resource].observedAt > budgetSnapshotTtl(resource))) status = "stale";
   else if (RATE_RESOURCES.some((resource) => state.budgets[resource].blockUntil > nowMs)) status = "blocked";
   return {
     status,
@@ -3170,7 +3254,7 @@ async function refreshSharedBudget(scope, leaseId, signal, {
       if (
         RATE_RESOURCES.every((resource) =>
           snapshot.value.budgets[resource] &&
-          now() - snapshot.value.budgets[resource].observedAt <= BUDGET_SNAPSHOT_TTL_MS,
+          now() - snapshot.value.budgets[resource].observedAt <= budgetSnapshotTtl(resource),
         ) && snapshot.value.probeOutcome.status === "healthy"
       ) {
         return { ok: true, value: { status: "published", budgets: snapshot.value.budgets } };
@@ -6183,7 +6267,7 @@ function governorProtocolReady(refreshResult, snapshot, nowMs) {
   if (snapshot.value.probeClaim || snapshot.value.probeOutcome?.status !== "healthy") return false;
   return RATE_RESOURCES.every((resource) => {
     const budget = snapshot.value.budgets[resource];
-    return budget && nowMs - budget.observedAt <= BUDGET_SNAPSHOT_TTL_MS;
+    return budget && nowMs - budget.observedAt <= budgetSnapshotTtl(resource);
   });
 }
 
@@ -6193,8 +6277,9 @@ function governorDataReady(refreshResult, snapshot, activeKey, nowMs) {
   return RATE_RESOURCES.every((resource) => {
     if (costs[resource] <= 0) return true;
     const budget = snapshot.value.budgets[resource];
-    return budget && nowMs - budget.observedAt <= BUDGET_SNAPSHOT_TTL_MS &&
-      budget.blockUntil <= nowMs && availableForGrant({ budget, nowMs }).mode === "open";
+    return budget && nowMs - budget.observedAt <= budgetSnapshotTtl(resource) &&
+      budget.blockUntil <= nowMs &&
+      availableForGrant({ budget, resource, nowMs }).mode === "open";
   });
 }
 
@@ -6655,9 +6740,10 @@ function refreshStatus({
     return status("paused", "paused", "Paused", "attention", false, detailKind);
   }
   if (["waiting", "pending", "probe"].includes(mode)) {
-    const watchingDetail = Number.isFinite(governorDecision?.notBefore)
-      ? "next"
-      : detailKind;
+    const sharing = sharedLaneProvenance(governorDecision).waitCause === "shared-lane";
+    const watchingDetail = sharing
+      ? "sharing"
+      : Number.isFinite(governorDecision?.notBefore) ? "next" : detailKind;
     return status("watching", "watching", "Watching", "inert", false, watchingDetail);
   }
   if (activeError) return status("failed", "failed", "Failed", "attention");
@@ -6676,6 +6762,12 @@ function statusInterval(at, nowMs = Date.now()) {
 function statusDetailVariants(status, detail, nowMs) {
   if (!status?.detailKind) return [];
   if (status.detailKind === "probing") return ["probing"];
+  if (status.detailKind === "sharing") {
+    const sharing = sharedLaneProvenance(detail);
+    return sharing.waitCause
+      ? [`sharing ${sharing.sharingCount}`]
+      : [];
+  }
   const at = status.detailKind === "next" ? detail?.notBefore : detail?.resetMs;
   const interval = statusInterval(at, nowMs);
   if (!interval) return [];
@@ -6815,6 +6907,8 @@ function sameVisibleGovernorDecision(left, right) {
     "resource",
     "probing",
     "detailKind",
+    "waitCause",
+    "sharingCount",
     "coordinationError",
     "reservationId",
   ]) {
@@ -7712,6 +7806,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           status: "scheduled",
           reservationId: `reservation:${pendingIntent.intentId}`,
           ...reservation,
+          ...currentSharedLaneProvenance(pendingIntent, snapshot.value.leases, nowMs),
         }));
         return;
       }
@@ -8217,8 +8312,14 @@ function App({ onCreateRemote = () => {} } = {}) {
         pauseCoordination(key, registered.reason);
         return Promise.resolve({ persisted: false, retry: true, kind });
       }
-      pending.set(key, { intentId, kind, force, wasDeferred: false });
       const decision = registered.value;
+      pending.set(key, {
+        intentId,
+        kind,
+        force,
+        wasDeferred: false,
+        ...sharedLaneEvidence(decision),
+      });
       if (decision.status !== "scheduled" || decision.notBefore > nowMs) {
         const item = pending.get(key);
         if (item) item.wasDeferred = true;
@@ -8302,7 +8403,10 @@ function App({ onCreateRemote = () => {} } = {}) {
         }
         if (decision.value.status !== "scheduled" || decision.value.notBefore > nowMs) {
           item.wasDeferred = true;
-          setTabGovernorDecision(key, visibleGovernorDecision(decision.value));
+          setTabGovernorDecision(key, visibleGovernorDecision({
+            ...decision.value,
+            ...sharedLaneProvenance(decision.value),
+          }));
           setTabWaiting(key, true);
           armWake("data", decision.value.retryAt ?? decision.value.notBefore ?? nowMs + runtime.refreshMs, dataWake);
           continue;
@@ -8320,6 +8424,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           setTabGovernorDecision(key, visibleGovernorDecision({
             ...decision.value,
             ...started.value,
+            ...sharedLaneProvenance(decision.value),
           }));
           armWake("data", started.value.notBefore ?? nowMs + runtime.refreshMs, dataWake);
           continue;
@@ -8359,7 +8464,9 @@ function App({ onCreateRemote = () => {} } = {}) {
       const wakes = governorWakeTimes(snapshot.value, nowMs, runtime.refreshMs, leaseId);
       const heldResources = Object.fromEntries(RATE_RESOURCES.map((resource) => {
         const budget = snapshot.value.budgets[resource];
-        const decision = budget ? availableForGrant({ budget, nowMs }) : { mode: "paused" };
+        const decision = budget
+          ? availableForGrant({ budget, resource, nowMs })
+          : { mode: "paused" };
         const held = !budget || budget.blockUntil > nowMs || decision.mode !== "open";
         const retryAt = budget?.blockUntil > nowMs
           ? budget.blockUntil
@@ -9237,6 +9344,9 @@ export {
   BUDGET_SAFETY,
   BUDGET_RESERVE_FRACTION,
   BUDGET_SNAPSHOT_TTL_MS,
+  GRAPHQL_BUDGET_SNAPSHOT_TTL_MS,
+  budgetSnapshotTtl,
+  currentSharedLaneProvenance,
   GOVERNOR_HEARTBEAT_MS,
   GOVERNOR_LEASE_TTL_MS,
   GOVERNOR_PROBE_LEASE_MS,

@@ -135,3 +135,97 @@
   then passed unchanged when its complete module ran in a fresh process.
 - The protected exhaustion and reset/external-burn governor cases passed with
   their predicates and assertions unchanged.
+
+### Phase 5 live mixed-epoch correction
+
+- **Plan said:** Any endpoint response header with a non-rewound reset could
+  advance the stored core epoch.
+- **Found:** GitHub returned different core reset epochs from different REST
+  endpoints at the same time. A later endpoint epoch could replace the `/user`
+  observer epoch, after which authoritative samples for the real shared window
+  were rejected as rewinds.
+- **Chose:** Only the claimed observer can establish or move an epoch. Response
+  settlement accepts only `response-header` samples whose full
+  `(limit, resetMs)` epoch matches that owner epoch, then applies monotonic
+  counter ordering inside it.
+- **Why:** The owner remains authoritative while useful endpoint counters still
+  close the loop. In the accepted hour, 1,125 endpoint headers matched the
+  owner epoch and 1,722 endpoint-specific headers were safely ignored.
+
+## Phase 6 measurement and tuning
+
+### Window and method
+
+- Four real panes ran continuously from 2026-08-29 22:02:17 to 23:02:17 CEST.
+  A 2-second private governor sampler recorded 1,782 samples; its maximum gap
+  was 3 seconds, and every sample contained four live leases.
+- The window crossed the real core reset at 22:36:53 CEST. The next owner
+  sample established the new epoch. Only one REST response completed in second
+  3 after reset, three in second 4, none in seconds 5 through 13, and two in
+  second 14, so there was no synchronized reset burst.
+- Temporary JSONL instrumentation accepted only operation names, status kinds,
+  response codes, declared costs, numeric rate fields, and source labels. It
+  excluded targets, paths, IDs, titles, bodies, tokens, and error text, and was
+  removed before the final candidate.
+
+### Measured cost and conditional results
+
+- Actions made 528 runs and 528 workflows requests. Security made 1,791 alert
+  requests. All 2,847 data REST responses were `304`; 59 conditional `/user`
+  observer responses were also `304`. The measured panes used 0 attributable
+  core units in the window.
+- Issues and pull requests completed 760 and 789 successful two-unit GraphQL
+  operations. Their declared attributable load was 3,098 units.
+- Core remaining never fell below 2,775 of 5,000. GraphQL reported 5,000 of
+  5,000 throughout. Both stayed above the 1,000-unit hard reserve.
+
+### Status and freshness
+
+- Actions spent 286.200 seconds Checking, 3,308.543 seconds Watching, and
+  0.318 seconds Paused. Issues spent 391.199 seconds Checking, 3,148.992
+  seconds Watching, 54.275 seconds Paused, and 1.955 seconds Failed. Pull
+  requests spent 268.680 seconds Checking, 3,304.131 seconds Watching, 22.405
+  seconds Paused, and 2.961 seconds Failed. Security spent 208.448 seconds
+  Checking, 1,943.178 seconds Watching, and 1,448.275 seconds Failed because an
+  alert source was unavailable. No pane stayed inert.
+- Core observation age peaked at 60.813 seconds and had no 65-second stale
+  transition. GraphQL age peaked at 122.591 seconds and crossed the old
+  65-second TTL in two episodes when one minute sample could not advance its
+  sliding epoch.
+
+### Decisions
+
+- Keep `BUDGET_PROBE_MS = 60_000` and the core
+  `BUDGET_SNAPSHOT_TTL_MS = 65_000`. Core headers maintained freshness between
+  owner probes, and the probe still owns bootstrap, exhaustion recovery,
+  external-burn detection, and GraphQL observation.
+- Set the GraphQL TTL to `2 * 60_000 + 5_000 = 125_000` ms. The derivation is
+  two probe periods plus the existing 5-second grace. It covers the measured
+  122.591-second worst case, produces zero stale episodes for this window, and
+  still fails closed after two consecutive unusable observations.
+- Do not add factor decay. The valid-window factor peaked at 7.58, returned to
+  1 within 305 seconds, and ended at 1.21 while other existing local consumers
+  continued to use the account. Two earlier controlled burns of about 500
+  units also tightened pacing within one probe and then converged naturally.
+- Add transient `sharing N` copy for a wait caused only by a lane owned by
+  another live lease. Four-pane PTY evidence shows `Watching sharing 4` and the
+  same hint start column as settled Watching. Stored reservations retain their
+  exact v2 shape.
+- Keep the five-second default. Every measured REST data response was a free
+  `304`, but no `200` change occurred in the accepted hour. The observation
+  therefore does not justify changing the floor or claiming a measured
+  changed-repository latency.
+
+### Phase 6 final verification
+
+- `node --check index.mjs`, `npm run lint`, all 295 unit and real-filesystem
+  tests, `node index.mjs --help`, and `git diff --check` passed on the final
+  candidate.
+- All 95 PTY cases passed in isolated module processes. The protected
+  exhausted-core and reset/external-burn cases passed with their predicates and
+  assertions unchanged.
+- The simplify review removed hot-path budget clones and scheduler allocations,
+  centralized sharing validation, reduced the new four-pane PTY from a fixed
+  15-second hold to a readiness handshake, rejected wrong-source core probe
+  publication, and revalidates transient sharing evidence against current live
+  leases. No measurement-only code or test remains.

@@ -88,7 +88,7 @@ current.
   unavailable budget; **Failed** names a normal fetch error; and **Limited**
   means Security visibility is incomplete. Startup and manual Checking can
   animate. Adapted automatic checks, Watching, Paused, Failed, and Limited are
-  static
+  static. A pure shared-lane wait adds `sharing N` without moving the key hints
 - Row state icons are real GitHub Octicons (via the Nerd Font glyph set), not emoji
   -- with a plain-ASCII fallback for terminals without one
 - Readable without colour: severity has its own column, a failing newest run puts
@@ -561,7 +561,9 @@ reservations, and observed external spend. Startup and each new reset epoch add
 a stable per-pane phase, so panes do not resume as a herd. There is no
 60-second maximum: if the next safe slot is farther away, the pane waits that
 long. `next 2m` is the coarse time until one current grant, not a promise of a
-recurring polling interval. The detail is capped at `99m+`.
+recurring polling interval. When another live local pane alone owns the lane
+ahead of this pane, the detail says `sharing N` instead. The detail is capped
+at `99m+`.
 
 When a refresh fails, the last successful rows stay visible below the live
 error instead of disappearing. If gh-glance is restarted while GitHub is still
@@ -674,6 +676,7 @@ GH_GLANCE_ICONS=ascii gh-glance
 | A tab's count is red | That tab's last fetch failed. The error itself is shown when you switch to it, translated into what to do about it where `gh-glance` recognises the failure. |
 | Security tab shows `?` instead of a number | The alert endpoints could not be read at all -- an expired SAML session, a token without `security_events`, or an org OAuth restriction. `?` means "unknown", not "zero"; run `gh-glance --doctor` to see which probe failed and how it was classified. |
 | `Watching` with `next 2m` | The active tab has a shared budget probe or safe grant scheduled. The interval names this grant only; it is not a recurring polling interval. Pressing `r` raises safe priority but cannot bypass the lane or reserve. |
+| `Watching` with `sharing 4` | Four local panes share this account governor, and another pane owns the lane immediately ahead of this grant. This is pacing, not quota scarcity. |
 | `Paused` with a reset time | The active tab's REST or GraphQL resource is at its reserve, exhausted, or under a shared rate-limit block. Wait for the stated reset/probe. Other tabs can continue when they use the healthy resource. |
 | `Paused` without a reset time | Budget or coordinator evidence is unknown, corrupt, locked, or unwritable. No data call is started. Run `gh-glance --doctor`; also check the config directory permissions and whether another live process owns its private lock. |
 | A failing tab seems to have stopped retrying | Recognized endpoint failures back off rather than re-spawning `gh` at the floor. Press `r` to request a higher-priority retry; the backoff clears only after a safe grant, so the tab remains Watching or Paused. |

@@ -136,7 +136,8 @@ Worth knowing about the app's shape before changing it:
   interval. Started, interrupted, and uncertain reservations remain charged
   until completion evidence and a later clean probe account for them.
 - Loading and animated Checking state begin only after admission. A pending or
-  denied request is Waiting or Paused and makes no quota-consuming `gh` call.
+  scheduled request is Watching; an unsafe request is Paused. Neither starts a
+  quota-consuming `gh` call before admission.
 - The polling effect's empty dependency array is deliberate. Every value it
   needs is read through a ref precisely so the interval is created once; adding
   dependencies would rebuild it on every tab keypress and every resize and
