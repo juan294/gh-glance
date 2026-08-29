@@ -1571,6 +1571,7 @@ const GOVERNOR_PROBE_DRAIN_MS = 30_000;
 const GOVERNOR_PUBLICATION_REINSPECT_MS = 1_000;
 const GOVERNOR_PROBE_TRANSITION_MS = 5_000;
 const GOVERNOR_MAX_FUTURE_MS = 24 * 60 * 60 * 1000;
+const persistenceWaitCell = new Int32Array(new SharedArrayBuffer(4));
 const GOVERNOR_OUTCOMES = new Set([
   "measured-success",
   "rejected",
@@ -3673,6 +3674,14 @@ function helpLines(maxRows) {
   const all = keyTableLines();
   if (all.length <= rows) return all;
   if (rows === 1) return [`… ${all.length} keys: gh-glance --help`];
+  if (rows === 4) {
+    return [
+      all[9],
+      all[6],
+      "Ent/jk Open the selected/Move the cursor",
+      `… ${all.length - 4} more: gh-glance --help`,
+    ];
+  }
   const priority = [9, 6, 5, 3, 0, 7, 8, 1, 2, 4]
     .slice(0, rows - 1)
     .map((index) => all[index]);
@@ -4772,7 +4781,6 @@ function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-const persistenceWaitCell = new Int32Array(new SharedArrayBuffer(4));
 const PERSISTENCE_LOCK_WAIT_MS = 250;
 const PERSISTENCE_STALE_LOCK_MS = 5000;
 
@@ -5890,6 +5898,7 @@ const REMOTE_SETUP_NONINTERACTIVE_LINES = [
 // Reserved so the hints never shift when the active tab changes state. Every
 // status label below fits this fixed cell in both icon profiles.
 const REFRESH_STATUS_WIDTH = 12;
+const NOTICE_ROWS = 1;
 
 const REFRESH_STATUS_GLYPHS = Object.freeze({
   unicode: Object.freeze({
@@ -6443,8 +6452,7 @@ function App({ onCreateRemote = () => {} } = {}) {
   // Counts the lines actually rendered, not the notes collected -- getting this
   // wrong by one row is what makes ink repaint the whole frame.
   const extraLines =
-    (tabError && !remoteSetup ? 1 : 0) +
-    (activeGovernorDecision?.coordinationError && !remoteSetup ? 1 : 0) +
+    NOTICE_ROWS +
     (tab.key === "security" && !remoteSetup ? securityLines.length : 0);
   // Reserve lines for: the tab bar and the divider under it (2), the panel's
   // top and bottom edges (2), the column header and its separator (2), and
@@ -7813,6 +7821,11 @@ function App({ onCreateRemote = () => {} } = {}) {
 
   const items = data[tab.key];
   const displayError = formatTabErrorForWidth(tabError, failureContext, Math.max(1, cols - 5));
+  const coordinationError = activeGovernorDecision?.coordinationError && !remoteSetup;
+  const noticeLine = coordinationError
+    ? `API coordination unavailable (${activeGovernorDecision.reason}); retrying safely`
+    : !remoteSetup && displayError ? displayError : "";
+  const noticeTone = coordinationError ? ATTENTION : displayError ? ERROR_TEXT : undefined;
   const spin = SPINNER[frame % SPINNER.length];
 
   const counts = Object.fromEntries(
@@ -8075,20 +8088,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       !showHelp &&
         tooNarrow &&
         e(Text, { dimColor: true, wrap: "truncate-end" }, "too narrow"),
-      !showHelp &&
-        !tooNarrow &&
-        !remoteSetup &&
-        activeGovernorDecision?.coordinationError &&
-        e(
-          Text,
-          { color: ATTENTION, wrap: "truncate-end" },
-          `API coordination unavailable (${activeGovernorDecision.reason}); retrying safely`,
-        ),
-      !showHelp &&
-        !tooNarrow &&
-        !remoteSetup &&
-        displayError &&
-        e(Text, { color: ERROR_TEXT, wrap: "truncate-end" }, displayError),
+      e(Text, { color: noticeTone, wrap: "truncate-end" }, noticeLine),
       !showHelp &&
         !tooNarrow &&
         !remoteSetup &&

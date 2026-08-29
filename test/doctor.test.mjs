@@ -12,11 +12,11 @@ import { execFile } from "node:child_process";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 
-import { redact, classify } from "../index.mjs";
+import { classify, createGovernorScope, redact } from "../index.mjs";
 
 const execFileAsync = promisify(execFile);
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -132,6 +132,29 @@ test("--doctor reports governor health without a raw scope identifier", async (t
   assert.match(out, /^status {12}healthy$/m);
   assert.match(out, /^live leases {7}0$/m);
   assert.ok(!/rate-governor-v1-|[0-9a-f]{64}/.test(out), out);
+});
+
+test("--doctor fails closed instead of touching an uninitialized lock wait cell", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-live-lock-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = createGovernorScope({
+    effectiveHost: "github.com",
+    env: { ...process.env, XDG_CONFIG_HOME: root },
+  });
+  assert.equal(scope.ok, true);
+  mkdirSync(dirname(scope.value.path), { recursive: true, mode: 0o700 });
+  writeFileSync(
+    `${scope.value.path}.lock`,
+    `${JSON.stringify({ pid: process.pid, nonce: "doctor-live-test-owner" })}\n`,
+    { mode: 0o600 },
+  );
+
+  const out = await doctor({
+    env: { XDG_CONFIG_HOME: root },
+    args: ["--repo", "acme/widget"],
+  });
+  assert.match(out, /gh-glance doctor/);
+  assert.match(out, /API governor\n------------/);
 });
 
 test("--doctor never prints a token that was planted in its environment", async () => {

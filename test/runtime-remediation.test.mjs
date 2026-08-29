@@ -393,6 +393,8 @@ test("short help always includes exit, refresh, and an explicit continuation cue
   assert.equal(lines.length, 4);
   assert.ok(lines.some((line) => /Quit/.test(line)));
   assert.ok(lines.some((line) => /Refresh/.test(line)));
+  assert.ok(lines.some((line) => /Open the selected/.test(line)));
+  assert.ok(lines.some((line) => /Move the cursor/.test(line)));
   assert.ok(lines.some((line) => /more|closes/.test(line)));
 });
 

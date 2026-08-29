@@ -354,6 +354,51 @@ test("corrupt, live-locked, and blocked storage pause with no data calls", (t) =
   assert.equal(dataStarts(blocked.read()).length, 0);
 });
 
+test("a coordination notice can appear and clear without overflowing the frame", (t) => {
+  const root = configRoot(t, "gh-glance-status-notice-transition-");
+  capture({
+    cols: 80,
+    rows: 12,
+    signal: "none",
+    settle: 15,
+    stdin: quitAfterCached("actions"),
+    configHome: root,
+  });
+  const noticeLock = `${governorPath(root)}.lock`;
+  const result = capture({
+    cols: 80,
+    rows: 12,
+    signal: "none",
+    settle: 25,
+    stdin:
+      waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Watching") { ok=1 }') +
+      'printf \'{"pid":%s,"nonce":"notice-transition-owner"}\\n\' "$$" > "$GH_GLANCE_NOTICE_LOCK"; ' +
+      waitForAwk(
+        '"$GH_GLANCE_CAPTURE_OUT"',
+        'index($0, "API coordination unavailable") { ok=1 }',
+        200,
+      ) +
+      `watching=$(${captureCount("Watching")}); ` +
+      'rm -f "$GH_GLANCE_NOTICE_LOCK"; ' +
+      'i=0; current=$watching; while [ "$current" -le "$watching" ] && [ $i -lt 200 ]; ' +
+      `do i=$((i + 1)); sleep .1; current=$(${captureCount("Watching")}); ` +
+      'done; sleep .3; printf q',
+    configHome: root,
+    env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+      GH_GLANCE_NOTICE_LOCK: noticeLock,
+    },
+  });
+
+  assert.match(result.raw, /API coordination unavailable/);
+  assert.doesNotMatch(result.finalFrame.lines.join("\n"), /API coordination unavailable/);
+  assert.ok(result.liveScreen.statusHistory.some((line) => /^‖ Paused/.test(line)));
+  assert.match(statusLine(result) ?? "", /^· (?:Watching|Waiting)/);
+  assert.ok(result.fullClears <= 2, `${result.fullClears} full clears during notice transition`);
+  assert.equal(result.liveScreen.maxStatusLines, 1);
+  assert.equal(result.finalFrame.lines.length, 11);
+});
+
 test("a non-budget failure settles on Failed and stops status motion", (t) => {
   const result = capture({
     cols: 80,
