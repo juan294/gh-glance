@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The footer stays calm while checks follow their safe schedule.** Scheduler
+  holds now remain Watching, grant and reset details use coarse relative
+  minutes, and detail or stale text stays inside a fixed state region so key
+  hints do not move. Staleness also follows each tab's admitted request cadence.
+
 ## [0.10.0] - 2026-08-19
 
 ### Fixed
@@ -24,10 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Startup, reset, polling, and status now reflect the shared safe schedule.**
   Stable pane phases spread startup and post-reset work, active checks precede
   one rotating background check, and the old 60-second pacing ceiling is gone.
-  The active footer says Watching, Checking, Waiting, Paused, Failed, or Limited.
-  Startup and manual Checking animate while admitted; adapted automatic checks
-  and non-working states stay static. `next HH:MM` names one current grant, not
-  a recurring interval.
+  The active footer reports an explicit semantic state. Startup and manual
+  Checking animate while admitted; adapted automatic checks and non-working
+  states stay static. The next-grant detail names one current grant, not a
+  recurring interval.
 
 ## [0.9.1] - 2026-08-11
 

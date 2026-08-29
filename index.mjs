@@ -3730,8 +3730,8 @@ from the git remote, the same way \`gh\` does it. Requires the \`gh\` CLI
 
 On a healthy single pane, the active tab is considered every ${REFRESH_MS / 1000}s and each
 background tab about every ${(REFRESH_MS * BACKGROUND_EVERY) / 1000}s. Quota-consuming calls still
-need a shared, resource-specific grant that preserves a hard reserve. Waiting
-and manual refresh do not bypass that safety check.
+need a shared, resource-specific grant that preserves a hard reserve. Scheduled
+checks and manual refresh do not bypass that safety check.
 
 Row icons are GitHub Octicons and need a Nerd Font. Without one, set
 GH_GLANCE_ICONS=unicode for Unicode status glyphs and text row substitutes, or
@@ -5898,6 +5898,10 @@ const REMOTE_SETUP_NONINTERACTIVE_LINES = [
 // Reserved so the hints never shift when the active tab changes state. Every
 // status label below fits this fixed cell in both icon profiles.
 const REFRESH_STATUS_WIDTH = 12;
+const WIDE_STATE_WIDTH = REFRESH_STATUS_WIDTH + 1 + 12;
+// StatusBar receives the drawable frame width, which is one column narrower
+// than the terminal. A 44-cell threshold preserves the 45-column contract.
+const WIDE_STATE_MIN_COLS = 44;
 const NOTICE_ROWS = 1;
 
 const REFRESH_STATUS_GLYPHS = Object.freeze({
@@ -5905,7 +5909,6 @@ const REFRESH_STATUS_GLYPHS = Object.freeze({
     setup: "·",
     checking: SPINNER[0],
     paused: "‖",
-    waiting: "·",
     failed: "!",
     limited: "?",
     watching: "·",
@@ -5914,7 +5917,6 @@ const REFRESH_STATUS_GLYPHS = Object.freeze({
     setup: ".",
     checking: ".",
     paused: "|",
-    waiting: ".",
     failed: "!",
     limited: "?",
     watching: ".",
@@ -5963,30 +5965,31 @@ function refreshStatus({
     return status("paused", "paused", "Paused", "attention", false, detailKind);
   }
   if (["waiting", "pending", "probe"].includes(mode)) {
-    const waitingDetail = Number.isFinite(governorDecision?.notBefore)
+    const watchingDetail = Number.isFinite(governorDecision?.notBefore)
       ? "next"
       : detailKind;
-    return status("waiting", "waiting", "Waiting", "inert", false, waitingDetail);
+    return status("watching", "watching", "Watching", "inert", false, watchingDetail);
   }
   if (activeError) return status("failed", "failed", "Failed", "attention");
   if (securityIncomplete) return status("limited", "limited", "Limited", "attention");
   return status("watching", "watching", "Watching", "inert");
 }
 
-function statusTime(at) {
-  if (!Number.isFinite(at)) return null;
-  const date = new Date(at);
-  if (!Number.isFinite(date.getTime())) return null;
-  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+function statusInterval(at, nowMs = Date.now()) {
+  if (!Number.isFinite(at) || !Number.isFinite(nowMs)) return null;
+  const remaining = at - nowMs;
+  if (remaining < 60_000) return "<1m";
+  const minutes = Math.ceil(remaining / 60_000);
+  return minutes > 99 ? "99m+" : `${minutes}m`;
 }
 
-function statusDetailVariants(status, detail) {
+function statusDetailVariants(status, detail, nowMs) {
   if (!status?.detailKind) return [];
   if (status.detailKind === "probing") return ["probing"];
   const at = status.detailKind === "next" ? detail?.notBefore : detail?.resetMs;
-  const time = statusTime(at);
-  if (!time) return [];
-  return [`${status.detailKind} ${time}`, time];
+  const interval = statusInterval(at, nowMs);
+  if (!interval) return [];
+  return [`${status.detailKind} ${interval}`, interval];
 }
 
 function statusBarLayout({
@@ -5996,20 +5999,25 @@ function statusBarLayout({
   status,
   detail = null,
   stale = null,
+  nowMs = Date.now(),
   version: currentVersion = "",
 } = {}) {
   const width = Number.isSafeInteger(cols) ? Math.max(0, cols) : 0;
   const hints = Array.isArray(availableHints) ? availableHints : [];
   const mandatory = hints.filter(isMandatoryHint);
   const optional = hints.filter((hint) => !isMandatoryHint(hint));
-  let used = Math.min(width, REFRESH_STATUS_WIDTH);
+  const stateWidth = width >= WIDE_STATE_MIN_COLS
+    ? Math.min(width, WIDE_STATE_WIDTH)
+    : Math.min(width, REFRESH_STATUS_WIDTH);
+  let used = stateWidth;
   const selectedHints = [];
   const separatorWidth = () => selectedHints.length > 0 ? 1 : 0;
   const addHint = (hint, showLabel) => {
     const text = showLabel ? `${hint.label}: ${hint.keys}` : hint.keys;
-    const cost = separatorWidth() + [...text].length;
+    const separator = separatorWidth();
+    const cost = separator + [...text].length;
     if (used + cost > width) return false;
-    selectedHints.push({ ...hint, showLabel, text });
+    selectedHints.push({ ...hint, showLabel, text, start: used + separator });
     used += cost;
     return true;
   };
@@ -6029,19 +6037,16 @@ function statusBarLayout({
     else addHint(hint, false);
   }
 
-  let selectedDetail = null;
-  for (const candidate of statusDetailVariants(status, detail)) {
-    const cost = (selectedHints.length > 0 ? 1 : 0) + candidate.length;
-    if (used + cost <= width) {
-      selectedDetail = candidate;
-      used += cost;
-      break;
-    }
-  }
-
+  const payloadWidth = stateWidth > REFRESH_STATUS_WIDTH
+    ? stateWidth - REFRESH_STATUS_WIDTH - 1
+    : 0;
   const staleText = typeof stale === "string" ? stale : null;
-  const selectedStale = staleText && used + 1 + staleText.length <= width ? staleText : null;
-  if (selectedStale) used += 1 + selectedStale.length;
+  const selectedStale = staleText && [...staleText].length <= payloadWidth ? staleText : null;
+  let selectedDetail = null;
+  if (!selectedStale) {
+    selectedDetail = statusDetailVariants(status, detail, nowMs)
+      .find((candidate) => [...candidate].length <= payloadWidth) ?? null;
+  }
 
   for (const hint of optional) {
     if (!addHint(hint, true)) addHint(hint, false);
@@ -6050,7 +6055,7 @@ function statusBarLayout({
   const versionText = String(currentVersion ?? "");
   const showVersion = versionText.length > 0 && used + 1 + versionText.length <= width;
   return {
-    statusWidth: Math.min(width, REFRESH_STATUS_WIDTH),
+    stateWidth,
     hints: selectedHints,
     mandatoryHints: selectedHints.filter(isMandatoryHint),
     optionalHints: selectedHints.filter((hint) => !isMandatoryHint(hint)),
@@ -6064,11 +6069,13 @@ function statusBarLayout({
 function freshnessDeadline({
   lastOk,
   refreshMs,
+  grantedMs = null,
   governorDecision = null,
   currentEpochs = null,
 } = {}) {
   if (!Number.isFinite(lastOk) || !Number.isFinite(refreshMs) || refreshMs < 0) return null;
-  const baseDeadline = lastOk + Math.max(STALE_AFTER_MS, refreshMs * 6);
+  const cadenceMs = Number.isFinite(grantedMs) && grantedMs >= 0 ? grantedMs : refreshMs;
+  const baseDeadline = lastOk + Math.max(STALE_AFTER_MS, cadenceMs * 6);
   const decisionEpochs = governorDecision?.epochs;
   const chargedEpochs = isRecord(decisionEpochs)
     ? Object.entries(decisionEpochs).filter(([, epoch]) => epoch !== null)
@@ -6082,6 +6089,16 @@ function freshnessDeadline({
   return validWaitingGrant
     ? Math.max(baseDeadline, governorDecision.notBefore + GH_TIMEOUT_MS)
     : baseDeadline;
+}
+
+function nextAdmittedCadence(previous, startedAt) {
+  if (!Number.isFinite(startedAt)) return previous ?? { startedAt: null, grantedMs: null };
+  return {
+    startedAt,
+    grantedMs: Number.isFinite(previous?.startedAt)
+      ? Math.max(0, startedAt - previous.startedAt)
+      : null,
+  };
 }
 
 function probingGovernorDecisions() {
@@ -6158,6 +6175,7 @@ function StatusBar({
   detail,
   spin,
   stale,
+  nowMs,
   interactive,
   cols,
   remoteSetup = false,
@@ -6199,6 +6217,7 @@ function StatusBar({
     status: semanticStatus,
     detail,
     stale,
+    nowMs,
     version,
   });
   const profile = ICON_PROFILE === "ascii" ? "ascii" : "unicode";
@@ -6227,20 +6246,20 @@ function StatusBar({
     { flexDirection: "row" },
     e(
       Box,
-      { width: layout.statusWidth, flexShrink: 0 },
+      { width: layout.stateWidth, flexShrink: 0, flexDirection: "row" },
       e(
         Text,
         { color: statusColor, dimColor: semanticStatus.tone === "inert", wrap: "truncate-end" },
         `${glyph} ${semanticStatus.label}`,
       ),
+      layout.detail
+        ? e(Box, { marginLeft: 1, flexShrink: 0 }, e(Text, { dimColor: true }, layout.detail))
+        : null,
+      layout.stale
+        ? e(Box, { marginLeft: 1, flexShrink: 0 }, e(Text, { color: ATTENTION }, layout.stale))
+        : null,
     ),
     ...layout.mandatoryHints.flatMap((hint, index) => renderHint(hint, index, "mandatory")),
-    layout.detail
-      ? e(Box, { marginLeft: 1, flexShrink: 0 }, e(Text, { dimColor: true }, layout.detail))
-      : null,
-    layout.stale
-      ? e(Box, { marginLeft: 1, flexShrink: 0 }, e(Text, { color: ATTENTION }, layout.stale))
-      : null,
     ...layout.optionalHints.flatMap((hint, index) => renderHint(hint, index, "optional")),
     layout.version && e(Box, { flexGrow: 1 }),
     layout.version && e(Text, { key: "version", dimColor: true, wrap: "truncate-end" }, layout.version),
@@ -6483,6 +6502,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     ANIMATE && tab.key === "actions" && (data.actions ?? []).some((r) => r.status === "in_progress");
 
   const inFlightRef = useRef({});
+  const admittedCadenceRef = useRef({});
   const rawRef = useRef({});
   // Last *successful* poll per tab, wall-clock. Wall-clock on purpose: a laptop
   // sleeping is exactly the gap this is meant to report, and a monotonic clock
@@ -7035,6 +7055,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       force = false,
       scope,
       reservationId,
+      admittedAt,
       onSettled,
       automaticStatusVisible = false,
     } = {}) {
@@ -7043,6 +7064,10 @@ function App({ onCreateRemote = () => {} } = {}) {
       // background fetch -- and so a slow repo can't stack refreshes.
       if (inFlightRef.current[key]) return Promise.resolve();
       inFlightRef.current[key] = true;
+      admittedCadenceRef.current[key] = nextAdmittedCadence(
+        admittedCadenceRef.current[key],
+        admittedAt,
+      );
       clearForcedBackoffAfterStart(key, force, "started");
       const visibleLoading = shouldShowFetchLoading({
         hasData: dataRef.current[key] !== null,
@@ -7509,6 +7534,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           force,
           scope: currentScope,
           reservationId: decision.reservationId,
+          admittedAt: nowMs,
           automaticStatusVisible: false,
           onSettled: () => finishPending(key, intentId),
         },
@@ -7578,6 +7604,7 @@ function App({ onCreateRemote = () => {} } = {}) {
             force: item.force,
             scope: currentScope,
             reservationId: decision.value.reservationId,
+            admittedAt: nowMs,
             automaticStatusVisible: item.wasDeferred && !item.force,
             onSettled: () => finishPending(key, item.intentId),
           },
@@ -7880,6 +7907,7 @@ function App({ onCreateRemote = () => {} } = {}) {
   const staleAt = freshnessDeadline({
     lastOk,
     refreshMs: runtime.refreshMs,
+    grantedMs: admittedCadenceRef.current[tab.key]?.grantedMs,
     governorDecision: activeGovernorDecision,
     currentEpochs: governorEpochs,
   });
@@ -8167,7 +8195,7 @@ function App({ onCreateRemote = () => {} } = {}) {
               // Suppressed once icons are already ASCII, since then there is
               // nothing to fix.
               (USING_NERD_ICONS && iconHintDue ? "   (icons blank? GH_GLANCE_ICONS=unicode)" : "")
-            : ["waiting", "paused"].includes(semanticStatus.kind) || waiting[tab.key]
+            : semanticStatus.kind === "paused" || waiting[tab.key]
               ? "waiting for API budget…"
             : tab.key === "security" && securityNotes.length === ALERT_SOURCES.length
               ? "no alert sources available"
@@ -8184,6 +8212,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       detail: activeGovernorDecision,
       spin: showSpinner ? spin : null,
       stale: staleLabel,
+      nowMs: now.getTime(),
       interactive,
       cols: frameCols,
       remoteSetup,
@@ -8622,8 +8651,10 @@ export {
   summarizeDoctorEnv,
   widthStatusText,
   refreshStatus,
+  statusInterval,
   statusBarLayout,
   freshnessDeadline,
+  nextAdmittedCadence,
   probingGovernorDecisions,
   retainDeferredGovernorHold,
   REFRESH_STATUS_GLYPHS,

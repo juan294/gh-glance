@@ -65,14 +65,19 @@ const statusLine = (result) => result.finalFrame.lines.find(isStatusLine);
 test("footer layout keeps semantic status and essential actions from 80 to 24 columns", (t) => {
   for (const cols of [80, 60, 45, 24]) {
     const box = sharedFixture(t, {
-      core: { limit: 5000, used: 5000, remaining: 0, resetMs: Date.now() + 3_600_000 },
+      core: { limit: 5000, used: 4450, remaining: 550, resetMs: Date.now() + 3_600_000 },
     });
     const result = capture({
       cols,
       rows: 20,
       signal: "none",
       settle: 15,
-      stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Paused") { ok=1 }') +
+      stdin: waitForAwk(
+        '"$GH_GLANCE_CAPTURE_OUT"',
+        cols >= 45
+          ? 'index($0, "Paused") && index($0, "reset") { ok=1 }'
+          : 'index($0, "Paused") { ok=1 }',
+      ) +
         "sleep .3; printf q",
       configHome: box.root,
       env: {
@@ -84,8 +89,14 @@ test("footer layout keeps semantic status and essential actions from 80 to 24 co
     assert.match(line ?? "", /^‖ Paused/);
     assert.match(line ?? "", /(?:Refresh: )?r(?:\s|$)/);
     assert.match(line ?? "", /(?:Quit: )?q(?:\s|$)/);
-    if (cols >= 45) assert.match(line ?? "", /reset \d\d:\d\d/);
-    else assert.doesNotMatch(line ?? "", /reset|\d\d:\d\d/);
+    if (cols >= 45) {
+      assert.ok(
+        result.liveScreen.statusHistory.some((status) => /^‖ Paused.*reset \d+m/.test(status)),
+        result.liveScreen.statusHistory.join(" -> "),
+      );
+    } else {
+      assert.doesNotMatch(result.liveScreen.statusHistory.join("\n"), /reset|\d+m/);
+    }
     assert.ok(result.finalFrame.widest <= cols, `${cols}-column frame overflowed`);
     assert.ok(result.liveScreen.maxStatusLines <= 1);
     assert.equal(result.liveScreen.lines.at(-1), "");
@@ -118,7 +129,7 @@ test("Setup and NO_COLOR footers keep explicit semantic labels", (t) => {
     configHome: configRoot(t, "gh-glance-status-no-color-"),
     env: { NO_COLOR: "1" },
   });
-  assert.match(statusLine(noColor) ?? "", /^· (?:Watching|Waiting)/);
+  assert.match(statusLine(noColor) ?? "", /^· Watching/);
   assert.match(statusLine(noColor) ?? "", /(?:Refresh: )?r(?:\s|$)/);
   assert.match(statusLine(noColor) ?? "", /(?:Quit: )?q(?:\s|$)/);
 });
@@ -133,7 +144,7 @@ test("ASCII profile keeps the same status label and a width-one marker", (t) => 
     icons: "ascii",
     configHome: configRoot(t, "gh-glance-status-ascii-"),
   });
-  assert.match(statusLine(result) ?? "", /^\. (?:Watching|Waiting)/);
+  assert.match(statusLine(result) ?? "", /^\. Watching/);
   const frame = result.finalFrame.lines.join("\n");
   assert.match(frame, /^│ {2}[+x-] {2}\S/m);
   assert.doesNotMatch(frame, /[\uE000-\uF8FF]/);
@@ -186,7 +197,7 @@ test("a future adapted check stays still, shows next, and then settles", (t) => 
     env: { GH_GLANCE_FIXTURE_STATE: box.statePath, GH_GLANCE_FIXTURE_PANE: "adapted" },
   });
   const statuses = adapted.liveScreen.statusHistory;
-  const waitingAt = statuses.findIndex((line) => /^· Waiting.*next \d\d:\d\d/.test(line));
+  const scheduledAt = statuses.findIndex((line) => /^· Watching next (?:<1m|\d+m)/.test(line));
   const checkingAt = statuses.findIndex((line) => / Checking(?:\s|$)/.test(line));
   const watchingAt = statuses.findIndex(
     (line, index) => index > checkingAt && /^· Watching/.test(line),
@@ -194,10 +205,51 @@ test("a future adapted check stays still, shows next, and then settles", (t) => 
   const checkingMarkers = statuses
     .filter((line) => / Checking(?:\s|$)/.test(line))
     .map((line) => [...line][0]);
-  assert.ok(waitingAt >= 0, statuses.join(" -> "));
-  assert.ok(checkingAt > waitingAt, statuses.join(" -> "));
+  assert.ok(scheduledAt >= 0, statuses.join(" -> "));
+  assert.ok(checkingAt > scheduledAt, statuses.join(" -> "));
   assert.equal(new Set(checkingMarkers).size, 1, "adapted automatic Checking animated");
   assert.ok(watchingAt > checkingAt, statuses.join(" -> "));
+  assert.equal(adapted.hasFullKeyHints, true);
+});
+
+test("a long future grant uses a coarse minute interval without moving full hints", (t) => {
+  const now = Date.now();
+  const box = sharedFixture(t, {
+    core: { limit: 5000, used: 3950, remaining: 1050, resetMs: now + 3_600_000 },
+  });
+  capture({
+    cols: 80,
+    rows: 24,
+    signal: "none",
+    settle: 15,
+    stdin: quitAfterCached("actions"),
+    args: "--refresh 40",
+    configHome: box.root,
+    env: { GH_GLANCE_FIXTURE_STATE: box.statePath, GH_GLANCE_FIXTURE_PANE: "long-warm" },
+  });
+  const held = capture({
+    cols: 80,
+    rows: 24,
+    signal: "none",
+    settle: 15,
+    stdin: waitForAwk(
+      '"$GH_GLANCE_CAPTURE_OUT"',
+      '/^· Watching next [0-9]+m/ { ok=1 }',
+      200,
+    ) + "sleep .3; printf q",
+    args: "--refresh 40",
+    configHome: box.root,
+    env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+      GH_GLANCE_FIXTURE_STATE: box.statePath,
+      GH_GLANCE_FIXTURE_PANE: "long-held",
+    },
+  });
+  assert.ok(
+    held.liveScreen.statusHistory.some((line) => /^· Watching next \d+m/.test(line)),
+    held.liveScreen.statusHistory.join(" -> "),
+  );
+  assert.equal(held.hasFullKeyHints, true);
 });
 
 test("manual refresh waits without motion and animates only after admission", (t) => {
@@ -222,7 +274,7 @@ test("manual refresh waits without motion and animates only after admission", (t
     signal: "none",
     settle: 30,
     stdin:
-      waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Waiting") { ok=1 }') +
+      waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Watching next") { ok=1 }') +
       `watching=$(${captureCount("Watching")}); ` +
       "printf r; " +
       waitForAwk(
@@ -245,12 +297,12 @@ test("manual refresh waits without motion and animates only after admission", (t
     },
   });
   const statuses = manual.liveScreen.statusHistory;
-  const waitingAt = statuses.findIndex((line) => /^· Waiting/.test(line));
+  const scheduledAt = statuses.findIndex((line) => /^· Watching next/.test(line));
   const checking = statuses
     .map((line, index) => ({ line, index }))
     .filter(({ line }) => / Checking(?:\s|$)/.test(line));
-  assert.ok(waitingAt >= 0, statuses.join(" -> "));
-  assert.ok(checking[0]?.index > waitingAt, statuses.join(" -> "));
+  assert.ok(scheduledAt >= 0, statuses.join(" -> "));
+  assert.ok(checking[0]?.index > scheduledAt, statuses.join(" -> "));
   assert.ok(
     new Set(checking.map(({ line }) => [...line][0])).size > 1,
     `manual Checking did not animate: ${statuses.join(" -> ")}`,
@@ -393,7 +445,7 @@ test("a coordination notice can appear and clear without overflowing the frame",
   assert.match(result.raw, /API coordination unavailable/);
   assert.doesNotMatch(result.finalFrame.lines.join("\n"), /API coordination unavailable/);
   assert.ok(result.liveScreen.statusHistory.some((line) => /^‖ Paused/.test(line)));
-  assert.match(statusLine(result) ?? "", /^· (?:Watching|Waiting)/);
+  assert.match(statusLine(result) ?? "", /^· Watching/);
   assert.ok(result.fullClears <= 2, `${result.fullClears} full clears during notice transition`);
   assert.equal(result.liveScreen.maxStatusLines, 1);
   assert.equal(result.finalFrame.lines.length, 11);
@@ -472,8 +524,11 @@ test("linear screen-reader polling omits adapted Checking but retains manual Che
     signal: "none",
     settle: 20,
     stdin:
-      waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Waiting") { ok=1 }') +
-      waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Watching") { ok=1 }', 200) +
+      waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Watching next") { ok=1 }') +
+      `watching=$(${captureCount("Watching")}); ` +
+      "i=0; current=$watching; while [ \"$current\" -le \"$watching\" ] && [ $i -lt 200 ]; " +
+      `do i=$((i + 1)); sleep .1; current=$(${captureCount("Watching")}); ` +
+      "done; " +
       "printf r; " +
       waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Checking") { ok=1 }', 200) +
       "sleep .3; printf q",
@@ -486,7 +541,8 @@ test("linear screen-reader polling omits adapted Checking but retains manual Che
     },
   });
   assert.ok(reader.fixtureCalls.filter((call) => call.startsWith("run list")).length >= 1);
-  assert.match(reader.raw, /Waiting/);
+  assert.doesNotMatch(reader.raw, /\bWaiting\b/);
+  assert.match(reader.raw, /Watching next (?:<1m|\d+m)/);
   assert.match(reader.raw, /Watching/);
   assert.ok(reader.raw.indexOf("Checking") > reader.raw.indexOf("Watching"));
 });
@@ -536,7 +592,7 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
     },
   });
   assert.match(paused.raw, /Paused/);
-  assert.match(paused.raw, /reset \d\d:\d\d/);
+  assert.match(paused.raw, /reset \d+m/);
 
   const failed = capture({
     cols: 80,

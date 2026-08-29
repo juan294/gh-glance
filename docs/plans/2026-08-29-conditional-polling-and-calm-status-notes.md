@@ -15,3 +15,15 @@
 - **Why:** Per-file isolation preserves the repository's required sequential
   execution while avoiding aggregate local PTY process pressure. No assertion,
   timeout, or product contract was weakened.
+
+### Phase 2 PTY execution
+
+- **Plan said:** Run `npm run test:pty` as one serialized Node test command.
+- **Found:** An aggregate run placed a literal terminal `^D` in the final guard
+  row of the 45-column footer case. The unchanged empty-row assertion passed
+  when the complete status module ran in its own Node process.
+- **Chose:** Keep the guard-row assertion unchanged and run every PTY module
+  sequentially in its own Node process. All 85 cases passed after Phase 2.
+- **Why:** The failure is the same local aggregate process-pressure artifact
+  recorded in Phase 1. Module isolation verifies the product contract without
+  weakening an assertion or increasing a timeout.

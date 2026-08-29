@@ -33,12 +33,14 @@ derive one fixed wide-state cap from reachable content:
   separator = 1 cell
   WIDE_STATE_WIDTH = 12 + 1 + 12 = 25 cells
 
-  stateWidth = cols >= 45 ? min(cols, WIDE_STATE_WIDTH)
-                          : min(cols, REFRESH_STATUS_WIDTH)
+  stateWidth = drawableCols >= 44 ? min(drawableCols, WIDE_STATE_WIDTH)
+                                  : min(drawableCols, REFRESH_STATUS_WIDTH)
 
-  # At 45 columns, 25 state cells plus the existing full mandatory Refresh and
-  # Quit hints fit. Below 45, the existing narrow contract wins: reserve only
-  # the 12-cell label and omit detail/stale.
+  # StatusBar receives one fewer drawable column than the terminal width. At a
+  # 45-column terminal, 25 state cells plus the existing full mandatory Refresh
+  # and Quit hints fit in 44 drawable cells. Below 45 terminal columns, the
+  # existing narrow contract wins: reserve only the 12-cell label and omit
+  # detail/stale.
 
   # Detail is capped to the remaining 12-cell payload. Relative minute text is
   # bounded at `99m+`; a later `sharing N` detail must use the same cap. If a
@@ -185,3 +187,15 @@ the deadline under 120s.
 ## Out of scope
 
 Notice wording (Phase 3); the pane-count detail (Phase 6).
+
+## Completion
+
+- [x] The wide state region uses the derived 25-cell cap at terminal widths of
+  45 or more and preserves the existing 12-cell narrow collapse below 45.
+- [x] Ordinary scheduler holds render `Watching`; actionable holds render
+  `Paused`; the `Waiting` status contract is retired.
+- [x] Relative grant details are minute-granular and capped, stale warnings win
+  the bounded payload, and admitted per-tab cadence controls freshness.
+- [x] Lint, 270 unit/runtime tests, syntax, all 85 isolated sequential PTY cases,
+  and diff checks pass. The aggregate PTY harness deviation is recorded in the
+  implementation notes without weakening an assertion or timeout.

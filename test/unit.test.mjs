@@ -49,8 +49,10 @@ import {
   resetTabWidthPreferences,
   widthStatusText,
   refreshStatus,
+  statusInterval,
   statusBarLayout,
   freshnessDeadline,
+  nextAdmittedCadence,
   probingGovernorDecisions,
   retainDeferredGovernorHold,
   REFRESH_STATUS_GLYPHS,
@@ -1415,7 +1417,7 @@ test("refresh status pins active-tab precedence, copy, motion, and details", () 
     tone: "attention", animate: false, detailKind: "reset",
   });
   assert.deepEqual(status({ governorDecision: { mode: "waiting", notBefore: 456 } }), {
-    kind: "waiting", glyphKind: "waiting", label: "Waiting",
+    kind: "watching", glyphKind: "watching", label: "Watching",
     tone: "inert", animate: false, detailKind: "next",
   });
   assert.equal(status({ activeError: { verdict: "other" }, securityIncomplete: true }).kind, "failed");
@@ -1428,12 +1430,15 @@ test("refresh status pins active-tab precedence, copy, motion, and details", () 
   for (const [expected, input] of [
     ["setup", { remoteSetup: true }],
     ["checking", { visibleLoading: true }],
-    ["waiting", { governorDecision: { mode: "waiting" } }],
+    ["watching", { governorDecision: { mode: "waiting" } }],
     ["paused", { governorDecision: { mode: "paused" } }],
     ["failed", { activeError: { verdict: "other" } }],
     ["limited", { securityIncomplete: true }],
   ]) {
     assert.equal(status({ ...input, screenReader: true }).kind, expected);
+  }
+  for (const mode of ["waiting", "pending", "probe"]) {
+    assert.equal(status({ governorDecision: { mode } }).label, "Watching");
   }
 });
 
@@ -1443,19 +1448,35 @@ test("refresh status markers are width one and labels do not change by profile",
     for (const glyph of Object.values(profile)) assert.equal([...glyph].length, 1, glyph);
   }
   assert.deepEqual(
-    ["setup", "checking", "paused", "waiting", "failed", "limited", "watching"]
+    ["setup", "checking", "paused", "watching", "failed", "limited"]
       .map((kind) => refreshStatus(kind === "watching" ? {} : {
         remoteSetup: kind === "setup",
         visibleLoading: kind === "checking",
-        governorDecision: ["paused", "waiting"].includes(kind) ? { mode: kind } : null,
+        governorDecision: kind === "paused" ? { mode: kind } : null,
         activeError: kind === "failed" ? { verdict: "other" } : null,
         securityIncomplete: kind === "limited",
       }).label),
-    ["Setup", "Checking", "Paused", "Waiting", "Failed", "Limited", "Watching"],
+    ["Setup", "Checking", "Paused", "Watching", "Failed", "Limited"],
   );
 });
 
-test("status bar layout preserves actions before deterministic detail and optional hints", () => {
+test("status intervals are minute-granular and capped", () => {
+  const nowMs = new Date(2026, 7, 18, 8, 40).getTime();
+  assert.equal(statusInterval(Number.NaN, nowMs), null);
+  assert.equal(statusInterval(nowMs - 1, nowMs), "<1m");
+  assert.equal(statusInterval(nowMs + 59_999, nowMs), "<1m");
+  assert.equal(statusInterval(nowMs + 60_000, nowMs), "1m");
+  assert.equal(statusInterval(nowMs + 60_001, nowMs), "2m");
+  assert.equal(statusInterval(nowMs + 99 * 60_000, nowMs), "99m");
+  assert.equal(statusInterval(nowMs + 100 * 60_000, nowMs), "99m+");
+  const samples = Array.from(
+    { length: 60 },
+    (_, second) => statusInterval(nowMs + 120_000, nowMs + second * 1_000),
+  );
+  assert.ok(new Set(samples).size <= 2, samples.join(", "));
+});
+
+test("status bar layout preserves a fixed state region before deterministic hints", () => {
   const hints = [
     { label: "Move", keys: "jk" },
     { label: "Open", keys: "Ent" },
@@ -1464,43 +1485,58 @@ test("status bar layout preserves actions before deterministic detail and option
     { label: "Quit", keys: "q" },
   ];
   const status = refreshStatus({ governorDecision: { mode: "waiting", notBefore: 0 } });
-  const detail = { notBefore: new Date(2026, 7, 18, 8, 42).getTime() };
+  const nowMs = new Date(2026, 7, 18, 8, 40).getTime();
+  const detail = { notBefore: nowMs + 120_000 };
   const layouts = Object.fromEntries([80, 60, 45, 24, 23].map((cols) => [
     cols,
-    statusBarLayout({ cols, interactive: true, availableHints: hints, status, detail, version: "v0.10.0" }),
+    statusBarLayout({
+      cols,
+      interactive: true,
+      availableHints: hints,
+      status,
+      detail,
+      nowMs,
+      version: "v0.10.0",
+    }),
   ]));
 
   assert.deepEqual(Object.fromEntries([80, 60, 45, 24, 23].map((cols) => [cols, {
+    stateWidth: layouts[cols].stateWidth,
     detail: layouts[cols].detail,
     mandatory: layouts[cols].mandatoryHints.map((hint) => hint.text),
     optional: layouts[cols].optionalHints.map((hint) => hint.text),
     version: layouts[cols].version,
   }])), {
     80: {
-      detail: "next 08:42",
+      stateWidth: 25,
+      detail: "next 2m",
       mandatory: ["Refresh: r", "Quit: q"],
       optional: ["Move: jk", "Open: Ent", "Width: w"],
       version: "v0.10.0",
     },
     60: {
-      detail: "next 08:42",
+      stateWidth: 25,
+      detail: "next 2m",
       mandatory: ["Refresh: r", "Quit: q"],
-      optional: ["Move: jk", "Open: Ent"],
+      optional: ["Move: jk", "Ent", "w"],
       version: null,
     },
     45: {
-      detail: "next 08:42",
+      stateWidth: 25,
+      detail: "next 2m",
       mandatory: ["Refresh: r", "Quit: q"],
-      optional: ["jk"],
+      optional: ["w"],
       version: null,
     },
     24: {
+      stateWidth: 12,
       detail: null,
       mandatory: ["Refresh: r", "q"],
       optional: [],
       version: null,
     },
     23: {
+      stateWidth: 12,
       detail: null,
       mandatory: ["r", "Quit: q"],
       optional: ["w"],
@@ -1515,23 +1551,55 @@ test("status bar layout preserves actions before deterministic detail and option
     availableHints: hints,
     status: paused,
     detail: { resetMs: detail.notBefore },
+    nowMs,
     version: "v0.10.0",
-  }).detail, "reset 08:42");
+  }).detail, "reset 2m");
   assert.equal(statusBarLayout({
     cols: 24,
     interactive: true,
     availableHints: hints,
     status: refreshStatus({ governorDecision: { mode: "waiting", probing: true } }),
     detail: {},
+    nowMs,
     version: "v0.10.0",
   }).detail, null);
+
+  const steady = statusBarLayout({
+    cols: 80,
+    interactive: true,
+    availableHints: hints,
+    status: refreshStatus(),
+    nowMs,
+  });
+  const stale = statusBarLayout({
+    cols: 80,
+    interactive: true,
+    availableHints: hints,
+    status,
+    detail,
+    stale: "stale 99h59m",
+    nowMs,
+  });
+  assert.equal(layouts[80].mandatoryHints[0].start, steady.mandatoryHints[0].start);
+  assert.equal(stale.mandatoryHints[0].start, steady.mandatoryHints[0].start);
+  assert.equal(stale.detail, null);
+  assert.equal(stale.stale, "stale 99h59m");
 });
 
-test("freshness extends only through a valid current-epoch waiting grant", () => {
+test("admitted starts track granted cadence per tab", () => {
+  assert.deepEqual(nextAdmittedCadence(undefined, 1_000), { startedAt: 1_000, grantedMs: null });
+  assert.deepEqual(nextAdmittedCadence({ startedAt: 1_000, grantedMs: null }, 4_500), {
+    startedAt: 4_500,
+    grantedMs: 3_500,
+  });
+});
+
+test("freshness uses granted cadence and extends only through a valid current-epoch grant", () => {
   const lastOk = 1_000_000;
   const base = lastOk + 30_000;
   const epochs = { core: "core:1", graphql: null };
   assert.equal(freshnessDeadline({ lastOk, refreshMs: 5_000 }), base);
+  assert.equal(freshnessDeadline({ lastOk, refreshMs: 5_000, grantedMs: 20_000 }), lastOk + 120_000);
   assert.equal(freshnessDeadline({
     lastOk,
     refreshMs: 5_000,

@@ -83,7 +83,7 @@ test("terminal replay retains transient status accumulation evidence", () => {
   const raw =
     ALT_ENTER +
     SYNC_START +
-    "[1:Actions]\r\n· Waiting old\r\n⣾ Checking new\r\n" +
+    "[1:Actions]\r\n· Watching next 2m\r\n⣾ Checking new\r\n" +
     SYNC_END +
     SYNC_START +
     `${ESC}[2J${ESC}[H` +
@@ -95,7 +95,7 @@ test("terminal replay retains transient status accumulation evidence", () => {
 
   assert.equal(parsed.liveScreen.statusLines, 1);
   assert.equal(parsed.liveScreen.maxStatusLines, 2);
-  assert.deepEqual(parsed.liveScreen.statusHistory, ["· Waiting old", "⣾ Checking new", "· Watching"]);
+  assert.deepEqual(parsed.liveScreen.statusHistory, ["· Watching next 2m", "⣾ Checking new", "· Watching"]);
 });
 
 test("capture termination reaps the full stdin producer and script trees", async (t) => {

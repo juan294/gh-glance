@@ -260,7 +260,7 @@ test("manual refresh wins a held lane without stacking repeated requests", { tim
   });
   const competitorReady = join(box.root, "manual-competitor-ready");
   const manualInput =
-    "i=0; while ! grep -q 'Waiting' \"$GH_GLANCE_CAPTURE_OUT\" 2>/dev/null && [ $i -lt 150 ]; " +
+    "i=0; while ! grep -Eq 'Watching (next|probing)' \"$GH_GLANCE_CAPTURE_OUT\" 2>/dev/null && [ $i -lt 150 ]; " +
     "do i=$((i + 1)); sleep .1; done; " +
     "i=0; while [ $i -lt 8 ]; do printf r; i=$((i + 1)); sleep .03; done; " +
     "i=0; while ! grep -Fq '\"pane\":\"manual\",\"argv\":[\"run\"' " +
@@ -309,11 +309,11 @@ test("manual refresh wins a held lane without stacking repeated requests", { tim
   assert.equal(runs[0].pane, "manual", "lower-priority work started before manual refresh");
   const manualResult = results[0];
   const statuses = manualResult.liveScreen.statusHistory;
-  const waitingAt = statuses.findIndex((status) => / Waiting(?:\s|$)/.test(status));
+  const scheduledAt = statuses.findIndex((status) => / Watching (?:next|probing)(?:\s|$)/.test(status));
   const checkingAt = statuses.findIndex((status, index) =>
-    index > waitingAt && / Checking(?:\s|$)/.test(status));
-  assert.ok(waitingAt >= 0, statuses.join(" -> "));
-  assert.ok(checkingAt > waitingAt, statuses.join(" -> "));
+    index > scheduledAt && / Checking(?:\s|$)/.test(status));
+  assert.ok(scheduledAt >= 0, statuses.join(" -> "));
+  assert.ok(checkingAt > scheduledAt, statuses.join(" -> "));
   assertDebitsStayOutsideReserve(runs);
 });
 
@@ -352,7 +352,7 @@ test("twelve exhausted core panes share one visible hold and make no REST data c
   assert.equal(results.length, 12);
   for (const [index, result] of results.entries()) {
     assert.ok(
-      result.liveScreen.statusHistory.some((status) => / (?:Paused|Waiting)(?:\s|$)/.test(status)),
+      result.liveScreen.statusHistory.some((status) => / Paused(?:\s|$)/.test(status)),
       `pane ${index} did not render the shared hold: ${result.liveScreen.statusHistory.join(" -> ")}`,
     );
   }

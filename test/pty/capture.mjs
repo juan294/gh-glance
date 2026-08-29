@@ -40,7 +40,7 @@ const TAB_BAR = /1:(?:Actions|Act)/;
 // StatusBar always starts at column zero with one width-1 state marker. Panel
 // rows start with a border, so remote titles containing these words cannot be
 // mistaken for accumulated footers.
-const STATUS_LINE = /^\S (?:Setup|Checking|Paused|Waiting|Failed|Limited|Watching)(?:\s|$)/;
+const STATUS_LINE = /^\S (?:Setup|Checking|Paused|Failed|Limited|Watching)(?:\s|$)/;
 
 export function isStatusLine(line) {
   return typeof line === "string" && STATUS_LINE.test(line);
