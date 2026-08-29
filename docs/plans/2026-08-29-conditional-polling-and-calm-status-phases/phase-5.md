@@ -138,9 +138,11 @@ charged.
 The three owner contracts stay executable:
 
 1. **Bootstrap and exhaustion recovery.**
-   `test/pty/governor.test.mjs:320` passes unmodified.
+   `twelve exhausted core panes share one visible hold and make no REST data
+   calls` passes with its assertions unmodified.
 2. **External-burn detection.**
-   `test/pty/throttle.test.mjs:391` passes unmodified.
+   `a real reset resumes all panes, while atomic external burn limits the next
+   epoch` in `test/pty/governor.test.mjs` passes with its assertions unmodified.
 3. **GraphQL bootstrap, recovery, and external spend.**
    The `rate_limit` probe remains its owner.
 
@@ -152,9 +154,10 @@ overwrite the core observer.
 
 ## Behaviour to match
 
-- `test/pty/throttle.test.mjs:391` is the executable guarantee that external
-  burn is still caught. It must pass **unmodified**; if it needs editing, the
-  design has regressed.
+- `a real reset resumes all panes, while atomic external burn limits the next
+  epoch` in `test/pty/governor.test.mjs` is the executable guarantee that
+  external burn is still caught. Its assertions must pass **unmodified**; if
+  they need editing, the design has regressed.
 - `test/governor.test.mjs:1392` (`"clean probe samples persist the shared
   external-spend factor"`) remains the executable law for the claimed observer
   and its `claimAt` watermark.
@@ -177,7 +180,7 @@ overwrite the core observer.
   external-factor law; arbitrary response order never updates the factor.
 - PTY: with the fixture's counter moving, `budgets.core.used` tracks the fixture
   between probes rather than only at probe boundaries.
-- PTY: `test/pty/governor.test.mjs:320` and `test/pty/throttle.test.mjs:391` pass
+- PTY: the named exhausted-core and reset/external-burn governor cases pass
   with their assertions unmodified. If either assertion needs editing, stop:
   the redesign has regressed.
 - Sequential verification passes.
@@ -195,3 +198,24 @@ overwrite the core observer.
 ## Out of scope
 
 GraphQL conditional requests. Removing the probe. Re-tuning cadences --- Phase 6.
+
+## Completion
+
+- [x] The v2 stored protocol migrates the exact v1 shape in place without
+  changing the scope hash or `rate-governor-v1` path. Read-only and mutating
+  migration paths persist v2 atomically before releasing the lock.
+- [x] One shared claim owns the conditional core observer and the GraphQL-only
+  `rate_limit` source. Core exhaustion waits through reset plus grace, while
+  GraphQL-only observation remains independent.
+- [x] Response observations and reservations settle in one lock mutation with
+  deterministic ordering, exact local-cost attribution, conservative residual
+  charging, and no response-driven block or manual-probe clearing.
+- [x] Doctor uses claimed observations, reports the winning source, and does
+  not expose a validator or scope identifier.
+- [x] Source authority, migration, rewound and out-of-order samples, future and
+  foreign observations, worker concurrency, 200/304/403 fixture costs, and
+  slow-source claim renewal have direct automated coverage.
+- [x] The protected bootstrap, exhaustion, reset/external-burn, factor,
+  crash-recovery, and block contracts pass without weaker assertions.
+- [ ] The live four-pane, out-of-band burn, and Doctor checks are pending the
+  Phase 6 real-window measurement, where their evidence will be recorded.

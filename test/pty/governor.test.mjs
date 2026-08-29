@@ -56,7 +56,7 @@ function probes(state) {
 function dataStarts(state) {
   return starts(state, (event) =>
     ["run", "issue", "pr"].includes(event.argv[0]) ||
-    event.argv[0] === "api" && event.argv[1] !== "rate_limit");
+    event.argv[0] === "api" && event.argv[1] !== "rate_limit" && !event.argv.includes("user"));
 }
 
 function isActionsEndpoint(event) {
@@ -577,7 +577,8 @@ test("probe and reservation owner crashes recover without optimistic spend", { t
   try {
     recoveredReservation = await observeUntil(
       reservationBox.read,
-      (state) => dataStarts(state).some((event) => event.pane === "reservation-survivor"),
+      (state) => dataStarts(state).some((event) => event.pane === "reservation-survivor") &&
+        state.active === 0 && state.dataActive === 0,
       20_000,
     );
   } finally {

@@ -123,7 +123,11 @@ Worth knowing about the app's shape before changing it:
 - `OPERATION_COSTS` is the one quota-cost authority. Every `runGh()` operation
   must have an exact REST/GraphQL vector there, and every non-free data call must
   obtain and revalidate a governor grant before its subprocess starts. A new
-  call path is incomplete until both statements are true.
+  call path is incomplete until both statements are true. ADR 0003 names one
+  bounded control-plane exception: the single shared core observer may make one
+  initial `GET /user` request before an authoritative core sample exists. Its
+  first 200 can cost one unit, records that counter immediately, and persists
+  the validator so later observations can return a free 304.
 - Budget control, data work, and lease heartbeats use independent one-shot
   schedulers. A slow request must not suppress a probe or lease renewal, and a
   control wake must not create an unconditional data poll.

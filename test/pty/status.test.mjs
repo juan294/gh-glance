@@ -57,7 +57,7 @@ function governorPath(root) {
 const dataStarts = (state, pane = null) => state.events.filter((event) =>
   event.type === "start" && (pane === null || event.pane === pane) && (
     ["run", "issue", "pr"].includes(event.argv[0]) ||
-    event.argv[0] === "api" && event.argv[1] !== "rate_limit"
+    event.argv[0] === "api" && event.argv[1] !== "rate_limit" && !event.argv.includes("user")
   ));
 const actionsRuns = (state, pane = null) => dataStarts(state, pane)
   .filter((event) => event.argv.some((argument) => argument.includes("/actions/runs?")));

@@ -44,7 +44,7 @@ test("the shell fixture finds API paths and conditional headers independent of f
   assert.doesNotMatch(second.stdout, /ci: pin actions/);
 });
 
-test("the shared fixture charges 200, makes 304 free, and leaves rate_limit unchanged", (t) => {
+test("the shared fixture makes conditional core observations free and pins rate_limit core wrong", (t) => {
   const root = mkdtempSync(join(tmpdir(), "gh-glance-fixture-api-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const statePath = join(root, "state.json");
@@ -90,6 +90,43 @@ test("the shared fixture charges 200, makes 304 free, and leaves rate_limit unch
 
   const probe = invoke(["api", "rate_limit"], env);
   assert.equal(probe.status, 0, probe.stderr);
-  assert.equal(JSON.parse(probe.stdout).resources.core.used, 12);
+  assert.equal(JSON.parse(probe.stdout).resources.core.used, 0);
   assert.doesNotMatch(probe.stdout, /HTTP\//);
+
+  const observer = invoke(["api", "-i", "user"], env);
+  assert.equal(observer.status, 0, observer.stderr);
+  assert.match(observer.stdout, /x-ratelimit-used: 13/i);
+  const observerEtag = etag(observer.stdout);
+  const conditionalObserver = invoke([
+    "api",
+    "-i",
+    "user",
+    "-H",
+    `If-None-Match: ${observerEtag}`,
+  ], env);
+  assert.equal(conditionalObserver.status, 1);
+  assert.match(conditionalObserver.stdout, /^HTTP\/2 304 Not Modified\r?$/m);
+  assert.equal(JSON.parse(readFileSync(statePath, "utf8")).core.used, 13);
+
+  const exhaustedState = JSON.parse(readFileSync(statePath, "utf8"));
+  exhaustedState.core.used = exhaustedState.core.limit;
+  exhaustedState.core.remaining = 0;
+  writeFileSync(statePath, `${JSON.stringify(exhaustedState)}\n`, { mode: 0o600 });
+  const exhaustedObserver = invoke([
+    "api",
+    "-i",
+    "user",
+    "-H",
+    `If-None-Match: ${observerEtag}`,
+  ], env);
+  assert.equal(exhaustedObserver.status, 1);
+  assert.match(exhaustedObserver.stdout, /^HTTP\/2 403 Forbidden\r?$/m);
+  assert.match(exhaustedObserver.stdout, /x-ratelimit-used: 5000/i);
+  assert.match(exhaustedObserver.stdout, /x-ratelimit-remaining: 0/i);
+  const finalState = JSON.parse(readFileSync(statePath, "utf8"));
+  assert.equal(finalState.core.used, 5000);
+  assert.deepEqual(finalState.events.filter((event) => event.type === "start").at(-1).cost, {
+    core: 0,
+    graphql: 0,
+  });
 });

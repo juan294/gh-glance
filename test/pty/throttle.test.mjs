@@ -54,7 +54,7 @@ const starts = (state, command) => state.events.filter(
 const dataStarts = (state) => state.events.filter((event) =>
   event.type === "start" && (
     ["run", "issue", "pr"].includes(event.argv[0]) ||
-    event.argv[0] === "api" && event.argv[1] !== "rate_limit"
+    event.argv[0] === "api" && event.argv[1] !== "rate_limit" && !event.argv.includes("user")
   ),
 );
 const actionsRuns = (state) => dataStarts(state)
@@ -164,13 +164,13 @@ test("manual refresh bursts create one unchanged held-sample probe demand", asyn
     setupAt + 20_000,
   );
   const startupObservedAt = startupPublication.matched
-    ? startupPublication.value.budgets.core.observedAt
+    ? startupPublication.value.budgets.graphql.observedAt
     : setupAt;
   writeFileSync(startupReadyPath, "ready\n", { mode: 0o600 });
   const manualPublication = await observeUntil(
     box.readGovernor,
     (governor) => governor?.budgets?.core?.remaining === 0 &&
-      governor.budgets.core.observedAt > startupObservedAt,
+      governor.budgets.graphql.observedAt > startupObservedAt,
     Date.now() + 20_000,
   );
   writeFileSync(secondBurstReadyPath, "ready\n", { mode: 0o600 });
@@ -178,7 +178,7 @@ test("manual refresh bursts create one unchanged held-sample probe demand", asyn
   const state = box.read();
   const rate = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
   assert.equal(startupPublication.matched, true, "startup held publication was not observed");
-  assert.equal(manualPublication.matched, true, "manual held publication was not observed");
+  assert.equal(manualPublication.matched, true, "manual GraphQL publication was not observed");
   assert.equal(rate.length, 2, `expected startup plus one manual probe, got ${rate.length}`);
   assert.equal(dataStarts(state).length, 0, "manual refresh crossed the core hold");
   assert.equal(result.exitCode, 0);

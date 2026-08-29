@@ -49,9 +49,13 @@ The exact enforceable guarantee is:
 
 Manual refresh, tab changes, item opening, failure context, and diagnostic
 probes use the same admission rule as automatic polling. Manual work has higher
-queue priority, but it cannot bypass a held budget. The free `rate_limit` probe
-and local version, authentication, and Git inspection do not need a quota
-grant.
+queue priority, but it cannot bypass a held budget. Local version,
+authentication, and Git inspection do not need a quota grant. The GraphQL
+observer uses the free `rate_limit` endpoint. Core has one explicit
+control-plane exception: one shared claimant can make a bounded `GET /user`
+bootstrap request before an authoritative core observation exists. Its first
+200 response can cost one unit and records that unit immediately. Later core
+observations are conditional and a matching 304 costs zero.
 
 ## Protocol and recovery
 
@@ -62,8 +66,10 @@ factor. REST and GraphQL are scheduled separately, so a held REST resource does
 not stop Issues or Pull Requests from using healthy GraphQL capacity.
 
 A short synchronous lock section validates and atomically writes each state
-transition. One process owns a free budget probe while the others wait for its
-publication. Pending work is ordered by manual/diagnostic, tab-switch, active,
+transition. One process owns the split budget observation claim while the
+others wait for publication. It reads GraphQL only from `rate_limit` and core
+only from response headers or conditional `/user`; `rate_limit` core data is
+never admission evidence. Pending work is ordered by manual/diagnostic, tab-switch, active,
 then background priority, with round-robin progress among equal-priority live
 leases. Stable per-lease phases spread startup and reset work. There is no
 60-second maximum wait: a request waits until its computed safe `notBefore`, or
@@ -125,7 +131,7 @@ evidence, not a promise that the account-wide counter can never cross it.
 - The dashboard cache and governor remain separate. The cache is last-good UI
   recovery data and can be ignored when unavailable; the governor is admission
   authority and fails closed.
-- `--doctor` uses one free rate-limit read, reports redacted governor health,
+- `--doctor` uses the same split observer, reports the winning redacted source,
   and admits or skips each quota-consuming diagnostic through the same policy.
 - ADR 0001's independent `gh` fetchers remain intact. Each can still commit as
   soon as it finishes; the governor controls only whether and when it may start.

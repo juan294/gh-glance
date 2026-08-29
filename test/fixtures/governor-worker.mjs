@@ -11,6 +11,7 @@ import {
   registerLease,
   releaseLease,
   requestManualProbe,
+  settleReservationWithBudgetObservations,
   startReservation,
   withGovernorLock,
 } from "../../index.mjs";
@@ -81,6 +82,13 @@ switch (command.operation) {
   case "readIntentDecision": result = retryBusy(() => readIntentDecision(scope, command.intentId, command.now)); break;
   case "startReservation": result = retryBusy(() => startReservation(scope, command.reservationId, command.now)); break;
   case "completeReservation": result = retryBusy(() => completeReservation(scope, command.reservationId, command.completion, command.now)); break;
+  case "settleReservationWithBudgetObservations": result = retryBusy(() => settleReservationWithBudgetObservations(
+    scope,
+    command.leaseId,
+    command.reservationId,
+    command.completion,
+    command.now,
+  )); break;
   case "recordResourceBlock": result = retryBusy(() => recordResourceBlock(scope, command.resource, command.resetMs, command.reason)); break;
   case "releaseLease": result = retryBusy(() => releaseLease(scope, command.leaseId)); break;
   case "inspectGovernor": result = retryBusy(() => inspectGovernor(scope, command.now)); break;

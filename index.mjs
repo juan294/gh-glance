@@ -686,6 +686,15 @@ function pickRateLimit(headers) {
   return { resource, limit, used, remaining, resetMs: reset * 1000 };
 }
 
+function responseHeaderObservation(rateLimit, cost, receivedAt = Date.now()) {
+  return rateLimit ? {
+    ...rateLimit,
+    source: "response-header",
+    receivedAt,
+    cost,
+  } : null;
+}
+
 function ghApiArgs(args, etag = null) {
   return [
     "api",
@@ -715,7 +724,12 @@ async function ghApi(args, { operation, signal, etag = null, run = runGh } = {})
         body: "",
       };
     }
-    if (parsed.status !== null) error.apiResponse = parsed;
+    if (parsed.status !== null) {
+      error.apiResponse = parsed;
+      const rateLimit = pickRateLimit(parsed.headers);
+      const observation = responseHeaderObservation(rateLimit, 0);
+      if (observation) error.budgetObservations = [observation];
+    }
     throw error;
   }
 }
@@ -1029,8 +1043,18 @@ async function fetchConditionalEntity({
     signal,
     etag: force ? null : cached?.etag ?? null,
   });
+  const observation = responseHeaderObservation(
+    response.rateLimit,
+    response.status === 200 ? 1 : 0,
+  );
   if (response.status === 304) {
-    return { path, status: 304, body: cached?.body ?? null, staged: null };
+    return {
+      path,
+      status: 304,
+      body: cached?.body ?? null,
+      staged: null,
+      observations: observation ? [observation] : [],
+    };
   }
   return {
     path,
@@ -1041,6 +1065,7 @@ async function fetchConditionalEntity({
           ? { etag: response.etag, body: response.body }
           : null]
       : null,
+    observations: observation ? [observation] : [],
   };
 }
 
@@ -1049,9 +1074,11 @@ function conditionalBatchResult(responses, previousRaw, joinedRaw = null) {
   let allNotModified = list.length > 0;
   let restSpent = 0;
   let stagedEntities = null;
+  const observations = [];
   for (const response of list) {
     if (response?.status !== 304 || typeof response.body !== "string") allNotModified = false;
     if (response?.status === 200) restSpent += 1;
+    if (Array.isArray(response?.observations)) observations.push(...response.observations);
     if (!response?.staged) continue;
     stagedEntities ??= new Map();
     stagedEntities.set(...response.staged);
@@ -1063,6 +1090,7 @@ function conditionalBatchResult(responses, previousRaw, joinedRaw = null) {
     allNotModified,
     restSpent,
     stagedEntities,
+    observations,
   };
 }
 
@@ -1107,6 +1135,7 @@ async function fetchActions(limit, signal, {
     restSpent: batch.restSpent,
     graphqlSpent: GRAPHQL_PER_FETCH.actions,
     stagedEntities: batch.stagedEntities,
+    observations: batch.observations,
     parse: () => parseActionsBodies(runs.body ?? "", workflows.body ?? ""),
   };
 }
@@ -1302,6 +1331,7 @@ const OPERATION_COSTS = Object.freeze({
   "doctor:issues": tabRequestCost("issues"),
   "doctor:prs": tabRequestCost("prs"),
   "doctor:security-endpoint": { core: 1, graphql: 0 },
+  "budget-core-observer": { core: 0, graphql: 0 },
   "rate-limit": { core: 0, graphql: 0 },
   "version": { core: 0, graphql: 0 },
   "auth-status": { core: 0, graphql: 0 },
@@ -1392,7 +1422,8 @@ function reservationCost(reservation, resource, leases, nowMs) {
     : reservation.costs;
   const cost = chargedCosts?.[resource] ??
     (reservation.resource === resource ? reservation.cost : 0);
-  return Number.isFinite(cost) && cost > 0 ? cost : 0;
+  const accounted = reservation.accountedCosts?.[resource] ?? 0;
+  return Number.isFinite(cost) && cost > 0 ? Math.max(0, cost - accounted) : 0;
 }
 
 function availableForGrant({
@@ -1767,7 +1798,11 @@ function scheduleIntents({
 
 // ---------- Shared account governor ----------
 
-const GOVERNOR_STATE_VERSION = 1;
+// The scope version is deliberately stable. Stored protocol revisions must use
+// the same file so an older process sees the new exact shape and fails closed
+// instead of coordinating through a second file.
+const GOVERNOR_SCOPE_VERSION = 1;
+const GOVERNOR_STATE_VERSION = 2;
 const GOVERNOR_MAX_LEASES = 128;
 const GOVERNOR_MAX_INTENTS = 512;
 const GOVERNOR_MAX_RESERVATIONS = 512;
@@ -1811,7 +1846,7 @@ function governorScopeHash(effectiveHost, authIdentity) {
   const host = normalizeHost(effectiveHost);
   if (!host || typeof authIdentity !== "string" || authIdentity.length === 0) return null;
   return createHash("sha256")
-    .update(JSON.stringify({ version: GOVERNOR_STATE_VERSION, effectiveHost: host, authCacheIdentity: authIdentity }))
+    .update(JSON.stringify({ version: GOVERNOR_SCOPE_VERSION, effectiveHost: host, authCacheIdentity: authIdentity }))
     .digest("hex");
 }
 
@@ -1879,6 +1914,9 @@ function emptyGovernorState() {
     version: GOVERNOR_STATE_VERSION,
     epochs: { core: null, graphql: null },
     budgets: {},
+    observers: {
+      core: { etag: null, outcome: "idle", at: 0, nextAt: 0 },
+    },
     probeClaim: null,
     probeOutcome: { status: "idle", at: 0, nextAt: 0 },
     leases: {},
@@ -1899,10 +1937,11 @@ function exactKeys(value, keys) {
     keys.every((key) => Object.hasOwn(value, key));
 }
 
-function normalizeGovernorBudget(raw, nowMs) {
+function normalizeGovernorBudget(raw, nowMs, resource = null) {
   if (!exactKeys(raw, [
     "limit", "remaining", "used", "resetMs", "observedAt", "blockUntil",
     "blockReason", "laneNextAt", "roundRobinCursor", "lastExternalFactor", "epoch",
+    "source", "factorBaseline", "knownLocalUsed",
   ])) return null;
   const normalized = normalizeBudgetResource(raw);
   if (
@@ -1914,6 +1953,14 @@ function normalizeGovernorBudget(raw, nowMs) {
     (raw.blockReason !== null && !GOVERNOR_BLOCK_REASONS.has(raw.blockReason)) ||
     (raw.roundRobinCursor !== null && !validGovernorId(raw.roundRobinCursor)) ||
     !Number.isFinite(raw.lastExternalFactor) || raw.lastExternalFactor < 1 ||
+    !["response-header", "core-observer", "rate-limit-probe"].includes(raw.source) ||
+    raw.source === "rate-limit-probe" && resource === "core" ||
+    !exactKeys(raw.factorBaseline, ["epoch", "used", "observedAt"]) ||
+    !validGovernorEpoch(raw.factorBaseline.epoch) ||
+    !Number.isSafeInteger(raw.factorBaseline.used) || raw.factorBaseline.used < 0 ||
+    finiteTimestamp(raw.factorBaseline.observedAt, nowMs) === undefined ||
+    raw.factorBaseline.observedAt > nowMs ||
+    !Number.isSafeInteger(raw.knownLocalUsed) || raw.knownLocalUsed < 0 ||
     !validGovernorEpoch(raw.epoch)
   ) return null;
   return {
@@ -1924,6 +1971,9 @@ function normalizeGovernorBudget(raw, nowMs) {
     roundRobinCursor: raw.roundRobinCursor,
     lastExternalFactor: raw.lastExternalFactor,
     epoch: raw.epoch,
+    source: raw.source,
+    factorBaseline: { ...raw.factorBaseline },
+    knownLocalUsed: raw.knownLocalUsed,
   };
 }
 
@@ -1962,18 +2012,19 @@ function normalizeGovernorIntent(raw, nowMs) {
 
 function normalizeGovernorReservation(raw, nowMs) {
   if (!exactKeys(raw, [
-    "leaseId", "intentId", "costs", "actualCosts", "notBefore", "status", "epochs",
+    "leaseId", "intentId", "costs", "actualCosts", "accountedCosts", "notBefore", "status", "epochs",
     "startedAt", "completedAt", "outcome",
   ])) return null;
   const costs = exactResourceCosts(raw.costs);
   const actualCosts = raw.actualCosts === null ? null : exactResourceCosts(raw.actualCosts);
+  const accountedCosts = exactResourceCosts(raw.accountedCosts);
   const epochs = exactKeys(raw.epochs, RATE_RESOURCES) &&
     RATE_RESOURCES.every((resource) => raw.epochs[resource] === null || validGovernorEpoch(raw.epochs[resource]))
     ? { ...raw.epochs }
     : null;
   if (
     !validGovernorId(raw.leaseId) || !validGovernorId(raw.intentId) ||
-    !costs || actualCosts === null && raw.actualCosts !== null || !epochs ||
+    !costs || actualCosts === null && raw.actualCosts !== null || !accountedCosts || !epochs ||
     finiteTimestamp(raw.notBefore, nowMs) === undefined ||
     !GOVERNOR_RESERVATION_STATUSES.has(raw.status) ||
     finiteTimestamp(raw.startedAt, nowMs, { nullable: true }) === undefined ||
@@ -1983,23 +2034,42 @@ function normalizeGovernorReservation(raw, nowMs) {
     (raw.outcome !== null && !GOVERNOR_OUTCOMES.has(raw.outcome))
   ) return null;
   if (actualCosts && RATE_RESOURCES.some((resource) => actualCosts[resource] > costs[resource])) return null;
-  return { ...raw, costs, actualCosts, epochs };
+  if (RATE_RESOURCES.some((resource) => accountedCosts[resource] > (actualCosts?.[resource] ?? costs[resource]))) return null;
+  return { ...raw, costs, actualCosts, accountedCosts, epochs };
+}
+
+function normalizeCoreObserver(raw, nowMs) {
+  if (!exactKeys(raw, ["etag", "outcome", "at", "nextAt"])) return null;
+  if (
+    raw.etag !== null && (typeof raw.etag !== "string" || raw.etag.length === 0) ||
+    !GOVERNOR_PROBE_STATUSES.has(raw.outcome) ||
+    finiteTimestamp(raw.at, nowMs) === undefined || raw.at > nowMs ||
+    finiteTimestamp(raw.nextAt, nowMs) === undefined
+  ) return null;
+  return { ...raw };
 }
 
 function normalizeProbeClaim(raw, nowMs) {
   if (raw === null) return null;
-  if (!exactKeys(raw, ["ownerLeaseId", "nonce", "leaseUntil", "nextAt", "claimAt", "startedReservationIds"])) {
+  if (!exactKeys(raw, [
+    "ownerLeaseId", "nonce", "leaseUntil", "nextAt", "claimAt", "startedReservationIds", "resources",
+  ])) {
     return undefined;
   }
+  const resources = Array.isArray(raw.resources) && raw.resources.length > 0 &&
+    raw.resources.every((resource) => RATE_RESOURCES.includes(resource))
+    ? [...new Set(raw.resources)]
+    : null;
   if (
     !validGovernorId(raw.ownerLeaseId) || !validGovernorId(raw.nonce) ||
     finiteTimestamp(raw.leaseUntil, nowMs) === undefined ||
     finiteTimestamp(raw.nextAt, nowMs) === undefined ||
     finiteTimestamp(raw.claimAt, nowMs) === undefined || raw.claimAt > nowMs ||
     !Array.isArray(raw.startedReservationIds) || raw.startedReservationIds.length > GOVERNOR_MAX_RESERVATIONS ||
-    raw.startedReservationIds.some((id) => !id.startsWith("reservation:") || !validGovernorId(id.slice(12)))
+    raw.startedReservationIds.some((id) => !id.startsWith("reservation:") || !validGovernorId(id.slice(12))) ||
+    !resources
   ) return undefined;
-  return { ...raw, startedReservationIds: [...new Set(raw.startedReservationIds)] };
+  return { ...raw, startedReservationIds: [...new Set(raw.startedReservationIds)], resources };
 }
 
 function normalizeManualProbe(raw, nowMs) {
@@ -2016,13 +2086,14 @@ function normalizeManualProbe(raw, nowMs) {
 
 function normalizeGovernorState(raw, nowMs, { prune = true } = {}) {
   if (!exactKeys(raw, [
-    "version", "epochs", "budgets", "probeClaim", "probeOutcome", "leases",
+    "version", "epochs", "budgets", "observers", "probeClaim", "probeOutcome", "leases",
     "intents", "reservations", "manualProbe",
   ]) || raw.version !== GOVERNOR_STATE_VERSION) return null;
   if (
     !exactKeys(raw.epochs, RATE_RESOURCES) ||
     RATE_RESOURCES.some((resource) => raw.epochs[resource] !== null && !validGovernorEpoch(raw.epochs[resource])) ||
     !isRecord(raw.budgets) || Object.keys(raw.budgets).some((resource) => !RATE_RESOURCES.includes(resource)) ||
+    !exactKeys(raw.observers, ["core"]) ||
     !isRecord(raw.leases) || !isRecord(raw.intents) || !isRecord(raw.reservations) ||
     !exactKeys(raw.probeOutcome, ["status", "at", "nextAt"]) ||
     !GOVERNOR_PROBE_STATUSES.has(raw.probeOutcome.status) ||
@@ -2034,8 +2105,10 @@ function normalizeGovernorState(raw, nowMs, { prune = true } = {}) {
   const state = emptyGovernorState();
   state.epochs = { ...raw.epochs };
   state.probeOutcome = { ...raw.probeOutcome };
+  state.observers.core = normalizeCoreObserver(raw.observers.core, nowMs);
+  if (!state.observers.core) return null;
   for (const resource of Object.keys(raw.budgets)) {
-    const budget = normalizeGovernorBudget(raw.budgets[resource], nowMs);
+    const budget = normalizeGovernorBudget(raw.budgets[resource], nowMs, resource);
     if (!budget) return null;
     state.budgets[resource] = budget;
   }
@@ -2075,7 +2148,36 @@ function serializeGovernorState(state) {
   return `${JSON.stringify(state)}\n`;
 }
 
-function readGovernorState(path, nowMs) {
+function migrateGovernorState(raw, nowMs) {
+  if (!exactKeys(raw, [
+    "version", "epochs", "budgets", "probeClaim", "probeOutcome", "leases",
+    "intents", "reservations", "manualProbe",
+  ]) || raw.version !== 1 || !isRecord(raw.budgets) || !isRecord(raw.reservations)) return null;
+  const migrated = structuredClone(raw);
+  migrated.version = GOVERNOR_STATE_VERSION;
+  migrated.observers = { core: { etag: null, outcome: "idle", at: 0, nextAt: 0 } };
+  // The v1 core value came from /rate_limit, which is not authoritative. Do not
+  // preserve it as bootstrap evidence. GraphQL remains valid.
+  delete migrated.budgets.core;
+  migrated.epochs.core = null;
+  if (migrated.budgets.graphql) {
+    const budget = migrated.budgets.graphql;
+    budget.source = "rate-limit-probe";
+    budget.factorBaseline = {
+      epoch: budget.epoch,
+      used: budget.used,
+      observedAt: budget.observedAt,
+    };
+    budget.knownLocalUsed = 0;
+  }
+  for (const reservation of Object.values(migrated.reservations)) {
+    reservation.accountedCosts = { core: 0, graphql: 0 };
+  }
+  if (migrated.probeClaim) migrated.probeClaim.resources = [...RATE_RESOURCES];
+  return normalizeGovernorState(migrated, nowMs);
+}
+
+function readGovernorState(path, nowMs, { persistMigration = true } = {}) {
   let raw;
   try {
     raw = readFileSync(path, "utf8");
@@ -2085,8 +2187,16 @@ function readGovernorState(path, nowMs) {
       : { ok: false, reason: "unwritable" };
   }
   try {
-    const value = normalizeGovernorState(JSON.parse(raw), nowMs);
-    return value ? { ok: true, value } : { ok: false, reason: "corrupt" };
+    const parsed = JSON.parse(raw);
+    const normalized = normalizeGovernorState(parsed, nowMs);
+    if (normalized) return { ok: true, value: normalized };
+    const migrated = migrateGovernorState(parsed, nowMs);
+    if (!migrated) return { ok: false, reason: "corrupt" };
+    if (!persistMigration) return { ok: true, value: migrated, migrated: true };
+    // Read-only callers persist the exact migration while they still hold the
+    // scope lock. Mutating callers use this same value for their final write.
+    const written = writeGovernorState(path, migrated);
+    return written.ok ? { ok: true, value: migrated, migrated: true } : written;
   } catch {
     return { ok: false, reason: "corrupt" };
   }
@@ -2315,13 +2425,21 @@ function mutateGovernor(scope, nowMs, mutate) {
     // held, immediately before it reads and mutates the shared state.
     const current = currentGovernorScope(scope);
     if (!current.ok) return current;
-    const loaded = readGovernorState(scope.path, at);
+    const loaded = readGovernorState(scope.path, at, { persistMigration: false });
     if (!loaded.ok) return loaded;
     const state = loaded.value;
+    // A mutator can reject without writing. Keep an untouched migration so
+    // that even that path upgrades the file once before releasing the lock.
+    const migration = loaded.migrated ? structuredClone(state) : null;
+    const returnAfterMigration = (result) => {
+      if (migration === null) return result;
+      const written = writeGovernorState(scope.path, migration);
+      return written.ok ? result : written;
+    };
     const value = mutate(state, at);
-    if (value?.ok === false && value.write !== true) return value;
+    if (value?.ok === false && value.write !== true) return returnAfterMigration(value);
     const normalized = normalizeGovernorState(state, at);
-    if (!normalized) return { ok: false, reason: "corrupt" };
+    if (!normalized) return returnAfterMigration({ ok: false, reason: "corrupt" });
     const written = writeGovernorState(scope.path, normalized);
     if (!written.ok) return written;
     return value?.ok === false ? { ok: false, reason: value.reason } : { ok: true, value: value?.value };
@@ -2374,6 +2492,7 @@ function scheduleGovernorState(state, nowMs) {
       intentId: grant.intentId,
       costs: grant.costs,
       actualCosts: null,
+      accountedCosts: { core: 0, graphql: 0 },
       notBefore: grant.notBefore,
       status: "scheduled",
       epochs: { core: grant.epochs.core ?? null, graphql: grant.epochs.graphql ?? null },
@@ -2452,11 +2571,32 @@ function claimProbe(scope, leaseId, nowMs) {
     if (state.probeClaim && state.probeClaim.leaseUntil > at) {
       return { value: { status: "waiting", leaseUntil: state.probeClaim.leaseUntil } };
     }
-    const resetProbeAt = Math.min(...Object.values(state.budgets).map(
-      (budget) => budget.resetMs + BUDGET_RESET_GRACE_MS,
-    ));
-    const nextAt = Math.min(state.probeOutcome.nextAt, resetProbeAt);
+    const coreResetAt = Number.isFinite(state.budgets.core?.resetMs)
+      ? state.budgets.core.resetMs + BUDGET_RESET_GRACE_MS
+      : Number.POSITIVE_INFINITY;
+    const graphqlResetAt = Number.isFinite(state.budgets.graphql?.resetMs)
+      ? state.budgets.graphql.resetMs + BUDGET_RESET_GRACE_MS
+      : Number.POSITIVE_INFINITY;
+    const dueAt = {
+      core: Math.min(
+        state.observers.core.nextAt,
+        coreResetAt,
+      ),
+      graphql: Math.min(
+        state.probeOutcome.nextAt,
+        graphqlResetAt,
+        // A core reset starts a new shared accounting epoch. Refresh the free
+        // GraphQL counter in that same nonce so external-spend baselines and
+        // the protected one-publication reset contract advance together.
+        coreResetAt,
+      ),
+    };
+    const nextAt = Math.min(...Object.values(dueAt));
     if (nextAt > at) return { value: { status: "waiting", nextAt } };
+    // One nonce owns the control-plane transition, but only the sources whose
+    // persisted clocks are due may be read. In particular, a GraphQL minute
+    // sample cannot spend or retry the held core observer before its reset.
+    const resources = RATE_RESOURCES.filter((resource) => dueAt[resource] <= at);
     const nonce = randomUUID();
     const startedReservationIds = Object.entries(state.reservations)
       .filter(([, reservation]) => reservation.status === "started")
@@ -2468,9 +2608,24 @@ function claimProbe(scope, leaseId, nowMs) {
       nextAt: at,
       claimAt: at,
       startedReservationIds,
+      resources,
     };
-    state.probeOutcome = { status: "waiting", at, nextAt: at + GOVERNOR_PROBE_LEASE_MS };
-    return { value: { status: "claimed", nonce, leaseUntil: state.probeClaim.leaseUntil, startedReservationIds } };
+    if (resources.includes("core")) {
+      state.observers.core.outcome = "waiting";
+      state.observers.core.at = at;
+      state.observers.core.nextAt = at + GOVERNOR_PROBE_LEASE_MS;
+    }
+    if (resources.includes("graphql")) {
+      state.probeOutcome = { status: "waiting", at, nextAt: at + GOVERNOR_PROBE_LEASE_MS };
+    }
+    return { value: {
+      status: "claimed",
+      nonce,
+      leaseUntil: state.probeClaim.leaseUntil,
+      startedReservationIds,
+      resources,
+      coreEtag: state.observers.core.etag,
+    } };
   });
 }
 
@@ -2485,18 +2640,34 @@ function renewProbeClaim(scope, leaseId, nonce, nowMs) {
   });
 }
 
-function budgetFromProbe(raw, previous, nowMs) {
-  const normalized = normalizeBudgetResource({ ...raw, observedAt: nowMs });
-  if (!normalized || normalized.resetMs <= nowMs) return null;
-  const baseEpoch = `${normalized.limit}:${normalized.resetMs}`;
-  const epoch = previous && previous.resetMs === normalized.resetMs && previous.used <= normalized.used
-    ? previous.epoch
-    : previous && previous.resetMs === normalized.resetMs && normalized.used < previous.used
-      ? `${baseEpoch}:${nowMs}`
-      : baseEpoch;
+function budgetFromObservation(raw, previous, nowMs, {
+  resource,
+  source,
+  receivedAt = nowMs,
+  clearProvenBlock = false,
+} = {}) {
+  const normalized = normalizeBudgetResource({ ...raw, observedAt: receivedAt });
+  if (
+    !normalized || normalized.resetMs <= nowMs || receivedAt > nowMs ||
+    !RATE_RESOURCES.includes(resource) ||
+    !["response-header", "core-observer", "rate-limit-probe"].includes(source) ||
+    resource === "core" && source === "rate-limit-probe"
+  ) return { status: "invalid" };
+  if (previous) {
+    if (normalized.resetMs < previous.resetMs) return { status: "ignored" };
+    if (normalized.resetMs === previous.resetMs && normalized.used < previous.used) {
+      return { status: "ignored" };
+    }
+    if (
+      normalized.resetMs === previous.resetMs && normalized.used === previous.used &&
+      receivedAt <= previous.observedAt
+    ) return { status: "ignored" };
+  }
+  const epoch = `${normalized.limit}:${normalized.resetMs}`;
   const epochChanged = !previous || previous.epoch !== epoch;
-  const blockActive = !epochChanged && Number.isFinite(previous.blockUntil) && previous.blockUntil > nowMs;
-  return {
+  const preserveBlock = !clearProvenBlock || !epochChanged;
+  const blockActive = preserveBlock && Number.isFinite(previous?.blockUntil) && previous.blockUntil > nowMs;
+  const next = {
     ...normalized,
     blockUntil: blockActive ? previous.blockUntil : null,
     blockReason: blockActive ? previous.blockReason : null,
@@ -2504,7 +2675,13 @@ function budgetFromProbe(raw, previous, nowMs) {
     roundRobinCursor: previous?.roundRobinCursor ?? null,
     lastExternalFactor: previous?.lastExternalFactor ?? 1,
     epoch,
+    source,
+    factorBaseline: epochChanged || !previous?.factorBaseline
+      ? { epoch, used: normalized.used, observedAt: receivedAt }
+      : { ...previous.factorBaseline },
+    knownLocalUsed: epochChanged ? 0 : previous.knownLocalUsed,
   };
+  return { status: "accepted", budget: next, epochChanged };
 }
 
 function publishProbe(scope, leaseId, nonce, budgets, nowMs) {
@@ -2513,42 +2690,94 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs) {
     if (!claim || claim.ownerLeaseId !== leaseId || claim.nonce !== nonce || claim.leaseUntil <= at) {
       return { ok: false, reason: "stale" };
     }
-    const nextBudgets = {};
-    for (const resource of RATE_RESOURCES) {
-      nextBudgets[resource] = budgetFromProbe(budgets?.[resource], state.budgets[resource], at);
-      if (!nextBudgets[resource]) return { ok: false, reason: "corrupt" };
+    const nextBudgets = { ...state.budgets };
+    const nextEpochs = { ...state.epochs };
+    const changedResources = [];
+    const resetResources = [];
+    if (!claim.resources.every((resource) => budgets?.[resource])) {
+      return { ok: false, reason: "corrupt" };
     }
-    const nextEpochs = Object.fromEntries(RATE_RESOURCES.map((resource) => [
-      resource,
-      budgetEpoch(nextBudgets[resource]),
-    ]));
-    for (const resource of RATE_RESOURCES) {
+    for (const resource of claim.resources) {
+      const supplied = budgets?.[resource];
+      if (!supplied) continue;
+      const raw = supplied.budget ?? supplied;
+      const source = supplied.source ?? (resource === "core" ? "core-observer" : "rate-limit-probe");
+      if (resource === "core" && source === "rate-limit-probe") continue;
+      const observed = budgetFromObservation(raw, state.budgets[resource], at, {
+        resource,
+        source,
+        receivedAt: supplied.receivedAt ?? at,
+        clearProvenBlock: true,
+      });
+      if (observed.status === "invalid") return { ok: false, reason: "corrupt" };
+      if (observed.status === "ignored") continue;
+      nextBudgets[resource] = observed.budget;
+      if (resource === "core" && supplied.blocked === true) {
+        nextBudgets[resource].blockUntil = observed.budget.resetMs;
+        nextBudgets[resource].blockReason = "rate-limit";
+      }
+      nextEpochs[resource] = observed.budget.epoch;
+      changedResources.push(resource);
+      if (observed.epochChanged && state.epochs[resource] !== null) resetResources.push(resource);
+    }
+    if (changedResources.length === 0) return { ok: false, reason: "corrupt" };
+    const completedBeforeClaim = Object.entries(state.reservations)
+      .filter(([, reservation]) =>
+        reservation.status === "completed" && reservation.completedAt < claim.claimAt);
+    for (const resource of changedResources) {
       const previous = state.budgets[resource];
-      if (!previous || nextBudgets[resource].used < previous.used) continue;
-      const sharedCompletedDelta = Object.values(state.reservations)
-        .filter((reservation) => reservation.status === "completed" && reservation.completedAt < claim.claimAt)
-        .reduce((total, reservation) => total + reservationCost(reservation, resource, state.leases, at), 0);
+      if (!previous || nextBudgets[resource].epoch !== previous.epoch) continue;
+      const baseline = previous.factorBaseline;
+      if (!baseline || baseline.epoch !== nextBudgets[resource].epoch || nextBudgets[resource].used < baseline.used) {
+        continue;
+      }
+      const legacyCompletedDelta = completedBeforeClaim
+        .reduce((total, [, reservation]) =>
+          total + (reservation.completedAt > baseline.observedAt
+            ? reservationCost(reservation, resource, state.leases, at)
+            : 0), 0);
       const factor = nextExternalFactor({
         lastExternalFactor: previous.lastExternalFactor,
-        globalUsedDelta: nextBudgets[resource].used - previous.used,
-        sharedCompletedDelta,
+        globalUsedDelta: nextBudgets[resource].used - baseline.used,
+        sharedCompletedDelta: previous.knownLocalUsed + legacyCompletedDelta,
       });
       if (factor === null) return { ok: false, reason: "corrupt" };
       nextBudgets[resource].lastExternalFactor = factor;
+      nextBudgets[resource].factorBaseline = {
+        epoch: nextBudgets[resource].epoch,
+        used: nextBudgets[resource].used,
+        observedAt: nextBudgets[resource].observedAt,
+      };
+      nextBudgets[resource].knownLocalUsed = 0;
     }
-    const resetChanged = RATE_RESOURCES.some((resource) =>
-      state.epochs[resource] !== null && state.epochs[resource] !== nextEpochs[resource],
-    );
-    for (const [id, reservation] of Object.entries(state.reservations)) {
-      if (reservation.status === "completed" && reservation.completedAt < claim.claimAt) {
-        delete state.reservations[id];
-      }
+    for (const [id, reservation] of completedBeforeClaim) {
+      const accountedByEveryResource = RATE_RESOURCES.every((resource) =>
+        reservationCost(reservation, resource, state.leases, at) === 0 ||
+        nextBudgets[resource]?.factorBaseline?.observedAt >= reservation.completedAt);
+      if (accountedByEveryResource) delete state.reservations[id];
     }
     state.budgets = nextBudgets;
     state.epochs = nextEpochs;
     state.probeClaim = null;
-    state.probeOutcome = { status: "healthy", at, nextAt: at + BUDGET_PROBE_MS };
-    if (resetChanged) state.manualProbe = null;
+    if (claim.resources.includes("core")) {
+      const core = nextBudgets.core;
+      state.observers.core = {
+        etag: typeof budgets.core.etag === "string" ? budgets.core.etag : state.observers.core.etag,
+        outcome: "healthy",
+        at,
+        nextAt: core.remaining === 0
+          ? core.resetMs + BUDGET_RESET_GRACE_MS
+          : at + BUDGET_PROBE_MS,
+      };
+    }
+    if (claim.resources.includes("graphql")) {
+      state.probeOutcome = {
+        status: "healthy",
+        at,
+        nextAt: at + BUDGET_PROBE_MS,
+      };
+    }
+    if (resetResources.length > 0) state.manualProbe = null;
     else if (state.manualProbe &&
       Object.values(nextEpochs).includes(state.manualProbe.requestedEpoch) &&
       RATE_RESOURCES.some((resource) => availableForGrant({ budget: nextBudgets[resource], nowMs: at }).spendable === 0)) {
@@ -2566,8 +2795,18 @@ function failProbeClaim(scope, leaseId, nonce, nowMs) {
       return { ok: false, reason: "stale" };
     }
     state.probeClaim = null;
-    state.probeOutcome = { status: "failed", at, nextAt: at + BUDGET_PROBE_MS };
-    return { value: { retryAt: state.probeOutcome.nextAt } };
+    if (claim.resources.includes("graphql")) {
+      state.probeOutcome = { status: "failed", at, nextAt: at + BUDGET_PROBE_MS };
+    }
+    if (claim.resources.includes("core")) {
+      state.observers.core = {
+        ...state.observers.core,
+        outcome: "failed",
+        at,
+        nextAt: at + BUDGET_PROBE_MS,
+      };
+    }
+    return { value: { retryAt: at + BUDGET_PROBE_MS } };
   });
 }
 
@@ -2580,7 +2819,16 @@ function requestManualProbe(scope, leaseId, epoch, observedAt, nowMs) {
       return { value: { status: state.manualProbe.satisfiedAt === null ? "pending" : "satisfied", ...state.manualProbe } };
     }
     state.manualProbe = { requestedEpoch: epoch, baselineObservedAt: observedAt, satisfiedAt: null };
-    state.probeOutcome.nextAt = Math.min(state.probeOutcome.nextAt || at, at);
+    if (state.epochs.core === epoch) {
+      const core = state.budgets.core;
+      const heldThroughReset = core?.blockUntil > at && core.blockUntil === core.resetMs;
+      state.observers.core.nextAt = heldThroughReset
+        ? Math.max(state.observers.core.nextAt, core.blockUntil + BUDGET_RESET_GRACE_MS)
+        : Math.min(state.observers.core.nextAt || at, at);
+    }
+    if (state.epochs.graphql === epoch) {
+      state.probeOutcome.nextAt = Math.min(state.probeOutcome.nextAt || at, at);
+    }
     return { value: { status: "pending", ...state.manualProbe } };
   });
 }
@@ -2720,7 +2968,103 @@ function completeReservation(scope, reservationId, completion, nowMs) {
     reservation.completedAt = at;
     reservation.outcome = completion.outcome;
     reservation.actualCosts = { ...measured };
+    reservation.accountedCosts = { core: 0, graphql: 0 };
     return { value: { status: "completed", actualCosts: reservation.actualCosts } };
+  });
+}
+
+function settleReservationWithBudgetObservations(
+  scope,
+  leaseId,
+  reservationId,
+  completion,
+  nowMs,
+) {
+  return mutateGovernor(scope, nowMs, (state, at) => {
+    const reservation = state.reservations[reservationId];
+    const lease = state.leases[leaseId];
+    if (
+      !lease || lease.expiresAt <= at || !reservation ||
+      reservation.leaseId !== leaseId || reservation.status !== "started" ||
+      !GOVERNOR_OUTCOMES.has(completion?.outcome)
+    ) return { ok: false, reason: "stale" };
+    const measured = completion.outcome === "measured-success"
+      ? exactResourceCosts(completion.actualCosts ?? completion.actualCost)
+      : reservation.costs;
+    if (!measured || RATE_RESOURCES.some((resource) => measured[resource] > reservation.costs[resource])) {
+      return { ok: false, reason: "corrupt" };
+    }
+    const observations = Array.isArray(completion.observations) ? completion.observations : [];
+    if (observations.some((observation) =>
+      !isRecord(observation) || !Number.isFinite(observation.receivedAt) || observation.receivedAt > at)) {
+      return { ok: false, reason: "corrupt" };
+    }
+    const acceptedCosts = { core: 0, graphql: 0 };
+    const acceptedAfterBaseline = { core: 0, graphql: 0 };
+    for (const resource of RATE_RESOURCES) {
+      const candidates = observations
+        .filter((observation) => observation.resource === resource)
+        .sort((left, right) =>
+          left.resetMs - right.resetMs || left.used - right.used || left.receivedAt - right.receivedAt);
+      for (const observation of candidates) {
+        const observed = budgetFromObservation(observation, state.budgets[resource], at, {
+          resource,
+          source: observation.source,
+          receivedAt: observation.receivedAt,
+          clearProvenBlock: false,
+        });
+        if (observed.status === "invalid") continue;
+        const definiteCost = Number.isSafeInteger(observation.cost) && observation.cost >= 0
+          ? observation.cost
+          : 0;
+        if (observed.status === "accepted") {
+          state.budgets[resource] = observed.budget;
+          state.epochs[resource] = observed.budget.epoch;
+          acceptedCosts[resource] += definiteCost;
+          if (observation.receivedAt > observed.budget.factorBaseline.observedAt) {
+            acceptedAfterBaseline[resource] += definiteCost;
+          }
+        } else if (
+          observation.source === "response-header" &&
+          state.budgets[resource]?.resetMs === observation.resetMs &&
+          state.budgets[resource].used >= observation.used
+        ) {
+          // A newer same-window counter already includes this completed call.
+          acceptedCosts[resource] += definiteCost;
+          if (observation.receivedAt > state.budgets[resource].factorBaseline.observedAt) {
+            acceptedAfterBaseline[resource] += definiteCost;
+          }
+        }
+      }
+    }
+    reservation.status = "completed";
+    reservation.completedAt = at;
+    reservation.outcome = completion.outcome;
+    reservation.actualCosts = { ...measured };
+    reservation.accountedCosts = Object.fromEntries(RATE_RESOURCES.map((resource) => [
+      resource,
+      completion.outcome === "measured-success"
+        ? Math.min(measured[resource], acceptedCosts[resource])
+        : 0,
+    ]));
+    for (const resource of RATE_RESOURCES) {
+      const budget = state.budgets[resource];
+      if (!budget || completion.outcome !== "measured-success") continue;
+      // accountedCosts removes the portion already present in an authoritative
+      // counter from the reservation residual. knownLocalUsed contains only
+      // that same portion when it arrived after the factor baseline. Their sum
+      // is therefore exactly the measured local cost, never twice that cost.
+      budget.knownLocalUsed += Math.min(
+        reservation.accountedCosts[resource],
+        acceptedAfterBaseline[resource],
+      );
+    }
+    scheduleGovernorState(state, at);
+    return { value: {
+      status: "completed",
+      actualCosts: reservation.actualCosts,
+      accountedCosts: reservation.accountedCosts,
+    } };
   });
 }
 
@@ -2731,6 +3075,17 @@ function recordResourceBlock(scope, resource, resetMs, reason) {
       !GOVERNOR_BLOCK_REASONS.has(reason)) return { ok: false, reason: "corrupt" };
     budget.blockUntil = resetMs;
     budget.blockReason = reason;
+    if (resource === "core") {
+      state.observers.core.nextAt = Math.min(
+        state.observers.core.nextAt || resetMs + BUDGET_RESET_GRACE_MS,
+        resetMs + BUDGET_RESET_GRACE_MS,
+      );
+    } else {
+      state.probeOutcome.nextAt = Math.min(
+        state.probeOutcome.nextAt || resetMs + BUDGET_RESET_GRACE_MS,
+        resetMs + BUDGET_RESET_GRACE_MS,
+      );
+    }
     return { value: { resource, resetMs, reason } };
   });
 }
@@ -2775,6 +3130,7 @@ function governorHealth(result, nowMs = Date.now()) {
         reserve: resourceReserve(budget.limit),
         remaining: budget.remaining,
         resetMs: budget.resetMs,
+        source: budget.source,
       }]] : [];
     })),
   };
@@ -2790,7 +3146,7 @@ async function retryGovernorMutation(run, { now, wait, deadline, signal }) {
 }
 
 async function refreshSharedBudget(scope, leaseId, signal, {
-  readBudgets = readRateBudgets,
+  readBudgets = readSharedBudgetSources,
   now = () => scopeNow(scope),
   wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   inspect = inspectGovernor,
@@ -2825,7 +3181,7 @@ async function refreshSharedBudget(scope, leaseId, signal, {
     claim = claimProbe(scope, leaseId, now());
     if (!claim.ok || claim.value.status !== "claimed") return claim;
   }
-  const { nonce, startedReservationIds } = claim.value;
+  const { nonce, startedReservationIds, resources = RATE_RESOURCES, coreEtag = null } = claim.value;
   const drainUntil = now() + GOVERNOR_PROBE_DRAIN_MS;
   while (startedReservationIds.length > 0 && now() < drainUntil) {
     const snapshot = inspect(scope, now());
@@ -2856,7 +3212,24 @@ async function refreshSharedBudget(scope, leaseId, signal, {
   }
   let budgets;
   try {
-    budgets = await readBudgets(signal, scope.host);
+    budgets = await readBudgets(signal, scope.host, {
+      resources,
+      coreEtag,
+      renewClaim: async () => {
+        const startedAt = now();
+        const extended = await retryGovernorMutation(
+          () => renew(scope, leaseId, nonce, now()),
+          {
+            now,
+            wait,
+            deadline: Math.min(renewed.value.leaseUntil, startedAt + GOVERNOR_PROBE_TRANSITION_MS),
+            signal,
+          },
+        );
+        if (extended.ok) renewed.value.leaseUntil = extended.value.leaseUntil;
+        return extended.ok;
+      },
+    });
   } catch {
     budgets = null;
   }
@@ -3006,6 +3379,7 @@ async function fetchAlertSource(source, signal, now, {
     };
   }
   let completedCalls = 0;
+  const observations = [];
   try {
     const requests = alertRequestArgs(source);
     const payloads = [];
@@ -3024,11 +3398,13 @@ async function fetchAlertSource(source, signal, now, {
           entities,
         });
         if (response.status === 200) completedCalls += 1;
+        observations.push(...(response.observations ?? []));
         responses.push(response);
         payloads.push(response.body ?? "");
         groups.push(parseJsonOutput(response.body ?? "").filter((alert) => alert.state === "open"));
       } catch (error) {
         if (response === null) completedCalls += 1;
+        observations.push(...(error.budgetObservations ?? []));
         throw error;
       }
     }
@@ -3041,6 +3417,7 @@ async function fetchAlertSource(source, signal, now, {
       verdict: "ok",
       allNotModified: batch.allNotModified,
       stagedEntities: batch.stagedEntities,
+      observations,
       parse: () => {
         const rows = mergeAlertRows(groups);
         return {
@@ -3064,6 +3441,7 @@ async function fetchAlertSource(source, signal, now, {
         verdict,
         allNotModified: false,
         stagedEntities: new Map(),
+        observations,
         parse: () => ({
           alerts: [],
           note: null,
@@ -3087,6 +3465,7 @@ async function fetchAlertSource(source, signal, now, {
       verdict,
       allNotModified: false,
       stagedEntities: new Map(),
+      observations,
       parse: () => ({ alerts: [], note, verdict, truncated: false }),
     };
   }
@@ -3135,6 +3514,7 @@ async function fetchSecurity(signal, {
     measuredSuccess: parts.every((part) => part.verdict === "ok"),
     rateLimited: parts.some((part) => part.verdict === "rate-limited"),
     stagedEntities,
+    observations: parts.flatMap((part) => part.observations ?? []),
     parse: () => {
       if (parts.some((part) => part.verdict === "unusable-output")) return { unusable: true };
       const parsed = parts.map((p) => p.parse());
@@ -3525,19 +3905,55 @@ function normalizeRateBudgets(resources) {
   ]));
 }
 
-async function readRateBudgets(signal, host = effectiveRuntimeHost()) {
+async function readCoreBudget(signal, host = effectiveRuntimeHost(), etag = null) {
   try {
-    // apiHostArgs() for the same reason the alert endpoints carry it: --repo
-    // host/owner/name sets runtime.host without setting GH_HOST, so without the
-    // flag this reads github.com's budget while the pane spends against the
-    // tenant -- and then throttles, or fails to, against an unrelated number.
-    const resources = await readRateLimitResources(signal, host);
-    return normalizeRateBudgets(resources);
-  } catch {
-    // The caller publishes a failed probe outcome and keeps data admission
-    // closed. A missing sample must never fall back to the configured floor.
-    return null;
+    const response = await ghApi(["user", ...apiHostArgs(host)], {
+      signal,
+      operation: "budget-core-observer",
+      etag,
+    });
+    if (response.rateLimit?.resource !== "core") return null;
+    return {
+      budget: response.rateLimit,
+      etag: response.etag ?? etag,
+      receivedAt: Date.now(),
+    };
+  } catch (error) {
+    const status = error?.apiResponse?.status;
+    const rateLimit = pickRateLimit(error?.apiResponse?.headers);
+    if (![403, 429].includes(status) || rateLimit?.resource !== "core") return null;
+    return {
+      budget: rateLimit,
+      etag: error.apiResponse.headers.etag ?? etag,
+      receivedAt: Date.now(),
+      blocked: true,
+    };
   }
+}
+
+async function readSharedBudgetSources(signal, host = effectiveRuntimeHost(), {
+  resources = RATE_RESOURCES,
+  coreEtag = null,
+  renewClaim = null,
+  readGraphql = readRateLimitResources,
+  readCore = readCoreBudget,
+} = {}) {
+  const result = {};
+  if (resources.includes("graphql")) {
+    const rateResources = await readGraphql(signal, host).catch(() => null);
+    const graphql = normalizeRateBudget(rateResources?.graphql);
+    if (!graphql) return null;
+    result.graphql = { budget: graphql, receivedAt: Date.now(), cost: 0 };
+  }
+  if (resources.includes("core")) {
+    // Each gh command is independently bounded, but two sequential commands
+    // can outlive one claim. Extend the same nonce after the free GraphQL read
+    // and before the one-cost bootstrap observer can start.
+    if (resources.includes("graphql") && typeof renewClaim === "function" && !await renewClaim()) return null;
+    const core = await readCore(signal, host, coreEtag);
+    if (core) result.core = core;
+  }
+  return Object.keys(result).length > 0 ? result : null;
 }
 
 // Conservative unpaced demand at this configuration's floor, derived from the
@@ -3608,8 +4024,8 @@ async function runDoctor() {
 
   const probes = doctorProbePlan();
 
-  // Free checks run first. In particular the one rate_limit read both renders
-  // the budget and seeds admission; diagnostics never spend before that proof.
+  // Free checks run first. The display rate_limit read is report data only;
+  // admission re-reads its GraphQL source after owning the shared claim.
   const [ghVersion, authStatus, remote, remoteUrls] = await Promise.all([
     captureGh(["--version"], "version"),
     captureGh(["auth", "status"], "auth-status"),
@@ -3637,13 +4053,7 @@ async function runDoctor() {
       demand: { core: 6, graphql: 2 },
     });
     try {
-      const normalized = resources && normalizeRateBudgets(resources);
-      if (registered.ok && normalized?.core && normalized?.graphql) {
-        const claim = claimProbe(scope, leaseId, nowMs);
-        if (claim.value?.status === "claimed") {
-          publishProbe(scope, leaseId, claim.value.nonce, normalized, nowMs);
-        }
-      }
+      if (registered.ok) await refreshSharedBudget(scope, leaseId, undefined);
       const admissionAt = Date.now();
       const admittedProbes = probes.map(([name, args, operation], index) => {
         const admitted = registered.ok
@@ -3719,7 +4129,7 @@ async function runDoctor() {
       return field(
         resource,
         detail
-          ? `${detail.remaining} remaining, ${detail.reserve} reserved, reset ${new Date(detail.resetMs).toISOString()}`
+          ? `${detail.remaining} remaining, ${detail.reserve} reserved, reset ${new Date(detail.resetMs).toISOString()} (${detail.source})`
           : "unavailable",
       );
     }),
@@ -5767,10 +6177,18 @@ function governorWakeTimes(state, nowMs, floorMs, leaseId = null) {
   };
 }
 
-function governorDataReady(refreshResult, snapshot, activeKey, nowMs) {
+function governorProtocolReady(refreshResult, snapshot, nowMs) {
   if (!refreshResult?.ok || !snapshot?.ok) return false;
   if (["waiting", "paused", "probe"].includes(refreshResult.value?.status)) return false;
   if (snapshot.value.probeClaim || snapshot.value.probeOutcome?.status !== "healthy") return false;
+  return RATE_RESOURCES.every((resource) => {
+    const budget = snapshot.value.budgets[resource];
+    return budget && nowMs - budget.observedAt <= BUDGET_SNAPSHOT_TTL_MS;
+  });
+}
+
+function governorDataReady(refreshResult, snapshot, activeKey, nowMs) {
+  if (!governorProtocolReady(refreshResult, snapshot, nowMs)) return false;
   const costs = tabRequestCost(activeKey);
   return RATE_RESOURCES.every((resource) => {
     if (costs[resource] <= 0) return true;
@@ -5848,8 +6266,8 @@ function pendingFailureIsTerminal(reason) {
   return reason === "stale";
 }
 
-function runtimeIntentGate(liveScheduling, { force = false } = {}) {
-  return liveScheduling
+function runtimeIntentGate(liveScheduling, { force = false, protocolReady = false } = {}) {
+  return liveScheduling || protocolReady
     ? { registerIntent: true, requestProbe: false }
     : { registerIntent: false, requestProbe: force === true };
 }
@@ -7363,14 +7781,15 @@ function App({ onCreateRemote = () => {} } = {}) {
       }
       return run()
         .then((result) => {
-          completeReservation(scope, reservationId, result?.measuredSuccess === false
-            ? { outcome: "rejected" }
+          settleReservationWithBudgetObservations(scope, leaseId, reservationId, result?.measuredSuccess === false
+            ? { outcome: "rejected", observations: result?.observations ?? [] }
             : {
                 outcome: "measured-success",
-                actualCost: {
+                actualCosts: {
                   core: result?.restSpent ?? REST_PER_FETCH[key] ?? 0,
                   graphql: result?.graphqlSpent ?? GRAPHQL_PER_FETCH[key] ?? 0,
                 },
+                observations: result?.observations ?? [],
               }, Date.now());
           if (result?.rateLimited) {
             const blockAt = Date.now();
@@ -7488,8 +7907,9 @@ function App({ onCreateRemote = () => {} } = {}) {
           });
         })
         .catch((err) => {
-          completeReservation(scope, reservationId, {
+          settleReservationWithBudgetObservations(scope, leaseId, reservationId, {
             outcome: governorOutcomeForError(err),
+            observations: err?.budgetObservations ?? [],
           }, Date.now());
           if (cancelled || err?.name === "AbortError") return;
           // Preserve both the verdict and the bounded raw error in state. The
@@ -7739,20 +8159,39 @@ function App({ onCreateRemote = () => {} } = {}) {
         pauseCoordination(key, "unknown-scope");
         return Promise.resolve({ persisted: false, retry: true, kind });
       }
-      const intentGate = runtimeIntentGate(liveScheduling, { force });
+      let protocolReady = liveScheduling;
+      let resourceReady = liveScheduling;
+      if (!liveScheduling || force) {
+        const snapshot = inspectGovernor(currentScope, nowMs);
+        protocolReady = governorProtocolReady(
+          { ok: true, value: { status: "published" } },
+          snapshot,
+          nowMs,
+        );
+        resourceReady = governorDataReady(
+          { ok: true, value: { status: "published" } }, snapshot, key, nowMs);
+        if (!liveScheduling && resourceReady) {
+          liveScheduling = true;
+          activePollAt = nowMs;
+          backgroundPollAt = nowMs + 4 * runtime.refreshMs;
+          armWake("heartbeat", nowMs + GOVERNOR_HEARTBEAT_MS, heartbeatWake);
+        }
+      }
+      const intentGate = runtimeIntentGate(liveScheduling, { force, protocolReady });
+      if (intentGate.requestProbe || force && !resourceReady) {
+        const snapshot = inspectGovernor(currentScope, nowMs);
+        const costs = tabRequestCost(key);
+        for (const resource of RATE_RESOURCES) {
+          const budget = snapshot.value?.budgets?.[resource];
+          if (costs[resource] > 0 && budget) {
+            requestManualProbe(currentScope, leaseId, budget.epoch, budget.observedAt, nowMs);
+          }
+        }
+        armWake("control", nowMs + 1, controlWake);
+      }
       if (!intentGate.registerIntent) {
         setTabGovernorDecision(key, { mode: "waiting", probing: true });
         setTabWaiting(key, true);
-        if (intentGate.requestProbe) {
-          const snapshot = inspectGovernor(currentScope, nowMs);
-          const costs = tabRequestCost(key);
-          for (const resource of RATE_RESOURCES) {
-            const budget = snapshot.value?.budgets?.[resource];
-            if (costs[resource] > 0 && budget) {
-              requestManualProbe(currentScope, leaseId, budget.epoch, budget.observedAt, nowMs);
-            }
-          }
-        }
         return Promise.resolve({ persisted: false, retry: false, kind });
       }
       const existing = pending.get(key);
@@ -8000,10 +8439,9 @@ function App({ onCreateRemote = () => {} } = {}) {
         attemptPendingBlockPublications(currentScope, checkedAt, snapshot.value);
       }
       publishControlStatus(activeKey, refreshed, snapshot, checkedAt);
-      if (pendingBlockPublications.size === 0 && !liveScheduling && governorDataReady(
+      if (pendingBlockPublications.size === 0 && !liveScheduling && governorProtocolReady(
         refreshed,
         snapshot,
-        activeKey,
         checkedAt,
       )) {
         liveScheduling = true;
@@ -8046,10 +8484,9 @@ function App({ onCreateRemote = () => {} } = {}) {
       const snapshot = inspectGovernor(currentScope, checkedAt);
       const activeKey = TABS[activeIndexRef.current].key;
       publishControlStatus(activeKey, refreshed, snapshot, checkedAt);
-      if (governorDataReady(
+      if (governorProtocolReady(
         refreshed,
         snapshot,
-        activeKey,
         checkedAt,
       )) {
         liveScheduling = true;
@@ -8852,11 +9289,14 @@ export {
   cancelIntent,
   startReservation,
   completeReservation,
+  settleReservationWithBudgetObservations,
   recordResourceBlock,
   releaseLease,
   inspectGovernor,
   governorHealth,
   refreshSharedBudget,
+  readCoreBudget,
+  readSharedBudgetSources,
   safe,
   shortErr,
   isUnavailable,

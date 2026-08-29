@@ -251,6 +251,7 @@ function withLock(run) {
 
 function selector() {
   if (args[0] === "api" && apiInvocation?.path === "rate_limit") return "rate_limit";
+  if (args[0] === "api" && apiInvocation?.path === "user") return "core-observer";
   if (args[0] === "api" && apiInvocation?.path?.includes("/actions/")) return "actions";
   if (args[0] === "api") return "security";
   if (["run", "issue", "pr", "repo", "auth"].includes(args[0])) return args[0];
@@ -258,7 +259,7 @@ function selector() {
 }
 
 function cost(apiResponse = null) {
-  if (apiResponse?.status === 304) return { core: 0, graphql: 0 };
+  if ([304, 403, 429].includes(apiResponse?.status)) return { core: 0, graphql: 0 };
   if (args[0] === "run") return { core: 2, graphql: 0 };
   if (["issue", "pr"].includes(args[0])) return { core: 0, graphql: 2 };
   if (args[0] === "repo" && args[1] === "view") return { core: 0, graphql: 1 };
@@ -363,10 +364,40 @@ if (args[0] === "--fixture-burn") {
   process.exit(0);
 }
 
+function actionStartCountsForOwner(state) {
+  const counts = { runs: 0, workflows: 0 };
+  for (const event of state.events ?? []) {
+    if (event.type !== "start" || event.ownerPid !== process.ppid) continue;
+    if (event.argv?.some((argument) => argument.includes("/actions/runs?"))) counts.runs += 1;
+    else if (event.argv?.some((argument) => argument.includes("/actions/workflows?"))) counts.workflows += 1;
+  }
+  return counts;
+}
+
+// fetchActions launches runs and workflows in parallel, in that order. Under
+// high process contention the workflows fixture can win the state-file lock
+// even though its sibling was launched second. Keep the fixture's event order
+// deterministic per dashboard process without serializing the production
+// requests: the workflows child waits only until the matching runs child has
+// recorded this batch's start.
+if (apiInvocation?.path?.includes("/actions/workflows?")) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    try {
+      const state = JSON.parse(readFileSync(statePath, "utf8"));
+      const { runs, workflows } = actionStartCountsForOwner(state);
+      if (runs > workflows) break;
+    } catch {
+      // The fixture state is atomically replaced; a transient read can retry.
+    }
+    Atomics.wait(waitCell, 0, 0, 5);
+  }
+}
+
 const started = withLock((state) => {
   const now = Date.now();
-  const isRateProbe = args[0] === "api" && args[1] === "rate_limit";
-  if (state.anchorAtFirstProbe === true && isRateProbe && !Number.isFinite(state.createdAt)) {
+  const isBudgetObserver = args[0] === "api" && ["rate_limit", "user"].includes(apiInvocation?.path);
+  if (state.anchorAtFirstProbe === true && isBudgetObserver && !Number.isFinite(state.createdAt)) {
     state.createdAt = now;
     for (const resource of RATE_RESOURCES) {
       const resetOffsetMs = state[resource]?.resetOffsetMs;
@@ -380,9 +411,11 @@ const started = withLock((state) => {
   state.sequence = (state.sequence ?? 0) + 1;
   state.inFlight ??= {};
   const sequence = state.sequence;
+  applyResetSequence(state, now);
   const apiResponse = selector() === "rate_limit" || apiInvocation === null
     ? null
     : apiEntity(state, apiInvocation.path, fallbackApiEntity);
+  if (selector() === "core-observer" && state.core.remaining === 0) apiResponse.status = 403;
   const debit = cost(apiResponse);
   const isData = debit.core > 0 || debit.graphql > 0;
   state.inFlight[sequence] = {
@@ -394,7 +427,6 @@ const started = withLock((state) => {
   };
   pruneDeadInflight(state);
   state.maxConcurrency = Math.max(state.maxConcurrency ?? 0, state.active);
-  applyResetSequence(state, now);
   const chargedResources = RATE_RESOURCES.filter((resource) => debit[resource] > 0);
   const before = isData ? resourceSnapshot(state, chargedResources) : null;
   for (const resource of RATE_RESOURCES) {
@@ -458,15 +490,21 @@ if (started.fail) {
 
 switch (selector()) {
   case "rate_limit": {
-    const resources = Object.fromEntries(["core", "graphql"].map((resource) => {
-      const budget = started.budgets[resource];
-      return [resource, {
-        limit: budget.limit,
-        used: budget.used,
-        remaining: budget.remaining,
-        reset: Math.floor(budget.resetMs / 1000),
-      }];
-    }));
+    const graphql = started.budgets.graphql;
+    const resources = {
+      core: {
+        limit: started.budgets.core.limit,
+        used: 0,
+        remaining: started.budgets.core.limit,
+        reset: Math.floor(Date.now() / 1000) + 3600,
+      },
+      graphql: {
+        limit: graphql.limit,
+        used: graphql.used,
+        remaining: graphql.remaining,
+        reset: Math.floor(graphql.resetMs / 1000),
+      },
+    };
     process.stdout.write(`${JSON.stringify({ resources })}\n`);
     break;
   }
@@ -493,7 +531,9 @@ switch (selector()) {
   default:
     if (started.apiResponse) {
       if (apiInvocation.include) {
-        const phrase = started.apiResponse.status === 304 ? "Not Modified" : "OK";
+        const phrase = started.apiResponse.status === 304
+          ? "Not Modified"
+          : started.apiResponse.status === 403 ? "Forbidden" : "OK";
         process.stdout.write(
           `HTTP/2 ${started.apiResponse.status} ${phrase}\r\n` +
           `etag: ${started.apiResponse.etag}\r\n` +

@@ -73,7 +73,7 @@ fi
 matches_selector() {
   wanted=$1
   if [ "$wanted" = "api-data" ]; then
-    [ "$gh_command" = "api" ] && [ "$api_path" != "rate_limit" ]
+    [ "$gh_command" = "api" ] && [ "$api_path" != "rate_limit" ] && [ "$api_path" != "user" ]
     return
   fi
   if [ "$wanted" = "dependabot" ]; then
@@ -155,12 +155,13 @@ fi
 
 emit_api_headers() {
   entity_tag=$1
+  reset=$(( $(date +%s) + 3600 ))
   if [ "$api_include" -eq 1 ] && [ "$api_if_none_match" = "$entity_tag" ]; then
-    printf 'HTTP/2 304 Not Modified\r\netag: %s\r\nx-ratelimit-resource: core\r\n\r\n' "$entity_tag"
+    printf 'HTTP/2 304 Not Modified\r\netag: %s\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-used: 1\r\nx-ratelimit-remaining: 4999\r\nx-ratelimit-reset: %s\r\nx-ratelimit-resource: core\r\n\r\n' "$entity_tag" "$reset"
     exit 1
   fi
   if [ "$api_include" -eq 1 ]; then
-    printf 'HTTP/2 200 OK\r\netag: %s\r\nx-ratelimit-resource: core\r\n\r\n' "$entity_tag"
+    printf 'HTTP/2 200 OK\r\netag: %s\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-used: 1\r\nx-ratelimit-remaining: 4999\r\nx-ratelimit-reset: %s\r\nx-ratelimit-resource: core\r\n\r\n' "$entity_tag" "$reset"
   fi
 }
 
@@ -257,9 +258,20 @@ case "$gh_command" in
     case "$api_path" in
       rate_limit)
         reset=$(( $(date +%s) + 3600 ))
+        rate_used=0
+        if [ -n "${GH_GLANCE_FIXTURE_RATE_SEQUENCE_FILE:-}" ]; then
+          rate_sequence=$(sed -n '1p' "$GH_GLANCE_FIXTURE_RATE_SEQUENCE_FILE" 2>/dev/null || printf '0')
+          case "$rate_sequence" in
+            ''|*[!0-9]*) rate_sequence=0 ;;
+          esac
+          printf '%s\n' "$((rate_sequence + 1))" > "$GH_GLANCE_FIXTURE_RATE_SEQUENCE_FILE"
+          rate_used=$((rate_sequence * 10))
+        fi
+        rate_remaining=$((5000 - rate_used))
         printf '{"resources":{"core":{"limit":5000,"used":%s,"remaining":%s,"reset":%s},' \
-          "$((5000 - GH_GLANCE_FIXTURE_RATE_REMAINING))" "$GH_GLANCE_FIXTURE_RATE_REMAINING" "$reset"
-        printf '"graphql":{"limit":5000,"used":0,"remaining":5000,"reset":%s}}}\n' "$reset"
+          "0" "5000" "$reset"
+        printf '"graphql":{"limit":5000,"used":%s,"remaining":%s,"reset":%s}}}\n' \
+          "$rate_used" "$rate_remaining" "$reset"
         exit 0
         ;;
     esac

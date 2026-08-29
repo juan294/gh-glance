@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The shared governor now follows authoritative response counters.** Core
+  observations come from conditional endpoint headers and one shared `/user`
+  observer, while the free `rate_limit` probe remains the GraphQL authority.
+  Response accounting and reservation settlement now commit atomically, so
+  concurrent panes cannot double-charge or overwrite a newer budget sample.
 - **Unchanged Actions and Security checks no longer consume REST quota.** The
   dashboard now revalidates each REST endpoint with its cached ETag, while a
   manual refresh still requests fresh data and new Actions runs still appear.

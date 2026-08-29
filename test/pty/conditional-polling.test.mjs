@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -27,6 +27,11 @@ function fixture(t, overrides = {}) {
     root,
     statePath,
     read: () => JSON.parse(readFileSync(statePath, "utf8")),
+    readGovernor: () => {
+      const directory = join(root, "gh-glance");
+      const name = readdirSync(directory).find((entry) => entry.startsWith("rate-governor-v1-"));
+      return JSON.parse(readFileSync(join(directory, name), "utf8"));
+    },
   };
 }
 
@@ -80,7 +85,10 @@ test("a quiet Actions tab spends nothing after its first fetch across three refr
   assert.equal(workflows[0].cost.core, 1);
   assert.ok(runs.slice(1).every((event) => event.cost.core === 0 && isConditional(event)));
   assert.ok(workflows.slice(1).every((event) => event.cost.core === 0 && isConditional(event)));
-  assert.equal(state.core.used, 2);
+  assert.equal(state.core.used, 3);
+  const governor = box.readGovernor();
+  assert.equal(governor.budgets.core.used, state.core.used);
+  assert.equal(governor.budgets.core.source, "response-header");
   assert.match(result.finalFrame.lines.join("\n"), /ci: pin actions to commit/);
 });
 
@@ -152,6 +160,6 @@ test("manual refresh drops If-None-Match on a quiet tab and spends again", (t) =
   assert.equal(forcedRuns.at(-1).cost.core, 1);
   assert.equal(forcedWorkflows.at(-1).cost.core, 1);
   assert.equal(forcedEnd?.status, 200);
-  assert.equal(state.core.used, 4);
+  assert.equal(state.core.used, 5);
   assert.match(result.finalFrame.lines.join("\n"), /ci: pin actions to commit/);
 });
