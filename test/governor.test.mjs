@@ -40,6 +40,7 @@ import {
   doctorProbePlan,
   emptyGovernorState,
   failProbeClaim,
+  governorControlReady,
   governorDataReady,
   governorControlRetryAt,
   governorHealth,
@@ -499,6 +500,23 @@ test("bootstrap readiness requires a successful publication and a safe active re
     governorDataReady({ ok: true, value: { status: "waiting" } }, snapshot, "actions", NOW),
     false,
   );
+  assert.equal(
+    governorControlReady({ ok: true, value: { status: "waiting" } }, snapshot, NOW),
+    true,
+  );
+  const claimed = structuredClone(snapshot);
+  claimed.value.probeClaim = { leaseUntil: NOW + 1_000 };
+  assert.equal(
+    governorControlReady({ ok: true, value: { status: "waiting" } }, claimed, NOW),
+    false,
+  );
+  const failed = structuredClone(snapshot);
+  failed.value.probeOutcome = { status: "failed", at: NOW, nextAt: NOW + BUDGET_PROBE_MS };
+  assert.equal(
+    governorControlReady({ ok: true, value: { status: "waiting" } }, failed, NOW),
+    false,
+  );
+  assert.equal(governorControlReady({ ok: false, reason: "stale" }, snapshot, NOW), false);
   assert.equal(governorDataReady({ ok: false, reason: "stale" }, snapshot, "actions", NOW), false);
   recordResourceBlock(box.scope, "core", NOW + 30_000, "rate-limit");
   const blocked = inspectGovernor(box.scope, NOW);

@@ -25,6 +25,13 @@
   explicit bootstrap interval before the first reset, so the reset assertion
   begins with all intended contenders instead of depending on aggregate
   process startup speed.
+- **Release CI then found:** A pane that lost reset-probe ownership could finish
+  its bounded inspection just before the winner published. Its refresh result
+  remained `waiting` even though the locked snapshot read immediately after it
+  was healthy, fresh, and claim-free. The pane kept `liveScheduling` disabled
+  until the next control interval. Bootstrap and control recovery now adopt
+  only that successful waiting-to-published handoff; errors, stale budgets,
+  active claims, and failed probe outcomes remain closed.
 - **Gate:** The canonical serialized `npm run test:pty` command, not a set of
   separately collected module passes, is the final repair gate.
 

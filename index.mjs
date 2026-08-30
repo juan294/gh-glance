@@ -6274,6 +6274,16 @@ function governorProtocolReady(refreshResult, snapshot, nowMs) {
   });
 }
 
+function governorControlReady(refreshResult, snapshot, nowMs) {
+  if (governorProtocolReady(refreshResult, snapshot, nowMs)) return true;
+  // A losing probe claimant can exhaust its bounded reinspection just before
+  // the winner publishes. Its return value is still `waiting`, but the locked
+  // snapshot taken immediately afterwards is authoritative. Adopt only that
+  // successful handoff; failures and every incomplete snapshot remain closed.
+  return refreshResult?.ok && refreshResult.value?.status === "waiting" &&
+    governorProtocolReady({ ok: true, value: { status: "published" } }, snapshot, nowMs);
+}
+
 function governorDataReady(refreshResult, snapshot, activeKey, nowMs) {
   if (!governorProtocolReady(refreshResult, snapshot, nowMs)) return false;
   const costs = tabRequestCost(activeKey);
@@ -8574,7 +8584,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         attemptPendingBlockPublications(currentScope, checkedAt, snapshot.value);
       }
       publishControlStatus(activeKey, refreshed, snapshot, checkedAt);
-      if (pendingBlockPublications.size === 0 && !liveScheduling && governorProtocolReady(
+      if (pendingBlockPublications.size === 0 && !liveScheduling && governorControlReady(
         refreshed,
         snapshot,
         checkedAt,
@@ -8619,7 +8629,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       const snapshot = inspectGovernor(currentScope, checkedAt);
       const activeKey = TABS[activeIndexRef.current].key;
       publishControlStatus(activeKey, refreshed, snapshot, checkedAt);
-      if (governorProtocolReady(
+      if (governorControlReady(
         refreshed,
         snapshot,
         checkedAt,
@@ -9513,6 +9523,7 @@ export {
   pollSchedule,
   retryPollAfterAdmissionFailure,
   governorWakeTimes,
+  governorControlReady,
   governorDataReady,
   governorControlRetryAt,
   createWakeScheduler,

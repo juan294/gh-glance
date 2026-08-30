@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flight, and coalesces repeated `r` presses while that forced batch runs. This
   prevents both a lost manual refresh and an immediate duplicate automatic
   request.
+- **Reset recovery no longer strands a pane that lost shared probe ownership.**
+  When the winning pane publishes between a waiter's bounded inspection and
+  its final snapshot, the waiter now adopts that locked, fresh, claim-free
+  publication instead of sleeping until the next control interval.
 
 ### Changed
 
