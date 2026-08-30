@@ -9,14 +9,25 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 
-import { redact, classify } from "../index.mjs";
+import {
+  GOVERNOR_LEASE_TTL_MS,
+  claimProbe,
+  classify,
+  createGovernorScope,
+  inspectGovernor,
+  publishProbe,
+  redact,
+  registerLease,
+  requestManualProbe,
+} from "../index.mjs";
 
 const execFileAsync = promisify(execFile);
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -118,7 +129,7 @@ test("--doctor exits 0 through a pipe and prints a complete report", async () =>
   assert.match(out, /Endpoint probes/);
   assert.match(out, /^ {2}Repository access$/m);
   // One block per diagnostic request, including the bounded Security priority lanes.
-  assert.equal(out.match(/^ {2}classified {2}/gm)?.length, 10, out);
+  assert.equal(out.match(/^ {2}classified {2}/gm)?.length, 11, out);
 });
 
 test("--doctor reports governor health without a raw scope identifier", async (t) => {
@@ -131,7 +142,97 @@ test("--doctor reports governor health without a raw scope identifier", async (t
   assert.match(out, /API governor\n------------/);
   assert.match(out, /^status {12}healthy$/m);
   assert.match(out, /^live leases {7}0$/m);
+  assert.match(out, /^core .*\(core-observer\)$/m);
+  assert.match(out, /^graphql .*\(rate-limit-probe\)$/m);
   assert.ok(!/rate-governor-v1-|[0-9a-f]{64}/.test(out), out);
+});
+
+test("--doctor claims the core observer and uses its persisted ETag before calling user", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-observer-claim-"));
+  const log = join(root, "gh.log");
+  const rateSequence = join(root, "rate-sequence");
+  writeFileSync(rateSequence, "0\n", { mode: 0o600 });
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scopeResult = createGovernorScope({
+    effectiveHost: "github.com",
+    env: { ...process.env, XDG_CONFIG_HOME: root },
+  });
+  assert.equal(scopeResult.ok, true);
+  const scope = scopeResult.value;
+  const leaseId = randomUUID();
+  const now = Date.now();
+  assert.equal(registerLease(scope, {
+    id: leaseId,
+    expiresAt: now + GOVERNOR_LEASE_TTL_MS,
+    floorMs: 5_000,
+    activeTab: "actions",
+    phaseSeed: { seed: leaseId, registeredAt: now },
+    demand: { core: 2, graphql: 0 },
+  }).ok, true);
+  const claim = claimProbe(scope, leaseId, now);
+  assert.equal(claim.value.status, "claimed");
+  const resetMs = Math.floor((now + 3_600_000) / 1_000) * 1_000;
+  assert.equal(publishProbe(scope, leaseId, claim.value.nonce, {
+    core: {
+      source: "core-observer",
+      etag: '"fixture-empty-v1"',
+      budget: { limit: 5000, used: 1, remaining: 4999, resetMs },
+    },
+    graphql: {
+      source: "rate-limit-probe",
+      budget: { limit: 5000, used: 0, remaining: 5000, resetMs },
+    },
+  }, now).ok, true);
+  const core = inspectGovernor(scope, now).value.budgets.core;
+  assert.equal(requestManualProbe(scope, leaseId, core.epoch, core.observedAt, Date.now()).ok, true);
+
+  await doctor({
+    env: {
+      XDG_CONFIG_HOME: root,
+      GH_GLANCE_FIXTURE_LOG: log,
+      GH_GLANCE_FIXTURE_RATE_SEQUENCE_FILE: rateSequence,
+    },
+    args: ["--repo", "acme/widget"],
+  });
+  const calls = readFileSync(log, "utf8").split(/\r?\n/);
+  const userCall = calls
+    .find((line) => /(?:^| )user(?: |$)/.test(line));
+  assert.ok(userCall, "doctor did not run the claimed core observer");
+  assert.match(userCall, /If-None-Match: "fixture-empty-v1"/);
+  assert.equal(calls.filter((line) => /api rate_limit(?: |$)/.test(line)).length, 2);
+  const state = inspectGovernor(scope, Date.now()).value;
+  assert.equal(state.budgets.graphql.used, 10,
+    "doctor published its pre-claim display body instead of the claimed GraphQL read");
+  assert.ok(state.budgets.graphql.observedAt >= now);
+});
+
+test("--doctor reaches a contended live lock after its wait cell is initialized", async (t) => {
+  const source = readFileSync(ENTRY, "utf8");
+  const waitCellDeclaration = source.indexOf("const persistenceWaitCell =");
+  const mainEntry = source.indexOf("if (IS_MAIN)");
+  assert.ok(waitCellDeclaration >= 0 && waitCellDeclaration < mainEntry,
+    "the lock wait cell must be initialized before the main doctor entry can use it");
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-live-lock-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = createGovernorScope({
+    effectiveHost: "github.com",
+    env: { ...process.env, XDG_CONFIG_HOME: root },
+  });
+  assert.equal(scope.ok, true);
+  mkdirSync(dirname(scope.value.path), { recursive: true, mode: 0o700 });
+  writeFileSync(
+    `${scope.value.path}.lock`,
+    `${JSON.stringify({ pid: process.pid, nonce: "doctor-live-test-owner" })}\n`,
+    { mode: 0o600 },
+  );
+
+  const out = await doctor({
+    env: { XDG_CONFIG_HOME: root },
+    args: ["--repo", "acme/widget"],
+  });
+  assert.match(out, /gh-glance doctor/);
+  assert.match(out, /API governor\n------------/);
+  assert.match(out, /^status {12}unavailable$/m);
 });
 
 test("--doctor never prints a token that was planted in its environment", async () => {
@@ -166,7 +267,7 @@ test("--doctor spends nothing when the free budget probe fails", async () => {
   const message = "HTTP 403: Resource protected by organization SAML enforcement";
   const out = await doctor({ env: { GH_GLANCE_FIXTURE_FAIL: message } });
   assert.match(out, /^REST core {9}unavailable$/m);
-  assert.equal(out.match(/^ {2}classified {2}skipped$/gm)?.length, 10, out);
+  assert.equal(out.match(/^ {2}classified {2}skipped$/gm)?.length, 11, out);
 });
 
 test("--doctor skips a REST diagnostic whose paced slot is still in the future", async () => {
@@ -202,8 +303,10 @@ test("--doctor reports paced repository access separately", async () => {
     assert.ok(repositoryBlock.includes(message), repositoryBlock);
   }
 
-  const actions = probeBlock(out, "Actions (run list)");
-  assert.match(actions, /^ {2}classified {2}(?:skipped|ok)$/m, actions);
+  for (const name of ["Actions runs", "Actions workflows"]) {
+    const actions = probeBlock(out, name);
+    assert.match(actions, /^ {2}classified {2}(?:skipped|ok)$/m, actions);
+  }
   for (const name of ["Issues (issue list)", "Pull requests (pr list)"]) {
     const block = probeBlock(out, name);
     assert.match(block, /^ {2}classified {2}skipped$/m, block);
@@ -220,7 +323,7 @@ test("--doctor reports the host-qualified target it was given", async () => {
   );
   // The D2 guard, stated in the report: the host travels as --hostname and
   // never as path text.
-  assert.match(out, /argv {8}gh api repos\/acme\/widget\/.*--hostname tenant\.ghe\.com/);
+  assert.match(out, /argv {8}gh api -i repos\/acme\/widget\/.*--hostname tenant\.ghe\.com/);
   assert.ok(!out.includes("repos/tenant.ghe.com/"), out);
 });
 

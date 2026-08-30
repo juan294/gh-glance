@@ -16,6 +16,56 @@ echo "$*" >> "$GH_GLANCE_FIXTURE_LOG"
 
 FIXTURE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
+gh_command=${1:-}
+api_path=
+api_include=0
+api_if_none_match=
+
+parse_api_args() {
+  expect=
+  command_seen=0
+  for argument do
+    if [ "$command_seen" -eq 0 ]; then
+      if [ "$argument" = "api" ]; then
+        command_seen=1
+      fi
+      continue
+    fi
+    if [ -n "$expect" ]; then
+      if [ "$expect" = "header" ]; then
+        case "$argument" in
+          [Ii][Ff]-[Nn][Oo][Nn][Ee]-[Mm][Aa][Tt][Cc][Hh]:*)
+            api_if_none_match=${argument#*:}
+            api_if_none_match=${api_if_none_match#"${api_if_none_match%%[![:space:]]*}"}
+            ;;
+        esac
+      fi
+      expect=
+      continue
+    fi
+    case "$argument" in
+      -i|--include) api_include=1 ;;
+      -H|--header) expect=header ;;
+      --hostname|--jq|-X|--method|-f|--raw-field|-F|--field|--input) expect=value ;;
+      -H*)
+        header=${argument#-H}
+        case "$header" in
+          [Ii][Ff]-[Nn][Oo][Nn][Ee]-[Mm][Aa][Tt][Cc][Hh]:*)
+            api_if_none_match=${header#*:}
+            api_if_none_match=${api_if_none_match#"${api_if_none_match%%[![:space:]]*}"}
+            ;;
+        esac
+        ;;
+      --hostname=*|--jq=*|--method=*|--raw-field=*|--field=*|--input=*|-*) ;;
+      *) [ -n "$api_path" ] || api_path=$argument ;;
+    esac
+  done
+}
+
+if [ "$gh_command" = "api" ]; then
+  parse_api_args "$@"
+fi
+
 if [ -n "${GH_GLANCE_FIXTURE_STATE:-}" ]; then
   exec node "$FIXTURE_DIR/gh-state.mjs" "$@"
 fi
@@ -23,39 +73,64 @@ fi
 matches_selector() {
   wanted=$1
   if [ "$wanted" = "api-data" ]; then
-    [ "$1" != "" ] && [ "${2:-}" = "api" ] && [ "${3:-}" != "rate_limit" ]
+    [ "$gh_command" = "api" ] && [ "$api_path" != "rate_limit" ] && [ "$api_path" != "user" ]
     return
   fi
   if [ "$wanted" = "dependabot" ]; then
-    [ "${2:-}" = "api" ] && printf '%s' "${3:-}" | grep -q dependabot
+    [ "$gh_command" = "api" ] && printf '%s' "$api_path" | grep -q dependabot
     return
   fi
-  [ "${2:-}" = "$wanted" ]
+  if [ "$wanted" = "actions" ]; then
+    [ "$gh_command" = "api" ] && printf '%s' "$api_path" | grep -q '/actions/'
+    return
+  fi
+  [ "$gh_command" = "$wanted" ]
 }
+
+consume_matching_counter() {
+  counter_file=$1
+  selectors=$2
+  IFS= read -r remaining < "$counter_file" || remaining=0
+  case "$remaining" in
+    ''|*[!0-9]*) remaining=0 ;;
+  esac
+  [ "$remaining" -gt 0 ] || return 1
+  while [ -n "$selectors" ]; do
+    selector=${selectors%%,*}
+    if matches_selector "$selector"; then
+      printf '%s\n' "$((remaining - 1))" > "$counter_file"
+      return 0
+    fi
+    case "$selectors" in
+      *,*) selectors=${selectors#*,} ;;
+      *) break ;;
+    esac
+  done
+  return 1
+}
+
+# A successful process can still leave unusable stdout when it is killed after
+# starting or dies during a write. A caller-owned counter makes that boundary
+# deterministic while the next invocation returns the ordinary fixture body.
+if [ -n "${GH_GLANCE_FIXTURE_EMPTY_FIRST_FILE:-}" ] &&
+  [ -f "$GH_GLANCE_FIXTURE_EMPTY_FIRST_FILE" ]; then
+  if consume_matching_counter \
+    "$GH_GLANCE_FIXTURE_EMPTY_FIRST_FILE" \
+    "${GH_GLANCE_FIXTURE_EMPTY_FIRST_ON:-api}"; then
+    exit 0
+  fi
+fi
 
 # A caller-owned counter makes recovery deterministic without timing a race.
 # Each matching invocation consumes one failure, then the same live process sees
 # ordinary successful fixture responses.
 if [ -n "${GH_GLANCE_FIXTURE_FAIL_FIRST_FILE:-}" ] &&
   [ -f "$GH_GLANCE_FIXTURE_FAIL_FIRST_FILE" ]; then
-  remaining=$(sed -n '1p' "$GH_GLANCE_FIXTURE_FAIL_FIRST_FILE")
-  case "$remaining" in
-    ''|*[!0-9]*) remaining=0 ;;
-  esac
-  if [ "$remaining" -gt 0 ]; then
-    fail_first_on=${GH_GLANCE_FIXTURE_FAIL_FIRST_ON:-api}
-    while [ -n "$fail_first_on" ]; do
-      selector=${fail_first_on%%,*}
-      if matches_selector "$selector" "$1" "${2:-}"; then
-        printf '%s\n' "$((remaining - 1))" > "$GH_GLANCE_FIXTURE_FAIL_FIRST_FILE"
-        echo "${GH_GLANCE_FIXTURE_FAIL_FIRST_MESSAGE:-temporary fixture failure}" >&2
-        exit 1
-      fi
-      case "$fail_first_on" in
-        *,*) fail_first_on=${fail_first_on#*,} ;;
-        *) break ;;
-      esac
-    done
+  if consume_matching_counter \
+    "$GH_GLANCE_FIXTURE_FAIL_FIRST_FILE" \
+    "${GH_GLANCE_FIXTURE_FAIL_FIRST_ON:-api}"; then
+    echo "${GH_GLANCE_FIXTURE_FAIL_FIRST_MESSAGE:-temporary fixture failure}" >&2
+    exit 1
   fi
 fi
 
@@ -67,7 +142,7 @@ if [ -n "${GH_GLANCE_FIXTURE_FAIL:-}" ]; then
   fail_on="${GH_GLANCE_FIXTURE_FAIL_ON:-api}"
   while [ -n "$fail_on" ]; do
     selector=${fail_on%%,*}
-    if matches_selector "$selector" "$1" "${2:-}"; then
+    if matches_selector "$selector"; then
       echo "$GH_GLANCE_FIXTURE_FAIL" >&2
       exit 1
     fi
@@ -78,7 +153,33 @@ if [ -n "${GH_GLANCE_FIXTURE_FAIL:-}" ]; then
   done
 fi
 
-case "$1" in
+emit_api_headers() {
+  entity_tag=$1
+  reset=$(( $(date +%s) + 3600 ))
+  if [ "$api_include" -eq 1 ] && [ "$api_if_none_match" = "$entity_tag" ]; then
+    printf 'HTTP/2 304 Not Modified\r\netag: %s\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-used: 1\r\nx-ratelimit-remaining: 4999\r\nx-ratelimit-reset: %s\r\nx-ratelimit-resource: core\r\n\r\n' "$entity_tag" "$reset"
+    exit 1
+  fi
+  if [ "$api_include" -eq 1 ]; then
+    printf 'HTTP/2 200 OK\r\netag: %s\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-used: 1\r\nx-ratelimit-remaining: 4999\r\nx-ratelimit-reset: %s\r\nx-ratelimit-resource: core\r\n\r\n' "$entity_tag" "$reset"
+  fi
+}
+
+emit_api_file() {
+  body_file=$1
+  entity_tag=$2
+  emit_api_headers "$entity_tag"
+  cat "$body_file"
+}
+
+emit_api_text() {
+  entity_tag=$1
+  body=$2
+  emit_api_headers "$entity_tag"
+  printf '%s\n' "$body"
+}
+
+case "$gh_command" in
   --version)
     # preflight() runs this first and exits 3 if it fails (index.mjs:552-560),
     # so nothing renders unless this succeeds.
@@ -154,19 +255,53 @@ case "$1" in
     # so a capture can drive the shared governor; the default is a healthy
     # budget with no admission hold.
     : "${GH_GLANCE_FIXTURE_RATE_REMAINING:=5000}"
-    case "${2:-}" in
+    case "$api_path" in
       rate_limit)
         reset=$(( $(date +%s) + 3600 ))
+        rate_used=0
+        if [ -n "${GH_GLANCE_FIXTURE_RATE_SEQUENCE_FILE:-}" ]; then
+          rate_sequence=$(sed -n '1p' "$GH_GLANCE_FIXTURE_RATE_SEQUENCE_FILE" 2>/dev/null || printf '0')
+          case "$rate_sequence" in
+            ''|*[!0-9]*) rate_sequence=0 ;;
+          esac
+          printf '%s\n' "$((rate_sequence + 1))" > "$GH_GLANCE_FIXTURE_RATE_SEQUENCE_FILE"
+          rate_used=$((rate_sequence * 10))
+        fi
+        rate_remaining=$((5000 - rate_used))
         printf '{"resources":{"core":{"limit":5000,"used":%s,"remaining":%s,"reset":%s},' \
-          "$((5000 - GH_GLANCE_FIXTURE_RATE_REMAINING))" "$GH_GLANCE_FIXTURE_RATE_REMAINING" "$reset"
-        printf '"graphql":{"limit":5000,"used":0,"remaining":5000,"reset":%s}}}\n' "$reset"
+          "0" "5000" "$reset"
+        printf '"graphql":{"limit":5000,"used":%s,"remaining":%s,"reset":%s}}}\n' \
+          "$rate_used" "$rate_remaining" "$reset"
+        exit 0
+        ;;
+    esac
+    case "$api_path" in
+      *'/actions/runs?'*)
+        run_file="$FIXTURE_DIR/actions-runs.json"
+        run_etag='"fixture-runs-v1"'
+        if [ -n "${GH_GLANCE_FIXTURE_RUN_SEQUENCE_FILE:-}" ]; then
+          sequence=$(sed -n '1p' "$GH_GLANCE_FIXTURE_RUN_SEQUENCE_FILE" 2>/dev/null || printf '0')
+          case "$sequence" in
+            ''|*[!0-9]*) sequence=0 ;;
+          esac
+          printf '%s\n' "$((sequence + 1))" > "$GH_GLANCE_FIXTURE_RUN_SEQUENCE_FILE"
+          if [ "$sequence" -gt 0 ]; then
+            run_file="$FIXTURE_DIR/actions-runs-expanded.json"
+            run_etag='"fixture-runs-v2"'
+          fi
+        fi
+        emit_api_file "$run_file" "$run_etag"
+        exit 0
+        ;;
+      *'/actions/workflows?'*)
+        emit_api_file "$FIXTURE_DIR/actions-workflows.json" '"fixture-workflows-v1"'
         exit 0
         ;;
     esac
     if [ -n "${GH_GLANCE_FIXTURE_SECURITY_ALERTS:-}" ]; then
-      case "${2:-}" in
+      case "$api_path" in
         *dependabot*)
-          echo '[{"number":1,"state":"open","created_at":"2026-08-11T05:00:00Z","severity":"high","title":"cached dependency alert","detail":"ink"}]'
+          emit_api_text '"fixture-dependabot-v1"' '[{"number":1,"state":"open","created_at":"2026-08-11T05:00:00Z","severity":"high","title":"cached dependency alert","detail":"ink"}]'
           exit 0
           ;;
       esac
@@ -175,7 +310,7 @@ case "$1" in
     # alerts, which keeps the Security tab in its resolved-and-empty state
     # rather than its error state -- errors would add note lines and change the
     # frame's reserved-line arithmetic (index.mjs:1239-1243).
-    echo '[]'
+    emit_api_text '"fixture-empty-v1"' '[]'
     ;;
   *)
     echo '[]'

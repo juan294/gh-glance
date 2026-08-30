@@ -162,6 +162,11 @@ const AUTH_RETRY_MS = [30_000];
 // byte-identical-idle-frame property the rest of this file works to keep.
 const STALE_AFTER_MS = 30_000;
 
+// A coordination hold must persist long enough to be meaningful before it
+// takes the notice row. Short startup and lock-contention states recover on
+// their own and should not present themselves as user-visible failures.
+const COORDINATION_NOTICE_AFTER_MS = 2_000;
+
 // Mutable because the fetchers below are defined before argv is parsed, and the
 // argv block is what fills this in. Everything here has a working default, so
 // the zero-argument invocation the README documents behaves exactly as before.
@@ -390,6 +395,24 @@ function isMissingRemote(err) {
   return /(?:failed to determine base repo:\s*)?no git remotes found/i.test(errText(err));
 }
 
+const UNUSABLE_OUTPUT_CODE = "GH_GLANCE_UNUSABLE_OUTPUT";
+
+// Only JSON parsed from a successful gh stdout stream goes through this seam.
+// Marking the SyntaxError here distinguishes our own failed parse from a gh
+// stderr message that happens to use the same words.
+function parseJsonOutput(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    if (error instanceof SyntaxError) error.code = UNUSABLE_OUTPUT_CODE;
+    throw error;
+  }
+}
+
+function isUnusableOutput(err) {
+  return err?.code === UNUSABLE_OUTPUT_CODE;
+}
+
 // The one place the three predicates are turned into a verdict. Both consumers
 // go through it -- the fetcher, to choose a note and a backoff ladder, and
 // `--doctor`, to report what gh-glance concluded -- so the report cannot claim
@@ -409,6 +432,7 @@ function classify(err) {
   if (isRateLimited(err)) return "rate-limited";
   if (isAuthProblem(err)) return "auth-problem";
   if (isUnavailable(err)) return "unavailable";
+  if (isUnusableOutput(err)) return "unusable-output";
   return "other";
 }
 
@@ -621,6 +645,92 @@ async function runGh(args, { signal, operation } = {}) {
   } catch (err) {
     logGh(args, startedAt, `FAILED ${shortErr(err)}`);
     throw err;
+  }
+}
+
+function parseGhApiResponse(stdout) {
+  const text = typeof stdout === "string" ? stdout : String(stdout ?? "");
+  const separator = /\r?\n\r?\n/.exec(text);
+  const prefix = separator ? text.slice(0, separator.index) : text;
+  const body = separator ? text.slice(separator.index + separator[0].length) : "";
+  const lines = prefix.split(/\r?\n/);
+  const statusMatch = /^HTTP\/\d(?:\.\d+)?\s+(\d{3})(?:\s|$)/i.exec(lines[0] ?? "");
+  const headers = {};
+  for (const line of lines.slice(1)) {
+    const colon = line.indexOf(":");
+    if (colon <= 0) continue;
+    const name = line.slice(0, colon).trim().toLowerCase();
+    if (name) headers[name] = line.slice(colon + 1).trim();
+  }
+  return {
+    status: statusMatch ? Number(statusMatch[1]) : null,
+    headers,
+    body,
+  };
+}
+
+function pickRateLimit(headers) {
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) return null;
+  const integer = (name) => {
+    const value = Number(headers[name]);
+    return Number.isSafeInteger(value) && value >= 0 ? value : null;
+  };
+  const resource = typeof headers["x-ratelimit-resource"] === "string"
+    ? headers["x-ratelimit-resource"].trim().toLowerCase()
+    : "";
+  const limit = integer("x-ratelimit-limit");
+  const used = integer("x-ratelimit-used");
+  const remaining = integer("x-ratelimit-remaining");
+  const reset = integer("x-ratelimit-reset");
+  if (!RATE_RESOURCES.includes(resource) || [limit, used, remaining, reset].includes(null)) return null;
+  return { resource, limit, used, remaining, resetMs: reset * 1000 };
+}
+
+function responseHeaderObservation(rateLimit, cost, receivedAt = Date.now()) {
+  return rateLimit ? {
+    ...rateLimit,
+    source: "response-header",
+    receivedAt,
+    cost,
+  } : null;
+}
+
+function ghApiArgs(args, etag = null) {
+  return [
+    "api",
+    "-i",
+    ...args,
+    ...(typeof etag === "string" && etag.length > 0 ? ["-H", `If-None-Match: ${etag}`] : []),
+  ];
+}
+
+async function ghApi(args, { operation, signal, etag = null, run = runGh } = {}) {
+  const argv = ghApiArgs(args, etag);
+  try {
+    const parsed = parseGhApiResponse(await run(argv, { operation, signal }));
+    return {
+      status: parsed.status,
+      etag: parsed.headers.etag ?? null,
+      rateLimit: pickRateLimit(parsed.headers),
+      body: parsed.body,
+    };
+  } catch (error) {
+    const parsed = parseGhApiResponse(error?.stdout);
+    if (parsed.status === 304) {
+      return {
+        status: 304,
+        etag: parsed.headers.etag ?? null,
+        rateLimit: pickRateLimit(parsed.headers),
+        body: "",
+      };
+    }
+    if (parsed.status !== null) {
+      error.apiResponse = parsed;
+      const rateLimit = pickRateLimit(parsed.headers);
+      const observation = responseHeaderObservation(rateLimit, 0);
+      if (observation) error.budgetObservations = [observation];
+    }
+    throw error;
   }
 }
 
@@ -872,40 +982,161 @@ function createFailureContextCoordinator({ resolve, commit, fallback }) {
   return { ensure, invalidate };
 }
 
-function actionsArgs(limit) {
+function actionsRunsArgs(limit) {
   return [
-    "run",
-    "list",
-    ...repoArgs(),
-    "--limit",
-    String(limit),
-    "--json",
-    "databaseId,displayTitle,workflowName,number,headBranch,status,conclusion,startedAt,updatedAt",
+    apiPath(`repos/{owner}/{repo}/actions/runs?exclude_pull_requests=true&per_page=${limit}`),
+    ...apiHostArgs(),
+    "--jq",
+    "[.workflow_runs[] | {databaseId: .id, displayTitle: .display_title, number: .run_number, headBranch: .head_branch, status, conclusion, startedAt: .run_started_at, updatedAt: .updated_at, workflowId: .workflow_id}]",
   ];
 }
 
-async function fetchActions(limit, signal) {
-  const raw = await runGh(actionsArgs(limit), { signal, operation: "tab:actions" });
+function actionsWorkflowsArgs() {
+  return [
+    apiPath("repos/{owner}/{repo}/actions/workflows?page=1&per_page=100"),
+    ...apiHostArgs(),
+    "--jq",
+    "[.workflows[] | {id, name}]",
+  ];
+}
+
+function parseActionsBodies(runsBody, workflowsBody) {
+  const workflows = new Map(parseJsonOutput(workflowsBody).map((workflow) => [
+    workflow.id,
+    safe(workflow.name),
+  ]));
+  return parseJsonOutput(runsBody).map((run) => ({
+    databaseId: run.databaseId,
+    displayTitle: safe(run.displayTitle),
+    workflowName: workflows.get(run.workflowId) ?? "",
+    number: run.number,
+    headBranch: safe(run.headBranch),
+    status: run.status,
+    conclusion: run.conclusion,
+    startedAt: run.startedAt,
+    updatedAt: run.updatedAt,
+  }));
+}
+
+function entityKey(tab, path) {
+  return `${tab}\0${path}`;
+}
+
+function cachedEntity(entities, tab, path) {
+  const value = entities instanceof Map ? entities.get(entityKey(tab, path)) : null;
+  return typeof value?.etag === "string" && typeof value?.body === "string" ? value : null;
+}
+
+async function fetchConditionalEntity({
+  tab,
+  args,
+  operation,
+  signal,
+  force,
+  entities,
+  request = ghApi,
+}) {
+  const path = args[0];
+  const cached = cachedEntity(entities, tab, path);
+  const response = await request(args, {
+    operation,
+    signal,
+    etag: force ? null : cached?.etag ?? null,
+  });
+  const observation = responseHeaderObservation(
+    response.rateLimit,
+    response.status === 200 ? 1 : 0,
+  );
+  if (response.status === 304) {
+    return {
+      path,
+      status: 304,
+      body: cached?.body ?? null,
+      staged: null,
+      observations: observation ? [observation] : [],
+    };
+  }
   return {
-    raw,
+    path,
+    status: response.status,
+    body: response.body,
+    staged: response.status === 200
+      ? [entityKey(tab, path), typeof response.etag === "string"
+          ? { etag: response.etag, body: response.body }
+          : null]
+      : null,
+    observations: observation ? [observation] : [],
+  };
+}
+
+function conditionalBatchResult(responses, previousRaw, joinedRaw = null) {
+  const list = Array.isArray(responses) ? responses : [];
+  let allNotModified = list.length > 0;
+  let restSpent = 0;
+  let stagedEntities = null;
+  const observations = [];
+  for (const response of list) {
+    if (response?.status !== 304 || typeof response.body !== "string") allNotModified = false;
+    if (response?.status === 200) restSpent += 1;
+    if (Array.isArray(response?.observations)) observations.push(...response.observations);
+    if (!response?.staged) continue;
+    stagedEntities ??= new Map();
+    stagedEntities.set(...response.staged);
+  }
+  return {
+    raw: allNotModified
+      ? previousRaw
+      : joinedRaw ?? list.map((response) => response?.body ?? "").join("\0"),
+    allNotModified,
+    restSpent,
+    stagedEntities,
+    observations,
+  };
+}
+
+function publishStagedEntities(entities, staged, transitionKind) {
+  if (!(entities instanceof Map) || !(staged instanceof Map) ||
+    !["changed", "unchanged"].includes(transitionKind)) return false;
+  for (const [key, value] of staged) {
+    if (value === null) entities.delete(key);
+    else entities.set(key, value);
+  }
+  return true;
+}
+
+async function fetchActions(limit, signal, {
+  entities = new Map(),
+  force = false,
+  previousRaw = null,
+} = {}) {
+  const responses = await Promise.all([
+    fetchConditionalEntity({
+      tab: "actions",
+      args: actionsRunsArgs(limit),
+      operation: "tab:actions-runs",
+      signal,
+      force,
+      entities,
+    }),
+    fetchConditionalEntity({
+      tab: "actions",
+      args: actionsWorkflowsArgs(),
+      operation: "tab:actions-workflows",
+      signal,
+      force,
+      entities,
+    }),
+  ]);
+  const [runs, workflows] = responses;
+  const batch = conditionalBatchResult(responses, previousRaw);
+  return {
+    raw: batch.raw,
     limit,
-    // What this fetch actually cost, read from the one cost table rather than
-    // re-derived from the argv shape -- a second copy of the cost model is the
-    // drift this file warns about repeatedly.
-    restSpent: REST_PER_FETCH.actions,
+    restSpent: batch.restSpent,
     graphqlSpent: GRAPHQL_PER_FETCH.actions,
-    parse: () =>
-      JSON.parse(raw).map((r) => ({
-        databaseId: r.databaseId,
-        displayTitle: safe(r.displayTitle),
-        workflowName: safe(r.workflowName),
-        number: r.number,
-        headBranch: safe(r.headBranch),
-        status: r.status,
-        conclusion: r.conclusion,
-        startedAt: r.startedAt,
-        updatedAt: r.updatedAt,
-      })),
+    stagedEntities: batch.stagedEntities,
+    observations: batch.observations,
+    parse: () => parseActionsBodies(runs.body ?? "", workflows.body ?? ""),
   };
 }
 
@@ -944,7 +1175,7 @@ async function fetchIssues(signal) {
     restSpent: REST_PER_FETCH.issues,
     graphqlSpent: GRAPHQL_PER_FETCH.issues,
     parse: () =>
-      JSON.parse(raw).map((i) => ({
+      parseJsonOutput(raw).map((i) => ({
         number: i.number,
         title: safe(i.title),
         author: safe(i.author?.login ?? ""),
@@ -978,7 +1209,7 @@ async function fetchPRs(signal) {
     restSpent: REST_PER_FETCH.prs,
     graphqlSpent: GRAPHQL_PER_FETCH.prs,
     parse: () =>
-      JSON.parse(raw).map((p) => ({
+      parseJsonOutput(raw).map((p) => ({
         number: p.number,
         title: safe(p.title),
         author: safe(p.author?.login ?? ""),
@@ -1086,6 +1317,8 @@ function tabRequestCost(tab) {
 // individual calls covered by the tab's six-call upfront reservation.
 const OPERATION_COSTS = Object.freeze({
   ...Object.fromEntries(TAB_KEYS.map((tab) => [`tab:${tab}`, tabRequestCost(tab)])),
+  "tab:actions-runs": { core: 1, graphql: 0 },
+  "tab:actions-workflows": { core: 1, graphql: 0 },
   "tab:security-endpoint": { core: 1, graphql: 0 },
   "failure-context:repository": { core: 0, graphql: 1 },
   "failure-context:auth": { core: 0, graphql: 0 },
@@ -1093,10 +1326,15 @@ const OPERATION_COSTS = Object.freeze({
   "open:issues": { core: 0, graphql: GRAPHQL_PER_FETCH.issues },
   "open:prs": { core: 0, graphql: GRAPHQL_PER_FETCH.prs },
   "doctor:repository": { core: 0, graphql: 1 },
-  "doctor:actions": tabRequestCost("actions"),
+  "doctor:actions-runs": { core: 1, graphql: 0 },
+  "doctor:actions-workflows": { core: 1, graphql: 0 },
   "doctor:issues": tabRequestCost("issues"),
   "doctor:prs": tabRequestCost("prs"),
   "doctor:security-endpoint": { core: 1, graphql: 0 },
+  // The claimed observer is the one control-plane exception to normal data
+  // admission, but its worst-case vector is still one core unit: the first 200
+  // can spend it before an ETag makes later observations free.
+  "budget-core-observer": { core: 1, graphql: 0 },
   "rate-limit": { core: 0, graphql: 0 },
   "version": { core: 0, graphql: 0 },
   "auth-status": { core: 0, graphql: 0 },
@@ -1111,7 +1349,15 @@ function operationCost(operation) {
 // is for the user's own `gh` and `git` commands.
 const BUDGET_SAFETY = 0.8;
 const BUDGET_RESERVE_FRACTION = 1 - BUDGET_SAFETY;
+// How often to re-read the budget. `gh api rate_limit` does not count against
+// the limit (verified, delta 0 -- see rateBudget) but it is still a subprocess,
+// so once a minute rather than once a tick: the quantity it measures moves on
+// the scale of minutes.
+const BUDGET_PROBE_MS = 60_000;
 const BUDGET_SNAPSHOT_TTL_MS = 65_000;
+// GraphQL has no response-header owner. One unusable minute sample must not
+// close admission, but two consecutive misses still do: 2 probes + 5s grace.
+const GRAPHQL_BUDGET_SNAPSHOT_TTL_MS = 2 * BUDGET_PROBE_MS + 5_000;
 const GOVERNOR_HEARTBEAT_MS = 20_000;
 const GOVERNOR_LEASE_TTL_MS = 90_000;
 const GOVERNOR_PROBE_LEASE_MS = 70_000;
@@ -1120,11 +1366,27 @@ const BUDGET_RESET_GRACE_MS = 2_000;
 const GOVERNOR_PHASE_WINDOW_MS = 5_000;
 const BUDGET_WINDOW_MS = 3_600_000;
 
-// How often to re-read the budget. `gh api rate_limit` does not count against
-// the limit (verified, delta 0 -- see rateBudget) but it is still a subprocess,
-// so once a minute rather than once a tick: the quantity it measures moves on
-// the scale of minutes.
-const BUDGET_PROBE_MS = 60_000;
+function budgetSnapshotTtl(resource) {
+  return resource === "graphql" ? GRAPHQL_BUDGET_SNAPSHOT_TTL_MS : BUDGET_SNAPSHOT_TTL_MS;
+}
+
+function sharedLaneProvenance(value) {
+  return value?.waitCause === "shared-lane" &&
+    Number.isSafeInteger(value?.sharingCount) && value.sharingCount > 1
+    ? { waitCause: "shared-lane", sharingCount: value.sharingCount }
+    : {};
+}
+
+function sharedLaneEvidence(value) {
+  const provenance = sharedLaneProvenance(value);
+  const ownerLeaseIds = Array.isArray(value?.sharingOwnerLeaseIds)
+    ? [...new Set(value.sharingOwnerLeaseIds.filter((leaseId) =>
+        typeof leaseId === "string" && leaseId.length > 0))]
+    : [];
+  return provenance.waitCause && ownerLeaseIds.length > 0
+    ? { ...provenance, sharingOwnerLeaseIds: ownerLeaseIds }
+    : {};
+}
 
 // Below this many completed shared calls in a probe window, external-spend
 // inference is noise. Under the threshold the loop retains the previous factor.
@@ -1175,6 +1437,23 @@ function leaseFor(leases, leaseId) {
   return leases instanceof Map ? leases.get(leaseId) : leases?.[leaseId];
 }
 
+function countLiveLeases(leases, nowMs) {
+  let count = 0;
+  const values = leases instanceof Map ? leases.values() : Object.values(leases);
+  for (const lease of values) {
+    if (Number.isFinite(lease?.expiresAt) && lease.expiresAt > nowMs) count += 1;
+  }
+  return count;
+}
+
+function currentSharedLaneProvenance(value, leases, nowMs) {
+  const evidence = sharedLaneEvidence(value);
+  if (!evidence.waitCause || countLiveLeases(leases, nowMs) !== evidence.sharingCount) return {};
+  return evidence.sharingOwnerLeaseIds.every((leaseId) => leaseFor(leases, leaseId)?.expiresAt > nowMs)
+    ? sharedLaneProvenance(evidence)
+    : {};
+}
+
 function reservationCost(reservation, resource, leases, nowMs) {
   if (!reservation || ["cancelled", "reconciled"].includes(reservation.status)) return 0;
   if (reservation.status === "scheduled") {
@@ -1187,11 +1466,13 @@ function reservationCost(reservation, resource, leases, nowMs) {
     : reservation.costs;
   const cost = chargedCosts?.[resource] ??
     (reservation.resource === resource ? reservation.cost : 0);
-  return Number.isFinite(cost) && cost > 0 ? cost : 0;
+  const accounted = reservation.accountedCosts?.[resource] ?? 0;
+  return Number.isFinite(cost) && cost > 0 ? Math.max(0, cost - accounted) : 0;
 }
 
 function availableForGrant({
   budget,
+  resource = budget?.resource,
   reservations = [],
   leases = {},
   nowMs,
@@ -1199,8 +1480,9 @@ function availableForGrant({
 }) {
   const normalized = normalizeBudgetResource(budget);
   if (!normalized) return { mode: "probe", reason: "budget-unknown" };
+  if (!RATE_RESOURCES.includes(resource)) return { mode: "probe", reason: "budget-resource" };
   if (normalized.observedAt > nowMs) return { mode: "probe", reason: "budget-future" };
-  if (nowMs - normalized.observedAt > BUDGET_SNAPSHOT_TTL_MS) {
+  if (nowMs - normalized.observedAt > budgetSnapshotTtl(resource)) {
     return { mode: "probe", reason: "budget-stale" };
   }
   if (nowMs >= normalized.resetMs) return { mode: "probe", reason: "budget-reset" };
@@ -1226,7 +1508,7 @@ function availableForGrant({
 
   const reserve = resourceReserve(normalized.limit);
   const charged = chargedCost ?? reservations.reduce(
-    (total, reservation) => total + reservationCost(reservation, budget.resource, leases, nowMs),
+    (total, reservation) => total + reservationCost(reservation, resource, leases, nowMs),
     0,
   );
   return {
@@ -1272,7 +1554,8 @@ function resourceDecision({
   chargedCost = null,
 }) {
   const capacity = availableForGrant({
-    budget: budget && { ...budget, resource },
+    budget,
+    resource,
     reservations,
     leases,
     nowMs,
@@ -1480,6 +1763,7 @@ function scheduleIntents({
   const updatedCursors = { ...cursors };
   const grants = [];
   const denied = [];
+  const liveLeaseCount = countLiveLeases(leases, nowMs);
   const priorities = [...new Set(valid.map((intent) => intent.normalizedPriority))].sort((a, b) => a - b);
 
   for (const priority of priorities) {
@@ -1510,9 +1794,9 @@ function scheduleIntents({
         resource,
         governorEpochPhaseAt(intent.phaseSeed, decisions[resource]),
       ]));
+      const intrinsicAt = Math.max(nowMs, ...Object.values(phaseTimes));
       const notBefore = Math.max(
-        nowMs,
-        ...Object.values(phaseTimes),
+        intrinsicAt,
         ...resources.map((resource) => updatedLanes[resource]?.nextAt ?? nowMs),
       );
       const expiring = resources.find((resource) => notBefore >= decisions[resource].resetMs);
@@ -1538,6 +1822,18 @@ function scheduleIntents({
         status: "scheduled",
         epochs: Object.fromEntries(resources.map((resource) => [resource, decisions[resource].epoch])),
       };
+      const limitingLanes = resources.filter((resource) =>
+        updatedLanes[resource]?.nextAt === notBefore);
+      const sharingOwnerLeaseIds = [...new Set(limitingLanes.map((resource) =>
+        updatedCursors[resource]))];
+      const sharedLane = liveLeaseCount > 1 && notBefore > intrinsicAt &&
+        sharingOwnerLeaseIds.length > 0 && sharingOwnerLeaseIds.every((owner) =>
+          owner !== intent.leaseId && leaseFor(leases, owner)?.expiresAt > nowMs);
+      if (sharedLane) {
+        reservation.waitCause = "shared-lane";
+        reservation.sharingCount = liveLeaseCount;
+        reservation.sharingOwnerLeaseIds = sharingOwnerLeaseIds;
+      }
       grants.push(reservation);
       for (const resource of resources) {
         chargedTotals[resource] += intent.costs[resource];
@@ -1562,7 +1858,11 @@ function scheduleIntents({
 
 // ---------- Shared account governor ----------
 
-const GOVERNOR_STATE_VERSION = 1;
+// The scope version is deliberately stable. Stored protocol revisions must use
+// the same file so an older process sees the new exact shape and fails closed
+// instead of coordinating through a second file.
+const GOVERNOR_SCOPE_VERSION = 1;
+const GOVERNOR_STATE_VERSION = 2;
 const GOVERNOR_MAX_LEASES = 128;
 const GOVERNOR_MAX_INTENTS = 512;
 const GOVERNOR_MAX_RESERVATIONS = 512;
@@ -1571,6 +1871,7 @@ const GOVERNOR_PROBE_DRAIN_MS = 30_000;
 const GOVERNOR_PUBLICATION_REINSPECT_MS = 1_000;
 const GOVERNOR_PROBE_TRANSITION_MS = 5_000;
 const GOVERNOR_MAX_FUTURE_MS = 24 * 60 * 60 * 1000;
+const persistenceWaitCell = new Int32Array(new SharedArrayBuffer(4));
 const GOVERNOR_OUTCOMES = new Set([
   "measured-success",
   "rejected",
@@ -1605,7 +1906,7 @@ function governorScopeHash(effectiveHost, authIdentity) {
   const host = normalizeHost(effectiveHost);
   if (!host || typeof authIdentity !== "string" || authIdentity.length === 0) return null;
   return createHash("sha256")
-    .update(JSON.stringify({ version: GOVERNOR_STATE_VERSION, effectiveHost: host, authCacheIdentity: authIdentity }))
+    .update(JSON.stringify({ version: GOVERNOR_SCOPE_VERSION, effectiveHost: host, authCacheIdentity: authIdentity }))
     .digest("hex");
 }
 
@@ -1673,6 +1974,9 @@ function emptyGovernorState() {
     version: GOVERNOR_STATE_VERSION,
     epochs: { core: null, graphql: null },
     budgets: {},
+    observers: {
+      core: { etag: null, outcome: "idle", at: 0, nextAt: 0 },
+    },
     probeClaim: null,
     probeOutcome: { status: "idle", at: 0, nextAt: 0 },
     leases: {},
@@ -1693,10 +1997,11 @@ function exactKeys(value, keys) {
     keys.every((key) => Object.hasOwn(value, key));
 }
 
-function normalizeGovernorBudget(raw, nowMs) {
+function normalizeGovernorBudget(raw, nowMs, resource = null) {
   if (!exactKeys(raw, [
     "limit", "remaining", "used", "resetMs", "observedAt", "blockUntil",
     "blockReason", "laneNextAt", "roundRobinCursor", "lastExternalFactor", "epoch",
+    "source", "factorBaseline", "knownLocalUsed",
   ])) return null;
   const normalized = normalizeBudgetResource(raw);
   if (
@@ -1708,6 +2013,14 @@ function normalizeGovernorBudget(raw, nowMs) {
     (raw.blockReason !== null && !GOVERNOR_BLOCK_REASONS.has(raw.blockReason)) ||
     (raw.roundRobinCursor !== null && !validGovernorId(raw.roundRobinCursor)) ||
     !Number.isFinite(raw.lastExternalFactor) || raw.lastExternalFactor < 1 ||
+    !["response-header", "core-observer", "rate-limit-probe"].includes(raw.source) ||
+    raw.source === "rate-limit-probe" && resource === "core" ||
+    !exactKeys(raw.factorBaseline, ["epoch", "used", "observedAt"]) ||
+    !validGovernorEpoch(raw.factorBaseline.epoch) ||
+    !Number.isSafeInteger(raw.factorBaseline.used) || raw.factorBaseline.used < 0 ||
+    finiteTimestamp(raw.factorBaseline.observedAt, nowMs) === undefined ||
+    raw.factorBaseline.observedAt > nowMs ||
+    !Number.isSafeInteger(raw.knownLocalUsed) || raw.knownLocalUsed < 0 ||
     !validGovernorEpoch(raw.epoch)
   ) return null;
   return {
@@ -1718,6 +2031,9 @@ function normalizeGovernorBudget(raw, nowMs) {
     roundRobinCursor: raw.roundRobinCursor,
     lastExternalFactor: raw.lastExternalFactor,
     epoch: raw.epoch,
+    source: raw.source,
+    factorBaseline: { ...raw.factorBaseline },
+    knownLocalUsed: raw.knownLocalUsed,
   };
 }
 
@@ -1756,18 +2072,19 @@ function normalizeGovernorIntent(raw, nowMs) {
 
 function normalizeGovernorReservation(raw, nowMs) {
   if (!exactKeys(raw, [
-    "leaseId", "intentId", "costs", "actualCosts", "notBefore", "status", "epochs",
+    "leaseId", "intentId", "costs", "actualCosts", "accountedCosts", "notBefore", "status", "epochs",
     "startedAt", "completedAt", "outcome",
   ])) return null;
   const costs = exactResourceCosts(raw.costs);
   const actualCosts = raw.actualCosts === null ? null : exactResourceCosts(raw.actualCosts);
+  const accountedCosts = exactResourceCosts(raw.accountedCosts);
   const epochs = exactKeys(raw.epochs, RATE_RESOURCES) &&
     RATE_RESOURCES.every((resource) => raw.epochs[resource] === null || validGovernorEpoch(raw.epochs[resource]))
     ? { ...raw.epochs }
     : null;
   if (
     !validGovernorId(raw.leaseId) || !validGovernorId(raw.intentId) ||
-    !costs || actualCosts === null && raw.actualCosts !== null || !epochs ||
+    !costs || actualCosts === null && raw.actualCosts !== null || !accountedCosts || !epochs ||
     finiteTimestamp(raw.notBefore, nowMs) === undefined ||
     !GOVERNOR_RESERVATION_STATUSES.has(raw.status) ||
     finiteTimestamp(raw.startedAt, nowMs, { nullable: true }) === undefined ||
@@ -1777,23 +2094,42 @@ function normalizeGovernorReservation(raw, nowMs) {
     (raw.outcome !== null && !GOVERNOR_OUTCOMES.has(raw.outcome))
   ) return null;
   if (actualCosts && RATE_RESOURCES.some((resource) => actualCosts[resource] > costs[resource])) return null;
-  return { ...raw, costs, actualCosts, epochs };
+  if (RATE_RESOURCES.some((resource) => accountedCosts[resource] > (actualCosts?.[resource] ?? costs[resource]))) return null;
+  return { ...raw, costs, actualCosts, accountedCosts, epochs };
+}
+
+function normalizeCoreObserver(raw, nowMs) {
+  if (!exactKeys(raw, ["etag", "outcome", "at", "nextAt"])) return null;
+  if (
+    raw.etag !== null && (typeof raw.etag !== "string" || raw.etag.length === 0) ||
+    !GOVERNOR_PROBE_STATUSES.has(raw.outcome) ||
+    finiteTimestamp(raw.at, nowMs) === undefined || raw.at > nowMs ||
+    finiteTimestamp(raw.nextAt, nowMs) === undefined
+  ) return null;
+  return { ...raw };
 }
 
 function normalizeProbeClaim(raw, nowMs) {
   if (raw === null) return null;
-  if (!exactKeys(raw, ["ownerLeaseId", "nonce", "leaseUntil", "nextAt", "claimAt", "startedReservationIds"])) {
+  if (!exactKeys(raw, [
+    "ownerLeaseId", "nonce", "leaseUntil", "nextAt", "claimAt", "startedReservationIds", "resources",
+  ])) {
     return undefined;
   }
+  const resources = Array.isArray(raw.resources) && raw.resources.length > 0 &&
+    raw.resources.every((resource) => RATE_RESOURCES.includes(resource))
+    ? [...new Set(raw.resources)]
+    : null;
   if (
     !validGovernorId(raw.ownerLeaseId) || !validGovernorId(raw.nonce) ||
     finiteTimestamp(raw.leaseUntil, nowMs) === undefined ||
     finiteTimestamp(raw.nextAt, nowMs) === undefined ||
     finiteTimestamp(raw.claimAt, nowMs) === undefined || raw.claimAt > nowMs ||
     !Array.isArray(raw.startedReservationIds) || raw.startedReservationIds.length > GOVERNOR_MAX_RESERVATIONS ||
-    raw.startedReservationIds.some((id) => !id.startsWith("reservation:") || !validGovernorId(id.slice(12)))
+    raw.startedReservationIds.some((id) => !id.startsWith("reservation:") || !validGovernorId(id.slice(12))) ||
+    !resources
   ) return undefined;
-  return { ...raw, startedReservationIds: [...new Set(raw.startedReservationIds)] };
+  return { ...raw, startedReservationIds: [...new Set(raw.startedReservationIds)], resources };
 }
 
 function normalizeManualProbe(raw, nowMs) {
@@ -1810,13 +2146,14 @@ function normalizeManualProbe(raw, nowMs) {
 
 function normalizeGovernorState(raw, nowMs, { prune = true } = {}) {
   if (!exactKeys(raw, [
-    "version", "epochs", "budgets", "probeClaim", "probeOutcome", "leases",
+    "version", "epochs", "budgets", "observers", "probeClaim", "probeOutcome", "leases",
     "intents", "reservations", "manualProbe",
   ]) || raw.version !== GOVERNOR_STATE_VERSION) return null;
   if (
     !exactKeys(raw.epochs, RATE_RESOURCES) ||
     RATE_RESOURCES.some((resource) => raw.epochs[resource] !== null && !validGovernorEpoch(raw.epochs[resource])) ||
     !isRecord(raw.budgets) || Object.keys(raw.budgets).some((resource) => !RATE_RESOURCES.includes(resource)) ||
+    !exactKeys(raw.observers, ["core"]) ||
     !isRecord(raw.leases) || !isRecord(raw.intents) || !isRecord(raw.reservations) ||
     !exactKeys(raw.probeOutcome, ["status", "at", "nextAt"]) ||
     !GOVERNOR_PROBE_STATUSES.has(raw.probeOutcome.status) ||
@@ -1828,8 +2165,10 @@ function normalizeGovernorState(raw, nowMs, { prune = true } = {}) {
   const state = emptyGovernorState();
   state.epochs = { ...raw.epochs };
   state.probeOutcome = { ...raw.probeOutcome };
+  state.observers.core = normalizeCoreObserver(raw.observers.core, nowMs);
+  if (!state.observers.core) return null;
   for (const resource of Object.keys(raw.budgets)) {
-    const budget = normalizeGovernorBudget(raw.budgets[resource], nowMs);
+    const budget = normalizeGovernorBudget(raw.budgets[resource], nowMs, resource);
     if (!budget) return null;
     state.budgets[resource] = budget;
   }
@@ -1869,7 +2208,36 @@ function serializeGovernorState(state) {
   return `${JSON.stringify(state)}\n`;
 }
 
-function readGovernorState(path, nowMs) {
+function migrateGovernorState(raw, nowMs) {
+  if (!exactKeys(raw, [
+    "version", "epochs", "budgets", "probeClaim", "probeOutcome", "leases",
+    "intents", "reservations", "manualProbe",
+  ]) || raw.version !== 1 || !isRecord(raw.budgets) || !isRecord(raw.reservations)) return null;
+  const migrated = structuredClone(raw);
+  migrated.version = GOVERNOR_STATE_VERSION;
+  migrated.observers = { core: { etag: null, outcome: "idle", at: 0, nextAt: 0 } };
+  // The v1 core value came from /rate_limit, which is not authoritative. Do not
+  // preserve it as bootstrap evidence. GraphQL remains valid.
+  delete migrated.budgets.core;
+  migrated.epochs.core = null;
+  if (migrated.budgets.graphql) {
+    const budget = migrated.budgets.graphql;
+    budget.source = "rate-limit-probe";
+    budget.factorBaseline = {
+      epoch: budget.epoch,
+      used: budget.used,
+      observedAt: budget.observedAt,
+    };
+    budget.knownLocalUsed = 0;
+  }
+  for (const reservation of Object.values(migrated.reservations)) {
+    reservation.accountedCosts = { core: 0, graphql: 0 };
+  }
+  if (migrated.probeClaim) migrated.probeClaim.resources = [...RATE_RESOURCES];
+  return normalizeGovernorState(migrated, nowMs);
+}
+
+function readGovernorState(path, nowMs, { persistMigration = true } = {}) {
   let raw;
   try {
     raw = readFileSync(path, "utf8");
@@ -1879,8 +2247,16 @@ function readGovernorState(path, nowMs) {
       : { ok: false, reason: "unwritable" };
   }
   try {
-    const value = normalizeGovernorState(JSON.parse(raw), nowMs);
-    return value ? { ok: true, value } : { ok: false, reason: "corrupt" };
+    const parsed = JSON.parse(raw);
+    const normalized = normalizeGovernorState(parsed, nowMs);
+    if (normalized) return { ok: true, value: normalized };
+    const migrated = migrateGovernorState(parsed, nowMs);
+    if (!migrated) return { ok: false, reason: "corrupt" };
+    if (!persistMigration) return { ok: true, value: migrated, migrated: true };
+    // Read-only callers persist the exact migration while they still hold the
+    // scope lock. Mutating callers use this same value for their final write.
+    const written = writeGovernorState(path, migrated);
+    return written.ok ? { ok: true, value: migrated, migrated: true } : written;
   } catch {
     return { ok: false, reason: "corrupt" };
   }
@@ -2109,13 +2485,21 @@ function mutateGovernor(scope, nowMs, mutate) {
     // held, immediately before it reads and mutates the shared state.
     const current = currentGovernorScope(scope);
     if (!current.ok) return current;
-    const loaded = readGovernorState(scope.path, at);
+    const loaded = readGovernorState(scope.path, at, { persistMigration: false });
     if (!loaded.ok) return loaded;
     const state = loaded.value;
+    // A mutator can reject without writing. Keep an untouched migration so
+    // that even that path upgrades the file once before releasing the lock.
+    const migration = loaded.migrated ? structuredClone(state) : null;
+    const returnAfterMigration = (result) => {
+      if (migration === null) return result;
+      const written = writeGovernorState(scope.path, migration);
+      return written.ok ? result : written;
+    };
     const value = mutate(state, at);
-    if (value?.ok === false && value.write !== true) return value;
+    if (value?.ok === false && value.write !== true) return returnAfterMigration(value);
     const normalized = normalizeGovernorState(state, at);
-    if (!normalized) return { ok: false, reason: "corrupt" };
+    if (!normalized) return returnAfterMigration({ ok: false, reason: "corrupt" });
     const written = writeGovernorState(scope.path, normalized);
     if (!written.ok) return written;
     return value?.ok === false ? { ok: false, reason: value.reason } : { ok: true, value: value?.value };
@@ -2168,6 +2552,7 @@ function scheduleGovernorState(state, nowMs) {
       intentId: grant.intentId,
       costs: grant.costs,
       actualCosts: null,
+      accountedCosts: { core: 0, graphql: 0 },
       notBefore: grant.notBefore,
       status: "scheduled",
       epochs: { core: grant.epochs.core ?? null, graphql: grant.epochs.graphql ?? null },
@@ -2246,11 +2631,32 @@ function claimProbe(scope, leaseId, nowMs) {
     if (state.probeClaim && state.probeClaim.leaseUntil > at) {
       return { value: { status: "waiting", leaseUntil: state.probeClaim.leaseUntil } };
     }
-    const resetProbeAt = Math.min(...Object.values(state.budgets).map(
-      (budget) => budget.resetMs + BUDGET_RESET_GRACE_MS,
-    ));
-    const nextAt = Math.min(state.probeOutcome.nextAt, resetProbeAt);
+    const coreResetAt = Number.isFinite(state.budgets.core?.resetMs)
+      ? state.budgets.core.resetMs + BUDGET_RESET_GRACE_MS
+      : Number.POSITIVE_INFINITY;
+    const graphqlResetAt = Number.isFinite(state.budgets.graphql?.resetMs)
+      ? state.budgets.graphql.resetMs + BUDGET_RESET_GRACE_MS
+      : Number.POSITIVE_INFINITY;
+    const dueAt = {
+      core: Math.min(
+        state.observers.core.nextAt,
+        coreResetAt,
+      ),
+      graphql: Math.min(
+        state.probeOutcome.nextAt,
+        graphqlResetAt,
+        // A core reset starts a new shared accounting epoch. Refresh the free
+        // GraphQL counter in that same nonce so external-spend baselines and
+        // the protected one-publication reset contract advance together.
+        coreResetAt,
+      ),
+    };
+    const nextAt = Math.min(...Object.values(dueAt));
     if (nextAt > at) return { value: { status: "waiting", nextAt } };
+    // One nonce owns the control-plane transition, but only the sources whose
+    // persisted clocks are due may be read. In particular, a GraphQL minute
+    // sample cannot spend or retry the held core observer before its reset.
+    const resources = RATE_RESOURCES.filter((resource) => dueAt[resource] <= at);
     const nonce = randomUUID();
     const startedReservationIds = Object.entries(state.reservations)
       .filter(([, reservation]) => reservation.status === "started")
@@ -2262,9 +2668,24 @@ function claimProbe(scope, leaseId, nowMs) {
       nextAt: at,
       claimAt: at,
       startedReservationIds,
+      resources,
     };
-    state.probeOutcome = { status: "waiting", at, nextAt: at + GOVERNOR_PROBE_LEASE_MS };
-    return { value: { status: "claimed", nonce, leaseUntil: state.probeClaim.leaseUntil, startedReservationIds } };
+    if (resources.includes("core")) {
+      state.observers.core.outcome = "waiting";
+      state.observers.core.at = at;
+      state.observers.core.nextAt = at + GOVERNOR_PROBE_LEASE_MS;
+    }
+    if (resources.includes("graphql")) {
+      state.probeOutcome = { status: "waiting", at, nextAt: at + GOVERNOR_PROBE_LEASE_MS };
+    }
+    return { value: {
+      status: "claimed",
+      nonce,
+      leaseUntil: state.probeClaim.leaseUntil,
+      startedReservationIds,
+      resources,
+      coreEtag: state.observers.core.etag,
+    } };
   });
 }
 
@@ -2279,18 +2700,41 @@ function renewProbeClaim(scope, leaseId, nonce, nowMs) {
   });
 }
 
-function budgetFromProbe(raw, previous, nowMs) {
-  const normalized = normalizeBudgetResource({ ...raw, observedAt: nowMs });
-  if (!normalized || normalized.resetMs <= nowMs) return null;
-  const baseEpoch = `${normalized.limit}:${normalized.resetMs}`;
-  const epoch = previous && previous.resetMs === normalized.resetMs && previous.used <= normalized.used
-    ? previous.epoch
-    : previous && previous.resetMs === normalized.resetMs && normalized.used < previous.used
-      ? `${baseEpoch}:${nowMs}`
-      : baseEpoch;
+function budgetFromObservation(raw, previous, nowMs, {
+  resource,
+  source,
+  receivedAt = nowMs,
+  clearProvenBlock = false,
+  allowEpochChange = false,
+} = {}) {
+  const normalized = normalizeBudgetResource({ ...raw, observedAt: receivedAt });
+  if (
+    !normalized || normalized.resetMs <= nowMs || receivedAt > nowMs ||
+    !RATE_RESOURCES.includes(resource) ||
+    !["response-header", "core-observer", "rate-limit-probe"].includes(source) ||
+    resource === "core" && source === "rate-limit-probe"
+  ) return { status: "invalid" };
+  const epoch = `${normalized.limit}:${normalized.resetMs}`;
+  // Endpoint responses can carry cached or endpoint-specific rate headers.
+  // They may refine the counter inside the epoch established by its claimed
+  // observer, but only that observer may move the resource into a new epoch.
+  if (!allowEpochChange && (!previous || previous.epoch !== epoch)) {
+    return { status: "ignored", epoch };
+  }
+  if (previous) {
+    if (normalized.resetMs < previous.resetMs) return { status: "ignored" };
+    if (normalized.resetMs === previous.resetMs && normalized.used < previous.used) {
+      return { status: "ignored" };
+    }
+    if (
+      normalized.resetMs === previous.resetMs && normalized.used === previous.used &&
+      receivedAt <= previous.observedAt
+    ) return { status: "ignored" };
+  }
   const epochChanged = !previous || previous.epoch !== epoch;
-  const blockActive = !epochChanged && Number.isFinite(previous.blockUntil) && previous.blockUntil > nowMs;
-  return {
+  const preserveBlock = !clearProvenBlock || !epochChanged;
+  const blockActive = preserveBlock && Number.isFinite(previous?.blockUntil) && previous.blockUntil > nowMs;
+  const next = {
     ...normalized,
     blockUntil: blockActive ? previous.blockUntil : null,
     blockReason: blockActive ? previous.blockReason : null,
@@ -2298,7 +2742,13 @@ function budgetFromProbe(raw, previous, nowMs) {
     roundRobinCursor: previous?.roundRobinCursor ?? null,
     lastExternalFactor: previous?.lastExternalFactor ?? 1,
     epoch,
+    source,
+    factorBaseline: epochChanged || !previous?.factorBaseline
+      ? { epoch, used: normalized.used, observedAt: receivedAt }
+      : { ...previous.factorBaseline },
+    knownLocalUsed: epochChanged ? 0 : previous.knownLocalUsed,
   };
+  return { status: "accepted", budget: next, epochChanged };
 }
 
 function publishProbe(scope, leaseId, nonce, budgets, nowMs) {
@@ -2307,45 +2757,103 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs) {
     if (!claim || claim.ownerLeaseId !== leaseId || claim.nonce !== nonce || claim.leaseUntil <= at) {
       return { ok: false, reason: "stale" };
     }
-    const nextBudgets = {};
-    for (const resource of RATE_RESOURCES) {
-      nextBudgets[resource] = budgetFromProbe(budgets?.[resource], state.budgets[resource], at);
-      if (!nextBudgets[resource]) return { ok: false, reason: "corrupt" };
+    const nextBudgets = { ...state.budgets };
+    const nextEpochs = { ...state.epochs };
+    const changedResources = [];
+    const resetResources = [];
+    if (!claim.resources.every((resource) => budgets?.[resource])) {
+      return { ok: false, reason: "corrupt" };
     }
-    const nextEpochs = Object.fromEntries(RATE_RESOURCES.map((resource) => [
-      resource,
-      budgetEpoch(nextBudgets[resource]),
-    ]));
-    for (const resource of RATE_RESOURCES) {
+    for (const resource of claim.resources) {
+      const supplied = budgets?.[resource];
+      if (!supplied) continue;
+      const raw = supplied.budget ?? supplied;
+      const source = supplied.source ?? (resource === "core" ? "core-observer" : "rate-limit-probe");
+      const ownerSource = resource === "core" ? "core-observer" : "rate-limit-probe";
+      if (source !== ownerSource) return { ok: false, reason: "corrupt" };
+      const observed = budgetFromObservation(raw, state.budgets[resource], at, {
+        resource,
+        source,
+        receivedAt: supplied.receivedAt ?? at,
+        clearProvenBlock: true,
+        allowEpochChange: true,
+      });
+      if (observed.status === "invalid") return { ok: false, reason: "corrupt" };
+      if (observed.status === "ignored") continue;
+      nextBudgets[resource] = observed.budget;
+      if (resource === "core" && supplied.blocked === true) {
+        nextBudgets[resource].blockUntil = observed.budget.resetMs;
+        nextBudgets[resource].blockReason = "rate-limit";
+      }
+      nextEpochs[resource] = observed.budget.epoch;
+      changedResources.push(resource);
+      if (observed.epochChanged && state.epochs[resource] !== null) resetResources.push(resource);
+    }
+    if (changedResources.length === 0) return { ok: false, reason: "corrupt" };
+    const completedBeforeClaim = Object.entries(state.reservations)
+      .filter(([, reservation]) =>
+        reservation.status === "completed" && reservation.completedAt < claim.claimAt);
+    for (const resource of changedResources) {
       const previous = state.budgets[resource];
-      if (!previous || nextBudgets[resource].used < previous.used) continue;
-      const sharedCompletedDelta = Object.values(state.reservations)
-        .filter((reservation) => reservation.status === "completed" && reservation.completedAt < claim.claimAt)
-        .reduce((total, reservation) => total + reservationCost(reservation, resource, state.leases, at), 0);
+      if (!previous || nextBudgets[resource].epoch !== previous.epoch) continue;
+      const baseline = previous.factorBaseline;
+      if (!baseline || baseline.epoch !== nextBudgets[resource].epoch || nextBudgets[resource].used < baseline.used) {
+        continue;
+      }
+      const legacyCompletedDelta = completedBeforeClaim
+        .reduce((total, [, reservation]) =>
+          total + (reservation.completedAt > baseline.observedAt
+            ? reservationCost(reservation, resource, state.leases, at)
+            : 0), 0);
       const factor = nextExternalFactor({
         lastExternalFactor: previous.lastExternalFactor,
-        globalUsedDelta: nextBudgets[resource].used - previous.used,
-        sharedCompletedDelta,
+        globalUsedDelta: nextBudgets[resource].used - baseline.used,
+        sharedCompletedDelta: previous.knownLocalUsed + legacyCompletedDelta,
       });
       if (factor === null) return { ok: false, reason: "corrupt" };
       nextBudgets[resource].lastExternalFactor = factor;
+      nextBudgets[resource].factorBaseline = {
+        epoch: nextBudgets[resource].epoch,
+        used: nextBudgets[resource].used,
+        observedAt: nextBudgets[resource].observedAt,
+      };
+      nextBudgets[resource].knownLocalUsed = 0;
     }
-    const resetChanged = RATE_RESOURCES.some((resource) =>
-      state.epochs[resource] !== null && state.epochs[resource] !== nextEpochs[resource],
-    );
-    for (const [id, reservation] of Object.entries(state.reservations)) {
-      if (reservation.status === "completed" && reservation.completedAt < claim.claimAt) {
-        delete state.reservations[id];
-      }
+    for (const [id, reservation] of completedBeforeClaim) {
+      const accountedByEveryResource = RATE_RESOURCES.every((resource) =>
+        reservationCost(reservation, resource, state.leases, at) === 0 ||
+        nextBudgets[resource]?.factorBaseline?.observedAt >= reservation.completedAt);
+      if (accountedByEveryResource) delete state.reservations[id];
     }
     state.budgets = nextBudgets;
     state.epochs = nextEpochs;
     state.probeClaim = null;
-    state.probeOutcome = { status: "healthy", at, nextAt: at + BUDGET_PROBE_MS };
-    if (resetChanged) state.manualProbe = null;
+    if (claim.resources.includes("core")) {
+      const core = nextBudgets.core;
+      state.observers.core = {
+        etag: typeof budgets.core.etag === "string" ? budgets.core.etag : state.observers.core.etag,
+        outcome: "healthy",
+        at,
+        nextAt: core.remaining === 0
+          ? core.resetMs + BUDGET_RESET_GRACE_MS
+          : at + BUDGET_PROBE_MS,
+      };
+    }
+    if (claim.resources.includes("graphql")) {
+      state.probeOutcome = {
+        status: "healthy",
+        at,
+        nextAt: at + BUDGET_PROBE_MS,
+      };
+    }
+    if (resetResources.length > 0) state.manualProbe = null;
     else if (state.manualProbe &&
       Object.values(nextEpochs).includes(state.manualProbe.requestedEpoch) &&
-      RATE_RESOURCES.some((resource) => availableForGrant({ budget: nextBudgets[resource], nowMs: at }).spendable === 0)) {
+      RATE_RESOURCES.some((resource) => availableForGrant({
+        budget: nextBudgets[resource],
+        resource,
+        nowMs: at,
+      }).spendable === 0)) {
       state.manualProbe.satisfiedAt = at;
     }
     scheduleGovernorState(state, at);
@@ -2360,8 +2868,18 @@ function failProbeClaim(scope, leaseId, nonce, nowMs) {
       return { ok: false, reason: "stale" };
     }
     state.probeClaim = null;
-    state.probeOutcome = { status: "failed", at, nextAt: at + BUDGET_PROBE_MS };
-    return { value: { retryAt: state.probeOutcome.nextAt } };
+    if (claim.resources.includes("graphql")) {
+      state.probeOutcome = { status: "failed", at, nextAt: at + BUDGET_PROBE_MS };
+    }
+    if (claim.resources.includes("core")) {
+      state.observers.core = {
+        ...state.observers.core,
+        outcome: "failed",
+        at,
+        nextAt: at + BUDGET_PROBE_MS,
+      };
+    }
+    return { value: { retryAt: at + BUDGET_PROBE_MS } };
   });
 }
 
@@ -2374,7 +2892,16 @@ function requestManualProbe(scope, leaseId, epoch, observedAt, nowMs) {
       return { value: { status: state.manualProbe.satisfiedAt === null ? "pending" : "satisfied", ...state.manualProbe } };
     }
     state.manualProbe = { requestedEpoch: epoch, baselineObservedAt: observedAt, satisfiedAt: null };
-    state.probeOutcome.nextAt = Math.min(state.probeOutcome.nextAt || at, at);
+    if (state.epochs.core === epoch) {
+      const core = state.budgets.core;
+      const heldThroughReset = core?.blockUntil > at && core.blockUntil === core.resetMs;
+      state.observers.core.nextAt = heldThroughReset
+        ? Math.max(state.observers.core.nextAt, core.blockUntil + BUDGET_RESET_GRACE_MS)
+        : Math.min(state.observers.core.nextAt || at, at);
+    }
+    if (state.epochs.graphql === epoch) {
+      state.probeOutcome.nextAt = Math.min(state.probeOutcome.nextAt || at, at);
+    }
     return { value: { status: "pending", ...state.manualProbe } };
   });
 }
@@ -2410,9 +2937,15 @@ function registerIntent(scope, intent) {
     state.intents[intent.id] = normalized;
     const scheduled = scheduleGovernorState(state, nowMs);
     const reservation = state.reservations[reservationId];
+    const grant = scheduled.grants.find((item) => item.id === reservationId);
     const denial = scheduled.denied.find((item) => item.intentId === intent.id);
     return { value: reservation
-      ? { status: "scheduled", reservationId, ...reservation }
+      ? {
+          status: "scheduled",
+          reservationId,
+          ...reservation,
+          ...sharedLaneEvidence(grant),
+        }
       : {
           status: denial?.mode ?? "pending",
           intentId: intent.id,
@@ -2430,7 +2963,13 @@ function readIntentDecision(scope, intentId, nowMs) {
     const scheduled = scheduleGovernorState(state, at);
     const reservationId = `reservation:${intentId}`;
     const reservation = state.reservations[reservationId];
-    if (reservation) return { value: { status: reservation.status, reservationId, ...reservation } };
+    const grant = scheduled.grants.find((item) => item.id === reservationId);
+    if (reservation) return { value: {
+      status: reservation.status,
+      reservationId,
+      ...reservation,
+      ...sharedLaneEvidence(grant),
+    } };
     if (!state.intents[intentId]) return { ok: false, reason: "stale" };
     const denial = scheduled.denied.find((item) => item.intentId === intentId);
     return { value: {
@@ -2476,7 +3015,7 @@ function startReservation(scope, reservationId, nowMs) {
     for (const resource of RATE_RESOURCES.filter((name) => reservation.costs[name] > 0)) {
       const budget = state.budgets[resource];
       if (
-        !budget || at - budget.observedAt > BUDGET_SNAPSHOT_TTL_MS || at >= budget.resetMs ||
+        !budget || at - budget.observedAt > budgetSnapshotTtl(resource) || at >= budget.resetMs ||
         state.epochs[resource] !== reservation.epochs[resource] ||
         (Number.isFinite(budget.blockUntil) && budget.blockUntil > at)
       ) {
@@ -2514,7 +3053,104 @@ function completeReservation(scope, reservationId, completion, nowMs) {
     reservation.completedAt = at;
     reservation.outcome = completion.outcome;
     reservation.actualCosts = { ...measured };
+    reservation.accountedCosts = { core: 0, graphql: 0 };
     return { value: { status: "completed", actualCosts: reservation.actualCosts } };
+  });
+}
+
+function settleReservationWithBudgetObservations(
+  scope,
+  leaseId,
+  reservationId,
+  completion,
+  nowMs,
+) {
+  return mutateGovernor(scope, nowMs, (state, at) => {
+    const reservation = state.reservations[reservationId];
+    const lease = state.leases[leaseId];
+    if (
+      !lease || lease.expiresAt <= at || !reservation ||
+      reservation.leaseId !== leaseId || reservation.status !== "started" ||
+      !GOVERNOR_OUTCOMES.has(completion?.outcome)
+    ) return { ok: false, reason: "stale" };
+    const measured = completion.outcome === "measured-success"
+      ? exactResourceCosts(completion.actualCosts ?? completion.actualCost)
+      : reservation.costs;
+    if (!measured || RATE_RESOURCES.some((resource) => measured[resource] > reservation.costs[resource])) {
+      return { ok: false, reason: "corrupt" };
+    }
+    const observations = Array.isArray(completion.observations) ? completion.observations : [];
+    if (observations.some((observation) =>
+      !isRecord(observation) || observation.source !== "response-header" ||
+      !Number.isFinite(observation.receivedAt) || observation.receivedAt > at)) {
+      return { ok: false, reason: "corrupt" };
+    }
+    const acceptedCosts = { core: 0, graphql: 0 };
+    const acceptedAfterBaseline = { core: 0, graphql: 0 };
+    for (const resource of RATE_RESOURCES) {
+      const candidates = observations
+        .filter((observation) => observation.resource === resource)
+        .sort((left, right) =>
+          left.resetMs - right.resetMs || left.used - right.used || left.receivedAt - right.receivedAt);
+      for (const observation of candidates) {
+        const observed = budgetFromObservation(observation, state.budgets[resource], at, {
+          resource,
+          source: observation.source,
+          receivedAt: observation.receivedAt,
+          clearProvenBlock: false,
+        });
+        if (observed.status === "invalid") continue;
+        const definiteCost = Number.isSafeInteger(observation.cost) && observation.cost >= 0
+          ? observation.cost
+          : 0;
+        if (observed.status === "accepted") {
+          state.budgets[resource] = observed.budget;
+          state.epochs[resource] = observed.budget.epoch;
+          acceptedCosts[resource] += definiteCost;
+          if (observation.receivedAt > observed.budget.factorBaseline.observedAt) {
+            acceptedAfterBaseline[resource] += definiteCost;
+          }
+        } else if (
+          observation.source === "response-header" &&
+          state.budgets[resource]?.epoch === `${observation.limit}:${observation.resetMs}` &&
+          state.budgets[resource].used >= observation.used
+        ) {
+          // A newer same-window counter already includes this completed call.
+          acceptedCosts[resource] += definiteCost;
+          if (observation.receivedAt > state.budgets[resource].factorBaseline.observedAt) {
+            acceptedAfterBaseline[resource] += definiteCost;
+          }
+        }
+      }
+    }
+    reservation.status = "completed";
+    reservation.completedAt = at;
+    reservation.outcome = completion.outcome;
+    reservation.actualCosts = { ...measured };
+    reservation.accountedCosts = Object.fromEntries(RATE_RESOURCES.map((resource) => [
+      resource,
+      completion.outcome === "measured-success"
+        ? Math.min(measured[resource], acceptedCosts[resource])
+        : 0,
+    ]));
+    for (const resource of RATE_RESOURCES) {
+      const budget = state.budgets[resource];
+      if (!budget || completion.outcome !== "measured-success") continue;
+      // accountedCosts removes the portion already present in an authoritative
+      // counter from the reservation residual. knownLocalUsed contains only
+      // that same portion when it arrived after the factor baseline. Their sum
+      // is therefore exactly the measured local cost, never twice that cost.
+      budget.knownLocalUsed += Math.min(
+        reservation.accountedCosts[resource],
+        acceptedAfterBaseline[resource],
+      );
+    }
+    scheduleGovernorState(state, at);
+    return { value: {
+      status: "completed",
+      actualCosts: reservation.actualCosts,
+      accountedCosts: reservation.accountedCosts,
+    } };
   });
 }
 
@@ -2525,6 +3161,17 @@ function recordResourceBlock(scope, resource, resetMs, reason) {
       !GOVERNOR_BLOCK_REASONS.has(reason)) return { ok: false, reason: "corrupt" };
     budget.blockUntil = resetMs;
     budget.blockReason = reason;
+    if (resource === "core") {
+      state.observers.core.nextAt = Math.min(
+        state.observers.core.nextAt || resetMs + BUDGET_RESET_GRACE_MS,
+        resetMs + BUDGET_RESET_GRACE_MS,
+      );
+    } else {
+      state.probeOutcome.nextAt = Math.min(
+        state.probeOutcome.nextAt || resetMs + BUDGET_RESET_GRACE_MS,
+        resetMs + BUDGET_RESET_GRACE_MS,
+      );
+    }
     return { value: { resource, resetMs, reason } };
   });
 }
@@ -2558,7 +3205,8 @@ function governorHealth(result, nowMs = Date.now()) {
   const state = result.value;
   let status = "healthy";
   if (state.probeClaim?.leaseUntil > nowMs) status = "waiting for probe";
-  else if (RATE_RESOURCES.some((resource) => !state.budgets[resource] || nowMs - state.budgets[resource].observedAt > BUDGET_SNAPSHOT_TTL_MS)) status = "stale";
+  else if (RATE_RESOURCES.some((resource) => !state.budgets[resource] ||
+    nowMs - state.budgets[resource].observedAt > budgetSnapshotTtl(resource))) status = "stale";
   else if (RATE_RESOURCES.some((resource) => state.budgets[resource].blockUntil > nowMs)) status = "blocked";
   return {
     status,
@@ -2569,6 +3217,7 @@ function governorHealth(result, nowMs = Date.now()) {
         reserve: resourceReserve(budget.limit),
         remaining: budget.remaining,
         resetMs: budget.resetMs,
+        source: budget.source,
       }]] : [];
     })),
   };
@@ -2584,7 +3233,7 @@ async function retryGovernorMutation(run, { now, wait, deadline, signal }) {
 }
 
 async function refreshSharedBudget(scope, leaseId, signal, {
-  readBudgets = readRateBudgets,
+  readBudgets = readSharedBudgetSources,
   now = () => scopeNow(scope),
   wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   inspect = inspectGovernor,
@@ -2608,7 +3257,7 @@ async function refreshSharedBudget(scope, leaseId, signal, {
       if (
         RATE_RESOURCES.every((resource) =>
           snapshot.value.budgets[resource] &&
-          now() - snapshot.value.budgets[resource].observedAt <= BUDGET_SNAPSHOT_TTL_MS,
+          now() - snapshot.value.budgets[resource].observedAt <= budgetSnapshotTtl(resource),
         ) && snapshot.value.probeOutcome.status === "healthy"
       ) {
         return { ok: true, value: { status: "published", budgets: snapshot.value.budgets } };
@@ -2619,7 +3268,7 @@ async function refreshSharedBudget(scope, leaseId, signal, {
     claim = claimProbe(scope, leaseId, now());
     if (!claim.ok || claim.value.status !== "claimed") return claim;
   }
-  const { nonce, startedReservationIds } = claim.value;
+  const { nonce, startedReservationIds, resources = RATE_RESOURCES, coreEtag = null } = claim.value;
   const drainUntil = now() + GOVERNOR_PROBE_DRAIN_MS;
   while (startedReservationIds.length > 0 && now() < drainUntil) {
     const snapshot = inspect(scope, now());
@@ -2650,7 +3299,24 @@ async function refreshSharedBudget(scope, leaseId, signal, {
   }
   let budgets;
   try {
-    budgets = await readBudgets(signal, scope.host);
+    budgets = await readBudgets(signal, scope.host, {
+      resources,
+      coreEtag,
+      renewClaim: async () => {
+        const startedAt = now();
+        const extended = await retryGovernorMutation(
+          () => renew(scope, leaseId, nonce, now()),
+          {
+            now,
+            wait,
+            deadline: Math.min(renewed.value.leaseUntil, startedAt + GOVERNOR_PROBE_TRANSITION_MS),
+            signal,
+          },
+        );
+        if (extended.ok) renewed.value.leaseUntil = extended.value.leaseUntil;
+        return extended.ok;
+      },
+    });
   } catch {
     budgets = null;
   }
@@ -2703,7 +3369,7 @@ function resourcePerTick(table, activeKey) {
 }
 
 function alertArgs(source, path = source.path) {
-  return ["api", apiPath(path), ...apiHostArgs(), "--jq", source.jq];
+  return [apiPath(path), ...apiHostArgs(), "--jq", source.jq];
 }
 
 function alertRequestArgs(source) {
@@ -2778,7 +3444,11 @@ function clearForcedBackoffAfterStart(key, force, status, clear = clearBackoff) 
   return true;
 }
 
-async function fetchAlertSource(source, signal, now) {
+async function fetchAlertSource(source, signal, now, {
+  entities,
+  force = false,
+  request = fetchConditionalEntity,
+} = {}) {
   if (backoffActive(source.key, now)) {
     const { note, verdict } = alertBackoff.get(source.key);
     // The verdict is replayed alongside the note. Replaying only the note left
@@ -2790,27 +3460,51 @@ async function fetchAlertSource(source, signal, now) {
       raw: `backoff:${note}`,
       completedCalls: 0,
       verdict,
+      allNotModified: false,
+      stagedEntities: new Map(),
       parse: () => ({ alerts: [], note, verdict, truncated: false }),
     };
   }
   let completedCalls = 0;
+  const observations = [];
   try {
     const requests = alertRequestArgs(source);
     const payloads = [];
     const groups = [];
+    const responses = [];
     for (const [index, args] of requests.entries()) {
       if (index > 0 && !shouldFetchAlertPriorityLanes(groups[0]?.length ?? 0)) break;
-      completedCalls += 1;
-      const payload = await runGh(args, { signal, operation: "tab:security-endpoint" });
-      payloads.push(payload);
-      groups.push(JSON.parse(payload).filter((alert) => alert.state === "open"));
+      let response = null;
+      try {
+        response = await request({
+          tab: "security",
+          args,
+          operation: "tab:security-endpoint",
+          signal,
+          force,
+          entities,
+        });
+        if (response.status === 200) completedCalls += 1;
+        observations.push(...(response.observations ?? []));
+        responses.push(response);
+        payloads.push(response.body ?? "");
+        groups.push(parseJsonOutput(response.body ?? "").filter((alert) => alert.state === "open"));
+      } catch (error) {
+        if (response === null) completedCalls += 1;
+        observations.push(...(error.budgetObservations ?? []));
+        throw error;
+      }
     }
     const raw = payloads.join("\0");
     clearBackoff(source.key);
+    const batch = conditionalBatchResult(responses, raw, raw);
     return {
       raw,
       completedCalls,
       verdict: "ok",
+      allNotModified: batch.allNotModified,
+      stagedEntities: batch.stagedEntities,
+      observations,
       parse: () => {
         const rows = mergeAlertRows(groups);
         return {
@@ -2827,6 +3521,23 @@ async function fetchAlertSource(source, signal, now) {
     // source's fixed note. Everything else -- an expired SAML session, a rate
     // limit, a network drop -- surfaces as itself.
     const verdict = classify(err);
+    if (verdict === "unusable-output") {
+      return {
+        raw: "unusable-output",
+        completedCalls,
+        verdict,
+        allNotModified: false,
+        stagedEntities: new Map(),
+        observations,
+        parse: () => ({
+          alerts: [],
+          note: null,
+          verdict,
+          truncated: false,
+          unusable: true,
+        }),
+      };
+    }
     const note = verdict === "unavailable" ? source.unavailable : `${source.name}: ${shortErr(err)}`;
     const steps = pick(FAILURE_LADDER, verdict, null);
     if (steps) {
@@ -2839,6 +3550,9 @@ async function fetchAlertSource(source, signal, now) {
       // whether it returned data, `[]`, or a 403.
       completedCalls,
       verdict,
+      allNotModified: false,
+      stagedEntities: new Map(),
+      observations,
       parse: () => ({ alerts: [], note, verdict, truncated: false }),
     };
   }
@@ -2856,7 +3570,11 @@ function severityRank(severity) {
   return Object.hasOwn(SEVERITY_RANK, severity) ? SEVERITY_RANK[severity] : SEVERITY_RANK.unknown;
 }
 
-async function fetchSecurity(signal) {
+async function fetchSecurity(signal, {
+  entities = new Map(),
+  force = false,
+  previousRaw = null,
+} = {}) {
   // Monotonic, not wall-clock. These deadlines measure *elapsed* time, and
   // Date.now() can jump: a laptop resume or an NTP correction stepping the clock
   // backwards would hold an alert source in backoff for up to an hour of apparent
@@ -2865,12 +3583,15 @@ async function fetchSecurity(signal) {
   // for the mirror-image reason: a sleep gap is the thing it reports, and
   // performance.now() does not advance across suspend.
   const now = performance.now();
-  const parts = await Promise.all(ALERT_SOURCES.map((s) => fetchAlertSource(s, signal, now)));
+  const parts = await Promise.all(ALERT_SOURCES.map((source) =>
+    fetchAlertSource(source, signal, now, { entities, force })));
+  const allNotModified = parts.length > 0 && parts.every((part) => part.allNotModified);
+  const stagedEntities = new Map(parts.flatMap((part) => [...part.stagedEntities]));
   return {
     // Joined with a NUL so a change in any one of the three shows up as a
     // change in the combined payload, without risk of two different splits
     // colliding on the same string.
-    raw: parts.map((p) => p.raw).join("\0"),
+    raw: allNotModified ? previousRaw : parts.map((p) => p.raw).join("\0"),
     limit: ALERT_PER_PAGE,
     // Summed from what each source reported rather than assumed to be
     // ALERT_SOURCES.length: a source held off by backoff spawned nothing and
@@ -2879,7 +3600,10 @@ async function fetchSecurity(signal) {
     graphqlSpent: 0,
     measuredSuccess: parts.every((part) => part.verdict === "ok"),
     rateLimited: parts.some((part) => part.verdict === "rate-limited"),
+    stagedEntities,
+    observations: parts.flatMap((part) => part.observations ?? []),
     parse: () => {
+      if (parts.some((part) => part.verdict === "unusable-output")) return { unusable: true };
       const parsed = parts.map((p) => p.parse());
       const alerts = parsed.flatMap((p) => p.alerts);
       alerts.sort((a, b) => {
@@ -2890,6 +3614,7 @@ async function fetchSecurity(signal) {
       return {
         alerts,
         notes: parsed.map((p) => p.note).filter(Boolean),
+        unusable: parsed.some((p) => p.unusable),
         // "Blind" is not the same as "switched off", and the tab bar could not
         // tell them apart: fetchAlertSource never rejects, so a repo whose three
         // endpoints all 403'd on an expired SAML session rendered
@@ -3267,19 +3992,55 @@ function normalizeRateBudgets(resources) {
   ]));
 }
 
-async function readRateBudgets(signal, host = effectiveRuntimeHost()) {
+async function readCoreBudget(signal, host = effectiveRuntimeHost(), etag = null) {
   try {
-    // apiHostArgs() for the same reason the alert endpoints carry it: --repo
-    // host/owner/name sets runtime.host without setting GH_HOST, so without the
-    // flag this reads github.com's budget while the pane spends against the
-    // tenant -- and then throttles, or fails to, against an unrelated number.
-    const resources = await readRateLimitResources(signal, host);
-    return normalizeRateBudgets(resources);
-  } catch {
-    // The caller publishes a failed probe outcome and keeps data admission
-    // closed. A missing sample must never fall back to the configured floor.
-    return null;
+    const response = await ghApi(["user", ...apiHostArgs(host)], {
+      signal,
+      operation: "budget-core-observer",
+      etag,
+    });
+    if (response.rateLimit?.resource !== "core") return null;
+    return {
+      budget: response.rateLimit,
+      etag: response.etag ?? etag,
+      receivedAt: Date.now(),
+    };
+  } catch (error) {
+    const status = error?.apiResponse?.status;
+    const rateLimit = pickRateLimit(error?.apiResponse?.headers);
+    if (![403, 429].includes(status) || rateLimit?.resource !== "core") return null;
+    return {
+      budget: rateLimit,
+      etag: error.apiResponse.headers.etag ?? etag,
+      receivedAt: Date.now(),
+      blocked: true,
+    };
   }
+}
+
+async function readSharedBudgetSources(signal, host = effectiveRuntimeHost(), {
+  resources = RATE_RESOURCES,
+  coreEtag = null,
+  renewClaim = null,
+  readGraphql = readRateLimitResources,
+  readCore = readCoreBudget,
+} = {}) {
+  const result = {};
+  if (resources.includes("graphql")) {
+    const rateResources = await readGraphql(signal, host).catch(() => null);
+    const graphql = normalizeRateBudget(rateResources?.graphql);
+    if (!graphql) return null;
+    result.graphql = { budget: graphql, receivedAt: Date.now(), cost: 0 };
+  }
+  if (resources.includes("core")) {
+    // Each gh command is independently bounded, but two sequential commands
+    // can outlive one claim. Extend the same nonce after the free GraphQL read
+    // and before the one-cost bootstrap observer can start.
+    if (resources.includes("graphql") && typeof renewClaim === "function" && !await renewClaim()) return null;
+    const core = await readCore(signal, host, coreEtag);
+    if (core) result.core = core;
+  }
+  return Object.keys(result).length > 0 ? result : null;
 }
 
 // Conservative unpaced demand at this configuration's floor, derived from the
@@ -3298,13 +4059,14 @@ function projectedHourlyCost(activeKey) {
 function doctorProbePlan() {
   return [
     ["Repository access", repoContextArgs(), "doctor:repository"],
-    ["Actions (run list)", actionsArgs(MIN_RUN_LIMIT), "doctor:actions"],
+    ["Actions runs", ghApiArgs(actionsRunsArgs(MIN_RUN_LIMIT)), "doctor:actions-runs"],
+    ["Actions workflows", ghApiArgs(actionsWorkflowsArgs()), "doctor:actions-workflows"],
     ["Issues (issue list)", issuesArgs(), "doctor:issues"],
     ["Pull requests (pr list)", prsArgs(), "doctor:prs"],
     ...ALERT_SOURCES.flatMap((source) =>
       alertRequestArgs(source).map((args, index) => [
         index === 0 ? source.name : `${source.name} (priority ${index})`,
-        args,
+        ghApiArgs(args),
         "doctor:security-endpoint",
       ]),
     ),
@@ -3349,8 +4111,8 @@ async function runDoctor() {
 
   const probes = doctorProbePlan();
 
-  // Free checks run first. In particular the one rate_limit read both renders
-  // the budget and seeds admission; diagnostics never spend before that proof.
+  // Free checks run first. The display rate_limit read is report data only;
+  // admission re-reads its GraphQL source after owning the shared claim.
   const [ghVersion, authStatus, remote, remoteUrls] = await Promise.all([
     captureGh(["--version"], "version"),
     captureGh(["auth", "status"], "auth-status"),
@@ -3378,13 +4140,7 @@ async function runDoctor() {
       demand: { core: 6, graphql: 2 },
     });
     try {
-      const normalized = resources && normalizeRateBudgets(resources);
-      if (registered.ok && normalized?.core && normalized?.graphql) {
-        const claim = claimProbe(scope, leaseId, nowMs);
-        if (claim.value?.status === "claimed") {
-          publishProbe(scope, leaseId, claim.value.nonce, normalized, nowMs);
-        }
-      }
+      if (registered.ok) await refreshSharedBudget(scope, leaseId, undefined);
       const admissionAt = Date.now();
       const admittedProbes = probes.map(([name, args, operation], index) => {
         const admitted = registered.ok
@@ -3460,7 +4216,7 @@ async function runDoctor() {
       return field(
         resource,
         detail
-          ? `${detail.remaining} remaining, ${detail.reserve} reserved, reset ${new Date(detail.resetMs).toISOString()}`
+          ? `${detail.remaining} remaining, ${detail.reserve} reserved, reset ${new Date(detail.resetMs).toISOString()} (${detail.source})`
           : "unavailable",
       );
     }),
@@ -3673,6 +4429,14 @@ function helpLines(maxRows) {
   const all = keyTableLines();
   if (all.length <= rows) return all;
   if (rows === 1) return [`… ${all.length} keys: gh-glance --help`];
+  if (rows === 4) {
+    return [
+      all[9],
+      all[6],
+      "Ent/jk Open the selected/Move the cursor",
+      `… ${all.length - 4} more: gh-glance --help`,
+    ];
+  }
   const priority = [9, 6, 5, 3, 0, 7, 8, 1, 2, 4]
     .slice(0, rows - 1)
     .map((index) => all[index]);
@@ -3721,8 +4485,8 @@ from the git remote, the same way \`gh\` does it. Requires the \`gh\` CLI
 
 On a healthy single pane, the active tab is considered every ${REFRESH_MS / 1000}s and each
 background tab about every ${(REFRESH_MS * BACKGROUND_EVERY) / 1000}s. Quota-consuming calls still
-need a shared, resource-specific grant that preserves a hard reserve. Waiting
-and manual refresh do not bypass that safety check.
+need a shared, resource-specific grant that preserves a hard reserve. Scheduled
+checks and manual refresh do not bypass that safety check.
 
 Row icons are GitHub Octicons and need a Nerd Font. Without one, set
 GH_GLANCE_ICONS=unicode for Unicode status glyphs and text row substitutes, or
@@ -4520,7 +5284,7 @@ const MemoSecurityRow = React.memo(SecurityRow);
 const TABS = [
   {
     key: "actions",
-    fetch: ({ signal, runLimit }) => fetchActions(runLimit, signal),
+    fetch: ({ signal, runLimit, ...options }) => fetchActions(runLimit, signal, options),
     label: "Actions",
     short: "Actions",
     header: ACTIONS_HEADER,
@@ -4550,7 +5314,7 @@ const TABS = [
   },
   {
     key: "security",
-    fetch: ({ signal }) => fetchSecurity(signal),
+    fetch: ({ signal, ...options }) => fetchSecurity(signal, options),
     label: "Security",
     short: "Security",
     header: SECURITY_HEADER,
@@ -4772,7 +5536,6 @@ function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-const persistenceWaitCell = new Int32Array(new SharedArrayBuffer(4));
 const PERSISTENCE_LOCK_WAIT_MS = 250;
 const PERSISTENCE_STALE_LOCK_MS = 5000;
 
@@ -5501,16 +6264,42 @@ function governorWakeTimes(state, nowMs, floorMs, leaseId = null) {
   };
 }
 
-function governorDataReady(refreshResult, snapshot, activeKey, nowMs) {
+function governorProtocolReady(refreshResult, snapshot, nowMs) {
   if (!refreshResult?.ok || !snapshot?.ok) return false;
   if (["waiting", "paused", "probe"].includes(refreshResult.value?.status)) return false;
   if (snapshot.value.probeClaim || snapshot.value.probeOutcome?.status !== "healthy") return false;
+  return RATE_RESOURCES.every((resource) => {
+    const budget = snapshot.value.budgets[resource];
+    return budget && nowMs - budget.observedAt <= budgetSnapshotTtl(resource);
+  });
+}
+
+function governorControlReady(refreshResult, snapshot, nowMs) {
+  if (governorProtocolReady(refreshResult, snapshot, nowMs)) return true;
+  // A losing probe claimant can exhaust its bounded reinspection just before
+  // the winner publishes. Its return value is still `waiting`, but the locked
+  // snapshot taken immediately afterwards is authoritative. Adopt only that
+  // successful handoff; failures and every incomplete snapshot remain closed.
+  return refreshResult?.ok && refreshResult.value?.status === "waiting" &&
+    governorProtocolReady({ ok: true, value: { status: "published" } }, snapshot, nowMs);
+}
+
+function tabEpochChanged(previous, next, key) {
+  const costs = tabRequestCost(key);
+  if (!costs || !isRecord(previous) || !isRecord(next)) return false;
+  return RATE_RESOURCES.some((resource) =>
+    costs[resource] > 0 && previous[resource] !== next[resource]);
+}
+
+function governorDataReady(refreshResult, snapshot, activeKey, nowMs) {
+  if (!governorProtocolReady(refreshResult, snapshot, nowMs)) return false;
   const costs = tabRequestCost(activeKey);
   return RATE_RESOURCES.every((resource) => {
     if (costs[resource] <= 0) return true;
     const budget = snapshot.value.budgets[resource];
-    return budget && nowMs - budget.observedAt <= BUDGET_SNAPSHOT_TTL_MS &&
-      budget.blockUntil <= nowMs && availableForGrant({ budget, nowMs }).mode === "open";
+    return budget && nowMs - budget.observedAt <= budgetSnapshotTtl(resource) &&
+      budget.blockUntil <= nowMs &&
+      availableForGrant({ budget, resource, nowMs }).mode === "open";
   });
 }
 
@@ -5582,8 +6371,8 @@ function pendingFailureIsTerminal(reason) {
   return reason === "stale";
 }
 
-function runtimeIntentGate(liveScheduling, { force = false } = {}) {
-  return liveScheduling
+function runtimeIntentGate(liveScheduling, { force = false, protocolReady = false } = {}) {
+  return liveScheduling || protocolReady
     ? { registerIntent: true, requestProbe: false }
     : { registerIntent: false, requestProbe: force === true };
 }
@@ -5633,6 +6422,13 @@ function rateLimitBlockDecision(results, resetMs) {
     coordinationError: false,
     failClosed: false,
   };
+}
+
+function coordinationNotice(reason) {
+  if (reason === "unknown-scope") return "Confirming your GitHub login…";
+  if (reason === "block-unpublished") return "Holding until the rate-limit block is shared";
+  if (reason === "busy" || reason === "stale") return "Coordinating with your other panes";
+  return "Can't coordinate API use — retrying";
 }
 
 function retryRateLimitBlockPublication(pending, nowMs, publish) {
@@ -5728,7 +6524,14 @@ async function runAdmittedOperation({ scope, leaseId, operation, priority = "man
 
 function pollResultTransition({ key, previousRaw, raw, parse, limit, completedAt }) {
   if (previousRaw === raw) return { kind: "unchanged", completedAt };
-  const value = parse();
+  let value;
+  try {
+    value = parse();
+  } catch (error) {
+    if (isUnusableOutput(error)) return { kind: "unusable", nextRaw: null };
+    throw error;
+  }
+  if (value?.unusable) return { kind: "unusable", nextRaw: null };
   if (key === "security" && value?.blind) {
     return {
       kind: "blind",
@@ -5890,13 +6693,17 @@ const REMOTE_SETUP_NONINTERACTIVE_LINES = [
 // Reserved so the hints never shift when the active tab changes state. Every
 // status label below fits this fixed cell in both icon profiles.
 const REFRESH_STATUS_WIDTH = 12;
+const WIDE_STATE_WIDTH = REFRESH_STATUS_WIDTH + 1 + 12;
+// StatusBar receives the drawable frame width, which is one column narrower
+// than the terminal. A 44-cell threshold preserves the 45-column contract.
+const WIDE_STATE_MIN_COLS = 44;
+const NOTICE_ROWS = 1;
 
 const REFRESH_STATUS_GLYPHS = Object.freeze({
   unicode: Object.freeze({
     setup: "·",
     checking: SPINNER[0],
     paused: "‖",
-    waiting: "·",
     failed: "!",
     limited: "?",
     watching: "·",
@@ -5905,7 +6712,6 @@ const REFRESH_STATUS_GLYPHS = Object.freeze({
     setup: ".",
     checking: ".",
     paused: "|",
-    waiting: ".",
     failed: "!",
     limited: "?",
     watching: ".",
@@ -5954,30 +6760,38 @@ function refreshStatus({
     return status("paused", "paused", "Paused", "attention", false, detailKind);
   }
   if (["waiting", "pending", "probe"].includes(mode)) {
-    const waitingDetail = Number.isFinite(governorDecision?.notBefore)
-      ? "next"
-      : detailKind;
-    return status("waiting", "waiting", "Waiting", "inert", false, waitingDetail);
+    const sharing = sharedLaneProvenance(governorDecision).waitCause === "shared-lane";
+    const watchingDetail = sharing
+      ? "sharing"
+      : Number.isFinite(governorDecision?.notBefore) ? "next" : detailKind;
+    return status("watching", "watching", "Watching", "inert", false, watchingDetail);
   }
   if (activeError) return status("failed", "failed", "Failed", "attention");
   if (securityIncomplete) return status("limited", "limited", "Limited", "attention");
   return status("watching", "watching", "Watching", "inert");
 }
 
-function statusTime(at) {
-  if (!Number.isFinite(at)) return null;
-  const date = new Date(at);
-  if (!Number.isFinite(date.getTime())) return null;
-  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+function statusInterval(at, nowMs = Date.now()) {
+  if (!Number.isFinite(at) || !Number.isFinite(nowMs)) return null;
+  const remaining = at - nowMs;
+  if (remaining < 60_000) return "<1m";
+  const minutes = Math.ceil(remaining / 60_000);
+  return minutes > 99 ? "99m+" : `${minutes}m`;
 }
 
-function statusDetailVariants(status, detail) {
+function statusDetailVariants(status, detail, nowMs) {
   if (!status?.detailKind) return [];
   if (status.detailKind === "probing") return ["probing"];
+  if (status.detailKind === "sharing") {
+    const sharing = sharedLaneProvenance(detail);
+    return sharing.waitCause
+      ? [`sharing ${sharing.sharingCount}`]
+      : [];
+  }
   const at = status.detailKind === "next" ? detail?.notBefore : detail?.resetMs;
-  const time = statusTime(at);
-  if (!time) return [];
-  return [`${status.detailKind} ${time}`, time];
+  const interval = statusInterval(at, nowMs);
+  if (!interval) return [];
+  return [`${status.detailKind} ${interval}`, interval];
 }
 
 function statusBarLayout({
@@ -5987,20 +6801,25 @@ function statusBarLayout({
   status,
   detail = null,
   stale = null,
+  nowMs = Date.now(),
   version: currentVersion = "",
 } = {}) {
   const width = Number.isSafeInteger(cols) ? Math.max(0, cols) : 0;
   const hints = Array.isArray(availableHints) ? availableHints : [];
   const mandatory = hints.filter(isMandatoryHint);
   const optional = hints.filter((hint) => !isMandatoryHint(hint));
-  let used = Math.min(width, REFRESH_STATUS_WIDTH);
+  const stateWidth = width >= WIDE_STATE_MIN_COLS
+    ? Math.min(width, WIDE_STATE_WIDTH)
+    : Math.min(width, REFRESH_STATUS_WIDTH);
+  let used = stateWidth;
   const selectedHints = [];
   const separatorWidth = () => selectedHints.length > 0 ? 1 : 0;
   const addHint = (hint, showLabel) => {
     const text = showLabel ? `${hint.label}: ${hint.keys}` : hint.keys;
-    const cost = separatorWidth() + [...text].length;
+    const separator = separatorWidth();
+    const cost = separator + [...text].length;
     if (used + cost > width) return false;
-    selectedHints.push({ ...hint, showLabel, text });
+    selectedHints.push({ ...hint, showLabel, text, start: used + separator });
     used += cost;
     return true;
   };
@@ -6020,19 +6839,16 @@ function statusBarLayout({
     else addHint(hint, false);
   }
 
-  let selectedDetail = null;
-  for (const candidate of statusDetailVariants(status, detail)) {
-    const cost = (selectedHints.length > 0 ? 1 : 0) + candidate.length;
-    if (used + cost <= width) {
-      selectedDetail = candidate;
-      used += cost;
-      break;
-    }
-  }
-
+  const payloadWidth = stateWidth > REFRESH_STATUS_WIDTH
+    ? stateWidth - REFRESH_STATUS_WIDTH - 1
+    : 0;
   const staleText = typeof stale === "string" ? stale : null;
-  const selectedStale = staleText && used + 1 + staleText.length <= width ? staleText : null;
-  if (selectedStale) used += 1 + selectedStale.length;
+  const selectedStale = staleText && [...staleText].length <= payloadWidth ? staleText : null;
+  let selectedDetail = null;
+  if (!selectedStale) {
+    selectedDetail = statusDetailVariants(status, detail, nowMs)
+      .find((candidate) => [...candidate].length <= payloadWidth) ?? null;
+  }
 
   for (const hint of optional) {
     if (!addHint(hint, true)) addHint(hint, false);
@@ -6041,7 +6857,7 @@ function statusBarLayout({
   const versionText = String(currentVersion ?? "");
   const showVersion = versionText.length > 0 && used + 1 + versionText.length <= width;
   return {
-    statusWidth: Math.min(width, REFRESH_STATUS_WIDTH),
+    stateWidth,
     hints: selectedHints,
     mandatoryHints: selectedHints.filter(isMandatoryHint),
     optionalHints: selectedHints.filter((hint) => !isMandatoryHint(hint)),
@@ -6055,11 +6871,13 @@ function statusBarLayout({
 function freshnessDeadline({
   lastOk,
   refreshMs,
+  grantedMs = null,
   governorDecision = null,
   currentEpochs = null,
 } = {}) {
   if (!Number.isFinite(lastOk) || !Number.isFinite(refreshMs) || refreshMs < 0) return null;
-  const baseDeadline = lastOk + Math.max(STALE_AFTER_MS, refreshMs * 6);
+  const cadenceMs = Number.isFinite(grantedMs) && grantedMs >= 0 ? grantedMs : refreshMs;
+  const baseDeadline = lastOk + Math.max(STALE_AFTER_MS, cadenceMs * 6);
   const decisionEpochs = governorDecision?.epochs;
   const chargedEpochs = isRecord(decisionEpochs)
     ? Object.entries(decisionEpochs).filter(([, epoch]) => epoch !== null)
@@ -6073,6 +6891,16 @@ function freshnessDeadline({
   return validWaitingGrant
     ? Math.max(baseDeadline, governorDecision.notBefore + GH_TIMEOUT_MS)
     : baseDeadline;
+}
+
+function nextAdmittedCadence(previous, startedAt) {
+  if (!Number.isFinite(startedAt)) return previous ?? { startedAt: null, grantedMs: null };
+  return {
+    startedAt,
+    grantedMs: Number.isFinite(previous?.startedAt)
+      ? Math.max(0, startedAt - previous.startedAt)
+      : null,
+  };
 }
 
 function probingGovernorDecisions() {
@@ -6099,6 +6927,8 @@ function sameVisibleGovernorDecision(left, right) {
     "resource",
     "probing",
     "detailKind",
+    "waitCause",
+    "sharingCount",
     "coordinationError",
     "reservationId",
   ]) {
@@ -6149,6 +6979,7 @@ function StatusBar({
   detail,
   spin,
   stale,
+  nowMs,
   interactive,
   cols,
   remoteSetup = false,
@@ -6190,6 +7021,7 @@ function StatusBar({
     status: semanticStatus,
     detail,
     stale,
+    nowMs,
     version,
   });
   const profile = ICON_PROFILE === "ascii" ? "ascii" : "unicode";
@@ -6218,20 +7050,20 @@ function StatusBar({
     { flexDirection: "row" },
     e(
       Box,
-      { width: layout.statusWidth, flexShrink: 0 },
+      { width: layout.stateWidth, flexShrink: 0, flexDirection: "row" },
       e(
         Text,
         { color: statusColor, dimColor: semanticStatus.tone === "inert", wrap: "truncate-end" },
         `${glyph} ${semanticStatus.label}`,
       ),
+      layout.detail
+        ? e(Box, { marginLeft: 1, flexShrink: 0 }, e(Text, { dimColor: true }, layout.detail))
+        : null,
+      layout.stale
+        ? e(Box, { marginLeft: 1, flexShrink: 0 }, e(Text, { color: ATTENTION }, layout.stale))
+        : null,
     ),
     ...layout.mandatoryHints.flatMap((hint, index) => renderHint(hint, index, "mandatory")),
-    layout.detail
-      ? e(Box, { marginLeft: 1, flexShrink: 0 }, e(Text, { dimColor: true }, layout.detail))
-      : null,
-    layout.stale
-      ? e(Box, { marginLeft: 1, flexShrink: 0 }, e(Text, { color: ATTENTION }, layout.stale))
-      : null,
     ...layout.optionalHints.flatMap((hint, index) => renderHint(hint, index, "optional")),
     layout.version && e(Box, { flexGrow: 1 }),
     layout.version && e(Text, { key: "version", dimColor: true, wrap: "truncate-end" }, layout.version),
@@ -6399,6 +7231,7 @@ function App({ onCreateRemote = () => {} } = {}) {
   const [requestStatuses, setRequestStatuses] = useState(() =>
     Object.fromEntries(TABS.map((candidate) => [candidate.key, null])),
   );
+  const [visibleCoordinationCondition, setVisibleCoordinationCondition] = useState(null);
   const [now, setNow] = useState(new Date());
   const { rows, cols, useShortLabels } = useTerminalSize(stdout);
   const [frame, setFrame] = useState(0);
@@ -6443,8 +7276,7 @@ function App({ onCreateRemote = () => {} } = {}) {
   // Counts the lines actually rendered, not the notes collected -- getting this
   // wrong by one row is what makes ink repaint the whole frame.
   const extraLines =
-    (tabError && !remoteSetup ? 1 : 0) +
-    (activeGovernorDecision?.coordinationError && !remoteSetup ? 1 : 0) +
+    NOTICE_ROWS +
     (tab.key === "security" && !remoteSetup ? securityLines.length : 0);
   // Reserve lines for: the tab bar and the divider under it (2), the panel's
   // top and bottom edges (2), the column header and its separator (2), and
@@ -6475,7 +7307,9 @@ function App({ onCreateRemote = () => {} } = {}) {
     ANIMATE && tab.key === "actions" && (data.actions ?? []).some((r) => r.status === "in_progress");
 
   const inFlightRef = useRef({});
+  const admittedCadenceRef = useRef({});
   const rawRef = useRef({});
+  const entityRef = useRef(new Map());
   // Last *successful* poll per tab, wall-clock. Wall-clock on purpose: a laptop
   // sleeping is exactly the gap this is meant to report, and a monotonic clock
   // does not advance across suspend. Never written on the failure path, or a
@@ -6992,6 +7826,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           status: "scheduled",
           reservationId: `reservation:${pendingIntent.intentId}`,
           ...reservation,
+          ...currentSharedLaneProvenance(pendingIntent, snapshot.value.leases, nowMs),
         }));
         return;
       }
@@ -7027,6 +7862,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       force = false,
       scope,
       reservationId,
+      admittedAt,
       onSettled,
       automaticStatusVisible = false,
     } = {}) {
@@ -7035,6 +7871,11 @@ function App({ onCreateRemote = () => {} } = {}) {
       // background fetch -- and so a slow repo can't stack refreshes.
       if (inFlightRef.current[key]) return Promise.resolve();
       inFlightRef.current[key] = true;
+      if (force) manualInFlight.add(key);
+      admittedCadenceRef.current[key] = nextAdmittedCadence(
+        admittedCadenceRef.current[key],
+        admittedAt,
+      );
       clearForcedBackoffAfterStart(key, force, "started");
       const visibleLoading = shouldShowFetchLoading({
         hasData: dataRef.current[key] !== null,
@@ -7056,14 +7897,15 @@ function App({ onCreateRemote = () => {} } = {}) {
       }
       return run()
         .then((result) => {
-          completeReservation(scope, reservationId, result?.measuredSuccess === false
-            ? { outcome: "rejected" }
+          settleReservationWithBudgetObservations(scope, leaseId, reservationId, result?.measuredSuccess === false
+            ? { outcome: "rejected", observations: result?.observations ?? [] }
             : {
                 outcome: "measured-success",
-                actualCost: {
+                actualCosts: {
                   core: result?.restSpent ?? REST_PER_FETCH[key] ?? 0,
                   graphql: result?.graphqlSpent ?? GRAPHQL_PER_FETCH[key] ?? 0,
                 },
+                observations: result?.observations ?? [],
               }, Date.now());
           if (result?.rateLimited) {
             const blockAt = Date.now();
@@ -7075,7 +7917,7 @@ function App({ onCreateRemote = () => {} } = {}) {
             }], blockAt);
           }
           if (cancelled) return;
-          const { raw, parse, limit } = result;
+          const { raw, parse, limit, stagedEntities } = result;
           // Identical payload: skip the parse *and* the state update. Returning
           // the same state object makes React bail out of the re-render, so an
           // idle repo stops redrawing the pane entirely.
@@ -7114,6 +7956,7 @@ function App({ onCreateRemote = () => {} } = {}) {
                 force,
               });
           }
+          publishStagedEntities(entityRef.current, stagedEntities, transition.kind);
           if (transition.kind === "unchanged") {
             lastOkRef.current[key] = completedAt;
             // Clear on the first success or a single failure latches the ladder.
@@ -7138,6 +7981,16 @@ function App({ onCreateRemote = () => {} } = {}) {
                   : {},
               );
             }
+            return;
+          }
+          // Empty or truncated JSON is not a user-actionable fetch error. Keep
+          // the last-good rows and freshness clock, and clear the raw comparison
+          // so the next admitted tick parses its response instead of taking the
+          // identical-output fast path.
+          if (transition.kind === "unusable") {
+            if (key === "security") securityNextPollAt = 0;
+            rawRef.current[key] = transition.nextRaw;
+            setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
             return;
           }
           // Security fetches resolve each source independently so their notes
@@ -7170,8 +8023,9 @@ function App({ onCreateRemote = () => {} } = {}) {
           });
         })
         .catch((err) => {
-          completeReservation(scope, reservationId, {
+          settleReservationWithBudgetObservations(scope, leaseId, reservationId, {
             outcome: governorOutcomeForError(err),
+            observations: err?.budgetObservations ?? [],
           }, Date.now());
           if (cancelled || err?.name === "AbortError") return;
           // Preserve both the verdict and the bounded raw error in state. The
@@ -7207,6 +8061,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         })
         .finally(() => {
           inFlightRef.current[key] = false;
+          manualInFlight.delete(key);
           onSettled?.();
           if (!cancelled) {
             setLoading((l) => (l[key] ? { ...l, [key]: false } : l));
@@ -7222,17 +8077,26 @@ function App({ onCreateRemote = () => {} } = {}) {
                   : current);
             }
           }
+          if (!cancelled && queuedManual.delete(key)) {
+            void requestTab(key, "manual", { force: true });
+          }
         });
     }
 
     const leaseId = governorId();
     const pending = new Map();
+    // One manual handoff per tab. A keypress during an automatic request must
+    // not be lost, but repeated keypresses during the forced request itself
+    // must not create a trailing second batch.
+    const queuedManual = new Set();
+    const manualInFlight = new Set();
     const wakeScheduler = createWakeScheduler();
     let scope = null;
     let cleanupScope = null;
     let registeredScopeHash = null;
     let remoteUrls = [];
     let liveScheduling = false;
+    let controlEpochs = null;
     let activePollAt = Number.POSITIVE_INFINITY;
     let backgroundPollAt = Number.POSITIVE_INFINITY;
     let backgroundIndex = 0;
@@ -7244,6 +8108,7 @@ function App({ onCreateRemote = () => {} } = {}) {
 
     function failClosedRateLimit(key, reason) {
       liveScheduling = false;
+      controlEpochs = null;
       activePollAt = Number.POSITIVE_INFINITY;
       backgroundPollAt = Number.POSITIVE_INFINITY;
       wakeScheduler.clear("data");
@@ -7400,6 +8265,12 @@ function App({ onCreateRemote = () => {} } = {}) {
       armFromState();
     }
 
+    function replaceActivePoll(kind, at) {
+      if (["manual", "tab-switch"].includes(kind)) {
+        activePollAt = at + runtime.refreshMs;
+      }
+    }
+
     function requestTab(key, kind = "active", { force = false } = {}) {
       const signal = controller.signal;
       const descriptor = tabForKey(key);
@@ -7408,7 +8279,10 @@ function App({ onCreateRemote = () => {} } = {}) {
         pauseCoordination(key, "block-unpublished");
         return Promise.resolve({ persisted: false, retry: false, kind });
       }
-      if (inFlightRef.current[key]) return Promise.resolve({ persisted: false, retry: false, kind });
+      if (inFlightRef.current[key]) {
+        if (force && !manualInFlight.has(key)) queuedManual.add(key);
+        return Promise.resolve({ persisted: false, retry: false, kind });
+      }
       if (!force && backoffActive(`tab:${key}`, monotonicNow)) {
         return Promise.resolve({ persisted: false, retry: false, kind });
       }
@@ -7421,20 +8295,39 @@ function App({ onCreateRemote = () => {} } = {}) {
         pauseCoordination(key, "unknown-scope");
         return Promise.resolve({ persisted: false, retry: true, kind });
       }
-      const intentGate = runtimeIntentGate(liveScheduling, { force });
+      let protocolReady = liveScheduling;
+      let resourceReady = liveScheduling;
+      if (!liveScheduling || force) {
+        const snapshot = inspectGovernor(currentScope, nowMs);
+        protocolReady = governorProtocolReady(
+          { ok: true, value: { status: "published" } },
+          snapshot,
+          nowMs,
+        );
+        resourceReady = governorDataReady(
+          { ok: true, value: { status: "published" } }, snapshot, key, nowMs);
+        if (!liveScheduling && resourceReady) {
+          liveScheduling = true;
+          activePollAt = nowMs;
+          backgroundPollAt = nowMs + 4 * runtime.refreshMs;
+          armWake("heartbeat", nowMs + GOVERNOR_HEARTBEAT_MS, heartbeatWake);
+        }
+      }
+      const intentGate = runtimeIntentGate(liveScheduling, { force, protocolReady });
+      if (intentGate.requestProbe || force && !resourceReady) {
+        const snapshot = inspectGovernor(currentScope, nowMs);
+        const costs = tabRequestCost(key);
+        for (const resource of RATE_RESOURCES) {
+          const budget = snapshot.value?.budgets?.[resource];
+          if (costs[resource] > 0 && budget) {
+            requestManualProbe(currentScope, leaseId, budget.epoch, budget.observedAt, nowMs);
+          }
+        }
+        armWake("control", nowMs + 1, controlWake);
+      }
       if (!intentGate.registerIntent) {
         setTabGovernorDecision(key, { mode: "waiting", probing: true });
         setTabWaiting(key, true);
-        if (intentGate.requestProbe) {
-          const snapshot = inspectGovernor(currentScope, nowMs);
-          const costs = tabRequestCost(key);
-          for (const resource of RATE_RESOURCES) {
-            const budget = snapshot.value?.budgets?.[resource];
-            if (costs[resource] > 0 && budget) {
-              requestManualProbe(currentScope, leaseId, budget.epoch, budget.observedAt, nowMs);
-            }
-          }
-        }
         return Promise.resolve({ persisted: false, retry: false, kind });
       }
       const existing = pending.get(key);
@@ -7460,8 +8353,14 @@ function App({ onCreateRemote = () => {} } = {}) {
         pauseCoordination(key, registered.reason);
         return Promise.resolve({ persisted: false, retry: true, kind });
       }
-      pending.set(key, { intentId, kind, force, wasDeferred: false });
       const decision = registered.value;
+      pending.set(key, {
+        intentId,
+        kind,
+        force,
+        wasDeferred: false,
+        ...sharedLaneEvidence(decision),
+      });
       if (decision.status !== "scheduled" || decision.notBefore > nowMs) {
         const item = pending.get(key);
         if (item) item.wasDeferred = true;
@@ -7493,14 +8392,22 @@ function App({ onCreateRemote = () => {} } = {}) {
         return Promise.resolve({ persisted: true, retry: false, kind });
       }
       setTabWaiting(key, false);
+      replaceActivePoll(kind, nowMs);
       if (force) coordinator.invalidate();
       return commit(
         key,
-        () => descriptor.fetch({ signal, runLimit: runLimitRef.current }),
+        () => descriptor.fetch({
+          signal,
+          runLimit: runLimitRef.current,
+          entities: entityRef.current,
+          force,
+          previousRaw: rawRef.current[key] ?? null,
+        }),
         {
           force,
           scope: currentScope,
           reservationId: decision.reservationId,
+          admittedAt: nowMs,
           automaticStatusVisible: false,
           onSettled: () => finishPending(key, intentId),
         },
@@ -7508,7 +8415,11 @@ function App({ onCreateRemote = () => {} } = {}) {
     }
     fetchTabRef.current = (key, { force = false, kind = force ? "manual" : "active" } = {}) => {
       const requestedAt = Date.now();
-      if (kind === "tab-switch") activePollAt = requestedAt + runtime.refreshMs;
+      // Manual work replaces the active poll that would otherwise be due. Move
+      // that deadline before touching the governor so a data wake already in
+      // this event-loop turn cannot start a second batch as soon as the forced
+      // batch settles. The in-flight guard still coalesces work that overlaps.
+      replaceActivePoll(kind, requestedAt);
       const currentScope = ensureScope(requestedAt);
       if (currentScope) {
         heartbeatLease(currentScope, leaseId, tabRequestCost(key), requestedAt, key);
@@ -7538,7 +8449,10 @@ function App({ onCreateRemote = () => {} } = {}) {
         }
         if (decision.value.status !== "scheduled" || decision.value.notBefore > nowMs) {
           item.wasDeferred = true;
-          setTabGovernorDecision(key, visibleGovernorDecision(decision.value));
+          setTabGovernorDecision(key, visibleGovernorDecision({
+            ...decision.value,
+            ...sharedLaneProvenance(decision.value),
+          }));
           setTabWaiting(key, true);
           armWake("data", decision.value.retryAt ?? decision.value.notBefore ?? nowMs + runtime.refreshMs, dataWake);
           continue;
@@ -7556,20 +8470,29 @@ function App({ onCreateRemote = () => {} } = {}) {
           setTabGovernorDecision(key, visibleGovernorDecision({
             ...decision.value,
             ...started.value,
+            ...sharedLaneProvenance(decision.value),
           }));
           armWake("data", started.value.notBefore ?? nowMs + runtime.refreshMs, dataWake);
           continue;
         }
         setTabWaiting(key, false);
+        replaceActivePoll(item.kind, nowMs);
         if (item.force) coordinator.invalidate();
         const descriptor = tabForKey(key);
         void commit(
           key,
-          () => descriptor.fetch({ signal: controller.signal, runLimit: runLimitRef.current }),
+          () => descriptor.fetch({
+            signal: controller.signal,
+            runLimit: runLimitRef.current,
+            entities: entityRef.current,
+            force: item.force,
+            previousRaw: rawRef.current[key] ?? null,
+          }),
           {
             force: item.force,
             scope: currentScope,
             reservationId: decision.value.reservationId,
+            admittedAt: nowMs,
             automaticStatusVisible: item.wasDeferred && !item.force,
             onSettled: () => finishPending(key, item.intentId),
           },
@@ -7588,7 +8511,9 @@ function App({ onCreateRemote = () => {} } = {}) {
       const wakes = governorWakeTimes(snapshot.value, nowMs, runtime.refreshMs, leaseId);
       const heldResources = Object.fromEntries(RATE_RESOURCES.map((resource) => {
         const budget = snapshot.value.budgets[resource];
-        const decision = budget ? availableForGrant({ budget, nowMs }) : { mode: "paused" };
+        const decision = budget
+          ? availableForGrant({ budget, resource, nowMs })
+          : { mode: "paused" };
         const held = !budget || budget.blockUntil > nowMs || decision.mode !== "open";
         const retryAt = budget?.blockUntil > nowMs
           ? budget.blockUntil
@@ -7668,16 +8593,22 @@ function App({ onCreateRemote = () => {} } = {}) {
         attemptPendingBlockPublications(currentScope, checkedAt, snapshot.value);
       }
       publishControlStatus(activeKey, refreshed, snapshot, checkedAt);
-      if (pendingBlockPublications.size === 0 && !liveScheduling && governorDataReady(
+      const controlReady = pendingBlockPublications.size === 0 && governorControlReady(
         refreshed,
         snapshot,
-        activeKey,
         checkedAt,
-      )) {
+      );
+      const activeEpochChanged = controlReady && controlEpochs !== null &&
+        tabEpochChanged(controlEpochs, snapshot.value.epochs, activeKey);
+      if (controlReady) controlEpochs = { ...snapshot.value.epochs };
+      if (controlReady && (!liveScheduling || activeEpochChanged)) {
+        const starting = !liveScheduling;
         liveScheduling = true;
         activePollAt = checkedAt + 1;
-        backgroundPollAt = checkedAt + 4 * runtime.refreshMs;
-        armWake("heartbeat", checkedAt + GOVERNOR_HEARTBEAT_MS, heartbeatWake);
+        if (starting) {
+          backgroundPollAt = checkedAt + 4 * runtime.refreshMs;
+          armWake("heartbeat", checkedAt + GOVERNOR_HEARTBEAT_MS, heartbeatWake);
+        }
       }
       if (!refreshed.ok) {
         armWake("control", governorControlRetryAt(checkedAt, runtime.refreshMs), controlWake);
@@ -7714,12 +8645,13 @@ function App({ onCreateRemote = () => {} } = {}) {
       const snapshot = inspectGovernor(currentScope, checkedAt);
       const activeKey = TABS[activeIndexRef.current].key;
       publishControlStatus(activeKey, refreshed, snapshot, checkedAt);
-      if (governorDataReady(
+      const controlReady = governorControlReady(
         refreshed,
         snapshot,
-        activeKey,
         checkedAt,
-      )) {
+      );
+      if (controlReady) {
+        controlEpochs = { ...snapshot.value.epochs };
         liveScheduling = true;
         activePollAt = checkedAt + 1;
         backgroundPollAt = checkedAt + 4 * runtime.refreshMs;
@@ -7734,6 +8666,8 @@ function App({ onCreateRemote = () => {} } = {}) {
     void bootstrap();
     return () => {
       cancelled = true;
+      queuedManual.clear();
+      manualInFlight.clear();
       wakeScheduler.clearAll();
       for (const item of pending.values()) cancelIntent(cleanupScope, item.intentId, Date.now());
       if (cleanupScope && registeredScopeHash) releaseLease(cleanupScope, leaseId);
@@ -7813,6 +8747,24 @@ function App({ onCreateRemote = () => {} } = {}) {
 
   const items = data[tab.key];
   const displayError = formatTabErrorForWidth(tabError, failureContext, Math.max(1, cols - 5));
+  const coordinationError = activeGovernorDecision?.coordinationError && !remoteSetup;
+  const coordinationReason = activeGovernorDecision?.reason ?? "unavailable";
+  const coordinationCondition = coordinationError ? `${tab.key}\0${coordinationReason}` : null;
+  useEffect(() => {
+    setVisibleCoordinationCondition(null);
+    if (coordinationCondition === null) return;
+    const timer = setTimeout(
+      () => setVisibleCoordinationCondition(coordinationCondition),
+      COORDINATION_NOTICE_AFTER_MS,
+    );
+    return () => clearTimeout(timer);
+  }, [coordinationCondition]);
+  const showCoordinationNotice = coordinationCondition !== null &&
+    visibleCoordinationCondition === coordinationCondition;
+  const noticeLine = showCoordinationNotice
+    ? coordinationNotice(coordinationReason)
+    : !remoteSetup && displayError ? displayError : "";
+  const noticeTone = showCoordinationNotice ? ATTENTION : displayError ? ERROR_TEXT : undefined;
   const spin = SPINNER[frame % SPINNER.length];
 
   const counts = Object.fromEntries(
@@ -7867,6 +8819,7 @@ function App({ onCreateRemote = () => {} } = {}) {
   const staleAt = freshnessDeadline({
     lastOk,
     refreshMs: runtime.refreshMs,
+    grantedMs: admittedCadenceRef.current[tab.key]?.grantedMs,
     governorDecision: activeGovernorDecision,
     currentEpochs: governorEpochs,
   });
@@ -8075,20 +9028,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       !showHelp &&
         tooNarrow &&
         e(Text, { dimColor: true, wrap: "truncate-end" }, "too narrow"),
-      !showHelp &&
-        !tooNarrow &&
-        !remoteSetup &&
-        activeGovernorDecision?.coordinationError &&
-        e(
-          Text,
-          { color: ATTENTION, wrap: "truncate-end" },
-          `API coordination unavailable (${activeGovernorDecision.reason}); retrying safely`,
-        ),
-      !showHelp &&
-        !tooNarrow &&
-        !remoteSetup &&
-        displayError &&
-        e(Text, { color: ERROR_TEXT, wrap: "truncate-end" }, displayError),
+      e(Text, { color: noticeTone, wrap: "truncate-end" }, noticeLine),
       !showHelp &&
         !tooNarrow &&
         !remoteSetup &&
@@ -8167,7 +9107,7 @@ function App({ onCreateRemote = () => {} } = {}) {
               // Suppressed once icons are already ASCII, since then there is
               // nothing to fix.
               (USING_NERD_ICONS && iconHintDue ? "   (icons blank? GH_GLANCE_ICONS=unicode)" : "")
-            : ["waiting", "paused"].includes(semanticStatus.kind) || waiting[tab.key]
+            : semanticStatus.kind === "paused" || waiting[tab.key]
               ? "waiting for API budget…"
             : tab.key === "security" && securityNotes.length === ALERT_SOURCES.length
               ? "no alert sources available"
@@ -8184,6 +9124,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       detail: activeGovernorDecision,
       spin: showSpinner ? spin : null,
       stale: staleLabel,
+      nowMs: now.getTime(),
       interactive,
       cols: frameCols,
       remoteSetup,
@@ -8461,6 +9402,9 @@ export {
   BUDGET_SAFETY,
   BUDGET_RESERVE_FRACTION,
   BUDGET_SNAPSHOT_TTL_MS,
+  GRAPHQL_BUDGET_SNAPSHOT_TTL_MS,
+  budgetSnapshotTtl,
+  currentSharedLaneProvenance,
   GOVERNOR_HEARTBEAT_MS,
   GOVERNOR_LEASE_TTL_MS,
   GOVERNOR_PROBE_LEASE_MS,
@@ -8513,17 +9457,21 @@ export {
   cancelIntent,
   startReservation,
   completeReservation,
+  settleReservationWithBudgetObservations,
   recordResourceBlock,
   releaseLease,
   inspectGovernor,
   governorHealth,
   refreshSharedBudget,
+  readCoreBudget,
+  readSharedBudgetSources,
   safe,
   shortErr,
   isUnavailable,
   isRateLimited,
   isAuthProblem,
   isMissingRemote,
+  isUnusableOutput,
   forwardSignalToChild,
   toTabError,
   formatTabError,
@@ -8540,6 +9488,19 @@ export {
   BACKOFF_STEPS_MS,
   redact,
   classify,
+  parseJsonOutput,
+  parseGhApiResponse,
+  pickRateLimit,
+  ghApiArgs,
+  ghApi,
+  actionsRunsArgs,
+  actionsWorkflowsArgs,
+  parseActionsBodies,
+  entityKey,
+  fetchConditionalEntity,
+  conditionalBatchResult,
+  publishStagedEntities,
+  fetchAlertSource,
   formatAge,
   formatDuration,
   usableSize,
@@ -8580,6 +9541,8 @@ export {
   pollSchedule,
   retryPollAfterAdmissionFailure,
   governorWakeTimes,
+  governorControlReady,
+  tabEpochChanged,
   governorDataReady,
   governorControlRetryAt,
   createWakeScheduler,
@@ -8587,6 +9550,7 @@ export {
   pendingFailureIsTerminal,
   runtimeIntentGate,
   rateLimitBlockDecision,
+  coordinationNotice,
   mergeRateLimitBlockPublications,
   hydrateRateLimitBlockPublication,
   retryRateLimitBlockPublication,
@@ -8622,8 +9586,10 @@ export {
   summarizeDoctorEnv,
   widthStatusText,
   refreshStatus,
+  statusInterval,
   statusBarLayout,
   freshnessDeadline,
+  nextAdmittedCadence,
   probingGovernorDecisions,
   retainDeferredGovernorHold,
   REFRESH_STATUS_GLYPHS,
@@ -8642,4 +9608,5 @@ export {
   REMOTE_SETUP_NONINTERACTIVE_LINES,
   VERDICT_REMEDY,
   FAILURE_LADDER,
+  COORDINATION_NOTICE_AFTER_MS,
 };

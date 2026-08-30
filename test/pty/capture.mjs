@@ -40,7 +40,7 @@ const TAB_BAR = /1:(?:Actions|Act)/;
 // StatusBar always starts at column zero with one width-1 state marker. Panel
 // rows start with a border, so remote titles containing these words cannot be
 // mistaken for accumulated footers.
-const STATUS_LINE = /^\S (?:Setup|Checking|Paused|Waiting|Failed|Limited|Watching)(?:\s|$)/;
+const STATUS_LINE = /^\S (?:Setup|Checking|Paused|Failed|Limited|Watching)(?:\s|$)/;
 
 export function isStatusLine(line) {
   return typeof line === "string" && STATUS_LINE.test(line);
@@ -354,6 +354,11 @@ function replayTerminal(raw, cols, rows) {
 }
 
 export function parseCapture(raw, dimensions = null) {
+  // BSD script can echo its synthetic EOF as `^D` followed by two backspaces.
+  // This byte sequence is produced by the harness after its stdin writer
+  // closes, not by the app (remote text is sanitized before rendering). Drop
+  // it from terminal replay so it cannot occupy the reserved guard row.
+  const replayRaw = raw.replaceAll("^D\b\b", "");
   const visibleRaw = stripEscapes(raw);
   const altExitPositions = positionsOf(raw, ALT_EXIT);
   const mouse1002EnterPositions = positionsOf(raw, MOUSE_1002_ENTER);
@@ -392,7 +397,7 @@ export function parseCapture(raw, dimensions = null) {
   ).filter((line) => !/^EXITCODE=/.test(line));
   const replayed =
     dimensions && Number.isSafeInteger(dimensions.cols) && Number.isSafeInteger(dimensions.rows)
-      ? replayTerminal(raw, dimensions.cols, dimensions.rows)
+      ? replayTerminal(replayRaw, dimensions.cols, dimensions.rows)
       : null;
   const replayedScreen = replayed?.lines ?? null;
   const finalFrameLines = replayedScreen

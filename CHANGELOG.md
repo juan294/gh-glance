@@ -7,27 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-30
+
+### Fixed
+
+- **Manual refresh now owns exactly one fresh Actions batch.** It replaces the
+  due active-poll deadline, queues once when an automatic batch is already in
+  flight, and coalesces repeated `r` presses while that forced batch runs. This
+  prevents both a lost manual refresh and an immediate duplicate automatic
+  request.
+- **Reset recovery no longer strands a pane that lost shared probe ownership.**
+  When the winning pane publishes between a waiter's bounded inspection and
+  its final snapshot, the waiter now adopts that locked, fresh, claim-free
+  publication instead of sleeping until the next control interval. A data wake
+  that saw the old held epoch can no longer leave its active tab on that stale
+  deadline after the new safe epoch is published.
+
+### Changed
+
+- **The shared governor now follows authoritative response counters.** Core
+  observations come from conditional endpoint headers and one shared `/user`
+  observer. The free `rate_limit` GraphQL counter is now documented as a known
+  open-loop input, not as an authority: live GraphQL response headers can move
+  while that endpoint remains unchanged.
+  Response accounting and reservation settlement now commit atomically, so
+  concurrent panes cannot double-charge, move an owner-established epoch, or
+  overwrite a newer budget sample.
+- **Unchanged Actions and Security checks no longer consume REST quota.** The
+  dashboard now revalidates each REST endpoint with its cached ETag, while a
+  manual refresh still requests fresh data and new Actions runs still appear.
+- **The footer stays calm while checks follow their safe schedule.** Scheduler
+  holds now remain Watching, grant and reset details use coarse relative
+  minutes, and a wait caused only by other local panes says `sharing N`.
+  Detail or stale text stays inside a fixed state region so key hints do not
+  move. Staleness also follows each tab's admitted request cadence.
+- **GraphQL tolerates one unusable minute sample without a false hold.** Its
+  available observation remains probe-owned and fails closed after two missed
+  samples, but freshness does not make that counter accurate. The
+  response-header-backed core resource keeps its shorter freshness limit.
+
 ## [0.10.0] - 2026-08-19
 
 ### Fixed
 
-- **Concurrent panes preserve a hard reserve instead of slowing all the way to
-  exhaustion.** Local panes on one GitHub host and account now share atomic
+- **Concurrent panes preserve a core hard reserve instead of slowing all the way
+  to exhaustion.** Local panes on one GitHub host and account now share atomic
   grants, worst-case reservations, and one budget probe. gh-glance starts no
-  request when its latest fresh, conservatively debited REST or GraphQL sample
-  cannot pay for it outside the final 20% of that resource. Missing, corrupt,
-  locked, or unwritable coordination fails closed. REST exhaustion does not
-  stop healthy GraphQL tabs, and manual refresh cannot bypass the hold.
+  core request when its latest fresh, conservatively debited authoritative
+  sample cannot pay for it outside the final 20%. GraphQL work is locally paced
+  from its declared cost and the available `rate_limit` sample, but that sample
+  is not authoritative. Missing, corrupt, locked, or unwritable coordination
+  fails closed. REST exhaustion does not stop a GraphQL tab that its current
+  probe permits, and manual refresh cannot bypass the hold.
 
 ### Changed
 
 - **Startup, reset, polling, and status now reflect the shared safe schedule.**
   Stable pane phases spread startup and post-reset work, active checks precede
   one rotating background check, and the old 60-second pacing ceiling is gone.
-  The active footer says Watching, Checking, Waiting, Paused, Failed, or Limited.
-  Startup and manual Checking animate while admitted; adapted automatic checks
-  and non-working states stay static. `next HH:MM` names one current grant, not
-  a recurring interval.
+  The active footer reports an explicit semantic state. Startup and manual
+  Checking animate while admitted; adapted automatic checks and non-working
+  states stay static. The next-grant detail names one current grant, not a
+  recurring interval.
 
 ## [0.9.1] - 2026-08-11
 
@@ -47,10 +88,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   open alerts fill the base page, then merge and de-duplicate the result. A `+`
   marker stays explicit when any lane fills; the app never claims an unbounded
   repository is complete.
-- **Adaptive polling now protects both GitHub budgets.** REST and GraphQL spend
-  are measured separately, including failed calls, and the safer interval wins
-  without lowering the configured refresh floor. `--doctor` reports the same
-  conservative model.
+- **Adaptive polling models both GitHub budgets separately.** Declared REST and
+  GraphQL costs, including failed calls, feed the safer interval without
+  lowering the configured refresh floor. `--doctor` reports the same model.
+  Later validation established that only REST now has an authoritative
+  response-counter feedback loop.
 - **Terminal state has explicit non-colour and linear-rendering channels.** A
   stable ASCII `x` marks fetch failure, selected rows include `selected` in
   their accessibility label, narrow errors begin with the recovery action, and
@@ -734,7 +776,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/juan294/gh-glance/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/juan294/gh-glance/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/juan294/gh-glance/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/juan294/gh-glance/compare/v0.8.0...v0.9.0

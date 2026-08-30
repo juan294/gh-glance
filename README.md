@@ -25,14 +25,14 @@ without switching to the browser.
 ╭─ Actions · owner/repo ──────────────────────────────────────────────────╮
 │     TITLE                  │WORKFLOW  │BRANCH        │TIME   │UPDATED   │
 │ ─────────────────────────────────────────────────────────────────────── │
-│ >+  ci: pin actions to com… #443 CI    develop        1m20s   17d ago   │
-│  x  fix: restore the prima… #442 Code… develop        1m28s   17d ago   │
-│  +  chore: bump dependenci… #441 CI    dependa…int-10 30s     18d ago   │
-│  -  docs: update the readme #440 CI    develop        15s     18d ago   │
+│ >+  ci: pin actions to com… #443 CI    develop        1m20s   28d ago   │
+│  x  fix: restore the prima… #442 Code… develop        1m28s   28d ago   │
+│  +  chore: bump dependenci… #441 CI    dependa…int-10 30s     28d ago   │
+│  -  docs: update the readme #440 CI    develop        15s     29d ago   │
 │                                                                         │
 │                                                                         │
 ╰──────────────────────────────────────────────────────────────── 4 of 4 ─╯
-· Watching  Refresh: r Quit: q Move: ↑↓ Open: Ent Width: w           0.10.0
+· Watching               Refresh: r Quit: q Move: ↑↓ Open: Ent Width: w
 ```
 
 > Generated from this candidate's real binary under the repository PTY harness
@@ -83,12 +83,12 @@ current.
   mode, and preferences kept separately for each tab
 - `lazygit`-style panel frame: the tab name sits in the top border, the
   visible-of-total row count in the bottom
-- A semantic footer for the active tab: **Watching** is settled; **Checking**
-  means admitted work is live; **Waiting** means a probe or future grant;
-  **Paused** protects a held or unavailable budget; **Failed** names a normal
-  fetch error; and **Limited** means Security visibility is incomplete. Startup
-  and manual Checking can animate. Adapted automatic checks, Waiting, Paused,
-  Failed, Limited, and Watching are static
+- A semantic footer for the active tab: **Watching** is settled or scheduled;
+  **Checking** means admitted work is live; **Paused** protects a held or
+  unavailable budget; **Failed** names a normal fetch error; and **Limited**
+  means Security visibility is incomplete. Startup and manual Checking can
+  animate. Adapted automatic checks, Watching, Paused, Failed, and Limited are
+  static. A pure shared-lane wait adds `sharing N` without moving the key hints
 - Row state icons are real GitHub Octicons (via the Nerd Font glyph set), not emoji
   -- with a plain-ASCII fallback for terminals without one
 - Readable without colour: severity has its own column, a failing newest run puts
@@ -335,7 +335,7 @@ Environment variables work too, and the flags take precedence:
 | `GH_GLANCE_REFRESH=<seconds>` | Minimum active-tab poll interval, 2-3600. Sets the floor for every pane in a shell; `--refresh` takes precedence. See [Rate limit](#rate-limit). |
 | `GH_GLANCE_ICONS=unicode` | Unicode status glyphs and single-cell text substitutes for Nerd Font row icons |
 | `GH_GLANCE_ICONS=ascii` | ASCII-only status and row icons |
-| `GH_GLANCE_NO_ANIMATION=1` | Stop status and run-state motion. Semantic words such as Checking, Waiting, and Paused still report what is happening. |
+| `GH_GLANCE_NO_ANIMATION=1` | Stop status and run-state motion. Semantic words such as Watching, Checking, and Paused still report what is happening. |
 | `NO_COLOR=1` | Disable colour. Status stays readable: severity has its own column, a failing newest run puts a `!` on the Actions tab, and the active tab is bracketed. Note that run-state glyphs are not all distinct -- see the feature list above |
 | `INK_SCREEN_READER=true` | Switch the renderer to a linear, unthrottled mode. Automated PTY coverage checks that status and selection labels reach this Ink path, but it has not been validated with real assistive technology — treat it as automated rendering coverage, not claimed screen-reader support. |
 
@@ -534,7 +534,7 @@ either: one `gh run list` issues two REST requests. `gh-glance --doctor` reports
 this projection beside the server's actual REST and GraphQL budgets. Enterprise
 ceilings can differ from 5,000.
 
-For each resource, gh-glance reserves 20% of the reported limit for other work:
+For each resource, gh-glance calculates 20% of the reported limit for other work:
 
 ```text
 reserve = ceil(limit * 0.2)
@@ -543,16 +543,24 @@ spendable = max(0, remaining - reserve - charged reservations)
 
 That is 1,000 calls for a normal 5,000-call resource. Before any quota-consuming
 `gh` process starts, its declared worst-case REST/GraphQL cost must fit inside
-the latest fresh observation without entering the reserve. A grant is charged
-immediately, then reconciled only when completion evidence proves a lower cost.
+the latest fresh local observation without entering the calculated reserve. A
+grant is charged immediately, then reconciled only when completion evidence
+proves a lower cost.
 Started, interrupted, or process-lost work stays conservative until a later
 clean probe can account for it. Missing, stale, corrupt, locked, or unwritable
 coordination denies the call instead of returning to five-second polling.
 
+Core observations come from real response headers, so the core reserve has a
+closed feedback loop. GraphQL is currently weaker: `gh issue` and `gh pr` do
+not expose response headers in their normal output, and the free `rate_limit`
+endpoint can remain unchanged while real GraphQL use rises. gh-glance therefore
+paces its declared local GraphQL work and fails closed on a missing or stale
+probe, but it cannot yet prove the account-wide GraphQL reserve.
+
 One pane owns the free `rate_limit` probe for a control window and publishes it
 for the others. Manual and diagnostic work is considered before tab-switch,
 active, and background work; equal-priority panes rotate fairly. Manual `r`
-coalesces repeated presses, gives immediate Waiting or Paused feedback, and
+coalesces repeated presses, gives immediate Watching or Paused feedback, and
 clears an endpoint backoff only after admission. It cannot bypass a held budget
 or force a request into the reserve.
 
@@ -560,8 +568,10 @@ The shared lane uses spendable capacity, time to reset, outstanding
 reservations, and observed external spend. Startup and each new reset epoch add
 a stable per-pane phase, so panes do not resume as a herd. There is no
 60-second maximum: if the next safe slot is farther away, the pane waits that
-long. `next HH:MM` is the time of one current grant, not a promise of a recurring
-poll at that time or interval.
+long. `next 2m` is the coarse time until one current grant, not a promise of a
+recurring polling interval. When another live local pane alone owns the lane
+ahead of this pane, the detail says `sharing N` instead. The detail is capped
+at `99m+`.
 
 When a refresh fails, the last successful rows stay visible below the live
 error instead of disappearing. If gh-glance is restarted while GitHub is still
@@ -673,10 +683,11 @@ GH_GLANCE_ICONS=ascii gh-glance
 | Tabs start failing after working for a while | The enterprise SAML session lapsed. Re-authorize in the browser; the dashboard recovers within about 30 seconds. Run `gh-glance --doctor` to confirm. |
 | A tab's count is red | That tab's last fetch failed. The error itself is shown when you switch to it, translated into what to do about it where `gh-glance` recognises the failure. |
 | Security tab shows `?` instead of a number | The alert endpoints could not be read at all -- an expired SAML session, a token without `security_events`, or an org OAuth restriction. `?` means "unknown", not "zero"; run `gh-glance --doctor` to see which probe failed and how it was classified. |
-| `Waiting` or `next HH:MM` | The active tab is waiting for a shared budget probe or for its current safe grant. The time names this grant only; it is not a recurring polling interval. Pressing `r` raises safe priority but cannot bypass the lane or reserve. |
+| `Watching` with `next 2m` | The active tab has a shared budget probe or safe grant scheduled. The interval names this grant only; it is not a recurring polling interval. Pressing `r` raises safe priority but cannot bypass the lane or reserve. |
+| `Watching` with `sharing 4` | Four local panes share this account governor, and another pane owns the lane immediately ahead of this grant. This is pacing, not quota scarcity. |
 | `Paused` with a reset time | The active tab's REST or GraphQL resource is at its reserve, exhausted, or under a shared rate-limit block. Wait for the stated reset/probe. Other tabs can continue when they use the healthy resource. |
 | `Paused` without a reset time | Budget or coordinator evidence is unknown, corrupt, locked, or unwritable. No data call is started. Run `gh-glance --doctor`; also check the config directory permissions and whether another live process owns its private lock. |
-| A failing tab seems to have stopped retrying | Recognized endpoint failures back off rather than re-spawning `gh` at the floor. Press `r` to request a higher-priority retry; the backoff clears only after a safe grant, so a held budget remains Waiting or Paused. |
+| A failing tab seems to have stopped retrying | Recognized endpoint failures back off rather than re-spawning `gh` at the floor. Press `r` to request a higher-priority retry; the backoff clears only after a safe grant, so the tab remains Watching or Paused. |
 | `unknown argument: -v` | `-v` used to mean `--version` and no longer does, because this CLI also has `--verbose`. Use `--version` or `--verbose` explicitly. |
 | Cached rows plus `Paused` and `stale 2m` | The rows came from the separate last-known-good dashboard cache, while the live request is blocked or unsafe. Stale age is not extended by a pause. The error and footer describe current coordination; cached data never means the live check succeeded. |
 | Repeated GitHub rate-limit messages | A classified rate-limit response is published as one shared resource block. Local panes make no data retry before that block's probe/reset deadline. Use `--doctor` to inspect the resource and reset; repeated manual refresh cannot override it. |

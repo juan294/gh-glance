@@ -39,7 +39,8 @@ const listCalls = (result) => result.fixtureCalls.filter((call) => /^(run|issue|
 // probe: it is host-routed like these are, but it addresses no repository, so it
 // fails the request-path assertions below. It gets its own test instead.
 const apiCalls = (result) =>
-  result.fixtureCalls.filter((call) => call.startsWith("api ") && !call.startsWith("api rate_limit"));
+  result.fixtureCalls.filter((call) => call.startsWith("api ") &&
+    !call.startsWith("api rate_limit") && !call.startsWith("api -i user"));
 const probeCalls = (result) => result.fixtureCalls.filter((call) => call.startsWith("api rate_limit"));
 
 function assertReachedTheDataLayer(result, label) {

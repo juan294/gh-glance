@@ -19,6 +19,7 @@ import {
   isRateLimited,
   isAuthProblem,
   isMissingRemote,
+  isUnusableOutput,
   forwardSignalToChild,
   classify,
   toTabError,
@@ -49,8 +50,20 @@ import {
   resetTabWidthPreferences,
   widthStatusText,
   refreshStatus,
+  statusInterval,
   statusBarLayout,
   freshnessDeadline,
+  nextAdmittedCadence,
+  parseJsonOutput,
+  parseGhApiResponse,
+  pickRateLimit,
+  ghApi,
+  parseActionsBodies,
+  entityKey,
+  conditionalBatchResult,
+  publishStagedEntities,
+  pollResultTransition,
+  coordinationNotice,
   probingGovernorDecisions,
   retainDeferredGovernorHold,
   REFRESH_STATUS_GLYPHS,
@@ -95,6 +108,9 @@ import {
   BUDGET_SAFETY,
   BUDGET_RESERVE_FRACTION,
   BUDGET_SNAPSHOT_TTL_MS,
+  GRAPHQL_BUDGET_SNAPSHOT_TTL_MS,
+  budgetSnapshotTtl,
+  currentSharedLaneProvenance,
   GOVERNOR_HEARTBEAT_MS,
   GOVERNOR_LEASE_TTL_MS,
   GOVERNOR_PROBE_LEASE_MS,
@@ -269,6 +285,167 @@ test("unrelated GraphQL errors remain other", () => {
   const error = { stderr: "GraphQL: Something went wrong while executing your query" };
   assert.equal(isUnavailable(error), false);
   assert.equal(classify(error), "other");
+});
+
+test("app-owned unusable JSON output is transient while gh messages remain other", () => {
+  let parseFailure;
+  try {
+    parseJsonOutput("");
+  } catch (error) {
+    parseFailure = error;
+  }
+  assert.equal(isUnusableOutput(parseFailure), true);
+  assert.equal(classify(parseFailure), "unusable-output");
+  assert.throws(
+    () => parseJsonOutput('[{"number":41}'),
+    (error) => classify(error) === "unusable-output",
+  );
+  assert.equal(classify({ stderr: "dial tcp: lookup api.github.com: no such host" }), "other");
+  assert.equal(classify({ stderr: "Unexpected end of JSON input" }), "other");
+});
+
+test("unusable poll output keeps prior data clocks and forces the retry to parse", () => {
+  const transition = pollResultTransition({
+    key: "issues",
+    previousRaw: '[{"number":41}]',
+    raw: "",
+    parse: () => parseJsonOutput(""),
+    limit: 100,
+    completedAt: 1_000_000,
+  });
+  assert.deepEqual(transition, { kind: "unusable", nextRaw: null });
+});
+
+test("gh api response prefixes parse 200, 304, 404, and malformed output without throwing", () => {
+  assert.deepEqual(
+    parseGhApiResponse(
+      "HTTP/2 200 OK\r\nETag: \"runs-v1\"\r\nX-RateLimit-Limit: 5000\r\n" +
+      "X-RateLimit-Used: 12\r\nX-RateLimit-Remaining: 4988\r\n" +
+      "X-RateLimit-Reset: 1788019200\r\nX-RateLimit-Resource: core\r\n\r\n[{\"id\":1}]\n",
+    ),
+    {
+      status: 200,
+      headers: {
+        etag: '"runs-v1"',
+        "x-ratelimit-limit": "5000",
+        "x-ratelimit-used": "12",
+        "x-ratelimit-remaining": "4988",
+        "x-ratelimit-reset": "1788019200",
+        "x-ratelimit-resource": "core",
+      },
+      body: '[{"id":1}]\n',
+    },
+  );
+  assert.deepEqual(parseGhApiResponse("HTTP/2 304 Not Modified\nETag: W/\"same\"\n\n"), {
+    status: 304,
+    headers: { etag: 'W/"same"' },
+    body: "",
+  });
+  assert.equal(parseGhApiResponse("HTTP/1.1 404 Not Found\r\ncontent-type: text/plain\r\n\r\nno").status, 404);
+  assert.deepEqual(parseGhApiResponse("not an HTTP response"), {
+    status: null,
+    headers: {},
+    body: "",
+  });
+});
+
+test("gh api recognizes a 304 even when gh reports the jq empty-body error", async () => {
+  const error = Object.assign(new Error("gh api failed"), {
+    stdout: "HTTP/2 304 Not Modified\r\nETag: \"same\"\r\n\r\n",
+    stderr: "unexpected end of JSON input",
+  });
+  const response = await ghApi(["repos/acme/widget/actions/runs", "--jq", "."], {
+    operation: "tab:actions-runs",
+    etag: '"same"',
+    run: async () => { throw error; },
+  });
+  assert.deepEqual(response, { status: 304, etag: '"same"', rateLimit: null, body: "" });
+});
+
+test("rate-limit headers are normalized without changing governor state", () => {
+  assert.deepEqual(pickRateLimit({
+    "x-ratelimit-resource": "core",
+    "x-ratelimit-limit": "5000",
+    "x-ratelimit-used": "12",
+    "x-ratelimit-remaining": "4988",
+    "x-ratelimit-reset": "1788019200",
+  }), {
+    resource: "core",
+    limit: 5000,
+    used: 12,
+    remaining: 4988,
+    resetMs: 1_788_019_200_000,
+  });
+  assert.equal(pickRateLimit({ "x-ratelimit-resource": "core" }), null);
+});
+
+test("Actions joins workflows without dropping runs whose workflow is absent", () => {
+  assert.deepEqual(parseActionsBodies(
+    JSON.stringify([
+      { databaseId: 1, displayTitle: "CI", number: 7, headBranch: "main", status: "completed", conclusion: "success", startedAt: "start", updatedAt: "end", workflowId: 10 },
+      { databaseId: 2, displayTitle: "Deleted workflow", number: 6, headBranch: "old", status: "completed", conclusion: "failure", startedAt: "start2", updatedAt: "end2", workflowId: 99 },
+    ]),
+    JSON.stringify([{ id: 10, name: "Checks" }]),
+  ), [
+    { databaseId: 1, displayTitle: "CI", workflowName: "Checks", number: 7, headBranch: "main", status: "completed", conclusion: "success", startedAt: "start", updatedAt: "end" },
+    { databaseId: 2, displayTitle: "Deleted workflow", workflowName: "", number: 6, headBranch: "old", status: "completed", conclusion: "failure", startedAt: "start2", updatedAt: "end2" },
+  ]);
+});
+
+test("entity publication rejects malformed 200 and accepts an identical 200 ETag rotation", () => {
+  const path = "repos/acme/widget/actions/runs";
+  const key = entityKey("actions", path);
+  const entities = new Map([[key, { etag: '"old"', body: "[]" }]]);
+  const malformed = conditionalBatchResult([{
+    path,
+    status: 200,
+    body: "",
+    staged: [key, { etag: '"bad"', body: "" }],
+  }], "[]");
+  const unusable = pollResultTransition({
+    key: "actions",
+    previousRaw: "[]",
+    raw: malformed.raw,
+    parse: () => parseJsonOutput(malformed.raw),
+    limit: 100,
+    completedAt: 1,
+  });
+  assert.equal(unusable.kind, "unusable");
+  assert.equal(publishStagedEntities(entities, malformed.stagedEntities, unusable.kind), false);
+  assert.deepEqual(entities.get(key), { etag: '"old"', body: "[]" });
+
+  const rotated = conditionalBatchResult([{
+    path,
+    status: 200,
+    body: "[]",
+    staged: [key, { etag: '"new"', body: "[]" }],
+  }], "[]");
+  let parses = 0;
+  const unchanged = pollResultTransition({
+    key: "actions",
+    previousRaw: "[]",
+    raw: rotated.raw,
+    parse: () => { parses += 1; return []; },
+    limit: 100,
+    completedAt: 2,
+  });
+  assert.equal(unchanged.kind, "unchanged");
+  assert.equal(parses, 0);
+  assert.equal(publishStagedEntities(entities, rotated.stagedEntities, unchanged.kind), true);
+  assert.deepEqual(entities.get(key), { etag: '"new"', body: "[]" });
+});
+
+test("coordination notices translate raw reasons without exposing internal vocabulary", () => {
+  assert.equal(coordinationNotice("unknown-scope"), "Confirming your GitHub login…");
+  assert.equal(
+    coordinationNotice("block-unpublished"),
+    "Holding until the rate-limit block is shared",
+  );
+  assert.equal(coordinationNotice("busy"), "Coordinating with your other panes");
+  assert.equal(coordinationNotice("stale"), "Coordinating with your other panes");
+  for (const reason of ["corrupt", "unwritable", "unknown-host", "new-internal-reason"]) {
+    assert.equal(coordinationNotice(reason), "Can't coordinate API use — retrying");
+  }
 });
 
 test("structured tab errors select actionable one-line remedies", () => {
@@ -1415,8 +1592,17 @@ test("refresh status pins active-tab precedence, copy, motion, and details", () 
     tone: "attention", animate: false, detailKind: "reset",
   });
   assert.deepEqual(status({ governorDecision: { mode: "waiting", notBefore: 456 } }), {
-    kind: "waiting", glyphKind: "waiting", label: "Waiting",
+    kind: "watching", glyphKind: "watching", label: "Watching",
     tone: "inert", animate: false, detailKind: "next",
+  });
+  assert.deepEqual(status({ governorDecision: {
+    mode: "waiting",
+    notBefore: 456,
+    waitCause: "shared-lane",
+    sharingCount: 4,
+  } }), {
+    kind: "watching", glyphKind: "watching", label: "Watching",
+    tone: "inert", animate: false, detailKind: "sharing",
   });
   assert.equal(status({ activeError: { verdict: "other" }, securityIncomplete: true }).kind, "failed");
   assert.equal(status({ securityIncomplete: false, securityNotes: ["Dependabot is not enabled"] }).kind, "watching");
@@ -1428,12 +1614,15 @@ test("refresh status pins active-tab precedence, copy, motion, and details", () 
   for (const [expected, input] of [
     ["setup", { remoteSetup: true }],
     ["checking", { visibleLoading: true }],
-    ["waiting", { governorDecision: { mode: "waiting" } }],
+    ["watching", { governorDecision: { mode: "waiting" } }],
     ["paused", { governorDecision: { mode: "paused" } }],
     ["failed", { activeError: { verdict: "other" } }],
     ["limited", { securityIncomplete: true }],
   ]) {
     assert.equal(status({ ...input, screenReader: true }).kind, expected);
+  }
+  for (const mode of ["waiting", "pending", "probe"]) {
+    assert.equal(status({ governorDecision: { mode } }).label, "Watching");
   }
 });
 
@@ -1443,19 +1632,35 @@ test("refresh status markers are width one and labels do not change by profile",
     for (const glyph of Object.values(profile)) assert.equal([...glyph].length, 1, glyph);
   }
   assert.deepEqual(
-    ["setup", "checking", "paused", "waiting", "failed", "limited", "watching"]
+    ["setup", "checking", "paused", "watching", "failed", "limited"]
       .map((kind) => refreshStatus(kind === "watching" ? {} : {
         remoteSetup: kind === "setup",
         visibleLoading: kind === "checking",
-        governorDecision: ["paused", "waiting"].includes(kind) ? { mode: kind } : null,
+        governorDecision: kind === "paused" ? { mode: kind } : null,
         activeError: kind === "failed" ? { verdict: "other" } : null,
         securityIncomplete: kind === "limited",
       }).label),
-    ["Setup", "Checking", "Paused", "Waiting", "Failed", "Limited", "Watching"],
+    ["Setup", "Checking", "Paused", "Watching", "Failed", "Limited"],
   );
 });
 
-test("status bar layout preserves actions before deterministic detail and optional hints", () => {
+test("status intervals are minute-granular and capped", () => {
+  const nowMs = new Date(2026, 7, 18, 8, 40).getTime();
+  assert.equal(statusInterval(Number.NaN, nowMs), null);
+  assert.equal(statusInterval(nowMs - 1, nowMs), "<1m");
+  assert.equal(statusInterval(nowMs + 59_999, nowMs), "<1m");
+  assert.equal(statusInterval(nowMs + 60_000, nowMs), "1m");
+  assert.equal(statusInterval(nowMs + 60_001, nowMs), "2m");
+  assert.equal(statusInterval(nowMs + 99 * 60_000, nowMs), "99m");
+  assert.equal(statusInterval(nowMs + 100 * 60_000, nowMs), "99m+");
+  const samples = Array.from(
+    { length: 60 },
+    (_, second) => statusInterval(nowMs + 120_000, nowMs + second * 1_000),
+  );
+  assert.ok(new Set(samples).size <= 2, samples.join(", "));
+});
+
+test("status bar layout preserves a fixed state region before deterministic hints", () => {
   const hints = [
     { label: "Move", keys: "jk" },
     { label: "Open", keys: "Ent" },
@@ -1464,43 +1669,58 @@ test("status bar layout preserves actions before deterministic detail and option
     { label: "Quit", keys: "q" },
   ];
   const status = refreshStatus({ governorDecision: { mode: "waiting", notBefore: 0 } });
-  const detail = { notBefore: new Date(2026, 7, 18, 8, 42).getTime() };
+  const nowMs = new Date(2026, 7, 18, 8, 40).getTime();
+  const detail = { notBefore: nowMs + 120_000 };
   const layouts = Object.fromEntries([80, 60, 45, 24, 23].map((cols) => [
     cols,
-    statusBarLayout({ cols, interactive: true, availableHints: hints, status, detail, version: "v0.10.0" }),
+    statusBarLayout({
+      cols,
+      interactive: true,
+      availableHints: hints,
+      status,
+      detail,
+      nowMs,
+      version: "v0.11.0",
+    }),
   ]));
 
   assert.deepEqual(Object.fromEntries([80, 60, 45, 24, 23].map((cols) => [cols, {
+    stateWidth: layouts[cols].stateWidth,
     detail: layouts[cols].detail,
     mandatory: layouts[cols].mandatoryHints.map((hint) => hint.text),
     optional: layouts[cols].optionalHints.map((hint) => hint.text),
     version: layouts[cols].version,
   }])), {
     80: {
-      detail: "next 08:42",
+      stateWidth: 25,
+      detail: "next 2m",
       mandatory: ["Refresh: r", "Quit: q"],
       optional: ["Move: jk", "Open: Ent", "Width: w"],
-      version: "v0.10.0",
+      version: "v0.11.0",
     },
     60: {
-      detail: "next 08:42",
+      stateWidth: 25,
+      detail: "next 2m",
       mandatory: ["Refresh: r", "Quit: q"],
-      optional: ["Move: jk", "Open: Ent"],
+      optional: ["Move: jk", "Ent", "w"],
       version: null,
     },
     45: {
-      detail: "next 08:42",
+      stateWidth: 25,
+      detail: "next 2m",
       mandatory: ["Refresh: r", "Quit: q"],
-      optional: ["jk"],
+      optional: ["w"],
       version: null,
     },
     24: {
+      stateWidth: 12,
       detail: null,
       mandatory: ["Refresh: r", "q"],
       optional: [],
       version: null,
     },
     23: {
+      stateWidth: 12,
       detail: null,
       mandatory: ["r", "Quit: q"],
       optional: ["w"],
@@ -1515,23 +1735,92 @@ test("status bar layout preserves actions before deterministic detail and option
     availableHints: hints,
     status: paused,
     detail: { resetMs: detail.notBefore },
-    version: "v0.10.0",
-  }).detail, "reset 08:42");
+    nowMs,
+    version: "v0.11.0",
+  }).detail, "reset 2m");
   assert.equal(statusBarLayout({
     cols: 24,
     interactive: true,
     availableHints: hints,
     status: refreshStatus({ governorDecision: { mode: "waiting", probing: true } }),
     detail: {},
-    version: "v0.10.0",
+    nowMs,
+    version: "v0.11.0",
   }).detail, null);
+
+  const sharingStatus = refreshStatus({ governorDecision: {
+    mode: "waiting",
+    notBefore: detail.notBefore,
+    waitCause: "shared-lane",
+    sharingCount: 4,
+  } });
+  const sharingLayouts = Object.fromEntries([80, 60, 45, 24, 23].map((cols) => [
+    cols,
+    statusBarLayout({
+      cols,
+      interactive: true,
+      availableHints: hints,
+      status: sharingStatus,
+      detail: { ...detail, waitCause: "shared-lane", sharingCount: 4 },
+      nowMs,
+    }),
+  ]));
+  for (const cols of [80, 60, 45]) {
+    assert.equal(sharingLayouts[cols].detail, "sharing 4");
+    assert.equal(
+      sharingLayouts[cols].mandatoryHints[0].start,
+      layouts[cols].mandatoryHints[0].start,
+    );
+  }
+  for (const cols of [24, 23]) assert.equal(sharingLayouts[cols].detail, null);
+  const staleSharing = statusBarLayout({
+    cols: 80,
+    interactive: true,
+    availableHints: hints,
+    status: sharingStatus,
+    detail: { ...detail, waitCause: "shared-lane", sharingCount: 4 },
+    stale: "stale 99h59m",
+    nowMs,
+  });
+  assert.equal(staleSharing.detail, null);
+  assert.equal(staleSharing.stale, "stale 99h59m");
+
+  const steady = statusBarLayout({
+    cols: 80,
+    interactive: true,
+    availableHints: hints,
+    status: refreshStatus(),
+    nowMs,
+  });
+  const stale = statusBarLayout({
+    cols: 80,
+    interactive: true,
+    availableHints: hints,
+    status,
+    detail,
+    stale: "stale 99h59m",
+    nowMs,
+  });
+  assert.equal(layouts[80].mandatoryHints[0].start, steady.mandatoryHints[0].start);
+  assert.equal(stale.mandatoryHints[0].start, steady.mandatoryHints[0].start);
+  assert.equal(stale.detail, null);
+  assert.equal(stale.stale, "stale 99h59m");
 });
 
-test("freshness extends only through a valid current-epoch waiting grant", () => {
+test("admitted starts track granted cadence per tab", () => {
+  assert.deepEqual(nextAdmittedCadence(undefined, 1_000), { startedAt: 1_000, grantedMs: null });
+  assert.deepEqual(nextAdmittedCadence({ startedAt: 1_000, grantedMs: null }, 4_500), {
+    startedAt: 4_500,
+    grantedMs: 3_500,
+  });
+});
+
+test("freshness uses granted cadence and extends only through a valid current-epoch grant", () => {
   const lastOk = 1_000_000;
   const base = lastOk + 30_000;
   const epochs = { core: "core:1", graphql: null };
   assert.equal(freshnessDeadline({ lastOk, refreshMs: 5_000 }), base);
+  assert.equal(freshnessDeadline({ lastOk, refreshMs: 5_000, grantedMs: 20_000 }), lastOk + 120_000);
   assert.equal(freshnessDeadline({
     lastOk,
     refreshMs: 5_000,
@@ -2292,6 +2581,8 @@ test("local failure remedies have ladders while shared rate limits do not", () =
     Object.keys(FAILURE_LADDER).sort(),
   );
   assert.ok(!("other" in VERDICT_REMEDY));
+  assert.ok(!("unusable-output" in VERDICT_REMEDY));
+  assert.ok(!("unusable-output" in FAILURE_LADDER));
   assert.ok(!("ok" in FAILURE_LADDER));
   assert.equal("rate-limited" in FAILURE_LADDER, false);
 });
@@ -2349,6 +2640,9 @@ const policyLease = (
 test("the governor timing and reserve constants pin the policy contract", () => {
   assert.equal(BUDGET_RESERVE_FRACTION, 1 - BUDGET_SAFETY);
   assert.equal(BUDGET_SNAPSHOT_TTL_MS, 65_000);
+  assert.equal(GRAPHQL_BUDGET_SNAPSHOT_TTL_MS, 2 * BUDGET_PROBE_MS + 5_000);
+  assert.equal(budgetSnapshotTtl("core"), BUDGET_SNAPSHOT_TTL_MS);
+  assert.equal(budgetSnapshotTtl("graphql"), GRAPHQL_BUDGET_SNAPSHOT_TTL_MS);
   assert.equal(GOVERNOR_HEARTBEAT_MS, 20_000);
   assert.equal(GOVERNOR_LEASE_TTL_MS, 90_000);
   assert.equal(GOVERNOR_PROBE_LEASE_MS, 70_000);
@@ -2357,6 +2651,25 @@ test("the governor timing and reserve constants pin the policy contract", () => 
   assert.equal(GOVERNOR_PHASE_WINDOW_MS, 5_000);
   assert.equal(BUDGET_PROBE_MS, 60_000);
   assert.equal(resourceReserve(5000), 1000);
+});
+
+test("GraphQL tolerates one missed observer sample but fails closed after two", () => {
+  const observedAt = POLICY_NOW - BUDGET_SNAPSHOT_TTL_MS - 1;
+  assert.equal(availableForGrant({
+    budget: policyBudget({ observedAt }),
+    resource: "core",
+    nowMs: POLICY_NOW,
+  }).reason, "budget-stale");
+  assert.equal(availableForGrant({
+    budget: policyBudget({ observedAt }),
+    resource: "graphql",
+    nowMs: POLICY_NOW,
+  }).mode, "open");
+  assert.equal(availableForGrant({
+    budget: policyBudget({ observedAt: POLICY_NOW - GRAPHQL_BUDGET_SNAPSHOT_TTL_MS - 1 }),
+    resource: "graphql",
+    nowMs: POLICY_NOW,
+  }).reason, "budget-stale");
 });
 
 test("budget normalization rejects malformed values", () => {
@@ -2393,6 +2706,7 @@ test("missing, malformed, future, stale, and reset budgets never grant", () => {
 test("the hard reserve denies exhausted and reserve-crossing requests", () => {
   assert.equal(availableForGrant({
     budget: policyBudget({ remaining: 1000, used: 4000 }),
+    resource: "core",
     nowMs: POLICY_NOW,
   }).spendable, 0);
   for (const remaining of [1000, 999, 0]) {
@@ -2421,7 +2735,8 @@ test("invalid precomputed reservation totals fail closed", () => {
   };
   for (const chargedCost of [-1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
     assert.deepEqual(availableForGrant({
-      budget: { ...budget, resource: "core" },
+      budget,
+      resource: "core",
       nowMs: POLICY_NOW,
       chargedCost,
     }), expected);
@@ -2464,7 +2779,7 @@ test("a known shared rate block pauses until its reset", () => {
 test("a suffixed rollback epoch survives normalization into grants", () => {
   const epoch = `5000:${POLICY_NOW + 3_600_000}:${POLICY_NOW}`;
   const budget = policyBudget({ epoch });
-  assert.equal(availableForGrant({ budget, nowMs: POLICY_NOW }).epoch, epoch);
+  assert.equal(availableForGrant({ budget, resource: "core", nowMs: POLICY_NOW }).epoch, epoch);
   const scheduled = scheduleIntents({
     intents: [{
       id: "rollback-intent",
@@ -2495,11 +2810,20 @@ test("tab and auxiliary operation costs have one explicit registry", () => {
   assert.equal(tabRequestCost("unknown"), null);
   assert.equal(operationCost("__proto__"), null);
   assert.deepEqual(operationCost("tab:security"), { core: 6, graphql: 0 });
+  for (const operation of [
+    "tab:actions-runs",
+    "tab:actions-workflows",
+    "doctor:actions-runs",
+    "doctor:actions-workflows",
+  ]) {
+    assert.deepEqual(operationCost(operation), { core: 1, graphql: 0 }, operation);
+  }
   assert.deepEqual(operationCost("failure-context:repository"), { core: 0, graphql: 1 });
   assert.deepEqual(operationCost("open:actions"), { core: 2, graphql: 0 });
   assert.deepEqual(operationCost("open:issues"), { core: 0, graphql: 2 });
   assert.deepEqual(operationCost("open:prs"), { core: 0, graphql: 2 });
   assert.deepEqual(operationCost("doctor:security-endpoint"), { core: 1, graphql: 0 });
+  assert.deepEqual(operationCost("budget-core-observer"), { core: 1, graphql: 0 });
   for (const free of ["rate-limit", "version", "auth-status", "local-git", "failure-context:auth"]) {
     assert.deepEqual(operationCost(free), { core: 0, graphql: 0 });
   }
@@ -2515,7 +2839,7 @@ test("every production runGh call site declares a registry operation", () => {
   assert.ok(calls.length > 0);
   for (const { index } of calls) {
     const declaration = lines.slice(index, index + 5).join("\n");
-    assert.match(declaration, /operation(?::|\s*})/);
+    assert.match(declaration, /operation(?::|\s*[,}])/);
     const literal = /operation:\s*"([^"]+)"/.exec(declaration)?.[1];
     if (literal) assert.notEqual(operationCost(literal), null, literal);
     if (declaration.includes("`open:${tabKey}`")) {
@@ -2528,7 +2852,8 @@ test("every production runGh call site declares a registry operation", () => {
     "version",
     "auth-status",
     "doctor:repository",
-    "doctor:actions",
+    "doctor:actions-runs",
+    "doctor:actions-workflows",
     "doctor:issues",
     "doctor:prs",
     "doctor:security-endpoint",
@@ -2591,6 +2916,59 @@ test("manual and diagnostic requests from several leases remain lane paced", () 
   for (let index = 1; index < grantTimes.length; index += 1) {
     assert.ok(grantTimes[index] - grantTimes[index - 1] >= laneInterval);
   }
+});
+
+test("only a foreign live lane reports a transient sharing hold", () => {
+  const leases = Object.fromEntries(["a", "b", "c", "d"].map((id) => [
+    id,
+    policyLease(id, POLICY_NOW + 60_000),
+  ]));
+  const intent = {
+    id: "shared",
+    leaseId: "b",
+    priority: "active",
+    costs: { core: 1, graphql: 0 },
+    expiresAt: POLICY_NOW + 60_000,
+  };
+  const laneAt = POLICY_NOW + 10_000;
+  const schedule = (overrides = {}) => scheduleIntents({
+    intents: [intent],
+    leases,
+    budgets: { core: policyBudget() },
+    lanes: { core: { nextAt: laneAt } },
+    cursors: { core: "a" },
+    nowMs: POLICY_NOW,
+    ...overrides,
+  }).grants[0];
+
+  const shared = schedule();
+  assert.deepEqual(
+    { waitCause: shared.waitCause, sharingCount: shared.sharingCount },
+    { waitCause: "shared-lane", sharingCount: 4 },
+  );
+  assert.deepEqual(currentSharedLaneProvenance(shared, leases, POLICY_NOW), {
+    waitCause: "shared-lane",
+    sharingCount: 4,
+  });
+  assert.deepEqual(currentSharedLaneProvenance(shared, {
+    ...leases,
+    a: policyLease("a", POLICY_NOW - 1),
+  }, POLICY_NOW), {});
+  assert.deepEqual(currentSharedLaneProvenance(shared, {
+    a: leases.a,
+    b: leases.b,
+    c: leases.c,
+  }, POLICY_NOW), {});
+  assert.equal(schedule({ cursors: { core: "b" } }).waitCause, undefined);
+  assert.equal(schedule({ leases: { b: leases.b } }).waitCause, undefined);
+  assert.equal(schedule({ cursors: { core: "expired" }, leases: {
+    ...leases,
+    expired: policyLease("expired", POLICY_NOW - 1),
+  } }).waitCause, undefined);
+  assert.equal(schedule({
+    nowMs: laneAt,
+    lanes: { core: { nextAt: laneAt } },
+  }).waitCause, undefined, "an intrinsic-time tie is not a sharing hold");
 });
 
 test("tab intents derive registry costs and reject conflicting overrides", () => {

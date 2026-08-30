@@ -110,18 +110,19 @@ const assertTerminalContract = (result) => {
 };
 
 test("a healthy process writes dashboard state for restart", () => {
-  assert.ok(warm.fixtureCalls.some((call) => call.startsWith("run list")));
+  assert.ok(warm.fixtureCalls.some((call) => call.includes("/actions/runs?")));
   assert.match(screenOf(warm), /ci: pin actions to commit/);
 });
 
 test("same-target restart keeps stale Actions rows under a live rate-limit error", () => {
   const screen = screenOf(recovered);
-  assert.ok(recovered.fixtureCalls.some((call) => call.startsWith("run list")));
+  assert.ok(recovered.fixtureCalls.some((call) => call.includes("/actions/runs?")));
   assert.match(screen, /GitHub rate limit reached -- backing off/);
   assert.match(screen, /stale 2m/);
   assert.match(screen, /ci: pin actions to commit/);
   assert.match(screen, /4 of 4/);
-  assert.match(screen, /‖ Paused.*reset \d\d:\d\d/);
+  assert.match(screen, /‖ Paused.*stale 2m/);
+  assert.doesNotMatch(screen, /reset \S+/);
   const pausedAt = recovered.liveScreen.statusHistory.findLastIndex((line) => / Paused(?:\s|$)/.test(line));
   assert.ok(pausedAt >= 0, recovered.liveScreen.statusHistory.join(" -> "));
   assert.equal(
