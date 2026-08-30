@@ -1680,7 +1680,7 @@ test("status bar layout preserves a fixed state region before deterministic hint
       status,
       detail,
       nowMs,
-      version: "v0.10.0",
+      version: "v0.11.0",
     }),
   ]));
 
@@ -1696,7 +1696,7 @@ test("status bar layout preserves a fixed state region before deterministic hint
       detail: "next 2m",
       mandatory: ["Refresh: r", "Quit: q"],
       optional: ["Move: jk", "Open: Ent", "Width: w"],
-      version: "v0.10.0",
+      version: "v0.11.0",
     },
     60: {
       stateWidth: 25,
@@ -1736,7 +1736,7 @@ test("status bar layout preserves a fixed state region before deterministic hint
     status: paused,
     detail: { resetMs: detail.notBefore },
     nowMs,
-    version: "v0.10.0",
+    version: "v0.11.0",
   }).detail, "reset 2m");
   assert.equal(statusBarLayout({
     cols: 24,
@@ -1745,7 +1745,7 @@ test("status bar layout preserves a fixed state region before deterministic hint
     status: refreshStatus({ governorDecision: { mode: "waiting", probing: true } }),
     detail: {},
     nowMs,
-    version: "v0.10.0",
+    version: "v0.11.0",
   }).detail, null);
 
   const sharingStatus = refreshStatus({ governorDecision: {

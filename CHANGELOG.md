@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-30
+
 ### Fixed
 
 - **Manual refresh now owns exactly one fresh Actions batch.** It replaces the
@@ -768,7 +770,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/juan294/gh-glance/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/juan294/gh-glance/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/juan294/gh-glance/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/juan294/gh-glance/compare/v0.8.0...v0.9.0
