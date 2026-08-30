@@ -714,9 +714,16 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
   const startup = capture({
     cols: 80,
     rows: 24,
-    settle: 20,
+    signal: "none",
+    settle: 30,
+    stdin: waitForAwk(
+      '"$GH_GLANCE_CAPTURE_OUT"',
+      'index($0, "Checking") { checking=1 } checking && index($0, "Watching") { ok=1 }',
+      250,
+    ) + "sleep .3; printf q",
     configHome: startupBox.root,
     env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       INK_SCREEN_READER: "true",
       GH_GLANCE_FIXTURE_STATE: startupBox.statePath,
       GH_GLANCE_FIXTURE_PANE: "reader-startup",
@@ -731,9 +738,16 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
   const paused = capture({
     cols: 80,
     rows: 24,
-    settle: 15,
+    signal: "none",
+    settle: 30,
+    stdin: waitForAwk(
+      '"$GH_GLANCE_CAPTURE_OUT"',
+      'index($0, "Paused") { ok=1 }',
+      250,
+    ) + "sleep .3; printf q",
     configHome: heldBox.root,
     env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       INK_SCREEN_READER: "true",
       GH_GLANCE_FIXTURE_STATE: heldBox.statePath,
       GH_GLANCE_FIXTURE_PANE: "reader-paused",
@@ -745,10 +759,17 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
   const failed = capture({
     cols: 80,
     rows: 24,
-    settle: 20,
+    signal: "none",
+    settle: 30,
+    stdin: waitForAwk(
+      '"$GH_GLANCE_CAPTURE_OUT"',
+      'index($0, "Failed") { ok=1 }',
+      250,
+    ) + "sleep .3; printf q",
     args: "--tab issues",
     configHome: configRoot(t, "gh-glance-reader-failed-"),
     env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       INK_SCREEN_READER: "true",
       GH_GLANCE_FIXTURE_FAIL: "dial tcp: fixture unavailable",
       GH_GLANCE_FIXTURE_FAIL_ON: "issue",
@@ -771,10 +792,17 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
   const limited = capture({
     cols: 80,
     rows: 24,
-    settle: 20,
+    signal: "none",
+    settle: 30,
+    stdin: waitForAwk(
+      '"$GH_GLANCE_CAPTURE_OUT"',
+      'index($0, "Limited") { ok=1 }',
+      250,
+    ) + "sleep .3; printf q",
     args: "--tab security",
     configHome: limitedRoot,
     env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       INK_SCREEN_READER: "true",
       GH_GLANCE_FIXTURE_FAIL: "You are not logged into any GitHub hosts",
       GH_GLANCE_FIXTURE_FAIL_ON: "api-data",
@@ -806,9 +834,17 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
   const staleError = capture({
     cols: 80,
     rows: 24,
-    settle: 20,
+    signal: "none",
+    settle: 30,
+    stdin: waitForAwk(
+      '"$GH_GLANCE_CAPTURE_OUT"',
+      'index($0, "GitHub rate limit reached -- backing off") { failed=1 } ' +
+        'failed && index($0, "stale 2m") { ok=1 }',
+      250,
+    ) + "sleep .3; printf q",
     configHome: staleRoot,
     env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       INK_SCREEN_READER: "true",
       GH_GLANCE_FIXTURE_FAIL: "HTTP 403: API rate limit exceeded",
       GH_GLANCE_FIXTURE_FAIL_ON: "actions",
