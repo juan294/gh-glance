@@ -27,8 +27,8 @@ gh-glance uses a versioned, private, file-backed governor for every effective
 GitHub host and account namespace. It coordinates local panes before a data
 subprocess starts. It is not a daemon and adds no service or dependency.
 
-The existing 0.8 policy now defines a hard reserve independently for REST
-`core` and GraphQL:
+The existing 0.8 policy defines a reserve independently for REST `core` and
+GraphQL:
 
 ```text
 reserve = ceil(limit * (1 - BUDGET_SAFETY))
@@ -41,27 +41,40 @@ intent can receive a grant only when a fresh observation can pay that cost
 without entering the resource reserve. A grant becomes a conservative
 reservation and is revalidated immediately before its `gh` process starts.
 
-The exact enforceable guarantee is:
+For REST `core`, response headers close the feedback loop. Its exact enforceable
+guarantee is:
 
-> gh-glance starts no data request for a rate resource when its latest fresh,
-> conservatively debited observation cannot cover the request without entering
-> that resource's hard reserve.
+> gh-glance starts no core data request when its latest fresh, conservatively
+> debited authoritative observation cannot cover the request without entering
+> the core hard reserve.
+
+GraphQL does not currently have the same guarantee. The porcelain `gh issue`
+and `gh pr` commands do not expose their response rate-limit headers, and the
+free `rate_limit` endpoint has been observed reporting a constant GraphQL
+counter while real GraphQL response headers increased. The governor still
+fails closed when that probe is missing or stale and paces declared local
+GraphQL costs, but its GraphQL counter is open-loop and cannot prove the
+account-wide reserve. Closing this loop requires a separately designed
+response-header observation path.
 
 Manual refresh, tab changes, item opening, failure context, and diagnostic
 probes use the same admission rule as automatic polling. Manual work has higher
 queue priority, but it cannot bypass a held budget. Local version,
 authentication, and Git inspection do not need a quota grant. The GraphQL
-observer uses the free `rate_limit` endpoint. Core has one explicit
+observer uses the free `rate_limit` endpoint as its currently available, but
+non-authoritative, counter input. Core has one explicit
 control-plane exception: one shared claimant can make a bounded `GET /user`
 bootstrap request before an authoritative core observation exists. Its first
 200 response can cost one unit and records that unit immediately. Later core
 observations are conditional and a matching 304 costs zero.
 
 Only a claimed observer can establish or change a resource epoch: conditional
-`GET /user` owns core and `rate_limit` owns GraphQL. Endpoint response headers
-can refine an absolute counter only when their full `(limit, reset)` epoch
-matches the persisted observer epoch. A cached or endpoint-specific header from
-another epoch is ignored and its request cost stays conservatively reserved.
+`GET /user` owns core and `rate_limit` owns the local GraphQL probe epoch. That
+protocol ownership does not make the GraphQL counter authoritative. Endpoint
+response headers can refine an absolute counter only when their full
+`(limit, reset)` epoch matches the persisted observer epoch. A cached or
+endpoint-specific header from another epoch is ignored and its request cost
+stays conservatively reserved.
 
 ## Protocol and recovery
 
@@ -69,17 +82,18 @@ The governor state records resource epochs and observations, fair lane cursors,
 leases, pending intents, reservations, shared probe ownership and outcomes,
 manual probe demand, rate-limit blocks, and a conservative external-spend
 factor. REST and GraphQL are scheduled separately, so a held REST resource does
-not stop Issues or Pull Requests from using healthy GraphQL capacity.
+not stop Issues or Pull Requests when the current GraphQL probe permits them.
 
 A short synchronous lock section validates and atomically writes each state
 transition. One process owns the split budget observation claim while the
-others wait for publication. It reads GraphQL only from `rate_limit` and core
-only from response headers or conditional `/user`; `rate_limit` core data is
-never admission evidence. Pending work is ordered by manual/diagnostic, tab-switch, active,
-then background priority, with round-robin progress among equal-priority live
-leases. Stable per-lease phases spread startup and reset work. There is no
-60-second maximum wait: a request waits until its computed safe `notBefore`, or
-the resource pauses when one request cannot be paid safely.
+others wait for publication. It reads the currently available GraphQL counter
+from `rate_limit` and core only from response headers or conditional `/user`;
+`rate_limit` core data is never admission evidence. Pending work is ordered by
+manual/diagnostic, tab-switch, active, then background priority, with
+round-robin progress among equal-priority live leases. Stable per-lease phases
+spread startup and reset work. There is no 60-second maximum wait: a request
+waits until its computed safe `notBefore`, or the resource pauses when one
+request cannot be paid safely.
 
 The state file is replaced atomically. The lock contains only a PID and random
 nonce. A live or suspended owner is never stolen; a PID-confirmed dead owner is
@@ -109,10 +123,13 @@ scope before receiving another grant.
 The local scope is the boundary of the guarantee. An unrelated program can
 spend after the latest probe, a process using a different local configuration
 scope cannot share the file, and another machine cannot take the local lock.
-The token-wide probe measures that external use and reduces later lane capacity,
-but GitHub provides no atomic global quota-reservation API. The reserve is
-therefore a guarantee about gh-glance's own admissions from fresh local
-evidence, not a promise that the account-wide counter can never cross it.
+The token-wide core observer measures that external use and reduces later lane
+capacity, but GitHub provides no atomic global quota-reservation API. The core
+reserve is therefore a guarantee about gh-glance's own admissions from fresh
+local authoritative evidence, not a promise that the account-wide counter can
+never cross it. GraphQL remains weaker: without authoritative response
+counters, even that local-admission guarantee cannot be tied to the real
+GraphQL remaining value.
 
 ## Alternatives considered
 

@@ -1331,7 +1331,10 @@ const OPERATION_COSTS = Object.freeze({
   "doctor:issues": tabRequestCost("issues"),
   "doctor:prs": tabRequestCost("prs"),
   "doctor:security-endpoint": { core: 1, graphql: 0 },
-  "budget-core-observer": { core: 0, graphql: 0 },
+  // The claimed observer is the one control-plane exception to normal data
+  // admission, but its worst-case vector is still one core unit: the first 200
+  // can spend it before an ETag makes later observations free.
+  "budget-core-observer": { core: 1, graphql: 0 },
   "rate-limit": { core: 0, graphql: 0 },
   "version": { core: 0, graphql: 0 },
   "auth-status": { core: 0, graphql: 0 },
@@ -7851,6 +7854,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       // background fetch -- and so a slow repo can't stack refreshes.
       if (inFlightRef.current[key]) return Promise.resolve();
       inFlightRef.current[key] = true;
+      if (force) manualInFlight.add(key);
       admittedCadenceRef.current[key] = nextAdmittedCadence(
         admittedCadenceRef.current[key],
         admittedAt,
@@ -8040,6 +8044,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         })
         .finally(() => {
           inFlightRef.current[key] = false;
+          manualInFlight.delete(key);
           onSettled?.();
           if (!cancelled) {
             setLoading((l) => (l[key] ? { ...l, [key]: false } : l));
@@ -8055,11 +8060,19 @@ function App({ onCreateRemote = () => {} } = {}) {
                   : current);
             }
           }
+          if (!cancelled && queuedManual.delete(key)) {
+            void requestTab(key, "manual", { force: true });
+          }
         });
     }
 
     const leaseId = governorId();
     const pending = new Map();
+    // One manual handoff per tab. A keypress during an automatic request must
+    // not be lost, but repeated keypresses during the forced request itself
+    // must not create a trailing second batch.
+    const queuedManual = new Set();
+    const manualInFlight = new Set();
     const wakeScheduler = createWakeScheduler();
     let scope = null;
     let cleanupScope = null;
@@ -8233,6 +8246,12 @@ function App({ onCreateRemote = () => {} } = {}) {
       armFromState();
     }
 
+    function replaceActivePoll(kind, at) {
+      if (["manual", "tab-switch"].includes(kind)) {
+        activePollAt = at + runtime.refreshMs;
+      }
+    }
+
     function requestTab(key, kind = "active", { force = false } = {}) {
       const signal = controller.signal;
       const descriptor = tabForKey(key);
@@ -8241,7 +8260,10 @@ function App({ onCreateRemote = () => {} } = {}) {
         pauseCoordination(key, "block-unpublished");
         return Promise.resolve({ persisted: false, retry: false, kind });
       }
-      if (inFlightRef.current[key]) return Promise.resolve({ persisted: false, retry: false, kind });
+      if (inFlightRef.current[key]) {
+        if (force && !manualInFlight.has(key)) queuedManual.add(key);
+        return Promise.resolve({ persisted: false, retry: false, kind });
+      }
       if (!force && backoffActive(`tab:${key}`, monotonicNow)) {
         return Promise.resolve({ persisted: false, retry: false, kind });
       }
@@ -8351,6 +8373,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         return Promise.resolve({ persisted: true, retry: false, kind });
       }
       setTabWaiting(key, false);
+      replaceActivePoll(kind, nowMs);
       if (force) coordinator.invalidate();
       return commit(
         key,
@@ -8373,7 +8396,11 @@ function App({ onCreateRemote = () => {} } = {}) {
     }
     fetchTabRef.current = (key, { force = false, kind = force ? "manual" : "active" } = {}) => {
       const requestedAt = Date.now();
-      if (kind === "tab-switch") activePollAt = requestedAt + runtime.refreshMs;
+      // Manual work replaces the active poll that would otherwise be due. Move
+      // that deadline before touching the governor so a data wake already in
+      // this event-loop turn cannot start a second batch as soon as the forced
+      // batch settles. The in-flight guard still coalesces work that overlaps.
+      replaceActivePoll(kind, requestedAt);
       const currentScope = ensureScope(requestedAt);
       if (currentScope) {
         heartbeatLease(currentScope, leaseId, tabRequestCost(key), requestedAt, key);
@@ -8430,6 +8457,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           continue;
         }
         setTabWaiting(key, false);
+        replaceActivePoll(item.kind, nowMs);
         if (item.force) coordinator.invalidate();
         const descriptor = tabForKey(key);
         void commit(
@@ -8610,6 +8638,8 @@ function App({ onCreateRemote = () => {} } = {}) {
     void bootstrap();
     return () => {
       cancelled = true;
+      queuedManual.clear();
+      manualInFlight.clear();
       wakeScheduler.clearAll();
       for (const item of pending.values()) cancelIntent(cleanupScope, item.intentId, Date.now());
       if (cleanupScope && registeredScopeHash) releaseLease(cleanupScope, leaseId);

@@ -204,7 +204,8 @@ test("twelve real panes share one startup probe and every active pane progresses
     startupGovernor = scheduled.governor;
     progress = await observeUntil(
       box.read,
-      (state) => new Set(dataStarts(state).map((event) => event.pane)).size === 12,
+      (state) => dataStarts(state).length >= 24 &&
+        new Set(dataStarts(state).map((event) => event.pane)).size === 12,
       reservationHorizon(startupGovernor, "core"),
     );
   } finally {

@@ -534,7 +534,7 @@ either: one `gh run list` issues two REST requests. `gh-glance --doctor` reports
 this projection beside the server's actual REST and GraphQL budgets. Enterprise
 ceilings can differ from 5,000.
 
-For each resource, gh-glance reserves 20% of the reported limit for other work:
+For each resource, gh-glance calculates 20% of the reported limit for other work:
 
 ```text
 reserve = ceil(limit * 0.2)
@@ -543,11 +543,19 @@ spendable = max(0, remaining - reserve - charged reservations)
 
 That is 1,000 calls for a normal 5,000-call resource. Before any quota-consuming
 `gh` process starts, its declared worst-case REST/GraphQL cost must fit inside
-the latest fresh observation without entering the reserve. A grant is charged
-immediately, then reconciled only when completion evidence proves a lower cost.
+the latest fresh local observation without entering the calculated reserve. A
+grant is charged immediately, then reconciled only when completion evidence
+proves a lower cost.
 Started, interrupted, or process-lost work stays conservative until a later
 clean probe can account for it. Missing, stale, corrupt, locked, or unwritable
 coordination denies the call instead of returning to five-second polling.
+
+Core observations come from real response headers, so the core reserve has a
+closed feedback loop. GraphQL is currently weaker: `gh issue` and `gh pr` do
+not expose response headers in their normal output, and the free `rate_limit`
+endpoint can remain unchanged while real GraphQL use rises. gh-glance therefore
+paces its declared local GraphQL work and fails closed on a missing or stale
+probe, but it cannot yet prove the account-wide GraphQL reserve.
 
 One pane owns the free `rate_limit` probe for a control window and publishes it
 for the others. Manual and diagnostic work is considered before tab-switch,

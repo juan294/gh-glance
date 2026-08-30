@@ -2,6 +2,32 @@
 
 ## Deviations
 
+### 2026-08-30 PTY validation correction
+
+- **Earlier notes said:** Aggregate PTY failures in Phases 1 through 4 were
+  local process-pressure artifacts because affected modules later passed in
+  separate processes, and all 95 Phase 6 PTY cases passed in isolated module
+  processes.
+- **Validation found:** The manual-refresh status case failed repeatedly in an
+  isolated module with two Actions runs requests instead of one. The canonical
+  `npm run test:pty` also failed, and a clean-worktree rerun exposed a separate
+  readiness race that inspected a two-subprocess Actions batch after only 23 of
+  24 starts were recorded.
+- **Correction:** The broad process-pressure explanation and the absolute
+  Phase 6 PTY claim are withdrawn. A manual refresh did not move the active
+  poll deadline, so a due automatic wake could start a second batch after the
+  forced batch settled. The opposite overlap could also drop `r` when an
+  automatic batch was already in flight. Manual work now replaces the active
+  deadline and has one per-tab handoff behind an automatic request; repeated
+  presses during the forced request still coalesce. The twelve-pane startup
+  predicate now waits for both declared Actions endpoints from every pane
+  before inspecting the batch. The three-pane reset fixture now leaves an
+  explicit bootstrap interval before the first reset, so the reset assertion
+  begins with all intended contenders instead of depending on aggregate
+  process startup speed.
+- **Gate:** The canonical serialized `npm run test:pty` command, not a set of
+  separately collected module passes, is the final repair gate.
+
 ### Phase 1 PTY execution
 
 - **Plan said:** Run `npm run test:pty` as one serialized Node test command.
@@ -177,7 +203,10 @@
 - Issues and pull requests completed 760 and 789 successful two-unit GraphQL
   operations. Their declared attributable load was 3,098 units.
 - Core remaining never fell below 2,775 of 5,000. GraphQL reported 5,000 of
-  5,000 throughout. Both stayed above the 1,000-unit hard reserve.
+  5,000 throughout. The core observation proves its 1,000-unit reserve was
+  preserved. The GraphQL value does not: later live validation showed
+  `/rate_limit` fixed at `used=0, remaining=5000` while real GraphQL response
+  headers advanced from `used=41` to `used=45`.
 
 ### Status and freshness
 
@@ -202,7 +231,9 @@
 - Set the GraphQL TTL to `2 * 60_000 + 5_000 = 125_000` ms. The derivation is
   two probe periods plus the existing 5-second grace. It covers the measured
   122.591-second worst case, produces zero stale episodes for this window, and
-  still fails closed after two consecutive unusable observations.
+  still fails closed after two consecutive unusable observations. This is only
+  a freshness rule for the available probe; it does not make the open-loop
+  GraphQL counter authoritative.
 - Do not add factor decay. The valid-window factor peaked at 7.58, returned to
   1 within 305 seconds, and ended at 1.21 while other existing local consumers
   continued to use the account. Two earlier controlled burns of about 500
@@ -211,21 +242,41 @@
   another live lease. Four-pane PTY evidence shows `Watching sharing 4` and the
   same hint start column as settled Watching. Stored reservations retain their
   exact v2 shape.
+- Stale text has precedence over all status detail inside the fixed capped
+  region. A stale label therefore suppresses `next`, `reset`, and `sharing`
+  detail instead of widening the region or moving the key hints.
 - Keep the five-second default. Every measured REST data response was a free
   `304`, but no `200` change occurred in the accepted hour. The observation
   therefore does not justify changing the floor or claiming a measured
   changed-repository latency.
 
-### Phase 6 final verification
+### Phase 6 original verification claim
 
 - `node --check index.mjs`, `npm run lint`, all 295 unit and real-filesystem
   tests, `node index.mjs --help`, and `git diff --check` passed on the final
   candidate.
-- All 95 PTY cases passed in isolated module processes. The protected
-  exhausted-core and reset/external-burn cases passed with their predicates and
-  assertions unchanged.
+- The original claim that all 95 PTY cases passed in isolated module processes
+  did not reproduce during independent validation and is superseded by the
+  2026-08-30 correction and repair verification below. The protected
+  exhausted-core and reset/external-burn predicates and assertions remain
+  unchanged.
 - The simplify review removed hot-path budget clones and scheduler allocations,
   centralized sharing validation, reduced the new four-pane PTY from a fixed
   15-second hold to a readiness handshake, rejected wrong-source core probe
   publication, and revalidates transient sharing evidence against current live
   leases. No measurement-only code or test remains.
+
+### 2026-08-30 repair verification
+
+- `npm run lint`, all 295 unit and real-filesystem tests,
+  `node --check index.mjs`, `node index.mjs --help`, and `git diff --check`
+  passed after the final manual-refresh handoff fix.
+- The canonical `npm run test:pty` command passed all 95 cases in one
+  serialized process. The status manual-refresh case observed one Actions runs
+  request, the conditional-polling manual case observed its required fresh
+  request, and the held-lane case retained one manual intent.
+- The protected exhausted-core and reset/external-burn tests passed without
+  changing their assertions. The three-pane throttle reset fixture now leaves
+  ten seconds for all panes to bootstrap before its reset; its exact probe,
+  one-request-per-pane, lane-spacing, reserve, and no-background-work
+  assertions are unchanged.

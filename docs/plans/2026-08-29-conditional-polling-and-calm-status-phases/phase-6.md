@@ -92,12 +92,24 @@ evidence rather than inheritance.
 - `test/pty/governor.test.mjs` and `test/pty/throttle.test.mjs` pass unmodified.
 - Sequential verification passes.
 
+Validation repair: the protected exhaustion and reset/external-burn assertions
+remain unmodified. A separate three-pane throttle reset fixture now leaves ten
+seconds for all real panes to bootstrap before it opens the reset epoch; its
+policy assertions are unchanged. The canonical serialized PTY command passes
+95 of 95 cases.
+
 ### Manual
 
 - Four panes for a full hour across one real reset. REST and GraphQL both stay
   outside their 20% reserves; no synchronized reset burst; the footer never
   looks inert.
 - Confirm a pane that is waiting purely because of sharing says so.
+
+Validation correction: the hour proved the core reserve and reset behavior,
+but it could not prove the GraphQL reserve. The free `rate_limit` GraphQL
+counter stayed at 5,000 remaining while later real GraphQL response headers
+showed increasing use. GraphQL admission remains open-loop until a separate
+response-header observation design is implemented.
 
 ## Out of scope
 
@@ -111,11 +123,15 @@ Release-pipeline or CI changes.
   freshness, factors, reserves, and reset behavior.
 - [x] Core keeps the 65-second response-header freshness limit. GraphQL keeps
   its 60-second probe and uses a measured 125-second TTL, which tolerates one
-  unusable sample and fails closed after two.
+  unusable sample and fails closed after two. That TTL proves only probe
+  freshness, not GraphQL counter accuracy.
 - [x] The external factor has no added decay because it returned from 7.58 to
   1 within 305 seconds under continued observation.
 - [x] A wait caused only by a foreign live lane reports `sharing N`. The value
   is transient and cannot change the stored governor protocol.
+- [x] Stale text suppresses state detail inside the fixed capped region. This
+  keeps the hint columns fixed without reserving worst-case stale-plus-detail
+  width.
 - [x] The five-second default is unchanged. The window had no changing REST
   response, so it supports the conditional cost result but not a different
   promise for a changing repository.

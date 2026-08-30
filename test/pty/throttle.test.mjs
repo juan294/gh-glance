@@ -206,10 +206,14 @@ test("a real reset gets one fresh probe then one phased active request per pane"
   const box = fixture(t, {
     anchorAtFirstProbe: true,
     createdAt: null,
-    core: { limit: 5000, used: 5000, remaining: 0, resetMs: 0, resetOffsetMs: 1_000 },
+    // Leave enough bootstrap time for all three real panes to register before
+    // the reset. Anchoring the reset two seconds after the first probe let a
+    // loaded aggregate runner begin the epoch with only two live contenders,
+    // so the test observed startup timing instead of reset pacing.
+    core: { limit: 5000, used: 5000, remaining: 0, resetMs: 0, resetOffsetMs: 10_000 },
     resetSequence: [{
-      offsetMs: 2_000,
-      core: { used: 0, remaining: 5000, resetOffsetMs: 3_602_000 },
+      offsetMs: 10_500,
+      core: { used: 0, remaining: 5000, resetOffsetMs: 3_610_500 },
     }],
   });
   const readyPath = join(box.root, "reset-ready");

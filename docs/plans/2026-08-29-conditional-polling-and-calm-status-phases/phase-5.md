@@ -64,6 +64,7 @@ core observer:
 graphql observer:
   gh api rate_limit
   consume only resources.graphql
+  treat it as the currently available probe, not an authoritative counter
 
 forbidden:
   resources.core from gh api rate_limit never writes budgets.core,
@@ -144,8 +145,10 @@ The three owner contracts stay executable:
 2. **External-burn detection.**
    `a real reset resumes all panes, while atomic external burn limits the next
    epoch` in `test/pty/governor.test.mjs` passes with its assertions unmodified.
-3. **GraphQL bootstrap, recovery, and external spend.**
-   The `rate_limit` probe remains its owner.
+3. **GraphQL bootstrap and freshness recovery.**
+   The `rate_limit` probe remains its protocol owner, but later validation
+   proved that its counter can stay fixed while real GraphQL use advances. It
+   does not provide authoritative external-spend evidence.
 
 The fixture changes source behavior, not these assertions: `/user` reads the
 same atomic fixture core counter, a matching conditional response costs zero,
@@ -223,3 +226,7 @@ GraphQL conditional requests. Removing the probe. Re-tuning cadences --- Phase 6
   and preserved the reserve. Doctor reported the winning `response-header`
   source after matching endpoint evidence. The Phase 6 notes contain the
   measured window and the mixed-epoch defect found before it.
+- [x] Validation later proved the free GraphQL `rate_limit` counter can stay
+  fixed while real GraphQL headers advance. GraphQL probe freshness remains
+  fail-closed, but its admission counter is open-loop and no GraphQL reserve
+  guarantee is claimed. The follow-up needs its own response-header design.

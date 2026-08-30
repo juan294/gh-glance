@@ -7,11 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Manual refresh now owns exactly one fresh Actions batch.** It replaces the
+  due active-poll deadline, queues once when an automatic batch is already in
+  flight, and coalesces repeated `r` presses while that forced batch runs. This
+  prevents both a lost manual refresh and an immediate duplicate automatic
+  request.
+
 ### Changed
 
 - **The shared governor now follows authoritative response counters.** Core
   observations come from conditional endpoint headers and one shared `/user`
-  observer, while the free `rate_limit` probe remains the GraphQL authority.
+  observer. The free `rate_limit` GraphQL counter is now documented as a known
+  open-loop input, not as an authority: live GraphQL response headers can move
+  while that endpoint remains unchanged.
   Response accounting and reservation settlement now commit atomically, so
   concurrent panes cannot double-charge, move an owner-established epoch, or
   overwrite a newer budget sample.
@@ -24,20 +34,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Detail or stale text stays inside a fixed state region so key hints do not
   move. Staleness also follows each tab's admitted request cadence.
 - **GraphQL tolerates one unusable minute sample without a false hold.** Its
-  observation remains probe-owned and fails closed after two missed samples;
-  the response-header-backed core resource keeps its shorter freshness limit.
+  available observation remains probe-owned and fails closed after two missed
+  samples, but freshness does not make that counter accurate. The
+  response-header-backed core resource keeps its shorter freshness limit.
 
 ## [0.10.0] - 2026-08-19
 
 ### Fixed
 
-- **Concurrent panes preserve a hard reserve instead of slowing all the way to
-  exhaustion.** Local panes on one GitHub host and account now share atomic
+- **Concurrent panes preserve a core hard reserve instead of slowing all the way
+  to exhaustion.** Local panes on one GitHub host and account now share atomic
   grants, worst-case reservations, and one budget probe. gh-glance starts no
-  request when its latest fresh, conservatively debited REST or GraphQL sample
-  cannot pay for it outside the final 20% of that resource. Missing, corrupt,
-  locked, or unwritable coordination fails closed. REST exhaustion does not
-  stop healthy GraphQL tabs, and manual refresh cannot bypass the hold.
+  core request when its latest fresh, conservatively debited authoritative
+  sample cannot pay for it outside the final 20%. GraphQL work is locally paced
+  from its declared cost and the available `rate_limit` sample, but that sample
+  is not authoritative. Missing, corrupt, locked, or unwritable coordination
+  fails closed. REST exhaustion does not stop a GraphQL tab that its current
+  probe permits, and manual refresh cannot bypass the hold.
 
 ### Changed
 
@@ -67,10 +80,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   open alerts fill the base page, then merge and de-duplicate the result. A `+`
   marker stays explicit when any lane fills; the app never claims an unbounded
   repository is complete.
-- **Adaptive polling now protects both GitHub budgets.** REST and GraphQL spend
-  are measured separately, including failed calls, and the safer interval wins
-  without lowering the configured refresh floor. `--doctor` reports the same
-  conservative model.
+- **Adaptive polling models both GitHub budgets separately.** Declared REST and
+  GraphQL costs, including failed calls, feed the safer interval without
+  lowering the configured refresh floor. `--doctor` reports the same model.
+  Later validation established that only REST now has an authoritative
+  response-counter feedback loop.
 - **Terminal state has explicit non-colour and linear-rendering channels.** A
   stable ASCII `x` marks fetch failure, selected rows include `selected` in
   their accessibility label, narrow errors begin with the recovery action, and

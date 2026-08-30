@@ -206,7 +206,12 @@ test("--doctor claims the core observer and uses its persisted ETag before calli
   assert.ok(state.budgets.graphql.observedAt >= now);
 });
 
-test("--doctor fails closed instead of touching an uninitialized lock wait cell", async (t) => {
+test("--doctor reaches a contended live lock after its wait cell is initialized", async (t) => {
+  const source = readFileSync(ENTRY, "utf8");
+  const waitCellDeclaration = source.indexOf("const persistenceWaitCell =");
+  const mainEntry = source.indexOf("if (IS_MAIN)");
+  assert.ok(waitCellDeclaration >= 0 && waitCellDeclaration < mainEntry,
+    "the lock wait cell must be initialized before the main doctor entry can use it");
   const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-live-lock-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const scope = createGovernorScope({
@@ -227,6 +232,7 @@ test("--doctor fails closed instead of touching an uninitialized lock wait cell"
   });
   assert.match(out, /gh-glance doctor/);
   assert.match(out, /API governor\n------------/);
+  assert.match(out, /^status {12}unavailable$/m);
 });
 
 test("--doctor never prints a token that was planted in its environment", async () => {

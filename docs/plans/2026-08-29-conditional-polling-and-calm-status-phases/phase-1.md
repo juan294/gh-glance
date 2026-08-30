@@ -133,7 +133,10 @@ Notice *wording* (Phase 3) and the status bar (Phase 2).
 - [x] The governor lock wait cell is initialized before every main-path use.
 - [x] The notice row is permanently reserved and uses coordination-first
   precedence.
-- [x] The doctor contention and notice appearance/disappearance regressions pass.
+- [x] The doctor contention regression starts the real `--doctor` entry with a
+  pre-existing live lock, asserts the wait-cell declaration precedes
+  `if (IS_MAIN)`, and reaches the fail-closed unavailable report. The notice
+  appearance/disappearance regression also passes.
 - [x] Lint, 268 unit/runtime tests, syntax, all 84 serialized PTY cases, and
   `git diff --check` pass. See the companion notes for the local PTY runner
   deviation.

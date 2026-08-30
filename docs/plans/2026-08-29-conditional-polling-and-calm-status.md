@@ -26,7 +26,7 @@ workstation's own credentials, and reproduced with raw `curl` where the result
 was surprising. Five gh-glance panes were live throughout; their draw was
 measured separately (0.244 units/sec) and subtracted where it mattered.
 
-### 1. `GET /rate_limit` does not report the bucket that gates real calls
+### 1. `GET /rate_limit` does not report the core bucket that gates real calls
 
 Back to back, one second apart, same token:
 
@@ -44,6 +44,12 @@ remaining 5000`) and its `reset` is `now + 3600` recomputed per call --- the
 signature of a bucket nothing has touched. Every other endpoint shares one
 bucket with a fixed reset. Identical under `curl`, so this is GitHub-side, not a
 `gh` artifact.
+
+Validation later found the same class of defect for GraphQL: `/rate_limit`
+reported `used=0, remaining=5000` while real GraphQL response headers advanced
+from `used=41` to `used=45`. The core response-header design below closes the
+core loop only. Porcelain `gh issue` and `gh pr` output provides no equivalent
+GraphQL headers, so GraphQL remains a separate open-loop follow-up.
 
 ### 2. A 304 costs nothing
 
@@ -160,7 +166,9 @@ observation sources, in precedence order:
   1. X-RateLimit-* from a real data response   (authoritative when present)
   2. gh api rate_limit probe                   (bootstrap, exhaustion recovery,
                                                 external-burn detection, and the
-                                                only source for graphql)
+                                                currently available but
+                                                non-authoritative source for
+                                                graphql)
 ```
 
 The governor's `budgets[resource]` record already carries everything a header
@@ -169,8 +177,9 @@ sample provides (`limit, remaining, used, resetMs, observedAt, epoch`), and
 wire (`index.mjs:2283`). A header sample is therefore the same shape arriving
 through a second door.
 
-This changes where a fresh observation comes from. It does not change the
-admission rule, so ADR 0003's guarantee stands unmodified.
+This changes where a fresh core observation comes from. It does not change the
+core admission rule, so ADR 0003's core guarantee stands. GraphQL freshness is
+not an accuracy guarantee and cannot support the same claim.
 
 ### D. The status bar's left region becomes what it already claims to be
 

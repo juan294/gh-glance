@@ -126,8 +126,14 @@ Worth knowing about the app's shape before changing it:
   call path is incomplete until both statements are true. ADR 0003 names one
   bounded control-plane exception: the single shared core observer may make one
   initial `GET /user` request before an authoritative core sample exists. Its
-  first 200 can cost one unit, records that counter immediately, and persists
-  the validator so later observations can return a free 304.
+  registry vector is still `{core:1, graphql:0}` because its first 200 can cost
+  one unit. It records that counter immediately and persists the validator so
+  later observations can return a free 304.
+- GraphQL admission is currently open-loop. `gh issue` and `gh pr` do not expose
+  response headers through their normal output, and `gh api rate_limit` can lag
+  the real GraphQL counter. Keep the probe freshness failure closed, but do not
+  describe that probe as authoritative or claim that it proves the GraphQL
+  reserve. ADR 0003 records the required follow-up boundary.
 - Budget control, data work, and lease heartbeats use independent one-shot
   schedulers. A slow request must not suppress a probe or lease renewal, and a
   control wake must not create an unconditional data poll.
