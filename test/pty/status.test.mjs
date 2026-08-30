@@ -330,9 +330,9 @@ test("manual refresh waits without motion and animates only after admission", as
   const now = Date.now();
   const box = sharedFixture(t, {
     // The keypress is released from the persisted scheduled reservation below,
-    // rather than from terminal bytes whose live flush timing differs between
-    // GNU and BSD script(1).
-    core: { limit: 5000, used: 3900, remaining: 1100, resetMs: now + 120_000 },
+    // with enough lead time for the terminal status to render before the lane
+    // can start on either GNU or BSD script(1).
+    core: { limit: 5000, used: 3980, remaining: 1020, resetMs: now + 100_000 },
     delayByCommand: { actions: 3_000 },
   });
   capture({
@@ -375,13 +375,20 @@ test("manual refresh waits without motion and animates only after admission", as
     },
   });
   const deadline = Date.now() + 15_000;
+  const keypressLeadMs = 1_500;
   let scheduled = false;
+  let largestLeadMs = Number.NEGATIVE_INFINITY;
   while (Date.now() < deadline && !scheduled) {
     try {
       const state = JSON.parse(readFileSync(governorPath(box.root), "utf8"));
-      scheduled = Object.values(state.reservations ?? {}).some((reservation) =>
-        reservation.status === "scheduled" && reservation.costs?.core === 2 &&
-        reservation.notBefore > Date.now());
+      const observedAt = Date.now();
+      const held = Object.values(state.reservations ?? {}).filter((reservation) =>
+        reservation.status === "scheduled" && reservation.costs?.core === 2);
+      largestLeadMs = Math.max(
+        largestLeadMs,
+        ...held.map((reservation) => reservation.notBefore - observedAt),
+      );
+      scheduled = held.some((reservation) => reservation.notBefore > observedAt + keypressLeadMs);
     } catch {
       // The new process has not published its first atomic governor update yet.
     }
@@ -389,7 +396,11 @@ test("manual refresh waits without motion and animates only after admission", as
   }
   writeFileSync(manualReady, "ready\n", { mode: 0o600 });
   const manual = await manualCapture;
-  assert.equal(scheduled, true, "manual keypress fixture never reached a held automatic lane");
+  assert.equal(
+    scheduled,
+    true,
+    `manual keypress fixture never reached a held automatic lane; largest lead ${largestLeadMs}ms`,
+  );
   const statuses = manual.liveScreen.statusHistory;
   const scheduledAt = statuses.findIndex((line) => /^· Watching next/.test(line));
   const checking = statuses
