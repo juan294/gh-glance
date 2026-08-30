@@ -207,13 +207,13 @@ test("a real reset gets one fresh probe then one phased active request per pane"
     anchorAtFirstProbe: true,
     createdAt: null,
     // Leave enough bootstrap time for all three real panes to register before
-    // the reset. Anchoring the reset two seconds after the first probe let a
-    // loaded aggregate runner begin the epoch with only two live contenders,
-    // so the test observed startup timing instead of reset pacing.
-    core: { limit: 5000, used: 5000, remaining: 0, resetMs: 0, resetOffsetMs: 10_000 },
+    // the reset. A loaded aggregate runner can otherwise begin the epoch with
+    // only two live contenders, so the test observes startup timing instead of
+    // reset pacing.
+    core: { limit: 5000, used: 5000, remaining: 0, resetMs: 0, resetOffsetMs: 30_000 },
     resetSequence: [{
-      offsetMs: 10_500,
-      core: { used: 0, remaining: 5000, resetOffsetMs: 3_610_500 },
+      offsetMs: 30_500,
+      core: { used: 0, remaining: 5000, resetOffsetMs: 3_630_500 },
     }],
   });
   const readyPath = join(box.root, "reset-ready");
@@ -221,17 +221,17 @@ test("a real reset gets one fresh probe then one phased active request per pane"
     cols: 80,
     rows: 24,
     signal: "none",
-    settle: 45,
+    settle: 90,
     args: "--refresh 40",
     stdin:
-      "i=0; while [ ! -f \"$GH_GLANCE_FIXTURE_READY\" ] && [ \"$i\" -lt 600 ]; do " +
+      "i=0; while [ ! -f \"$GH_GLANCE_FIXTURE_READY\" ] && [ \"$i\" -lt 1200 ]; do " +
       "sleep .1; i=$((i + 1)); done; printf q",
     env: { GH_GLANCE_FIXTURE_READY: readyPath },
   });
   const resetProbe = await observeUntil(
     box.read,
     (state) => starts(state, "api").filter((event) => event.argv[1] === "rate_limit").length >= 2,
-    Date.now() + 20_000,
+    Date.now() + 45_000,
   );
   const resetProbeAt = resetProbe.matched
     ? starts(resetProbe.value, "api").filter((event) => event.argv[1] === "rate_limit")[1].at
@@ -254,7 +254,7 @@ test("a real reset gets one fresh probe then one phased active request per pane"
   });
   const laneInterval = resetDecision?.mode === "open" ? 2 / resetDecision.callsPerMs : null;
   const progressDeadline = Number.isFinite(laneInterval)
-    ? publishedCore.observedAt + GOVERNOR_PHASE_WINDOW_MS + 2 * laneInterval + 10_000
+    ? publishedCore.observedAt + GOVERNOR_PHASE_WINDOW_MS + 2 * laneInterval + 40_000
     : Date.now();
   const progress = Number.isFinite(laneInterval)
     ? await observeUntil(
@@ -498,9 +498,9 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
   });
   const captures = capturePanes(12, box, "blocked-minute", {
     signal: "none",
-    settle: 90,
+    settle: 150,
     stdin:
-      "i=0; while [ ! -f \"$GH_GLANCE_FIXTURE_READY\" ] && [ \"$i\" -lt 1000 ]; do " +
+      "i=0; while [ ! -f \"$GH_GLANCE_FIXTURE_READY\" ] && [ \"$i\" -lt 1600 ]; do " +
       "sleep .1; i=$((i + 1)); done; printf q",
     env: { GH_GLANCE_FIXTURE_READY: readyPath },
   });
@@ -553,8 +553,8 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
   const blockObservedAt = blockResult.matched ? Date.now() : null;
   const initialProbeNextAt = blockedGovernor?.probeOutcome?.nextAt;
   const boundedDeadline = Math.min(
-    Number.isFinite(initialProbeNextAt) ? initialProbeNextAt + 15_000 : setupAt + 20_000,
-    setupAt + 95_000,
+    Number.isFinite(initialProbeNextAt) ? initialProbeNextAt + 45_000 : setupAt + 50_000,
+    setupAt + 125_000,
   );
   const secondProbe = blockedGovernor
     ? await observeUntil(

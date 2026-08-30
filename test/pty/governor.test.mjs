@@ -271,7 +271,10 @@ test("manual refresh wins a held lane without stacking repeated requests", { tim
   });
   const competitorReady = join(box.root, "manual-competitor-ready");
   const manualInput =
-    "i=0; while ! grep -Eq 'Watching (next|probing)' \"$GH_GLANCE_CAPTURE_OUT\" 2>/dev/null && [ $i -lt 150 ]; " +
+    // Exhaustion is an actionable hold and therefore renders Paused. Retain
+    // the transient Watching forms because a fast platform can observe them
+    // before the authoritative reset sample is published.
+    "i=0; while ! grep -Eq 'Paused|Watching (next|probing)' \"$GH_GLANCE_CAPTURE_OUT\" 2>/dev/null && [ $i -lt 150 ]; " +
     "do i=$((i + 1)); sleep .1; done; " +
     "i=0; while [ $i -lt 8 ]; do printf r; i=$((i + 1)); sleep .03; done; " +
     "i=0; while ! grep -Fq '\"pane\":\"manual\",\"argv\":[\"api\",\"-i\",\"repos/acme/widget/actions/runs?' " +

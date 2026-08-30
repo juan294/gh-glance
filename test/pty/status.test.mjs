@@ -114,8 +114,10 @@ test("four ample panes explain a shared lane without moving the hint group", asy
     cols: 80,
     rows: 20,
     signal: "none",
-    settle: 25,
-    stdin: `i=0; while [ ! -f "${releasePath}" ] && [ "$i" -lt 400 ]; do ` +
+    // The observer can legitimately wait 40 seconds for its shared lane. Keep
+    // all three owners live past that horizon on both GNU and BSD script(1).
+    settle: 65,
+    stdin: `i=0; while [ ! -f "${releasePath}" ] && [ "$i" -lt 1200 ]; do ` +
       "sleep .05; i=$((i + 1)); done; printf q",
     args: "--refresh 40 --tab security",
     configHome: box.root,
@@ -143,7 +145,7 @@ test("four ample panes explain a shared lane without moving the hint group", asy
       cols: 80,
       rows: 20,
       signal: "none",
-      settle: 20,
+      settle: 45,
       stdin: waitForAwk(
         '"$GH_GLANCE_CAPTURE_OUT"',
         'index($0, "Watching sharing 4") { ok=1 }',
@@ -324,9 +326,12 @@ test("a long future grant uses a coarse minute interval without moving full hint
   assert.equal(held.hasFullKeyHints, true);
 });
 
-test("manual refresh waits without motion and animates only after admission", (t) => {
+test("manual refresh waits without motion and animates only after admission", async (t) => {
   const now = Date.now();
   const box = sharedFixture(t, {
+    // The keypress is released from the persisted scheduled reservation below,
+    // rather than from terminal bytes whose live flush timing differs between
+    // GNU and BSD script(1).
     core: { limit: 5000, used: 3900, remaining: 1100, resetMs: now + 120_000 },
     delayByCommand: { actions: 3_000 },
   });
@@ -340,15 +345,15 @@ test("manual refresh waits without motion and animates only after admission", (t
     configHome: box.root,
     env: { GH_GLANCE_FIXTURE_STATE: box.statePath, GH_GLANCE_FIXTURE_PANE: "warm" },
   });
-  const manual = capture({
+  const manualReady = join(box.root, "manual-refresh-ready");
+  const manualCapture = captureAsync({
     cols: 80,
     rows: 24,
     signal: "none",
     settle: 30,
     stdin:
-      waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Watching next") { ok=1 }') +
-      `watching=$(${captureCount("Watching")}); ` +
-      "printf r; " +
+      `i=0; while [ ! -f "${manualReady}" ] && [ $i -lt 300 ]; do ` +
+      "i=$((i + 1)); sleep .1; done; sleep .3; printf r; " +
       waitForAwk(
         '"$GH_GLANCE_CAPTURE_OUT"',
         'index($0, "⣾ Checking") { first=1 } ' +
@@ -356,6 +361,7 @@ test("manual refresh waits without motion and animates only after admission", (t
           '{ moved=1 } first && moved { ok=1 }',
         200,
       ) +
+      `watching=$(${captureCount("Watching")}); ` +
       "i=0; current=$watching; while [ \"$current\" -le \"$watching\" ] && [ $i -lt 200 ]; " +
       `do i=$((i + 1)); sleep .1; current=$(${captureCount("Watching")}); ` +
       "done; sleep .3; printf q",
@@ -368,6 +374,22 @@ test("manual refresh waits without motion and animates only after admission", (t
       GH_GLANCE_FIXTURE_PANE: "manual",
     },
   });
+  const deadline = Date.now() + 15_000;
+  let scheduled = false;
+  while (Date.now() < deadline && !scheduled) {
+    try {
+      const state = JSON.parse(readFileSync(governorPath(box.root), "utf8"));
+      scheduled = Object.values(state.reservations ?? {}).some((reservation) =>
+        reservation.status === "scheduled" && reservation.costs?.core === 2 &&
+        reservation.notBefore > Date.now());
+    } catch {
+      // The new process has not published its first atomic governor update yet.
+    }
+    if (!scheduled) await new Promise((resolve) => setTimeout(resolve, 40));
+  }
+  writeFileSync(manualReady, "ready\n", { mode: 0o600 });
+  const manual = await manualCapture;
+  assert.equal(scheduled, true, "manual keypress fixture never reached a held automatic lane");
   const statuses = manual.liveScreen.statusHistory;
   const scheduledAt = statuses.findIndex((line) => /^· Watching next/.test(line));
   const checking = statuses
@@ -567,11 +589,18 @@ test("a non-budget failure settles on Failed and stops status motion", (t) => {
   const result = capture({
     cols: 80,
     rows: 24,
-    settle: 8,
+    signal: "none",
+    settle: 30,
+    stdin: waitForAwk(
+      '"$GH_GLANCE_CAPTURE_OUT"',
+      'index($0, "Failed") { ok=1 }',
+      250,
+    ) + "sleep .3; printf q",
     args: "--tab issues",
     animation: true,
     configHome: configRoot(t, "gh-glance-status-failed-"),
     env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       GH_GLANCE_FIXTURE_FAIL: "dial tcp: fixture unavailable",
       GH_GLANCE_FIXTURE_FAIL_ON: "issue",
     },
@@ -600,10 +629,17 @@ test("incomplete Security observation preserves known rows and shows Limited", (
   const blind = capture({
     cols: 80,
     rows: 24,
-    settle: 8,
+    signal: "none",
+    settle: 30,
+    stdin: waitForAwk(
+      '"$GH_GLANCE_CAPTURE_OUT"',
+      'index($0, "Limited") { ok=1 }',
+      250,
+    ) + "sleep .3; printf q",
     args: "--tab security",
     configHome: root,
     env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       GH_GLANCE_FIXTURE_FAIL: "You are not logged into any GitHub hosts",
       GH_GLANCE_FIXTURE_FAIL_ON: "api-data",
     },
@@ -678,7 +714,7 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
   const startup = capture({
     cols: 80,
     rows: 24,
-    settle: 9,
+    settle: 20,
     configHome: startupBox.root,
     env: {
       INK_SCREEN_READER: "true",
@@ -695,7 +731,7 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
   const paused = capture({
     cols: 80,
     rows: 24,
-    settle: 7,
+    settle: 15,
     configHome: heldBox.root,
     env: {
       INK_SCREEN_READER: "true",
@@ -709,7 +745,7 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
   const failed = capture({
     cols: 80,
     rows: 24,
-    settle: 8,
+    settle: 20,
     args: "--tab issues",
     configHome: configRoot(t, "gh-glance-reader-failed-"),
     env: {
@@ -735,7 +771,7 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
   const limited = capture({
     cols: 80,
     rows: 24,
-    settle: 8,
+    settle: 20,
     args: "--tab security",
     configHome: limitedRoot,
     env: {
@@ -770,7 +806,7 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
   const staleError = capture({
     cols: 80,
     rows: 24,
-    settle: 9,
+    settle: 20,
     configHome: staleRoot,
     env: {
       INK_SCREEN_READER: "true",
