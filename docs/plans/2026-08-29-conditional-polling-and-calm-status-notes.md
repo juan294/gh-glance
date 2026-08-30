@@ -31,7 +31,12 @@
   was healthy, fresh, and claim-free. The pane kept `liveScheduling` disabled
   until the next control interval. Bootstrap and control recovery now adopt
   only that successful waiting-to-published handoff; errors, stale budgets,
-  active claims, and failed probe outcomes remain closed.
+  active claims, and failed probe outcomes remain closed. A later exact-SHA run
+  exposed the adjacent already-live race: a data wake could inspect the held
+  epoch immediately before publication and move its active deadline away from
+  reset. Control recovery now tracks the last safe control epoch and pulls the
+  active deadline forward only when the selected tab spends a resource whose
+  epoch changed.
 - **Gate:** The canonical serialized `npm run test:pty` command, not a set of
   separately collected module passes, is the final repair gate.
 

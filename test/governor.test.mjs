@@ -79,6 +79,7 @@ import {
   resolveEffectiveHost,
   startReservation,
   settleReservationWithBudgetObservations,
+  tabEpochChanged,
   withGovernorLock,
   writeGovernorState,
 } from "../index.mjs";
@@ -524,6 +525,15 @@ test("bootstrap readiness requires a successful publication and a safe active re
   assert.equal(governorDataReady({ ok: true, value: {} }, blocked, "issues", NOW), true);
   assert.equal(governorControlRetryAt(NOW, 40_000), NOW + 1000);
   assert.equal(governorControlRetryAt(NOW, 500), NOW + 500);
+});
+
+test("a new epoch advances only tabs that spend its resource", () => {
+  const previous = { core: "core-a", graphql: "graphql-a" };
+  assert.equal(tabEpochChanged(previous, { ...previous, core: "core-b" }, "actions"), true);
+  assert.equal(tabEpochChanged(previous, { ...previous, core: "core-b" }, "issues"), false);
+  assert.equal(tabEpochChanged(previous, { ...previous, graphql: "graphql-b" }, "issues"), true);
+  assert.equal(tabEpochChanged(previous, { ...previous, graphql: "graphql-b" }, "actions"), false);
+  assert.equal(tabEpochChanged(null, previous, "actions"), false);
 });
 
 test("control-only wakes keep a held lease live through the t=120 probe", (t) => {

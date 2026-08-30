@@ -6284,6 +6284,13 @@ function governorControlReady(refreshResult, snapshot, nowMs) {
     governorProtocolReady({ ok: true, value: { status: "published" } }, snapshot, nowMs);
 }
 
+function tabEpochChanged(previous, next, key) {
+  const costs = tabRequestCost(key);
+  if (!costs || !isRecord(previous) || !isRecord(next)) return false;
+  return RATE_RESOURCES.some((resource) =>
+    costs[resource] > 0 && previous[resource] !== next[resource]);
+}
+
 function governorDataReady(refreshResult, snapshot, activeKey, nowMs) {
   if (!governorProtocolReady(refreshResult, snapshot, nowMs)) return false;
   const costs = tabRequestCost(activeKey);
@@ -8089,6 +8096,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     let registeredScopeHash = null;
     let remoteUrls = [];
     let liveScheduling = false;
+    let controlEpochs = null;
     let activePollAt = Number.POSITIVE_INFINITY;
     let backgroundPollAt = Number.POSITIVE_INFINITY;
     let backgroundIndex = 0;
@@ -8100,6 +8108,7 @@ function App({ onCreateRemote = () => {} } = {}) {
 
     function failClosedRateLimit(key, reason) {
       liveScheduling = false;
+      controlEpochs = null;
       activePollAt = Number.POSITIVE_INFINITY;
       backgroundPollAt = Number.POSITIVE_INFINITY;
       wakeScheduler.clear("data");
@@ -8584,15 +8593,22 @@ function App({ onCreateRemote = () => {} } = {}) {
         attemptPendingBlockPublications(currentScope, checkedAt, snapshot.value);
       }
       publishControlStatus(activeKey, refreshed, snapshot, checkedAt);
-      if (pendingBlockPublications.size === 0 && !liveScheduling && governorControlReady(
+      const controlReady = pendingBlockPublications.size === 0 && governorControlReady(
         refreshed,
         snapshot,
         checkedAt,
-      )) {
+      );
+      const activeEpochChanged = controlReady && controlEpochs !== null &&
+        tabEpochChanged(controlEpochs, snapshot.value.epochs, activeKey);
+      if (controlReady) controlEpochs = { ...snapshot.value.epochs };
+      if (controlReady && (!liveScheduling || activeEpochChanged)) {
+        const starting = !liveScheduling;
         liveScheduling = true;
         activePollAt = checkedAt + 1;
-        backgroundPollAt = checkedAt + 4 * runtime.refreshMs;
-        armWake("heartbeat", checkedAt + GOVERNOR_HEARTBEAT_MS, heartbeatWake);
+        if (starting) {
+          backgroundPollAt = checkedAt + 4 * runtime.refreshMs;
+          armWake("heartbeat", checkedAt + GOVERNOR_HEARTBEAT_MS, heartbeatWake);
+        }
       }
       if (!refreshed.ok) {
         armWake("control", governorControlRetryAt(checkedAt, runtime.refreshMs), controlWake);
@@ -8629,11 +8645,13 @@ function App({ onCreateRemote = () => {} } = {}) {
       const snapshot = inspectGovernor(currentScope, checkedAt);
       const activeKey = TABS[activeIndexRef.current].key;
       publishControlStatus(activeKey, refreshed, snapshot, checkedAt);
-      if (governorControlReady(
+      const controlReady = governorControlReady(
         refreshed,
         snapshot,
         checkedAt,
-      )) {
+      );
+      if (controlReady) {
+        controlEpochs = { ...snapshot.value.epochs };
         liveScheduling = true;
         activePollAt = checkedAt + 1;
         backgroundPollAt = checkedAt + 4 * runtime.refreshMs;
@@ -9524,6 +9542,7 @@ export {
   retryPollAfterAdmissionFailure,
   governorWakeTimes,
   governorControlReady,
+  tabEpochChanged,
   governorDataReady,
   governorControlRetryAt,
   createWakeScheduler,

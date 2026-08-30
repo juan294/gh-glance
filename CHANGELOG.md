@@ -19,7 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Reset recovery no longer strands a pane that lost shared probe ownership.**
   When the winning pane publishes between a waiter's bounded inspection and
   its final snapshot, the waiter now adopts that locked, fresh, claim-free
-  publication instead of sleeping until the next control interval.
+  publication instead of sleeping until the next control interval. A data wake
+  that saw the old held epoch can no longer leave its active tab on that stale
+  deadline after the new safe epoch is published.
 
 ### Changed
 
