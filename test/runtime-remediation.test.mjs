@@ -113,6 +113,7 @@ test("a 304 Security primary reuses its path-keyed body to decide priority work"
   ]);
   assert.equal(result.completedCalls, 0);
   assert.equal(result.allNotModified, true);
+  assert.deepEqual(result.stagedEntities, new Map());
   assert.equal(result.parse().alerts.length, 101);
 });
 

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Unchanged Security checks no longer turn a known count red.** A conditional
+  alert-source response with no staged ETag write now contributes an empty
+  cache update instead of failing with `part.stagedEntities is not iterable`.
+
 ## [0.11.1] - 2026-08-31
 
 ### Fixed

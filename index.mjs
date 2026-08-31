@@ -3515,7 +3515,10 @@ async function fetchAlertSource(source, signal, now, {
       completedCalls,
       verdict: "ok",
       allNotModified: batch.allNotModified,
-      stagedEntities: batch.stagedEntities,
+      // Every other fetchAlertSource path returns a Map. An all-304 batch has
+      // no staged writes, so conditionalBatchResult returns null; normalize it
+      // here before fetchSecurity merges the independently fetched sources.
+      stagedEntities: batch.stagedEntities ?? new Map(),
       observations,
       parse: () => {
         const rows = mergeAlertRows(groups);
