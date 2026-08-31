@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-08-31
+
 ### Fixed
 
 - **Unchanged Security checks no longer turn a known count red.** A conditional
@@ -793,7 +795,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.11.2...HEAD
+[0.11.2]: https://github.com/juan294/gh-glance/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/juan294/gh-glance/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/juan294/gh-glance/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/juan294/gh-glance/compare/v0.9.1...v0.10.0
