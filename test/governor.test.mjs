@@ -1550,6 +1550,34 @@ test("a near-timeout request drain renews one probe claimant without takeover", 
   assert.equal(state.reservations[grant.reservationId].status, "started");
 });
 
+test("a dead request owner stays charged without delaying later probes", async (t) => {
+  const box = sandbox(t, { authIdentity: "dead-request-owner" });
+  const deadLeaseId = randomUUID();
+  registerLease(box.scope, lease(deadLeaseId));
+  const resetMs = NOW + 3_600_000;
+  publishInitial(box.scope, deadLeaseId, NOW, budgets(NOW, { resetMs }));
+  const grant = registerIntent(box.scope, intent(randomUUID(), deadLeaseId)).value;
+  assert.equal(startReservation(box.scope, grant.reservationId, grant.notBefore).value.status, "started");
+
+  let clock = NOW + GOVERNOR_LEASE_TTL_MS + 1;
+  box.setNow(clock);
+  const ownerId = randomUUID();
+  registerLease(box.scope, lease(ownerId, clock));
+  makeProbeDue(box.scope, ownerId, clock);
+  let waits = 0;
+  const refreshed = await refreshSharedBudget(box.scope, ownerId, null, {
+    now: () => clock,
+    wait: async (ms) => { waits += 1; clock += ms; box.setNow(clock); },
+    readBudgets: async () => budgets(clock, { resetMs }),
+  });
+
+  assert.equal(refreshed.ok, true);
+  assert.equal(waits, 0);
+  const state = inspectGovernor(box.scope, clock).value;
+  assert.equal(state.leases[deadLeaseId], undefined);
+  assert.equal(state.reservations[grant.reservationId].status, "started");
+});
+
 test("clean probe samples persist the shared external-spend factor", (t) => {
   const { scope } = sandbox(t);
   const leaseId = randomUUID();
@@ -1620,6 +1648,36 @@ test("rate_limit publication updates GraphQL but never overwrites authoritative 
   assert.equal(state.observers.core.at, NOW + 1);
   assert.equal(state.budgets.graphql.used, 20);
   assert.equal(state.budgets.graphql.source, "rate-limit-probe");
+});
+
+test("a lagging same-epoch observer refreshes core without increasing capacity", (t) => {
+  const { scope } = sandbox(t, { authIdentity: "lagging-core-observer" });
+  const leaseId = randomUUID();
+  registerLease(scope, lease(leaseId));
+  const resetMs = NOW + 3_600_000;
+  publishInitial(scope, leaseId, NOW, budgets(NOW, { remaining: 4990, resetMs }));
+
+  const observedAt = NOW + BUDGET_SNAPSHOT_TTL_MS + 1;
+  const claim = claimProbe(scope, leaseId, observedAt);
+  assert.equal(claim.value.status, "claimed");
+  const published = publishProbe(scope, leaseId, claim.value.nonce, {
+    core: {
+      source: "core-observer",
+      budget: { limit: 5000, used: 7, remaining: 4993, resetMs },
+    },
+    graphql: {
+      source: "rate-limit-probe",
+      budget: { limit: 5000, used: 0, remaining: 5000, resetMs },
+    },
+  }, observedAt);
+
+  assert.equal(published.ok, true);
+  const result = inspectGovernor(scope, observedAt);
+  assert.equal(result.value.budgets.core.used, 10);
+  assert.equal(result.value.budgets.core.remaining, 4990);
+  assert.equal(result.value.budgets.core.observedAt, observedAt);
+  assert.equal(result.value.budgets.core.source, "core-observer");
+  assert.equal(governorHealth(result, observedAt).status, "healthy");
 });
 
 test("atomic response settlement applies monotonic headers without clearing owner-only state", (t) => {

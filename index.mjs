@@ -2659,7 +2659,10 @@ function claimProbe(scope, leaseId, nowMs) {
     const resources = RATE_RESOURCES.filter((resource) => dueAt[resource] <= at);
     const nonce = randomUUID();
     const startedReservationIds = Object.entries(state.reservations)
-      .filter(([, reservation]) => reservation.status === "started")
+      // An expired owner can no longer settle its request. Keep that uncertain
+      // cost charged, but do not make every later probe wait for it to finish.
+      .filter(([, reservation]) => reservation.status === "started" &&
+        state.leases[reservation.leaseId]?.expiresAt > at)
       .map(([id]) => id);
     state.probeClaim = {
       ownerLeaseId: leaseId,
@@ -2707,7 +2710,7 @@ function budgetFromObservation(raw, previous, nowMs, {
   clearProvenBlock = false,
   allowEpochChange = false,
 } = {}) {
-  const normalized = normalizeBudgetResource({ ...raw, observedAt: receivedAt });
+  let normalized = normalizeBudgetResource({ ...raw, observedAt: receivedAt });
   if (
     !normalized || normalized.resetMs <= nowMs || receivedAt > nowMs ||
     !RATE_RESOURCES.includes(resource) ||
@@ -2723,8 +2726,17 @@ function budgetFromObservation(raw, previous, nowMs, {
   }
   if (previous) {
     if (normalized.resetMs < previous.resetMs) return { status: "ignored" };
-    if (normalized.resetMs === previous.resetMs && normalized.used < previous.used) {
-      return { status: "ignored" };
+    if (budgetEpoch(previous) === epoch && normalized.used < previous.used) {
+      if (!allowEpochChange) return { status: "ignored" };
+      // The claimed observer can lag a newer endpoint response within the
+      // same GitHub window. Refresh its timestamp without giving that stale
+      // counter any capacity: retain the higher used and lower remaining
+      // values until the observer catches up.
+      normalized = {
+        ...normalized,
+        used: previous.used,
+        remaining: Math.min(normalized.remaining, previous.remaining),
+      };
     }
     if (
       normalized.resetMs === previous.resetMs && normalized.used === previous.used &&
