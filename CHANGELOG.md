@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-08-31
+
+### Fixed
+
+- **Lagging GitHub rate-limit counters no longer leave REST-backed tabs paused.**
+  A same-window observer refresh now keeps the governor fresh while retaining
+  the more conservative used and remaining values.
+- **Dead request owners no longer delay every shared budget probe.** Their
+  uncertain API cost remains reserved, but later probes do not wait 30 seconds
+  for requests that can no longer complete.
+
 ## [0.11.0] - 2026-08-30
 
 ### Fixed
@@ -776,7 +787,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/juan294/gh-glance/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/juan294/gh-glance/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/juan294/gh-glance/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/juan294/gh-glance/compare/v0.9.0...v0.9.1
