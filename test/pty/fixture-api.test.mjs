@@ -6,6 +6,8 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { createOracleState, oracleEnvironment } from "../fixtures/request-oracle.mjs";
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, "fixtures", "gh");
 const RUNS_PATH = "repos/acme/widget/actions/runs?exclude_pull_requests=true&per_page=100";
@@ -13,7 +15,7 @@ const RUNS_PATH = "repos/acme/widget/actions/runs?exclude_pull_requests=true&per
 function invoke(args, env = {}) {
   return spawnSync(FIXTURE, args, {
     encoding: "utf8",
-    env: { ...process.env, GH_GLANCE_FIXTURE_LOG: "/dev/null", ...env },
+    env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: tmpdir(), GH_CONFIG_DIR: tmpdir(), GH_GLANCE_FIXTURE_LOG: "/dev/null", ...env },
   });
 }
 
@@ -129,4 +131,24 @@ test("the shared fixture makes conditional core observations free and pins rate_
     core: 0,
     graphql: 0,
   });
+});
+
+
+test("the shell fixture routes opt-in oracle GraphQL JSON input with independent charged evidence", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-oracle-api-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const statePath = join(root, "server.json");
+  writeFileSync(statePath, JSON.stringify(createOracleState()), { mode: 0o600 });
+  const response = spawnSync(FIXTURE, ["api", "-i", "graphql", "--input", "-"], {
+    encoding: "utf8",
+    input: JSON.stringify({ query: "query { rateLimit { cost used remaining resetAt } }" }),
+    env: oracleEnvironment({ root, statePath }),
+  });
+  assert.equal(response.status, 0, response.stderr);
+  assert.match(response.stdout, /x-ratelimit-resource: graphql/);
+  assert.match(response.stdout, /"cost":1/);
+  const state = JSON.parse(readFileSync(statePath, "utf8"));
+  assert.equal(state.accounts.octocat.graphql.used, 1);
+  assert.equal(state.events[0].operation, "graphql.observer");
+  assert.ok(state.events[0].completedAt >= state.events[0].startedAt);
 });

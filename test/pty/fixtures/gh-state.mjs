@@ -10,6 +10,12 @@ import {
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 
+if (process.env.GH_GLANCE_REQUEST_ORACLE) {
+  const { runOracleFixture } = await import("../../fixtures/request-oracle.mjs");
+  await runOracleFixture();
+  process.exit(process.exitCode ?? 0);
+}
+
 const statePath = process.env.GH_GLANCE_FIXTURE_STATE;
 const args = process.argv.slice(2);
 const fixtures = dirname(new URL(import.meta.url).pathname);

@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "description": "Deterministic offline contracts. Baseline measurements are observations; target assertions activate only in their owning phase.",
+  "defaults": { "host": "github.com", "principal": "octocat", "credential": "fixture-full", "responseLatencyMs": 100, "refreshFloorMs": 5000, "limit": 5000 },
+  "scenarios": [
+    { "id": "single-pane", "panes": 1, "repositories": ["acme/widget"], "activationPhase": 6, "targets": { "requestsPerDueQuery": 1 } },
+    { "id": "two-duplicates", "panes": 2, "repositories": ["acme/widget"], "activationPhase": 6, "targets": { "requestsPerDueQuery": 1 } },
+    { "id": "seven-duplicates", "panes": 7, "repositories": ["acme/widget"], "activationPhase": 6, "targets": { "requestsPerDueQuery": 1 } },
+    { "id": "ten-duplicates", "panes": 10, "repositories": ["acme/widget"], "activationPhase": 6, "targets": { "requestsPerDueQuery": 1, "followerDeliveryMs": 2000 } },
+    { "id": "ten-distinct", "panes": 10, "repositoryPattern": "acme/project-{pane}", "activationPhase": 6, "targets": { "attributableStreams": 10 } },
+    { "id": "two-machines", "panes": 7, "clientsByRoot": [3, 4], "repositories": ["acme/widget"], "activationPhase": 9, "targets": { "clientGithubRequests": 0, "collectorRequestsPerDueQuery": 1 } },
+    { "id": "changing-ci", "panes": 10, "repositories": ["acme/widget"], "events": [{ "type": "change", "atMs": 5000, "version": 2 }, { "type": "change", "atMs": 10000, "version": 3 }], "activationPhase": 6, "targets": { "sourceToDisplayMs": 7000 } },
+    { "id": "pinned-graphql-probe", "panes": 7, "publishedProbes": { "graphql": { "mode": "pinned" } }, "activationPhase": 3, "targets": { "useAuthoritativeOperationCost": true } },
+    { "id": "retry-after", "panes": 2, "retryFormats": ["seconds", "date"], "activationPhase": 4, "targets": { "honorSecondaryDeadlineAcrossReset": true } },
+    { "id": "partial-graphql", "panes": 1, "response": { "status": 200, "errors": [{ "type": "FORBIDDEN" }] }, "activationPhase": 3, "targets": { "publishPartialData": false, "ingestBudgetEvidence": true } },
+    { "id": "credential-switch", "panes": 2, "credentials": ["fixture-full", "fixture-restricted"], "activationPhase": 2, "targets": { "privatePayloadIsolation": true, "sharedPrincipalQuota": true } },
+    { "id": "explicit-pagination", "panes": 1, "rows": 150, "pageSize": 50, "activationPhase": 5, "targets": { "explicitPages": 3, "maximumRows": 150 } },
+    { "id": "sustained-hour", "panes": 10, "repositoryPattern": "acme/project-{pane}", "durationMs": 3600000, "clock": "injected", "activationPhase": 12, "targets": { "preserveReserveFraction": 0.2, "progressAfterReset": true } }
+  ]
+}
