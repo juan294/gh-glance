@@ -192,7 +192,7 @@ test("--doctor claims the core observer and uses its persisted ETag before calli
     phaseSeed: { seed: leaseId, registeredAt: now },
     demand: { core: 2, graphql: 0 },
   }).ok, true);
-  const claim = claimProbe(scope, leaseId, now);
+  const claim = claimProbe(scope, leaseId, now, "core");
   assert.equal(claim.value.status, "claimed");
   const resetMs = Math.floor((now + 3_600_000) / 1_000) * 1_000;
   assert.equal(publishProbe(scope, leaseId, claim.value.nonce, {
@@ -205,7 +205,7 @@ test("--doctor claims the core observer and uses its persisted ETag before calli
       source: "graphql-observer",
       budget: { limit: 5000, used: 0, remaining: 5000, resetMs },
     },
-  }, now).ok, true);
+  }, now, "core").ok, true);
   const core = inspectGovernor(scope, now).value.budgets.core;
   assert.equal(requestManualProbe(scope, leaseId, core.epoch, core.observedAt, Date.now()).ok, true);
 

@@ -214,12 +214,12 @@ test("ID-07 uncertain bootstrap debt transfers once and survives until authorita
   at = NOW + 3_600_003;
   const leaseId = randomUUID();
   registerLease(scope, { id: leaseId, expiresAt: at + 90_000, floorMs: 5000, activeTab: "actions", phaseSeed: { seed: leaseId, registeredAt: at }, demand: { core: 1, graphql: 0 } });
-  const claim = claimProbe(scope, leaseId, at);
+  const claim = claimProbe(scope, leaseId, at, "core");
   assert.equal(claim.value.status, "claimed");
   assert.equal(publishProbe(scope, leaseId, claim.value.nonce, {
     core: { source: "core-observer", budget: { limit: 5000, used: 1, remaining: 4999, resetMs: at + 3_600_000 } },
     graphql: { source: "graphql-observer", budget: { limit: 5000, used: 0, remaining: 5000, resetMs: at + 3_600_000 } },
-  }, at).ok, true);
+  }, at, "core").ok, true);
   ledger = inspectGovernor(scope, at).value;
   assert.equal(ledger.reservations[`reservation:${failed.value.id}`], undefined);
   assert.equal(inspectIdentityRegistry(root, { now: at }).value.attempts[failed.value.id], undefined);

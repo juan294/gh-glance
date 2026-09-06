@@ -26,6 +26,7 @@ import {
   GOVERNOR_ACTIVE_PROBE_LEASE_MS,
   GOVERNOR_LEASE_TTL_MS,
   GOVERNOR_STATE_VERSION,
+  RATE_RESOURCES,
   GOVERNOR_MAX_LEASES,
   GOVERNOR_MAX_INTENTS,
   GOVERNOR_MAX_RESERVATIONS,
@@ -129,19 +130,32 @@ function budgets(now = NOW, { remaining = 5000, resetMs = now + 3_600_000 } = {}
   };
 }
 
+// Observers are claimed per resource now, so establishing "the shared budget"
+// means establishing each one. The helper keeps that detail out of the tests
+// that only care that a budget exists.
 function publishInitial(scope, leaseId, now = NOW, values = budgets(now)) {
-  const claim = claimProbe(scope, leaseId, now);
-  assert.equal(claim.ok, true);
-  assert.equal(claim.value.status, "claimed");
-  const published = publishProbe(scope, leaseId, claim.value.nonce, values, now);
-  assert.equal(published.ok, true);
-  return published.value;
+  let published;
+  for (const resource of ["core", "graphql"]) {
+    const claim = claimProbe(scope, leaseId, now, resource);
+    assert.equal(claim.ok, true, resource);
+    assert.equal(claim.value.status, "claimed", resource);
+    const result = publishProbe(scope, leaseId, claim.value.nonce, values, now, resource);
+    assert.equal(result.ok, true, resource);
+    published = result.value;
+  }
+  return published;
 }
 
 function asV1GovernorState(state) {
   const legacy = structuredClone(state);
   legacy.version = 1;
   delete legacy.observers;
+  // v1 held one claim for both resources and a separately-shaped outcome. The
+  // fixture has to be a genuine v1 document, not the current shape with its
+  // version field rewritten, or it exercises nothing the migration does.
+  delete legacy.probeClaims;
+  legacy.probeClaim = null;
+  legacy.probeOutcome = { status: "idle", at: 0, nextAt: 0 };
   for (const budget of Object.values(legacy.budgets)) {
     delete budget.source;
     delete budget.factorBaseline;
@@ -158,9 +172,9 @@ function makeProbeDue(scope, leaseId, now) {
   assert.equal(requestManualProbe(scope, leaseId, resource.epoch, now, now).ok, true);
 }
 
-function claimNow(scope, leaseId, now) {
+function claimNow(scope, leaseId, now, resource = "core") {
   makeProbeDue(scope, leaseId, now);
-  const claim = claimProbe(scope, leaseId, now);
+  const claim = claimProbe(scope, leaseId, now, resource);
   assert.equal(claim.value.status, "claimed");
   return claim;
 }
@@ -226,11 +240,18 @@ test("lease, probe, intent, reservation, completion, and reconciliation form one
   const leaseId = randomUUID();
   assert.equal(registerLease(scope, lease(leaseId)).ok, true);
 
-  const firstClaim = claimProbe(scope, leaseId, NOW);
+  const firstClaim = claimProbe(scope, leaseId, NOW, "core");
   assert.equal(firstClaim.value.status, "claimed");
-  assert.equal(claimProbe(scope, leaseId, NOW).value.status, "waiting");
-  assert.equal(publishProbe(scope, leaseId, randomUUID(), budgets(), NOW).reason, "stale");
-  assert.equal(publishProbe(scope, leaseId, firstClaim.value.nonce, budgets(), NOW).ok, true);
+  assert.equal(claimProbe(scope, leaseId, NOW, "core").value.status, "waiting");
+  // A core claim leaves GraphQL free to be claimed independently -- that is the
+  // whole point of splitting them. Held once, so this is the claim published
+  // below rather than a second one that would find the first still live.
+  const graphqlClaim = claimProbe(scope, leaseId, NOW, "graphql");
+  assert.equal(graphqlClaim.value.status, "claimed");
+  assert.equal(publishProbe(scope, leaseId, randomUUID(), budgets(), NOW, "core").reason, "stale");
+  assert.equal(publishProbe(scope, leaseId, firstClaim.value.nonce, budgets(), NOW, "core").ok, true);
+  // Both resources need a published budget before ordinary work is schedulable.
+  assert.equal(publishProbe(scope, leaseId, graphqlClaim.value.nonce, budgets(), NOW, "graphql").ok, true);
 
   const intentId = randomUUID();
   const registered = registerIntent(scope, intent(intentId, leaseId));
@@ -249,7 +270,7 @@ test("lease, probe, intent, reservation, completion, and reconciliation form one
 
   const reconcileAt = registered.value.notBefore + 2;
   const reconcile = claimNow(scope, leaseId, reconcileAt);
-  assert.equal(publishProbe(scope, leaseId, reconcile.value.nonce, budgets(reconcileAt), reconcileAt).ok, true);
+  assert.equal(publishProbe(scope, leaseId, reconcile.value.nonce, budgets(reconcileAt), reconcileAt, "core").ok, true);
   assert.equal(inspectGovernor(scope, reconcileAt).value.reservations[reservationId], undefined);
 
   const auxiliaryId = randomUUID();
@@ -300,7 +321,7 @@ test("pending intents coalesce while persisted priorities compete", (t) => {
   const claim = claimNow(box.scope, backgroundLeaseId, NOW + 1);
   assert.equal(publishProbe(box.scope, backgroundLeaseId, claim.value.nonce, budgets(NOW + 1, {
     resetMs: NOW + 3_600_000,
-  }), NOW + 1).ok, true);
+  }), NOW + 1, "core").ok, true);
   const scheduled = inspectGovernor(box.scope, NOW + 1).value.reservations;
   const activeReservation = Object.values(scheduled).find((reservation) => reservation.intentId === activeId);
   const backgroundReservation = Object.values(scheduled).find((reservation) => reservation.intentId === backgroundId);
@@ -356,7 +377,7 @@ test("heartbeats extend leases while release and expiry prune only unstarted wor
   const deadId = randomUUID();
   registerLease(box.scope, lease(deadId, NOW + 20_001));
   const deadClaim = claimNow(box.scope, deadId, NOW + 20_001);
-  publishProbe(box.scope, deadId, deadClaim.value.nonce, budgets(NOW + 20_001), NOW + 20_001);
+  publishProbe(box.scope, deadId, deadClaim.value.nonce, budgets(NOW + 20_001), NOW + 20_001, "core");
   const started = registerIntent(box.scope, intent(randomUUID(), deadId, NOW + 20_001)).value;
   startReservation(box.scope, started.reservationId, started.notBefore);
   box.setNow(NOW + 20_001 + GOVERNOR_LEASE_TTL_MS + 1);
@@ -461,10 +482,13 @@ test("failed probes wait for their persisted retry instead of spinning on an old
   const failedAt = NOW + BUDGET_PROBE_MS + 1;
   box.setNow(failedAt);
   const claim = claimNow(box.scope, leaseId, failedAt);
-  assert.equal(failProbeClaim(box.scope, leaseId, claim.value.nonce, failedAt).ok, true);
+  assert.equal(failProbeClaim(box.scope, leaseId, claim.value.nonce, failedAt, "core").ok, true);
   const state = inspectGovernor(box.scope, failedAt).value;
   const expected = failedAt + BUDGET_PROBE_MS;
-  assert.equal(state.probeOutcome.nextAt, expected);
+  // The failed claim was core's, so core's retry is what moves. A failure on one
+  // resource no longer reschedules the other -- that coupling is exactly what
+  // made an unrelated healthy lane wait.
+  assert.equal(state.observers.core.nextAt, expected);
   const callerWakes = Array.from({ length: 12 }, () =>
     governorWakeTimes(state, failedAt + 10_000, 5000).controlAt);
   assert.deepEqual([...new Set(callerWakes)], [expected]);
@@ -508,13 +532,13 @@ test("bootstrap readiness requires a successful publication and a safe active re
     true,
   );
   const claimed = structuredClone(snapshot);
-  claimed.value.probeClaim = { leaseUntil: NOW + 1_000 };
+  claimed.value.probeClaims.core = { leaseUntil: NOW + 1_000 };
   assert.equal(
     governorControlReady({ ok: true, value: { status: "waiting" } }, claimed, NOW),
     false,
   );
   const failed = structuredClone(snapshot);
-  failed.value.probeOutcome = { status: "failed", at: NOW, nextAt: NOW + BUDGET_PROBE_MS };
+  failed.value.observers.graphql = { outcome: "failed", at: NOW, nextAt: NOW + BUDGET_PROBE_MS };
   assert.equal(
     governorControlReady({ ok: true, value: { status: "waiting" } }, failed, NOW),
     false,
@@ -549,7 +573,11 @@ test("control-only wakes keep a held lease live through the t=120 probe", (t) =>
     const maintained = maintainControlLease(box.scope, leaseId, 5000, "actions", at);
     assert.equal(maintained.ok, true);
     assert.equal(maintained.value.status, "renewed");
-    const claim = claimProbe(box.scope, leaseId, at);
+    // Core is exhausted, so its observer is due at its reset, not at the probe
+    // cadence -- GraphQL is the one that comes round every minute. The lease has
+    // to stay live across that probe either way, which is what this asserts.
+    assert.equal(claimProbe(box.scope, leaseId, at, "core").value.status, "waiting");
+    const claim = claimProbe(box.scope, leaseId, at, "graphql");
     assert.equal(claim.ok, true);
     assert.equal(claim.value.status, "claimed");
     assert.equal(publishProbe(
@@ -557,10 +585,9 @@ test("control-only wakes keep a held lease live through the t=120 probe", (t) =>
       leaseId,
       claim.value.nonce,
       budgets(at, { remaining: 0, resetMs: NOW + 3_600_000 }),
-      at,
-    ).ok, true);
+      at, "graphql").ok, true);
     const snapshot = inspectGovernor(box.scope, at).value;
-    assert.equal(snapshot.probeOutcome.status, "healthy");
+    assert.equal(snapshot.observers.graphql.outcome, "healthy");
     assert.equal(snapshot.leases[leaseId].expiresAt, at + GOVERNOR_LEASE_TTL_MS);
     assert.deepEqual(snapshot.intents, {});
     assert.deepEqual(snapshot.reservations, {});
@@ -575,7 +602,7 @@ test("control-only wakes keep a held lease live through the t=120 probe", (t) =>
   const registered = maintainControlLease(expiredBox.scope, expiredLeaseId, 5000, "actions", late);
   assert.equal(registered.ok, true);
   assert.equal(registered.value.status, "registered");
-  assert.equal(claimProbe(expiredBox.scope, expiredLeaseId, late).value.status, "claimed");
+  assert.equal(claimProbe(expiredBox.scope, expiredLeaseId, late, "core").value.status, "claimed");
 });
 
 test("abort and signal outcomes retain each operation's worst-case reservation", async (t) => {
@@ -946,11 +973,11 @@ test("probe barriers, nonce renewal, and expired claimant takeover are bounded",
   const second = randomUUID();
   registerLease(box.scope, lease(first));
   registerLease(box.scope, lease(second));
-  const claim = claimProbe(box.scope, first, NOW);
-  assert.equal(renewProbeClaim(box.scope, first, claim.value.nonce, NOW + 29_999).value.leaseUntil, NOW + 29_999 + GOVERNOR_ACTIVE_PROBE_LEASE_MS);
-  assert.equal(claimProbe(box.scope, second, NOW + 60_000).value.status, "waiting");
+  const claim = claimProbe(box.scope, first, NOW, "core");
+  assert.equal(renewProbeClaim(box.scope, first, claim.value.nonce, NOW + 29_999, "core").value.leaseUntil, NOW + 29_999 + GOVERNOR_ACTIVE_PROBE_LEASE_MS);
+  assert.equal(claimProbe(box.scope, second, NOW + 60_000, "core").value.status, "waiting");
   const takeoverAt = NOW + GOVERNOR_PROBE_LEASE_MS + 1;
-  const takeover = claimProbe(box.scope, second, takeoverAt);
+  const takeover = claimProbe(box.scope, second, takeoverAt, "core");
   assert.equal(takeover.value.status, "claimed");
   assert.notEqual(takeover.value.nonce, claim.value.nonce);
 });
@@ -963,16 +990,16 @@ test("probe cadence is shared while manual demand and reset make it due sooner",
 
   const expectedNextAt = NOW + BUDGET_PROBE_MS;
   for (const leaseId of leaseIds) {
-    assert.deepEqual(claimProbe(box.scope, leaseId, NOW + 1).value, {
+    assert.deepEqual(claimProbe(box.scope, leaseId, NOW + 1, "core").value, {
       status: "waiting",
       nextAt: expectedNextAt,
     });
   }
   makeProbeDue(box.scope, leaseIds[1], NOW + 2);
-  const manualWinner = claimProbe(box.scope, leaseIds[1], NOW + 2);
+  const manualWinner = claimProbe(box.scope, leaseIds[1], NOW + 2, "core");
   assert.equal(manualWinner.value.status, "claimed");
   for (const leaseId of [leaseIds[0], leaseIds[2]]) {
-    assert.equal(claimProbe(box.scope, leaseId, NOW + 2).value.status, "waiting");
+    assert.equal(claimProbe(box.scope, leaseId, NOW + 2, "core").value.status, "waiting");
   }
 
   const resetBox = sandbox(t, { authIdentity: "probe-reset" });
@@ -983,16 +1010,14 @@ test("probe cadence is shared while manual demand and reset make it due sooner",
   assert.deepEqual(claimProbe(
     resetBox.scope,
     resetLeaseId,
-    resetAt + BUDGET_RESET_GRACE_MS - 1,
-  ).value, {
+    resetAt + BUDGET_RESET_GRACE_MS - 1, "core").value, {
     status: "waiting",
     nextAt: resetAt + BUDGET_RESET_GRACE_MS,
   });
   assert.equal(claimProbe(
     resetBox.scope,
     resetLeaseId,
-    resetAt + BUDGET_RESET_GRACE_MS,
-  ).value.status, "claimed");
+    resetAt + BUDGET_RESET_GRACE_MS, "core").value.status, "claimed");
 });
 
 test("a GraphQL-only minute claim does not poll an exhausted core observer", (t) => {
@@ -1005,19 +1030,23 @@ test("a GraphQL-only minute claim does not poll an exhausted core observer", (t)
     graphql: { limit: 5000, used: 0, remaining: 5000, resetMs },
   });
 
-  const claim = claimProbe(box.scope, leaseId, NOW + BUDGET_PROBE_MS);
+  // Core is exhausted and not yet reset, so its observer is not due; GraphQL is.
+  // Independent claims are what make that expressible -- one combined claim had
+  // to choose, and choosing meant a due GraphQL sample could drag the held core
+  // observer along with it.
+  assert.equal(claimProbe(box.scope, leaseId, NOW + BUDGET_PROBE_MS, "core").value.status, "waiting");
+  const claim = claimProbe(box.scope, leaseId, NOW + BUDGET_PROBE_MS, "graphql");
   assert.equal(claim.value.status, "claimed");
-  assert.deepEqual(claim.value.resources, ["graphql"]);
-  assert.equal(claim.value.coreEtag, null);
+  assert.equal(claim.value.resource, "graphql");
   assert.equal(publishProbe(box.scope, leaseId, claim.value.nonce, {
     graphql: {
       source: "graphql-observer",
       budget: { limit: 5000, used: 0, remaining: 5000, resetMs },
     },
-  }, NOW + BUDGET_PROBE_MS).ok, true);
+  }, NOW + BUDGET_PROBE_MS, "core").ok, true);
   const state = inspectGovernor(box.scope, NOW + BUDGET_PROBE_MS).value;
   assert.equal(state.observers.core.nextAt, resetMs + BUDGET_RESET_GRACE_MS);
-  assert.equal(state.probeOutcome.status, "healthy");
+  assert.equal(state.observers.graphql.outcome, "healthy");
 });
 
 test("the shared probe wrapper publishes once and failed probes pause only background work", async (t) => {
@@ -1030,7 +1059,9 @@ test("the shared probe wrapper publishes once and failed probes pause only backg
     readBudgets: async () => { reads += 1; return budgets(); },
   });
   assert.equal(refreshed.ok, true);
-  assert.equal(reads, 1);
+  // One read per resource: observers are claimed and published independently
+  // now, so a shared refresh is two refreshes that do not wait on each other.
+  assert.equal(reads, RATE_RESOURCES.length);
 
   makeProbeDue(scope, leaseId, NOW + 1);
   const failed = await refreshSharedBudget(scope, leaseId, null, {
@@ -1038,7 +1069,7 @@ test("the shared probe wrapper publishes once and failed probes pause only backg
     readBudgets: async () => null,
   });
   assert.equal(failed.reason, "stale");
-  assert.equal(inspectGovernor(scope, NOW + 1).value.probeOutcome.status, "failed");
+  assert.equal(inspectGovernor(scope, NOW + 1).value.observers.graphql.outcome, "failed");
 
   const background = registerIntent(scope, intent(randomUUID(), leaseId, NOW + 1, {
     priority: "background",
@@ -1060,8 +1091,8 @@ test("the shared probe wrapper publishes once and failed probes pause only backg
   });
   assert.equal(malformed.reason, "corrupt");
   const malformedState = inspectGovernor(malformedBox.scope, NOW).value;
-  assert.equal(malformedState.probeClaim, null);
-  assert.equal(malformedState.probeOutcome.status, "failed");
+  assert.deepEqual(malformedState.probeClaims, { core: null, graphql: null });
+  assert.equal(malformedState.observers.graphql.outcome, "failed");
 
   const routedBox = sandbox(t, { host: "tenant.ghe.com", authIdentity: "host-route" });
   const routedLeaseId = randomUUID();
@@ -1078,7 +1109,7 @@ test("the shared probe wrapper publishes once and failed probes pause only backg
   const inspectionWaiter = randomUUID();
   registerLease(inspectionBox.scope, lease(inspectionOwner));
   registerLease(inspectionBox.scope, lease(inspectionWaiter));
-  assert.equal(claimProbe(inspectionBox.scope, inspectionOwner, NOW).value.status, "claimed");
+  assert.equal(claimProbe(inspectionBox.scope, inspectionOwner, NOW, "core").value.status, "claimed");
   let waits = 0;
   const observedBudgets = Object.fromEntries(["core", "graphql"].map((resource) => [resource, {
     observedAt: NOW,
@@ -1126,7 +1157,7 @@ test("slow independent sources renew one claim and spend one core bootstrap", as
         clock += 20_000;
         box.setNow(clock);
         coreBootstraps += 1;
-        competingClaim = claimProbe(box.scope, waiterId, clock);
+        competingClaim = claimProbe(box.scope, waiterId, clock, "core");
         return {
           budget: { limit: 5000, used: 1, remaining: 4999, resetMs },
           etag: etag ?? '"slow-bootstrap-v1"',
@@ -1139,7 +1170,7 @@ test("slow independent sources renew one claim and spend one core bootstrap", as
   assert.equal(coreBootstraps, 1);
   assert.equal(competingClaim.value.status, "waiting");
   assert.ok(competingClaim.value.leaseUntil > clock);
-  assert.equal(inspectGovernor(box.scope, clock).value.probeClaim, null);
+  assert.deepEqual(inspectGovernor(box.scope, clock).value.probeClaims, { core: null, graphql: null });
 });
 
 test("a probe owner retries nonce-safe renew, publish, and fail mutations without another API read", async (t) => {
@@ -1165,7 +1196,7 @@ test("a probe owner retries nonce-safe renew, publish, and fail mutations withou
   });
   assert.equal(published.ok, true);
   assert.equal(renewAttempts, 3);
-  assert.equal(reads, 1, "lock contention reran the external rate_limit probe");
+  assert.equal(reads, RATE_RESOURCES.length, "lock contention reran the external probe");
   assert.equal(publishAttempts, 3);
   assert.equal(inspectGovernor(publishBox.scope, clock).value.probeClaim, null);
 
@@ -1187,7 +1218,7 @@ test("a probe owner retries nonce-safe renew, publish, and fail mutations withou
   assert.equal(failAttempts, 3);
   const failedState = inspectGovernor(failBox.scope, clock).value;
   assert.equal(failedState.probeClaim, null);
-  assert.equal(failedState.probeOutcome.status, "failed");
+  assert.equal(failedState.observers.graphql.outcome, "failed");
 });
 
 test("governor readers and mutators refresh time after a concurrent locked write", (t) => {
@@ -1195,7 +1226,7 @@ test("governor readers and mutators refresh time after a concurrent locked write
   const ownerId = randomUUID();
   const laterId = randomUUID();
   registerLease(box.scope, lease(ownerId));
-  const claim = claimProbe(box.scope, ownerId, NOW);
+  const claim = claimProbe(box.scope, ownerId, NOW, "core");
   assert.equal(claim.value.status, "claimed");
 
   // Model a caller that captured NOW before waiting for the lock. By the time
@@ -1209,7 +1240,7 @@ test("governor readers and mutators refresh time after a concurrent locked write
   const inspected = inspectGovernor(box.scope, NOW);
   assert.equal(inspected.ok, true);
   assert.deepEqual(Object.keys(inspected.value.leases).sort(), [laterId, ownerId].sort());
-  assert.equal(renewProbeClaim(box.scope, ownerId, claim.value.nonce, NOW).ok, true);
+  assert.equal(renewProbeClaim(box.scope, ownerId, claim.value.nonce, NOW, "core").ok, true);
 });
 
 test("probe drain and renewal failures release only their own barrier", async (t) => {
@@ -1230,7 +1261,7 @@ test("probe drain and renewal failures release only their own barrier", async (t
   assert.equal(readAfterDrainFailure, false);
   const drained = inspectGovernor(drainBox.scope, grant.notBefore + 1).value;
   assert.equal(drained.probeClaim, null);
-  assert.equal(drained.probeOutcome.status, "failed");
+  assert.equal(drained.observers.graphql.outcome, "failed");
 
   const renewalBox = sandbox(t, { authIdentity: "renewal-failure" });
   const renewalLeaseId = randomUUID();
@@ -1253,7 +1284,7 @@ test("probe drain and renewal failures release only their own barrier", async (t
     now: () => clock,
     renew: () => {
       clock = NOW + GOVERNOR_PROBE_LEASE_MS + 1;
-      successorClaim = claimProbe(successorBox.scope, successorId, clock);
+      successorClaim = claimProbe(successorBox.scope, successorId, clock, "core");
       return { ok: false, reason: "stale" };
     },
   });
@@ -1273,16 +1304,16 @@ test("manual probe demand coalesces until reset changes the epoch", (t) => {
   assert.equal(initial.value.status, "pending");
   assert.equal(repeated.value.status, "pending");
 
-  const claim = claimProbe(scope, leaseId, NOW + 1);
+  const claim = claimProbe(scope, leaseId, NOW + 1, "core");
   publishProbe(scope, leaseId, claim.value.nonce, budgets(NOW + 1, {
     remaining: 1000,
     resetMs: NOW + 3_600_000,
-  }), NOW + 1);
+  }), NOW + 1, "core");
   assert.equal(requestManualProbe(scope, leaseId, epoch, NOW, NOW + 1).value.status, "satisfied");
 
   const resetAt = NOW + 3_600_000;
   const resetClaim = claimNow(scope, leaseId, NOW + 2);
-  publishProbe(scope, leaseId, resetClaim.value.nonce, budgets(NOW + 2, { remaining: 5000, resetMs: resetAt + 3_600_000 }), NOW + 2);
+  publishProbe(scope, leaseId, resetClaim.value.nonce, budgets(NOW + 2, { remaining: 5000, resetMs: resetAt + 3_600_000 }), NOW + 2, "core");
   assert.equal(inspectGovernor(scope, NOW + 2).value.manualProbe, null);
 });
 
@@ -1302,9 +1333,13 @@ test("forced refresh keeps a blocked core observer at reset plus grace", (t) => 
   ).ok, true);
   const state = inspectGovernor(box.scope, NOW + 1).value;
   assert.equal(state.observers.core.nextAt, resetMs + BUDGET_RESET_GRACE_MS);
-  const earlyClaim = claimProbe(box.scope, leaseId, NOW + 1);
+  // Core is blocked through its reset, so its observer is not claimable early --
+  // and GraphQL, which has nothing wrong with it, still is. That separation is
+  // what independent claims buy.
+  assert.equal(claimProbe(box.scope, leaseId, NOW + 1, "core").value.status, "waiting");
+  const earlyClaim = claimProbe(box.scope, leaseId, NOW + 1, "graphql");
   assert.equal(earlyClaim.value.status, "claimed");
-  assert.deepEqual(earlyClaim.value.resources, ["graphql"]);
+  assert.equal(earlyClaim.value.resource, "graphql");
 });
 
 test("successful probes preserve live same-epoch blocks and clear proven ones", (t) => {
@@ -1319,7 +1354,7 @@ test("successful probes preserve live same-epoch blocks and clear proven ones", 
   const sameEpochClaim = claimNow(box.scope, leaseId, NOW + 1);
   assert.equal(publishProbe(box.scope, leaseId, sameEpochClaim.value.nonce, budgets(NOW + 1, {
     resetMs,
-  }), NOW + 1).ok, true);
+  }), NOW + 1, "core").ok, true);
   let state = inspectGovernor(box.scope, NOW + 1).value;
   assert.equal(state.budgets.core.blockUntil, blockUntil);
   assert.equal(state.budgets.core.blockReason, "rate-limit");
@@ -1329,7 +1364,7 @@ test("successful probes preserve live same-epoch blocks and clear proven ones", 
   const expiredClaim = claimNow(box.scope, leaseId, blockUntil);
   assert.equal(publishProbe(box.scope, leaseId, expiredClaim.value.nonce, budgets(blockUntil, {
     resetMs,
-  }), blockUntil).ok, true);
+  }), blockUntil, "core").ok, true);
   state = inspectGovernor(box.scope, blockUntil).value;
   assert.equal(state.budgets.core.blockUntil, null);
   assert.equal(state.budgets.core.blockReason, null);
@@ -1339,7 +1374,7 @@ test("successful probes preserve live same-epoch blocks and clear proven ones", 
   const resetClaim = claimNow(box.scope, leaseId, blockUntil + 1);
   assert.equal(publishProbe(box.scope, leaseId, resetClaim.value.nonce, budgets(blockUntil + 1, {
     resetMs: resetMs + 3_600_000,
-  }), blockUntil + 1).ok, true);
+  }), blockUntil + 1, "core").ok, true);
   state = inspectGovernor(box.scope, blockUntil + 1).value;
   assert.equal(state.budgets.core.blockUntil, null);
   assert.equal(state.budgets.core.blockReason, null);
@@ -1357,8 +1392,8 @@ test("planned-to-start revalidation fails closed after stale budget, block, or s
   const freshAt = NOW + BUDGET_SNAPSHOT_TTL_MS + 2;
   box.setNow(freshAt);
   heartbeatLease(box.scope, leaseId, { core: 2, graphql: 0 }, freshAt);
-  const claim = claimProbe(box.scope, leaseId, freshAt);
-  publishProbe(box.scope, leaseId, claim.value.nonce, budgets(freshAt), freshAt);
+  const claim = claimProbe(box.scope, leaseId, freshAt, "core");
+  publishProbe(box.scope, leaseId, claim.value.nonce, budgets(freshAt), freshAt, "core");
   const blockedGrant = registerIntent(box.scope, intent(randomUUID(), leaseId, freshAt)).value;
   recordResourceBlock(box.scope, "core", freshAt + 60_000, "rate-limit");
   assert.equal(startReservation(box.scope, blockedGrant.reservationId, blockedGrant.notBefore).reason, "stale");
@@ -1439,7 +1474,7 @@ test("planned reservations revalidate expiry, epoch, probe barrier, and capacity
   const epochClaim = claimNow(epoch.scope, epoch.leaseId, NOW + 1);
   assert.equal(publishProbe(epoch.scope, epoch.leaseId, epochClaim.value.nonce, budgets(NOW + 1, {
     resetMs: NOW + 7_200_000,
-  }), NOW + 1).ok, true);
+  }), NOW + 1, "core").ok, true);
   assert.equal(startReservation(epoch.scope, epoch.grant.reservationId, epoch.grant.notBefore).reason, "stale");
 
   const barrier = planned("barrier");
@@ -1456,7 +1491,7 @@ test("planned reservations revalidate expiry, epoch, probe barrier, and capacity
   const capacityClaim = claimNow(capacity.scope, capacity.leaseId, NOW + 1);
   assert.equal(publishProbe(capacity.scope, capacity.leaseId, capacityClaim.value.nonce, budgets(NOW + 1, {
     remaining: 1001,
-  }), NOW + 1).ok, true);
+  }), NOW + 1, "core").ok, true);
   assert.equal(startReservation(capacity.scope, capacity.grant.reservationId, capacity.grant.notBefore).reason, "stale");
 });
 
@@ -1494,14 +1529,14 @@ test("probe watermark retires only completions whose ordering is certain", (t) =
   const claimAt = before.notBefore + 2;
   const claim = claimNow(scope, leaseId, claimAt);
 
-  assert.equal(publishProbe(scope, leaseId, claim.value.nonce, budgets(claimAt), claimAt + 1).ok, true);
+  assert.equal(publishProbe(scope, leaseId, claim.value.nonce, budgets(claimAt), claimAt + 1, "core").ok, true);
   assert.equal(inspectGovernor(scope, claimAt + 1).value.reservations[before.reservationId], undefined);
 
   const overlap = registerIntent(scope, intent(randomUUID(), leaseId, claimAt + 1)).value;
   startReservation(scope, overlap.reservationId, overlap.notBefore);
   const overlapClaim = claimNow(scope, leaseId, overlap.notBefore + 1);
   completeReservation(scope, overlap.reservationId, { outcome: "timeout", actualCost: { core: 0, graphql: 0 } }, overlap.notBefore + 2);
-  publishProbe(scope, leaseId, overlapClaim.value.nonce, budgets(overlap.notBefore + 2), overlap.notBefore + 2);
+  publishProbe(scope, leaseId, overlapClaim.value.nonce, budgets(overlap.notBefore + 2), overlap.notBefore + 2, "core");
   assert.equal(inspectGovernor(scope, overlap.notBefore + 2).value.reservations[overlap.reservationId].status, "completed");
 
   const sameMillisecond = registerIntent(scope, intent(randomUUID(), leaseId, overlap.notBefore + 3)).value;
@@ -1512,7 +1547,7 @@ test("probe watermark retires only completions whose ordering is certain", (t) =
     outcome: "measured-success",
     actualCost: { core: 2, graphql: 0 },
   }, sameClaimAt);
-  publishProbe(scope, leaseId, sameClaim.value.nonce, budgets(sameClaimAt + 1), sameClaimAt + 1);
+  publishProbe(scope, leaseId, sameClaim.value.nonce, budgets(sameClaimAt + 1), sameClaimAt + 1, "core");
   assert.equal(
     inspectGovernor(scope, sameClaimAt + 1).value.reservations[sameMillisecond.reservationId].status,
     "completed",
@@ -1535,7 +1570,7 @@ test("a used-counter reset starts a new epoch and carries a straddling request",
     core: { limit: 5000, remaining: 4950, used: 50, resetMs: resetMs + 1 },
     graphql: { limit: 5000, remaining: 4950, used: 50, resetMs: resetMs + 1 },
   };
-  const published = publishProbe(scope, leaseId, claim.value.nonce, resetBudgets, claimAt);
+  const published = publishProbe(scope, leaseId, claim.value.nonce, resetBudgets, claimAt, "core");
   assert.notEqual(published.value.epochs.core, first.epochs.core);
   const carried = inspectGovernor(scope, claimAt).value.reservations[grant.reservationId];
   assert.equal(carried.status, "started");
@@ -1566,7 +1601,7 @@ test("a near-timeout request drain renews one probe claimant without takeover", 
     wait: async (ms) => { waits += 1; clock += ms; },
     readBudgets: async () => {
       probeReads += 1;
-      const takeover = claimProbe(scope, waiterId, clock);
+      const takeover = claimProbe(scope, waiterId, clock, "core");
       assert.equal(takeover.value.status, "waiting");
       assert.ok(takeover.value.leaseUntil > clock);
       return budgets(clock);
@@ -1574,7 +1609,8 @@ test("a near-timeout request drain renews one probe claimant without takeover", 
   });
 
   assert.equal(refreshed.ok, true);
-  assert.equal(probeReads, 1);
+  // One read per resource: the observers refresh independently now.
+  assert.equal(probeReads, RATE_RESOURCES.length);
   assert.equal(waits, GOVERNOR_PROBE_DRAIN_MS / 100);
   assert.equal(clock, grant.notBefore + 1 + GOVERNOR_PROBE_DRAIN_MS);
   const state = inspectGovernor(scope, clock).value;
@@ -1629,7 +1665,7 @@ test("clean probe samples persist the shared external-spend factor", (t) => {
   const next = budgets(claimAt, { resetMs: NOW + 3_600_000 });
   next.core.used = 12;
   next.core.remaining = 4988;
-  publishProbe(scope, leaseId, claim.value.nonce, next, claimAt);
+  publishProbe(scope, leaseId, claim.value.nonce, next, claimAt, "core");
   assert.equal(inspectGovernor(scope, claimAt).value.budgets.core.lastExternalFactor, 2);
 });
 
@@ -1651,7 +1687,7 @@ test("rate_limit publication updates GraphQL but never overwrites authoritative 
       source: "graphql-observer",
       budget: { limit: 5000, used: 20, remaining: 4980, resetMs: laterReset },
     },
-  }, NOW + 1);
+  }, NOW + 1, "core");
   assert.equal(rejected.reason, "corrupt");
   let state = inspectGovernor(scope, NOW + 1).value;
   assert.deepEqual(state.observers.core, claimed.observers.core);
@@ -1671,7 +1707,7 @@ test("rate_limit publication updates GraphQL but never overwrites authoritative 
       source: "graphql-observer",
       budget: { limit: 5000, used: 20, remaining: 4980, resetMs: laterReset },
     },
-  }, NOW + 1);
+  }, NOW + 1, "core");
   assert.equal(published.ok, true);
   state = inspectGovernor(scope, NOW + 1).value;
   assert.equal(state.budgets.core.resetMs, before.budgets.core.resetMs);
@@ -1690,7 +1726,7 @@ test("a lagging same-epoch observer refreshes core without increasing capacity",
   publishInitial(scope, leaseId, NOW, budgets(NOW, { remaining: 4990, resetMs }));
 
   const observedAt = NOW + BUDGET_SNAPSHOT_TTL_MS + 1;
-  const claim = claimProbe(scope, leaseId, observedAt);
+  const claim = claimProbe(scope, leaseId, observedAt, "core");
   assert.equal(claim.value.status, "claimed");
   const published = publishProbe(scope, leaseId, claim.value.nonce, {
     core: {
@@ -1701,7 +1737,7 @@ test("a lagging same-epoch observer refreshes core without increasing capacity",
       source: "graphql-observer",
       budget: { limit: 5000, used: 0, remaining: 5000, resetMs },
     },
-  }, observedAt);
+  }, observedAt, "core");
 
   assert.equal(published.ok, true);
   const result = inspectGovernor(scope, observedAt);
@@ -1868,7 +1904,7 @@ test("missing and partial response observations partition local cost exactly onc
         budget: { limit: 5000, used: 0, remaining: 5000, resetMs: initial.resetMs },
       };
     }
-    assert.equal(publishProbe(box.scope, leaseId, claim.value.nonce, claimedBudgets, probeAt).ok, true);
+    assert.equal(publishProbe(box.scope, leaseId, claim.value.nonce, claimedBudgets, probeAt, "core").ok, true);
     state = inspectGovernor(box.scope, probeAt).value;
     assert.equal(state.budgets.core.lastExternalFactor, 1);
   }
@@ -1948,8 +1984,7 @@ test("response settlement cannot advance the core epoch ahead of the claimed obs
     leaseId,
     claim.value.nonce,
     budgets(ownerAt, { remaining: 4999, resetMs: ownerResetMs }),
-    ownerAt,
-  ).ok, true);
+    ownerAt, "core").ok, true);
   state = inspectGovernor(box.scope, ownerAt).value;
   assert.equal(state.budgets.core.resetMs, ownerResetMs);
   assert.equal(state.budgets.core.source, "core-observer");
@@ -2055,7 +2090,7 @@ test("schema, bounds, corrupt data, and future timestamps fail closed", (t) => {
   assert.equal(inspectGovernor(scope, NOW).reason, "corrupt");
 
   const future = emptyGovernorState();
-  future.probeOutcome.nextAt = NOW + 25 * 60 * 60 * 1000;
+  future.observers.graphql.nextAt = NOW + 25 * 60 * 60 * 1000;
   writeGovernorState(scope.path, future);
   assert.equal(inspectGovernor(scope, NOW).reason, "corrupt");
 
@@ -2390,7 +2425,7 @@ test("twelve real workers share one probe, preserve state, pace grants, and isol
 
   const winnerIndex = registrations.findIndex((result) => result.claim?.value?.status === "claimed");
   const winner = registrations[winnerIndex].claim.value;
-  assert.equal(publishProbe(box.scope, leaseIds[winnerIndex], winner.nonce, budgets(), NOW).ok, true);
+  assert.equal(publishProbe(box.scope, leaseIds[winnerIndex], winner.nonce, budgets(), NOW, "core").ok, true);
 
   const intentIds = leaseIds.map(() => randomUUID());
   const scheduled = await Promise.all(leaseIds.map((leaseId, index) => worker({
@@ -2426,7 +2461,7 @@ test("twelve real workers share one probe, preserve state, pace grants, and isol
     const roundClaim = claimNow(box.scope, leaseIds[0], releaseAt);
     assert.equal(publishProbe(box.scope, leaseIds[0], roundClaim.value.nonce, budgets(roundAt, {
       resetMs: firstResetMs,
-    }), releaseAt).ok, true);
+    }), releaseAt, "core").ok, true);
   }
 
   const progressedAt = NOW + 4;
@@ -2481,8 +2516,7 @@ test("twelve real workers share one probe, preserve state, pace grants, and isol
     leaseIds[resetWinnerIndex],
     resetWinner.nonce,
     budgets(resetAt, { resetMs: secondResetMs }),
-    resetAt,
-  ).ok, true);
+    resetAt, "core").ok, true);
 
   const resetScheduled = await Promise.all(resetLeases.map((value) => worker({
     ...resetBase,
@@ -2531,8 +2565,8 @@ test("real probe and request owner crashes recover without releasing uncertain c
   probeOwner.child.kill("SIGKILL");
   await new Promise((resolve) => probeOwner.child.once("exit", resolve));
   registerLease(probeBox.scope, lease(waiterId));
-  assert.equal(claimProbe(probeBox.scope, waiterId, NOW + GOVERNOR_PROBE_LEASE_MS - 1).value.status, "waiting");
-  assert.equal(claimProbe(probeBox.scope, waiterId, NOW + GOVERNOR_PROBE_LEASE_MS + 1).value.status, "claimed");
+  assert.equal(claimProbe(probeBox.scope, waiterId, NOW + GOVERNOR_PROBE_LEASE_MS - 1, "core").value.status, "waiting");
+  assert.equal(claimProbe(probeBox.scope, waiterId, NOW + GOVERNOR_PROBE_LEASE_MS + 1, "core").value.status, "claimed");
 
   const requestBox = sandbox(t, { authIdentity: "auth-request" });
   const requestLeaseId = randomUUID();
@@ -2586,10 +2620,10 @@ test("governor health is redacted and discriminates stale, waiting, blocked, and
   assert.equal(governorHealth(inspectGovernor(scope, NOW), NOW).status, "stale");
   const leaseId = randomUUID();
   registerLease(scope, lease(leaseId));
-  assert.equal(claimProbe(scope, leaseId, NOW).value.status, "claimed");
+  assert.equal(claimProbe(scope, leaseId, NOW, "core").value.status, "claimed");
   assert.equal(governorHealth(inspectGovernor(scope, NOW), NOW).status, "waiting for probe");
   const claim = inspectGovernor(scope, NOW).value.probeClaim;
-  publishProbe(scope, leaseId, claim.nonce, budgets(), NOW);
+  publishProbe(scope, leaseId, claim.nonce, budgets(), NOW, "core");
   assert.equal(governorHealth(inspectGovernor(scope, NOW), NOW).status, "healthy");
   recordResourceBlock(scope, "core", NOW + 60_000, "rate-limit");
   const health = governorHealth(inspectGovernor(scope, NOW), NOW);
