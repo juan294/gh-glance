@@ -1040,7 +1040,16 @@ function remoteSlug(value) {
     path = /^(?:[^@\s]+@)?[^:/\s]+:([^\s]+)$/.exec(value)?.[1] ?? null;
   }
   if (path === null) return null;
-  const slug = path.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/, "");
+  // Trimmed by index rather than with /\/+$/. An end-anchored quantifier is
+  // retried from every position, so a remote URL carrying a long run of slashes
+  // costs quadratic time to reject (CodeQL js/polynomial-redos, high). Remote
+  // URLs are library input: `git remote -v` reports whatever is configured.
+  let start = 0;
+  let end = path.length;
+  while (start < end && path[start] === "/") start += 1;
+  while (end > start && path[end - 1] === "/") end -= 1;
+  const trimmed = path.slice(start, end);
+  const slug = trimmed.endsWith(".git") ? trimmed.slice(0, -4) : trimmed;
   return REPO_PATTERN.test(slug) ? slug : null;
 }
 
