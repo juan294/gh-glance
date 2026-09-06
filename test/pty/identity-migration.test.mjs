@@ -133,8 +133,8 @@ function exerciseAllTabs() {
   const calls = '"$GH_GLANCE_CAPTURE_OUT.calls"';
   const waitForCall = (pattern) => waitForAwk(calls, `index($0, "${pattern}") { ok=1 }`, 200) + "sleep .4; ";
   return waitForCall("/actions/workflows?") + "printf 2; " +
-    waitForCall("issue list") + "printf 3; " +
-    waitForCall("pr list") + "printf 4; " +
+    waitForCall("graphql issues.page") + "printf 3; " +
+    waitForCall("graphql pulls.page") + "printf 4; " +
     waitForCall("secret-scanning/alerts") + "printf q";
 }
 
@@ -147,7 +147,7 @@ test("ID-08: two real panes serialize all four tabs and control requests through
   })));
   for (const result of results) {
     assertRestored(result);
-    for (const operation of ["/actions/runs?", "issue list", "pr list", "dependabot/alerts", "code-scanning/alerts", "secret-scanning/alerts"]) {
+    for (const operation of ["/actions/runs?", "graphql issues.page", "graphql pulls.page", "dependabot/alerts", "code-scanning/alerts", "secret-scanning/alerts"]) {
       assert.ok(result.fixtureCalls.some((call) => call.includes(operation)), `pane never acquired ${operation}`);
     }
     assert.equal(result.fixtureCalls.filter((call) => call.startsWith("auth status")).length, 0);
@@ -157,7 +157,7 @@ test("ID-08: two real panes serialize all four tabs and control requests through
   const ends = new Map(events.filter((event) => event.type === "end").map((event) => [event.sequence, event]));
   assert.ok(starts.length >= 15, "fixture never exercised all tab and control demand");
   assert.ok(starts.some((event) => event.argv.includes("user")), "identity/core observer was not exercised");
-  assert.ok(starts.some((event) => event.argv.includes("rate_limit")), "GraphQL control probe was not exercised");
+  assert.ok(starts.some((event) => event.graphqlOperation === "graphql.observer"), "GraphQL control probe was not exercised");
   // These timestamps are independent server process entry/exit, not permit
   // grant timestamps. Unit seam tests pin the exact 250ms grant interval.
   // Here every operation must finish before the next HTTP operation starts.

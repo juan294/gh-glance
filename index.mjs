@@ -658,7 +658,41 @@ function assertBoundCredential(bound) {
   }
 }
 
-async function runGh(args, { signal, operation } = {}) {
+// GraphQL documents are supplied on stdin rather than as an argument, so a
+// query never lands in argv where `ps` or an error string could carry it, and
+// so its size is bounded by a pipe rather than by the platform argument limit.
+// promisify(execFile) exposes the child, which is what lets stdin be written
+// without giving up the timeout, kill signal, maxBuffer, abort and redaction
+// contracts every other call depends on.
+// The control plane cannot be gated on the capacity it exists to establish.
+// Both observers are exempt from the data-admission recheck for that reason:
+// a resource whose budget is unknown would otherwise refuse the one request
+// that could learn it, and the tab would wait for a number nothing can fetch.
+// They remain bounded elsewhere -- by the rolling attempt allowance, the shared
+// transport permit and the secondary cooldown -- so this is an exemption from
+// data admission, not from accounting.
+const CONTROL_OPERATIONS = ["budget-core-observer", "graphql-observer"];
+
+// An operation whose actual cost exceeded its declared bound is paused until its
+// resource resets. Continuing to spend against a bound already known to be wrong
+// is how a reserve gets crossed with every individual request looking admissible.
+// Process-local on purpose: the bound is a property of this build's query text,
+// so a differently-built pane's bound is not this one's to suspend.
+const pausedOperations = new Map();
+
+function pauseOperation(operation, untilMs) {
+  if (!Number.isFinite(untilMs)) return;
+  pausedOperations.set(operation, Math.max(pausedOperations.get(operation) ?? 0, untilMs));
+}
+
+function operationPausedUntil(operation, now = Date.now()) {
+  const until = pausedOperations.get(operation);
+  if (until === undefined) return null;
+  if (until <= now) { pausedOperations.delete(operation); return null; }
+  return until;
+}
+
+async function runGh(args, { signal, operation, input = null } = {}) {
   if (operationCost(operation) === null) {
     throw new Error(`undeclared gh operation: ${operation ?? "missing"}`);
   }
@@ -681,18 +715,30 @@ async function runGh(args, { signal, operation } = {}) {
     // A sibling request may publish a shared hold while this call is queued.
     // Keep the started envelope charged, but recheck resource validity at the
     // actual subprocess boundary without reserving the same work again.
-    if (bound && !local && operation !== "budget-core-observer") {
+    const pausedUntil = operationPausedUntil(operation);
+    if (pausedUntil !== null) {
+      throw new Error(`Operation paused after an unbounded cost (retry after ${new Date(pausedUntil).toISOString()})`);
+    }
+    if (bound && !local && !CONTROL_OPERATIONS.includes(operation)) {
       const ready = inspectAdmittedHttpStart(bound, operation);
       if (!ready.ok) throw new Error(`API budget paused (${ready.reason})`);
     }
     assertBoundCredential(bound);
-    const { stdout } = await execFileAsync("gh", args, {
+    const pending = execFileAsync("gh", args, {
       timeout: GH_TIMEOUT_MS,
       killSignal: "SIGKILL",
       maxBuffer: GH_MAX_BUFFER,
       env: { ...process.env, ...GH_ENV_OVERRIDES },
       signal,
     });
+    if (typeof input === "string") {
+      // A child killed by the timeout or the abort signal closes stdin under
+      // us; that EPIPE is the kill's consequence, not the failure worth
+      // reporting, so let the awaited result below carry the real error.
+      pending.child.stdin?.on("error", () => {});
+      pending.child.stdin?.end(input);
+    }
+    const { stdout } = await pending;
     requestStdout = stdout;
     logGh(args, startedAt, `ok ${stdout.length}B`);
     return stdout;
@@ -800,13 +846,140 @@ async function ghApi(args, { operation, signal, etag = null, run = runGh } = {})
   }
 }
 
-// The target as `gh` spells it: host-qualified when a host was given, the bare
-// slug otherwise -- which is exactly the [HOST/]OWNER/REPO form `gh --repo`
-// documents.
-function qualifiedRepo() {
-  const host = runtime.repoExplicit ? effectiveRuntimeHost() : runtime.host;
-  return host ? `${host}/${runtime.repo}` : runtime.repo;
+// ---------- Explicit GraphQL ----------
+
+// The version travels in the query key, so a changed document invalidates its
+// cursors instead of paging a new shape with an old cursor.
+const GRAPHQL_QUERY_VERSION = 1;
+// GitHub prices a connection by the pages it could return, and the row's single
+// label is a nested connection of its own. Two points is the conservative bound
+// for one page; the observer selects nothing but the meter and costs one.
+const GRAPHQL_PAGE_POINTS = 2;
+const GRAPHQL_OBSERVER_POINTS = 1;
+// 50 rows per page and no more than three pages preserves the existing
+// LIST_LIMIT of 150 while making every page a separately admitted request.
+const GRAPHQL_PAGE_SIZE = 50;
+// Two hours: comfortably past any real primary window, and short enough that a
+// nonsense timestamp cannot park the budget in a reset that never arrives.
+const GRAPHQL_MAX_RESET_MS = 2 * 60 * 60 * 1000;
+
+// Issues and pull requests are deliberately two documents, not one with two
+// connections: a combined query cannot publish either tab until both halves
+// are complete, which is exactly the completion barrier this phase removes.
+// Both select only what a row renders, which is also what keeps the cost at
+// its declared bound.
+const ISSUE_PAGE_QUERY = `query($owner:String!,$name:String!,$first:Int!,$after:String){
+  repository(owner:$owner,name:$name){
+    id
+    name
+    nameWithOwner
+    url
+    issues(first:$first,after:$after,states:OPEN,orderBy:{field:UPDATED_AT,direction:DESC}){
+      totalCount
+      pageInfo{hasNextPage endCursor}
+      nodes{id number title url updatedAt author{login} labels(first:1){nodes{name}}}
+    }
+  }
+  rateLimit{cost limit used remaining resetAt}
+}`;
+
+const PULL_PAGE_QUERY = `query($owner:String!,$name:String!,$first:Int!,$after:String){
+  repository(owner:$owner,name:$name){
+    id
+    name
+    nameWithOwner
+    url
+    pullRequests(first:$first,after:$after,states:OPEN,orderBy:{field:UPDATED_AT,direction:DESC}){
+      totalCount
+      pageInfo{hasNextPage endCursor}
+      nodes{id number title url updatedAt author{login} headRefName isDraft reviewDecision}
+    }
+  }
+  rateLimit{cost limit used remaining resetAt}
+}`;
+
+// Selects the meter and nothing else. This is the only claimed GraphQL
+// observer; a data page's counters constrain the same epoch but never open a
+// new one.
+const GRAPHQL_OBSERVER_QUERY = `query{rateLimit{cost limit used remaining resetAt}}`;
+
+// Replaces `gh repo view --json`, whose GraphQL cost was real but undeclared.
+const REPOSITORY_QUERY = `query($owner:String!,$name:String!){
+  repository(owner:$owner,name:$name){
+    id
+    nameWithOwner
+    url
+    viewerPermission
+  }
+  rateLimit{cost limit used remaining resetAt}
+}`;
+
+const GRAPHQL_QUERIES = Object.freeze({
+  repository: { query: REPOSITORY_QUERY, connection: null, points: GRAPHQL_OBSERVER_POINTS },
+  issues: { query: ISSUE_PAGE_QUERY, connection: "issues", points: GRAPHQL_PAGE_POINTS },
+  prs: { query: PULL_PAGE_QUERY, connection: "pullRequests", points: GRAPHQL_PAGE_POINTS },
+  observer: { query: GRAPHQL_OBSERVER_QUERY, connection: null, points: GRAPHQL_OBSERVER_POINTS },
+});
+
+// `--input -` keeps the document and its variables on stdin as one typed JSON
+// object, so variables stay typed rather than becoming the strings that
+// `-f`/`-F` would produce, and nothing reaches argv.
+function graphqlArgs(host = effectiveRuntimeHost()) {
+  return ["api", "-i", "graphql", "--input", "-", ...apiHostArgs(host)];
 }
+
+function graphqlInput(kind, variables) {
+  const declared = pick(GRAPHQL_QUERIES, kind, null);
+  if (!declared) throw new Error(`undeclared graphql query: ${kind}`);
+  if (variables === null) throw new Error(UNRESOLVED_REPOSITORY);
+  return JSON.stringify({ query: declared.query, variables });
+}
+
+// `gh` resolves an omitted repository from the working directory. GraphQL has
+// no such inference, so the slug must be resolved here or the document cannot
+// be built at all -- and running without `--repo` is the documented default.
+//
+// Refusing is deliberate. A half-filled variable set is worse than no request:
+// GitHub answers a missing `String!` with HTTP 200 and an errors array, which
+// is indistinguishable from a denied query, so the tab would report a
+// permission problem for what is really an unresolved target.
+function graphqlRepositoryVariables(repository = effectiveRuntimeRepository()) {
+  if (!repository) return null;
+  const [owner, name] = repository.split("/");
+  return { owner, name };
+}
+
+function graphqlPageVariables(after = null, repository = effectiveRuntimeRepository()) {
+  const target = graphqlRepositoryVariables(repository);
+  return target && { ...target, first: GRAPHQL_PAGE_SIZE, after };
+}
+
+// GitHub answers a rejected query with HTTP 200 and an `errors` array, and can
+// answer a partly-resolvable one with both `data` and `errors`. Headers and
+// envelope are therefore read separately: budget evidence stays usable even
+// when the data is not, which is the only way a failed page can still be paid
+// for honestly.
+function parseGraphqlEnvelope(body) {
+  let envelope;
+  try { envelope = JSON.parse(body); } catch { return { ok: false, reason: "unparseable", errors: [], data: null, rateLimit: null }; }
+  if (!isRecord(envelope)) return { ok: false, reason: "unparseable", errors: [], data: null, rateLimit: null };
+  const errors = Array.isArray(envelope.errors) ? envelope.errors : [];
+  const data = isRecord(envelope.data) ? envelope.data : null;
+  const meter = isRecord(data?.rateLimit) ? data.rateLimit : null;
+  const number = (value) => (Number.isSafeInteger(value) && value >= 0 ? value : null);
+  // A primary window is an hour; anything beyond a generous ceiling is not a
+  // reset this app can wait for, and accepting it would pin an epoch that
+  // `budget.resetMs <= now` never clears.
+  const parsedReset = typeof meter?.resetAt === "string" ? Date.parse(meter.resetAt) : Number.NaN;
+  const resetMs = Number.isFinite(parsedReset) && parsedReset <= Date.now() + GRAPHQL_MAX_RESET_MS
+    ? parsedReset
+    : Number.NaN;
+  const rateLimit = meter && [number(meter.limit), number(meter.used), number(meter.remaining)].every((value) => value !== null) && Number.isFinite(resetMs)
+    ? { resource: "graphql", limit: meter.limit, used: meter.used, remaining: meter.remaining, resetMs, cost: number(meter.cost) }
+    : null;
+  return { ok: errors.length === 0 && data !== null, reason: errors.length > 0 ? "graphql-errors" : data === null ? "no-data" : null, errors, data, rateLimit };
+}
+
 
 function normalizeHost(value) {
   if (typeof value !== "string") return null;
@@ -853,6 +1026,42 @@ function resolveEffectiveHost({
   return hosts.size === 1 ? [...hosts][0] : null;
 }
 
+const UNRESOLVED_REPOSITORY = "Repository could not be resolved; pass --repo owner/name";
+
+// The owner/name half of the same question resolveEffectiveHost answers for the
+// host, and in the same precedence: an explicit --repo, then GH_REPO, then an
+// unambiguous git remote. Ambiguity resolves to null rather than to a guess.
+function remoteSlug(value) {
+  if (typeof value !== "string" || value.length === 0) return null;
+  let path;
+  if (value.includes("://")) {
+    try { path = new URL(value).pathname; } catch { return null; }
+  } else {
+    path = /^(?:[^@\s]+@)?[^:/\s]+:([^\s]+)$/.exec(value)?.[1] ?? null;
+  }
+  if (path === null) return null;
+  const slug = path.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/, "");
+  return REPO_PATTERN.test(slug) ? slug : null;
+}
+
+function resolveEffectiveRepository({ runtimeRepo = null, ghRepo = null, remoteUrls = [] } = {}) {
+  if (runtimeRepo) return runtimeRepo;
+  if (ghRepo) {
+    try { return parseRepoTarget(ghRepo).slug; } catch { return null; }
+  }
+  const slugs = new Set(remoteUrls.map(remoteSlug).filter(Boolean));
+  return slugs.size === 1 ? [...slugs][0] : null;
+}
+
+function effectiveRuntimeRepository(options = {}) {
+  return resolveEffectiveRepository({
+    runtimeRepo: runtime.repo,
+    ghRepo: process.env.GH_REPO,
+    remoteUrls: runtimeRemoteUrls,
+    ...options,
+  });
+}
+
 function effectiveRuntimeHost(options = {}) {
   return resolveEffectiveHost({
     runtimeHost: runtime.host,
@@ -865,11 +1074,6 @@ function effectiveRuntimeHost(options = {}) {
   });
 }
 
-// `--repo` for the list subcommands. Empty when unset, so the argv vector stays
-// byte-identical to what shipped before.
-function repoArgs() {
-  return runtime.repo ? ["--repo", qualifiedRepo()] : [];
-}
 
 // `gh api` has no --repo, so a host-qualified target has nowhere to put its
 // host: GH_REPO=host/owner/repo supplies the owner and repo and *ignores* the
@@ -897,20 +1101,12 @@ function apiPath(path) {
 // inline, because `--doctor` reports these vectors and a second copy of them
 // would be a report that drifts away from what the dashboard actually sends --
 // which is the failure mode the whole diagnostics command exists to rule out.
-function repoContextArgs() {
-  const target = runtime.repo ? qualifiedRepo() : null;
-  return [
-    "repo",
-    "view",
-    ...(target ? [target] : []),
-    "--json",
-    "nameWithOwner,url,viewerPermission",
-  ];
-}
-
+// Parses the explicit repository query's envelope. The shape the rest of the
+// failure context consumes is unchanged; only how it was obtained is.
 function parseRepoContext(raw) {
   try {
-    const value = JSON.parse(raw);
+    const envelope = JSON.parse(raw);
+    const value = isRecord(envelope?.data?.repository) ? envelope.data.repository : envelope;
     if (
       value == null ||
       Array.isArray(value) ||
@@ -981,10 +1177,11 @@ async function resolveFailureContext(signal, governor = null, { run = runGh } = 
         ...governor,
         operation: "failure-context:repository",
         signal,
-        run: (admittedSignal) => run(repoContextArgs(), {
+        run: (admittedSignal) => run(graphqlArgs(), {
           signal: admittedSignal,
           operation: "failure-context:repository",
-        }),
+          input: graphqlInput("repository", graphqlRepositoryVariables()),
+        }).then((stdout) => parseGhApiResponse(stdout).body),
       }).then((result) => result.ok ? result.value : Promise.reject(result.error))
     : Promise.reject(new Error("API budget unavailable"));
   const identity = runtimeIdentityCoordinator?.current();
@@ -1042,7 +1239,12 @@ function actionsRunsArgs(limit) {
     apiPath(`repos/{owner}/{repo}/actions/runs?exclude_pull_requests=true&per_page=${limit}`),
     ...apiHostArgs(),
     "--jq",
-    "[.workflow_runs[] | {databaseId: .id, displayTitle: .display_title, number: .run_number, headBranch: .head_branch, status, conclusion, startedAt: .run_started_at, updatedAt: .updated_at, workflowId: .workflow_id}]",
+    // html_url is projected because a run's page must come from the row itself.
+    // Deriving it from the repository slug only works when --repo was given;
+    // with an inferred repository the app never learns the slug, and the row is
+    // the one place the answer is always present. It costs nothing extra: the
+    // field is already in the response being parsed.
+    "[.workflow_runs[] | {databaseId: .id, displayTitle: .display_title, number: .run_number, headBranch: .head_branch, status, conclusion, startedAt: .run_started_at, updatedAt: .updated_at, workflowId: .workflow_id, url: .html_url}]",
   ];
 }
 
@@ -1070,6 +1272,7 @@ function parseActionsBodies(runsBody, workflowsBody) {
     conclusion: run.conclusion,
     startedAt: run.startedAt,
     updatedAt: run.updatedAt,
+    url: safe(run.url ?? ""),
   }));
 }
 
@@ -1195,85 +1398,188 @@ async function fetchActions(limit, signal, {
   };
 }
 
-// Both list endpoints return created-descending by default, while the row
-// renders updatedAt under a column headed AGE -- so the visible column was
-// non-monotonic (verified against cli/cli: a PR updated yesterday sat below one
-// updated three days earlier) and, worse, truncating to pane height dropped the
-// oldest-*created* rows. A PR opened six months ago and reviewed five minutes
-// ago was invisible. Sorting server-side fixes the ordering and the truncation
-// criterion together; verified that --search composes with --state open and
-// returns the same result count.
-const SORT_RECENT = ["--search", "sort:updated-desc"];
+// Ordering is part of the query now (`orderBy: UPDATED_AT DESC`) rather than a
+// `--search sort:` flag. The AGE column renders updatedAt, so a created-order
+// list made that column non-monotonic and, worse, truncating to pane height
+// dropped the oldest-*created* rows -- a PR opened six months ago and reviewed
+// five minutes ago was invisible. The old fix routed `gh issue list` through
+// GraphQL implicitly and at an unobservable cost; asking for the order directly
+// keeps the behaviour and makes the price visible.
 
-function issuesArgs() {
-  return [
-    "issue",
-    "list",
-    ...repoArgs(),
-    "--state",
-    "open",
-    "--limit",
-    String(LIST_LIMIT),
-    ...SORT_RECENT,
-    "--json",
-    "number,title,author,labels,createdAt,updatedAt",
-  ];
-}
-
-async function fetchIssues(signal) {
-  const raw = await runGh(issuesArgs(), { signal, operation: "tab:issues" });
+// One page of an explicit connection. Headers and envelope are settled
+// separately so a rejected query still pays honestly: GitHub answers those with
+// HTTP 200 and an `errors` array, and its counters are trustworthy even when
+// its data is not.
+async function fetchGraphqlPage(kind, { signal, after = null, run = runGh, operation, host = effectiveRuntimeHost(), variables = null } = {}) {
+  const declared = pick(GRAPHQL_QUERIES, kind, null);
+  if (!declared) throw new Error(`undeclared graphql query: ${kind}`);
+  let stdout;
+  let failure = null;
+  try {
+    stdout = await run(graphqlArgs(host), { signal, operation, input: graphqlInput(kind, variables ?? graphqlPageVariables(after)) });
+  } catch (error) {
+    failure = error;
+    // A failed call can still carry a complete response body: `gh` exits
+    // non-zero on 4xx/5xx but has already written the headers and envelope,
+    // and that is where trustworthy budget evidence lives.
+    stdout = typeof error?.stdout === "string" ? error.stdout : "";
+  }
+  const parsed = parseGhApiResponse(stdout);
+  const envelope = parseGraphqlEnvelope(parsed.body);
+  // Prefer the envelope's meter: it carries this query's actual `cost`, which
+  // the headers do not. Headers remain the fallback when the body is unusable.
+  const meter = envelope.rateLimit ?? pickRateLimit(parsed.headers);
+  // Absent evidence never refunds. An unobserved page keeps its conservative
+  // reservation rather than being treated as free.
+  const observedCost = Number.isSafeInteger(envelope.rateLimit?.cost)
+    ? envelope.rateLimit.cost
+    : declared.points;
+  const observation = meter && meter.resource === "graphql"
+    ? responseHeaderObservation(meter, observedCost)
+    : null;
   return {
-    raw,
-    limit: LIST_LIMIT,
-    // Stated rather than omitted so the zero is visibly deliberate: SORT_RECENT's
-    // --search routes this through GraphQL, which is a separate budget.
-    restSpent: REST_PER_FETCH.issues,
-    graphqlSpent: GRAPHQL_PER_FETCH.issues,
-    parse: () =>
-      parseJsonOutput(raw).map((i) => ({
-        number: i.number,
-        title: safe(i.title),
-        author: safe(i.author?.login ?? ""),
-        label: safe(i.labels?.[0]?.name ?? ""),
-        updatedAt: i.updatedAt,
-      })),
+    kind,
+    status: parsed.status,
+    ok: failure === null && parsed.status === 200 && envelope.ok,
+    reason: failure ? "transport" : parsed.status !== 200 ? "http" : envelope.reason,
+    failure,
+    data: envelope.data,
+    // Recorded in full even when it exceeds the declared bound: an overrun is
+    // evidence to reconcile, not a bookkeeping error to discard.
+    observedCost,
+    overrun: observedCost > declared.points,
+    observations: observation ? [observation] : [],
   };
 }
 
-function prsArgs() {
-  return [
-    "pr",
-    "list",
-    ...repoArgs(),
-    "--state",
-    "open",
-    "--limit",
-    String(LIST_LIMIT),
-    ...SORT_RECENT,
-    "--json",
-    "number,title,author,headRefName,isDraft,reviewDecision,createdAt,updatedAt",
-  ];
+function graphqlConnection(page, connection) {
+  const repository = isRecord(page.data?.repository) ? page.data.repository : null;
+  const value = isRecord(repository?.[connection]) ? repository[connection] : null;
+  return value && Array.isArray(value.nodes) ? value : null;
 }
 
-async function fetchPRs(signal) {
-  const raw = await runGh(prsArgs(), { signal, operation: "tab:prs" });
+const ISSUE_ROW = (node) => ({
+  number: node.number,
+  title: safe(node.title),
+  author: safe(node.author?.login ?? ""),
+  label: safe(node.labels?.nodes?.[0]?.name ?? ""),
+  updatedAt: node.updatedAt,
+  url: safe(node.url ?? ""),
+});
+
+const PR_ROW = (node) => ({
+  number: node.number,
+  title: safe(node.title),
+  author: safe(node.author?.login ?? ""),
+  headRefName: safe(node.headRefName),
+  isDraft: node.isDraft,
+  reviewDecision: node.reviewDecision,
+  updatedAt: node.updatedAt,
+  url: safe(node.url ?? ""),
+});
+
+// Walks the connection one explicitly admitted page at a time. The first page
+// is covered by the tab's own reservation; each later page reserves its own
+// envelope, so a denial there is an ordinary scheduling outcome rather than a
+// hidden overspend. Rows already collected survive that denial and the result
+// is marked incomplete rather than being published as a complete tab.
+async function fetchGraphqlList(kind, mapRow, {
+  signal,
+  governor = null,
+  previousRaw = null,
+  // Seams, so the paging loop can be exercised without a live governor: the
+  // settlement figure it produces was wrong for months of repositories with
+  // more than one page, and nothing could see it.
+  fetchPage = fetchGraphqlPage,
+  admit = runAdmittedOperation,
+} = {}) {
+  const connection = GRAPHQL_QUERIES[kind].connection;
+  const operation = `tab:${kind}`;
+  const first = await fetchPage(kind, { signal, operation });
+  if (!first.ok) {
+    const error = first.failure ?? new Error(`GraphQL ${kind} page unavailable (${first.reason})`);
+    error.budgetObservations = first.observations;
+    throw error;
+  }
+  const rows = [];
+  const observations = [...first.observations];
+  // Only the first page. Pages past it opened their own reservation inside
+  // runAdmittedOperation and settle against it, so adding them here charges the
+  // same work twice -- and a settlement above its reservation is rejected as
+  // corrupt, which silently leaks the tab's reservation and discards every
+  // budget observation the fetch gathered.
+  const envelopeSpent = first.observedCost;
+  let spent = first.observedCost;
+  let page = graphqlConnection(first, connection);
+  let incomplete = false;
+  let overrun = first.overrun;
+  let totalCount = page?.totalCount ?? null;
+  for (const node of page?.nodes ?? []) rows.push(mapRow(node));
+  while (page?.pageInfo?.hasNextPage && rows.length < LIST_LIMIT) {
+    const cursor = page.pageInfo.endCursor;
+    if (typeof cursor !== "string" || cursor.length === 0) { incomplete = true; break; }
+    if (!governor) { incomplete = true; break; }
+    const admitted = await admit({
+      ...governor,
+      operation: `page:${kind}`,
+      priority: "background",
+      signal,
+      run: (admittedSignal) => fetchPage(kind, { signal: admittedSignal, after: cursor, operation: `page:${kind}` }),
+    });
+    // A later page that is denied, fails, or returns errors leaves the rows
+    // already gathered exactly as they are. Losing page one because page two
+    // was refused would turn a budget decision into data loss.
+    //
+    // Note that runAdmittedOperation settles these at their *declared* cost, not
+    // their observed one -- conservative, so never an under-charge. A later
+    // page's real meter reaches the ledger through the observations forwarded to
+    // the tab settlement rather than through its own reservation.
+    // Evidence first, and unconditionally: a page that failed as data still
+    // observed the meter, and dropping that is the one thing this phase says
+    // it will not do.
+    if (admitted.value?.observations) observations.push(...admitted.value.observations);
+    if (admitted.value?.overrun) overrun = true;
+    if (!admitted.ok || !admitted.value?.ok) { incomplete = true; break; }
+    const next = admitted.value;
+    spent += next.observedCost;
+    page = graphqlConnection(next, connection);
+    if (!page) { incomplete = true; break; }
+    for (const node of page.nodes) rows.push(mapRow(node));
+  }
+  if (page?.pageInfo?.hasNextPage && rows.length >= LIST_LIMIT) incomplete = true;
+  if (overrun) {
+    // Recorded at its real cost above; suspended here until the resource resets,
+    // which is the soonest a corrected bound could be trusted again.
+    const reset = observations.at(-1)?.resetMs;
+    pauseOperation(operation, Number.isFinite(reset) ? reset + BUDGET_RESET_GRACE_MS : Date.now() + BUDGET_PROBE_MS);
+  }
+  const limited = rows.slice(0, LIST_LIMIT);
+  // Serialized rows are the payload identity the unchanged-frame suppression
+  // and the cache both compare on, so it must cover exactly what is rendered.
+  const raw = JSON.stringify({ v: GRAPHQL_QUERY_VERSION, totalCount, incomplete, rows: limited });
   return {
-    raw,
-    limit: LIST_LIMIT,
-    // Zero for the same reason as issues: --search makes this a GraphQL call.
-    restSpent: REST_PER_FETCH.prs,
-    graphqlSpent: GRAPHQL_PER_FETCH.prs,
-    parse: () =>
-      parseJsonOutput(raw).map((p) => ({
-        number: p.number,
-        title: safe(p.title),
-        author: safe(p.author?.login ?? ""),
-        headRefName: safe(p.headRefName),
-        isDraft: p.isDraft,
-        reviewDecision: p.reviewDecision,
-        updatedAt: p.updatedAt,
-      })),
+    raw: raw === previousRaw ? previousRaw : raw,
+    // An incomplete walk reports the rows it has as its own limit, so the
+    // existing truncation indicator fires. "More rows exist than are shown" is
+    // exactly what incomplete means, and publishing 50 of 150 rows as a
+    // complete tab is indistinguishable from a repository with 50 open issues.
+    limit: incomplete ? limited.length : LIST_LIMIT,
+    restSpent: 0,
+    graphqlSpent: envelopeSpent,
+    // What the whole walk cost, for reporting. Never the settlement figure.
+    graphqlSpentTotal: spent,
+    observations,
+    incomplete,
+    parse: () => limited,
   };
+}
+
+async function fetchIssues(signal, { governor = null, previousRaw = null } = {}) {
+  return fetchGraphqlList("issues", ISSUE_ROW, { signal, governor, previousRaw });
+}
+
+async function fetchPRs(signal, { governor = null, previousRaw = null } = {}) {
+  return fetchGraphqlList("prs", PR_ROW, { signal, governor, previousRaw });
 }
 
 // The three alert endpoints were three near-identical 26-line blocks that had
@@ -1375,10 +1681,14 @@ const OPERATION_COSTS = Object.freeze({
   "tab:actions-runs": { core: 1, graphql: 0 },
   "tab:actions-workflows": { core: 1, graphql: 0 },
   "tab:security-endpoint": { core: 1, graphql: 0 },
-  "failure-context:repository": { core: 0, graphql: 1 },
-  "open:actions": { core: REST_PER_FETCH.actions, graphql: 0 },
-  "open:issues": { core: 0, graphql: GRAPHQL_PER_FETCH.issues },
-  "open:prs": { core: 0, graphql: GRAPHQL_PER_FETCH.prs },
+  "failure-context:repository": { core: 0, graphql: GRAPHQL_OBSERVER_POINTS },
+  // Each page past the first reserves its own envelope, so a denial there is a
+  // scheduling outcome rather than an unadmitted overspend.
+  "page:issues": { core: 0, graphql: GRAPHQL_PAGE_POINTS },
+  "page:prs": { core: 0, graphql: GRAPHQL_PAGE_POINTS },
+  // The one claimed GraphQL observer. Not free, and not describable as free:
+  // it selects the meter and pays a point for it.
+  "graphql-observer": { core: 0, graphql: GRAPHQL_OBSERVER_POINTS },
   "doctor:repository": { core: 0, graphql: 1 },
   "doctor:actions-runs": { core: 1, graphql: 0 },
   "doctor:actions-workflows": { core: 1, graphql: 0 },
@@ -2150,7 +2460,13 @@ function inspectLegacyMigration(root, state, now) {
     let raw;
     try { raw = JSON.parse(readFileSync(join(dirname(root), name), "utf8")); } catch { return { ok: false, reason: "legacy-corrupt" }; }
     // Evidence is never rewritten. Recognize only the pinned legacy schemas.
-    const legacy = normalizeGovernorState(raw, now, { prune: false }) ?? migrateGovernorState(raw, now);
+    // Every protocol an older pane could still be running, newest first. The set
+    // grows as GOVERNOR_STATE_VERSION advances: a version bump makes an old
+    // binary fail closed on its own gate, but this side must still recognise
+    // that binary's file well enough to see it holds a live lease.
+    const legacy = LEGACY_GOVERNOR_VERSIONS
+      .map((version) => normalizeGovernorState(raw, now, { prune: false, acceptVersion: version }))
+      .find(Boolean) ?? migrateGovernorState(raw, now);
     if (legacy && raw.version === 1 && raw.budgets?.core) {
       const core = raw.budgets.core;
       const preserved = normalizeGovernorBudget({ ...core, source: "core-observer", factorBaseline: { epoch: core.epoch, used: core.used, observedAt: core.observedAt }, knownLocalUsed: 0 }, now, "core");
@@ -2607,7 +2923,14 @@ function identityCoordinationMessage(reason) {
 // the same file so an older process sees the new exact shape and fails closed
 // instead of coordinating through a second file.
 const GOVERNOR_SCOPE_VERSION = 1;
-const GOVERNOR_STATE_VERSION = 2;
+// 3: GraphQL budgets carry `graphql-observer` provenance. An older build does
+// not know that source and would reject the budget -- and normalizeGovernorState
+// turns one rejected budget into total loss, discarding every live pane's
+// leases, intents and reservations. The version gate makes it fail closed on the
+// file instead, which is the whole point of having one.
+const GOVERNOR_STATE_VERSION = 3;
+// Readable-as-evidence, never written: 2 is the shape a 0.11.x pane still holds.
+const LEGACY_GOVERNOR_VERSIONS = [GOVERNOR_STATE_VERSION, 2];
 const GOVERNOR_MAX_LEASES = 128;
 const GOVERNOR_MAX_INTENTS = 512;
 const GOVERNOR_MAX_RESERVATIONS = 512;
@@ -2759,8 +3082,12 @@ function normalizeGovernorBudget(raw, nowMs, resource = null) {
     (raw.blockReason !== null && !GOVERNOR_BLOCK_REASONS.has(raw.blockReason)) ||
     (raw.roundRobinCursor !== null && !validGovernorId(raw.roundRobinCursor)) ||
     !Number.isFinite(raw.lastExternalFactor) || raw.lastExternalFactor < 1 ||
-    !["response-header", "core-observer", "rate-limit-probe"].includes(raw.source) ||
-    raw.source === "rate-limit-probe" && resource === "core" ||
+    !["response-header", "core-observer", "graphql-observer", "rate-limit-probe"].includes(raw.source) ||
+    // "rate-limit-probe" is retained as readable legacy provenance only: ledgers
+    // written before the claimed GraphQL observer existed still carry it. Nothing
+    // writes it any more, and neither it nor the GraphQL observer may ever stand
+    // as core authority.
+    ["rate-limit-probe", "graphql-observer"].includes(raw.source) && resource === "core" ||
     !exactKeys(raw.factorBaseline, ["epoch", "used", "observedAt"]) ||
     !validGovernorEpoch(raw.factorBaseline.epoch) ||
     !Number.isSafeInteger(raw.factorBaseline.used) || raw.factorBaseline.used < 0 ||
@@ -2890,11 +3217,15 @@ function normalizeManualProbe(raw, nowMs) {
   return { ...raw };
 }
 
-function normalizeGovernorState(raw, nowMs, { prune = true } = {}) {
+// `acceptVersion` exists for one caller: the legacy inspector, which must be
+// able to *read* a still-running older pane's file to see its live leases. It
+// never publishes what it reads. Every other caller takes the default, so a
+// version this build does not write is unreadable and fails closed.
+function normalizeGovernorState(raw, nowMs, { prune = true, acceptVersion = GOVERNOR_STATE_VERSION } = {}) {
   if (!exactKeys(raw, [
     "version", "epochs", "budgets", "observers", "probeClaim", "probeOutcome", "leases",
     "intents", "reservations", "manualProbe",
-  ]) || raw.version !== GOVERNOR_STATE_VERSION) return null;
+  ]) || raw.version !== acceptVersion) return null;
   if (
     !exactKeys(raw.epochs, RATE_RESOURCES) ||
     RATE_RESOURCES.some((resource) => raw.epochs[resource] !== null && !validGovernorEpoch(raw.epochs[resource])) ||
@@ -2966,16 +3297,15 @@ function migrateGovernorState(raw, nowMs) {
   // preserve it as bootstrap evidence. GraphQL remains valid.
   delete migrated.budgets.core;
   migrated.epochs.core = null;
-  if (migrated.budgets.graphql) {
-    const budget = migrated.budgets.graphql;
-    budget.source = "rate-limit-probe";
-    budget.factorBaseline = {
-      epoch: budget.epoch,
-      used: budget.used,
-      observedAt: budget.observedAt,
-    };
-    budget.knownLocalUsed = 0;
-  }
+  // The v1 GraphQL value came from /rate_limit, for the same reason the core
+  // value did, and is dropped for the same reason: this phase makes that
+  // endpoint explicitly non-authoritative, and "never a source of spendable
+  // capacity" cannot have an exception for numbers that arrived before the rule.
+  // Keeping it would let a migrated pane admit GraphQL work against it and let
+  // it establish the epoch later headers refine. The claimed observer
+  // re-establishes capacity on the next probe.
+  delete migrated.budgets.graphql;
+  migrated.epochs.graphql = null;
   for (const reservation of Object.values(migrated.reservations)) {
     reservation.accountedCosts = { core: 0, graphql: 0 };
   }
@@ -3470,8 +3800,8 @@ function budgetFromObservation(raw, previous, nowMs, {
   if (
     !normalized || normalized.resetMs <= nowMs || receivedAt > nowMs ||
     !RATE_RESOURCES.includes(resource) ||
-    !["response-header", "core-observer", "rate-limit-probe"].includes(source) ||
-    resource === "core" && source === "rate-limit-probe"
+    !["response-header", "core-observer", "graphql-observer", "rate-limit-probe"].includes(source) ||
+    resource === "core" && ["rate-limit-probe", "graphql-observer"].includes(source)
   ) return { status: "invalid" };
   const epoch = `${normalized.limit}:${normalized.resetMs}`;
   // Endpoint responses can carry cached or endpoint-specific rate headers.
@@ -3532,12 +3862,16 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs) {
     if (!claim.resources.every((resource) => budgets?.[resource])) {
       return { ok: false, reason: "corrupt" };
     }
+    const observerCosts = {};
     for (const resource of claim.resources) {
       const supplied = budgets?.[resource];
       if (!supplied) continue;
       const raw = supplied.budget ?? supplied;
-      const source = supplied.source ?? (resource === "core" ? "core-observer" : "rate-limit-probe");
-      const ownerSource = resource === "core" ? "core-observer" : "rate-limit-probe";
+      // The owner source names what actually established the number. Calling a
+      // GraphQL budget a "rate-limit-probe" was accurate when /rate_limit supplied
+      // it and is a lie now that the claimed observer does.
+      const source = supplied.source ?? (resource === "core" ? "core-observer" : "graphql-observer");
+      const ownerSource = resource === "core" ? "core-observer" : "graphql-observer";
       if (source !== ownerSource) return { ok: false, reason: "corrupt" };
       const observed = budgetFromObservation(raw, state.budgets[resource], at, {
         resource,
@@ -3548,6 +3882,10 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs) {
       });
       if (observed.status === "invalid") return { ok: false, reason: "corrupt" };
       if (observed.status === "ignored") continue;
+      // The observer's own cost is local spend. Left out, the external-factor
+      // reconciliation below attributes it to other clients, and the governor
+      // throttles the user's real work to make room for its own probing.
+      observerCosts[resource] = Number.isSafeInteger(supplied.cost) && supplied.cost > 0 ? supplied.cost : 0;
       nextBudgets[resource] = observed.budget;
       if (resource === "core" && supplied.blocked === true) {
         nextBudgets[resource].blockUntil = observed.budget.resetMs;
@@ -3576,7 +3914,7 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs) {
       const factor = nextExternalFactor({
         lastExternalFactor: previous.lastExternalFactor,
         globalUsedDelta: nextBudgets[resource].used - baseline.used,
-        sharedCompletedDelta: previous.knownLocalUsed + legacyCompletedDelta,
+        sharedCompletedDelta: previous.knownLocalUsed + legacyCompletedDelta + (observerCosts[resource] ?? 0),
       });
       if (factor === null) return { ok: false, reason: "corrupt" };
       nextBudgets[resource].lastExternalFactor = factor;
@@ -4072,10 +4410,24 @@ async function refreshSharedBudget(scope, leaseId, signal, {
     failProbeClaim(scope, leaseId, nonce, now());
     return renewed;
   }
+  // Known exhaustion waits for its actual reset. The GraphQL observer costs a
+  // point, so probing an already-empty budget to be told it is still empty digs
+  // the hole deeper -- the /rate_limit read this replaced was free and could
+  // afford to be unconditional.
+  const beforeRead = inspect(scope, now());
+  const spendable = resources.filter((resource) => {
+    if (resource !== "graphql" || !beforeRead.ok) return true;
+    const budget = beforeRead.value.budgets.graphql;
+    return !(budget && budget.remaining <= 0 && now() < budget.resetMs + BUDGET_RESET_GRACE_MS);
+  });
+  if (spendable.length === 0) {
+    failProbeClaim(scope, leaseId, nonce, now());
+    return { ok: false, reason: "budget-reset" };
+  }
   let budgets;
   try {
     budgets = await requestIdentityStorage.run(scope, () => readBudgets(signal, scope.host, {
-      resources,
+      resources: spendable,
       coreEtag,
       renewClaim: async () => {
         const startedAt = now();
@@ -4436,36 +4788,72 @@ function reconcileSelectionViewport({ items, key, offset = 0, rows = 1 }) {
   return { key, offset: nextOffset };
 }
 
-// `gh <kind> view --web` for the tabs that have a per-item command. The Security
-// tab is absent on purpose: alerts have no `gh` view subcommand, so there is
-// nothing honest to open.
-const OPENABLE = { actions: "run", issues: "issue", prs: "pr" };
+// The tabs with a per-item URL. Security is absent on purpose: an alert has no
+// stable per-item page this app can construct honestly.
+const OPENABLE = ["actions", "issues", "prs"];
 
-// Output is captured rather than inherited. `gh ... --web` prints "Opening ...
-// in your browser" to stdout, and stdout is ink's frame stream -- letting that
-// through would corrupt the diff and the alternate screen.
-//
-// `gh run view` takes the run's databaseId, not its display `number` -- the
-// two are different ID spaces (databaseId is global across GitHub, number is
-// per-workflow and restarts near 1 in every repo), so a run's `number` is
-// almost never a valid databaseId elsewhere and 404s. `gh issue view` and
-// `gh pr view` are the opposite: they take the issue/PR number, and neither
-// row shape carries a databaseId to prefer instead.
-async function openInBrowser(tabKey, item, signal, governor = null, { run = runGh } = {}) {
-  const kind = pick(OPENABLE, tabKey, null);
-  const id = kind === "run" ? (item?.databaseId ?? item?.number) : (item?.number ?? item?.databaseId);
-  if (!kind || id == null) return;
-  if (!governor) throw new Error("API budget unavailable; refresh and try again");
-  const admitted = await runAdmittedOperation({
-    ...governor,
-    operation: `open:${tabKey}`,
-    signal,
-    run: (admittedSignal) => run([kind, "view", ...repoArgs(), String(id), "--web"], {
-      signal: admittedSignal,
-      operation: `open:${tabKey}`,
-    }),
+// The platform's opener, by fixed argv and without a shell, so a URL is an
+// argument and never a fragment of a command line.
+// rundll32 rather than `cmd /c start ""`: cmd re-parses its /c string, so a URL
+// handed to it is a fragment of a command line and its metacharacters are live.
+// FileProtocolHandler takes the URL as one real argument, which is the whole
+// point of using execFile without a shell.
+const BROWSER_OPENERS = {
+  darwin: ["open"],
+  linux: ["xdg-open"],
+  win32: ["rundll32", "url.dll,FileProtocolHandler"],
+};
+
+// Only https, and only the host this pane is actually talking to. A row is
+// remote data; without this a crafted `url` could point the user's browser
+// anywhere, or hand a `file:`/`javascript:` URL to the platform opener.
+function admittedRowUrl(value, host) {
+  if (typeof value !== "string" || value.length === 0) return null;
+  let parsed;
+  try { parsed = new URL(value); } catch { return null; }
+  if (parsed.protocol !== "https:") return null;
+  return parsed.host === host ? parsed.toString() : null;
+}
+
+// Actions rows come from REST and carry no URL, but a run's page is a pure
+// function of the repository and its databaseId -- both already validated --
+// so it is derived locally rather than fetched. Issues and PRs select `url` in
+// their query, which is validated against the same host before use.
+function rowBrowserUrl(tabKey, item, { host = effectiveRuntimeHost(), repo = effectiveRuntimeRepository() } = {}) {
+  if (!OPENABLE.includes(tabKey) || !isRecord(item) || !host) return null;
+  // The row's own URL first, for every tab. A run only falls back to a derived
+  // URL when the payload predates the projection, and that fallback needs the
+  // slug, which the app only has when --repo was given.
+  const declared = admittedRowUrl(item.url, host);
+  if (declared || tabKey !== "actions") return declared;
+  const id = item.databaseId ?? item.number;
+  if (!Number.isSafeInteger(id) || id <= 0 || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(repo ?? ""))) return null;
+  return `https://${host}/${repo}/actions/runs/${id}`;
+}
+
+// Opening a page the row already names costs nothing and needs no admission:
+// `gh <kind> view --web` spent a request to be told a URL that was already in
+// hand. Output is still captured rather than inherited, because stdout is ink's
+// frame stream and an opener's chatter would corrupt the alternate screen.
+async function openInBrowser(tabKey, item, signal, _governor = null, { run = null, host, repo } = {}) {
+  if (!OPENABLE.includes(tabKey)) return;
+  const url = rowBrowserUrl(tabKey, item, {
+    ...(host === undefined ? {} : { host }),
+    ...(repo === undefined ? {} : { repo }),
   });
-  if (!admitted.ok) throw admitted.error;
+  // Returning quietly here is how a dead Enter key looks: the row has no usable
+  // page, and the user is entitled to know that rather than press it again.
+  if (!url) throw new Error("This row has no page to open yet; refresh and try again");
+  const opener = pick(BROWSER_OPENERS, process.platform, null);
+  if (!opener) throw new Error(`Opening a browser is not supported on ${process.platform}`);
+  const [command, ...prefix] = opener;
+  const launch = run ?? ((argv) => execFileAsync(argv[0], argv.slice(1), {
+    timeout: GH_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+    maxBuffer: GH_MAX_BUFFER,
+    signal,
+  }));
+  await launch([command, ...prefix, url]);
 }
 
 function createOpenRequestRegistry() {
@@ -4631,10 +5019,16 @@ async function captureGh(args, operation) {
 
 const PROBE_STDERR_LIMIT = 400;
 
-async function probe(name, args, operation) {
+async function probe(name, args, operation, input = null) {
   const startedAt = Date.now();
+  // A declared local prerequisite the run cannot satisfy is reported, not
+  // attempted: starting a request whose document cannot be built would spend a
+  // reservation to receive a GraphQL error that says nothing about the tenant.
+  if (input === UNRESOLVED_REPOSITORY) {
+    return { name, args, ms: 0, failed: true, stderr: UNRESOLVED_REPOSITORY, http: null, classified: "unavailable" };
+  }
   try {
-    const stdout = await runGh(args, { operation });
+    const stdout = await runGh(args, { operation, input });
     return { name, args, ms: Date.now() - startedAt, bytes: stdout.length, classified: "ok" };
   } catch (err) {
     return {
@@ -4715,6 +5109,28 @@ function targetSource() {
 // measures as free (verified: delta 0), so this is safe to run on a diagnostic
 // path. GHES tenants can be configured with a different ceiling, which is
 // exactly why this reports the server's own numbers rather than asserting 5,000.
+// The claimed GraphQL observer, and the only source of spendable GraphQL
+// capacity. `/rate_limit` used to supply this number for free, but a counter
+// obtained for free is not authority: it is another endpoint's view of the
+// meter, it can lag behind the spend it is meant to bound, and it can never
+// report what a particular query actually cost. This query costs a point and
+// says exactly what it cost, which is what makes it reconcilable.
+async function readGraphqlObserver(signal, host = effectiveRuntimeHost(), {
+  fetchPage = fetchGraphqlPage,
+} = {}) {
+  const page = await fetchPage("observer", { signal, operation: "graphql-observer", host, variables: {} });
+  const observed = page.observations[0];
+  if (!observed || observed.resource !== "graphql") return null;
+  return {
+    budget: { remaining: observed.remaining, limit: observed.limit, used: observed.used, resetMs: observed.resetMs },
+    receivedAt: observed.receivedAt,
+    cost: page.observedCost,
+  };
+}
+
+// Report data only, and explicitly not authority: it is left available because
+// a diagnostic that can contradict the observer is useful evidence, and pinned
+// as non-authoritative so it can never be mistaken for spendable capacity.
 async function readRateLimitResources(signal, host = effectiveRuntimeHost()) {
   const raw = await runGh(["api", "rate_limit", ...apiHostArgs(host)], {
     signal,
@@ -4805,20 +5221,21 @@ async function readSharedBudgetSources(signal, host = effectiveRuntimeHost(), {
   resources = RATE_RESOURCES,
   coreEtag = null,
   renewClaim = null,
-  readGraphql = readRateLimitResources,
+  readGraphql = readGraphqlObserver,
   readCore = readCoreBudget,
 } = {}) {
   const result = {};
   if (resources.includes("graphql")) {
-    const rateResources = await readGraphql(signal, host).catch(() => null);
-    const graphql = normalizeRateBudget(rateResources?.graphql);
-    if (!graphql) return null;
-    result.graphql = { budget: graphql, receivedAt: Date.now(), cost: 0 };
+    const observed = await readGraphql(signal, host).catch(() => null);
+    if (!observed?.budget) return null;
+    result.graphql = observed;
   }
   if (resources.includes("core")) {
-    // Each gh command is independently bounded, but two sequential commands
-    // can outlive one claim. Extend the same nonce after the free GraphQL read
-    // and before the one-cost bootstrap observer can start.
+    // Each gh command is independently bounded, but two sequential commands can
+    // outlive one claim. Extend the same nonce between the two observers. The
+    // GraphQL read is no longer the free one -- it costs a point of its own now
+    // -- so this renewal separates two charged requests, not a free one from a
+    // charged one.
     if (resources.includes("graphql") && typeof renewClaim === "function" && !await renewClaim()) return null;
     const core = await readCore(signal, host, coreEtag);
     if (core) result.core = core;
@@ -4840,12 +5257,21 @@ function projectedHourlyCost(activeKey) {
 }
 
 function doctorProbePlan() {
+  // GraphQL cannot infer a repository the way `gh` does, so a report run from a
+  // directory with no unambiguous remote says so per probe instead of sending a
+  // document with a missing variable and reporting the resulting error as if it
+  // came from the server.
+  const target = effectiveRuntimeRepository();
+  const document = (kind, variables) => (variables ? graphqlInput(kind, variables) : UNRESOLVED_REPOSITORY);
   return [
-    ["Repository access", repoContextArgs(), "doctor:repository"],
+    // Every probe is now an explicit request whose cost is declared. The old
+    // Issues/PRs entries ran `gh issue list`/`gh pr list`, whose `--search`
+    // routed through GraphQL at a price the report could not name.
+    ["Repository access", graphqlArgs(), "doctor:repository", document("repository", graphqlRepositoryVariables(target)), "repository"],
     ["Actions runs", ghApiArgs(actionsRunsArgs(MIN_RUN_LIMIT)), "doctor:actions-runs"],
     ["Actions workflows", ghApiArgs(actionsWorkflowsArgs()), "doctor:actions-workflows"],
-    ["Issues (issue list)", issuesArgs(), "doctor:issues"],
-    ["Pull requests (pr list)", prsArgs(), "doctor:prs"],
+    ["Issues (first page)", graphqlArgs(), "doctor:issues", document("issues", graphqlPageVariables(null, target)), "issues"],
+    ["Pull requests (first page)", graphqlArgs(), "doctor:prs", document("prs", graphqlPageVariables(null, target)), "prs"],
     ...ALERT_SOURCES.flatMap((source) =>
       alertRequestArgs(source).map((args, index) => [
         index === 0 ? source.name : `${source.name} (priority ${index})`,
@@ -4930,19 +5356,20 @@ async function runDoctor() {
     try {
       if (registered.ok) await refreshSharedBudget(scope, leaseId, undefined);
       const admissionAt = Date.now();
-      const admittedProbes = probes.map(([name, args, operation], index) => {
+      const admittedProbes = probes.map(([name, args, operation, input = null, document = null], index) => {
         const admitted = registered.ok
           ? admitGovernorOperation(scope, leaseId, operation, "diagnostic", admissionAt)
           : registered;
         if (!admitted?.ok || admitted.value.status !== "started") {
-          return { index, skipped: skippedDoctorProbe(name, args, admitted) };
+          return { index, skipped: { ...skippedDoctorProbe(name, args, admitted), ...(document ? { document } : {}) } };
         }
-        return { index, name, args, operation, reservationId: admitted.value.reservationId };
+        return { index, name, args, operation, input, document, reservationId: admitted.value.reservationId };
       });
       results = admittedProbes.map((item) => item.skipped ?? null);
       const runnable = admittedProbes.filter((item) => !item.skipped);
       const settled = await mapAllSettledBounded(runnable, 4, async (item) => {
-        const result = await requestIdentityStorage.run(scope, () => probe(item.name, item.args, item.operation));
+        const result = await requestIdentityStorage.run(scope, () => probe(item.name, item.args, item.operation, item.input));
+        if (item.document) result.document = item.document;
         completeReservation({ ...scope, identityProvider: null }, item.reservationId, result.failed
           ? { outcome: "rejected" }
           : { outcome: "measured-success", actualCost: operationCost(item.operation) }, Date.now());
@@ -4984,7 +5411,12 @@ async function runDoctor() {
     field("slug", runtime.repo ?? "(inferred from the working directory)"),
     field("git remote", remote),
     "",
-    ...section("API budget"),
+    // Labelled, because these two numbers come from `gh api rate_limit`, which
+    // this version treats as a diagnostic and never as spendable capacity. The
+    // "API governor" section below carries the numbers actually admitted
+    // against, with their provenance. A reader who cannot tell the two apart
+    // will believe the wrong one.
+    ...section("API budget (rate_limit, non-authoritative)"),
     field("REST core", budget.core),
     field("GraphQL", budget.graphql),
     field(
@@ -5019,6 +5451,10 @@ async function runDoctor() {
   for (const result of results) {
     lines.push(`  ${result.name}`);
     probeLine("argv", `gh ${result.args.join(" ")}`);
+    // Three GraphQL probes share one argv, and the document that distinguishes
+    // them travels on stdin. A report that cannot say which query it sent is
+    // exactly the drift this command exists to rule out.
+    if (result.document) probeLine("document", result.document);
     probeLine(
       "outcome",
       result.skipped
@@ -6097,7 +6533,7 @@ const TABS = [
   },
   {
     key: "issues",
-    fetch: ({ signal }) => fetchIssues(signal),
+    fetch: ({ signal, governor, previousRaw }) => fetchIssues(signal, { governor, previousRaw }),
     label: "Issues",
     short: "Issues",
     header: ISSUES_HEADER,
@@ -6107,7 +6543,7 @@ const TABS = [
   },
   {
     key: "prs",
-    fetch: ({ signal }) => fetchPRs(signal),
+    fetch: ({ signal, governor, previousRaw }) => fetchPRs(signal, { governor, previousRaw }),
     label: "Pull requests",
     short: "PRs",
     header: PRS_HEADER,
@@ -6657,7 +7093,8 @@ const createWidthPreferenceWriter = createCoalescedWriter;
 
 // ---------- Last-known-good dashboard cache ----------
 
-const DASHBOARD_CACHE_VERSION = 2;
+// 3: cached rows carry their page URL, without which they cannot be opened.
+const DASHBOARD_CACHE_VERSION = 3;
 const MAX_DASHBOARD_CACHE_TARGETS = 5;
 const MAX_DASHBOARD_CACHE_ROWS_PER_TAB = 60;
 let dashboardCacheTempSequence = 0;
@@ -6746,6 +7183,9 @@ function normalizeCachedItem(tabKey, item) {
       conclusion: item.conclusion == null ? null : safe(item.conclusion),
       startedAt: safe(item.startedAt),
       updatedAt: safe(item.updatedAt),
+      // Retained because opening a row now reads its URL from the row. Dropping
+      // it made Enter on a cache-hydrated row do nothing at all, with no error.
+      url: safe(item.url ?? ""),
     };
   }
   if (tabKey === "issues") {
@@ -6756,6 +7196,7 @@ function normalizeCachedItem(tabKey, item) {
       author: safe(item.author),
       label: safe(item.label),
       updatedAt: safe(item.updatedAt),
+      url: safe(item.url ?? ""),
     };
   }
   if (tabKey === "prs") {
@@ -6768,6 +7209,7 @@ function normalizeCachedItem(tabKey, item) {
       isDraft: Boolean(item.isDraft),
       reviewDecision: safe(item.reviewDecision),
       updatedAt: safe(item.updatedAt),
+      url: safe(item.url ?? ""),
     };
   }
   if (tabKey === "security") {
@@ -9279,6 +9721,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           runLimit: runLimitRef.current,
           entities: entityRef.current,
           force,
+          governor: { scope: currentScope, leaseId },
           previousRaw: rawRef.current[key] ?? null,
         }),
         {
@@ -9365,6 +9808,7 @@ function App({ onCreateRemote = () => {} } = {}) {
             runLimit: runLimitRef.current,
             entities: entityRef.current,
             force: item.force,
+            governor: { scope: currentScope, leaseId },
             previousRaw: rawRef.current[key] ?? null,
           }),
           {
@@ -10016,7 +10460,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       canMove: allItems.length > 0,
       canOpen:
         selectedKey !== null &&
-        Object.hasOwn(OPENABLE, tab.key) &&
+        OPENABLE.includes(tab.key) &&
         allItems.some((item) => itemKey(item) === selectedKey),
       canResize: fullHeaderVisible,
     }),
@@ -10462,6 +10906,24 @@ export {
   forcedBackoffKeys,
   clearForcedBackoffAfterStart,
   doctorProbePlan,
+  rowBrowserUrl,
+  admittedRowUrl,
+  remoteSlug,
+  resolveEffectiveRepository,
+  graphqlPageVariables,
+  graphqlRepositoryVariables,
+  parseGraphqlEnvelope,
+  graphqlInput,
+  graphqlArgs,
+  fetchGraphqlPage,
+  fetchGraphqlList,
+  operationPausedUntil,
+  LIST_LIMIT,
+  readGraphqlObserver,
+  GRAPHQL_QUERIES,
+  GRAPHQL_PAGE_SIZE,
+  GRAPHQL_PAGE_POINTS,
+  GRAPHQL_OBSERVER_POINTS,
   mapAllSettledBounded,
   alertRequestArgs,
   shouldFetchAlertPriorityLanes,

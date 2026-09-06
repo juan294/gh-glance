@@ -52,13 +52,19 @@ function starts(state, predicate) {
 }
 
 function probes(state) {
-  return starts(state, (event) => event.argv[0] === "api" && event.argv[1] === "rate_limit");
+  // The shared budget probe is the claimed GraphQL observer now. `api
+  // rate_limit` is no longer authority, so it is not what panes coordinate on.
+  return starts(state, (event) => event.graphqlOperation === "graphql.observer");
 }
 
 function dataStarts(state) {
   return starts(state, (event) =>
     ["run", "issue", "pr"].includes(event.argv[0]) ||
-    event.argv[0] === "api" && event.argv[1] !== "rate_limit" && !event.argv.includes("user"));
+    (event.graphqlOperation
+      // The claimed observer is control-plane work, not data. It shares its
+      // command line with every page, so only the parsed operation separates them.
+      ? event.graphqlOperation !== "graphql.observer"
+      : event.argv[0] === "api" && event.argv[1] !== "rate_limit" && !event.argv.includes("user")));
 }
 
 function isActionsEndpoint(event) {
@@ -253,8 +259,10 @@ test("twelve mixed active panes pace core and GraphQL without consuming either r
   assert.ok(data.some((event) => event.cost.graphql > 0));
   for (const event of data) {
     if (event.pane.includes("-actions-")) assert.ok(isActionsEndpoint(event));
-    if (event.pane.includes("-issues-")) assert.equal(event.argv[0], "issue");
-    if (event.pane.includes("-prs-")) assert.equal(event.argv[0], "pr");
+    // Semantic, not argv-shaped: Issues and PRs are both `api -i graphql` now,
+    // so only the parsed operation says which tab a pane was actually serving.
+    if (event.pane.includes("-issues-")) assert.equal(event.graphqlOperation, "issues.page");
+    if (event.pane.includes("-prs-")) assert.equal(event.graphqlOperation, "pulls.page");
     if (event.pane.includes("-security-")) assert.equal(event.argv[0], "api");
   }
   assertDebitsStayOutsideReserve(data);
@@ -397,7 +405,7 @@ test("a held core pane switches to Issues and spends only GraphQL", async (t) =>
   const state = box.read();
   const data = dataStarts(state, "isolation");
   assert.equal(data.filter((event) => event.cost.core > 0).length, 0);
-  assert.equal(data.filter((event) => event.argv[0] === "issue").length, 1);
+  assert.equal(data.filter((event) => event.graphqlOperation === "issues.page").length, 1);
   assert.equal(data.filter((event) => event.cost.graphql > 0).length, 1);
   const statuses = result.liveScreen.statusHistory;
   const pausedAt = statuses.findIndex((status) => / Paused(?:\s|$)/.test(status));
@@ -524,7 +532,9 @@ test("a real reset resumes all panes, while atomic external burn limits the next
 
 test("probe and reservation owner crashes recover without optimistic spend", { timeout: 120_000 }, async (t) => {
   const probeBox = fixture(t, {
-    delayByCommand: { rate_limit: { ms: 30_000, remaining: 1 } },
+    // The shared budget probe is the claimed GraphQL observer now, so that is
+    // the call this test has to hold open long enough to kill its owner.
+    delayByCommand: { "graphql-observer": { ms: 30_000, remaining: 1 } },
   });
   const probeOwnerReady = join(probeBox.root, "probe-owner-ready");
   const crashedProbeCapture = startPane(probeBox, "probe-owner", {

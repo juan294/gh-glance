@@ -113,3 +113,43 @@ Migration may wait for a real rate-limit reset, and damaged coordination needs
 investigation rather than automatic state deletion. The independent fixture
 oracle, pinned legacy protocol fixture and identity scenarios verify these
 boundaries without network credentials.
+
+## Amendment: explicit GraphQL requests (phase 3)
+
+Issues and pull requests are fetched with fixed, versioned GraphQL documents
+carrying typed variables on stdin, replacing `gh issue list` / `gh pr list`.
+The porcelain was not merely opaque: its `--search sort:updated-desc` routed the
+call through GraphQL at a price nothing in this codebase could name, so the
+budget was debited by a number that had been measured once by hand and written
+down. The documents are separate per resource on purpose -- one document with
+two connections cannot publish either tab until both halves resolve, which is a
+completion barrier, not an optimisation.
+
+The document travels on stdin rather than in argv, so a query never appears in
+`ps` output or in an error string, and its size is bounded by a pipe rather than
+by the platform argument limit.
+
+Each page declares a conservative two-point bound and each observer one point.
+An actual cost above its bound is recorded at its real value and pauses that
+operation for reconciliation; it is never clamped to the bound, because a clamp
+would under-charge the ledger precisely when the estimate was wrong. Absent cost
+evidence never refunds: an unobserved page keeps its conservative reservation.
+
+A GraphQL response can be HTTP 200 and still be a refusal, carrying `errors` and
+no data, or partial data alongside errors. Headers and envelope are therefore
+settled separately. Budget evidence from such a response is ingested; its rows
+are not published. Treating a refusal as a successful empty page would render
+"no open issues" for a repository that has plenty.
+
+Pages past the first reserve their own envelope. A denial there is an ordinary
+scheduling outcome: the rows already gathered stay, and the result is marked
+incomplete rather than published as complete. Losing page one because page two
+was refused would turn a budget decision into data loss.
+
+Opening a row's page spends nothing. `gh <kind> view --web` spent a request to
+be told a URL the app was already holding, and then had to refuse the user the
+page when the budget was tight. Issues and pull requests select their `url`;
+a run's page is derived from the repository and its databaseId. Every URL is
+admitted before use -- https only, and only the host this pane is talking to --
+because a row is remote data, and an unadmitted `url` would let a crafted row
+point the user's browser anywhere or hand a `file:` URL to the platform opener.

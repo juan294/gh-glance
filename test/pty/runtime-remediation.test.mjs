@@ -59,7 +59,7 @@ const recovered = withCounterCapture("gh-glance-recover-", 1, (counter) =>
     args: "--tab issues",
     env: {
       GH_GLANCE_FIXTURE_FAIL_FIRST_FILE: counter,
-      GH_GLANCE_FIXTURE_FAIL_FIRST_ON: "issue",
+      GH_GLANCE_FIXTURE_FAIL_FIRST_ON: "graphql-data",
       GH_GLANCE_FIXTURE_FAIL_FIRST_MESSAGE: "dial tcp: temporary network failure",
     },
   }),
@@ -210,7 +210,7 @@ const noColorFailure = capture({
   env: {
     NO_COLOR: "1",
     GH_GLANCE_FIXTURE_FAIL: "dial tcp: fixture unavailable",
-    GH_GLANCE_FIXTURE_FAIL_ON: "issue",
+    GH_GLANCE_FIXTURE_FAIL_ON: "graphql-data",
   },
 });
 
@@ -222,7 +222,7 @@ const narrowAuthFailure = capture({
   env: {
     GH_GLANCE_FIXTURE_FAIL:
       "You are not logged into any GitHub hosts. To log in, run: gh auth login",
-    GH_GLANCE_FIXTURE_FAIL_ON: "issue",
+    GH_GLANCE_FIXTURE_FAIL_ON: "graphql-data",
   },
 });
 
@@ -252,7 +252,7 @@ test("Checking colour state tolerates combined and split SGR sequences", () => {
 });
 
 test("a timer-driven list failure recovers in the same process", () => {
-  const issueCalls = recovered.fixtureCalls.filter((call) => call.startsWith("issue list"));
+  const issueCalls = recovered.fixtureCalls.filter((call) => call.startsWith("graphql issues.page"));
   assert.ok(issueCalls.length >= 2, `expected a retry, saw ${issueCalls.length} issue calls`);
   assert.match(recovered.finalFrame.lines.join("\n"), /#41 SIGTERM/);
   assert.doesNotMatch(recovered.finalFrame.lines.join("\n"), /temporary network failure/i);
@@ -267,11 +267,11 @@ test("empty list output stays silent and retries on the next tick", () => {
       args: "--tab issues --refresh 2",
       env: {
         GH_GLANCE_FIXTURE_EMPTY_FIRST_FILE: counter,
-        GH_GLANCE_FIXTURE_EMPTY_FIRST_ON: "issue",
+        GH_GLANCE_FIXTURE_EMPTY_FIRST_ON: "graphql-data",
       },
     }),
   );
-  const issueCalls = result.fixtureCalls.filter((call) => call.startsWith("issue list"));
+  const issueCalls = result.fixtureCalls.filter((call) => call.startsWith("graphql issues.page"));
   assert.ok(issueCalls.length >= 2, `expected an immediate retry, saw ${issueCalls.length} issue calls`);
   assert.match(result.finalFrame.lines.join("\n"), /#41 SIGTERM/);
   assert.doesNotMatch(result.raw, /JSON input/);
@@ -343,8 +343,11 @@ test("Ink screen-reader rendering has a linear content smoke test", () => {
 
 test("quitting aborts an in-flight open child instead of waiting for it", () => {
   assert.equal(stalledOpen.exitCode, 0);
+  // Opening a row spends no request now, so the child being aborted is the
+  // platform opener rather than `gh run view --web`. The contract under test is
+  // unchanged: quitting must not wait for it.
   assert.equal(
-    stalledOpen.fixtureCalls.filter((call) => call.startsWith("run view")).length,
+    stalledOpen.fixtureCalls.filter((call) => call.startsWith("open ")).length,
     1,
   );
   assert.ok(stalledElapsedMs < 15_000, `open child kept the app alive for ${stalledElapsedMs} ms`);
@@ -353,8 +356,10 @@ test("quitting aborts an in-flight open child instead of waiting for it", () => 
 test("selection stays visible and opens the same item after rows insert above it", () => {
   const frame = insertedAbove.finalFrame.lines.join("\n");
   assert.match(frame, />.*test: terminal lifecycle/);
+  // The opener is handed the row's own URL, so the run id in it is the proof
+  // that selection still points at the same item after rows inserted above it.
   assert.ok(
-    insertedAbove.fixtureCalls.some((call) => call.startsWith("run view") && call.includes("104")),
+    insertedAbove.fixtureCalls.some((call) => call.startsWith("open ") && call.includes("/104")),
     insertedAbove.fixtureCalls.join("\n"),
   );
 });

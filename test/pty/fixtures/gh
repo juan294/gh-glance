@@ -72,8 +72,14 @@ fi
 
 matches_selector() {
   wanted=$1
+  # Data calls only: the observers must stay readable, or a test that meant to
+  # fail a tab starves the budget instead and the pane reports Paused rather
+  # than the failure it was asked to show. `graphql` is excluded here because
+  # one of its documents is the claimed observer; use graphql-data to fail the
+  # GraphQL pages and leave the observer alone.
   if [ "$wanted" = "api-data" ]; then
-    [ "$gh_command" = "api" ] && [ "$api_path" != "rate_limit" ] && [ "$api_path" != "user" ]
+    [ "$gh_command" = "api" ] && [ "$api_path" != "rate_limit" ] && [ "$api_path" != "user" ] &&
+      [ "$api_path" != "graphql" ]
     return
   fi
   if [ "$wanted" = "dependabot" ]; then
@@ -83,6 +89,16 @@ matches_selector() {
   if [ "$wanted" = "actions" ]; then
     [ "$gh_command" = "api" ] && printf '%s' "$api_path" | grep -q '/actions/'
     return
+  fi
+  # Every GraphQL document, observer included. Selecting only the data
+  # documents needs the parsed query, so `graphql-data` and `graphql-observer`
+  # are evaluated in graphql.mjs instead and deliberately match nothing here.
+  if [ "$wanted" = "graphql" ]; then
+    [ "$gh_command" = "api" ] && [ "$api_path" = "graphql" ]
+    return
+  fi
+  if [ "$wanted" = "graphql-data" ] || [ "$wanted" = "graphql-observer" ]; then
+    return 1
   fi
   [ "$gh_command" = "$wanted" ]
 }
@@ -204,12 +220,7 @@ case "$gh_command" in
       cat "$FIXTURE_DIR/runs.json"
     fi
     ;;
-  issue)
-    cat "$FIXTURE_DIR/issues.json"
-    ;;
-  pr)
-    cat "$FIXTURE_DIR/prs.json"
-    ;;
+
   repo)
     if [ "${2:-}" = "view" ]; then
       echo '{"nameWithOwner":"acme/widget","url":"https://github.com/acme/widget","viewerPermission":"READ"}'
@@ -260,6 +271,12 @@ case "$gh_command" in
     # budget with no admission hold.
     : "${GH_GLANCE_FIXTURE_RATE_REMAINING:=5000}"
     case "$api_path" in
+      graphql)
+        # Answered by a node responder rather than in shell: the document has to
+        # be parsed semantically, and a shell pattern match would happily answer
+        # a query the app should never have sent.
+        exec node "$FIXTURE_DIR/graphql.mjs"
+        ;;
       user)
         emit_api_text '"fixture-user-v1"' "$(printf '{"id":%s,"login":"%s"}' "${GH_GLANCE_FIXTURE_USER_ID:-1}" "${GH_GLANCE_FIXTURE_LOGIN:-octocat}")"
         exit 0

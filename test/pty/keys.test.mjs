@@ -47,7 +47,7 @@ const detached = capture({ cols: 80, rows: 24, settle: 4 });
 
 const noRemoteEnv = {
   GH_GLANCE_FIXTURE_FAIL: "failed to determine base repo: no git remotes found",
-  GH_GLANCE_FIXTURE_FAIL_ON: "run,issue,pr,api",
+  GH_GLANCE_FIXTURE_FAIL_ON: "run,graphql,api",
 };
 const remoteSetupDeclined = capture({
   cols: 80,

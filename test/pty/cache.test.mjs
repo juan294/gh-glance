@@ -17,7 +17,7 @@ const configHome = mkdtempSync(join(tmpdir(), "gh-glance-pty-cache-"));
 const cachePath = join(configHome, "gh-glance", "dashboard-cache.json");
 const rateLimited = {
   GH_GLANCE_FIXTURE_FAIL: "HTTP 403: API rate limit exceeded",
-  GH_GLANCE_FIXTURE_FAIL_ON: "run,issue,pr,api-data",
+  GH_GLANCE_FIXTURE_FAIL_ON: "run,graphql-data,api-data",
 };
 
 function quitAfterCached(tab) {

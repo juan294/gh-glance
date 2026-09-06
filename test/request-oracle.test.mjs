@@ -36,8 +36,11 @@ test("ORACLE-01: pinned and sliding probes diverge from actual GraphQL charge", 
     assert.equal(after.used, before.used);
     assert.equal(after.remaining, before.remaining);
     assert.equal(after.reset - before.reset, mode === "sliding" ? 10 : 0);
-    assert.equal(state.accounts.octocat.graphql.used, 2);
-    assert.equal(state.events.reduce((sum, event) => sum + event.cost.graphql, 0), 2);
+    // An issues page costs two points, not one: the oracle prices per
+    // operation now, matching the shell fixture instead of modelling a flat
+    // price no server charges.
+    assert.equal(state.accounts.octocat.graphql.used, 4);
+    assert.equal(state.events.reduce((sum, event) => sum + event.cost.graphql, 0), 4);
   }
 });
 
@@ -66,7 +69,8 @@ test("ORACLE-03: seven concurrent processes across 3+4 configuration roots share
     oracleEnvironment({ root: join(root, index < 3 ? "machine-a" : "machine-b"), statePath, pane: `pane-${index}` }))));
   for (const result of results) assert.equal(result.code, 0, result.stderr);
   const state = JSON.parse(readFileSync(statePath, "utf8"));
-  assert.equal(state.accounts.octocat.graphql.used, 7);
+  // Seven issue pages at two points each.
+  assert.equal(state.accounts.octocat.graphql.used, 14);
   assert.equal(state.accounts.octocat.httpRequests, 7);
   assert.deepEqual(state.events.map((event) => event.sequence), [1, 2, 3, 4, 5, 6, 7]);
   assert.equal(new Set(state.events.map((event) => event.pid)).size, 7);
@@ -96,7 +100,7 @@ test("ORACLE-04: retry dates/seconds, partial errors, wrong epochs and missing/u
   assert.notEqual(state.accounts.octocat.graphql.resetMs, 123_000);
   state.scriptedEvents.push({ type: "response", response: { absentCost: true } });
   assert.equal(Object.hasOwn(body(request(state, QUERY)).data.rateLimit, "cost"), false);
-  assert.equal(state.accounts.octocat.graphql.used, 10);
+  assert.equal(state.accounts.octocat.graphql.used, 11);
   state.publishedProbes.graphql = { mode: "missing" };
   assert.equal(Object.hasOwn(body(request(state, ["api", "rate_limit"])).resources, "graphql"), false);
 });
@@ -142,12 +146,13 @@ test("oracle scripted external burn/reset/delay/disconnect uses injected time an
   assert.equal(new Set(seen.map((row) => row.id)).size, 150);
   state.scriptedEvents.push({ type: "externalSpend", resource: "graphql", amount: 100 });
   request(state, QUERY);
-  assert.equal(state.accounts.octocat.graphql.used, 104);
+  assert.equal(state.accounts.octocat.graphql.used, 108);
   state.scriptedEvents.push({ type: "reset", at: state.now + 3_600_000 }, { type: "delay", ms: 100 }, { type: "disconnect" });
   const disconnected = request(state, QUERY, { now: state.now + 3_600_000 });
   assert.equal(disconnected.disconnect, true);
   assert.equal(disconnected.delayMs, 100);
-  assert.equal(state.accounts.octocat.graphql.used, 1);
+  // After the reset, one issues page: two points, not one.
+  assert.equal(state.accounts.octocat.graphql.used, 2);
   assert.throws(() => request(state, ["api", "repos/acme/widget/actions/runs?per_page=151"]), /unbounded/);
 });
 
@@ -215,7 +220,8 @@ test("oracle rejects undeclared GraphQL roots, combined connections, aliases and
   assert.equal(state.events.length, 0);
   const bounded = request(state, ["api", "graphql", "-f", 'query=query Issues($owner: String!, $name: String!, $first: Int!) { repository(owner: $owner, name: $name) { id issues(first: $first, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { id labels(first: 1) { nodes { name } } } pageInfo { hasNextPage endCursor } totalCount } } rateLimit { cost } }', "-f", "owner=acme", "-f", "name=widget", "-f", "first=50"]);
   assert.equal(bounded.event.operation, "issues.page");
-  assert.equal(bounded.event.cost.graphql, 1);
+  // Per-operation pricing: an issues page is two points.
+  assert.equal(bounded.event.cost.graphql, 2);
 });
 
 test("oracle identity responses distinguish repositories and principals, while same-principal credentials agree", () => {

@@ -60,7 +60,11 @@ function governorPath(root) {
 const dataStarts = (state, pane = null) => state.events.filter((event) =>
   event.type === "start" && (pane === null || event.pane === pane) && (
     ["run", "issue", "pr"].includes(event.argv[0]) ||
-    event.argv[0] === "api" && event.argv[1] !== "rate_limit" && !event.argv.includes("user")
+    (event.graphqlOperation
+      // The claimed observer is control-plane work, not data. It shares its
+      // command line with every page, so only the parsed operation separates them.
+      ? event.graphqlOperation !== "graphql.observer"
+      : event.argv[0] === "api" && event.argv[1] !== "rate_limit" && !event.argv.includes("user"))
   ));
 const actionsRuns = (state, pane = null) => dataStarts(state, pane)
   .filter((event) => event.argv.some((argument) => argument.includes("/actions/runs?")));
@@ -190,7 +194,7 @@ test("Setup and NO_COLOR footers keep explicit semantic labels", (t) => {
     configHome: configRoot(t, "gh-glance-status-setup-"),
     env: {
       GH_GLANCE_FIXTURE_FAIL: "failed to determine base repo: no git remotes found",
-      GH_GLANCE_FIXTURE_FAIL_ON: "run,issue,pr,api-data",
+      GH_GLANCE_FIXTURE_FAIL_ON: "run,graphql-data,api-data",
       GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
     },
   });
@@ -455,7 +459,9 @@ test("a held core tab stays Paused while a selected GraphQL tab progresses", (t)
   assert.ok(independent > firstPaused, statuses.join(" -> "));
   assert.ok(finalPaused > independent, statuses.join(" -> "));
   assert.equal(actionsRuns(box.read(), "switch").length, 0);
-  assert.ok(dataStarts(box.read(), "switch").some((event) => event.argv[0] === "issue"));
+  // Semantic, not argv-shaped: an observer and a page share one command line,
+  // so only the parsed operation proves the Issues tab actually progressed.
+  assert.ok(dataStarts(box.read(), "switch").some((event) => event.graphqlOperation === "issues.page"));
 });
 
 test("corrupt, live-locked, and blocked storage pause with no data calls", (t) => {
@@ -616,7 +622,7 @@ test("a non-budget failure settles on Failed and stops status motion", (t) => {
     env: {
       GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       GH_GLANCE_FIXTURE_FAIL: "dial tcp: fixture unavailable",
-      GH_GLANCE_FIXTURE_FAIL_ON: "issue",
+      GH_GLANCE_FIXTURE_FAIL_ON: "graphql-data",
     },
   });
   const statuses = result.liveScreen.statusHistory;
@@ -718,7 +724,7 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
     env: {
       INK_SCREEN_READER: "true",
       GH_GLANCE_FIXTURE_FAIL: "failed to determine base repo: no git remotes found",
-      GH_GLANCE_FIXTURE_FAIL_ON: "run,issue,pr,api-data",
+      GH_GLANCE_FIXTURE_FAIL_ON: "run,graphql-data,api-data",
     },
   });
   assert.match(setup.raw, /Setup/);
@@ -786,7 +792,7 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
       GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       INK_SCREEN_READER: "true",
       GH_GLANCE_FIXTURE_FAIL: "dial tcp: fixture unavailable",
-      GH_GLANCE_FIXTURE_FAIL_ON: "issue",
+      GH_GLANCE_FIXTURE_FAIL_ON: "graphql-data",
     },
   });
   assert.match(failed.raw, /Failed/);

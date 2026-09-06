@@ -3,7 +3,7 @@
 Date: 2026-09-05  
 Source: `develop` at `b819f42e87922671a35bb72052bd0ede445b74be` (0.11.2)  
 Research: [multi-instance API efficiency and architecture](../research/2026-09-05-multi-instance-api-efficiency-and-architecture.md)  
-Status: Implementation underway; phases 1 and 2 completed and locally verified.
+Status: Implementation underway; phases 1-3 completed and locally verified.
 
 ## Outcome and scope
 
@@ -170,7 +170,7 @@ Planning review is complete. Independent controller and whole-plan reviews ident
 
 - [x] Phase 1
 - [x] Phase 2
-- [ ] Phase 3
+- [x] Phase 3
 - [ ] Phase 4
 - [ ] Phase 5
 - [ ] Phase 6

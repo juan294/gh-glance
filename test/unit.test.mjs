@@ -387,8 +387,11 @@ test("Actions joins workflows without dropping runs whose workflow is absent", (
     ]),
     JSON.stringify([{ id: 10, name: "Checks" }]),
   ), [
-    { databaseId: 1, displayTitle: "CI", workflowName: "Checks", number: 7, headBranch: "main", status: "completed", conclusion: "success", startedAt: "start", updatedAt: "end" },
-    { databaseId: 2, displayTitle: "Deleted workflow", workflowName: "", number: 6, headBranch: "old", status: "completed", conclusion: "failure", startedAt: "start2", updatedAt: "end2" },
+    // `url` is projected from html_url so a run's page can be opened without a
+    // request. Absent in this payload, it sanitizes to the empty string, and
+    // rowBrowserUrl then falls back to deriving it from a known slug.
+    { databaseId: 1, displayTitle: "CI", workflowName: "Checks", number: 7, headBranch: "main", status: "completed", conclusion: "success", startedAt: "start", updatedAt: "end", url: "" },
+    { databaseId: 2, displayTitle: "Deleted workflow", workflowName: "", number: 6, headBranch: "old", status: "completed", conclusion: "failure", startedAt: "start2", updatedAt: "end2", url: "" },
   ]);
 });
 
@@ -2819,9 +2822,19 @@ test("tab and auxiliary operation costs have one explicit registry", () => {
     assert.deepEqual(operationCost(operation), { core: 1, graphql: 0 }, operation);
   }
   assert.deepEqual(operationCost("failure-context:repository"), { core: 0, graphql: 1 });
-  assert.deepEqual(operationCost("open:actions"), { core: 2, graphql: 0 });
-  assert.deepEqual(operationCost("open:issues"), { core: 0, graphql: 2 });
-  assert.deepEqual(operationCost("open:prs"), { core: 0, graphql: 2 });
+  // Each page past the first is separately admitted, so it has to be declared
+  // separately too -- a page that could not name its own price would be exactly
+  // the hidden pagination this replaced.
+  assert.deepEqual(operationCost("page:issues"), { core: 0, graphql: 2 });
+  assert.deepEqual(operationCost("page:prs"), { core: 0, graphql: 2 });
+  // The observer is declared and charged. Describing it as free is what let
+  // /rate_limit masquerade as authority.
+  assert.deepEqual(operationCost("graphql-observer"), { core: 0, graphql: 1 });
+  // Opening a row's page spends nothing: the URL is already known, so there is
+  // no operation left to declare.
+  for (const gone of ["open:actions", "open:issues", "open:prs"]) {
+    assert.equal(operationCost(gone), null, gone);
+  }
   assert.deepEqual(operationCost("doctor:security-endpoint"), { core: 1, graphql: 0 });
   assert.deepEqual(operationCost("budget-core-observer"), { core: 1, graphql: 0 });
   for (const free of ["rate-limit", "version", "local-git"]) {
@@ -2842,9 +2855,14 @@ test("every production runGh call site declares a registry operation", () => {
     assert.match(declaration, /operation(?::|\s*[,}])/);
     const literal = /operation:\s*"([^"]+)"/.exec(declaration)?.[1];
     if (literal) assert.notEqual(operationCost(literal), null, literal);
-    if (declaration.includes("`open:${tabKey}`")) {
-      for (const tab of ["actions", "issues", "prs"]) {
-        assert.notEqual(operationCost(`open:${tab}`), null, `open:${tab}`);
+    if (declaration.includes("`page:${kind}`")) {
+      for (const kind of ["issues", "prs"]) {
+        assert.notEqual(operationCost(`page:${kind}`), null, `page:${kind}`);
+      }
+    }
+    if (declaration.includes("`tab:${kind}`")) {
+      for (const kind of ["issues", "prs"]) {
+        assert.notEqual(operationCost(`tab:${kind}`), null, `tab:${kind}`);
       }
     }
   }

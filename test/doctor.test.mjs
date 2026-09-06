@@ -171,7 +171,7 @@ test("--doctor reports governor health without a raw scope identifier", async (t
   assert.match(out, /^status {12}healthy$/m);
   assert.match(out, /^live leases {7}0$/m);
   assert.match(out, /^core .*\(core-observer\)$/m);
-  assert.match(out, /^graphql .*\(rate-limit-probe\)$/m);
+  assert.match(out, /^graphql .*\(graphql-observer\)$/m);
   assert.ok(!/rate-governor-v1-|coordination-v2|quota-[0-9a-f]{64}|[0-9a-f]{64}/.test(out), out);
 });
 
@@ -202,7 +202,7 @@ test("--doctor claims the core observer and uses its persisted ETag before calli
       budget: { limit: 5000, used: 1, remaining: 4999, resetMs },
     },
     graphql: {
-      source: "rate-limit-probe",
+      source: "graphql-observer",
       budget: { limit: 5000, used: 0, remaining: 5000, resetMs },
     },
   }, now).ok, true);
@@ -222,10 +222,19 @@ test("--doctor claims the core observer and uses its persisted ETag before calli
     .find((line) => /(?:^| )user(?: |$)/.test(line));
   assert.ok(userCall, "doctor did not run the claimed core observer");
   assert.match(userCall, /If-None-Match: "fixture-user-v1"/);
-  assert.equal(calls.filter((line) => /api rate_limit(?: |$)/.test(line)).length, 2);
+  // /rate_limit is read once, for the report's display line, and never again:
+  // it is no longer where spendable GraphQL capacity comes from. The claimed
+  // observer query is, and it is the call that has to appear here.
+  assert.equal(calls.filter((line) => /api rate_limit(?: |$)/.test(line)).length, 1);
+  assert.ok(
+    calls.some((line) => /^api -i graphql --input -/.test(line)),
+    "doctor did not run the claimed GraphQL observer",
+  );
   const state = inspectGovernor(scope, Date.now()).value;
-  assert.equal(state.budgets.graphql.used, 10,
-    "doctor published its pre-claim display body instead of the claimed GraphQL read");
+  // 1, from the observer's own meter -- not 10, which was the display probe's
+  // sequence and is exactly the number that must no longer reach the ledger.
+  assert.equal(state.budgets.graphql.used, 1,
+    "doctor published the non-authoritative rate_limit body instead of the claimed observer");
   assert.ok(state.budgets.graphql.observedAt >= now);
 });
 
@@ -297,15 +306,20 @@ test("--doctor uses cached identity and admits no diagnostics when the budget pr
   assert.match(out, /github\.com: octocat \(verified\)/);
   const calls = readFileSync(log, "utf8").split(/\r?\n/).filter(Boolean);
   assert.equal(calls.filter((call) => call.startsWith("auth status")).length, 0);
+  // The control observer shares its argv with every data document, so the
+  // fixture's semantic log line is what distinguishes them: no data query was
+  // answered, which is the property this test is about. The 11 skipped
+  // classifications above are the other half of the proof.
+  assert.equal(calls.filter((call) => /^graphql (?:issues|pulls|repository)\./.test(call)).length, 0);
   assert.equal(calls.filter((call) => /^(?:issue|pr|run|repo) /.test(call) || call.includes("/actions/") || call.includes("/alerts")).length, 0);
 });
 
 test("--doctor skips a REST diagnostic whose paced slot is still in the future", async () => {
   const message = "To get started with GitHub CLI, please run: gh auth login";
   const out = await doctor({
-    env: { GH_GLANCE_FIXTURE_FAIL: message, GH_GLANCE_FIXTURE_FAIL_ON: "issue" },
+    env: { GH_GLANCE_FIXTURE_FAIL: message, GH_GLANCE_FIXTURE_FAIL_ON: "graphql" },
   });
-  const block = probeBlock(out, "Issues (issue list)");
+  const block = probeBlock(out, "Issues (first page)");
   assert.match(block, /^ {2}classified {2}skipped$/m, block);
   assert.ok(!block.includes(message), block);
 });
@@ -314,9 +328,9 @@ test("--doctor skips a GraphQL diagnostic whose paced slot is still in the futur
   const message =
     "GraphQL: Could not resolve to a Repository with the name 'Nvteca/cashflor-forecast'. (repository)";
   const out = await doctor({
-    env: { GH_GLANCE_FIXTURE_FAIL: message, GH_GLANCE_FIXTURE_FAIL_ON: "issue" },
+    env: { GH_GLANCE_FIXTURE_FAIL: message, GH_GLANCE_FIXTURE_FAIL_ON: "graphql" },
   });
-  const block = probeBlock(out, "Issues (issue list)");
+  const block = probeBlock(out, "Issues (first page)");
   assert.match(block, /^ {2}classified {2}skipped$/m, block);
   assert.ok(!block.includes(message), block);
 });
@@ -325,7 +339,7 @@ test("--doctor reports paced repository access separately", async () => {
   const message =
     "GraphQL: Could not resolve to a Repository with the name 'Nvteca/cashflor-forecast'. (repository)";
   const out = await doctor({
-    env: { GH_GLANCE_FIXTURE_FAIL: message, GH_GLANCE_FIXTURE_FAIL_ON: "repo" },
+    env: { GH_GLANCE_FIXTURE_FAIL: message, GH_GLANCE_FIXTURE_FAIL_ON: "graphql" },
   });
   const repositoryBlock = probeBlock(out, "Repository access");
   assert.match(repositoryBlock, /^ {2}classified {2}(?:skipped|unavailable)$/m, repositoryBlock);
@@ -337,7 +351,7 @@ test("--doctor reports paced repository access separately", async () => {
     const actions = probeBlock(out, name);
     assert.match(actions, /^ {2}classified {2}(?:skipped|ok)$/m, actions);
   }
-  for (const name of ["Issues (issue list)", "Pull requests (pr list)"]) {
+  for (const name of ["Issues (first page)", "Pull requests (first page)"]) {
     const block = probeBlock(out, name);
     assert.match(block, /^ {2}classified {2}skipped$/m, block);
   }
@@ -349,7 +363,9 @@ test("--doctor reports the host-qualified target it was given", async () => {
   assert.match(out, /^slug {14}acme\/widget$/m);
   assert.match(
     out,
-    /argv {8}gh repo view tenant\.ghe\.com\/acme\/widget --json nameWithOwner,url,viewerPermission/,
+    // The repository probe is an explicit GraphQL document now, and the host
+    // still travels as --hostname rather than as path text.
+    /argv {8}gh api -i graphql --input - --hostname tenant\.ghe\.com/,
   );
   // The D2 guard, stated in the report: the host travels as --hostname and
   // never as path text.

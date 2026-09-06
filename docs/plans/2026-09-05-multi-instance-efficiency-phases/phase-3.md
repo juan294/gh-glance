@@ -52,6 +52,31 @@ None required for offline implementation acceptance. Actual enterprise installat
 
 ## Completion
 
-- [ ] Queries, header/cost authority, control observer and diagnostic/open paths implemented.
-- [ ] GQL scenarios and parent local gates passed.
-- [ ] Independent compliance/quality review complete; integrated locally; stop.
+- [x] Queries, header/cost authority, control observer and diagnostic/open paths implemented.
+- [x] GQL scenarios and parent local gates passed.
+- [x] Independent compliance/quality review complete; integrated locally; stop.
+
+Two independent reviews ran against the finished worktree: quality (BLOCK, 21
+defects) and plan-compliance (APPROVE WITH FIXES, 9 defects, 2 blocking). All
+were fixed before integration. Four were user-visible breakage that a green
+suite showed no sign of:
+
+- Issues and PRs were broken outright without `--repo` -- the documented default
+  mode. `gh issue list` inferred the repository from the working directory;
+  GraphQL cannot, and the variables went out as `{owner: "", name: undefined}`.
+  Every PTY capture passes `--repo`, so nothing caught it.
+- Every repository with more than one page leaked its tab reservation on every
+  poll: the settlement summed all page costs, but later pages already settle
+  against their own reservation, and an over-settlement is rejected as corrupt --
+  discarding the budget observations from the only requests carrying real cost
+  evidence. The independent oracle hid it by pricing every GraphQL request at 1.
+- `routing.test.mjs`, the only guard that the host travels as `--hostname` and
+  never as path text, had been edited into vacuity while this phase moved the
+  list tabs onto a new vector.
+- The observer's own spend was attributed to external consumers, so the governor
+  would progressively throttle the user to make room for its own probing.
+
+One reviewer recommendation was not taken: `GOVERNOR_STATE_VERSION` was bumped
+rather than making an unrecognised budget source drop a single resource. The
+alternative cannot work -- the code that would need the tolerance is the *older*
+binary, which is already written. Only a version gate makes it fail closed.

@@ -34,7 +34,7 @@ export function oracleEnvironment({ root, statePath, credential = "fixture-full"
 
 // Deliberately small, explicit GraphQL grammar. Unknown fields, aliases,
 // fragments and extra connections fail closed instead of getting a cheap answer.
-function graphqlShape(query, variables) {
+export function graphqlShape(query, variables) {
   const tokens = [];
   const scanner = /\s+|#[^\n]*|"(?:[^"\\]|\\.)*"|[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[!$():{},[\]]/gy;
   let position = 0;
@@ -148,7 +148,7 @@ function graphqlShape(query, variables) {
     repository: root.repository ? `${root.repository.args.owner ?? variables.owner ?? "acme"}/${root.repository.args.name ?? variables.name ?? "widget"}` : null };
 }
 
-export function identifyOracleRequest(argv) {
+export function identifyOracleRequest(argv, { input = null } = {}) {
   if (argv[0] === "--version") return { operation: "cli.version", local: true };
   if (argv[0] === "auth" && argv[1] === "token") return { operation: "cli.token", local: true };
 
@@ -211,9 +211,25 @@ export function identifyOracleRequest(argv) {
   if (path === "rate_limit") return { ...base, operation: "quota.probe", observer: true, resource: "core", cost: 0 };
   if (path === "user") return { ...base, operation: "core.observer", observer: true, resource: "core", cost: 1 };
   if (path === "graphql") {
-    const query = fields.query ?? "";
-    const shape = graphqlShape(query, fields);
-    return { ...base, ...shape, observer: shape.operation === "graphql.observer", resource: "graphql", cost: 1,
+    // `--input -` carries a typed JSON document on stdin, so the query and its
+    // variables are read from there rather than from -f/-F fields, which would
+    // have stringified every variable.
+    let typed = null;
+    if (fields["--input"] === "-" || argv.includes("--input")) {
+      if (typeof input !== "string") throw new Error("fixture graphql input was not supplied");
+      try { typed = JSON.parse(input); } catch { throw new Error("fixture graphql input was not JSON"); }
+      if (!typed || typeof typed.query !== "string") throw new Error("fixture graphql input declared no query");
+      if (typed.variables !== undefined && (typeof typed.variables !== "object" || typed.variables === null || Array.isArray(typed.variables))) {
+        throw new Error("fixture graphql variables were not an object");
+      }
+    }
+    const query = typed ? typed.query : fields.query ?? "";
+    const shape = graphqlShape(query, typed ? (typed.variables ?? {}) : fields);
+    // Priced per operation, identically to test/pty/fixtures/graphql-response.mjs.
+    // A flat price of 1 modelled economics no server has and hid a real
+    // double-charge that only appears at three points or more.
+    const cost = { "graphql.observer": 1, "repository.identity": 1, "issues.page": 2, "pulls.page": 2 }[shape.operation] ?? 1;
+    return { ...base, ...shape, observer: shape.operation === "graphql.observer", resource: "graphql", cost,
       repository: shape.repository ?? repository };
 
   }
@@ -299,11 +315,11 @@ function probeBudget(state, host, principal, resource, budget, now) {
   return { limit: value.limit, used: value.used, remaining: value.remaining, reset: Math.floor(value.resetMs / 1000) };
 }
 
-export function handleOracleRequest(state, { argv, credential = "fixture-full", now = state.now, pane = null, configRoot = null, pid = process.pid } = {}) {
+export function handleOracleRequest(state, { argv, input = null, credential = "fixture-full", now = state.now, pane = null, configRoot = null, pid = process.pid } = {}) {
   if (state.schema !== 1) throw new Error("unsupported oracle schema");
   const identity = state.credentials[credential];
   if (!identity) throw new Error("unknown fixture credential");
-  const request = identifyOracleRequest(argv);
+  const request = identifyOracleRequest(argv, { input });
   if (request.local) return {
     status: 200,
     body: request.operation === "cli.token" ? `${credential}\n` : "gh version 2.97.0 (fixture)\n",
@@ -395,6 +411,12 @@ export function withOracleState(path, operation) {
 
 export async function runOracleFixture(argv = process.argv.slice(2), env = process.env) {
   // gh api graphql --input - sends one JSON body, not hidden requests.
+  // The document stays on stdin and is handed through as-is. Rewriting it into
+  // -f fields -- which this used to do -- put the query back in argv and turned
+  // every typed variable into a string, so `first: 50` became "50" and
+  // `after: null` vanished. That is precisely what stdin exists to prevent, and
+  // it meant the oracle path verified none of it.
+  let stdin = null;
   const inputIndex = argv.indexOf("--input");
   if (inputIndex !== -1) {
     if (argv[inputIndex + 1] !== "-") throw new Error("oracle only accepts stdin fixture input");
@@ -403,15 +425,10 @@ export async function runOracleFixture(argv = process.argv.slice(2), env = proce
       input += chunk;
       if (Buffer.byteLength(input) > 1024 * 1024) throw new Error("oversized oracle input");
     }
-    const parsed = JSON.parse(input);
-    argv = argv.filter((_, index) => index !== inputIndex && index !== inputIndex + 1);
-    argv.push("-f", `query=${parsed.query}`);
-    for (const [name, value] of Object.entries(parsed.variables ?? {})) {
-      if (value !== null) argv.push("-f", `${name}=${value}`);
-    }
+    stdin = input;
   }
   const response = withOracleState(env.GH_GLANCE_REQUEST_ORACLE, (state) => handleOracleRequest(state, {
-    argv, credential: env.GH_GLANCE_FIXTURE_CREDENTIAL,
+    argv, input: stdin, credential: env.GH_GLANCE_FIXTURE_CREDENTIAL,
     now: env.GH_GLANCE_FIXTURE_NOW === undefined ? Date.now() : Number(env.GH_GLANCE_FIXTURE_NOW),
     pane: env.GH_GLANCE_FIXTURE_PANE, configRoot: env.XDG_CONFIG_HOME,
   }));

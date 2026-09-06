@@ -60,7 +60,7 @@ const waitForWorkflowResize =
 
 const noRemoteEnv = {
   GH_GLANCE_FIXTURE_FAIL: "failed to determine base repo: no git remotes found",
-  GH_GLANCE_FIXTURE_FAIL_ON: "run,issue,pr,api-data",
+  GH_GLANCE_FIXTURE_FAIL_ON: "run,graphql-data,api-data",
 };
 
 function captureWithPreloader(prefix, source, options) {
