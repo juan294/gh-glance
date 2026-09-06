@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-06
+
+### Changed
+
+- **Upgrading requires restarting older panes, and may wait for a quota reset.**
+  The coordination protocol moved from version 3 to 5. A pane still running an
+  older build holds a lease this one refuses to coordinate against, so it must
+  be closed; if that pane left API charges it never settled, admission waits for
+  the affected quota window to reset before spending against a counter it cannot
+  account for. Both are conservative on purpose, and both clear on their own.
+- **A slow or failed budget observer no longer holds up the other resource.**
+  Core and GraphQL are claimed, published and retried independently. What still
+  couples them is the shared transport permit and any account-wide hold, which
+  are enforced where they belong.
+
+### Added
+
+- **Secondary rate limits back off on a bounded ladder.** A `Retry-After` the
+  server supplies is honoured exactly, in seconds or as an HTTP date, and
+  concurrent holds merge by maximum so a shorter error cannot shorten a longer
+  hold. Without a supplied deadline the client waits 60, 120, 240, 480 then 900
+  seconds by consecutive throttle; that cap applies only to the delay gh-glance
+  chooses, never to one the server asked for. After five consecutive throttles
+  it stops choosing and waits for an explicit refresh.
+- **A run of manual refreshes yields a turn to a waiting tab.** Manual work
+  still outranks background polling, but after three consecutive grants an
+  active tab that has been waiting goes next, so holding `r` can no longer
+  starve the rest of the dashboard.
+
+### Fixed
+
+- **A permission error no longer pauses every pane.** A 403 carrying no
+  rate-limit headers and no secondary-limit marker is a permission failure, not
+  a throttle. It previously held the shared transport, so one repository the
+  token could not read stalled every pane using that account.
+- **The external-use estimator can come back down.** When other clients were
+  busy, gh-glance would raise its estimate of their share and then keep pacing
+  against it: each sampling window closed on publication even when the sample
+  was too small to reconcile, discarding the local accumulation that would
+  eventually have made one. A window now closes only when it actually
+  reconciles, and a new quota window starts from no assumed external use rather
+  than inheriting the previous window's ratio.
+- **A request that cost nothing no longer paces as though it had.** Work is
+  paced by the cost it reserves, which is a worst case. A conditional request
+  answered `304` spends nothing, and cancelled work spends nothing at all -- the
+  unused pacing is now returned instead of leaving the next request waiting out
+  a slot nobody used.
+- **Older coordination files are readable again.** The version 3 to 4 change
+  altered the file's shape, and the legacy reader recognised only the version
+  number, so every file an older pane had actually written was rejected as
+  corrupt -- exactly the file the restart boundary has to read to see that an
+  older pane is still running.
+
 ## [0.12.0] - 2026-09-06
 
 ### Added
@@ -851,7 +904,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/juan294/gh-glance/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/juan294/gh-glance/compare/v0.11.2...v0.12.0
 [0.11.2]: https://github.com/juan294/gh-glance/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/juan294/gh-glance/compare/v0.11.0...v0.11.1
