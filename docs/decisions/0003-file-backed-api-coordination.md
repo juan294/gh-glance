@@ -89,14 +89,6 @@ stays conservatively reserved.
 
 ## Protocol and recovery
 
-> Partly superseded by the phase 3 amendment at the end of this document. The
-> paragraphs below describing one shared claim and `rate_limit` as the GraphQL
-> probe record the original design: `rate_limit` is no longer a source of
-> spendable capacity, and a claimed observer supplies it instead. Read the
-> amendment before relying on anything in this section. The body is corrected
-> rather than appended to when the observer work lands in full.
-
-
 The governor state records resource epochs and observations, fair lane cursors,
 leases, pending intents, reservations, shared probe ownership and outcomes,
 manual probe demand, rate-limit blocks, and a conservative external-spend
@@ -104,10 +96,11 @@ factor. REST and GraphQL are scheduled separately, so a held REST resource does
 not stop Issues or Pull Requests when the current GraphQL probe permits them.
 
 A short synchronous lock section validates and atomically writes each state
-transition. One process owns the split budget observation claim while the
-others wait for publication. It reads the currently available GraphQL counter
-from `rate_limit` and core only from response headers or conditional `/user`;
-`rate_limit` core data is never admission evidence. Pending work is ordered by
+transition. Each resource has its own observer claim: one process owns core's
+and one owns GraphQL's, and the others wait for that resource's publication.
+Core is read from response headers or a conditional `/user`; GraphQL from a
+claimed observer that selects only the meter and reports what it cost.
+`rate_limit` is not admission evidence for either resource. Pending work is ordered by
 manual/diagnostic, tab-switch, active, then background priority, with
 round-robin progress among equal-priority live leases. Stable per-lease phases
 spread startup and reset work. There is no 60-second maximum wait: a request
@@ -225,3 +218,80 @@ it exists to establish: a resource whose budget is unknown would otherwise
 refuse the one request able to learn it. The exemption is from data admission
 only. They remain bounded by the rolling attempt allowance, the shared transport
 permit and the secondary cooldown, and every attempt is still charged.
+
+## Amendment: per-resource observers and secondary throttles (phase 4)
+
+Observer claims, readiness and outcomes are per resource. Core and GraphQL each
+have their own claim; a slow or failed observer for one no longer holds up the
+other's readiness, because nothing about the resources couples them. What still
+couples them is the shared HTTP permit and any account-wide secondary hold, and
+those are enforced where they belong rather than by serialising the observers.
+
+`GOVERNOR_STATE_VERSION` moves to 4 because the *shape* changed rather than a
+field's contents: `observers` and `probeClaims` are keyed by resource and
+`probeOutcome` is gone. Versions 3 and 2 stay readable as evidence, but reading
+them needs more than accepting an old version number — those files are in the
+pre-split shape, and the legacy inspector adapts that shape before reading it.
+Recognising that an older pane holds a live lease is what the restart boundary
+depends on, so this is not optional.
+
+One coupling is deliberate and survives: a core reset opens a new shared
+accounting epoch, so the GraphQL counter is due with it. Independent claims make
+that harder to state than it was, because a core publication moves core's reset
+an hour out and any rule phrased in terms of that reset stops being true the
+moment it fires. It is therefore phrased against the observation instead —
+GraphQL is due at a core reset only until it has observed since that reset — and
+stated in both places it is decided. Phrased in terms of the reset alone, one
+refresh order produced no GraphQL observation at all and the other produced one
+per pane.
+
+Secondary limits are classified from evidence rather than inferred from a status
+code. A permission-only 403 carries no rate-limit headers and no secondary
+marker, and is not a throttle: treating it as one would hold the shared
+transport for every pane over a single repository the user cannot read. Primary
+exhaustion holds only its own resource until that resource's reset. A confirmed
+secondary limit or a generic 429 holds the account.
+
+A server-supplied `Retry-After`, in seconds or as an HTTP date, is honoured
+exactly and is never shortened; holds merge by maximum, so a shorter concurrent
+error cannot erode a longer one. Without a supplied deadline the client chooses
+60, 120, 240, 480 then 900 seconds by consecutive throttle, and the 900-second
+cap applies only to that locally chosen delay — never to a deadline the server
+asked for, which may legitimately be hours. After five consecutive throttles the
+transport stops choosing delays and waits for an explicit retry or a
+reset-triggered recovery: continuing to climb keeps a wedged credential politely
+hammering a limit it cannot satisfy. Only a request that returns without
+throttle evidence clears the ladder — waiting out a deadline is what produced
+the previous throttle.
+
+These are conservative client-side limits. They do not promise immunity from
+GitHub's secondary limits, which are undocumented and may change.
+
+## Amendment: pacing credit (phase 4)
+
+A grant paces its resource's lane forward by the cost it *reserved*, which is a
+declared worst case. When the request costs less than that, or never happens,
+the difference was capacity paced away for nobody: the next request waited out a
+slot no one used. A conditional request answered 304 is the ordinary case, and
+it costs nothing at all.
+
+Settlement now returns the difference between the reserved and the measured
+cost, and cancelling an unstarted reservation returns the whole slot. Only a
+measured outcome does this. A timeout, an abort or a lost process proves nothing
+about what was spent, so its worst case stays charged and its pacing stays
+spent; refunding there would let a run of timeouts pace as though nothing had
+been sent.
+
+Two bounds keep the return from becoming a burst. The lane is never pulled
+earlier than the shared transport gap, and a single return is capped at the
+largest atomic operation the governor will admit, so an idle stretch cannot
+accumulate into a burst either.
+
+The return is an estimate rather than an exact reversal: the pacing rate is
+recomputed at settlement and can differ from the rate that applied at grant
+time, because capacity may have changed in between. That is acceptable because
+of what pacing is for. Pacing decides *when* admitted work may start, never
+whether it may: the reserve is enforced by admission, which re-checks
+affordability immediately before any request begins. A too-generous return can
+therefore make work start sooner than it strictly should, and cannot make it
+start at all when the budget could not pay for it.

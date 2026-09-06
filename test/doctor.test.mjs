@@ -192,20 +192,20 @@ test("--doctor claims the core observer and uses its persisted ETag before calli
     phaseSeed: { seed: leaseId, registeredAt: now },
     demand: { core: 2, graphql: 0 },
   }).ok, true);
-  const claim = claimProbe(scope, leaseId, now);
+  // Seeding the identity already published the core observer and its ETag, so
+  // core is not due again for a minute; GraphQL never has been. Claim and
+  // publish GraphQL alone -- the ledger then holds a GraphQL budget that only
+  // the doctor's own claimed observer can move, which is what the used-count
+  // assertion below actually tests.
+  const claim = claimProbe(scope, leaseId, now, "graphql");
   assert.equal(claim.value.status, "claimed");
   const resetMs = Math.floor((now + 3_600_000) / 1_000) * 1_000;
   assert.equal(publishProbe(scope, leaseId, claim.value.nonce, {
-    core: {
-      source: "core-observer",
-      etag: '"fixture-user-v1"',
-      budget: { limit: 5000, used: 1, remaining: 4999, resetMs },
-    },
     graphql: {
       source: "graphql-observer",
       budget: { limit: 5000, used: 0, remaining: 5000, resetMs },
     },
-  }, now).ok, true);
+  }, now, "graphql").ok, true);
   const core = inspectGovernor(scope, now).value.budgets.core;
   assert.equal(requestManualProbe(scope, leaseId, core.epoch, core.observedAt, Date.now()).ok, true);
 

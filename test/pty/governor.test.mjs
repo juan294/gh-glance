@@ -357,7 +357,7 @@ test("twelve exhausted core panes share one visible hold and make no REST data c
   try {
     publication = await observeUntil(
       box.readGovernor,
-      (governor) => governor?.probeOutcome?.status === "healthy" &&
+      (governor) => governor?.observers?.graphql?.outcome === "healthy" &&
         governor?.budgets?.core?.remaining === 0,
       10_000,
     );
