@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 
 import { resourceReserve } from "../../index.mjs";
 import { captureAsync } from "./capture.mjs";
+import { seedKnownHeldIdentity } from "./fixtures/known-identity.mjs";
 
 const STATE_HELPER = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "gh-state.mjs");
 const LIMIT = 10_000;
@@ -32,14 +33,15 @@ function fixture(t, overrides = {}) {
     events: [],
     ...overrides,
   };
+  if (state.core.remaining === 0) seedKnownHeldIdentity(root, state, now);
   writeFileSync(statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
   return {
     root,
     statePath,
     read: () => JSON.parse(readFileSync(statePath, "utf8")),
     readGovernor: () => {
-      const directory = join(root, "gh-glance");
-      const name = readdirSync(directory).find((entry) => entry.startsWith("rate-governor-v1-"));
+      const directory = join(root, "gh-glance", "coordination-v2");
+      const name = readdirSync(directory).find((entry) => /^quota-[a-f0-9]{64}\.json$/.test(entry));
       return JSON.parse(readFileSync(join(directory, name), "utf8"));
     },
   };
@@ -50,13 +52,19 @@ function starts(state, predicate) {
 }
 
 function probes(state) {
-  return starts(state, (event) => event.argv[0] === "api" && event.argv[1] === "rate_limit");
+  // The shared budget probe is the claimed GraphQL observer now. `api
+  // rate_limit` is no longer authority, so it is not what panes coordinate on.
+  return starts(state, (event) => event.graphqlOperation === "graphql.observer");
 }
 
 function dataStarts(state) {
   return starts(state, (event) =>
     ["run", "issue", "pr"].includes(event.argv[0]) ||
-    event.argv[0] === "api" && event.argv[1] !== "rate_limit" && !event.argv.includes("user"));
+    (event.graphqlOperation
+      // The claimed observer is control-plane work, not data. It shares its
+      // command line with every page, so only the parsed operation separates them.
+      ? event.graphqlOperation !== "graphql.observer"
+      : event.argv[0] === "api" && event.argv[1] !== "rate_limit" && !event.argv.includes("user")));
 }
 
 function isActionsEndpoint(event) {
@@ -251,8 +259,10 @@ test("twelve mixed active panes pace core and GraphQL without consuming either r
   assert.ok(data.some((event) => event.cost.graphql > 0));
   for (const event of data) {
     if (event.pane.includes("-actions-")) assert.ok(isActionsEndpoint(event));
-    if (event.pane.includes("-issues-")) assert.equal(event.argv[0], "issue");
-    if (event.pane.includes("-prs-")) assert.equal(event.argv[0], "pr");
+    // Semantic, not argv-shaped: Issues and PRs are both `api -i graphql` now,
+    // so only the parsed operation says which tab a pane was actually serving.
+    if (event.pane.includes("-issues-")) assert.equal(event.graphqlOperation, "issues.page");
+    if (event.pane.includes("-prs-")) assert.equal(event.graphqlOperation, "pulls.page");
     if (event.pane.includes("-security-")) assert.equal(event.argv[0], "api");
   }
   assertDebitsStayOutsideReserve(data);
@@ -290,6 +300,7 @@ test("manual refresh wins a held lane without stacking repeated requests", { tim
   let held;
   let progress;
   let results;
+  let admitted;
   try {
     await observeUntil(
       box.readGovernor,
@@ -309,9 +320,10 @@ test("manual refresh wins a held lane without stacking repeated requests", { tim
     );
     progress = await observeUntil(
       box.read,
-      (state) => new Set(dataStarts(state).map((event) => event.pane)).size === 2,
+      (state) => new Set(actionsRuns(state).map((event) => event.pane)).size === 2,
       30_000,
     );
+    admitted = box.readGovernor();
   } finally {
     results = await releasePanes(competitorReady, captures);
   }
@@ -320,10 +332,12 @@ test("manual refresh wins a held lane without stacking repeated requests", { tim
   const runs = actionsRuns(progress);
   assert.equal(runs.filter((event) => event.pane === "manual").length, 1);
   assert.equal(runs.filter((event) => event.pane === "competitor").length, 1);
-  assert.equal(runs[0].pane, "manual", "lower-priority work started before manual refresh");
+  assert.equal(runs[0].pane, "manual", `lower-priority work started before manual refresh: ${JSON.stringify(
+    { events: progress.events, held: held.intents, reservations: admitted.reservations, leases: admitted.leases },
+  )}`);
   const manualResult = results[0];
   const statuses = manualResult.liveScreen.statusHistory;
-  const scheduledAt = statuses.findIndex((status) => / Watching (?:next|probing)(?:\s|$)/.test(status));
+  const scheduledAt = statuses.findIndex((status) => / (?:Paused|Watching (?:next|probing))(?:\s|$)/.test(status));
   const checkingAt = statuses.findIndex((status, index) =>
     index > scheduledAt && / Checking(?:\s|$)/.test(status));
   assert.ok(scheduledAt >= 0, statuses.join(" -> "));
@@ -391,7 +405,7 @@ test("a held core pane switches to Issues and spends only GraphQL", async (t) =>
   const state = box.read();
   const data = dataStarts(state, "isolation");
   assert.equal(data.filter((event) => event.cost.core > 0).length, 0);
-  assert.equal(data.filter((event) => event.argv[0] === "issue").length, 1);
+  assert.equal(data.filter((event) => event.graphqlOperation === "issues.page").length, 1);
   assert.equal(data.filter((event) => event.cost.graphql > 0).length, 1);
   const statuses = result.liveScreen.statusHistory;
   const pausedAt = statuses.findIndex((status) => / Paused(?:\s|$)/.test(status));
@@ -447,7 +461,7 @@ test("a real reset resumes all panes, while atomic external burn limits the next
     resetProgress = await observeUntil(
       resetBox.read,
       (state) => probes(state).length === 2 &&
-        new Set(dataStarts(state).map((event) => event.pane)).size === 12,
+        new Set(actionsRuns(state).map((event) => event.pane)).size === 12,
       reservationHorizon(scheduled, "core"),
     );
   } finally {
@@ -490,7 +504,7 @@ test("a real reset resumes all panes, while atomic external burn limits the next
       Math.max(0, anchored.createdAt + 10_700 - Date.now()),
     ));
     execFileSync(process.execPath, [STATE_HELPER, "--fixture-burn", "core", "7996"], {
-      env: { ...process.env, GH_GLANCE_FIXTURE_STATE: burnBox.statePath },
+      env: { GH_GLANCE_FIXTURE_STATE: burnBox.statePath },
     });
     burned = await observeUntil(
       burnBox.read,
@@ -518,7 +532,9 @@ test("a real reset resumes all panes, while atomic external burn limits the next
 
 test("probe and reservation owner crashes recover without optimistic spend", { timeout: 120_000 }, async (t) => {
   const probeBox = fixture(t, {
-    delayByCommand: { rate_limit: { ms: 30_000, remaining: 1 } },
+    // The shared budget probe is the claimed GraphQL observer now, so that is
+    // the call this test has to hold open long enough to kill its owner.
+    delayByCommand: { "graphql-observer": { ms: 30_000, remaining: 1 } },
   });
   const probeOwnerReady = join(probeBox.root, "probe-owner-ready");
   const crashedProbeCapture = startPane(probeBox, "probe-owner", {

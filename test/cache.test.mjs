@@ -52,6 +52,9 @@ function actionsTab(title = "cached action") {
         conclusion: "success",
         startedAt: "2026-08-11T05:00:00Z",
         updatedAt: "2026-08-11T05:01:00Z",
+        // Rows carry their own page URL now; opening one reads it from here
+        // rather than spending a request to be told what it is.
+        url: "https://github.com/acme/widget/actions/runs/101",
       },
     ],
     meta: { at: NOW, truncated: false },
@@ -68,6 +71,7 @@ function issuesTab(title = "cached issue") {
         author: "octocat",
         label: "bug",
         updatedAt: "2026-08-11T05:02:00Z",
+        url: "https://github.com/acme/widget/issues/42",
       },
     ],
     meta: { at: NOW + 1, truncated: false },

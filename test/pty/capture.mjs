@@ -464,8 +464,16 @@ let captureSeq = 0;
 
 function captureEnvironment(env, configHome, animation, icons) {
   return {
-    ...process.env,
+    // Only runtime instrumentation/locale are inherited. Real gh credentials,
+    // host selection and config never enter an offline dashboard capture.
+    ...Object.fromEntries(["NODE_V8_COVERAGE", "LANG", "LC_ALL", "TZ"]
+      .filter((key) => process.env[key] !== undefined)
+      .map((key) => [key, process.env[key]])),
+    PATH: `${dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`,
+    TERM: "xterm-256color",
     ...env,
+    HOME: env.HOME ?? configHome,
+    GH_CONFIG_DIR: env.GH_CONFIG_DIR ?? configHome,
     GH_GLANCE_CAPTURE_ANIMATION: animation ? "1" : "0",
     GH_GLANCE_CAPTURE_ICONS: icons,
     XDG_CONFIG_HOME: configHome,

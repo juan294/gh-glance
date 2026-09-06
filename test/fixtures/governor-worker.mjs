@@ -17,6 +17,8 @@ import {
 } from "../../index.mjs";
 
 const command = JSON.parse(process.argv[2] ?? "{}");
+// Readiness reports real process time; command.now remains the injected clock.
+if (command.ready) process.stdout.write(`${JSON.stringify({ ready: true, pid: process.pid, at: Date.now() })}\n`);
 const scopeResult = createGovernorScope({
   effectiveHost: command.host,
   authIdentity: command.authIdentity,

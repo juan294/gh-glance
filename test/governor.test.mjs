@@ -25,6 +25,7 @@ import {
   OPERATION_COSTS,
   GOVERNOR_ACTIVE_PROBE_LEASE_MS,
   GOVERNOR_LEASE_TTL_MS,
+  GOVERNOR_STATE_VERSION,
   GOVERNOR_MAX_LEASES,
   GOVERNOR_MAX_INTENTS,
   GOVERNOR_MAX_RESERVATIONS,
@@ -49,6 +50,7 @@ import {
   governorPath,
   governorScopeHash,
   heartbeatLease,
+  inspectAdmittedHttpStart,
   inspectGovernor,
   maintainControlLease,
   admitGovernorOperation,
@@ -419,7 +421,7 @@ test("an immediate admitted operation revalidates with the post-registration clo
   const admitted = admitGovernorOperation(
     box.scope,
     leaseId,
-    "open:actions",
+    "tab:actions",
     "manual",
     NOW,
   );
@@ -614,7 +616,7 @@ test("every doctor endpoint reserves its declared exact cost", (t) => {
   }
 });
 
-test("unsafe failure context and open requests run no quota call and suppress repeats", async (t) => {
+test("unsafe failure context runs no quota call, and opening a row spends nothing", async (t) => {
   const box = sandbox(t, { authIdentity: "unsafe-auxiliary" });
   const leaseId = randomUUID();
   registerLease(box.scope, lease(leaseId));
@@ -632,15 +634,25 @@ test("unsafe failure context and open requests run no quota call and suppress re
   const governor = { scope: box.scope, leaseId };
   const context = await resolveFailureContext(undefined, governor, { run: runner });
   assert.equal(context.repo.ok, false);
-  assert.equal(authCalls, 1);
+  assert.equal(authCalls, 0);
   assert.equal(repoCalls, 0);
 
+  // A row's page is already named by the row, so opening it makes no request at
+  // all -- which is why a paused budget no longer has to refuse it. Previously
+  // this spent a GraphQL call through `gh <kind> view --web` to be told a URL
+  // the app was holding, and then had to deny the user the page when the budget
+  // was tight.
   const registry = createOpenRequestRegistry();
-  const first = registry.start("actions:7", ({ signal }) =>
-    openInBrowser("actions", { databaseId: 7 }, signal, governor, { run: runner }));
-  assert.equal(registry.start("actions:7", async () => {}), null);
-  await assert.rejects(first, /API budget paused/);
+  const launched = [];
+  const launcher = async (argv) => { launched.push(argv); };
+  const first = registry.start("issues:7", ({ signal }) =>
+    openInBrowser("issues", { number: 7, url: "https://github.com/acme/widget/issues/7" }, signal, governor, { run: launcher, host: "github.com" }));
+  assert.equal(registry.start("issues:7", async () => {}), null);
+  await first;
   assert.equal(repoCalls, 0);
+  assert.equal(authCalls, 0);
+  assert.equal(launched.length, 1);
+  assert.equal(launched[0].at(-1), "https://github.com/acme/widget/issues/7");
   assert.equal(registry.size(), 0);
 });
 
@@ -999,7 +1011,7 @@ test("a GraphQL-only minute claim does not poll an exhausted core observer", (t)
   assert.equal(claim.value.coreEtag, null);
   assert.equal(publishProbe(box.scope, leaseId, claim.value.nonce, {
     graphql: {
-      source: "rate-limit-probe",
+      source: "graphql-observer",
       budget: { limit: 5000, used: 0, remaining: 5000, resetMs },
     },
   }, NOW + BUDGET_PROBE_MS).ok, true);
@@ -1098,11 +1110,16 @@ test("slow independent sources renew one claim and spend one core bootstrap", as
     wait: async (ms) => { clock += ms; box.setNow(clock); },
     readBudgets: (signal, host, options) => readSharedBudgetSources(signal, host, {
       ...options,
+      // The claimed GraphQL observer, not /rate_limit: it returns a settled
+      // budget and the point it actually cost, rather than a free-looking
+      // counter from a different endpoint.
       readGraphql: async () => {
         clock += 20_000;
         box.setNow(clock);
         return {
-          graphql: { limit: 5000, used: 0, remaining: 5000, reset: resetMs / 1000 },
+          budget: { limit: 5000, used: 1, remaining: 4999, resetMs },
+          receivedAt: clock,
+          cost: 1,
         };
       },
       readCore: async (_signal, _host, etag) => {
@@ -1380,6 +1397,21 @@ test("a just-created shared-lane grant reports pane count without persisting UI 
   assert.equal(Object.hasOwn(persisted, "sharingOwnerLeaseIds"), false);
   const reread = readIntentDecision(box.scope, second.intentId, NOW).value;
   assert.equal(reread.waitCause, undefined, "another process gets a safe false negative");
+  const retained = readIntentDecision(box.scope, second.intentId, NOW, second).value;
+  assert.equal(retained.waitCause, "shared-lane", "the owning pane retains its local evidence on resume");
+  assert.equal(retained.sharingCount, 4);
+  assert.deepEqual(retained.sharingOwnerLeaseIds, [leaseIds[0]]);
+  const mismatched = readIntentDecision(box.scope, second.intentId, NOW, { ...second, intentId: randomUUID() }).value;
+  assert.equal(mismatched.waitCause, undefined, "provenance cannot move to another intent");
+  registerLease(box.scope, lease(leaseIds[0], NOW, { expiresAt: NOW + 1 }));
+  box.setNow(NOW + 2);
+  assert.equal(registerLease(box.scope, lease(randomUUID(), NOW + 2)).ok, true);
+  assert.equal(Object.keys(inspectGovernor(box.scope, NOW + 2).value.leases).length, 4,
+    "replacement pane keeps the count unchanged so expiry checks the actual owner");
+  const expired = readIntentDecision(box.scope, second.intentId, NOW + 2, { ...retained, intentId: second.intentId }).value;
+  assert.equal(expired.waitCause, undefined, "an expired lane owner invalidates retained provenance");
+  const afterResume = inspectGovernor(box.scope, NOW + 2).value.reservations[second.reservationId];
+  assert.equal(Object.hasOwn(afterResume, "waitCause"), false, "resume must not persist UI provenance");
 });
 
 test("planned reservations revalidate expiry, epoch, probe barrier, and capacity", (t) => {
@@ -1612,11 +1644,11 @@ test("rate_limit publication updates GraphQL but never overwrites authoritative 
   const claimed = inspectGovernor(scope, NOW + 1).value;
   const rejected = publishProbe(scope, leaseId, claim.value.nonce, {
     core: {
-      source: "rate-limit-probe",
+      source: "graphql-observer",
       budget: { limit: 5000, used: 0, remaining: 5000, resetMs: laterReset },
     },
     graphql: {
-      source: "rate-limit-probe",
+      source: "graphql-observer",
       budget: { limit: 5000, used: 20, remaining: 4980, resetMs: laterReset },
     },
   }, NOW + 1);
@@ -1636,7 +1668,7 @@ test("rate_limit publication updates GraphQL but never overwrites authoritative 
       },
     },
     graphql: {
-      source: "rate-limit-probe",
+      source: "graphql-observer",
       budget: { limit: 5000, used: 20, remaining: 4980, resetMs: laterReset },
     },
   }, NOW + 1);
@@ -1647,7 +1679,7 @@ test("rate_limit publication updates GraphQL but never overwrites authoritative 
   assert.equal(state.observers.core.outcome, "healthy");
   assert.equal(state.observers.core.at, NOW + 1);
   assert.equal(state.budgets.graphql.used, 20);
-  assert.equal(state.budgets.graphql.source, "rate-limit-probe");
+  assert.equal(state.budgets.graphql.source, "graphql-observer");
 });
 
 test("a lagging same-epoch observer refreshes core without increasing capacity", (t) => {
@@ -1666,7 +1698,7 @@ test("a lagging same-epoch observer refreshes core without increasing capacity",
       budget: { limit: 5000, used: 7, remaining: 4993, resetMs },
     },
     graphql: {
-      source: "rate-limit-probe",
+      source: "graphql-observer",
       budget: { limit: 5000, used: 0, remaining: 5000, resetMs },
     },
   }, observedAt);
@@ -1832,7 +1864,7 @@ test("missing and partial response observations partition local cost exactly onc
     };
     if (claim.value.resources.includes("graphql")) {
       claimedBudgets.graphql = {
-        source: "rate-limit-probe",
+        source: "graphql-observer",
         budget: { limit: 5000, used: 0, remaining: 5000, resetMs: initial.resetMs },
       };
     }
@@ -1926,7 +1958,7 @@ test("response settlement cannot advance the core epoch ahead of the claimed obs
 });
 
 test("response settlement rejects claimed-source labels", (t) => {
-  for (const source of ["core-observer", "rate-limit-probe"]) {
+  for (const source of ["core-observer", "graphql-observer"]) {
     const box = sandbox(t, { authIdentity: `settlement-source-${source}` });
     const leaseId = randomUUID();
     registerLease(box.scope, lease(leaseId));
@@ -1959,14 +1991,18 @@ test("v1 governor state migrates in place without retaining its core probe sampl
   writeGovernorState(scope.path, asV1GovernorState(inspectGovernor(scope, NOW).value));
   const migrated = inspectGovernor(scope, NOW);
   assert.equal(migrated.ok, true);
-  assert.equal(migrated.value.version, 2);
+  assert.equal(migrated.value.version, GOVERNOR_STATE_VERSION);
   assert.equal(migrated.value.budgets.core, undefined);
   assert.equal(migrated.value.epochs.core, null);
-  assert.equal(migrated.value.budgets.graphql.source, "rate-limit-probe");
+  // Dropped for the same reason the core budget is: a /rate_limit number is not
+  // spendable capacity, and a rule with an exception for numbers that predate it
+  // is not the rule the phase states. The claimed observer re-establishes it.
+  assert.equal(migrated.value.budgets.graphql, undefined);
+  assert.equal(migrated.value.epochs.graphql, null);
   assert.equal(migrated.value.observers.core.etag, null);
   assert.equal(scope.path, governorPath(scope.hash, { env: { XDG_CONFIG_HOME: dirname(dirname(scope.path)) } }));
   const persisted = JSON.parse(readFileSync(scope.path, "utf8"));
-  assert.equal(persisted.version, 2);
+  assert.equal(persisted.version, GOVERNOR_STATE_VERSION);
   assert.equal(persisted.budgets.core, undefined);
   assert.equal(existsSync(`${scope.path}.lock`), false);
   assert.deepEqual(
@@ -1989,7 +2025,7 @@ test("a mutating v1 migration persists its v2 result at the same path before unl
   assert.equal(heartbeat.ok, true);
   assert.equal(heartbeat.value.activeTab, "issues");
   const persisted = JSON.parse(readFileSync(box.scope.path, "utf8"));
-  assert.equal(persisted.version, 2);
+  assert.equal(persisted.version, GOVERNOR_STATE_VERSION);
   assert.equal(persisted.budgets.core, undefined);
   assert.equal(persisted.leases[leaseId].activeTab, "issues");
   assert.equal(
@@ -2011,7 +2047,10 @@ test("schema, bounds, corrupt data, and future timestamps fail closed", (t) => {
   assert.equal(inspectGovernor(scope, NOW).reason, "corrupt");
 
   const wrongVersion = emptyGovernorState();
-  wrongVersion.version = 3;
+  // Any version this build does not write, in either direction: a newer file is
+  // as unreadable as an older one, and guessing at either is how a live pane's
+  // leases get discarded.
+  wrongVersion.version = GOVERNOR_STATE_VERSION + 1;
   writeGovernorState(scope.path, wrongVersion);
   assert.equal(inspectGovernor(scope, NOW).reason, "corrupt");
 
@@ -2556,4 +2595,34 @@ test("governor health is redacted and discriminates stale, waiting, blocked, and
   const health = governorHealth(inspectGovernor(scope, NOW), NOW);
   assert.equal(health.status, "blocked");
   assert.deepEqual(Object.keys(health).sort(), ["leases", "resources", "status"]);
+});
+
+
+test("a queued HTTP call rechecks a newly shared resource block without changing its started charge", (t) => {
+  const box = sandbox(t, { authIdentity: "queued-http-shared-block" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const grant = registerIntent(box.scope, intent(randomUUID(), leaseId)).value;
+  const at = grant.notBefore;
+  box.setNow(at);
+  assert.equal(startReservation(box.scope, grant.reservationId, at).value.status, "started");
+  assert.equal(inspectAdmittedHttpStart(box.scope, "tab:actions-workflows", at).ok, true);
+  const resetMs = inspectGovernor(box.scope, at).value.budgets.core.resetMs;
+  const crossingClock = [resetMs - 1, resetMs];
+  assert.equal(inspectAdmittedHttpStart(box.scope, "tab:actions-workflows", () => crossingClock.shift()).reason, "budget-reset",
+    "a reset crossed during inspection must prevent the actual HTTP start");
+  assert.equal(crossingClock.length, 0);
+  assert.equal(recordResourceBlock(box.scope, "core", resetMs, "rate-limit").ok, true);
+  assert.deepEqual(inspectAdmittedHttpStart(box.scope, "tab:actions-workflows", at), {
+    ok: false, reason: "blocked", resource: "core", retryAt: resetMs,
+  });
+  assert.equal(inspectAdmittedHttpStart(box.scope, "tab:issues", at).ok, true);
+  assert.equal(inspectAdmittedHttpStart(box.scope, "tab:actions-runs", resetMs).reason, "budget-reset");
+  const reservation = inspectGovernor(box.scope, at).value.reservations[grant.reservationId];
+  assert.equal(reservation.status, "started");
+  assert.deepEqual(reservation.costs, { core: 2, graphql: 0 });
+  assert.equal(reservation.actualCosts, null);
+  assert.equal(completeReservation(box.scope, grant.reservationId, { outcome: "rejected" }, at).ok, true);
+  assert.deepEqual(inspectGovernor(box.scope, at).value.reservations[grant.reservationId].actualCosts, { core: 2, graphql: 0 });
 });

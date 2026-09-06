@@ -101,13 +101,15 @@ Values arriving from the API are also read through an own-property check before
 being used as lookup keys, so a field whose value happens to be `constructor` or
 `__proto__` cannot return an unexpected object into the render path.
 
-Successfully parsed rows can be persisted in an account-and-target-scoped
+Successfully parsed rows can be persisted in an authorization-and-target-scoped
 `dashboard-cache.json` beside the width-preference file. The cache contains
 sanitized repository data such as titles, authors, branches, and Security
 findings, but it never contains a GitHub token or other credential. It retains
 at most five repository targets and 60 rows per tab. The account namespace is
-derived from the normalized `GH_CONFIG_DIR`/`hosts.yml` identity and one-way
-SHA-256 digests of any supported token environment variables that are set. Raw
+derived from the effective host, a one-way SHA-256 digest of the selected
+credential, and its authorization generation. Two credentials for the same
+verified account share quota coordination but cannot hydrate each other's
+private rows. Unused environment credentials do not change either identity. Raw
 token values are never serialized. On POSIX systems, gh-glance restricts the
 parent config directory to `0700`, writes temporary and final files as `0600`,
 and replaces them atomically. A bounded advisory lock plus three-way merge
@@ -117,10 +119,10 @@ advisory: it is ignored rather than weakening authentication or preventing
 startup. A failed or blind Security observation never replaces a
 last-known-good alert set with an empty one.
 
-API admission uses a separate `rate-governor-v1-<scope hash>.json` file in the
-same private directory. The SHA-256 file-name scope binds the normalized
-effective GitHub host to the existing local authentication namespace; neither
-raw value is stored in the name or canonical state. The governor contains only
+API admission uses a separate `coordination-v2/quota-<scope hash>.json` file in
+the same private directory. Its SHA-256 scope binds the effective host to the
+verified principal kind and numeric ID. Neither raw value is stored in the
+name or quota ledger. The governor contains only
 protocol data: REST/GraphQL observations and epochs, leases, intents,
 reservations, fair-lane cursors, probe state, and shared rate-limit blocks. It
 contains no token, raw host, login, account identifier, repository, working
@@ -138,6 +140,31 @@ private lock is held. Corrupt, stale, busy, or unwritable coordination denies
 the request instead of falling back to process-local polling. Started,
 interrupted, or process-lost reservations stay charged conservatively until a
 later clean probe can account for them.
+
+A separate private `coordination-v2/registry.json` stores credential digests,
+verified host/account identities, authorization generations, bootstrap attempt
+receipts, migration state, and HTTP permit ownership and waiters. This identity registry
+can contain a sanitized login and numeric account ID; it contains no raw
+credential or repository rows. The root registry lock precedes a quota-ledger
+lock, and neither lock is held across a network request. Unknown identities
+must claim a persisted, bounded `/user` attempt before any data is admitted.
+Started attempts retain conservative debt across crashes and restarts. Shared
+HTTP permits serialize calls and preserve a minimum 250 ms start gap and the
+maximum observed cooldown deadline. Each host permits at most 128 FIFO waiters
+containing only process IDs, nonces and bounded timing data. Dead or expired
+waiters are pruned. Cancellation removes its matching nonce; if storage is
+temporarily unavailable, deferred cleanup remains bounded by the deadline.
+Cleaning up a waiter never erases quota uncertainty.
+
+Upgrading from the legacy governor requires stopping old panes first. A live
+legacy lease blocks activation with a restart-required message. After leases
+stop, uncertain old charges and rate-limit holds must be reconciled or expire
+through their applicable reset before new admission. Legacy files are retained
+as evidence, and corrupt or unknown state fails closed. Discoverable old leases
+that reappear pause new admission. An old binary does not understand this
+protocol: arbitrary old binaries started later, panes using a different config
+root, and processes on another machine cannot be made participants by this
+local migration guard. There is no mixed-version coordination guarantee.
 
 The repository target is the one user-supplied value that both reaches a
 subprocess argument and is interpolated into a `gh api` request path, so it is
@@ -171,18 +198,18 @@ quote the URL they failed on -- which is a real path for a credential to reach
 them.
 
 GitHub authentication is delegated to the existing `gh auth login` session,
-including on GitHub Enterprise and EMU hosts. gh-glance has no network code of
-its own; every GitHub API call goes through the `gh` CLI. It never requests
-`--show-token`, invokes `gh auth token`, or supplies a token argument. Its one
-credential-adjacent operation is local and non-authenticating: it hashes each
-set `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, and
-`GITHUB_ENTERPRISE_TOKEN` value into the cache and governor namespaces so
-different effective credentials cannot hydrate the same saved rows or share
-admission state. The raw value is not retained, rendered, logged, or written to
-disk. Failure context invokes only the read-only
-`gh auth status` and `gh repo view` commands. Optional account and repository
-strings are sanitized before rendering, and doctor output remains protected by
-the presence-only and redaction rules above. Login, authorization refresh, and
+including on GitHub Enterprise and EMU hosts. Every GitHub API call currently
+goes through the `gh` CLI. Effective credential selection follows `gh`'s
+host-specific environment precedence. When no applicable environment token is
+selected, a dedicated non-logging `gh auth token --hostname <host>` call obtains
+the local credential, hashes it immediately, and discards the raw output.
+Resolution is cached until relevant configuration changes. No token is placed
+in command arguments, returned to the UI, logged, or written to disk; keychain
+databases are never read directly. Failure authentication diagnosis uses the
+cached verified identity or reports that identity is unavailable, without a
+network-backed `gh auth status` call. Optional account and repository strings
+are sanitized before rendering, and doctor output remains protected by the
+presence-only and redaction rules above. Login, authorization refresh, and
 account switching remain explicit user-owned `gh` commands.
 
 Repository creation is also user-owned. When a local repository has no remote,

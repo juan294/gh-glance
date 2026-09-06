@@ -251,6 +251,25 @@ This project follows the [Contributor Covenant Code of
 Conduct](CODE_OF_CONDUCT.md). By participating, you are expected to uphold
 this code.
 
+## PTY suite timing
+
+`npm run test:pty` runs one file at a time with a **per-file** timeout of ten
+minutes. That ceiling is not arbitrary padding: `test/pty/status.test.mjs`
+takes around four minutes on a developer laptop, and a two-core CI runner is
+appreciably slower. It was 240s and CI began failing on that file alone --
+`testTimeoutFailure`, with every assertion in it passing -- because shared
+identity coordination added two subprocess round-trips to the startup of every
+capture, and that file drives roughly sixteen of them.
+
+Two consequences worth knowing before adding PTY coverage:
+
+- Startup cost is paid per capture, so a change to the startup path multiplies
+  across the suite. Measure a file's wall time (`/usr/bin/time -p node --test
+  --test-concurrency=1 test/pty/<file>.test.mjs`) after touching it.
+- A file approaching the ceiling should be split rather than have the ceiling
+  raised again. Files are serialized, so splitting costs no wall time and
+  halves the blast radius of one slow case.
+
 ## Security
 
 If you discover a security vulnerability, please follow the [Security

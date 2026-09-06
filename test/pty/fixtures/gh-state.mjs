@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import {
+  appendFileSync,
   linkSync,
   readFileSync,
   readdirSync,
@@ -10,8 +11,25 @@ import {
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 
+import { graphqlHeaders, graphqlResponseFor, readGraphqlDocument } from "./graphql-response.mjs";
+
+if (process.env.GH_GLANCE_REQUEST_ORACLE) {
+  const { runOracleFixture } = await import("../../fixtures/request-oracle.mjs");
+  await runOracleFixture();
+  process.exit(process.exitCode ?? 0);
+}
+
 const statePath = process.env.GH_GLANCE_FIXTURE_STATE;
 const args = process.argv.slice(2);
+// An isolated test account file models a local gh account switch. It is read
+// once per child, so a delayed response keeps the account selected at start.
+const accountFixture = process.env.GH_GLANCE_FIXTURE_ACCOUNT_FILE
+  ? JSON.parse(readFileSync(process.env.GH_GLANCE_FIXTURE_ACCOUNT_FILE, "utf8")) : null;
+// Token lookup is local credential access, not a synthetic HTTP operation.
+if (args[0] === "auth" && args[1] === "token") {
+  process.stdout.write(`${accountFixture?.token ?? process.env.GH_GLANCE_FIXTURE_TOKEN ?? "fixture-keyring-token"}\n`);
+  process.exit(0);
+}
 const fixtures = dirname(new URL(import.meta.url).pathname);
 const waitCell = new Int32Array(new SharedArrayBuffer(4));
 const RATE_RESOURCES = ["core", "graphql"];
@@ -21,6 +39,7 @@ function parseApiInvocation(argv) {
   let path = null;
   let include = false;
   let ifNoneMatch = null;
+  let hostname = null;
   for (let index = 1; index < argv.length; index += 1) {
     const argument = argv[index];
     if (["-i", "--include"].includes(argument)) {
@@ -42,23 +61,55 @@ function parseApiInvocation(argv) {
     }
     if (["--hostname", "--jq", "-X", "--method", "-f", "--raw-field", "-F", "--field", "--input"]
       .includes(argument)) {
+      // The host is needed to build row URLs that will survive the app's
+      // host admission, so it is captured rather than merely skipped.
+      if (argument === "--hostname") hostname = argv[index + 1] ?? null;
       index += 1;
       continue;
     }
+    const inlineHost = /^--hostname=(.+)$/.exec(argument);
+    if (inlineHost) { hostname = inlineHost[1]; continue; }
     if (/^(?:--hostname|--jq|--method|--raw-field|--field|--input)=/.test(argument) ||
       argument.startsWith("-")) continue;
     if (path === null) path = argument;
   }
-  return { path, include, ifNoneMatch };
+  return { path, include, ifNoneMatch, hostname };
 }
 
 const apiInvocation = parseApiInvocation(args);
+
+// A GraphQL document arrives on stdin, so it must be read before anything
+// decides what this invocation costs: an observer and a data page share one
+// argv and have very different prices.
+const graphqlDocument = apiInvocation?.path === "graphql"
+  ? readGraphqlDocument(readStdin())
+  : null;
+const graphqlAnswer = graphqlDocument
+  // Hard-coding github.com made every row URL fail host admission under an
+  // enterprise capture, so Enter would silently do nothing there.
+  ? graphqlResponseFor(graphqlDocument, { host: apiInvocation?.hostname ?? "github.com" })
+  : null;
+
+// The shell fixture logs argv for every call, but argv cannot distinguish an
+// observer from a page. Both fixture paths therefore log the parsed operation
+// in the same form, so a test written against one works against the other.
+if (graphqlAnswer && process.env.GH_GLANCE_FIXTURE_LOG && process.env.GH_GLANCE_FIXTURE_LOG !== "/dev/null") {
+  const shape = graphqlDocument.ok ? graphqlDocument.shape : null;
+  try {
+    appendFileSync(process.env.GH_GLANCE_FIXTURE_LOG,
+      `graphql ${graphqlAnswer.operation} first=${shape?.pageSize ?? "-"} after=${shape?.cursor ?? "-"}\n`);
+  } catch { /* the log is diagnostic; never fail a response over it */ }
+}
 
 function bodyEtag(body) {
   return `"fixture-${createHash("sha256").update(body).digest("hex").slice(0, 16)}"`;
 }
 
 function defaultApiBody(path) {
+  if (path === "user") return JSON.stringify({
+    id: Number(process.env.GH_GLANCE_FIXTURE_USER_ID ?? 1),
+    login: process.env.GH_GLANCE_FIXTURE_LOGIN ?? "octocat",
+  });
   if (path?.includes("/actions/runs?")) {
     return readFileSync(join(fixtures, "actions-runs.json"), "utf8");
   }
@@ -69,7 +120,12 @@ function defaultApiBody(path) {
 }
 
 function apiEntity(state, path, fallback) {
-  const configured = state.apiEntities?.[path];
+  const user = accountFixture?.user ?? state.user;
+  if (path === "user" && user) {
+    const body = JSON.stringify(user);
+    fallback = { body, etag: bodyEtag(body) };
+  }
+  const configured = accountFixture?.apiEntities?.[path] ?? state.apiEntities?.[path];
   let entity = configured;
   if (Array.isArray(configured?.sequence) && configured.sequence.length > 0) {
     const sequenceIndex = Math.min(configured.calls ?? 0, configured.sequence.length - 1);
@@ -249,19 +305,31 @@ function withLock(run) {
   }
 }
 
+function readStdin() {
+  try { return readFileSync(0, "utf8"); } catch { return ""; }
+}
+
 function selector() {
   if (args[0] === "api" && apiInvocation?.path === "rate_limit") return "rate_limit";
   if (args[0] === "api" && apiInvocation?.path === "user") return "core-observer";
+  // The observer is control-plane work and a page is data. Charging them alike,
+  // or calling both simply "graphql", is the generic treatment this fixture
+  // exists to stop.
+  if (args[0] === "api" && apiInvocation?.path === "graphql") {
+    return graphqlAnswer?.operation === "graphql.observer" ? "graphql-observer" : "graphql-data";
+  }
   if (args[0] === "api" && apiInvocation?.path?.includes("/actions/")) return "actions";
   if (args[0] === "api") return "security";
-  if (["run", "issue", "pr", "repo", "auth"].includes(args[0])) return args[0];
+  if (["run", "repo", "auth"].includes(args[0])) return args[0];
   return args[0] ?? "unknown";
 }
 
 function cost(apiResponse = null) {
   if ([304, 403, 429].includes(apiResponse?.status)) return { core: 0, graphql: 0 };
   if (args[0] === "run") return { core: 2, graphql: 0 };
-  if (["issue", "pr"].includes(args[0])) return { core: 0, graphql: 2 };
+  // Priced from the document actually sent, not from the command shape: a page
+  // and an observer differ, and a rejected document buys nothing.
+  if (graphqlAnswer) return { core: 0, graphql: graphqlAnswer.cost };
   if (args[0] === "repo" && args[1] === "view") return { core: 0, graphql: 1 };
   if (args[0] === "api" && args[1] !== "rate_limit") return { core: 1, graphql: 0 };
   return { core: 0, graphql: 0 };
@@ -364,36 +432,8 @@ if (args[0] === "--fixture-burn") {
   process.exit(0);
 }
 
-function actionStartCountsForOwner(state) {
-  const counts = { runs: 0, workflows: 0 };
-  for (const event of state.events ?? []) {
-    if (event.type !== "start" || event.ownerPid !== process.ppid) continue;
-    if (event.argv?.some((argument) => argument.includes("/actions/runs?"))) counts.runs += 1;
-    else if (event.argv?.some((argument) => argument.includes("/actions/workflows?"))) counts.workflows += 1;
-  }
-  return counts;
-}
-
-// fetchActions launches runs and workflows in parallel, in that order. Under
-// high process contention the workflows fixture can win the state-file lock
-// even though its sibling was launched second. Keep the fixture's event order
-// deterministic per dashboard process without serializing the production
-// requests: the workflows child waits only until the matching runs child has
-// recorded this batch's start.
-if (apiInvocation?.path?.includes("/actions/workflows?")) {
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline) {
-    try {
-      const state = JSON.parse(readFileSync(statePath, "utf8"));
-      const { runs, workflows } = actionStartCountsForOwner(state);
-      if (runs > workflows) break;
-    } catch {
-      // The fixture state is atomically replaced; a transient read can retry.
-    }
-    Atomics.wait(waitCell, 0, 0, 5);
-  }
-}
-
+// Each Actions endpoint is an independent HTTP request. Its fixture must not
+// wait for a sibling request: the caller may hold the host's sole HTTP permit.
 const started = withLock((state) => {
   const now = Date.now();
   const isBudgetObserver = args[0] === "api" && ["rate_limit", "user"].includes(apiInvocation?.path);
@@ -412,7 +452,7 @@ const started = withLock((state) => {
   state.inFlight ??= {};
   const sequence = state.sequence;
   applyResetSequence(state, now);
-  const apiResponse = selector() === "rate_limit" || apiInvocation === null
+  const apiResponse = selector() === "rate_limit" || apiInvocation === null || graphqlAnswer !== null
     ? null
     : apiEntity(state, apiInvocation.path, fallbackApiEntity);
   if (selector() === "core-observer" && state.core.remaining === 0) apiResponse.status = 403;
@@ -450,6 +490,10 @@ const started = withLock((state) => {
     ownerPid: process.ppid,
     pane: process.env.GH_GLANCE_FIXTURE_PANE ?? null,
     argv: args,
+    // argv cannot tell an observer from a page -- both are `api -i graphql
+    // --input -` -- so the operation is recorded from the parsed document.
+    // Without it a test can only assert that "some GraphQL happened".
+    ...(graphqlAnswer ? { graphqlOperation: graphqlAnswer.operation } : {}),
     cost: debit,
     ...(isData ? { before, after } : {}),
   });
@@ -511,12 +555,6 @@ switch (selector()) {
   case "run":
     process.stdout.write(readFileSync(join(fixtures, "runs.json"), "utf8"));
     break;
-  case "issue":
-    process.stdout.write(readFileSync(join(fixtures, "issues.json"), "utf8"));
-    break;
-  case "pr":
-    process.stdout.write(readFileSync(join(fixtures, "prs.json"), "utf8"));
-    break;
   case "repo":
     process.stdout.write('{"nameWithOwner":"acme/widget","url":"https://github.com/acme/widget","viewerPermission":"READ"}\n');
     break;
@@ -528,6 +566,30 @@ switch (selector()) {
   case "--version":
     process.stdout.write("gh version 2.97.0 (fixture)\n");
     break;
+  case "graphql-observer":
+  case "graphql-data": {
+    const graphql = started.budgets.graphql;
+    process.stdout.write(graphqlHeaders(graphqlAnswer.status, {
+      limit: graphql.limit,
+      used: graphql.used,
+      remaining: graphql.remaining,
+      resetMs: graphql.resetMs,
+    }));
+    // The envelope's own meter is what the app settles on, so it has to agree
+    // with the ledger this fixture keeps rather than be invented per call.
+    const envelope = JSON.parse(graphqlAnswer.body);
+    if (envelope.data?.rateLimit) {
+      envelope.data.rateLimit = {
+        cost: graphqlAnswer.cost,
+        limit: graphql.limit,
+        used: graphql.used,
+        remaining: graphql.remaining,
+        resetAt: new Date(graphql.resetMs).toISOString(),
+      };
+    }
+    process.stdout.write(JSON.stringify(envelope));
+    break;
+  }
   default:
     if (started.apiResponse) {
       if (apiInvocation.include) {

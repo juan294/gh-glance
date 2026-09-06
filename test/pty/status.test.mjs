@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { capture, captureAsync, isStatusLine, waitForAwk } from "./capture.mjs";
+import { seedKnownHeldIdentity } from "./fixtures/known-identity.mjs";
 
 function configRoot(t, prefix) {
   const root = mkdtempSync(join(tmpdir(), prefix));
@@ -33,13 +34,15 @@ function sharedFixture(t, overrides = {}) {
   const root = configRoot(t, "gh-glance-status-");
   const now = Date.now();
   const statePath = join(root, "fixture.json");
-  writeFileSync(statePath, `${JSON.stringify({
+  const state = {
     createdAt: now,
     core: { limit: 5000, used: 0, remaining: 5000, resetMs: now + 3_600_000 },
     graphql: { limit: 5000, used: 0, remaining: 5000, resetMs: now + 3_600_000 },
     events: [],
     ...overrides,
-  })}\n`, { mode: 0o600 });
+  };
+  if (state.core.remaining === 0) seedKnownHeldIdentity(root, state, now);
+  writeFileSync(statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
   return {
     root,
     statePath,
@@ -48,8 +51,8 @@ function sharedFixture(t, overrides = {}) {
 }
 
 function governorPath(root) {
-  const directory = join(root, "gh-glance");
-  const name = readdirSync(directory).find((entry) => entry.startsWith("rate-governor-v1-"));
+  const directory = join(root, "gh-glance", "coordination-v2");
+  const name = readdirSync(directory).find((entry) => /^quota-[a-f0-9]{64}\.json$/.test(entry));
   assert.ok(name, "governor state was not created");
   return join(directory, name);
 }
@@ -57,7 +60,11 @@ function governorPath(root) {
 const dataStarts = (state, pane = null) => state.events.filter((event) =>
   event.type === "start" && (pane === null || event.pane === pane) && (
     ["run", "issue", "pr"].includes(event.argv[0]) ||
-    event.argv[0] === "api" && event.argv[1] !== "rate_limit" && !event.argv.includes("user")
+    (event.graphqlOperation
+      // The claimed observer is control-plane work, not data. It shares its
+      // command line with every page, so only the parsed operation separates them.
+      ? event.graphqlOperation !== "graphql.observer"
+      : event.argv[0] === "api" && event.argv[1] !== "rate_limit" && !event.argv.includes("user"))
   ));
 const actionsRuns = (state, pane = null) => dataStarts(state, pane)
   .filter((event) => event.argv.some((argument) => argument.includes("/actions/runs?")));
@@ -187,7 +194,7 @@ test("Setup and NO_COLOR footers keep explicit semantic labels", (t) => {
     configHome: configRoot(t, "gh-glance-status-setup-"),
     env: {
       GH_GLANCE_FIXTURE_FAIL: "failed to determine base repo: no git remotes found",
-      GH_GLANCE_FIXTURE_FAIL_ON: "run,issue,pr,api-data",
+      GH_GLANCE_FIXTURE_FAIL_ON: "run,graphql-data,api-data",
       GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
     },
   });
@@ -452,7 +459,9 @@ test("a held core tab stays Paused while a selected GraphQL tab progresses", (t)
   assert.ok(independent > firstPaused, statuses.join(" -> "));
   assert.ok(finalPaused > independent, statuses.join(" -> "));
   assert.equal(actionsRuns(box.read(), "switch").length, 0);
-  assert.ok(dataStarts(box.read(), "switch").some((event) => event.argv[0] === "issue"));
+  // Semantic, not argv-shaped: an observer and a page share one command line,
+  // so only the parsed operation proves the Issues tab actually progressed.
+  assert.ok(dataStarts(box.read(), "switch").some((event) => event.graphqlOperation === "issues.page"));
 });
 
 test("corrupt, live-locked, and blocked storage pause with no data calls", (t) => {
@@ -613,14 +622,20 @@ test("a non-budget failure settles on Failed and stops status motion", (t) => {
     env: {
       GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       GH_GLANCE_FIXTURE_FAIL: "dial tcp: fixture unavailable",
-      GH_GLANCE_FIXTURE_FAIL_ON: "issue",
+      GH_GLANCE_FIXTURE_FAIL_ON: "graphql-data",
     },
   });
   const statuses = result.liveScreen.statusHistory;
   const failedAt = statuses.findLastIndex((line) => / Failed(?:\s|$)/.test(line));
   assert.ok(failedAt >= 0, statuses.join(" -> "));
   assert.equal(statuses.slice(failedAt + 1).some((line) => / Checking(?:\s|$)/.test(line)), false);
-  assert.match(statusLine(result) ?? "", /^! Failed/);
+  // Motion stopping is the property here, and the line above is what asserts
+  // it. The final line is whichever motionless state the pane was showing when
+  // the quit key landed -- Failed itself, or the settled retry state that
+  // replaces it once the next poll is scheduled. Requiring Failed specifically
+  // made this a race between the fixed 300ms settle and that countdown, which a
+  // two-core runner loses; neither marker animates, so neither is status motion.
+  assert.match(statusLine(result) ?? "", /^(?:! Failed|· Watching)/);
 });
 
 test("incomplete Security observation preserves known rows and shows Limited", (t) => {
@@ -715,7 +730,7 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
     env: {
       INK_SCREEN_READER: "true",
       GH_GLANCE_FIXTURE_FAIL: "failed to determine base repo: no git remotes found",
-      GH_GLANCE_FIXTURE_FAIL_ON: "run,issue,pr,api-data",
+      GH_GLANCE_FIXTURE_FAIL_ON: "run,graphql-data,api-data",
     },
   });
   assert.match(setup.raw, /Setup/);
@@ -783,7 +798,7 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
       GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       INK_SCREEN_READER: "true",
       GH_GLANCE_FIXTURE_FAIL: "dial tcp: fixture unavailable",
-      GH_GLANCE_FIXTURE_FAIL_ON: "issue",
+      GH_GLANCE_FIXTURE_FAIL_ON: "graphql-data",
     },
   });
   assert.match(failed.raw, /Failed/);

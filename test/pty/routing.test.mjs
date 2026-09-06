@@ -34,14 +34,20 @@ const hostQualified = capture({
   args: `--repo ${HOST}/acme/widget --tab security`,
 });
 
-const listCalls = (result) => result.fixtureCalls.filter((call) => /^(run|issue|pr) /.test(call));
-// The alert endpoints only. `api rate_limit` is the shared governor's budget
-// probe: it is host-routed like these are, but it addresses no repository, so it
-// fails the request-path assertions below. It gets its own test instead.
+// The list tabs are GraphQL documents now, so their routing evidence is the
+// `gh api -i graphql` argv rather than a `--repo` flag. The document that says
+// which query it was travels on stdin and is therefore irrelevant to routing --
+// which is exactly why routing is asserted on argv and nothing else.
+const graphqlCalls = (result) => result.fixtureCalls.filter((call) => call.startsWith("api -i graphql"));
+// The fixture's semantic log line, which proves the observer document was
+// actually sent. It carries no argv, so it can never be used for routing.
+const observerDocuments = (result) => result.fixtureCalls.filter((call) => call.startsWith("graphql graphql.observer"));
+// The REST endpoints only. `api rate_limit` and `api -i user` are control-plane
+// reads that address no repository, and the GraphQL vector has its own helper
+// above; all three would fail the request-path assertions below.
 const apiCalls = (result) =>
   result.fixtureCalls.filter((call) => call.startsWith("api ") &&
-    !call.startsWith("api rate_limit") && !call.startsWith("api -i user"));
-const probeCalls = (result) => result.fixtureCalls.filter((call) => call.startsWith("api rate_limit"));
+    !call.startsWith("api rate_limit") && !call.startsWith("api -i user") && !call.startsWith("api -i graphql"));
 
 function assertReachedTheDataLayer(result, label) {
   assert.ok(result.fixtureCalls.length > 0, `${label}: the fixture gh was never invoked`);
@@ -58,8 +64,8 @@ test("with no --repo, all-remotes inference routes API calls to github.com", () 
 
 test("a two-part --repo pins github.com despite conflicting environment targets", () => {
   assertReachedTheDataLayer(slugOnly, "slug-only");
-  for (const call of listCalls(slugOnly)) {
-    assert.ok(call.includes("--repo github.com/acme/widget"), call);
+  for (const call of graphqlCalls(slugOnly)) {
+    assert.ok(call.includes("--hostname github.com"), `list vector was not routed: ${call}`);
   }
   for (const call of apiCalls(slugOnly)) {
     assert.ok(call.includes("--hostname github.com"), `default host was not explicit: ${call}`);
@@ -72,8 +78,10 @@ test("a two-part --repo pins github.com despite conflicting environment targets"
 test("a host-qualified --repo routes BOTH halves to the host", () => {
   assertReachedTheDataLayer(hostQualified, "host-qualified");
 
-  for (const call of listCalls(hostQualified)) {
-    assert.ok(call.includes(`--repo ${HOST}/acme/widget`), call);
+  for (const call of graphqlCalls(hostQualified)) {
+    assert.ok(call.includes(`--hostname ${HOST}`), `list vector was not routed to the host: ${call}`);
+    // The host is an argument here too, never part of a path or a document.
+    assert.ok(!call.includes(`repos/${HOST}/`), `the host reached a request path: ${call}`);
   }
   for (const call of apiCalls(hostQualified)) {
     // The defect guard: without this flag these three calls go to github.com
@@ -92,9 +100,16 @@ test("the budget probe is routed to the host too", () => {
   // throttles -- or fails to -- against a number from an unrelated limit.
   // `--repo host/owner/name` is the case that needs the flag: it sets the host
   // without setting GH_HOST, which `gh` would otherwise have honoured on its own.
-  const probes = probeCalls(hostQualified);
-  assert.ok(probes.length > 0, "the budget probe never ran on the host-qualified target");
-  for (const call of probes) {
+  // Two halves: the observer document was genuinely sent, and every GraphQL
+  // invocation carried the host. Asserting a hostname against the semantic log
+  // line cannot work -- it contains no argv at all.
+  assert.ok(
+    observerDocuments(hostQualified).length > 0,
+    "the budget probe never ran on the host-qualified target",
+  );
+  const routed = graphqlCalls(hostQualified);
+  assert.ok(routed.length > 0, "no GraphQL invocation was recorded");
+  for (const call of routed) {
     assert.ok(call.includes(`--hostname ${HOST}`), `budget probe not routed to the host: ${call}`);
   }
 });

@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-06
+
+### Added
+
+- **Panes sharing a GitHub account now share one API budget.** Quota is keyed by
+  the verified principal and access by the effective credential, so two tokens
+  for the same account coordinate as one instead of splitting the budget in
+  half. A shared transport permit serializes HTTP starts across panes, and the
+  bootstrap allowance is persisted before a request starts, so a crash, restart
+  or manual refresh cannot replenish it.
+
+### Changed
+
+- **Issues and Pull Requests use explicit, bounded GraphQL documents.**
+  `gh issue list` and `gh pr list` silently routed through GraphQL at a price
+  nothing in the codebase could name -- the budget was debited from a number
+  measured by hand once and written into a constant. Both now use fixed,
+  versioned documents with typed variables on stdin, so the query never reaches
+  argv and every page declares the cost it is held to.
+- **`gh api rate_limit` is no longer a source of spendable GraphQL capacity.**
+  A claimed observer that selects only the meter supplies capacity and reports
+  what it cost. `/rate_limit` remains a diagnostic, is labelled as one in
+  `--doctor`, and is dropped on migration rather than kept as spendable
+  evidence.
+- **Opening a row spends no API budget.** `gh <kind> view --web` paid a request
+  to be told a URL the app already held, and had to refuse the user the page
+  when the budget was tight. URLs are admitted -- https only, matching host --
+  before reaching the platform opener.
+
+### Fixed
+
+- **Issues and Pull Requests worked only with an explicit `--repo`.** `gh`
+  infers the repository from the working directory and GraphQL cannot, so the
+  query variables went out half-filled without it.
+- **Multi-page repositories leaked a tab reservation on every poll.** Settlement
+  summed all page costs even though later pages settle against their own
+  reservation, and the resulting over-settlement was rejected as corrupt --
+  discarding the budget observations from the only requests carrying real cost
+  evidence.
+- **The budget observer's own spend was attributed to external consumers**, so
+  the governor progressively throttled real work to make room for its own
+  probing.
+- **A contended registry lock could retract a verified identity**, blanking
+  every tab and discarding the ETags that make the next round cheap. Unknown
+  and changed are now distinct, and only a proven change discards rows.
+- **Bootstrap attempts that never proved a principal were never retired**, so
+  the registry filled to its cap behind a captive portal and refused every
+  later bootstrap permanently, recoverable only by deleting state by hand.
+- **Identity debt transfer wrote the ledger and registry non-atomically**, so a
+  crash could orphan a charged receipt or record a debt as transferred to a
+  ledger that never received it.
+- **A stopped pane held the single machine-wide HTTP permit indefinitely**, as
+  it was reclaimed only on owner death.
+- **The Open key hint was dead on every tab**, and opening a cache-hydrated row
+  did nothing because the cache dropped the row's URL.
+
 ## [0.11.2] - 2026-08-31
 
 ### Fixed
@@ -795,7 +851,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.11.2...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/juan294/gh-glance/compare/v0.11.2...v0.12.0
 [0.11.2]: https://github.com/juan294/gh-glance/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/juan294/gh-glance/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/juan294/gh-glance/compare/v0.10.0...v0.11.0

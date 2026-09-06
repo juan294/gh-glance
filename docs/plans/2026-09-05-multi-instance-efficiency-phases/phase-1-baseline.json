@@ -1,0 +1,128 @@
+{
+  "schema": 1,
+  "kind": "observed-current-production-baseline",
+  "capturedAt": "2026-09-05T16:22:13.759Z",
+  "commit": "b819f42e87922671a35bb72052bd0ede445b74be",
+  "runtime": "v24.19.0",
+  "platform": "darwin/arm64",
+  "workload": "Actions-active panes; --refresh 40; background defaults; identical/distinct repositories; generous 1000000-unit ten-minute budgets; 100ms fixture delay; fixed 8-second observation window; current legacy fixture transport",
+  "measurementNotes": [
+    "Counts are fixture invocations, not claims about all HTTP requests hidden inside real gh porcelain commands.",
+    "Charged units are observations from the existing legacy server ledger, which does not debit auth status; the new independent oracle accounts for auth HTTP explicitly.",
+    "Only active Actions data becomes due within this fixed window; this is a startup duplicate-demand baseline, not a sustained all-tab workload."
+  ],
+  "unavailable": {
+    "sourceToDisplayLatency": "No content changes injected; request latency is measured, not source-to-display.",
+    "coalescedConsumers": "No production metric exposed at baseline.",
+    "queueWait": "Not sampled by existing capture harness."
+  },
+  "resourceMeasurement": "100ms samples of owned descendants (dashboard, shell, fixture); CPU is a sampled lower bound, RSS is aggregate sample peak; excludes measurement parent and sampler.",
+  "samples": [
+    {
+      "panes": 1,
+      "resources": {
+        "sampleIntervalMs": 100,
+        "samples": 80,
+        "sampledCpuSeconds": 0.48,
+        "peakSampledRssKiB": 223952
+      },
+      "elapsedMs": 8121,
+      "subprocessCount": 5,
+      "recordedFixtureStarts": 5,
+      "observers": 2,
+      "actionsRunRequests": 1,
+      "coreChargedUnits": 3,
+      "graphqlChargedUnits": 0,
+      "requestLatencyMs": {
+        "p50": 102,
+        "p95": 103
+      },
+      "maxConcurrency": 2
+    },
+    {
+      "panes": 2,
+      "resources": {
+        "sampleIntervalMs": 100,
+        "samples": 80,
+        "sampledCpuSeconds": 0.8500000000000002,
+        "peakSampledRssKiB": 349808
+      },
+      "elapsedMs": 8115,
+      "subprocessCount": 8,
+      "recordedFixtureStarts": 8,
+      "observers": 2,
+      "actionsRunRequests": 2,
+      "coreChargedUnits": 5,
+      "graphqlChargedUnits": 0,
+      "requestLatencyMs": {
+        "p50": 102,
+        "p95": 104
+      },
+      "maxConcurrency": 3
+    },
+    {
+      "panes": 7,
+      "resources": {
+        "sampleIntervalMs": 100,
+        "samples": 80,
+        "sampledCpuSeconds": 3.239999999999999,
+        "peakSampledRssKiB": 1581760
+      },
+      "elapsedMs": 8118,
+      "subprocessCount": 23,
+      "recordedFixtureStarts": 23,
+      "observers": 2,
+      "actionsRunRequests": 7,
+      "coreChargedUnits": 15,
+      "graphqlChargedUnits": 0,
+      "requestLatencyMs": {
+        "p50": 103,
+        "p95": 109
+      },
+      "maxConcurrency": 14
+    },
+    {
+      "panes": 10,
+      "resources": {
+        "sampleIntervalMs": 100,
+        "samples": 80,
+        "sampledCpuSeconds": 4.860000000000001,
+        "peakSampledRssKiB": 2015056
+      },
+      "elapsedMs": 8145,
+      "subprocessCount": 32,
+      "recordedFixtureStarts": 32,
+      "observers": 2,
+      "actionsRunRequests": 10,
+      "coreChargedUnits": 21,
+      "graphqlChargedUnits": 0,
+      "requestLatencyMs": {
+        "p50": 103,
+        "p95": 104
+      },
+      "maxConcurrency": 16
+    },
+    {
+      "panes": 10,
+      "distinct": true,
+      "resources": {
+        "sampleIntervalMs": 100,
+        "samples": 80,
+        "sampledCpuSeconds": 4.910000000000003,
+        "peakSampledRssKiB": 1322400
+      },
+      "elapsedMs": 8152,
+      "subprocessCount": 32,
+      "recordedFixtureStarts": 32,
+      "observers": 2,
+      "actionsRunRequests": 10,
+      "coreChargedUnits": 21,
+      "graphqlChargedUnits": 0,
+      "requestLatencyMs": {
+        "p50": 103,
+        "p95": 105
+      },
+      "maxConcurrency": 10
+    }
+  ]
+}

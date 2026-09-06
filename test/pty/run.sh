@@ -30,7 +30,13 @@ CAPTURE_PID=""
 STDIN_PID=""
 PIPE_ROOT=""
 
+valid_capture_pid() {
+  case "$1" in ''|0*|*[!0-9]*) return 1 ;; esac
+  [ "$1" -gt 1 ] 2>/dev/null && [ "$1" -ne "$$" ]
+}
+
 terminate_tree() {
+  valid_capture_pid "$1" || return 0
   for child in $(pgrep -P "$1" 2>/dev/null); do
     terminate_tree "$child"
   done
@@ -38,12 +44,23 @@ terminate_tree() {
 }
 
 cleanup_capture() {
-  if [ -n "$CAPTURE_PID" ]; then
-    terminate_tree "$CAPTURE_PID"
+  # A signal can arrive after the producer publishes its PID but before the
+  # parent caches either pipeline root. Recover ownership before killing any
+  # tree; the producer is a sibling of script, not its descendant.
+  if ! valid_capture_pid "$STDIN_PID" && [ -n "$PIPE_ROOT" ] && [ -s "$PIPE_ROOT/producer.pid" ]; then
+    IFS= read -r STDIN_PID < "$PIPE_ROOT/producer.pid" || true
   fi
-  if [ -n "$STDIN_PID" ]; then
-    terminate_tree "$STDIN_PID"
+  capture_roots="$CAPTURE_PID $STDIN_PID"
+  if ! valid_capture_pid "$CAPTURE_PID"; then
+    capture_roots="$capture_roots $(pgrep -P "$$" 2>/dev/null)"
   fi
+  stopped_roots=""
+  for root_pid in $capture_roots; do
+    valid_capture_pid "$root_pid" || continue
+    case " $stopped_roots " in *" $root_pid "*) continue ;; esac
+    stopped_roots="$stopped_roots $root_pid"
+    terminate_tree "$root_pid"
+  done
   if [ -n "$PIPE_ROOT" ]; then
     rm -f "$PIPE_ROOT/producer.pid"
     rmdir "$PIPE_ROOT" 2>/dev/null || true
@@ -166,13 +183,28 @@ else
   fi
 fi
 
+# A test-only barrier makes the signal-before-registration race reproducible.
+# Normal captures never enter this branch.
+if [ -n "${GH_GLANCE_CAPTURE_TEST_REGISTRATION_GATE:-}" ]; then
+  printf '%s\n' "$!" > "$GH_GLANCE_CAPTURE_TEST_REGISTRATION_GATE"
+  registration_waits=0
+  while [ ! -f "$GH_GLANCE_CAPTURE_TEST_REGISTRATION_GATE.continue" ]; do
+    registration_waits=$((registration_waits + 1))
+    if [ "$registration_waits" -ge 500 ]; then
+      echo "run.sh: PID registration barrier timed out" >&2
+      abort_capture
+    fi
+    sleep .01
+  done
+fi
+
 CAPTURE_PID=$!
 if [ -n "$STDIN_SCRIPT" ]; then
   while [ ! -s "$PIPE_ROOT/producer.pid" ] && kill -0 "$CAPTURE_PID" 2>/dev/null; do
     sleep .01
   done
   if [ -s "$PIPE_ROOT/producer.pid" ]; then
-    STDIN_PID=$(sed -n '1p' "$PIPE_ROOT/producer.pid")
+    IFS= read -r STDIN_PID < "$PIPE_ROOT/producer.pid" || true
   fi
 fi
 wait "$CAPTURE_PID"

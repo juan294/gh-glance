@@ -319,7 +319,7 @@ pane definition. Flags are there when you want them:
 | `-R`, `--repo [host/]owner/name` | Watch a specific repository instead of the current directory's. Works from anywhere -- you do not need a local clone. The optional host targets a GitHub Enterprise or EMU data-residency tenant, e.g. `tenant.ghe.com/acme/widget`. |
 | `--refresh <seconds>` | Minimum active-tab poll interval, 2-3600, default 5. Safe shared grants can make a check later; each background tab is considered about every 12 floors. |
 | `--tab <name>` | Start on `actions`, `issues`, `prs` or `security`. |
-| `--verbose` | Log one line per `gh` call to stderr, with timing and outcome. stderr must be redirected: `gh-glance --verbose 2>gh-glance.log`. |
+| `--verbose` | Log one line per dashboard `gh` call to stderr, with timing and outcome. Credential lookup and the account-identity proof are deliberately excluded, so that they cannot log anything derived from a token. stderr must be redirected: `gh-glance --verbose 2>gh-glance.log`. |
 | `--doctor` | Print a diagnostic report and exit. See [Diagnostics](#diagnostics). |
 
 An unrecognised flag exits 2 rather than being ignored, so a typo fails loudly.
@@ -396,21 +396,39 @@ recovery state owned by the UI, not a configuration interface.
 
 ### Private API governor state
 
-API admission uses a separate file beside the cache:
+API admission uses a separate directory beside the cache:
 
 ```text
-$XDG_CONFIG_HOME/gh-glance/rate-governor-v1-<scope hash>.json
-~/Library/Application Support/gh-glance/rate-governor-v1-<scope hash>.json
-~/.config/gh-glance/rate-governor-v1-<scope hash>.json
+$XDG_CONFIG_HOME/gh-glance/coordination-v2/
+~/Library/Application Support/gh-glance/coordination-v2/
+~/.config/gh-glance/coordination-v2/
 ```
 
-The hash binds the effective GitHub host to the local `gh` account namespace
-without putting either raw value in the file name. The file records only the
-protocol needed to coordinate panes: REST and GraphQL budget observations and
-epochs, leases, intents, reservations, fair-lane cursors, probe ownership and
-outcomes, and temporary rate-limit blocks. It stores no token, raw host, login,
-repository, working directory, title, author, branch, alert, or other dashboard
-row. Ephemeral lock records contain only a PID and random nonce.
+It holds `registry.json`, which maps credentials to verified accounts, and one
+`quota-<hash>.json` ledger per account. The ledger hash binds the effective
+GitHub host to the *verified principal* -- the account kind and numeric ID that
+GitHub itself confirmed -- rather than to whichever local `gh` configuration
+happened to select it, so two tokens for the same account coordinate as one
+instead of splitting the budget in half.
+
+A ledger records only the protocol needed to coordinate panes: REST and GraphQL
+budget observations and epochs, leases, intents, reservations, fair-lane
+cursors, probe ownership and outcomes, and temporary rate-limit blocks. It
+stores no token, raw host, login, repository, working directory, title, author,
+branch, alert, or other dashboard row.
+
+`registry.json` is the one exception, and it is deliberate: to know that two
+credentials are the same account it stores that account's numeric ID and its
+sanitized login, alongside private digests of the credentials themselves. No
+token is ever written, to it or anywhere else. Ephemeral lock records contain
+only a PID and random nonce.
+
+Panes from an older release coordinate through the previous
+`rate-governor-v1-<scope hash>.json` files, which this version cannot join.
+It preserves them as evidence, refuses to activate while any of their leases is
+still live, and waits out any unsettled charge they left behind. Closing the
+older panes is what completes the upgrade -- gh-glance will not close them for
+you, and deleting the files instead discards quota that is still owed.
 
 This state has a stricter role than `dashboard-cache.json`. A missing cache can
 be ignored because it only supplies last-good rows. Missing governor state can
@@ -692,7 +710,12 @@ GH_GLANCE_ICONS=ascii gh-glance
 | Cached rows plus `Paused` and `stale 2m` | The rows came from the separate last-known-good dashboard cache, while the live request is blocked or unsafe. Stale age is not extended by a pause. The error and footer describe current coordination; cached data never means the live check succeeded. |
 | Repeated GitHub rate-limit messages | A classified rate-limit response is published as one shared resource block. Local panes make no data retry before that block's probe/reset deadline. Use `--doctor` to inspect the resource and reset; repeated manual refresh cannot override it. |
 | It exits immediately when piped | Intentional. It is a full-screen dashboard, not a reporting command. |
-| It stopped updating and you cannot tell why | Run `gh-glance --verbose 2>gh-glance.log`, reproduce, then read the log: one line per `gh` call with its duration and outcome. It is redacted the same way `--doctor` is, so it is safe to attach to a bug report. `--doctor --verbose` logs the probes too. |
+| `Restart required: close older gh-glance panes` | A pane from an older release still holds a live lease in the previous coordination format, which this version cannot join. Quit those panes; this one resumes on its own. Nothing is killed for you, and no state needs deleting. |
+| `Upgrade waiting for legacy quota reset` | The older panes are gone, but left spend that cannot be proven settled. It waits for the affected rate-limit window to reset rather than assume the quota is free. |
+| `Coordination state unavailable; evidence preserved` | Coordination state could not be read and was deliberately not overwritten, so nothing is lost. Run `gh-glance --doctor` and check the config directory's permissions. |
+| `Shared HTTP request or cooldown in progress` | Panes share one outbound request slot and one cooldown. Another pane holds it, or a server-sent `Retry-After` is still running. Normal pacing, not an error. |
+| `Verified identity unavailable; waiting to retry` | The account behind your credential has not been confirmed yet -- not signed in, a denied or malformed proof, or a slow credential helper. Check `gh auth status`. Retries are rate-limited, so this clears on its own rather than immediately. |
+| It stopped updating and you cannot tell why | Run `gh-glance --verbose 2>gh-glance.log`, reproduce, then read the log: one line per dashboard `gh` call with its duration and outcome. Credential lookup and the identity proof are excluded by design. It is redacted the same way `--doctor` is, so it is safe to attach to a bug report. `--doctor --verbose` logs the probes too. |
 | `--verbose` refuses to start | stderr is still your terminal, where the log would draw over the dashboard. Redirect it to a file. |
 
 ## Contributing

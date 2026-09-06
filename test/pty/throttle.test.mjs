@@ -20,6 +20,7 @@ import {
   resourceReserve,
 } from "../../index.mjs";
 import { captureAsync } from "./capture.mjs";
+import { seedKnownHeldIdentity } from "./fixtures/known-identity.mjs";
 
 const STATE_HELPER = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "gh-state.mjs");
 
@@ -35,14 +36,15 @@ function fixture(t, overrides = {}) {
     events: [],
     ...overrides,
   };
+  if (state.core.remaining === 0) seedKnownHeldIdentity(root, state, now);
   writeFileSync(statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
   return {
     root,
     statePath,
     read: () => JSON.parse(readFileSync(statePath, "utf8")),
     readGovernor: () => {
-      const directory = join(root, "gh-glance");
-      const name = readdirSync(directory).find((entry) => entry.startsWith("rate-governor-v1-"));
+      const directory = join(root, "gh-glance", "coordination-v2");
+      const name = readdirSync(directory).find((entry) => /^quota-[a-f0-9]{64}\.json$/.test(entry));
       return JSON.parse(readFileSync(join(directory, name), "utf8"));
     },
   };
@@ -51,10 +53,17 @@ function fixture(t, overrides = {}) {
 const starts = (state, command) => state.events.filter(
   (event) => event.type === "start" && event.argv[0] === command,
 );
+const graphqlStarts = (state, operation) => state.events.filter(
+  (event) => event.type === "start" && event.graphqlOperation === operation,
+);
 const dataStarts = (state) => state.events.filter((event) =>
   event.type === "start" && (
     ["run", "issue", "pr"].includes(event.argv[0]) ||
-    event.argv[0] === "api" && event.argv[1] !== "rate_limit" && !event.argv.includes("user")
+    (event.graphqlOperation
+      // The claimed observer is control-plane work, not data. It shares its
+      // command line with every page, so only the parsed operation separates them.
+      ? event.graphqlOperation !== "graphql.observer"
+      : event.argv[0] === "api" && event.argv[1] !== "rate_limit" && !event.argv.includes("user"))
   ),
 );
 const actionsRuns = (state) => dataStarts(state)
@@ -110,7 +119,7 @@ test("the shared fixture recovers a dead private lock without using governor sta
     mode: 0o600,
   });
   execFileSync(process.execPath, [STATE_HELPER, "--version"], {
-    env: { ...process.env, GH_GLANCE_FIXTURE_STATE: box.statePath },
+    env: { GH_GLANCE_FIXTURE_STATE: box.statePath },
   });
   assert.equal(starts(box.read(), "--version").length, 1);
   assert.equal(existsSync(lockPath), false);
@@ -125,7 +134,7 @@ test("the shared fixture recovers an exact dead recovery marker", (t) => {
     nonce: "dead-recovery",
   })}\n`, { mode: 0o600 });
   execFileSync(process.execPath, [STATE_HELPER, "--version"], {
-    env: { ...process.env, GH_GLANCE_FIXTURE_STATE: box.statePath },
+    env: { GH_GLANCE_FIXTURE_STATE: box.statePath },
   });
   assert.equal(starts(box.read(), "--version").length, 1);
   assert.equal(existsSync(recoveryPath), false);
@@ -160,7 +169,8 @@ test("manual refresh bursts create one unchanged held-sample probe demand", asyn
   const startupPublication = await observeUntil(
     box.readGovernor,
     (governor) => governor?.budgets?.core?.remaining === 0 &&
-      governor.budgets.core.observedAt >= setupAt,
+      governor.budgets.core.observedAt >= setupAt &&
+      governor.budgets.graphql?.observedAt >= setupAt,
     setupAt + 20_000,
   );
   const startupObservedAt = startupPublication.matched
@@ -171,16 +181,30 @@ test("manual refresh bursts create one unchanged held-sample probe demand", asyn
     box.readGovernor,
     (governor) => governor?.budgets?.core?.remaining === 0 &&
       governor.budgets.graphql.observedAt > startupObservedAt,
-    Date.now() + 20_000,
+    Date.now() + 35_000,
   );
   writeFileSync(secondBurstReadyPath, "ready\n", { mode: 0o600 });
   const result = await resultPromise;
   const state = box.read();
-  const rate = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
+  const rate = starts(state, "api").filter((event) => event.graphqlOperation === "graphql.observer");
   assert.equal(startupPublication.matched, true, "startup held publication was not observed");
   assert.equal(manualPublication.matched, true, "manual GraphQL publication was not observed");
-  assert.equal(rate.length, 2, `expected startup plus one manual probe, got ${rate.length}`);
-  assert.equal(dataStarts(state).length, 0, "manual refresh crossed the core hold");
+  // Six manual refreshes, one probe. The contract is that a burst does not
+  // multiply probe demand; what changed is that it no longer needs a second
+  // probe at all. `/rate_limit` was free, so re-probing it on demand cost
+  // nothing; the claimed observer costs a point, and a data response header
+  // refines the same epoch for free -- so the burst is satisfied without
+  // spending again. One probe is the stronger result, not a weaker one.
+  assert.equal(rate.length, 1, `expected one startup probe, got ${rate.length}`);
+  // The hold under test is on core. Issues and PRs are GraphQL and are
+  // *supposed* to keep progressing through it -- the sibling test above requires
+  // exactly that -- so the thing that must be zero is core-spending work, not
+  // all work.
+  assert.equal(
+    dataStarts(state).filter((event) => event.cost.core > 0).length,
+    0,
+    "manual refresh crossed the core hold",
+  );
   assert.equal(result.exitCode, 0);
 });
 
@@ -198,8 +222,12 @@ test("a held core resource leaves both GraphQL tabs usable", async (t) => {
   })));
   const state = box.read();
   assert.equal(actionsCalls(state).length, 0);
-  assert.ok(starts(state, "issue").length >= 1, "Issues did not progress");
-  assert.ok(starts(state, "pr").length >= 1, "pull requests did not progress");
+  // Semantic, not argv-shaped: both tabs are `api -i graphql` now, so only the
+  // parsed operation distinguishes them -- and distinguishes either from the
+  // control observer, which would otherwise make this assertion pass on a tab
+  // that never actually fetched.
+  assert.ok(graphqlStarts(state, "issues.page").length >= 1, "Issues did not progress");
+  assert.ok(graphqlStarts(state, "pulls.page").length >= 1, "pull requests did not progress");
 });
 
 test("a real reset gets one fresh probe then one phased active request per pane", async (t) => {
@@ -230,11 +258,11 @@ test("a real reset gets one fresh probe then one phased active request per pane"
   });
   const resetProbe = await observeUntil(
     box.read,
-    (state) => starts(state, "api").filter((event) => event.argv[1] === "rate_limit").length >= 2,
+    (state) => starts(state, "api").filter((event) => event.graphqlOperation === "graphql.observer").length >= 2,
     Date.now() + 45_000,
   );
   const resetProbeAt = resetProbe.matched
-    ? starts(resetProbe.value, "api").filter((event) => event.argv[1] === "rate_limit")[1].at
+    ? starts(resetProbe.value, "api").filter((event) => event.graphqlOperation === "graphql.observer")[1].at
     : null;
   const publication = Number.isFinite(resetProbeAt)
     ? await observeUntil(
@@ -259,7 +287,8 @@ test("a real reset gets one fresh probe then one phased active request per pane"
   const progress = Number.isFinite(laneInterval)
     ? await observeUntil(
       box.read,
-      (state) => new Set(actionsRuns(state).map((event) => event.pane)).size >= 3,
+      (state) => new Set(actionsRuns(state).map((event) => event.pane)).size >= 3 &&
+        dataStarts(state).length >= 6,
       progressDeadline,
     )
     : null;
@@ -271,7 +300,7 @@ test("a real reset gets one fresh probe then one phased active request per pane"
   await captures;
 
   const state = box.read();
-  const probes = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
+  const probes = starts(state, "api").filter((event) => event.graphqlOperation === "graphql.observer");
   const runs = actionsRuns(state).sort((left, right) => left.at - right.at);
   const schedulingTolerance = laneInterval * 0.15;
   t.diagnostic(`reset publication ${publishedCore?.observedAt}; ` +
@@ -370,7 +399,7 @@ test("twelve panes share probe ownership and start bounded phased work", async (
 
   const state = box.read();
   const governor = box.readGovernor();
-  const probes = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
+  const probes = starts(state, "api").filter((event) => event.graphqlOperation === "graphql.observer");
   const runs = actionsRuns(state).sort((left, right) => left.at - right.at);
   t.diagnostic(JSON.stringify({
     publicationAt,
@@ -442,7 +471,7 @@ test("twelve held panes share one block probe instead of retrying per pane", asy
   await captures;
   const state = box.read();
   const governor = box.readGovernor();
-  const probes = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
+  const probes = starts(state, "api").filter((event) => event.graphqlOperation === "graphql.observer");
   assert.equal(publicationResult.matched, true, "the shared held publication missed its readiness bound");
   assert.ok(probes.length >= 1 && probes.length <= 2, `shared held probes: ${probes.length}`);
   assert.equal(dataStarts(state).length, 0);
@@ -559,7 +588,7 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
   const secondProbe = blockedGovernor
     ? await observeUntil(
       box.read,
-      (state) => starts(state, "api").filter((event) => event.argv[1] === "rate_limit").length >= 2,
+      (state) => starts(state, "api").filter((event) => event.graphqlOperation === "graphql.observer").length >= 2,
       boundedDeadline,
     )
     : null;
@@ -570,7 +599,7 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
     rmSync(readyPath, { force: true });
   }
   const state = box.read();
-  const probes = starts(state, "api").filter((event) => event.argv[1] === "rate_limit");
+  const probes = starts(state, "api").filter((event) => event.graphqlOperation === "graphql.observer");
   const coreData = dataStarts(state).filter((event) => event.cost.core > 0);
   const failureEnd = state.events.find((event) => event.type === "end" && event.failed === true);
   const governor = box.readGovernor();

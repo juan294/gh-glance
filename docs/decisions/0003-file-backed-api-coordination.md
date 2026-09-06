@@ -3,6 +3,17 @@
 Date: 2026-08-18
 Status: Accepted
 
+Amended 2026-09-05 by [ADR 0004](0004-quota-and-acquisition-identities.md):
+the new namespace uses verified quota principals and separate authorization
+identities. Transition requires stopping discoverable legacy panes and
+preserving old uncertain charges and holds. Legacy files remain evidence;
+corrupt or unknown schemas fail closed. Reappearing discoverable legacy leases
+pause new admission. This is a controlled restart boundary, not a mixed-version
+guarantee: an old binary launched later or using another configuration root
+cannot be forced to participate in a protocol it does not read. Descriptions
+below of the original authentication fingerprint record the initial design
+and are superseded by ADR 0004.
+
 ## Context
 
 Seven panes were observed consuming about 142 REST calls per minute. The shared
@@ -77,6 +88,14 @@ endpoint-specific header from another epoch is ignored and its request cost
 stays conservatively reserved.
 
 ## Protocol and recovery
+
+> Partly superseded by the phase 3 amendment at the end of this document. The
+> paragraphs below describing one shared claim and `rate_limit` as the GraphQL
+> probe record the original design: `rate_limit` is no longer a source of
+> spendable capacity, and a claimed observer supplies it instead. Read the
+> amendment before relying on anything in this section. The body is corrected
+> rather than appended to when the observer work lands in full.
+
 
 The governor state records resource epochs and observations, fair lane cursors,
 leases, pending intents, reservations, shared probe ownership and outcomes,
@@ -162,3 +181,47 @@ GraphQL remaining value.
   independent one-shot control, data, and heartbeat timers, while the footer
   renders their semantic state without permanent animation or accumulated
   terminal lines.
+
+## Amendment: GraphQL authority (phase 3)
+
+`gh api rate_limit` is no longer a source of spendable GraphQL capacity. It is
+retained as an explicitly non-authoritative diagnostic, reported and labelled as
+such, and a budget observation it produced can never be published as authority.
+
+Spendable GraphQL capacity now comes from a claimed observer that selects
+`rateLimit { cost limit used remaining resetAt }` and nothing else. The reason is
+not tidiness: `/rate_limit` is a different endpoint's view of the meter, it can
+lag behind the spend it is meant to bound, and it can never say what a
+particular query cost. The observer costs one point and reports exactly what it
+cost, which is what makes it reconcilable against the ledger. A counter obtained
+for free is not authority; it is a rumour with a number in it.
+
+Provenance is recorded accordingly. A GraphQL budget written by the observer
+carries `graphql-observer`. `rate-limit-probe` remains *readable* so that a
+ledger written before this change still parses, but nothing writes it, nothing
+may admit work against it, and neither source may ever stand as core authority.
+Migration from the v1 protocol therefore drops the GraphQL budget outright, as
+it already dropped the core one: "never a source of spendable capacity" cannot
+have an exception for numbers that happened to arrive before the rule existed.
+The claimed observer re-establishes capacity on the next probe.
+
+`GOVERNOR_STATE_VERSION` moves to 3 because of this provenance. An older build
+does not recognise `graphql-observer` and would reject the budget -- and its
+normalizer turns one rejected budget into total loss, discarding every live
+pane's leases, intents and reservations. The version gate makes such a build
+fail closed on the file instead, which is what a version gate is for. The
+legacy inspector can still *read* the previous protocol, because recognising
+that an older pane holds a live lease is exactly what the restart boundary
+depends on.
+
+Only a claimed observer opens a new epoch. A data page's counters constrain the
+same epoch -- they are real evidence of spend -- but a page cannot declare a
+reset, because an old or reordered response would otherwise appear to restore
+capacity that was never restored.
+
+Both observers are exempt from the data-admission recheck at the subprocess
+boundary, for the reason that the control plane cannot be gated on the capacity
+it exists to establish: a resource whose budget is unknown would otherwise
+refuse the one request able to learn it. The exemption is from data admission
+only. They remain bounded by the rolling attempt allowance, the shared transport
+permit and the secondary cooldown, and every attempt is still charged.
