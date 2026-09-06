@@ -206,8 +206,22 @@ test("--doctor claims the core observer and uses its persisted ETag before calli
       budget: { limit: 5000, used: 0, remaining: 5000, resetMs },
     },
   }, now, "graphql").ok, true);
-  const core = inspectGovernor(scope, now).value.budgets.core;
-  assert.equal(requestManualProbe(scope, leaseId, core.epoch, core.observedAt, Date.now()).ok, true);
+  // Both observers have to be due, and each is made due by naming its own
+  // epoch: requestManualProbe only pulls an observer forward when the epoch it
+  // is given matches that resource's. Asking with core's epoch alone worked
+  // only when both resources happened to share one, which they do only when the
+  // fixture derived both resets inside the same second -- every call computes
+  // its own `now + 3600s`. Straddling a second boundary left GraphQL not due,
+  // doctor rightly skipped its observer, and this test failed on CI for a race
+  // in its own setup.
+  const budgets = inspectGovernor(scope, now).value.budgets;
+  for (const resource of ["core", "graphql"]) {
+    assert.equal(
+      requestManualProbe(scope, leaseId, budgets[resource].epoch, budgets[resource].observedAt, Date.now()).ok,
+      true,
+      resource,
+    );
+  }
 
   await doctor({
     env: {
