@@ -154,6 +154,9 @@ function asV1GovernorState(state) {
   // fixture has to be a genuine v1 document, not the current shape with its
   // version field rewritten, or it exercises nothing the migration does.
   delete legacy.probeClaims;
+  // Persisted scheduling fairness arrived in v5 and is absent from a v1
+  // document for the same reason the per-resource claims are.
+  delete legacy.fairness;
   legacy.probeClaim = null;
   legacy.probeOutcome = { status: "idle", at: 0, nextAt: 0 };
   for (const budget of Object.values(legacy.budgets)) {

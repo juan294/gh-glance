@@ -2098,6 +2098,7 @@ function scheduleIntents({
   cursors = {},
   nowMs,
   maxGrants = Number.POSITIVE_INFINITY,
+  manualStreak = 0,
 }) {
   const valid = [];
   const prunedIntentIds = [];
@@ -2138,11 +2139,29 @@ function scheduleIntents({
   const liveLeaseCount = countLiveLeases(leases, nowMs);
   const priorities = [...new Set(valid.map((intent) => intent.normalizedPriority))].sort((a, b) => a - b);
 
-  for (const priority of priorities) {
-    const pending = valid.filter((intent) => intent.normalizedPriority === priority);
+  let streak = Number.isSafeInteger(manualStreak) && manualStreak > 0 ? manualStreak : 0;
+  const grantedIds = new Set();
+  // Priority still decides every other question. This says only that "higher
+  // priority" cannot mean "always": once manual work has taken the last three
+  // turns and an active owner is waiting, that owner takes this one. The turn
+  // is a single grant, and it is subject to exactly the same budget, phase and
+  // lane checks as any other -- fairness reorders work, it never admits work
+  // that could not otherwise be paid for.
+  const owedActiveTurn = streak >= MANUAL_GRANT_STREAK_LIMIT &&
+    valid.some((intent) => intent.normalizedPriority === REQUEST_PRIORITIES.active);
+  const passes = owedActiveTurn
+    ? [{ priority: REQUEST_PRIORITIES.active, limit: 1, record: false },
+      ...priorities.map((priority) => ({ priority, limit: Number.POSITIVE_INFINITY, record: true }))]
+    : priorities.map((priority) => ({ priority, limit: Number.POSITIVE_INFINITY, record: true }));
+
+  for (const pass of passes) {
+    const priority = pass.priority;
+    const pending = valid.filter((intent) =>
+      intent.normalizedPriority === priority && !grantedIds.has(intent.id));
     const roundRobinState = createRoundRobinState(pending, updatedCursors);
+    let grantedThisPass = 0;
     while (pending.length > 0) {
-      if (grants.length >= maxGrants) break;
+      if (grants.length >= maxGrants || grantedThisPass >= pass.limit) break;
       const intent = pending.splice(nextRoundRobinIndex(pending, roundRobinState), 1)[0];
       const resources = RATE_RESOURCES.filter((resource) => intent.costs[resource] > 0);
       const decisions = Object.fromEntries(resources.map((resource) => [
@@ -2158,7 +2177,10 @@ function scheduleIntents({
       ]));
       const blocked = resources.find((resource) => decisions[resource].mode !== "open");
       if (blocked) {
-        denied.push({ intentId: intent.id, resource: blocked, ...decisions[blocked] });
+        // Only the ordinary pass records a denial. The owed-turn pass looks at
+        // the same intents again immediately afterwards, and recording here
+        // would report every one of them twice.
+        if (pass.record) denied.push({ intentId: intent.id, resource: blocked, ...decisions[blocked] });
         continue;
       }
 
@@ -2173,6 +2195,7 @@ function scheduleIntents({
       );
       const expiring = resources.find((resource) => notBefore >= decisions[resource].resetMs);
       if (expiring) {
+        if (!pass.record) continue;
         denied.push({
           intentId: intent.id,
           resource: expiring,
@@ -2207,6 +2230,12 @@ function scheduleIntents({
         reservation.sharingOwnerLeaseIds = sharingOwnerLeaseIds;
       }
       grants.push(reservation);
+      grantedIds.add(intent.id);
+      grantedThisPass += 1;
+      // A manual grant extends the run; anything else ends it. The counter has
+      // to persist, because the run this bounds is one manual intent per
+      // planning pass rather than several within one.
+      streak = priority === REQUEST_PRIORITIES.manual ? streak + 1 : 0;
       for (const resource of resources) {
         chargedTotals[resource] += intent.costs[resource];
         updatedLanes[resource] = {
@@ -2225,6 +2254,7 @@ function scheduleIntents({
     cursors: updatedCursors,
     denied,
     prunedIntentIds,
+    manualStreak: streak,
   };
 }
 
@@ -3053,14 +3083,24 @@ const GOVERNOR_SCOPE_VERSION = 1;
 // 4: observer claims, readiness and outcomes are per resource, so the schema
 // shape changed rather than a field's contents. Replaced atomically -- an older
 // build must fail closed on the version gate rather than half-read it.
-const GOVERNOR_STATE_VERSION = 4;
+// 5: scheduling fairness is persisted, because the starvation it prevents
+// happens *between* planning passes -- each manual refresh is its own pass, so
+// a counter that lives only inside one cannot see a run of them.
+const GOVERNOR_STATE_VERSION = 5;
 // Readable-as-evidence, never written: the shapes a still-running older pane
 // holds. Recognising that such a pane owns a live lease is what the restart
 // boundary depends on.
-const LEGACY_GOVERNOR_VERSIONS = [GOVERNOR_STATE_VERSION, 3, 2];
+const LEGACY_GOVERNOR_VERSIONS = [GOVERNOR_STATE_VERSION, 4, 3, 2];
 // The first version whose file is already in the per-resource observer shape.
 // Anything below it is adapted before it can be read; see readLegacyGovernorState.
 const GOVERNOR_OBSERVER_SPLIT_VERSION = 4;
+// The first version carrying persisted scheduling fairness. A version 4 file is
+// otherwise in the current shape and only wants the field defaulted.
+const GOVERNOR_FAIRNESS_VERSION = 5;
+// Manual work outranks active work, which is right until it means "always". A
+// user holding the refresh key issues one manual intent per planning pass, and
+// without a bound the active owner behind them never gets a turn at all.
+const MANUAL_GRANT_STREAK_LIMIT = 3;
 const GOVERNOR_MAX_LEASES = 128;
 const GOVERNOR_MAX_INTENTS = 512;
 const GOVERNOR_MAX_RESERVATIONS = 512;
@@ -3173,6 +3213,7 @@ function emptyGovernorState() {
     version: GOVERNOR_STATE_VERSION,
     epochs: { core: null, graphql: null },
     budgets: {},
+    fairness: { manualStreak: 0 },
     // Symmetric on purpose. Core observer state lived in `observers.core` while
     // the GraphQL one lived in a differently-shaped `probeOutcome`, and a single
     // `probeClaim` serialized both -- so a slow or failed observer for one
@@ -3352,9 +3393,11 @@ function normalizeManualProbe(raw, nowMs) {
 // version this build does not write is unreadable and fails closed.
 function normalizeGovernorState(raw, nowMs, { prune = true, acceptVersion = GOVERNOR_STATE_VERSION } = {}) {
   if (!exactKeys(raw, [
-    "version", "epochs", "budgets", "observers", "probeClaims", "leases",
+    "version", "epochs", "budgets", "fairness", "observers", "probeClaims", "leases",
     "intents", "reservations", "manualProbe",
   ]) || raw.version !== acceptVersion) return null;
+  if (!exactKeys(raw.fairness, ["manualStreak"]) ||
+      !Number.isSafeInteger(raw.fairness.manualStreak) || raw.fairness.manualStreak < 0) return null;
   if (
     !exactKeys(raw.epochs, RATE_RESOURCES) ||
     RATE_RESOURCES.some((resource) => raw.epochs[resource] !== null && !validGovernorEpoch(raw.epochs[resource])) ||
@@ -3366,6 +3409,7 @@ function normalizeGovernorState(raw, nowMs, { prune = true, acceptVersion = GOVE
 
   const state = emptyGovernorState();
   state.epochs = { ...raw.epochs };
+  state.fairness = { ...raw.fairness };
   for (const resource of RATE_RESOURCES) {
     const observer = normalizeResourceObserver(raw.observers[resource], nowMs);
     if (!observer) return null;
@@ -3418,9 +3462,14 @@ function normalizeGovernorState(raw, nowMs, { prune = true, acceptVersion = GOVE
 function readLegacyGovernorState(raw, nowMs, version) {
   if (!isRecord(raw) || raw.version !== version) return null;
   const options = { prune: false, acceptVersion: version };
-  if (version >= GOVERNOR_OBSERVER_SPLIT_VERSION) return normalizeGovernorState(raw, nowMs, options);
-  const adapted = adaptPreSplitGovernorShape(raw);
-  return adapted ? normalizeGovernorState(adapted, nowMs, options) : null;
+  if (version >= GOVERNOR_FAIRNESS_VERSION) return normalizeGovernorState(raw, nowMs, options);
+  // A version 4 file is already in the per-resource observer shape and differs
+  // only by the field this version added, so defaulting it is the whole
+  // adaptation. Older files need their observer shape rewritten first.
+  const shaped = version >= GOVERNOR_OBSERVER_SPLIT_VERSION ? { ...raw } : adaptPreSplitGovernorShape(raw);
+  if (!shaped) return null;
+  shaped.fairness = { manualStreak: 0 };
+  return normalizeGovernorState(shaped, nowMs, options);
 }
 
 // Versions 2 and 3 held one observer for core, a differently shaped
@@ -3494,6 +3543,7 @@ function migrateGovernorState(raw, nowMs) {
     resource, { etag: null, outcome: "idle", at: 0, nextAt: 0 },
   ]));
   migrated.probeClaims = Object.fromEntries(RATE_RESOURCES.map((resource) => [resource, null]));
+  migrated.fairness = { manualStreak: 0 };
   return normalizeGovernorState(migrated, nowMs);
 }
 
@@ -3808,7 +3858,9 @@ function scheduleGovernorState(state, nowMs) {
     cursors,
     nowMs,
     maxGrants: GOVERNOR_MAX_RESERVATIONS - reservationCount,
+    manualStreak: state.fairness.manualStreak,
   });
+  state.fairness.manualStreak = result.manualStreak;
   result.denied.push(...deferredBackground.map((intentId) => ({
     intentId,
     mode: "paused",
@@ -11070,6 +11122,7 @@ export {
   retryThrottledTransport,
   THROTTLE_LADDER_MS,
   THROTTLE_PAUSE_AFTER,
+  MANUAL_GRANT_STREAK_LIMIT,
   renewProbeClaim,
   publishProbe,
   failProbeClaim,

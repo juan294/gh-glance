@@ -8,6 +8,7 @@ import { test } from "node:test";
 import {
   THROTTLE_LADDER_MS,
   THROTTLE_PAUSE_AFTER,
+  MANUAL_GRANT_STREAK_LIMIT,
   applyTransportCooldown,
   classifyThrottle,
   clearTransportThrottle,
@@ -271,4 +272,82 @@ test("SCHED-03 an authoritative new epoch resets the factor with the sample", (t
   assert.equal(fresh.lastExternalFactor, 1, "a new epoch must not inherit the previous window's ratio");
   assert.equal(fresh.knownLocalUsed, 0);
   assert.equal(fresh.factorBaseline.epoch, fresh.epoch);
+});
+
+// --- SCHED-08: manual pressure cannot starve an active owner ----------------
+
+// Each refresh keypress is its own planning pass, so the run this bounds is one
+// manual intent per pass rather than several within one. That is exactly why
+// the counter has to survive the pass -- and why it is persisted state.
+function requestOnce(box, leaseId, priority, tab = "actions") {
+  const id = randomUUID();
+  const at = box.at() + 1;
+  box.setNow(at);
+  const registered = registerIntent(box.scope, {
+    id, leaseId, tab, priority,
+    costs: { core: FETCH_COST, graphql: 0 }, requestedAt: at, expiresAt: at + GOVERNOR_LEASE_TTL_MS,
+  });
+  assert.equal(registered.ok, true, JSON.stringify(registered));
+  return registered.value;
+}
+
+test("SCHED-08 a run of manual refreshes yields a turn to a waiting active owner", (t) => {
+  const box = sandbox(t, "manual-starvation");
+  const manualLease = randomUUID();
+  const activeLease = randomUUID();
+  lease(box, manualLease);
+  lease(box, activeLease);
+  publishCore(box, manualLease, { used: 0 });
+  publishGraphql(box, manualLease);
+
+  // Three refreshes, each its own planning pass, each granted.
+  for (let press = 0; press < MANUAL_GRANT_STREAK_LIMIT; press += 1) {
+    assert.equal(requestOnce(box, manualLease, "manual").status, "scheduled");
+  }
+  assert.equal(inspectGovernor(box.scope, box.at()).value.fairness.manualStreak, MANUAL_GRANT_STREAK_LIMIT,
+    "the run has to be counted across passes or it cannot be bounded");
+
+  // Put an active owner in the queue and leave it there: exhausted core pauses
+  // it, and a paused intent stays pending for the next pass to reconsider.
+  box.setNow(box.at() + 1);
+  publishCore(box, manualLease, { used: 5000 });
+  const active = requestOnce(box, activeLease, "active");
+  assert.equal(active.status, "paused", JSON.stringify(active));
+  assert.equal(Object.keys(inspectGovernor(box.scope, box.at()).value.intents).length, 1);
+
+  // Capacity returns on a new epoch. The next refresh now plans a pass holding
+  // both the waiting owner and the fourth manual press.
+  box.setNow(box.at() + 1);
+  publishCore(box, manualLease, { used: 0, resetMs: RESET + 3_600_000 });
+  const fourth = requestOnce(box, manualLease, "manual");
+  assert.equal(fourth.status, "scheduled");
+
+  const settled = inspectGovernor(box.scope, box.at()).value;
+  const activeReservation = Object.values(settled.reservations)
+    .find((reservation) => reservation.leaseId === activeLease);
+  assert.ok(activeReservation, `the waiting owner was never granted: ${JSON.stringify(settled.reservations)}`);
+  // Manual work is still served -- it is not punished -- but after three turns
+  // in a row it no longer goes first.
+  assert.ok(
+    activeReservation.notBefore <= settled.reservations[fourth.reservationId].notBefore,
+    `the owner stayed queued behind the manual work: active ${activeReservation.notBefore} ` +
+    `vs manual ${settled.reservations[fourth.reservationId].notBefore}`,
+  );
+  assert.equal(settled.fairness.manualStreak, 1,
+    "granting the owed turn ends the run, and the manual grant after it starts a new one");
+});
+
+test("SCHED-08 the owed turn reorders work without admitting anything unaffordable", (t) => {
+  const box = sandbox(t, "manual-starvation-safety");
+  const leaseId = randomUUID();
+  lease(box, leaseId);
+  // Exhausted: nothing is affordable, whoever is owed a turn.
+  publishCore(box, leaseId, { used: 5000 });
+  publishGraphql(box, leaseId);
+  const state = inspectGovernor(box.scope, box.at()).value;
+  assert.equal(state.budgets.core.remaining, 0);
+
+  const denied = requestOnce(box, leaseId, "active");
+  assert.notEqual(denied.status, "scheduled",
+    "an owed turn must never admit work the budget cannot pay for");
 });
