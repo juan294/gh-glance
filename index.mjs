@@ -3826,6 +3826,33 @@ function mutateGovernor(scope, nowMs, mutate) {
   });
 }
 
+// The largest single operation the governor will ever admit. Returned pacing is
+// capped at one of these so an idle stretch cannot accumulate into a burst: at
+// most one operation's worth of the lane is ever given back at a time.
+const GOVERNOR_MAX_ATOMIC_COST = Math.max(...Object.values(OPERATION_COSTS)
+  .flatMap((costs) => RATE_RESOURCES.map((resource) => costs?.[resource] ?? 0)));
+
+// A grant paces the lane by what it *reserved*, which is a worst case. When the
+// request costs less than that -- a 304 costs nothing -- or never happens at
+// all, the difference is capacity paced away for nobody, and the next request
+// waits out a slot no one used.
+//
+// The lane is never pulled earlier than the transport gap, which is what keeps
+// this from becoming a burst. Recomputing the rate here can differ from the
+// rate at grant time if capacity has since changed, so the returned credit is
+// an estimate rather than an exact reversal; that is safe because admission
+// still re-checks affordability against the reserve before anything starts.
+// Pacing decides when work may go, never whether it may.
+function returnPacingCredit(state, resource, unusedCost, nowMs) {
+  const budget = state.budgets[resource];
+  if (!budget || !(unusedCost > 0)) return;
+  const decision = resourceDecision({ budget, resource, nowMs, cost: 0, chargedCost: 0 });
+  const callsPerMs = decision?.callsPerMs;
+  if (!Number.isFinite(callsPerMs) || callsPerMs <= 0) return;
+  const credit = Math.min(unusedCost, GOVERNOR_MAX_ATOMIC_COST) / callsPerMs;
+  budget.laneNextAt = Math.max(nowMs + HTTP_START_GAP_MS, budget.laneNextAt - credit);
+}
+
 function scheduleGovernorState(state, nowMs) {
   if (Object.keys(state.intents).length === 0) return { grants: [], denied: [] };
   let reservationCount = Object.keys(state.reservations).length;
@@ -4383,6 +4410,10 @@ function cancelIntent(scope, intentId, nowMs) {
       return { ok: false, reason: "stale" };
     }
     delete state.reservations[reservationId];
+    // The request never started, so the whole slot it was paced into is free.
+    for (const resource of RATE_RESOURCES) {
+      returnPacingCredit(state, resource, reservation.costs[resource], nowMs ?? Date.now());
+    }
     return { value: { status: "cancelled", intentId, reservationId } };
   });
 }
@@ -4537,6 +4568,15 @@ function settleReservationWithBudgetObservations(
         reservation.accountedCosts[resource],
         acceptedAfterBaseline[resource],
       );
+    }
+    // Only a measured outcome knows what it spent. A timeout, abort or process
+    // loss proves nothing, so its worst case stays charged and its pacing stays
+    // spent -- refunding there would let a run of timeouts pace as though
+    // nothing had been sent.
+    if (completion.outcome === "measured-success") {
+      for (const resource of RATE_RESOURCES) {
+        returnPacingCredit(state, resource, reservation.costs[resource] - measured[resource], at);
+      }
     }
     scheduleGovernorState(state, at);
     return { value: {

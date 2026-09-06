@@ -92,32 +92,41 @@ Highlights that are not obvious from the diff:
   v4 needs only the fairness field defaulted, v3/v2 need the observer shape
   rewritten first.
 
+## Pacing credit (SCHED-01/02)
+
+Writing the acceptance tests against current behaviour first was the right call:
+SCHED-02's safety property already held. Uncertain work -- a timeout, abort or
+process loss -- already kept its reserved pacing, because settlement only
+narrows the charge for a measured outcome. Both SCHED-01 clauses genuinely
+failed, and both were the same omission: the lane advances by what a grant
+*reserved*, and nothing ever gave the difference back.
+
+- A settlement that cost less than it reserved (a 304 costs nothing) left the
+  lane paced out for capacity nobody spent, so the next request waited out a
+  slot no one had used.
+- `cancelIntent` deleted the reservation and left the lane advanced -- the empty
+  slot the acceptance criterion names, literally.
+
+`returnPacingCredit` gives the difference back, floored at the transport gap so
+it can never become a burst and capped at one `GOVERNOR_MAX_ATOMIC_COST` so an
+idle stretch cannot accumulate into one either. It is an estimate, not an exact
+reversal: the rate is recomputed at settlement and can differ from the rate at
+grant time. That is safe because pacing decides *when* work may go and never
+*whether* -- admission re-checks affordability against the reserve before
+anything starts.
+
+The remaining SCHED-01/02 language ("future queue positions become advisory
+estimates; only startable work takes a quota reservation") describes the
+existing design rather than a change: an intent that cannot be paid for is
+paused and stays pending, and only granted work holds a reservation.
+
 ## Still outstanding
 
-Only SCHED-01 and SCHED-02's pacing credit remains, and it is the largest single
-piece of the phase:
+Phase 4's acceptance criteria are implemented. What has not been done:
 
-- Future queue positions become advisory estimates; only startable work takes a
-  quota reservation.
-- Track primary pacing credit/debt from actual and uncertain costs, refilled
-  from conservative spendable capacity over the remaining window.
-- Cap accumulated credit at the largest permitted atomic operation, so idle time
-  cannot become a burst.
-- Settlement returns unused primary credit, capped, and retains HTTP pacing.
-- A zero-cost settlement (a 304) advances the next primary-limited request
-  subject only to the HTTP gap, and cancelled work leaves no empty slot.
-
-Much of what SCHED-01/02 *assert* already holds -- the reserve, the shared
-permit, and retention of uncertain cost are phase 2/3 work with PTY coverage
-("twelve real workers share one probe", "twelve mixed active panes pace core and
-GraphQL without consuming either reserve"). What does not exist is the credit
-mechanism itself. Write the SCHED-01/02 acceptance tests first against current
-behaviour to find out which parts already pass; that tells you how much of this
-is new code rather than a new name for existing code.
-
-One trap, learned the hard way in SCHED-08: intents are planned as they are
-registered, so an intent that can be granted is granted immediately and never
-queues. A test that expects work to sit in a queue will pass for the wrong
-reason. The way to make an intent genuinely pending is to have it paused -- an
-exhausted budget will do it -- because a paused intent stays in `state.intents`
-for the next pass to reconsider.
+- A sustained multi-pane soak specifically for pacing credit. The twelve-pane
+  PTY scenarios cover the reserve and the shared permit, and they pass, but none
+  of them settles a long run of 304s -- which is exactly the shape that would
+  expose a credit return that is too generous.
+- ADR 0003 does not yet describe pacing credit; its phase 4 amendment covers the
+  observers and the throttle policy only.

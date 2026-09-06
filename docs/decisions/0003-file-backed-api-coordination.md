@@ -266,3 +266,32 @@ the previous throttle.
 
 These are conservative client-side limits. They do not promise immunity from
 GitHub's secondary limits, which are undocumented and may change.
+
+## Amendment: pacing credit (phase 4)
+
+A grant paces its resource's lane forward by the cost it *reserved*, which is a
+declared worst case. When the request costs less than that, or never happens,
+the difference was capacity paced away for nobody: the next request waited out a
+slot no one used. A conditional request answered 304 is the ordinary case, and
+it costs nothing at all.
+
+Settlement now returns the difference between the reserved and the measured
+cost, and cancelling an unstarted reservation returns the whole slot. Only a
+measured outcome does this. A timeout, an abort or a lost process proves nothing
+about what was spent, so its worst case stays charged and its pacing stays
+spent; refunding there would let a run of timeouts pace as though nothing had
+been sent.
+
+Two bounds keep the return from becoming a burst. The lane is never pulled
+earlier than the shared transport gap, and a single return is capped at the
+largest atomic operation the governor will admit, so an idle stretch cannot
+accumulate into a burst either.
+
+The return is an estimate rather than an exact reversal: the pacing rate is
+recomputed at settlement and can differ from the rate that applied at grant
+time, because capacity may have changed in between. That is acceptable because
+of what pacing is for. Pacing decides *when* admitted work may start, never
+whether it may: the reserve is enforced by admission, which re-checks
+affordability immediately before any request begins. A too-generous return can
+therefore make work start sooner than it strictly should, and cannot make it
+start at all when the budget could not pay for it.

@@ -16,6 +16,7 @@ import {
   throttleLadderMs,
   transportCooldownDeadline,
   GOVERNOR_LEASE_TTL_MS,
+  cancelIntent,
   claimProbe,
   createGovernorScope,
   inspectGovernor,
@@ -350,4 +351,88 @@ test("SCHED-08 the owed turn reorders work without admitting anything unaffordab
   const denied = requestOnce(box, leaseId, "active");
   assert.notEqual(denied.status, "scheduled",
     "an owed turn must never admit work the budget cannot pay for");
+});
+
+// --- SCHED-01/02: pacing credit ---------------------------------------------
+
+// The lane is the pacing clock: every grant pushes `laneNextAt` out by what it
+// reserved, which is a worst case. When the request turns out to cost less --
+// or never happens -- the difference is capacity that has been paced away for
+// nothing, and the next request waits for a slot nobody used.
+const laneOf = (box) => inspectGovernor(box.scope, box.at()).value.budgets.core.laneNextAt;
+
+function startAndSettle(box, leaseId, grant, completion) {
+  box.setNow(grant.notBefore);
+  assert.equal(startReservation(box.scope, grant.reservationId, grant.notBefore).value.status, "started");
+  const settledAt = grant.notBefore + 1;
+  box.setNow(settledAt);
+  const settled = settleReservationWithBudgetObservations(
+    box.scope, leaseId, grant.reservationId, { observations: [], ...completion }, settledAt,
+  );
+  assert.equal(settled.ok, true, JSON.stringify(settled));
+  return settledAt;
+}
+
+test("SCHED-01 a settlement that cost nothing returns the pacing it reserved", (t) => {
+  const box = sandbox(t, "pacing-credit");
+  const leaseId = randomUUID();
+  lease(box, leaseId);
+  publishCore(box, leaseId, { used: 0 });
+  publishGraphql(box, leaseId);
+
+  const grant = requestOnce(box, leaseId, "active");
+  assert.equal(grant.status, "scheduled");
+  const paced = laneOf(box);
+  assert.ok(paced > grant.notBefore, "the grant must pace the lane forward");
+
+  // A conditional request answered 304: charged nothing, so it paced nothing.
+  const settledAt = startAndSettle(box, leaseId, grant, {
+    outcome: "measured-success",
+    actualCosts: { core: 0, graphql: 0 },
+  });
+  const returned = laneOf(box);
+  assert.ok(returned < paced, `unused pacing must be returned: lane stayed at ${returned}`);
+  assert.ok(returned >= settledAt, "returned credit must not place the lane in the past");
+
+  // ...and the next request may start on the transport gap rather than waiting
+  // out a slot the 304 never used.
+  const next = requestOnce(box, leaseId, "active");
+  assert.equal(next.status, "scheduled");
+  assert.ok(next.notBefore < paced,
+    `the next request waited out an unused slot: ${next.notBefore} vs ${paced}`);
+});
+
+test("SCHED-01 cancelled work leaves no empty slot behind it", (t) => {
+  const box = sandbox(t, "pacing-cancel");
+  const leaseId = randomUUID();
+  lease(box, leaseId);
+  publishCore(box, leaseId, { used: 0 });
+  publishGraphql(box, leaseId);
+
+  const before = laneOf(box);
+  const grant = requestOnce(box, leaseId, "active");
+  const paced = laneOf(box);
+  assert.ok(paced > before);
+
+  box.setNow(box.at() + 1);
+  assert.equal(cancelIntent(box.scope, grant.intentId ?? grant.reservationId.slice(12), box.at()).ok, true);
+  const returned = laneOf(box);
+  assert.ok(returned < paced,
+    `a cancelled reservation must release its slot: lane stayed at ${returned}`);
+});
+
+test("SCHED-02 a replan never refunds work whose real cost is unknown", (t) => {
+  const box = sandbox(t, "pacing-uncertain");
+  const leaseId = randomUUID();
+  lease(box, leaseId);
+  publishCore(box, leaseId, { used: 0 });
+  publishGraphql(box, leaseId);
+
+  const grant = requestOnce(box, leaseId, "active");
+  const paced = laneOf(box);
+  // A timeout proves nothing about what the request spent, so its worst case
+  // stays charged and its pacing stays spent. Refunding here would let a run of
+  // timeouts pace as though nothing had been sent at all.
+  startAndSettle(box, leaseId, grant, { outcome: "timeout" });
+  assert.equal(laneOf(box), paced, "uncertain work must keep its reserved pacing");
 });
