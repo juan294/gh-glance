@@ -228,7 +228,13 @@ test("--doctor claims the core observer and uses its persisted ETag before calli
   assert.equal(calls.filter((line) => /api rate_limit(?: |$)/.test(line)).length, 1);
   assert.ok(
     calls.some((line) => /^api -i graphql --input -/.test(line)),
-    "doctor did not run the claimed GraphQL observer",
+    // This has failed on CI and never locally, so the failure has to carry its
+    // own diagnosis: which gh calls were made, and what the governor thought
+    // when it decided. Without them the next occurrence says only "no GraphQL
+    // call happened", which is where the last investigation ran out of road.
+    `doctor did not run the claimed GraphQL observer.\ngh calls:\n${
+      calls.filter(Boolean).map((line) => `  ${line}`).join("\n") || "  (none)"
+    }\ngovernor: ${JSON.stringify(inspectGovernor(scope, Date.now()).value, null, 1)}`,
   );
   const state = inspectGovernor(scope, Date.now()).value;
   // 1, from the observer's own meter -- not 10, which was the display probe's
