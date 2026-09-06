@@ -89,6 +89,14 @@ stays conservatively reserved.
 
 ## Protocol and recovery
 
+> Partly superseded by the phase 3 amendment at the end of this document. The
+> paragraphs below describing one shared claim and `rate_limit` as the GraphQL
+> probe record the original design: `rate_limit` is no longer a source of
+> spendable capacity, and a claimed observer supplies it instead. Read the
+> amendment before relying on anything in this section. The body is corrected
+> rather than appended to when the observer work lands in full.
+
+
 The governor state records resource epochs and observations, fair lane cursors,
 leases, pending intents, reservations, shared probe ownership and outcomes,
 manual probe demand, rate-limit blocks, and a conservative external-spend
