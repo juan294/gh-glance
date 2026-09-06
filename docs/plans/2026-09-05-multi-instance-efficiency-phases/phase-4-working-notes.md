@@ -69,52 +69,55 @@ the data waiting for it. A pane that merely published the reset was otherwise
 holding the shared permit for one more observer and taking the single data slot
 ahead of a manual refresh holding the earlier reservation.
 
+## Landed since
+
+SCHED-03/04/05/06/08 are implemented, tested and green on all three gates.
+Highlights that are not obvious from the diff:
+
+- The throttle ladder's cap binds only a locally chosen delay. A server-supplied
+  `Retry-After` is honoured exactly however long it is, and holds merge by
+  maximum so a shorter concurrent error cannot erode a longer one.
+- A permission-only 403 is explicitly not a throttle. It previously could hold
+  the shared transport, which paused every pane over one unreadable repository.
+- The estimator could raise its factor and had no reliable way to lower it:
+  publishProbe closed the sampling window on every publication, including
+  samples too small to reconcile, so local accumulation was thrown away before
+  it could reach the five-unit minimum. Only a reconciled sample closes the
+  window now. Nothing is written in the other branch on purpose -- keeping the
+  baseline is what lets the completed reservations behind it count again, and
+  folding them into the local total as well counts the same spend twice.
+- A new epoch no longer inherits the previous window's ratio.
+- GOVERNOR_STATE_VERSION is 5. Version 4 was never released, so phase 4 ships
+  one combined 3 -> 5 break. LEGACY_GOVERNOR_VERSIONS now spans two adaptations:
+  v4 needs only the fairness field defaulted, v3/v2 need the observer shape
+  rewritten first.
+
 ## Still outstanding
 
-Nothing below is started.
+Only SCHED-01 and SCHED-02's pacing credit remains, and it is the largest single
+piece of the phase:
 
-### Throttle classification and ladder (SCHED-04/05/06)
-`classifyThrottle({ status, headers, graphqlErrors, stderr })`:
-- Retry-After seconds or HTTP-date -> shared cooldown at that deadline (never shortened).
-- else confirmed secondary/abuse or generic 429 -> ladder 60/120/240/480/900s
-  by attempt count; the 900 cap applies only to the locally chosen delay, never
-  to a server-supplied deadline.
-- Permission-only 403 (no rate-limit headers, no secondary marker) -> NOT a throttle.
-- Primary exhaustion -> holds only that resource until its reset.
-- 5 consecutive failures -> paused until manual retry or a reset-triggered
-  recovery opportunity, still respecting the deadline.
-- Cooldowns merge by maximum and survive primary epoch changes.
+- Future queue positions become advisory estimates; only startable work takes a
+  quota reservation.
+- Track primary pacing credit/debt from actual and uncertain costs, refilled
+  from conservative spendable capacity over the remaining window.
+- Cap accumulated credit at the largest permitted atomic operation, so idle time
+  cannot become a burst.
+- Settlement returns unused primary credit, capped, and retains HTTP pacing.
+- A zero-cost settlement (a 304) advances the next primary-limited request
+  subject only to the HTTP gap, and cancelled work leaves no empty slot.
 
-Phase 2 already has the primitives: `transportCooldownDeadline`,
-`applyTransportCooldown`, `SECONDARY_LIMIT_PATTERN`, and a flat 60s for
-429/secondary. The ladder replaces that flat value and needs persisted attempt
-state. `state.hosts[host]` can gain a `throttle` field the way `waiters` did --
-see the optional-key pattern in `normalizeIdentityRegistry` -- so no registry
-version bump is required.
+Much of what SCHED-01/02 *assert* already holds -- the reserve, the shared
+permit, and retention of uncertain cost are phase 2/3 work with PTY coverage
+("twelve real workers share one probe", "twelve mixed active panes pace core and
+GraphQL without consuming either reserve"). What does not exist is the credit
+mechanism itself. Write the SCHED-01/02 acceptance tests first against current
+behaviour to find out which parts already pass; that tells you how much of this
+is new code rather than a new name for existing code.
 
-### Estimator (SCHED-03)
-- Keep sampling baseline + definite local accumulation until >= 5 local units.
-- Two 4-unit local-only samples must take factor 7 -> 1.
-- Authoritative new epoch resets factor and sample to 1 (reserve semantics unchanged).
-- Quiet recovery: 5 min of valid unchanged counters, zero local cost, no
-  uncertain work. Failed samples and external-only spend do NOT establish it.
-
-### Pacing credit (SCHED-01/02/08)
-- Future queue positions advisory; only startable work reserves.
-- Credit refills from conservative spendable capacity over the remaining window.
-- Cap accumulated credit at the largest permitted atomic operation (no idle bursts).
-- Settlement returns unused primary credit (capped), retains HTTP pacing.
-- At most 3 consecutive manual grants before an eligible active turn (SCHED-08).
-
-Note on SCHED-08: the shared HTTP permit is strict FIFO on arrival
-(`acquireIdentityHttpPermit`). Priority is enforced at grant time, not at the
-permit, so a pane that queued milliseconds earlier keeps the single data slot
-regardless of a higher-priority reservation behind it. That did not need fixing
-for the reset case once the call ordering was restored, but it is the mechanism
-SCHED-08 will have to address directly.
-
-### New tests and docs
-`test/scheduling-policy.test.mjs`, `test/pty/secondary-limit.test.mjs`, and the
-ADR 0003 amendment (per-resource observers and v4, the throttle ladder, pacing
-credit). ADR 0003's "Protocol and recovery" section still describes one shared
-claim and `rate_limit` as the GraphQL probe.
+One trap, learned the hard way in SCHED-08: intents are planned as they are
+registered, so an intent that can be granted is granted immediately and never
+queues. A test that expects work to sit in a queue will pass for the wrong
+reason. The way to make an intent genuinely pending is to have it paused -- an
+exhausted budget will do it -- because a paused intent stays in `state.intents`
+for the next pass to reconsider.
