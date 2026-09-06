@@ -4025,7 +4025,13 @@ function budgetFromObservation(raw, previous, nowMs, {
     blockReason: blockActive ? previous.blockReason : null,
     laneNextAt: epochChanged ? nowMs : previous.laneNextAt,
     roundRobinCursor: previous?.roundRobinCursor ?? null,
-    lastExternalFactor: previous?.lastExternalFactor ?? 1,
+    // A new epoch is a new accounting window, so what other clients did in the
+    // last one is not evidence about this one. The baseline and the local
+    // accumulation below are already reset here; carrying the factor across
+    // kept throttling this window on a ratio measured in a window that is over.
+    // Only a claimed observer can open an epoch, so this cannot be moved by a
+    // stale or reordered response.
+    lastExternalFactor: epochChanged ? 1 : (previous?.lastExternalFactor ?? 1),
     epoch,
     source,
     factorBaseline: epochChanged || !previous?.factorBaseline
@@ -4099,19 +4105,32 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs, resource) {
           total + (reservation.completedAt > baseline.observedAt
             ? reservationCost(reservation, resource, state.leases, at)
             : 0), 0);
+      const globalUsedDelta = nextBudgets[resource].used - baseline.used;
+      const sharedCompletedDelta = previous.knownLocalUsed + legacyCompletedDelta + (observerCosts[resource] ?? 0);
       const factor = nextExternalFactor({
         lastExternalFactor: previous.lastExternalFactor,
-        globalUsedDelta: nextBudgets[resource].used - baseline.used,
-        sharedCompletedDelta: previous.knownLocalUsed + legacyCompletedDelta + (observerCosts[resource] ?? 0),
+        globalUsedDelta,
+        sharedCompletedDelta,
       });
       if (factor === null) return { ok: false, reason: "corrupt" };
       nextBudgets[resource].lastExternalFactor = factor;
-      nextBudgets[resource].factorBaseline = {
-        epoch: nextBudgets[resource].epoch,
-        used: nextBudgets[resource].used,
-        observedAt: nextBudgets[resource].observedAt,
-      };
-      nextBudgets[resource].knownLocalUsed = 0;
+      // Closing the window costs the evidence in it, so only a window that
+      // actually reconciled may close. Four local units observed twice are
+      // eight, and eight are enough; discarding each four because neither
+      // reached five on its own is what kept a factor of seven alive through
+      // any amount of purely local spend.
+      if (externalSampleIsUsable({ globalUsedDelta, sharedCompletedDelta })) {
+        nextBudgets[resource].factorBaseline = {
+          epoch: nextBudgets[resource].epoch,
+          used: nextBudgets[resource].used,
+          observedAt: nextBudgets[resource].observedAt,
+        };
+        nextBudgets[resource].knownLocalUsed = 0;
+      }
+      // Otherwise both are left exactly as the observation produced them, which
+      // is the previous baseline and the previous local total. Rewriting them
+      // here would count the same completed reservations twice: they are still
+      // in the ledger precisely because the baseline did not advance past them.
     }
     for (const [id, reservation] of completedBeforeClaim) {
       const accountedByEveryResource = RATE_RESOURCES.every((resource) =>

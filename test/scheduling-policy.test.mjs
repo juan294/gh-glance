@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 
 import {
@@ -10,6 +14,16 @@ import {
   emptyTransportThrottle,
   throttleLadderMs,
   transportCooldownDeadline,
+  GOVERNOR_LEASE_TTL_MS,
+  claimProbe,
+  createGovernorScope,
+  inspectGovernor,
+  publishProbe,
+  registerIntent,
+  registerLease,
+  requestManualProbe,
+  settleReservationWithBudgetObservations,
+  startReservation,
 } from "../index.mjs";
 
 const NOW = 1_800_000_000_000;
@@ -109,4 +123,152 @@ test("SCHED-05 a permission failure moves neither the hold nor the ladder", () =
   // records the state that path leaves behind: untouched.
   assert.equal(shared.cooldownUntil, 0);
   assert.deepEqual(shared.throttle, emptyTransportThrottle());
+});
+
+// --- SCHED-03: the external-use estimator -----------------------------------
+
+function sandbox(t, authIdentity) {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-sched-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  let clock = NOW;
+  const scope = createGovernorScope({
+    effectiveHost: "github.com",
+    authIdentity,
+    env: { XDG_CONFIG_HOME: root },
+    now: () => clock,
+  }).value;
+  return { scope, at: () => clock, setNow: (value) => { clock = value; } };
+}
+
+const RESET = NOW + 3_600_000;
+
+// The observer is due once a minute. These tests need several publications
+// inside one lease, so the demand is expressed the way a manual refresh does
+// rather than by advancing the clock past the lease itself.
+function makeDue(box, leaseId) {
+  const budget = inspectGovernor(box.scope, box.at()).value.budgets.core;
+  if (!budget) return;
+  assert.equal(requestManualProbe(box.scope, leaseId, budget.epoch, box.at(), box.at()).ok, true);
+}
+
+function publishCore(box, leaseId, { used, resetMs = RESET }, at = box.at()) {
+  makeDue(box, leaseId);
+  const claim = claimProbe(box.scope, leaseId, at, "core");
+  assert.equal(claim.value.status, "claimed", JSON.stringify(claim.value));
+  const result = publishProbe(box.scope, leaseId, claim.value.nonce, {
+    core: { source: "core-observer", budget: { limit: 5000, used, remaining: 5000 - used, resetMs } },
+  }, at, "core");
+  assert.equal(result.ok, true, JSON.stringify(result));
+}
+
+// Admission needs every resource established, so GraphQL is published too even
+// though this section only reasons about core.
+function publishGraphql(box, leaseId, at = box.at()) {
+  const claim = claimProbe(box.scope, leaseId, at, "graphql");
+  assert.equal(claim.value.status, "claimed", JSON.stringify(claim.value));
+  assert.equal(publishProbe(box.scope, leaseId, claim.value.nonce, {
+    graphql: { source: "graphql-observer", budget: { limit: 5000, used: 0, remaining: 5000, resetMs: RESET } },
+  }, at, "graphql").ok, true);
+}
+
+// One Actions fetch is two core units, and an intent's costs must match the
+// tab's declared cost exactly, so local spend is counted in fetches. Settling
+// each one is what makes the charge definite -- reconciled, not inferred.
+const FETCH_COST = 2;
+
+function spendLocally(box, leaseId, fetches) {
+  let settledAt = box.at();
+  for (let index = 0; index < fetches; index += 1) {
+    const id = randomUUID();
+    const at = box.at() + 1;
+    box.setNow(at);
+    const registered = registerIntent(box.scope, {
+      id, leaseId, tab: "actions", priority: "active",
+      costs: { core: FETCH_COST, graphql: 0 }, requestedAt: at, expiresAt: at + GOVERNOR_LEASE_TTL_MS,
+    });
+    assert.equal(registered.ok, true, JSON.stringify(registered));
+    assert.equal(registered.value.status, "scheduled", JSON.stringify(registered.value));
+    const grant = registered.value;
+    box.setNow(grant.notBefore);
+    assert.equal(startReservation(box.scope, grant.reservationId, grant.notBefore).value.status, "started");
+    settledAt = grant.notBefore + 1;
+    box.setNow(settledAt);
+    assert.equal(settleReservationWithBudgetObservations(box.scope, leaseId, grant.reservationId, {
+      outcome: "measured-success",
+      actualCosts: { core: FETCH_COST, graphql: 0 },
+      observations: [],
+    }, settledAt).ok, true);
+  }
+  return settledAt;
+}
+
+function lease(box, leaseId, at = NOW) {
+  assert.equal(registerLease(box.scope, {
+    id: leaseId, expiresAt: at + GOVERNOR_LEASE_TTL_MS, floorMs: 5000, activeTab: "actions",
+    phaseSeed: { seed: leaseId, registeredAt: at }, demand: { core: 4, graphql: 0 },
+  }).ok, true);
+}
+
+const factorOf = (box) => inspectGovernor(box.scope, box.at()).value.budgets.core;
+
+test("SCHED-03 undersized local samples accumulate instead of being discarded", (t) => {
+  const box = sandbox(t, "estimator-accumulation");
+  const leaseId = randomUUID();
+  lease(box, leaseId);
+  publishCore(box, leaseId, { used: 0 });
+  publishGraphql(box, leaseId);
+
+  // One reconciled window: six local units against forty-two observed, so
+  // other clients are spending six units for every one of ours.
+  spendLocally(box, leaseId, 3);
+  box.setNow(box.at() + 1);
+  publishCore(box, leaseId, { used: 42 });
+  assert.equal(factorOf(box).lastExternalFactor, 7);
+  assert.equal(factorOf(box).knownLocalUsed, 0);
+  assert.equal(factorOf(box).factorBaseline.used, 42);
+
+  // Now windows of a single fetch, with the counter moving by exactly that
+  // fetch. Two units is below the five-unit minimum, so neither of the first
+  // two closes the window -- and crucially neither costs the evidence in it.
+  for (const used of [44, 46]) {
+    spendLocally(box, leaseId, 1);
+    box.setNow(box.at() + 1);
+    publishCore(box, leaseId, { used });
+    assert.equal(factorOf(box).lastExternalFactor, 7, "an undersized sample is not evidence");
+    assert.equal(factorOf(box).factorBaseline.used, 42, "an undersized sample must not close the window");
+  }
+
+  // The third takes the accumulation to six units against six observed, which
+  // reconciles: there was no external use at all.
+  spendLocally(box, leaseId, 1);
+  box.setNow(box.at() + 1);
+  publishCore(box, leaseId, { used: 48 });
+  assert.equal(factorOf(box).lastExternalFactor, 1,
+    "six local units against six observed is no external use");
+  assert.equal(factorOf(box).factorBaseline.used, 48, "a reconciled sample closes the window");
+});
+
+test("SCHED-03 an authoritative new epoch resets the factor with the sample", (t) => {
+  const box = sandbox(t, "estimator-epoch");
+  const leaseId = randomUUID();
+  lease(box, leaseId);
+  publishCore(box, leaseId, { used: 0 });
+  publishGraphql(box, leaseId);
+  spendLocally(box, leaseId, 3);
+  box.setNow(box.at() + 1);
+  publishCore(box, leaseId, { used: 42 });
+  assert.equal(factorOf(box).lastExternalFactor, 7);
+
+  // The reset opens a new accounting window. What other clients did in the last
+  // one is not evidence about this one, so the estimate starts over with it.
+  box.setNow(RESET + 1);
+  // An hour has passed, so the lease that owned the earlier publications is
+  // gone. Re-registering is what a pane still running would have done by
+  // heartbeat; the point of the test is the epoch, not lease liveness.
+  lease(box, leaseId, RESET + 1);
+  publishCore(box, leaseId, { used: 0, resetMs: RESET + 3_600_000 }, RESET + 1);
+  const fresh = factorOf(box);
+  assert.equal(fresh.lastExternalFactor, 1, "a new epoch must not inherit the previous window's ratio");
+  assert.equal(fresh.knownLocalUsed, 0);
+  assert.equal(fresh.factorBaseline.epoch, fresh.epoch);
 });
