@@ -256,20 +256,22 @@ test("a real reset gets one fresh probe then one phased active request per pane"
       "sleep .1; i=$((i + 1)); done; printf q",
     env: { GH_GLANCE_FIXTURE_READY: readyPath },
   });
-  const resetProbe = await observeUntil(
-    box.read,
-    (state) => starts(state, "api").filter((event) => event.graphqlOperation === "graphql.observer").length >= 2,
+  // The reset publication is core's own observation -- it is what reopens the
+  // core lane. Independent claims land it *before* the GraphQL observer that
+  // the same reset makes due, so keying the publication off that observer's
+  // timestamp would require it to follow a probe it now precedes.
+  const publication = await observeUntil(
+    box.readGovernor,
+    (governor) => governor?.budgets?.core?.used === 0,
     Date.now() + 45_000,
   );
-  const resetProbeAt = resetProbe.matched
-    ? starts(resetProbe.value, "api").filter((event) => event.graphqlOperation === "graphql.observer")[1].at
-    : null;
-  const publication = Number.isFinite(resetProbeAt)
+  // A core reset opens a new shared accounting epoch, so the GraphQL counter is
+  // due with it even though nothing about GraphQL changed.
+  const resetProbe = publication.matched
     ? await observeUntil(
-      box.readGovernor,
-      (governor) => governor?.budgets?.core?.used === 0 &&
-        governor.budgets.core.observedAt >= resetProbeAt,
-      Date.now() + 10_000,
+      box.read,
+      (state) => starts(state, "api").filter((event) => event.graphqlOperation === "graphql.observer").length >= 2,
+      Date.now() + 15_000,
     )
     : null;
   const publishedCore = publication?.matched ? publication.value.budgets.core : null;
@@ -308,13 +310,14 @@ test("a real reset gets one fresh probe then one phased active request per pane"
     `starts ${runs.map(({ at }) => at).join(",")}; horizon ${progressDeadline}; ` +
     `lane ${laneInterval}`);
   assert.ok(publication?.matched, "the reset budget publication was not observed");
+  assert.ok(resetProbe?.matched, "the core reset did not make the GraphQL observer due");
   assert.equal(resetDecision?.mode, "open", "reset publication did not reopen the core lane");
   assert.equal(progress?.matched, true, `three panes missed the reset horizon ${progressDeadline}`);
   assert.ok(probes.length >= 2, `expected reset probe, got ${probes.length}`);
   assert.equal(runs.length, 3, `expected one active request per pane, got ${runs.length}`);
   assert.equal(new Set(runs.map((event) => event.pane)).size, 3);
   assert.equal(dataStarts(state).length, runs.length * 2, "background work joined the reset phase");
-  assert.ok(probes[1].at <= runs[0].at, "data raced the reset publication");
+  assert.ok(publishedCore.observedAt <= runs[0].at, "data raced the reset publication");
   assert.equal(state.maxDataConcurrency, 1, "governed Actions batches overlapped");
   assert.equal(plannedReservations.length, 3, "reset reservations were not retained before teardown");
   for (let index = 1; index < plannedReservations.length; index += 1) {

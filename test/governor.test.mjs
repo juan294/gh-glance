@@ -1647,11 +1647,17 @@ test("a near-timeout request drain renews one probe claimant without takeover", 
   const refreshed = await refreshSharedBudget(scope, ownerId, null, {
     now: () => clock,
     wait: async (ms) => { waits += 1; clock += ms; },
-    readBudgets: async () => {
+    readBudgets: async (_signal, _host, options) => {
       probeReads += 1;
-      const takeover = claimProbe(scope, waiterId, clock, "core");
-      assert.equal(takeover.value.status, "waiting");
-      assert.ok(takeover.value.leaseUntil > clock);
+      // The owner holds the claim for whichever resource is in flight, so a
+      // waiter is told to wait rather than taking it over. Checking the
+      // resource being read, not core specifically, is what makes this true of
+      // each observer rather than of whichever one happens to go second.
+      for (const resource of options.resources) {
+        const takeover = claimProbe(scope, waiterId, clock, resource);
+        assert.equal(takeover.value.status, "waiting", resource);
+        assert.ok(takeover.value.leaseUntil > clock, resource);
+      }
       return budgets(clock);
     },
   });

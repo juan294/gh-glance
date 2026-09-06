@@ -3795,10 +3795,20 @@ function claimProbe(scope, leaseId, nowMs, resource) {
     const coreResetAt = Number.isFinite(state.budgets.core?.resetMs)
       ? state.budgets.core.resetMs + BUDGET_RESET_GRACE_MS
       : Number.POSITIVE_INFINITY;
+    // ...but only until it has actually observed since that reset. Left
+    // unqualified, every pane keeps qualifying for as long as core has not
+    // published its new epoch, so a reset draws a stampede of GraphQL observers
+    // instead of the one the shared epoch needs. The publication used to close
+    // that window as a side effect of being read first; saying it here means it
+    // does not depend on which resource a refresh happens to reach first.
+    const dueAtCoreReset = resource === "graphql" &&
+      state.observers.graphql.at < coreResetAt
+      ? coreResetAt
+      : Number.POSITIVE_INFINITY;
     const nextAt = Math.min(
       state.observers[resource].nextAt,
       resetAt,
-      resource === "graphql" ? coreResetAt : Number.POSITIVE_INFINITY,
+      dueAtCoreReset,
     );
     if (nextAt > at) return { value: { status: "waiting", nextAt } };
     const nonce = randomUUID();
@@ -3912,6 +3922,9 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs, resource) {
     }
     const nextBudgets = { ...state.budgets };
     const nextEpochs = { ...state.epochs };
+    // Captured before the publication overwrites it: the reset this epoch
+    // change supersedes is the boundary the GraphQL observer is measured against.
+    const supersededCoreResetMs = state.budgets.core?.resetMs;
     const changedResources = [];
     const resetResources = [];
     if (!budgets?.[resource]) return { ok: false, reason: "corrupt" };
@@ -4000,6 +4013,27 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs, resource) {
           ? published.resetMs + BUDGET_RESET_GRACE_MS
           : at + BUDGET_PROBE_MS,
       };
+    }
+    // A core reset opens a new shared accounting epoch, so the GraphQL counter
+    // is due with it: external-spend baselines and the protected
+    // one-publication reset contract have to advance together. A refresh that
+    // reads GraphQL before core has already done this, because core's old reset
+    // time still said GraphQL was due when that claim was evaluated. What
+    // cannot see it is a pane whose GraphQL observer last ran before the reset
+    // -- another pane published this epoch first, moving the reset out of
+    // reach. Only that case still owes an observation, so only that case is
+    // pulled forward; marking it unconditionally spends a second point to
+    // re-read a counter this same cycle has just read. An exhausted GraphQL
+    // counter waits for its own reset either way.
+    if (resource === "core" && resetResources.includes("core")) {
+      const graphql = nextBudgets.graphql;
+      const heldToReset = graphql && graphql.remaining === 0 &&
+        at < graphql.resetMs + BUDGET_RESET_GRACE_MS;
+      const observedSinceReset = Number.isFinite(supersededCoreResetMs) &&
+        state.observers.graphql.at >= supersededCoreResetMs;
+      if (!heldToReset && !observedSinceReset) {
+        state.observers.graphql.nextAt = Math.min(state.observers.graphql.nextAt || at, at);
+      }
     }
     if (resetResources.length > 0) state.manualProbe = null;
     else if (state.manualProbe &&
@@ -4402,9 +4436,18 @@ async function retryGovernorMutation(run, { now, wait, deadline, signal }) {
 // must not delay or invalidate the other's readiness -- nothing about the
 // resources couples them. What still couples them is the shared HTTP permit and
 // any account-wide secondary hold, and those are enforced where they belong.
+// Core is refreshed last because its publication is what reopens data
+// admission. Finishing the cycle's control work before that happens stops a
+// pane that merely published the reset from getting a head start, over the
+// shared permit, on higher-priority work waiting for the same lane. It is also
+// the order readSharedBudgetSources reads its sources in, and the order the
+// single claim this replaced already used, so the sequence of actual HTTP
+// calls is unchanged.
+const BUDGET_REFRESH_ORDER = ["graphql", "core"];
+
 async function refreshSharedBudget(scope, leaseId, signal, options = {}) {
   const outcomes = [];
-  for (const resource of RATE_RESOURCES) {
+  for (const resource of BUDGET_REFRESH_ORDER) {
     outcomes.push([resource, await refreshResourceBudget(scope, leaseId, signal, resource, options)]);
   }
   const published = outcomes.filter(([, result]) => result.ok);
