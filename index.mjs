@@ -2373,10 +2373,16 @@ function normalizeIdentityRegistry(raw) {
     if (!isRecord(transport)) return null;
     const keys = ["lastStartedAt", "cooldownUntil", "permit"];
     if (Object.hasOwn(transport, "waiters")) keys.push("waiters");
+    if (Object.hasOwn(transport, "throttle")) keys.push("throttle");
     if (!normalizeHost(host) || !exactKeys(transport, keys) ||
         !time(transport.lastStartedAt) || !time(transport.cooldownUntil)) return null;
     if (transport.permit !== null && (!exactKeys(transport.permit, ["pid", "nonce", "startedAt"]) ||
         !Number.isSafeInteger(transport.permit.pid) || transport.permit.pid < 1 || !validGovernorId(transport.permit.nonce) || !time(transport.permit.startedAt))) return null;
+    if (!Object.hasOwn(transport, "throttle")) transport.throttle = emptyTransportThrottle();
+    if (!isRecord(transport.throttle) || !exactKeys(transport.throttle, ["attempts", "lastAt", "paused"]) ||
+        !Number.isSafeInteger(transport.throttle.attempts) || transport.throttle.attempts < 0 ||
+        transport.throttle.attempts > THROTTLE_PAUSE_AFTER ||
+        !time(transport.throttle.lastAt) || typeof transport.throttle.paused !== "boolean") return null;
     if (!Object.hasOwn(transport, "waiters")) transport.waiters = [];
     if (!Array.isArray(transport.waiters) || transport.waiters.length > HTTP_MAX_WAITERS ||
         new Set(transport.waiters.map((waiter) => waiter?.nonce)).size !== transport.waiters.length ||
@@ -2840,7 +2846,13 @@ async function acquireIdentityHttpPermit(coordinator, { signal, now = Date.now }
         const migration = inspectLegacyMigration(coordinator.root, state, now());
         if (!migration.ok) return migration;
         if (now() >= deadline) return { ok: false, reason: "transport-busy", retryAt: deadline };
-        const transport = state.hosts[identity.host] ??= { lastStartedAt: 0, cooldownUntil: 0, permit: null, waiters: [] };
+        const transport = state.hosts[identity.host] ??= { lastStartedAt: 0, cooldownUntil: 0, permit: null, waiters: [], throttle: emptyTransportThrottle() };
+        // Five consecutive throttles means the ladder has stopped being useful.
+        // Waiting out the deadline is what produced the last one, so the pause
+        // holds until a person retries or a primary reset opens a recovery.
+        if (transport.throttle?.paused) {
+          return { ok: false, reason: "throttle-paused", retryAt: transport.cooldownUntil };
+        }
         if (transport.permit && staleHttpPermit(transport.permit, now())) transport.permit = null;
         // Admission can happen during the mandatory start gap. Persist call
         // order once so later polling cannot overtake an earlier caller.
@@ -2886,17 +2898,92 @@ async function acquireIdentityHttpPermit(coordinator, { signal, now = Date.now }
 // stops applying to the other.
 const SECONDARY_LIMIT_PATTERN = /secondary rate|abuse/i;
 
-function transportCooldownDeadline({ retryAfter, status, secondary, at }) {
-  const deadline = typeof retryAfter === "string" && /^\d+(?:\.\d+)?$/.test(retryAfter)
+// The locally chosen delay climbs by consecutive throttle and stops climbing at
+// fifteen minutes. The cap bounds only what this client invents for itself: a
+// server that asks for two hours is given two hours, because it knows something
+// we do not.
+const THROTTLE_LADDER_MS = [60_000, 120_000, 240_000, 480_000, 900_000];
+// After this many consecutive throttles the transport stops choosing new delays
+// and waits for a person or a primary reset. Climbing forever keeps a wedged
+// credential politely hammering a limit it has no way to satisfy.
+const THROTTLE_PAUSE_AFTER = 5;
+
+function throttleLadderMs(priorThrottles) {
+  const step = Number.isSafeInteger(priorThrottles) && priorThrottles > 0 ? priorThrottles : 0;
+  return THROTTLE_LADDER_MS[Math.min(step, THROTTLE_LADDER_MS.length - 1)];
+}
+
+// Reads throttle evidence without inventing any. The case this exists to get
+// right is the permission-only 403: it carries the same status as an exhausted
+// primary limit and is not a throttle at all, so treating it as one pauses a
+// pane that was never limited -- it was just not allowed.
+function classifyThrottle({ status = null, headers = null, graphqlErrors = null, stderr = "", body = null } = {}) {
+  const header = (name) => {
+    const value = headers?.[name];
+    return typeof value === "string" ? value.trim() : null;
+  };
+  const integer = (name) => {
+    const value = Number(header(name));
+    return Number.isSafeInteger(value) ? value : null;
+  };
+  const secondary = SECONDARY_LIMIT_PATTERN.test([
+    String(body?.message ?? ""),
+    String(stderr ?? ""),
+    ...(Array.isArray(graphqlErrors)
+      ? graphqlErrors.map((error) => `${error?.type ?? ""} ${error?.message ?? ""}`)
+      : []),
+  ].join("\n"));
+  const retryAfter = header("retry-after");
+  const remaining = integer("x-ratelimit-remaining");
+  const reset = integer("x-ratelimit-reset");
+  const resource = header("x-ratelimit-resource")?.toLowerCase() ?? null;
+  // The counter itself says there is nothing left. That holds its own resource
+  // until its own reset, and says nothing about the other one.
+  if (!secondary && remaining === 0 && reset !== null && RATE_RESOURCES.includes(resource) &&
+      (status === 403 || status === 429)) {
+    return { kind: "primary", resource, resetMs: reset * 1000 };
+  }
+  if (retryAfter !== null || secondary || status === 429) {
+    return { kind: "secondary", retryAfter, secondary, status };
+  }
+  return { kind: "none" };
+}
+
+function transportCooldownDeadline({ retryAfter, status, secondary, at, attempts = 0 }) {
+  const supplied = typeof retryAfter === "string" && /^\d+(?:\.\d+)?$/.test(retryAfter)
     ? at + Number(retryAfter) * 1000
     : Date.parse(retryAfter ?? "");
-  if (Number.isFinite(deadline)) return deadline;
-  return status === 429 || secondary === true ? at + 60_000 : null;
+  // A deadline the server supplied is honoured exactly, however long. Only the
+  // delay chosen here is laddered, and only it is capped.
+  if (Number.isFinite(supplied)) return supplied;
+  return status === 429 || secondary === true ? at + throttleLadderMs(attempts) : null;
+}
+
+function emptyTransportThrottle() {
+  return { attempts: 0, lastAt: 0, paused: false };
 }
 
 function applyTransportCooldown(transport, evidence) {
-  const deadline = transportCooldownDeadline(evidence);
-  if (deadline !== null) transport.cooldownUntil = Math.max(transport.cooldownUntil, deadline);
+  const throttle = transport.throttle ?? emptyTransportThrottle();
+  const deadline = transportCooldownDeadline({ ...evidence, attempts: throttle.attempts });
+  if (deadline === null) return null;
+  // Merged by maximum, so a shorter concurrent error never shortens a hold
+  // another response already established, and the hold survives a primary epoch
+  // change: secondary limits are not accounted in the primary counter.
+  transport.cooldownUntil = Math.max(transport.cooldownUntil, deadline);
+  const attempts = Math.min(throttle.attempts + 1, THROTTLE_PAUSE_AFTER);
+  transport.throttle = { attempts, lastAt: evidence.at, paused: attempts >= THROTTLE_PAUSE_AFTER };
+  return transport.cooldownUntil;
+}
+
+// A request that came back carrying no throttle evidence is the only thing that
+// proves the hold is over, so it is the only thing that resets the ladder.
+// Merely waiting out a deadline does not: that is what produced the next
+// throttle last time.
+function clearTransportThrottle(transport) {
+  if (transport && transport.throttle && transport.throttle.attempts > 0) {
+    transport.throttle = emptyTransportThrottle();
+  }
 }
 
 function releaseIdentityHttpPermit(coordinator, permit, error = null) {
@@ -2905,15 +2992,40 @@ function releaseIdentityHttpPermit(coordinator, permit, error = null) {
     if (transport?.permit?.nonce === permit.nonce) transport.permit = null;
     if (transport && error) {
       const response = parseGhApiResponse(error.stdout ?? "");
-      applyTransportCooldown(transport, {
-        retryAfter: response.headers["retry-after"],
+      const verdict = classifyThrottle({
         status: response.status,
-        secondary: SECONDARY_LIMIT_PATTERN.test(String(error.stderr ?? "")),
-        at: Date.now(),
+        headers: response.headers,
+        stderr: error.stderr,
       });
+      // A permission-only 403 reaches here too. It is a failure, but it is not a
+      // throttle, and holding the shared transport for it would pause every
+      // pane over one repository the user cannot read.
+      if (verdict.kind === "secondary") {
+        applyTransportCooldown(transport, {
+          retryAfter: verdict.retryAfter,
+          status: verdict.status,
+          secondary: verdict.secondary,
+          at: Date.now(),
+        });
+      }
+    } else if (transport && !error) {
+      clearTransportThrottle(transport);
     }
     return { ok: true };
   });
+}
+
+// The explicit retry a paused transport waits for. Clears the ladder and the
+// deadline together: a person choosing to retry is choosing to spend the next
+// request finding out, which is exactly the recovery election the pause defers.
+function retryThrottledTransport(root, host, { now = Date.now } = {}) {
+  return withIdentityRegistry(root, (state) => {
+    const transport = state.hosts[host];
+    if (!transport?.throttle?.paused) return { ok: true, value: { resumed: false } };
+    transport.throttle = emptyTransportThrottle();
+    transport.cooldownUntil = Math.min(transport.cooldownUntil, now());
+    return { ok: true, value: { resumed: true } };
+  }, { now: now() });
 }
 
 function identityCoordinationMessage(reason) {
@@ -2921,6 +3033,7 @@ function identityCoordinationMessage(reason) {
   if (["migration-hold", "legacy-unresolved"].includes(reason)) return "Upgrade waiting for legacy quota reset";
   if (["legacy-corrupt", "corrupt"].includes(reason)) return "Coordination state unavailable; evidence preserved";
   if (reason === "transport-busy") return "Shared HTTP request or cooldown in progress";
+  if (reason === "throttle-paused") return "Paused after repeated rate limits; refresh to retry";
   if (retryableCoordination(reason)) return "Coordinating with your other panes";
   if (reason === "identity-capacity") return "Coordination state full; retrying after the current window";
   return "Verified identity unavailable; waiting to retry";
@@ -7818,7 +7931,7 @@ function rateLimitBlockDecision(results, resetMs) {
 const IDENTITY_COORDINATION_REASONS = [
   "restart-required", "migration-hold", "legacy-unresolved", "legacy-corrupt",
   "credential-unavailable", "identity-backoff", "identity-busy",
-  "identity-unavailable", "identity-capacity", "transport-busy",
+  "identity-unavailable", "identity-capacity", "transport-busy", "throttle-paused",
 ];
 
 function coordinationNotice(reason) {
@@ -10929,6 +11042,15 @@ export {
   heartbeatLease,
   maintainControlLease,
   claimProbe,
+  classifyThrottle,
+  applyTransportCooldown,
+  clearTransportThrottle,
+  emptyTransportThrottle,
+  throttleLadderMs,
+  transportCooldownDeadline,
+  retryThrottledTransport,
+  THROTTLE_LADDER_MS,
+  THROTTLE_PAUSE_AFTER,
   renewProbeClaim,
   publishProbe,
   failProbeClaim,
