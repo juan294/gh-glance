@@ -152,3 +152,75 @@ test("the shell fixture routes opt-in oracle GraphQL JSON input with independent
   assert.equal(state.events[0].operation, "graphql.observer");
   assert.ok(state.events[0].completedAt >= state.events[0].startedAt);
 });
+
+
+test("fixture token lookup is synthetic and local; user responses expose the chosen principal", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-fixture-identity-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const token = invoke(["auth", "token", "--hostname", "github.com"], {
+    GH_GLANCE_FIXTURE_TOKEN: "fixture-synthetic-keyring",
+    // A local lookup must not even require the synthetic HTTP ledger to exist.
+    GH_GLANCE_FIXTURE_STATE: join(root, "absent-server.json"),
+  });
+  assert.equal(token.status, 0, token.stderr);
+  assert.equal(token.stdout, "fixture-synthetic-keyring\n");
+  const user = invoke(["api", "-i", "user"], {
+    GH_GLANCE_FIXTURE_USER_ID: "42", GH_GLANCE_FIXTURE_LOGIN: "fixture-other",
+  });
+  assert.equal(user.status, 0, user.stderr);
+  assert.deepEqual(JSON.parse(user.stdout.split(/\r?\n\r?\n/)[1]), { id: 42, login: "fixture-other" });
+  assert.match(user.stdout, /x-ratelimit-resource: core/);
+
+  const statePath = join(root, "server.json");
+  writeFileSync(statePath, JSON.stringify({
+    core: { limit: 5000, used: 0, remaining: 5000, resetMs: Date.now() + 3600000 },
+    graphql: { limit: 5000, used: 0, remaining: 5000, resetMs: Date.now() + 3600000 },
+    user: { id: 84, login: "fixture-state-user" }, events: [],
+  }), { mode: 0o600 });
+  const stateUser = invoke(["api", "-i", "user"], { GH_GLANCE_FIXTURE_STATE: statePath });
+  assert.equal(stateUser.status, 0, stateUser.stderr);
+  assert.deepEqual(JSON.parse(stateUser.stdout.split(/\r?\n\r?\n/)[1]), { id: 84, login: "fixture-state-user" });
+  assert.equal(JSON.parse(readFileSync(statePath, "utf8")).core.used, 1);
+});
+
+
+test("oracle token lookup emits only synthetic credentials without recording an HTTP request", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-oracle-token-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const statePath = join(root, "server.json");
+  writeFileSync(statePath, JSON.stringify(createOracleState()), { mode: 0o600 });
+  const response = spawnSync(FIXTURE, ["auth", "token", "--hostname", "github.com"], {
+    encoding: "utf8", env: oracleEnvironment({ root, statePath }),
+  });
+  assert.equal(response.status, 0, response.stderr);
+  assert.equal(response.stdout, "fixture-full\n");
+  const state = JSON.parse(readFileSync(statePath, "utf8"));
+  assert.equal(state.events.length, 0);
+  assert.equal(state.accounts.octocat.httpRequests, 0);
+});
+
+
+test("a workflows fixture completes independently when it owns the only HTTP slot", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-workflows-independent-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const statePath = join(root, "state.json");
+  const now = Date.now();
+  writeFileSync(statePath, JSON.stringify({
+    createdAt: now,
+    core: { limit: 5000, used: 0, remaining: 5000, resetMs: now + 3_600_000 },
+    graphql: { limit: 5000, used: 0, remaining: 5000, resetMs: now + 3_600_000 },
+    events: [],
+  }), { mode: 0o600 });
+  const result = spawnSync(process.execPath, [join(HERE, "fixtures", "gh-state.mjs"),
+    "api", "-i", "repos/acme/widget/actions/workflows?page=1&per_page=100"], {
+    encoding: "utf8", timeout: 2000,
+    env: { GH_GLANCE_FIXTURE_STATE: statePath },
+  });
+  assert.equal(result.error, undefined, "workflows waited for a runs request that cannot own the HTTP slot yet");
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^HTTP\/2 200 OK\r?$/m);
+  const state = JSON.parse(readFileSync(statePath, "utf8"));
+  assert.equal(state.core.used, 1);
+  assert.equal(state.events.filter((event) => event.type === "start").length, 1);
+  assert.equal(state.events.filter((event) => event.type === "end").length, 1);
+});

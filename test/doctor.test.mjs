@@ -18,10 +18,12 @@ import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 
 import {
+  BUDGET_SNAPSHOT_TTL_MS,
   GOVERNOR_LEASE_TTL_MS,
   claimProbe,
   classify,
-  createGovernorScope,
+  createIdentityCoordinator,
+  createQuotaScope,
   inspectGovernor,
   publishProbe,
   redact,
@@ -95,11 +97,13 @@ async function doctor({ env = {}, args = [] } = {}) {
     const { stdout } = await execFileAsync(process.execPath, [ENTRY, "--doctor", ...args], {
       cwd: REPO,
       env: {
-        ...process.env,
-        PATH: `${FIXTURE_BIN}:${process.env.PATH}`,
+        ...(process.env.NODE_V8_COVERAGE ? { NODE_V8_COVERAGE: process.env.NODE_V8_COVERAGE } : {}),
+        PATH: `${FIXTURE_BIN}:${dirname(process.execPath)}:/usr/bin:/bin`,
+        HOME: root,
+        GH_CONFIG_DIR: root,
         GH_GLANCE_FIXTURE_LOG: "/dev/null",
-        XDG_CONFIG_HOME: root,
         ...env,
+        XDG_CONFIG_HOME: root,
       },
       maxBuffer: 8 * 1024 * 1024,
     });
@@ -107,6 +111,30 @@ async function doctor({ env = {}, args = [] } = {}) {
   } finally {
     if (!env.XDG_CONFIG_HOME) rmSync(root, { recursive: true, force: true });
   }
+}
+
+// Seed a prior successful synthetic /user observation through the identity
+// seam. Tests then exercise the same v2 quota ledger as the spawned doctor.
+async function seededDoctorScope(root, now = Date.now()) {
+  const coordinator = createIdentityCoordinator({
+    host: "github.com",
+    pathOptions: { env: { XDG_CONFIG_HOME: root } },
+    env: { HOME: root, GH_CONFIG_DIR: root, XDG_CONFIG_HOME: root },
+    now: () => now,
+    runLocalToken: async () => "fixture-keyring-token\n",
+    requestIdentity: async () => ({
+      status: 200,
+      body: { id: 1, login: "octocat" },
+      rateLimit: { resource: "core", limit: 5000, used: 1, remaining: 4999,
+        resetMs: Math.floor((now + 3_600_000) / 1000) * 1000 },
+      etag: '"fixture-user-v1"',
+    }),
+  });
+  const resolved = await coordinator.refresh();
+  assert.equal(resolved.ok, true, JSON.stringify(resolved));
+  const scope = createQuotaScope(coordinator.current(), { root: coordinator.root });
+  coordinator.close();
+  return scope;
 }
 
 function probeBlock(report, name) {
@@ -144,7 +172,7 @@ test("--doctor reports governor health without a raw scope identifier", async (t
   assert.match(out, /^live leases {7}0$/m);
   assert.match(out, /^core .*\(core-observer\)$/m);
   assert.match(out, /^graphql .*\(rate-limit-probe\)$/m);
-  assert.ok(!/rate-governor-v1-|[0-9a-f]{64}/.test(out), out);
+  assert.ok(!/rate-governor-v1-|coordination-v2|quota-[0-9a-f]{64}|[0-9a-f]{64}/.test(out), out);
 });
 
 test("--doctor claims the core observer and uses its persisted ETag before calling user", async (t) => {
@@ -153,12 +181,7 @@ test("--doctor claims the core observer and uses its persisted ETag before calli
   const rateSequence = join(root, "rate-sequence");
   writeFileSync(rateSequence, "0\n", { mode: 0o600 });
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  const scopeResult = createGovernorScope({
-    effectiveHost: "github.com",
-    env: { ...process.env, XDG_CONFIG_HOME: root },
-  });
-  assert.equal(scopeResult.ok, true);
-  const scope = scopeResult.value;
+  const scope = await seededDoctorScope(root);
   const leaseId = randomUUID();
   const now = Date.now();
   assert.equal(registerLease(scope, {
@@ -175,7 +198,7 @@ test("--doctor claims the core observer and uses its persisted ETag before calli
   assert.equal(publishProbe(scope, leaseId, claim.value.nonce, {
     core: {
       source: "core-observer",
-      etag: '"fixture-empty-v1"',
+      etag: '"fixture-user-v1"',
       budget: { limit: 5000, used: 1, remaining: 4999, resetMs },
     },
     graphql: {
@@ -198,7 +221,7 @@ test("--doctor claims the core observer and uses its persisted ETag before calli
   const userCall = calls
     .find((line) => /(?:^| )user(?: |$)/.test(line));
   assert.ok(userCall, "doctor did not run the claimed core observer");
-  assert.match(userCall, /If-None-Match: "fixture-empty-v1"/);
+  assert.match(userCall, /If-None-Match: "fixture-user-v1"/);
   assert.equal(calls.filter((line) => /api rate_limit(?: |$)/.test(line)).length, 2);
   const state = inspectGovernor(scope, Date.now()).value;
   assert.equal(state.budgets.graphql.used, 10,
@@ -214,14 +237,10 @@ test("--doctor reaches a contended live lock after its wait cell is initialized"
     "the lock wait cell must be initialized before the main doctor entry can use it");
   const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-live-lock-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  const scope = createGovernorScope({
-    effectiveHost: "github.com",
-    env: { ...process.env, XDG_CONFIG_HOME: root },
-  });
-  assert.equal(scope.ok, true);
-  mkdirSync(dirname(scope.value.path), { recursive: true, mode: 0o700 });
+  const scope = await seededDoctorScope(root);
+  mkdirSync(dirname(scope.path), { recursive: true, mode: 0o700 });
   writeFileSync(
-    `${scope.value.path}.lock`,
+    `${scope.path}.lock`,
     `${JSON.stringify({ pid: process.pid, nonce: "doctor-live-test-owner" })}\n`,
     { mode: 0o600 },
   );
@@ -263,11 +282,22 @@ test("--doctor reports rather than exits when gh is missing", async () => {
   assert.match(out, /Endpoint probes/);
 });
 
-test("--doctor spends nothing when the free budget probe fails", async () => {
+test("--doctor uses cached identity and admits no diagnostics when the budget probe fails", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-held-budget-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  // Retain the verified identity and its accounted receipt, but make the
+  // previous core observation too old to authorize diagnostics after failure.
+  const scope = await seededDoctorScope(root, Date.now() - BUDGET_SNAPSHOT_TTL_MS - 1_000);
+  assert.ok(Date.now() - inspectGovernor(scope, Date.now()).value.budgets.core.observedAt > BUDGET_SNAPSHOT_TTL_MS);
+  const log = join(root, "gh.log");
   const message = "HTTP 403: Resource protected by organization SAML enforcement";
-  const out = await doctor({ env: { GH_GLANCE_FIXTURE_FAIL: message } });
+  const out = await doctor({ env: { XDG_CONFIG_HOME: root, GH_GLANCE_FIXTURE_LOG: log, GH_GLANCE_FIXTURE_FAIL: message } });
   assert.match(out, /^REST core {9}unavailable$/m);
   assert.equal(out.match(/^ {2}classified {2}skipped$/gm)?.length, 11, out);
+  assert.match(out, /github\.com: octocat \(verified\)/);
+  const calls = readFileSync(log, "utf8").split(/\r?\n/).filter(Boolean);
+  assert.equal(calls.filter((call) => call.startsWith("auth status")).length, 0);
+  assert.equal(calls.filter((call) => /^(?:issue|pr|run|repo) /.test(call) || call.includes("/actions/") || call.includes("/alerts")).length, 0);
 });
 
 test("--doctor skips a REST diagnostic whose paced slot is still in the future", async () => {

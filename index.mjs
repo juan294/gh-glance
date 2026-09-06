@@ -23,6 +23,7 @@
 process.env.NODE_ENV ??= "production";
 
 import { execFile, spawn } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
@@ -43,6 +44,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+const requestIdentityStorage = new AsyncLocalStorage();
 
 // Running as the CLI vs. being imported by a test. Everything with a side
 // effect -- argv handling, the TTY guard, the preflight, entering the alternate
@@ -616,6 +618,7 @@ function registerLiveAbort(controller) {
   liveAbort = controller;
 }
 function abortLiveRequests() {
+  runtimeIdentityCoordinator?.close();
   liveAbort?.abort();
   liveAbort = null;
 }
@@ -627,12 +630,62 @@ function forwardSignalToChild(child, signal) {
   return child.kill(signal);
 }
 
+function inspectAdmittedHttpStart(scope, operation, now = Date.now) {
+  const costs = operationCost(operation);
+  if (!costs) return { ok: false, reason: "undeclared" };
+  if (RATE_RESOURCES.every((resource) => costs[resource] === 0)) return { ok: true };
+  const readNow = typeof now === "function" ? now : () => now;
+  const snapshot = inspectGovernor(scope, readNow());
+  if (!snapshot.ok || snapshot.missing) return snapshot.ok ? { ok: false, reason: "corrupt" } : snapshot;
+  const checkedAt = readNow();
+  for (const resource of RATE_RESOURCES) {
+    if (costs[resource] <= 0) continue;
+    const budget = snapshot.value.budgets[resource];
+    if (!budget) return { ok: false, reason: "budget-unknown", resource };
+    if (budget.blockUntil > checkedAt) return { ok: false, reason: "blocked", resource, retryAt: budget.blockUntil };
+    if (budget.resetMs <= checkedAt) return { ok: false, reason: "budget-reset", resource, retryAt: budget.resetMs + BUDGET_RESET_GRACE_MS };
+  }
+  return { ok: true };
+}
+
+// Re-checked either side of every wait a request can sit in, because admission,
+// the transport permit and the subprocess boundary are each far enough apart
+// that the account can change in between. One definition so the three checks
+// cannot drift, and so a request costs one identity snapshot instead of three.
+function assertBoundCredential(bound) {
+  if (bound?.accessKey && bound.accessKey !== runtimeIdentityCoordinator?.current()?.accessKey) {
+    throw new Error("Credential changed before request start");
+  }
+}
+
 async function runGh(args, { signal, operation } = {}) {
   if (operationCost(operation) === null) {
     throw new Error(`undeclared gh operation: ${operation ?? "missing"}`);
   }
+  const bound = requestIdentityStorage.getStore();
+  assertBoundCredential(bound);
+  const local = ["version", "local-git"].includes(operation);
+  let control = null;
+  const permit = runtimeIdentityCoordinator && !local
+    ? await acquireIdentityHttpPermit(runtimeIdentityCoordinator, { signal }) : null;
   const startedAt = Date.now();
+  let requestError = null;
+  let requestStdout = null;
   try {
+    assertBoundCredential(bound);
+    if (runtimeIdentityCoordinator && operation === "budget-core-observer") {
+      control = startIdentityControl(runtimeIdentityCoordinator);
+      if (!control.ok) throw new Error(identityCoordinationMessage(control.reason));
+    }
+    // Admission can precede this per-call transport slot by many seconds.
+    // A sibling request may publish a shared hold while this call is queued.
+    // Keep the started envelope charged, but recheck resource validity at the
+    // actual subprocess boundary without reserving the same work again.
+    if (bound && !local && operation !== "budget-core-observer") {
+      const ready = inspectAdmittedHttpStart(bound, operation);
+      if (!ready.ok) throw new Error(`API budget paused (${ready.reason})`);
+    }
+    assertBoundCredential(bound);
     const { stdout } = await execFileAsync("gh", args, {
       timeout: GH_TIMEOUT_MS,
       killSignal: "SIGKILL",
@@ -640,11 +693,24 @@ async function runGh(args, { signal, operation } = {}) {
       env: { ...process.env, ...GH_ENV_OVERRIDES },
       signal,
     });
+    requestStdout = stdout;
     logGh(args, startedAt, `ok ${stdout.length}B`);
     return stdout;
   } catch (err) {
+    requestError = err;
     logGh(args, startedAt, `FAILED ${shortErr(err)}`);
     throw err;
+  } finally {
+    if (permit) {
+      const release = () => releaseIdentityHttpPermit(runtimeIdentityCoordinator, permit, requestError);
+      const released = await retryIdentityCompletion(release, { timeoutMs: IDENTITY_RELEASE_WAIT_MS, shouldRetry: () => !runtimeIdentityCoordinator.isClosed() });
+      if (!released.ok) runtimeIdentityCoordinator.deferCompletion(`permit:${permit.nonce}`, release);
+    }
+    if (control?.ok) {
+      const settle = () => settleIdentityControl(runtimeIdentityCoordinator, control.value, requestStdout ?? requestError?.stdout);
+      const settled = await retryIdentityCompletion(settle, { timeoutMs: IDENTITY_RELEASE_WAIT_MS, shouldRetry: () => !runtimeIdentityCoordinator.isClosed() });
+      if (!settled.ok) runtimeIdentityCoordinator.deferCompletion(`control:${control.value.id}`, settle);
+    }
   }
 }
 
@@ -842,18 +908,6 @@ function repoContextArgs() {
   ];
 }
 
-function authContextArgs() {
-  return [
-    "auth",
-    "status",
-    "--active",
-    "--json",
-    "hosts",
-    "--jq",
-    ".hosts | to_entries | map(.key as $host | .value[] | select(.active == true) | {host: $host, login: .login})",
-  ];
-}
-
 function parseRepoContext(raw) {
   try {
     const value = JSON.parse(raw);
@@ -933,9 +987,10 @@ async function resolveFailureContext(signal, governor = null, { run = runGh } = 
         }),
       }).then((result) => result.ok ? result.value : Promise.reject(result.error))
     : Promise.reject(new Error("API budget unavailable"));
+  const identity = runtimeIdentityCoordinator?.current();
   const [repo, auth] = await Promise.allSettled([
     repoCall,
-    run(authContextArgs(), { signal, operation: "failure-context:auth" }),
+    identity ? Promise.resolve(JSON.stringify([{ host: identity.host, login: identity.login }])) : Promise.reject(new Error("Verified identity unavailable")),
   ]);
   return buildFailureContext(repo, auth);
 }
@@ -1321,7 +1376,6 @@ const OPERATION_COSTS = Object.freeze({
   "tab:actions-workflows": { core: 1, graphql: 0 },
   "tab:security-endpoint": { core: 1, graphql: 0 },
   "failure-context:repository": { core: 0, graphql: 1 },
-  "failure-context:auth": { core: 0, graphql: 0 },
   "open:actions": { core: REST_PER_FETCH.actions, graphql: 0 },
   "open:issues": { core: 0, graphql: GRAPHQL_PER_FETCH.issues },
   "open:prs": { core: 0, graphql: GRAPHQL_PER_FETCH.prs },
@@ -1337,7 +1391,6 @@ const OPERATION_COSTS = Object.freeze({
   "budget-core-observer": { core: 1, graphql: 0 },
   "rate-limit": { core: 0, graphql: 0 },
   "version": { core: 0, graphql: 0 },
-  "auth-status": { core: 0, graphql: 0 },
   "local-git": { core: 0, graphql: 0 },
 });
 
@@ -1856,6 +1909,698 @@ function scheduleIntents({
   };
 }
 
+// ---------- Credential identities and restart-safe coordination ----------
+const IDENTITY_VERSION = 1;
+const IDENTITY_ATTEMPT_WINDOW_MS = 15 * 60_000;
+const IDENTITY_ATTEMPT_LIMIT = 3;
+const IDENTITY_HOST_ATTEMPT_LIMIT = 12;
+const IDENTITY_MAX_ATTEMPTS = 4096;
+const HTTP_START_GAP_MS = 250;
+const HTTP_MAX_WAITERS = 128;
+// A permit is reclaimable once it cannot still belong to a live request. The
+// owner-death check alone cannot see a process that is stopped, or one whose
+// release lost its lock, so a permit outliving the subprocess timeout it guards
+// is stale by construction rather than by guess.
+const HTTP_PERMIT_MAX_MS = GH_TIMEOUT_MS + 5_000;
+// The longest a primary window can run. An attempt that never obtained reset
+// evidence is still covered once a full window has demonstrably elapsed since it
+// started, which is what keeps an unprovable charge from being retained forever.
+const IDENTITY_UNCERTAIN_MAX_MS = 3_600_000 + BUDGET_RESET_GRACE_MS;
+// Bound the in-band wait for the registry lock when a request is already
+// finishing. The permit is what other panes queue behind, so a slow release must
+// hand off to deferCompletion quickly instead of holding the whole machine.
+const IDENTITY_RELEASE_WAIT_MS = 500;
+// How long startup will wait for a warm local identity before painting. Long
+// enough to win the ordinary case, short enough that a stuck credential helper
+// costs a cache-cold first frame rather than a blank terminal.
+const WARM_IDENTITY_WAIT_MS = 1_000;
+// "busy" and "unwritable" say the registry could not be read or written *right
+// now*. Every other reason is a statement about the identity itself. Three
+// callers each drew this line differently -- retryIdentityCompletion retried
+// both, refresh() treated them as proof the identity was gone, and permit
+// acquisition threw on them -- so a 250 ms lock wait could be reported as an
+// account change. One definition keeps them from drifting apart again.
+const RETRYABLE_COORDINATION_REASONS = ["busy", "unwritable"];
+// 60 s doubling per prior attempt in the window. The two callers deliberately
+// count different prior sets -- bootstrap also has a per-host unknown-principal
+// allowance and the transport start gap to respect, while a known-capacity
+// observer is admitted normally and only the exceptional branch is throttled --
+// but the delay they apply is one law and belongs in one place.
+function attemptRetryDelayMs(priorAttempts) {
+  return 60_000 * 2 ** priorAttempts;
+}
+
+function retryableCoordination(reason) {
+  return RETRYABLE_COORDINATION_REASONS.includes(reason);
+}
+
+// A dead owner releases its permit immediately; a live owner keeps it only for
+// as long as a request could still be running under it. Without the second
+// test a stopped process, or one whose release never won the lock, holds the
+// single machine-wide permit forever and every pane queues behind it.
+function staleHttpPermit(permit, now, kill = process.kill.bind(process)) {
+  if (pidIsDead(permit.pid, kill)) return true;
+  return Number.isFinite(permit.startedAt) && now - permit.startedAt > HTTP_PERMIT_MAX_MS;
+}
+let runtimeIdentityCoordinator = null;
+
+function privateIdentityDigest(...parts) {
+  return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
+}
+
+function identityRegistryRoot(pathOptions = {}) {
+  return join(dirname(widthPreferencesPath(pathOptions)), "coordination-v2");
+}
+
+function credentialEnvironmentNames(host) {
+  return host === "github.com" || host.endsWith(".ghe.com")
+    ? ["GH_TOKEN", "GITHUB_TOKEN"] : ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
+}
+
+// Deliberately not memoized, despite being called on the render and request
+// paths. resolveEffectiveCredential brackets the `gh auth token` subprocess with
+// a before/after comparison of this value to catch a credential swapped while
+// resolution was in flight, so any cache whose window can cover that gap makes
+// the process bind the wrong credential -- and a local token can resolve in
+// under a millisecond. The cost is one statSync plus a digest of four numbers;
+// reduce the number of callers instead of caching the answer.
+function credentialConfigurationRevision(host, env = process.env) {
+  const names = credentialEnvironmentNames(host);
+  const selected = names.find((name) => env[name]);
+  if (selected) return privateIdentityDigest(host, String(env[selected]));
+  const directory = effectiveGhConfigDir({ env });
+  let stamp = null;
+  try {
+    const value = statSync(join(directory, "hosts.yml"));
+    stamp = [value.dev, value.ino, value.size, value.mtimeMs];
+  } catch { /* missing local configuration is resolved honestly by gh */ }
+  return privateIdentityDigest(host, directory, stamp);
+}
+
+async function resolveEffectiveCredential({ host, env = process.env, runLocalToken } = {}) {
+  host = normalizeHost(host);
+  if (!host) return { ok: false, reason: "unknown-host" };
+  const names = credentialEnvironmentNames(host);
+  const initialRevision = credentialConfigurationRevision(host, env);
+  let token;
+  try {
+    const selected = names.find((name) => env[name]);
+    if (selected) token = String(env[selected]);
+    else {
+      // This seam never passes through runGh/logGh and never exposes the child
+      // error, stdout or stderr. Credentials exist only in this lexical scope.
+      const result = await (runLocalToken ?? (async (args) => execFileAsync("gh", args, {
+        env: { ...env, ...GH_ENV_OVERRIDES }, timeout: GH_TIMEOUT_MS,
+        maxBuffer: 1024 * 1024, killSignal: "SIGKILL",
+      })))(["auth", "token", "--hostname", host]);
+      token = String(typeof result === "string" ? result : result.stdout ?? "").trim();
+    }
+    if (credentialConfigurationRevision(host, env) !== initialRevision) return { ok: false, reason: "credential-changed" };
+    if (!token || /\s/.test(token)) return { ok: false, reason: "credential-unavailable" };
+    const credentialKey = privateIdentityDigest("credential-v1", host, token);
+    token = null;
+    return { ok: true, value: { host, credentialKey, configurationRevision: initialRevision } };
+  } catch {
+    return { ok: false, reason: "credential-unavailable" };
+  }
+}
+
+function emptyIdentityRegistry() {
+  return { version: IDENTITY_VERSION, migration: { activated: false, holdUntil: 0 }, identities: {}, attempts: {}, hosts: {} };
+}
+
+function normalizeIdentityRegistry(raw) {
+  if (!exactKeys(raw, ["version", "migration", "identities", "attempts", "hosts"]) || raw.version !== IDENTITY_VERSION ||
+      !exactKeys(raw.migration, ["activated", "holdUntil"]) || typeof raw.migration.activated !== "boolean" ||
+      !Number.isFinite(raw.migration.holdUntil) || raw.migration.holdUntil < 0 ||
+      !isRecord(raw.identities) || !isRecord(raw.attempts) || !isRecord(raw.hosts) ||
+      Object.keys(raw.attempts).length > IDENTITY_MAX_ATTEMPTS) return null;
+  const digest = (value) => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+  const time = (value) => Number.isFinite(value) && value >= 0;
+  for (const [key, identity] of Object.entries(raw.identities)) {
+    if (!digest(key) || !exactKeys(identity, ["host", "kind", "id", "login", "quotaKey", "accessKey", "generation", "observedAt"]) ||
+        !normalizeHost(identity.host) || identity.kind !== "user" || !Number.isSafeInteger(identity.id) || identity.id <= 0 ||
+        typeof identity.login !== "string" || identity.login !== safe(identity.login) || !digest(identity.quotaKey) || !digest(identity.accessKey) ||
+        !Number.isSafeInteger(identity.generation) || identity.generation < 1 || !time(identity.observedAt)) return null;
+  }
+  for (const [id, attempt] of Object.entries(raw.attempts)) {
+    if (!validGovernorId(id) || !exactKeys(attempt, ["credentialKey", "host", "resource", "startedAt", "retryAt", "ownerPid", "nonce", "status", "quotaKey", "resetMs", "accounted", "imported", "exceptional"]) ||
+        !digest(attempt.credentialKey) || !normalizeHost(attempt.host) || !RATE_RESOURCES.includes(attempt.resource) ||
+        !time(attempt.startedAt) || !time(attempt.retryAt) || !Number.isSafeInteger(attempt.ownerPid) || attempt.ownerPid < 1 || !validGovernorId(attempt.nonce) ||
+        !["started", "finished", "uncertain"].includes(attempt.status) || (attempt.quotaKey !== null && !digest(attempt.quotaKey)) ||
+        (attempt.resetMs !== null && !time(attempt.resetMs)) || typeof attempt.accounted !== "boolean" || typeof attempt.imported !== "boolean" || typeof attempt.exceptional !== "boolean") return null;
+  }
+  for (const [host, transport] of Object.entries(raw.hosts)) {
+    if (!isRecord(transport)) return null;
+    const keys = ["lastStartedAt", "cooldownUntil", "permit"];
+    if (Object.hasOwn(transport, "waiters")) keys.push("waiters");
+    if (!normalizeHost(host) || !exactKeys(transport, keys) ||
+        !time(transport.lastStartedAt) || !time(transport.cooldownUntil)) return null;
+    if (transport.permit !== null && (!exactKeys(transport.permit, ["pid", "nonce", "startedAt"]) ||
+        !Number.isSafeInteger(transport.permit.pid) || transport.permit.pid < 1 || !validGovernorId(transport.permit.nonce) || !time(transport.permit.startedAt))) return null;
+    if (!Object.hasOwn(transport, "waiters")) transport.waiters = [];
+    if (!Array.isArray(transport.waiters) || transport.waiters.length > HTTP_MAX_WAITERS ||
+        new Set(transport.waiters.map((waiter) => waiter?.nonce)).size !== transport.waiters.length ||
+        transport.waiters.some((waiter) => !exactKeys(waiter, ["pid", "nonce", "queuedAt", "deadline"]) ||
+          !Number.isSafeInteger(waiter.pid) || waiter.pid < 1 || !validGovernorId(waiter.nonce) ||
+          !time(waiter.queuedAt) || !time(waiter.deadline) || waiter.deadline <= waiter.queuedAt ||
+          waiter.deadline - waiter.queuedAt > GH_TIMEOUT_MS)) return null;
+  }
+  return raw;
+}
+
+function withIdentityRegistry(root, operation, { now = Date.now(), kill = process.kill.bind(process) } = {}) {
+  const path = join(root, "registry.json");
+  const scope = { path, hash: "identity-registry", host: "github.com", identityProvider: null, kill };
+  return withGovernorLock(scope, () => {
+    // Read and parse are separated for the same reason readGovernorState
+    // separates them: EACCES, EIO or EMFILE mean "try again", while unparseable
+    // bytes mean "stop and preserve the evidence". Collapsing the two reported a
+    // transient descriptor shortage as permanent corruption.
+    let raw = null;
+    try { raw = readFileSync(path, "utf8"); }
+    catch (error) { if (error?.code !== "ENOENT") return { ok: false, reason: "unwritable" }; }
+    let state;
+    if (raw === null) state = emptyIdentityRegistry();
+    else {
+      try { state = normalizeIdentityRegistry(JSON.parse(raw)); }
+      catch { return { ok: false, reason: "corrupt" }; }
+    }
+    if (!state) return { ok: false, reason: "corrupt" };
+    // Captured before the prunes below so their deletions still count as a
+    // change. Every governor operation -- including read-only inspection --
+    // funnels through here, and each one used to serialize and rename the
+    // registry while holding the one machine-wide lock.
+    const before = JSON.stringify(state);
+    for (const transport of Object.values(state.hosts)) {
+      transport.waiters = transport.waiters.filter((waiter) => waiter.deadline > now && !pidIsDead(waiter.pid, kill));
+    }
+    for (const [id, attempt] of Object.entries(state.attempts)) {
+      // Past its rolling window *and* past any backoff it still imposes. retryAt
+      // is what carries known exhaustion (settlement pushes it out to reset plus
+      // grace, beyond the window), so testing it is what lets an aged-out entry
+      // be dropped without forgiving a hold that is still in force.
+      if (attempt.startedAt + IDENTITY_ATTEMPT_WINDOW_MS > now || attempt.retryAt > now) continue;
+      const identity = state.identities[attempt.credentialKey];
+      // No identity for this credential means no quota scope, so there is no
+      // ledger receipt the attempt could be holding and nothing to reconcile.
+      // These are the failed bootstraps -- they never reach importIdentityDebts,
+      // so they used to be immortal and wedged claimIdentityBootstrap at
+      // IDENTITY_MAX_ATTEMPTS permanently, with deleting registry.json by hand
+      // as the only way out.
+      if (!identity) { delete state.attempts[id]; continue; }
+      const scope = { ...createQuotaScope({ ...identity, credentialKey: attempt.credentialKey }, { root, now: () => now, kill }), rootLocked: true };
+      const retired = withGovernorLock(scope, () => {
+        const ledger = readIdentityQuotaState(state, scope, now);
+        if (!ledger.ok || ledger.missing) return ledger.ok ? { ok: false, reason: "corrupt" } : ledger;
+        const budget = ledger.value.budgets[attempt.resource];
+        const resetCovered = attempt.resetMs !== null
+          ? now >= attempt.resetMs && budget?.resetMs > attempt.resetMs
+          // An attempt whose observer never returned core evidence has no reset
+          // of its own to wait for. A window boundary proven to fall after it
+          // started covers its charge just as well, and is the only thing that
+          // stops the entry from being retained for the life of the install.
+          : budget?.resetMs > attempt.startedAt + IDENTITY_UNCERTAIN_MAX_MS;
+        if (!attempt.accounted && !resetCovered) return { ok: true, value: false };
+        delete ledger.value.reservations[`reservation:${id}`];
+        const write = writeGovernorState(scope.path, ledger.value);
+        return write.ok ? { ok: true, value: true } : write;
+      });
+      if (!retired.ok) return retired;
+      if (retired.value) delete state.attempts[id];
+    }
+    const result = operation(state, now);
+    if (!normalizeIdentityRegistry(state)) return { ok: false, reason: "corrupt" };
+    if (JSON.stringify(state) === before) return result;
+    const written = writeGovernorState(path, state);
+    return written.ok ? result : written;
+  });
+}
+
+function inspectIdentityRegistry(root, options) {
+  return withIdentityRegistry(root, (state) => ({ ok: true, value: structuredClone(state) }), options);
+}
+
+function inspectLegacyMigration(root, state, now) {
+  let names;
+  try { names = readdirSync(dirname(root)).filter((name) => /^rate-governor-v1-[0-9a-f]{64}\.json$/.test(name)); }
+  catch (error) { return { ok: false, reason: error.code === "ENOENT" ? "unwritable" : "corrupt" }; }
+  let holdUntil = state.migration.holdUntil;
+  for (const name of names) {
+    let raw;
+    try { raw = JSON.parse(readFileSync(join(dirname(root), name), "utf8")); } catch { return { ok: false, reason: "legacy-corrupt" }; }
+    // Evidence is never rewritten. Recognize only the pinned legacy schemas.
+    const legacy = normalizeGovernorState(raw, now, { prune: false }) ?? migrateGovernorState(raw, now);
+    if (legacy && raw.version === 1 && raw.budgets?.core) {
+      const core = raw.budgets.core;
+      const preserved = normalizeGovernorBudget({ ...core, source: "core-observer", factorBaseline: { epoch: core.epoch, used: core.used, observedAt: core.observedAt }, knownLocalUsed: 0 }, now, "core");
+      if (!preserved) return { ok: false, reason: "legacy-corrupt" };
+      // This is a migration hold view only, never published as new authority.
+      legacy.budgets.core = preserved;
+      legacy.epochs.core = preserved.epoch;
+    }
+    if (!legacy) return { ok: false, reason: "legacy-corrupt" };
+    if (Object.values(legacy.leases).some((lease) => lease.expiresAt > now)) return { ok: false, reason: "restart-required" };
+    for (const resource of RATE_RESOURCES) {
+      const budget = legacy.budgets[resource];
+      holdUntil = Math.max(holdUntil, budget?.blockUntil ?? 0);
+      const uncertain = Object.values(legacy.reservations).some((reservation) =>
+        ["started", "completed"].includes(reservation.status) && reservationCost(reservation, resource, legacy.leases, now) > 0);
+      if (uncertain) {
+        const reset = budget?.resetMs;
+        if (!Number.isFinite(reset)) return { ok: false, reason: "legacy-unresolved" };
+        holdUntil = Math.max(holdUntil, reset + BUDGET_RESET_GRACE_MS);
+      }
+    }
+  }
+  state.migration.holdUntil = holdUntil;
+  if (holdUntil > now) return { ok: false, reason: "migration-hold", retryAt: holdUntil };
+  // Deliberately a record, not a gate. Re-listing the legacy directory on every
+  // operation is what satisfies "detect reappearing legacy leases during
+  // operation": an old binary started after migration must still be able to
+  // pause new admission, and it cannot announce itself through a sentinel it
+  // does not read. Short-circuiting on this flag would be faster and wrong.
+  state.migration.activated = true;
+  return { ok: true };
+}
+
+function claimIdentityBootstrap(root, { credentialKey, host, resource = "core", now = Date.now(), kill = process.kill.bind(process) } = {}) {
+  return withIdentityRegistry(root, (state) => {
+    const migration = inspectLegacyMigration(root, state, now);
+    if (!migration.ok) return migration;
+    const transport = state.hosts[host] ??= { lastStartedAt: 0, cooldownUntil: 0, permit: null };
+    if (transport.permit && staleHttpPermit(transport.permit, now, kill)) transport.permit = null;
+    if (transport.permit || transport.waiters?.length) return { ok: false, reason: "identity-busy", retryAt: now + 1000 };
+    const attempts = Object.values(state.attempts);
+    const recent = attempts.filter((attempt) => attempt.startedAt > now - IDENTITY_ATTEMPT_WINDOW_MS);
+    const own = recent.filter((attempt) => attempt.credentialKey === credentialKey && attempt.resource === resource && attempt.exceptional);
+    const unknown = recent.filter((attempt) => attempt.host === host && attempt.exceptional);
+    const retryAt = Math.max(transport.cooldownUntil, transport.lastStartedAt + HTTP_START_GAP_MS,
+      ...attempts.filter((attempt) => attempt.credentialKey === credentialKey && attempt.resource === resource).map((attempt) => attempt.retryAt),
+      own.length >= IDENTITY_ATTEMPT_LIMIT ? Math.min(...own.map((attempt) => attempt.startedAt)) + IDENTITY_ATTEMPT_WINDOW_MS : 0,
+      unknown.length >= IDENTITY_HOST_ATTEMPT_LIMIT ? Math.min(...unknown.map((attempt) => attempt.startedAt)) + IDENTITY_ATTEMPT_WINDOW_MS : 0);
+    if (retryAt > now) return { ok: false, reason: "identity-backoff", retryAt };
+    if (attempts.length >= IDENTITY_MAX_ATTEMPTS) return { ok: false, reason: "identity-capacity" };
+    const id = governorId();
+    const nonce = governorId();
+    state.attempts[id] = { credentialKey, host, resource, startedAt: now, retryAt: now + attemptRetryDelayMs(own.length),
+      ownerPid: process.pid, nonce, status: "started", quotaKey: null, resetMs: null, accounted: false, imported: false, exceptional: true };
+    transport.permit = { pid: process.pid, nonce, startedAt: now };
+    transport.lastStartedAt = now;
+    return { ok: true, value: { id, nonce } };
+  }, { now, kill });
+}
+
+function readIdentityQuotaState(registry, scope, now) {
+  const loaded = readGovernorState(scope.path, now);
+  const known = Object.values(registry.identities).some((identity) => identity.quotaKey === scope.quotaKey) ||
+    Object.values(registry.attempts).some((attempt) => attempt.imported && attempt.quotaKey === scope.quotaKey);
+  return loaded.ok && loaded.missing && known ? { ok: false, reason: "corrupt" } : loaded;
+}
+
+function importIdentityDebts(root, state, credentialKey, identity, now) {
+  const scope = { ...createQuotaScope({ ...identity, credentialKey }, { root, now: () => now }), rootLocked: true };
+  return withGovernorLock(scope, () => {
+    const loaded = readIdentityQuotaState(state, scope, now);
+    if (!loaded.ok) return loaded;
+    const transferred = [];
+    for (const [id, attempt] of Object.entries(state.attempts)) {
+      if (attempt.credentialKey !== credentialKey || attempt.imported) continue;
+      const reservationId = `reservation:${id}`;
+      loaded.value.reservations[reservationId] ??= {
+        leaseId: id, intentId: id, costs: { core: 0, graphql: 0, [attempt.resource]: 1 }, actualCosts: null,
+        accountedCosts: { core: 0, graphql: 0, [attempt.resource]: attempt.accounted ? 1 : 0 },
+        notBefore: attempt.startedAt, status: "started", epochs: { core: null, graphql: null },
+        startedAt: attempt.startedAt, completedAt: null, outcome: null,
+      };
+      transferred.push(id);
+    }
+    // importIdentityDebts writes this ledger before the registry transaction
+    // that records the mapping commits. A crash in between leaves a charged
+    // receipt here whose attempt is gone from the registry, and nothing else
+    // ever looks at it again -- it presents only as a permanently smaller
+    // budget. Re-bootstrapping the same credential is exactly when it can be
+    // recognised, and a full window since it started proves a reset covered it.
+    for (const key of Object.keys(loaded.value.reservations)) {
+      const attemptId = /^reservation:(.+)$/.exec(key)?.[1];
+      if (!attemptId || state.attempts[attemptId]) continue;
+      const reservation = loaded.value.reservations[key];
+      if (reservation.startedAt + IDENTITY_UNCERTAIN_MAX_MS > now) continue;
+      delete loaded.value.reservations[key];
+    }
+    const written = writeGovernorState(scope.path, loaded.value);
+    if (!written.ok) return written;
+    // Marked transferred only once the receipts are durable. withIdentityRegistry
+    // persists the registry whatever this returns, so setting these before the
+    // ledger write meant a failed write could leave the registry claiming a debt
+    // had moved to a ledger that never received it -- and the `imported` guard
+    // would then skip those attempts forever, dropping the conservative charge.
+    for (const id of transferred) {
+      state.attempts[id].quotaKey = identity.quotaKey;
+      state.attempts[id].imported = true;
+    }
+    return written;
+  });
+}
+
+function finishIdentityBootstrap(root, { credentialKey, id, nonce, response = null, now = Date.now(), isCurrent = () => true } = {}) {
+  return withIdentityRegistry(root, (state) => {
+    const attempt = state.attempts[id];
+    if (!attempt || attempt.nonce !== nonce || attempt.credentialKey !== credentialKey) return { ok: false, reason: "stale" };
+    const transport = state.hosts[attempt.host];
+    if (transport.permit?.nonce === nonce) transport.permit = null;
+    attempt.status = response ? "finished" : "uncertain";
+    const parsed = response?.body;
+    const evidence = response?.rateLimit;
+    applyTransportCooldown(transport, { retryAfter: response?.retryAfter, status: response?.status, secondary: response?.secondary, at: now });
+    if (evidence?.resource === "core" && normalizeBudgetResource(evidence, now)) {
+      attempt.resetMs = evidence.resetMs;
+      if (evidence.remaining === 0) attempt.retryAt = Math.max(attempt.retryAt, evidence.resetMs + BUDGET_RESET_GRACE_MS);
+    }
+    if (!isCurrent()) return { ok: false, reason: "stale" };
+    if ((response?.status ?? 200) !== 200 || !isRecord(parsed) || !Number.isSafeInteger(parsed.id) || parsed.id <= 0 || typeof parsed.login !== "string" ||
+        parsed.login.length === 0 || !evidence || evidence.resource !== "core" || !normalizeBudgetResource(evidence, now)) return { ok: false, reason: "identity-unavailable" };
+    const generation = state.identities[credentialKey]?.generation ?? 1;
+    const identity = { host: attempt.host, kind: "user", id: parsed.id, login: safe(parsed.login),
+      quotaKey: privateIdentityDigest("quota-v2", attempt.host, "user", parsed.id),
+      accessKey: privateIdentityDigest("access-v2", credentialKey, generation), generation, observedAt: now };
+    attempt.accounted = true;
+    for (const previous of Object.values(state.attempts)) {
+      if (previous.credentialKey === credentialKey && previous.resource === "core") previous.resetMs ??= evidence.resetMs;
+    }
+    // Record the mapping only after the ledger contains every debt. A crash
+    // between writes replays stable reservation IDs while the root lock prevents
+    // observers from deleting receipts before the mapping transaction finishes.
+    const imported = importIdentityDebts(root, state, credentialKey, identity, now);
+    if (!imported.ok) return imported;
+    // The admitted identity proof supplies core authority. Retain its validator
+    // so later observers can confirm unchanged identity without primary spend.
+    {
+      const scope = { ...createQuotaScope({ ...identity, credentialKey }, { root, now: () => now }), rootLocked: true };
+      const seeded = withGovernorLock(scope, () => {
+        const ledger = readIdentityQuotaState(state, scope, now);
+        if (!ledger.ok) return ledger;
+        const observation = budgetFromObservation(evidence, ledger.value.budgets.core, now, { resource: "core", source: "core-observer", receivedAt: now, allowEpochChange: true });
+        if (observation.status === "accepted") {
+          ledger.value.budgets.core = observation.budget;
+          ledger.value.epochs.core = observation.budget.epoch;
+          ledger.value.observers.core = { etag: typeof response.etag === "string" ? response.etag : null, outcome: "healthy", at: now, nextAt: now + BUDGET_PROBE_MS };
+        }
+        return writeGovernorState(scope.path, ledger.value);
+      });
+      if (!seeded.ok) return seeded;
+    }
+    if (!isCurrent()) return { ok: false, reason: "stale" };
+    state.identities[credentialKey] = identity;
+    return { ok: true, value: { ...identity, credentialKey } };
+  }, { now });
+}
+
+function createSettlementContext(scope, coordinator) {
+  return { scope: { ...scope, identityProvider: null }, isCurrent: () => coordinator.current()?.accessKey === scope.accessKey };
+}
+
+function createQuotaScope(identity, { root = identityRegistryRoot(), now = Date.now, identityProvider = null, kill = process.kill.bind(process) } = {}) {
+  return { hash: identity.quotaKey, quotaKey: identity.quotaKey, credentialKey: identity.credentialKey, accessKey: identity.accessKey,
+    path: join(root, `quota-${identity.quotaKey}.json`), coordinationRoot: root, host: identity.host, authIdentity: identity.quotaKey,
+    identityProvider, now, kill };
+}
+
+function createIdentityCoordinator({ host, pathOptions = {}, env = process.env, now = Date.now, kill = process.kill.bind(process), runLocalToken, requestIdentity } = {}) {
+  const root = identityRegistryRoot(pathOptions);
+  let current = null;
+  let revision = null;
+  let pending = null;
+  let failure = null;
+  let resolvedCredential = null;
+  let closed = false;
+  const bootstrapAbort = new AbortController();
+  const completions = new Map();
+  const deferCompletion = (key, operation) => completions.set(key, operation);
+  const flushCompletions = async () => {
+    for (const [key, operation] of completions) {
+      const result = await retryIdentityCompletion(operation, { shouldRetry: () => !closed });
+      if (!result.ok && ["busy", "unwritable"].includes(result.reason)) return result;
+      // A malformed/denied proof is a completed durable attempt, not pending
+      // storage work. Drop that callback so ordinary backoff can recover.
+      completions.delete(key);
+      if (!result.ok && result.reason === "corrupt") return result;
+    }
+    return { ok: true };
+  };
+  const resolveHost = () => normalizeHost(typeof host === "function" ? host() : host);
+  const snapshot = () => {
+    if (closed) return null;
+    const selectedHost = resolveHost();
+    if (current && (current.host !== selectedHost || credentialConfigurationRevision(selectedHost, env) !== revision)) current = null;
+    return current;
+  };
+  const refresh = ({ allowBootstrap = true } = {}) => {
+    if (closed) return Promise.resolve({ ok: false, reason: "closed" });
+    if (pending) return pending;
+    pending = (async () => {
+      const completed = await flushCompletions();
+      if (!completed.ok) { failure = completed; return completed; }
+      const selectedHost = resolveHost();
+      const wantedRevision = selectedHost ? credentialConfigurationRevision(selectedHost, env) : null;
+      const resolved = resolvedCredential?.value?.configurationRevision === wantedRevision
+        ? resolvedCredential : await resolveEffectiveCredential({ host: selectedHost, env, runLocalToken });
+      if (resolved.ok) resolvedCredential = resolved;
+      if (closed) return { ok: false, reason: "closed" };
+      if (!resolved.ok) { current = null; failure = resolved; return resolved; }
+      revision = resolved.value.configurationRevision;
+      const { credentialKey } = resolved.value;
+      const stored = withIdentityRegistry(root, (state) => {
+        const migration = inspectLegacyMigration(root, state, now());
+        if (!migration.ok) return migration;
+        const identity = state.identities[credentialKey];
+        return { ok: true, value: identity ? { ...identity, credentialKey } : null };
+      }, { now: now(), kill });
+      // A retryable lock failure says nothing about the identity, and nulling
+      // `current` for one makes ensureScope retire the lease and blank every
+      // tab -- discarding the ETags that make the next round cheap.
+      if (!stored.ok) { if (!retryableCoordination(stored.reason)) current = null; failure = stored; return stored; }
+      if (stored.value) { current = stored.value; failure = null; return { ok: true, value: current }; }
+      if (!allowBootstrap) {
+        failure = { ok: false, reason: "identity-unavailable" };
+        return failure;
+      }
+      const claim = claimIdentityBootstrap(root, { credentialKey, host: selectedHost, now: now(), kill });
+      if (!claim.ok) { if (!retryableCoordination(claim.reason)) current = null; failure = claim; return claim; }
+      const proofRevision = resolved.value.configurationRevision;
+      // Check after claim lock waits as well as inside deferred completion:
+      // either wait can outlive the host/configuration that selected this token.
+      const isCurrent = () => !closed && resolveHost() === selectedHost && credentialConfigurationRevision(selectedHost, env) === proofRevision;
+      let response = null;
+      try {
+        if (isCurrent()) response = await (requestIdentity ?? (async (requestHost, { signal }) => {
+          let stdout;
+          try {
+            ({ stdout } = await execFileAsync("gh", ["api", "-i", "user", "--hostname", requestHost], {
+              env: { ...env, ...GH_ENV_OVERRIDES }, timeout: GH_TIMEOUT_MS, maxBuffer: GH_MAX_BUFFER, killSignal: "SIGKILL", signal,
+            }));
+          } catch (error) { stdout = error.stdout ?? ""; }
+          const parsed = parseGhApiResponse(stdout);
+          let body = null;
+          try { body = JSON.parse(parsed.body); } catch { /* selected error evidence is still useful */ }
+          return { status: parsed.status, body, rateLimit: pickRateLimit(parsed.headers), etag: parsed.headers.etag ?? null,
+            retryAfter: parsed.headers["retry-after"] ?? null, secondary: SECONDARY_LIMIT_PATTERN.test(String(body?.message ?? "")) };
+        }))(selectedHost, { signal: bootstrapAbort.signal });
+      } catch { /* raw authentication errors never leave the credential seam */ }
+      const finish = () => finishIdentityBootstrap(root, { credentialKey, ...claim.value, response, now: now(), isCurrent });
+      const settled = await retryIdentityCompletion(finish, { shouldRetry: () => !closed });
+      if (!settled.ok && ["busy", "unwritable"].includes(settled.reason)) deferCompletion(`bootstrap:${claim.value.id}`, finish);
+      if (!isCurrent()) { current = null; return { ok: false, reason: "stale" }; }
+      current = settled.ok ? settled.value : null;
+      failure = settled.ok ? null : settled;
+      return settled;
+    })().finally(() => { pending = null; });
+    return pending;
+  };
+  return { root, current: snapshot, refresh, deferCompletion, flushCompletions, inspect: () => failure, isClosed: () => closed, close: () => { closed = true; current = null; bootstrapAbort.abort(); } };
+}
+
+async function retryIdentityCompletion(operation, { timeoutMs = GH_TIMEOUT_MS, shouldRetry = () => true } = {}) {
+  const deadline = performance.now() + timeoutMs;
+  for (;;) {
+    const result = operation();
+    if (result.ok || !retryableCoordination(result.reason) || !shouldRetry() || performance.now() >= deadline) return result;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Shutdown retains the unresolved receipt; do not keep the CLI alive to
+    // retry a lock owned by another live process. Account switches still retry.
+    if (!shouldRetry()) return result;
+  }
+}
+
+function startIdentityControl(coordinator, now = Date.now()) {
+  const identity = coordinator.current();
+  if (!identity) return { ok: false, reason: "identity-unavailable" };
+  return withIdentityRegistry(coordinator.root, (registry) => {
+    const scope = { ...createQuotaScope(identity, { root: coordinator.root, now: () => now }), rootLocked: true };
+    return withGovernorLock(scope, () => {
+      const loaded = readIdentityQuotaState(registry, scope, now);
+      if (!loaded.ok) return loaded;
+      const state = loaded.value;
+      const budget = state.budgets.core;
+      const exceptional = !budget || now >= budget.resetMs + BUDGET_RESET_GRACE_MS;
+      if (budget && now >= budget.resetMs && !exceptional) return { ok: false, reason: "identity-backoff", retryAt: budget.resetMs + BUDGET_RESET_GRACE_MS };
+      if (!exceptional) {
+        const reserved = Object.values(state.reservations).reduce((sum, reservation) => sum + reservationCost(reservation, "core", state.leases, now), 0);
+        if (budget.remaining - resourceReserve(budget.limit) - reserved < 1) return { ok: false, reason: "identity-backoff", retryAt: budget.resetMs + BUDGET_RESET_GRACE_MS };
+      }
+      const recent = Object.values(registry.attempts).filter((attempt) => attempt.credentialKey === identity.credentialKey && attempt.resource === "core" && attempt.exceptional && attempt.startedAt > now - IDENTITY_ATTEMPT_WINDOW_MS);
+      const retryAt = Math.max(0, ...recent.map((attempt) => attempt.retryAt), recent.length >= IDENTITY_ATTEMPT_LIMIT ? Math.min(...recent.map((attempt) => attempt.startedAt)) + IDENTITY_ATTEMPT_WINDOW_MS : 0);
+      if (exceptional && retryAt > now) return { ok: false, reason: "identity-backoff", retryAt };
+      if (Object.keys(registry.attempts).length >= IDENTITY_MAX_ATTEMPTS || Object.keys(state.reservations).length >= GOVERNOR_MAX_RESERVATIONS) return { ok: false, reason: "identity-capacity" };
+      const id = governorId();
+      registry.attempts[id] = { credentialKey: identity.credentialKey, host: identity.host, resource: "core", startedAt: now,
+        retryAt: exceptional ? now + attemptRetryDelayMs(recent.length) : now, ownerPid: process.pid, nonce: governorId(), status: "started",
+        quotaKey: identity.quotaKey, resetMs: budget?.resetMs ?? null, accounted: false, imported: true, exceptional };
+      state.reservations[`reservation:${id}`] = { leaseId: id, intentId: id, costs: { core: 1, graphql: 0 }, actualCosts: null,
+        accountedCosts: { core: 0, graphql: 0 }, notBefore: now, status: "started", epochs: { core: budget?.epoch ?? null, graphql: null },
+        startedAt: now, completedAt: null, outcome: null };
+      const written = writeGovernorState(scope.path, state);
+      return written.ok ? { ok: true, value: { id, identity } } : written;
+    });
+  }, { now });
+}
+
+function settleIdentityControl(coordinator, control, stdout, now = Date.now()) {
+  return withIdentityRegistry(coordinator.root, (registry) => {
+    const attempt = registry.attempts[control.id];
+    if (!attempt) return { ok: false, reason: "stale" };
+    const parsed = parseGhApiResponse(stdout ?? "");
+    const evidence = pickRateLimit(parsed.headers);
+    const proven = [200, 304].includes(parsed.status) && evidence?.resource === "core";
+    attempt.status = proven ? "finished" : "uncertain";
+    attempt.accounted = proven;
+    if (evidence?.resource === "core") {
+      attempt.resetMs = evidence.resetMs;
+      if (evidence.remaining === 0) attempt.retryAt = Math.max(attempt.retryAt, evidence.resetMs + BUDGET_RESET_GRACE_MS);
+    }
+    const scope = { ...createQuotaScope(control.identity, { root: coordinator.root, now: () => now }), rootLocked: true };
+    return withGovernorLock(scope, () => {
+      const loaded = readIdentityQuotaState(registry, scope, now);
+      if (!loaded.ok) return loaded;
+      const reservation = loaded.value.reservations[`reservation:${control.id}`];
+      if (!reservation) return { ok: false, reason: "stale" };
+      if (proven) {
+        const cost = parsed.status === 304 ? 0 : 1;
+        reservation.status = "completed";
+        reservation.completedAt = now;
+        reservation.outcome = "measured-success";
+        reservation.actualCosts = { core: cost, graphql: 0 };
+        reservation.accountedCosts = { core: cost, graphql: 0 };
+      }
+      return writeGovernorState(scope.path, loaded.value);
+    });
+  }, { now });
+}
+
+async function acquireIdentityHttpPermit(coordinator, { signal, now = Date.now } = {}) {
+  const flushed = await coordinator.flushCompletions?.();
+  if (flushed && !flushed.ok) throw new Error(identityCoordinationMessage(flushed.reason));
+  const identity = coordinator.current();
+  if (!identity) throw new Error("Verified identity unavailable");
+  const queuedAt = now();
+  const deadline = queuedAt + GH_TIMEOUT_MS;
+  const nonce = governorId();
+  let acquired = false;
+  try {
+    for (;;) {
+      if (signal?.aborted) throw new Error("Request cancelled");
+      if (coordinator.current()?.accessKey !== identity.accessKey) throw new Error("Credential changed before request start");
+      if (now() >= deadline) throw new Error(identityCoordinationMessage("transport-busy"));
+      const result = withIdentityRegistry(coordinator.root, (state) => {
+        const migration = inspectLegacyMigration(coordinator.root, state, now());
+        if (!migration.ok) return migration;
+        if (now() >= deadline) return { ok: false, reason: "transport-busy", retryAt: deadline };
+        const transport = state.hosts[identity.host] ??= { lastStartedAt: 0, cooldownUntil: 0, permit: null, waiters: [] };
+        if (transport.permit && staleHttpPermit(transport.permit, now())) transport.permit = null;
+        // Admission can happen during the mandatory start gap. Persist call
+        // order once so later polling cannot overtake an earlier caller.
+        if (!transport.waiters.some((waiter) => waiter.nonce === nonce)) {
+          if (transport.waiters.length >= HTTP_MAX_WAITERS) return { ok: false, reason: "identity-capacity" };
+          transport.waiters.push({ pid: process.pid, nonce, queuedAt, deadline });
+        }
+        const retryAt = Math.max(transport.cooldownUntil, transport.lastStartedAt + HTTP_START_GAP_MS);
+        if (transport.permit || transport.waiters[0].nonce !== nonce || retryAt > now()) {
+          return { ok: false, reason: "transport-busy", retryAt: Math.max(retryAt, now() + 50) };
+        }
+        transport.waiters.shift();
+        transport.permit = { pid: process.pid, nonce, startedAt: now() };
+        transport.lastStartedAt = now();
+        return { ok: true, value: { nonce, host: identity.host } };
+      }, { now: now() });
+      if (result.ok) { acquired = true; return result.value; }
+      // A contended registry lock is the same class of wait as a held permit:
+      // both mean "not yet", not "no identity". Only transport-busy carries a
+      // retryAt, so give the rest the poll interval the loop already uses.
+      const retryAt = result.retryAt ?? now() + 50;
+      if ((result.reason !== "transport-busy" && !retryableCoordination(result.reason)) ||
+          now() >= deadline || retryAt >= deadline) throw new Error(identityCoordinationMessage(result.reason));
+      await new Promise((resolve) => setTimeout(resolve, Math.max(1, Math.min(50, retryAt - now()))));
+    }
+  } finally {
+    if (!acquired) {
+      const cleanup = () => withIdentityRegistry(coordinator.root, (state) => {
+        const transport = state.hosts[identity.host];
+        if (transport) transport.waiters = transport.waiters.filter((waiter) => waiter.nonce !== nonce);
+        return { ok: true };
+      }, { now: now() });
+      const cleaned = cleanup();
+      if (!cleaned.ok) coordinator.deferCompletion?.(`waiter:${nonce}`, cleanup);
+    }
+  }
+}
+
+// One cooldown law, two call sites: the bootstrap observer reads its evidence
+// from a parsed response, the permit release from a failed subprocess's captured
+// output. They had already drifted into two implementations with two different
+// secondary-limit detectors -- which is how a tuning applied to one quietly
+// stops applying to the other.
+const SECONDARY_LIMIT_PATTERN = /secondary rate|abuse/i;
+
+function transportCooldownDeadline({ retryAfter, status, secondary, at }) {
+  const deadline = typeof retryAfter === "string" && /^\d+(?:\.\d+)?$/.test(retryAfter)
+    ? at + Number(retryAfter) * 1000
+    : Date.parse(retryAfter ?? "");
+  if (Number.isFinite(deadline)) return deadline;
+  return status === 429 || secondary === true ? at + 60_000 : null;
+}
+
+function applyTransportCooldown(transport, evidence) {
+  const deadline = transportCooldownDeadline(evidence);
+  if (deadline !== null) transport.cooldownUntil = Math.max(transport.cooldownUntil, deadline);
+}
+
+function releaseIdentityHttpPermit(coordinator, permit, error = null) {
+  return withIdentityRegistry(coordinator.root, (state) => {
+    const transport = state.hosts[permit.host];
+    if (transport?.permit?.nonce === permit.nonce) transport.permit = null;
+    if (transport && error) {
+      const response = parseGhApiResponse(error.stdout ?? "");
+      applyTransportCooldown(transport, {
+        retryAfter: response.headers["retry-after"],
+        status: response.status,
+        secondary: SECONDARY_LIMIT_PATTERN.test(String(error.stderr ?? "")),
+        at: Date.now(),
+      });
+    }
+    return { ok: true };
+  });
+}
+
+function identityCoordinationMessage(reason) {
+  if (reason === "restart-required") return "Restart required: close older gh-glance panes";
+  if (["migration-hold", "legacy-unresolved"].includes(reason)) return "Upgrade waiting for legacy quota reset";
+  if (["legacy-corrupt", "corrupt"].includes(reason)) return "Coordination state unavailable; evidence preserved";
+  if (reason === "transport-busy") return "Shared HTTP request or cooldown in progress";
+  if (retryableCoordination(reason)) return "Coordinating with your other panes";
+  if (reason === "identity-capacity") return "Coordination state full; retrying after the current window";
+  return "Verified identity unavailable; waiting to retry";
+}
+
 // ---------- Shared account governor ----------
 
 // The scope version is deliberately stable. Stored protocol revisions must use
@@ -1965,7 +2710,8 @@ function currentGovernorScope(scope) {
   } catch {
     return { ok: false, reason: "stale" };
   }
-  const hash = governorScopeHash(current?.effectiveHost, current?.authIdentity);
+  const hash = scope.quotaKey ? current?.quotaKey : governorScopeHash(current?.effectiveHost, current?.authIdentity);
+  if (scope.quotaKey && current?.accessKey !== scope.accessKey) return { ok: false, reason: "stale" };
   return hash === scope.hash ? { ok: true, value: scope } : { ok: false, reason: "stale" };
 }
 
@@ -2410,6 +3156,16 @@ function withGovernorLock(scope, operation, {
   kill = scope?.kill ?? process.kill.bind(process),
   observeArtifact = null,
 } = {}) {
+  if (scope?.coordinationRoot && !scope.rootLocked) {
+    return withIdentityRegistry(scope.coordinationRoot, (registry, at) => {
+      const migration = inspectLegacyMigration(scope.coordinationRoot, registry, at);
+      if (!migration.ok) return migration;
+      if (registry.identities[scope.credentialKey]) {
+        try { statSync(scope.path); } catch { return { ok: false, reason: "corrupt" }; }
+      }
+      return withGovernorLock({ ...scope, rootLocked: true }, operation, { pid, nonce, waitMs, kill, observeArtifact });
+    }, { now: scopeNow(scope), kill });
+  }
   const current = currentGovernorScope(scope);
   if (!current.ok) return current;
   const lockPath = `${scope.path}.lock`;
@@ -2970,16 +3726,23 @@ function registerIntent(scope, intent) {
   });
 }
 
-function readIntentDecision(scope, intentId, nowMs) {
+function readIntentDecision(scope, intentId, nowMs, previousEvidence = null) {
   return mutateGovernor(scope, nowMs, (state, at) => {
     const scheduled = scheduleGovernorState(state, at);
     const reservationId = `reservation:${intentId}`;
     const reservation = state.reservations[reservationId];
     const grant = scheduled.grants.find((item) => item.id === reservationId);
+    // UI provenance stays process-local. Reuse it only for this same pending
+    // intent while its original owners and pane count remain valid.
+    const retainedSharing = previousEvidence?.intentId === intentId &&
+      reservation?.status === "scheduled" && reservation.notBefore > at &&
+      currentSharedLaneProvenance(previousEvidence, state.leases, at).waitCause
+      ? sharedLaneEvidence(previousEvidence) : {};
     if (reservation) return { value: {
       status: reservation.status,
       reservationId,
       ...reservation,
+      ...retainedSharing,
       ...sharedLaneEvidence(grant),
     } };
     if (!state.intents[intentId]) return { ok: false, reason: "stale" };
@@ -3311,7 +4074,7 @@ async function refreshSharedBudget(scope, leaseId, signal, {
   }
   let budgets;
   try {
-    budgets = await readBudgets(signal, scope.host, {
+    budgets = await requestIdentityStorage.run(scope, () => readBudgets(signal, scope.host, {
       resources,
       coreEtag,
       renewClaim: async () => {
@@ -3328,7 +4091,7 @@ async function refreshSharedBudget(scope, leaseId, signal, {
         if (extended.ok) renewed.value.leaseUntil = extended.value.leaseUntil;
         return extended.ok;
       },
-    });
+    }));
   } catch {
     budgets = null;
   }
@@ -3417,8 +4180,13 @@ function mergeAlertRows(groups) {
 // mid-session is picked up within the hour.
 const alertBackoff = new Map();
 
+function backoffStorageKey(key) {
+  const access = requestIdentityStorage.getStore()?.accessKey ?? runtimeIdentityCoordinator?.current()?.accessKey;
+  return access ? `${access}\0${key}` : key;
+}
+
 function backoffActive(key, now) {
-  const state = alertBackoff.get(key);
+  const state = alertBackoff.get(backoffStorageKey(key));
   return Boolean(state) && now < state.until;
 }
 
@@ -3434,13 +4202,13 @@ const FAILURE_LADDER = {
 // which is the drift the ALERT_SOURCES comment below warns about: two copies of
 // this would diverge the first time one of them was fixed.
 function recordFailure(key, now, steps = BACKOFF_STEPS_MS) {
-  const previous = alertBackoff.get(key);
+  const previous = alertBackoff.get(backoffStorageKey(key));
   const step = Math.min((previous?.step ?? -1) + 1, steps.length - 1);
-  alertBackoff.set(key, { step, until: now + steps[step] });
+  alertBackoff.set(backoffStorageKey(key), { step, until: now + steps[step] });
 }
 
 function clearBackoff(key) {
-  alertBackoff.delete(key);
+  alertBackoff.delete(backoffStorageKey(key));
 }
 
 function forcedBackoffKeys(key) {
@@ -3462,7 +4230,7 @@ async function fetchAlertSource(source, signal, now, {
   request = fetchConditionalEntity,
 } = {}) {
   if (backoffActive(source.key, now)) {
-    const { note, verdict } = alertBackoff.get(source.key);
+    const { note, verdict } = alertBackoff.get(backoffStorageKey(source.key));
     // The verdict is replayed alongside the note. Replaying only the note left
     // the tab unable to tell "Dependabot is switched off here" from "we cannot
     // see Dependabot" for the whole length of a backoff window.
@@ -3557,7 +4325,7 @@ async function fetchAlertSource(source, signal, now, {
     const steps = pick(FAILURE_LADDER, verdict, null);
     if (steps) {
       recordFailure(source.key, now, steps);
-      Object.assign(alertBackoff.get(source.key), { note, verdict });
+      Object.assign(alertBackoff.get(backoffStorageKey(source.key)), { note, verdict });
     }
     return {
       raw: `unavailable:${note}`,
@@ -4128,18 +4896,23 @@ async function runDoctor() {
 
   // Free checks run first. The display rate_limit read is report data only;
   // admission re-reads its GraphQL source after owning the shared claim.
-  const [ghVersion, authStatus, remote, remoteUrls] = await Promise.all([
+  const [ghVersion, remote, remoteUrls] = await Promise.all([
     captureGh(["--version"], "version"),
-    captureGh(["auth", "status"], "auth-status"),
     gitRemote(),
     gitRemoteUrls(),
   ]);
   const effectiveHost = effectiveRuntimeHost({ remoteUrls });
-  const resources = await readRateLimitResources(undefined, effectiveHost).catch(() => null);
+  runtimeIdentityCoordinator = createIdentityCoordinator({ host: effectiveHost });
+  const verified = await runtimeIdentityCoordinator.refresh();
+  const verifiedIdentity = runtimeIdentityCoordinator.current();
+  const authStatus = verifiedIdentity ? `${verifiedIdentity.host}: ${verifiedIdentity.login} (verified)` : identityCoordinationMessage(verified.reason);
+  const resources = verifiedIdentity ? await readRateLimitResources(undefined, effectiveHost).catch(() => null) : null;
   const budget = resources
     ? await rateBudget(resources)
     : { core: "unavailable", graphql: "unavailable" };
-  const scopeResult = createGovernorScope({ effectiveHost });
+  const scopeResult = verifiedIdentity
+    ? { ok: true, value: createQuotaScope(verifiedIdentity, { root: runtimeIdentityCoordinator.root, identityProvider: runtimeIdentityCoordinator.current }) }
+    : verified;
   let governorResult = scopeResult;
   let results = [];
   if (scopeResult.ok) {
@@ -4169,8 +4942,8 @@ async function runDoctor() {
       results = admittedProbes.map((item) => item.skipped ?? null);
       const runnable = admittedProbes.filter((item) => !item.skipped);
       const settled = await mapAllSettledBounded(runnable, 4, async (item) => {
-        const result = await probe(item.name, item.args, item.operation);
-        completeReservation(scope, item.reservationId, result.failed
+        const result = await requestIdentityStorage.run(scope, () => probe(item.name, item.args, item.operation));
+        completeReservation({ ...scope, identityProvider: null }, item.reservationId, result.failed
           ? { outcome: "rejected" }
           : { outcome: "measured-success", actualCost: operationCost(item.operation) }, Date.now());
         return result;
@@ -4626,6 +5399,21 @@ if (IS_MAIN) {
     console.error(problem);
     process.exit(3);
   }
+  runtimeRemoteUrls = await gitRemoteUrls();
+  runtimeIdentityCoordinator = createIdentityCoordinator({ host: () => effectiveRuntimeHost() });
+  // Resolve warm identity/cache locally; cold proof belongs to the mounted UI
+  // so quit/signal handling remains available while GitHub is slow.
+  //
+  // Bounded, because the warm path still spawns `gh auth token`: a prompting
+  // credential helper, a keyring daemon that is not up yet in a fresh login
+  // session, or a cold binary on a network filesystem would otherwise hold the
+  // first frame for the full subprocess timeout with nothing on screen at all.
+  // Past the bound the same refresh is picked up by the mounted UI, and
+  // ensureScope corrects the cache target and hydrates from it.
+  await Promise.race([
+    runtimeIdentityCoordinator.refresh({ allowBootstrap: false }),
+    new Promise((resolve) => { setTimeout(resolve, WARM_IDENTITY_WAIT_MS).unref(); }),
+  ]);
 }
 
 const ReactModule = await import("react");
@@ -6439,10 +7227,27 @@ function rateLimitBlockDecision(results, resetMs) {
   };
 }
 
+// Identity reasons that name a condition the user can act on or wait out. The
+// list previously stopped short of identity-unavailable -- the ordinary "not
+// signed in" or "proof denied" case, and precisely the one this phase requires
+// to read as an honest unavailable state rather than a generic retry -- and of
+// identity-capacity and transport-busy.
+//
+// Purely internal reasons (corrupt, unwritable, unknown-host, closed) stay on
+// the generic message on purpose: this surface must not leak internal
+// vocabulary, which is the contract "coordination notices translate raw reasons
+// without exposing internal vocabulary" in test/unit.test.mjs pins.
+const IDENTITY_COORDINATION_REASONS = [
+  "restart-required", "migration-hold", "legacy-unresolved", "legacy-corrupt",
+  "credential-unavailable", "identity-backoff", "identity-busy",
+  "identity-unavailable", "identity-capacity", "transport-busy",
+];
+
 function coordinationNotice(reason) {
   if (reason === "unknown-scope") return "Confirming your GitHub login…";
   if (reason === "block-unpublished") return "Holding until the rate-limit block is shared";
   if (reason === "busy" || reason === "stale") return "Coordinating with your other panes";
+  if (IDENTITY_COORDINATION_REASONS.includes(reason)) return identityCoordinationMessage(reason);
   return "Can't coordinate API use — retrying";
 }
 
@@ -6523,16 +7328,18 @@ async function runAdmittedOperation({ scope, leaseId, operation, priority = "man
     return { ok: false, skipped: true, decision: admitted, error: new Error(`API budget paused${detail}`) };
   }
   const reservationId = admitted.value.reservationId;
+  const settlementScope = { ...scope, identityProvider: null };
   try {
-    const value = await run(signal);
+    const value = await requestIdentityStorage.run(scope, () => run(signal));
     const costs = operationCost(operation);
-    completeReservation(scope, reservationId, {
+    completeReservation(settlementScope, reservationId, {
       outcome: "measured-success",
       actualCost: costs,
     }, Date.now());
+    if (scope.accessKey && scope.accessKey !== runtimeIdentityCoordinator?.current()?.accessKey) return { ok: false, error: new Error("Credential changed"), reservationId };
     return { ok: true, value, reservationId };
   } catch (error) {
-    completeReservation(scope, reservationId, { outcome: governorOutcomeForError(error) }, Date.now());
+    completeReservation(settlementScope, reservationId, { outcome: governorOutcomeForError(error) }, Date.now());
     return { ok: false, error, reservationId };
   }
 }
@@ -7183,8 +7990,9 @@ function App({ onCreateRemote = () => {} } = {}) {
     dashboardCacheTarget({
       repo: runtime.repo,
       ghRepo: process.env.GH_REPO,
-      host: runtime.host ?? process.env.GH_HOST,
+      host: runtimeIdentityCoordinator?.current()?.host ?? effectiveRuntimeHost(),
       cwd: process.cwd(),
+      account: runtimeIdentityCoordinator?.current()?.accessKey ?? "unverified",
     }),
   );
   const [loadedCache] = useState(() => loadDashboardCache(cachePath, cacheTarget));
@@ -7885,6 +8693,9 @@ function App({ onCreateRemote = () => {} } = {}) {
       // refresh the tab you just landed on without waiting on an unrelated
       // background fetch -- and so a slow repo can't stack refreshes.
       if (inFlightRef.current[key]) return Promise.resolve();
+      const settlement = createSettlementContext(scope, runtimeIdentityCoordinator);
+      const settlementScope = settlement.scope;
+      const currentAccess = settlement.isCurrent;
       inFlightRef.current[key] = true;
       if (force) manualInFlight.add(key);
       admittedCadenceRef.current[key] = nextAdmittedCadence(
@@ -7910,9 +8721,9 @@ function App({ onCreateRemote = () => {} } = {}) {
           [key]: { automaticStatusVisible },
         }));
       }
-      return run()
+      return requestIdentityStorage.run(scope, run)
         .then((result) => {
-          settleReservationWithBudgetObservations(scope, leaseId, reservationId, result?.measuredSuccess === false
+          settleReservationWithBudgetObservations(settlementScope, leaseId, reservationId, result?.measuredSuccess === false
             ? { outcome: "rejected", observations: result?.observations ?? [] }
             : {
                 outcome: "measured-success",
@@ -7922,6 +8733,7 @@ function App({ onCreateRemote = () => {} } = {}) {
                 },
                 observations: result?.observations ?? [],
               }, Date.now());
+          if (!currentAccess()) return;
           if (result?.rateLimited) {
             const blockAt = Date.now();
             const budget = inspectGovernor(scope, blockAt).value?.budgets?.core;
@@ -8038,11 +8850,11 @@ function App({ onCreateRemote = () => {} } = {}) {
           });
         })
         .catch((err) => {
-          settleReservationWithBudgetObservations(scope, leaseId, reservationId, {
+          settleReservationWithBudgetObservations(settlementScope, leaseId, reservationId, {
             outcome: governorOutcomeForError(err),
             observations: err?.budgetObservations ?? [],
           }, Date.now());
-          if (cancelled || err?.name === "AbortError") return;
+          if (cancelled || !currentAccess() || err?.name === "AbortError") return;
           // Preserve both the verdict and the bounded raw error in state. The
           // renderer translates recognized verdicts at draw time, which lets a
           // later repository/account context refine the one-line remedy without
@@ -8076,6 +8888,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         })
         .finally(() => {
           inFlightRef.current[key] = false;
+          if (!currentAccess() && !Object.values(inFlightRef.current).some(Boolean) && runtimeIdentityCoordinator?.current()?.quotaKey !== settlementScope.quotaKey) releaseLease(settlementScope, leaseId);
           manualInFlight.delete(key);
           onSettled?.();
           if (!cancelled) {
@@ -8109,6 +8922,10 @@ function App({ onCreateRemote = () => {} } = {}) {
     let scope = null;
     let cleanupScope = null;
     let registeredScopeHash = null;
+    // The access partition the retained rows belong to, kept across a window
+    // where the identity is momentarily unknown so that an account which comes
+    // back *different* still clears them. Null means nothing is retained.
+    let retainedAccessKey = null;
     let remoteUrls = [];
     let liveScheduling = false;
     let controlEpochs = null;
@@ -8178,14 +8995,34 @@ function App({ onCreateRemote = () => {} } = {}) {
     }
 
     function identity() {
-      return {
-        effectiveHost: effectiveRuntimeHost({ remoteUrls }),
-        authIdentity: authCacheIdentity(),
-      };
+      return runtimeIdentityCoordinator?.current() ?? null;
     }
 
-    function resetVisibleScope(nowMs, { immediate = false } = {}) {
+    function retireCurrentScope() {
+      if (!cleanupScope || !registeredScopeHash) return;
+      for (const item of pending.values()) cancelIntent(cleanupScope, item.intentId, Date.now());
+      if (!Object.values(inFlightRef.current).some(Boolean)) releaseLease(cleanupScope, leaseId);
+    }
+
+    // discardData separates the two reasons this runs. An account *change* must
+    // drop every row, validator and note, because they belong to an access
+    // partition this pane no longer holds. An identity that is merely unknown
+    // for a moment must not: the rows are still ours, and throwing away the
+    // ETags with them makes the recovery round cost full price.
+    function resetVisibleScope(nowMs, { immediate = false, discardData = true } = {}) {
       pending.clear();
+      coordinator.invalidate();
+      setFailureContext(null);
+      if (discardData) {
+        rawRef.current = {};
+        entityRef.current.clear();
+        lastOkRef.current = {};
+        setData(Object.fromEntries(TAB_KEYS.map((key) => [key, null])));
+        setMeta({});
+        setSecurityNotes([]);
+        setSecurityBlind(false);
+        retainedAccessKey = null;
+      }
       pendingBlockPublications.clear();
       liveScheduling = false;
       activePollAt = Number.POSITIVE_INFINITY;
@@ -8204,20 +9041,26 @@ function App({ onCreateRemote = () => {} } = {}) {
 
     function ensureScope(nowMs = Date.now(), { maintain = false } = {}) {
       const current = identity();
-      const nextHash = governorScopeHash(current.effectiveHost, current.authIdentity);
+      const nextHash = current?.quotaKey;
       if (!nextHash) {
         if (scope !== null) {
-          if (cleanupScope && registeredScopeHash) releaseLease(cleanupScope, leaseId);
+          retireCurrentScope();
           registeredScopeHash = null;
           if (governorRef.current?.leaseId === leaseId) governorRef.current = null;
           scope = null;
           cleanupScope = null;
-          resetVisibleScope(nowMs);
+          // Unknown is not the same as changed. A contended registry lock, a
+          // `gh` write that only touched an unrelated host's entry, or a
+          // re-resolution still in flight all arrive here, and none of them says
+          // the rows on screen stopped being ours. Stop scheduling and let them
+          // age visibly; retainedAccessKey is what still clears them if the
+          // account turns out to have actually changed.
+          resetVisibleScope(nowMs, { discardData: false });
         }
         return null;
       }
-      const migrating = scope !== null && scope.hash !== nextHash;
-      if (scope?.hash === nextHash && registeredScopeHash === nextHash) {
+      const migrating = scope !== null && (scope.hash !== nextHash || scope.accessKey !== current.accessKey);
+      if (scope?.hash === nextHash && scope.accessKey === current.accessKey && registeredScopeHash === nextHash) {
         if (!maintain) return scope;
         const activeTab = TABS[activeIndexRef.current].key;
         const kept = maintainControlLease(scope, leaseId, runtime.refreshMs, activeTab, nowMs);
@@ -8226,20 +9069,40 @@ function App({ onCreateRemote = () => {} } = {}) {
         if (governorRef.current?.leaseId === leaseId) governorRef.current = null;
         return null;
       }
-      if (scope?.hash !== nextHash) {
-        if (cleanupScope && registeredScopeHash) releaseLease(cleanupScope, leaseId);
+      if (scope?.hash !== nextHash || scope.accessKey !== current.accessKey) {
+        retireCurrentScope();
         registeredScopeHash = null;
-        if (migrating) {
+        // The second test covers the identity returning after a window where it
+        // was unknown: scope is null by then, so `migrating` cannot see the
+        // change, and retained rows from the previous access partition would
+        // otherwise survive into an account that must not be able to read them.
+        if (migrating || (scope === null && retainedAccessKey !== null && retainedAccessKey !== current.accessKey)) {
           // The failed publication belonged to the old account scope. Releasing
           // that lease guarantees this process will start no more work there;
           // the new scope must establish its own authoritative budget instead
           // of inheriting an unrelated account's local hold.
           resetVisibleScope(nowMs, { immediate: true });
         }
-        const created = createGovernorScope({ ...current, identityProvider: identity });
-        if (!created.ok) return null;
-        scope = created.value;
+        scope = createQuotaScope(current, { root: runtimeIdentityCoordinator.root, identityProvider: identity });
         cleanupScope = { ...scope, identityProvider: null };
+        const nextTarget = dashboardCacheTarget({ repo: runtime.repo, ghRepo: process.env.GH_REPO, host: current.host, account: current.accessKey });
+        // The mount-time target had to guess the account, and guesses
+        // "unverified" whenever the bounded warm resolution above did not land
+        // in time -- so a session that has rows on disk can start with none.
+        // Now that the partition is proven, take them. Guarded on having
+        // published nothing yet, so this can never overwrite live rows.
+        if (nextTarget !== dashboardCacheTargetRef.current && retainedAccessKey === null &&
+            Object.values(dataRef.current).every((rows) => rows === null)) {
+          const warm = pick(dashboardCacheRef.current, nextTarget, null);
+          if (warm) {
+            setData(Object.fromEntries(TABS.map((candidate) => [candidate.key, warm.tabs[candidate.key]?.data ?? null])));
+            setMeta(Object.fromEntries(TABS.map((candidate) => [candidate.key, warm.tabs[candidate.key]?.meta ?? null])));
+            setSecurityNotes(warm.securityNotes ?? []);
+            setSecurityBlind(warm.securityBlind ?? false);
+          }
+        }
+        retainedAccessKey = current.accessKey;
+        dashboardCacheTargetRef.current = nextTarget;
       }
       const activeTab = TABS[activeIndexRef.current].key;
       const registered = registerLease(scope, {
@@ -8455,13 +9318,14 @@ function App({ onCreateRemote = () => {} } = {}) {
         if (inFlightRef.current[key]) continue;
         const currentScope = ensureScope(nowMs);
         if (!currentScope) continue;
-        const decision = readIntentDecision(currentScope, item.intentId, nowMs);
+        const decision = readIntentDecision(currentScope, item.intentId, nowMs, item);
         if (!decision.ok) {
           pauseCoordination(key, decision.reason);
           if (pendingFailureIsTerminal(decision.reason)) pending.delete(key);
           else armWake("data", governorControlRetryAt(nowMs, runtime.refreshMs), dataWake);
           continue;
         }
+        Object.assign(item, sharedLaneEvidence(decision.value));
         if (decision.value.status !== "scheduled" || decision.value.notBefore > nowMs) {
           item.wasDeferred = true;
           setTabGovernorDecision(key, visibleGovernorDecision({
@@ -8586,6 +9450,8 @@ function App({ onCreateRemote = () => {} } = {}) {
 
     async function controlWake() {
       if (cancelled) return;
+      await runtimeIdentityCoordinator.refresh();
+      if (cancelled) return;
       const nowMs = Date.now();
       const currentScope = ensureScope(nowMs, { maintain: true });
       if (currentScope && pendingBlockPublications.size > 0) {
@@ -8599,7 +9465,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       }
       const refreshed = currentScope
         ? await refreshSharedBudget(currentScope, leaseId, controller.signal)
-        : { ok: false, reason: "stale" };
+        : { ok: false, reason: runtimeIdentityCoordinator?.inspect()?.reason ?? "stale" };
       if (cancelled) return;
       const checkedAt = Date.now();
       const snapshot = currentScope ? inspectGovernor(currentScope, checkedAt) : refreshed;
@@ -8645,12 +9511,13 @@ function App({ onCreateRemote = () => {} } = {}) {
     }
 
     async function bootstrap() {
-      remoteUrls = await gitRemoteUrls();
+      remoteUrls = runtimeRemoteUrls.length > 0 ? runtimeRemoteUrls : await gitRemoteUrls();
       runtimeRemoteUrls = remoteUrls;
+      await runtimeIdentityCoordinator.refresh();
       if (cancelled) return;
       const currentScope = ensureScope(Date.now());
       if (!currentScope) {
-        pauseCoordination(TABS[activeIndexRef.current].key, "unknown-scope");
+        pauseCoordination(TABS[activeIndexRef.current].key, runtimeIdentityCoordinator?.inspect()?.reason ?? "unknown-scope");
         armWake("control", governorControlRetryAt(Date.now(), runtime.refreshMs), controlWake);
         return;
       }
@@ -9342,6 +10209,10 @@ if (IS_MAIN) {
       });
   };
   app = render(e(App, { onCreateRemote: createRemote }), { incrementalRendering: true });
+  // Ink's q/Esc/Ctrl+C exit unmounts directly rather than calling unmountApp.
+  // Only close the identity coordinator after that actual application exit,
+  // not when a polling effect reruns. Rejections reach the crash handler above.
+  void app.waitUntilExit().then(abortLiveRequests);
 
   // 128 + signal number, so a supervisor or `timeout` can tell an interrupted
   // run from a clean one. These fire on external `kill` and when raw mode is
@@ -9371,6 +10242,7 @@ if (IS_MAIN) {
     const finish = () => {
       unmountApp();
       restoreScreen();
+      abortLiveRequests();
       process.exit(code);
     };
 
@@ -9396,6 +10268,19 @@ if (IS_MAIN) {
 // Exported for unit tests. The dashboard itself is still one file; these are
 // the pure functions worth pinning, and nothing here is part of the public API.
 export {
+  retryIdentityCompletion,
+  createSettlementContext,
+  startIdentityControl,
+  settleIdentityControl,
+  resolveEffectiveCredential,
+  identityRegistryRoot,
+  inspectIdentityRegistry,
+  claimIdentityBootstrap,
+  finishIdentityBootstrap,
+  createIdentityCoordinator,
+  createQuotaScope,
+  acquireIdentityHttpPermit,
+  releaseIdentityHttpPermit,
   parseArgs,
   validateArgs,
   parseRepoTarget,
@@ -9475,6 +10360,7 @@ export {
   settleReservationWithBudgetObservations,
   recordResourceBlock,
   releaseLease,
+  inspectAdmittedHttpStart,
   inspectGovernor,
   governorHealth,
   refreshSharedBudget,

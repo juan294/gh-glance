@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -20,7 +20,39 @@ async function waitFor(predicate, timeoutMs = 5_000) {
   throw new Error("timed out waiting for PTY harness evidence");
 }
 
+function validOwnedPid(pid) {
+  return Number.isSafeInteger(pid) && pid > 1 && pid !== process.pid;
+}
+
+function readPublishedPid(path) {
+  try {
+    const raw = readFileSync(path, "utf8");
+    if (!/^[1-9][0-9]*\n$/.test(raw)) return null;
+    const pid = Number(raw.trim());
+    return validOwnedPid(pid) ? pid : null;
+  } catch { return null; }
+}
+
+function ownedDescendants(rootPid) {
+  const result = spawnSync("ps", ["-axo", "pid=,ppid="], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  const rows = result.stdout.trim().split("\n").map((row) => row.trim().split(/\s+/).map(Number));
+  const owned = new Set([rootPid]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [pid, parent] of rows) {
+      if (!validOwnedPid(pid) || owned.has(pid) || !owned.has(parent)) continue;
+      owned.add(pid);
+      changed = true;
+    }
+  }
+  owned.delete(rootPid);
+  return [...owned];
+}
+
 function processIsAlive(pid) {
+  assert.ok(validOwnedPid(pid), `invalid owned PID: ${pid}`);
   try {
     process.kill(pid, 0);
     return true;
@@ -117,6 +149,7 @@ test("capture termination reaps the full stdin producer and script trees", async
   const out = join(root, "capture.txt");
   const producerPath = `${out}.producer`;
   const childPath = `${out}.producer-child`;
+  const registrationGate = join(root, "before-pid-registration");
   const harness = spawn("/bin/sh", [
     RUN,
     "60",
@@ -124,23 +157,49 @@ test("capture termination reaps the full stdin producer and script trees", async
     out,
     "none",
     "30",
-    `printf '%s' "$$" > "$GH_GLANCE_CAPTURE_OUT.producer"; ` +
-      `sleep 300 & child=$!; printf '%s' "$child" > "$GH_GLANCE_CAPTURE_OUT.producer-child"; wait "$child"`,
-  ], { stdio: "ignore" });
+    `printf '%s\n' "$$" > "$GH_GLANCE_CAPTURE_OUT.producer"; ` +
+      `sleep 300 & child=$!; printf '%s\n' "$child" > "$GH_GLANCE_CAPTURE_OUT.producer-child"; wait "$child"`,
+  ], {
+    stdio: "ignore",
+    env: {
+      PATH: process.env.PATH,
+      HOME: root,
+      XDG_CONFIG_HOME: join(root, "config"),
+      TMPDIR: tmpdir(),
+      LANG: "en_US.UTF-8",
+      TERM: "xterm-256color",
+      GH_GLANCE_CAPTURE_TEST_REGISTRATION_GATE: registrationGate,
+    },
+  });
+  const exited = new Promise((resolve) => harness.once("exit", resolve));
   const tracked = [];
   t.after(() => {
+    // Readiness can fail before tracked is populated. Capture the still-owned
+    // trees and complete PID publications before stopping their parent.
+    const cleanupPids = new Set([
+      ...tracked,
+      ...[producerPath, childPath, registrationGate].map(readPublishedPid).filter(validOwnedPid),
+    ]);
+    if (harness.exitCode === null && harness.signalCode === null) {
+      for (const pid of ownedDescendants(harness.pid)) cleanupPids.add(pid);
+    }
     try { harness.kill("SIGKILL"); } catch { /* already stopped */ }
-    for (const pid of tracked) {
+    for (const pid of cleanupPids) {
+      if (!validOwnedPid(pid)) continue;
       try { process.kill(pid, "SIGKILL"); } catch { /* already stopped */ }
     }
     rmSync(root, { recursive: true, force: true });
   });
 
-  await waitFor(() => existsSync(producerPath) && existsSync(childPath));
-  tracked.push(Number(readFileSync(producerPath, "utf8")), Number(readFileSync(childPath, "utf8")));
+  await waitFor(() => [producerPath, childPath, registrationGate].every((path) => readPublishedPid(path) !== null));
+  tracked.push(...new Set([
+    readPublishedPid(producerPath), readPublishedPid(childPath), readPublishedPid(registrationGate),
+    ...ownedDescendants(harness.pid),
+  ]));
+  assert.ok(tracked.every(validOwnedPid));
   const terminatedAt = Date.now();
   harness.kill("SIGTERM");
-  await new Promise((resolve) => harness.once("exit", resolve));
+  await exited;
   await waitFor(() => tracked.every((pid) => !processIsAlive(pid)));
   assert.ok(Date.now() - terminatedAt < 5_000, "capture cleanup must stay below five seconds");
   assert.ok(tracked.every((pid) => !processIsAlive(pid)));

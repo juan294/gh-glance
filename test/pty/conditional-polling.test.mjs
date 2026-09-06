@@ -28,8 +28,8 @@ function fixture(t, overrides = {}) {
     statePath,
     read: () => JSON.parse(readFileSync(statePath, "utf8")),
     readGovernor: () => {
-      const directory = join(root, "gh-glance");
-      const name = readdirSync(directory).find((entry) => entry.startsWith("rate-governor-v1-"));
+      const directory = join(root, "gh-glance", "coordination-v2");
+      const name = readdirSync(directory).find((entry) => /^quota-[a-f0-9]{64}\.json$/.test(entry));
       return JSON.parse(readFileSync(join(directory, name), "utf8"));
     },
   };

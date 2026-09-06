@@ -3,6 +3,17 @@
 Date: 2026-08-18
 Status: Accepted
 
+Amended 2026-09-05 by [ADR 0004](0004-quota-and-acquisition-identities.md):
+the new namespace uses verified quota principals and separate authorization
+identities. Transition requires stopping discoverable legacy panes and
+preserving old uncertain charges and holds. Legacy files remain evidence;
+corrupt or unknown schemas fail closed. Reappearing discoverable legacy leases
+pause new admission. This is a controlled restart boundary, not a mixed-version
+guarantee: an old binary launched later or using another configuration root
+cannot be forced to participate in a protocol it does not read. Descriptions
+below of the original authentication fingerprint record the initial design
+and are superseded by ADR 0004.
+
 ## Context
 
 Seven panes were observed consuming about 142 REST calls per minute. The shared

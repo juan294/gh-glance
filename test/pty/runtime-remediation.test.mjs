@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import { capture } from "./capture.mjs";
+import { AUTH_RETRY_MS, GOVERNOR_PHASE_WINDOW_MS, resourceReserve, tabRequestCost } from "../../index.mjs";
 
 const ESC = String.fromCharCode(27);
 const strip = (text) =>
@@ -64,22 +65,61 @@ const recovered = withCounterCapture("gh-glance-recover-", 1, (counter) =>
   }),
 );
 
-const forcedSecurity = withCounterCapture("gh-glance-security-force-", 1, (counter) =>
-  capture({
+// One phase plus a full six-point lane at the fixture quota, HTTP start
+// gaps, and a two-second process/render margin bound each readiness wait.
+const securityCalls = tabRequestCost("security").core;
+const securityReadyMs = Math.ceil(GOVERNOR_PHASE_WINDOW_MS +
+  securityCalls * 3_600_000 / (5000 - resourceReserve(5000)) +
+  securityCalls * 250 + 2000);
+const recoveredSecurityCache = (cache) => Object.values(cache?.targets ?? {}).some((entry) =>
+  Array.isArray(entry.tabs?.security?.data) && entry.securityBlind === false && entry.securityNotes?.length === 0);
+
+// This fixed stdin driver observes completed UI/cache evidence. It emits no
+// manual key while the initial failed batch is still running, and never waits
+// long enough for the source auth ladder to recover without that key.
+function forceSecurityAfterFailure(waitMs, recovered) {
+  const { readFileSync } = require("node:fs");
+  const waitCell = new Int32Array(new SharedArrayBuffer(4));
+  const waitFor = (predicate) => {
+    const deadline = Date.now() + waitMs;
+    while (Date.now() < deadline) {
+      try { if (predicate()) return true; } catch { /* evidence not published yet */ }
+      Atomics.wait(waitCell, 0, 0, 100);
+    }
+    return false;
+  };
+  const failed = waitFor(() => /Dependabot.*not logged/.test(readFileSync(process.env.GH_GLANCE_CAPTURE_OUT, "utf8")));
+  if (failed) {
+    process.stdout.write("r");
+    waitFor(() => recovered(JSON.parse(readFileSync(`${process.env.XDG_CONFIG_HOME}/gh-glance/dashboard-cache.json`, "utf8"))));
+    Atomics.wait(waitCell, 0, 0, 300);
+  }
+  process.stdout.write("q");
+}
+
+const forcedSecurity = withCounterCapture("gh-glance-security-force-", 1, (counter) => {
+  const configHome = dirname(counter);
+  const result = capture({
     cols: 80,
     rows: 24,
     signal: "none",
     settle: 15,
     args: "--tab security",
-    stdin: "sleep 7; printf 'r'; sleep 4; printf 'q'; sleep 2",
+    configHome,
+    stdin: `node -e '(${forceSecurityAfterFailure.toString()})(${securityReadyMs}, ${recoveredSecurityCache.toString()})'`,
     env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       GH_GLANCE_FIXTURE_FAIL_FIRST_FILE: counter,
       GH_GLANCE_FIXTURE_FAIL_FIRST_ON: "dependabot",
       GH_GLANCE_FIXTURE_FAIL_FIRST_MESSAGE:
         "You are not logged into any GitHub hosts. To log in, run: gh auth login",
     },
-  }),
-);
+  });
+  let cached;
+  try { cached = JSON.parse(readFileSync(join(configHome, "gh-glance", "dashboard-cache.json"), "utf8")); } catch { /* recovery assertion reports an absent cache */ }
+  result.securityRecovered = recoveredSecurityCache(cached);
+  return result;
+});
 
 const cachedConfigHome = mkdtempSync(join(tmpdir(), "gh-glance-cached-pty-"));
 
@@ -103,9 +143,9 @@ const waitForStalledRender =
   "tries=0; while ! grep -q 'ci: pin actions to commit SHAs' \"$GH_GLANCE_CAPTURE_OUT\" " +
   "2>/dev/null && [ $tries -lt 150 ]; do tries=$((tries + 1)); sleep .1; done; ";
 const waitForStalledLane =
-  "tries=0; governor_dir=\"$XDG_CONFIG_HOME/gh-glance\"; " +
+  "tries=0; governor_dir=\"$XDG_CONFIG_HOME/gh-glance/coordination-v2\"; " +
   "while ! node -e 'const f=require(\"fs\"),d=process.argv[1],n=f.readdirSync(d).find(" +
-  "x=>x.startsWith(\"rate-governor-v1-\"));process.exit(n&&JSON.parse(" +
+  "x=>/^quota-[a-f0-9]{64}\\.json$/.test(x));process.exit(n&&JSON.parse(" +
   "f.readFileSync(d+\"/\"+n)).budgets.core.laneNextAt<=Date.now()?0:1)' " +
   "\"$governor_dir\" 2>/dev/null && [ $tries -lt 100 ]; do " +
   "tries=$((tries + 1)); sleep .05; done; ";
@@ -280,6 +320,9 @@ test("empty Security source output preserves rows and retries without an interna
 });
 
 test("manual Security refresh bypasses a source auth backoff", () => {
+  assert.ok(2 * securityReadyMs + 300 < AUTH_RETRY_MS[0], "readiness cannot outlast the auth backoff");
+  assert.match(strip(forcedSecurity.raw), /Dependabot.*not logged/, "manual input must follow the rendered initial auth failure");
+  assert.equal(forcedSecurity.securityRecovered, true, "forced refresh did not publish a complete successful Security snapshot");
   const dependabotCalls = forcedSecurity.fixtureCalls.filter(
     (call) => call.startsWith("api ") && call.includes("dependabot"),
   );

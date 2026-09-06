@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 
 import { resourceReserve } from "../../index.mjs";
 import { captureAsync } from "./capture.mjs";
+import { seedKnownHeldIdentity } from "./fixtures/known-identity.mjs";
 
 const STATE_HELPER = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "gh-state.mjs");
 const LIMIT = 10_000;
@@ -32,14 +33,15 @@ function fixture(t, overrides = {}) {
     events: [],
     ...overrides,
   };
+  if (state.core.remaining === 0) seedKnownHeldIdentity(root, state, now);
   writeFileSync(statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
   return {
     root,
     statePath,
     read: () => JSON.parse(readFileSync(statePath, "utf8")),
     readGovernor: () => {
-      const directory = join(root, "gh-glance");
-      const name = readdirSync(directory).find((entry) => entry.startsWith("rate-governor-v1-"));
+      const directory = join(root, "gh-glance", "coordination-v2");
+      const name = readdirSync(directory).find((entry) => /^quota-[a-f0-9]{64}\.json$/.test(entry));
       return JSON.parse(readFileSync(join(directory, name), "utf8"));
     },
   };
@@ -290,6 +292,7 @@ test("manual refresh wins a held lane without stacking repeated requests", { tim
   let held;
   let progress;
   let results;
+  let admitted;
   try {
     await observeUntil(
       box.readGovernor,
@@ -309,9 +312,10 @@ test("manual refresh wins a held lane without stacking repeated requests", { tim
     );
     progress = await observeUntil(
       box.read,
-      (state) => new Set(dataStarts(state).map((event) => event.pane)).size === 2,
+      (state) => new Set(actionsRuns(state).map((event) => event.pane)).size === 2,
       30_000,
     );
+    admitted = box.readGovernor();
   } finally {
     results = await releasePanes(competitorReady, captures);
   }
@@ -320,10 +324,12 @@ test("manual refresh wins a held lane without stacking repeated requests", { tim
   const runs = actionsRuns(progress);
   assert.equal(runs.filter((event) => event.pane === "manual").length, 1);
   assert.equal(runs.filter((event) => event.pane === "competitor").length, 1);
-  assert.equal(runs[0].pane, "manual", "lower-priority work started before manual refresh");
+  assert.equal(runs[0].pane, "manual", `lower-priority work started before manual refresh: ${JSON.stringify(
+    { events: progress.events, held: held.intents, reservations: admitted.reservations, leases: admitted.leases },
+  )}`);
   const manualResult = results[0];
   const statuses = manualResult.liveScreen.statusHistory;
-  const scheduledAt = statuses.findIndex((status) => / Watching (?:next|probing)(?:\s|$)/.test(status));
+  const scheduledAt = statuses.findIndex((status) => / (?:Paused|Watching (?:next|probing))(?:\s|$)/.test(status));
   const checkingAt = statuses.findIndex((status, index) =>
     index > scheduledAt && / Checking(?:\s|$)/.test(status));
   assert.ok(scheduledAt >= 0, statuses.join(" -> "));
@@ -447,7 +453,7 @@ test("a real reset resumes all panes, while atomic external burn limits the next
     resetProgress = await observeUntil(
       resetBox.read,
       (state) => probes(state).length === 2 &&
-        new Set(dataStarts(state).map((event) => event.pane)).size === 12,
+        new Set(actionsRuns(state).map((event) => event.pane)).size === 12,
       reservationHorizon(scheduled, "core"),
     );
   } finally {
@@ -490,7 +496,7 @@ test("a real reset resumes all panes, while atomic external burn limits the next
       Math.max(0, anchored.createdAt + 10_700 - Date.now()),
     ));
     execFileSync(process.execPath, [STATE_HELPER, "--fixture-burn", "core", "7996"], {
-      env: { ...process.env, GH_GLANCE_FIXTURE_STATE: burnBox.statePath },
+      env: { GH_GLANCE_FIXTURE_STATE: burnBox.statePath },
     });
     burned = await observeUntil(
       burnBox.read,

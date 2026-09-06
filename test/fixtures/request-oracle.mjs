@@ -150,6 +150,7 @@ function graphqlShape(query, variables) {
 
 export function identifyOracleRequest(argv) {
   if (argv[0] === "--version") return { operation: "cli.version", local: true };
+  if (argv[0] === "auth" && argv[1] === "token") return { operation: "cli.token", local: true };
 
   const fields = {};
   let path;
@@ -303,7 +304,11 @@ export function handleOracleRequest(state, { argv, credential = "fixture-full", 
   const identity = state.credentials[credential];
   if (!identity) throw new Error("unknown fixture credential");
   const request = identifyOracleRequest(argv);
-  if (request.local) return { status: 200, body: "gh version 2.97.0 (fixture)\n", local: true };
+  if (request.local) return {
+    status: 200,
+    body: request.operation === "cli.token" ? `${credential}\n` : "gh version 2.97.0 (fixture)\n",
+    local: true,
+  };
   if (!(identity.hosts ?? ["github.com"]).includes(request.host)) throw new Error("fixture credential host mismatch");
   const account = state.accounts[`${request.host}|${identity.principal}`] ??
     (request.host === "github.com" ? state.accounts[identity.principal] : undefined);

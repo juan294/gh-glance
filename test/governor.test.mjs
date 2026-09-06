@@ -49,6 +49,7 @@ import {
   governorPath,
   governorScopeHash,
   heartbeatLease,
+  inspectAdmittedHttpStart,
   inspectGovernor,
   maintainControlLease,
   admitGovernorOperation,
@@ -632,7 +633,7 @@ test("unsafe failure context and open requests run no quota call and suppress re
   const governor = { scope: box.scope, leaseId };
   const context = await resolveFailureContext(undefined, governor, { run: runner });
   assert.equal(context.repo.ok, false);
-  assert.equal(authCalls, 1);
+  assert.equal(authCalls, 0);
   assert.equal(repoCalls, 0);
 
   const registry = createOpenRequestRegistry();
@@ -1380,6 +1381,21 @@ test("a just-created shared-lane grant reports pane count without persisting UI 
   assert.equal(Object.hasOwn(persisted, "sharingOwnerLeaseIds"), false);
   const reread = readIntentDecision(box.scope, second.intentId, NOW).value;
   assert.equal(reread.waitCause, undefined, "another process gets a safe false negative");
+  const retained = readIntentDecision(box.scope, second.intentId, NOW, second).value;
+  assert.equal(retained.waitCause, "shared-lane", "the owning pane retains its local evidence on resume");
+  assert.equal(retained.sharingCount, 4);
+  assert.deepEqual(retained.sharingOwnerLeaseIds, [leaseIds[0]]);
+  const mismatched = readIntentDecision(box.scope, second.intentId, NOW, { ...second, intentId: randomUUID() }).value;
+  assert.equal(mismatched.waitCause, undefined, "provenance cannot move to another intent");
+  registerLease(box.scope, lease(leaseIds[0], NOW, { expiresAt: NOW + 1 }));
+  box.setNow(NOW + 2);
+  assert.equal(registerLease(box.scope, lease(randomUUID(), NOW + 2)).ok, true);
+  assert.equal(Object.keys(inspectGovernor(box.scope, NOW + 2).value.leases).length, 4,
+    "replacement pane keeps the count unchanged so expiry checks the actual owner");
+  const expired = readIntentDecision(box.scope, second.intentId, NOW + 2, { ...retained, intentId: second.intentId }).value;
+  assert.equal(expired.waitCause, undefined, "an expired lane owner invalidates retained provenance");
+  const afterResume = inspectGovernor(box.scope, NOW + 2).value.reservations[second.reservationId];
+  assert.equal(Object.hasOwn(afterResume, "waitCause"), false, "resume must not persist UI provenance");
 });
 
 test("planned reservations revalidate expiry, epoch, probe barrier, and capacity", (t) => {
@@ -2556,4 +2572,34 @@ test("governor health is redacted and discriminates stale, waiting, blocked, and
   const health = governorHealth(inspectGovernor(scope, NOW), NOW);
   assert.equal(health.status, "blocked");
   assert.deepEqual(Object.keys(health).sort(), ["leases", "resources", "status"]);
+});
+
+
+test("a queued HTTP call rechecks a newly shared resource block without changing its started charge", (t) => {
+  const box = sandbox(t, { authIdentity: "queued-http-shared-block" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const grant = registerIntent(box.scope, intent(randomUUID(), leaseId)).value;
+  const at = grant.notBefore;
+  box.setNow(at);
+  assert.equal(startReservation(box.scope, grant.reservationId, at).value.status, "started");
+  assert.equal(inspectAdmittedHttpStart(box.scope, "tab:actions-workflows", at).ok, true);
+  const resetMs = inspectGovernor(box.scope, at).value.budgets.core.resetMs;
+  const crossingClock = [resetMs - 1, resetMs];
+  assert.equal(inspectAdmittedHttpStart(box.scope, "tab:actions-workflows", () => crossingClock.shift()).reason, "budget-reset",
+    "a reset crossed during inspection must prevent the actual HTTP start");
+  assert.equal(crossingClock.length, 0);
+  assert.equal(recordResourceBlock(box.scope, "core", resetMs, "rate-limit").ok, true);
+  assert.deepEqual(inspectAdmittedHttpStart(box.scope, "tab:actions-workflows", at), {
+    ok: false, reason: "blocked", resource: "core", retryAt: resetMs,
+  });
+  assert.equal(inspectAdmittedHttpStart(box.scope, "tab:issues", at).ok, true);
+  assert.equal(inspectAdmittedHttpStart(box.scope, "tab:actions-runs", resetMs).reason, "budget-reset");
+  const reservation = inspectGovernor(box.scope, at).value.reservations[grant.reservationId];
+  assert.equal(reservation.status, "started");
+  assert.deepEqual(reservation.costs, { core: 2, graphql: 0 });
+  assert.equal(reservation.actualCosts, null);
+  assert.equal(completeReservation(box.scope, grant.reservationId, { outcome: "rejected" }, at).ok, true);
+  assert.deepEqual(inspectGovernor(box.scope, at).value.reservations[grant.reservationId].actualCosts, { core: 2, graphql: 0 });
 });

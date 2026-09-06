@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "epochs": {"core": null, "graphql": null},
+  "budgets": {},
+  "observers": {"core": {"etag": null, "outcome": "idle", "at": 0, "nextAt": 0}},
+  "probeClaim": null,
+  "probeOutcome": {"status": "idle", "at": 0, "nextAt": 0},
+  "leases": {},
+  "intents": {},
+  "reservations": {},
+  "manualProbe": null
+}

@@ -69,6 +69,28 @@ None for implementation. Restarting real user panes is a documented upgrade acti
 
 ## Completion
 
-- [ ] Identity, privacy boundary and migration protocol implemented and documented.
-- [ ] ID scenarios and parent local gates passed.
-- [ ] Independent compliance/quality review complete; integrated locally; stop.
+- [x] Identity, privacy boundary and migration protocol implemented and documented.
+- [x] ID scenarios and parent local gates passed.
+- [x] Independent compliance/quality review complete; integrated locally; stop.
+
+Two independent reviews ran against the finished worktree: a plan-compliance
+review (APPROVE WITH FIXES, 8 defects) and a quality/correctness review (BLOCK,
+14 defects). Every defect was fixed before integration. Neither review found a
+violation of a non-negotiable invariant, a credential leak, a lock-order
+inversion or a nested-permit deadlock.
+
+Three reviewer recommendations were deliberately not taken, each because it
+conflicted with something the spec requires:
+
+- Short-circuiting `inspectLegacyMigration` on `migration.activated` would be
+  faster but would stop legacy leases that reappear *during* operation from
+  pausing admission, which this phase requires. The unconditional registry
+  rewrite was removed instead; that, not the directory scan, was the cost.
+- Retiring aged-out bootstrap attempts on window age alone would discard an
+  exhaustion hold, because settlement pushes `retryAt` out to reset plus grace,
+  past the rolling window. Retirement additionally requires `retryAt` to have
+  passed.
+- Memoizing `credentialConfigurationRevision` would defeat the before/after
+  comparison that brackets the `gh auth token` subprocess, so a credential
+  swapped during a sub-millisecond local resolution could bind to the wrong
+  identity. The per-request call count was reduced instead.

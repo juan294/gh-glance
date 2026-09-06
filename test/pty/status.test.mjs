@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { capture, captureAsync, isStatusLine, waitForAwk } from "./capture.mjs";
+import { seedKnownHeldIdentity } from "./fixtures/known-identity.mjs";
 
 function configRoot(t, prefix) {
   const root = mkdtempSync(join(tmpdir(), prefix));
@@ -33,13 +34,15 @@ function sharedFixture(t, overrides = {}) {
   const root = configRoot(t, "gh-glance-status-");
   const now = Date.now();
   const statePath = join(root, "fixture.json");
-  writeFileSync(statePath, `${JSON.stringify({
+  const state = {
     createdAt: now,
     core: { limit: 5000, used: 0, remaining: 5000, resetMs: now + 3_600_000 },
     graphql: { limit: 5000, used: 0, remaining: 5000, resetMs: now + 3_600_000 },
     events: [],
     ...overrides,
-  })}\n`, { mode: 0o600 });
+  };
+  if (state.core.remaining === 0) seedKnownHeldIdentity(root, state, now);
+  writeFileSync(statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
   return {
     root,
     statePath,
@@ -48,8 +51,8 @@ function sharedFixture(t, overrides = {}) {
 }
 
 function governorPath(root) {
-  const directory = join(root, "gh-glance");
-  const name = readdirSync(directory).find((entry) => entry.startsWith("rate-governor-v1-"));
+  const directory = join(root, "gh-glance", "coordination-v2");
+  const name = readdirSync(directory).find((entry) => /^quota-[a-f0-9]{64}\.json$/.test(entry));
   assert.ok(name, "governor state was not created");
   return join(directory, name);
 }

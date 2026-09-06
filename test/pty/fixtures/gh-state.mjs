@@ -18,6 +18,15 @@ if (process.env.GH_GLANCE_REQUEST_ORACLE) {
 
 const statePath = process.env.GH_GLANCE_FIXTURE_STATE;
 const args = process.argv.slice(2);
+// An isolated test account file models a local gh account switch. It is read
+// once per child, so a delayed response keeps the account selected at start.
+const accountFixture = process.env.GH_GLANCE_FIXTURE_ACCOUNT_FILE
+  ? JSON.parse(readFileSync(process.env.GH_GLANCE_FIXTURE_ACCOUNT_FILE, "utf8")) : null;
+// Token lookup is local credential access, not a synthetic HTTP operation.
+if (args[0] === "auth" && args[1] === "token") {
+  process.stdout.write(`${accountFixture?.token ?? process.env.GH_GLANCE_FIXTURE_TOKEN ?? "fixture-keyring-token"}\n`);
+  process.exit(0);
+}
 const fixtures = dirname(new URL(import.meta.url).pathname);
 const waitCell = new Int32Array(new SharedArrayBuffer(4));
 const RATE_RESOURCES = ["core", "graphql"];
@@ -65,6 +74,10 @@ function bodyEtag(body) {
 }
 
 function defaultApiBody(path) {
+  if (path === "user") return JSON.stringify({
+    id: Number(process.env.GH_GLANCE_FIXTURE_USER_ID ?? 1),
+    login: process.env.GH_GLANCE_FIXTURE_LOGIN ?? "octocat",
+  });
   if (path?.includes("/actions/runs?")) {
     return readFileSync(join(fixtures, "actions-runs.json"), "utf8");
   }
@@ -75,7 +88,12 @@ function defaultApiBody(path) {
 }
 
 function apiEntity(state, path, fallback) {
-  const configured = state.apiEntities?.[path];
+  const user = accountFixture?.user ?? state.user;
+  if (path === "user" && user) {
+    const body = JSON.stringify(user);
+    fallback = { body, etag: bodyEtag(body) };
+  }
+  const configured = accountFixture?.apiEntities?.[path] ?? state.apiEntities?.[path];
   let entity = configured;
   if (Array.isArray(configured?.sequence) && configured.sequence.length > 0) {
     const sequenceIndex = Math.min(configured.calls ?? 0, configured.sequence.length - 1);
@@ -370,36 +388,8 @@ if (args[0] === "--fixture-burn") {
   process.exit(0);
 }
 
-function actionStartCountsForOwner(state) {
-  const counts = { runs: 0, workflows: 0 };
-  for (const event of state.events ?? []) {
-    if (event.type !== "start" || event.ownerPid !== process.ppid) continue;
-    if (event.argv?.some((argument) => argument.includes("/actions/runs?"))) counts.runs += 1;
-    else if (event.argv?.some((argument) => argument.includes("/actions/workflows?"))) counts.workflows += 1;
-  }
-  return counts;
-}
-
-// fetchActions launches runs and workflows in parallel, in that order. Under
-// high process contention the workflows fixture can win the state-file lock
-// even though its sibling was launched second. Keep the fixture's event order
-// deterministic per dashboard process without serializing the production
-// requests: the workflows child waits only until the matching runs child has
-// recorded this batch's start.
-if (apiInvocation?.path?.includes("/actions/workflows?")) {
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline) {
-    try {
-      const state = JSON.parse(readFileSync(statePath, "utf8"));
-      const { runs, workflows } = actionStartCountsForOwner(state);
-      if (runs > workflows) break;
-    } catch {
-      // The fixture state is atomically replaced; a transient read can retry.
-    }
-    Atomics.wait(waitCell, 0, 0, 5);
-  }
-}
-
+// Each Actions endpoint is an independent HTTP request. Its fixture must not
+// wait for a sibling request: the caller may hold the host's sole HTTP permit.
 const started = withLock((state) => {
   const now = Date.now();
   const isBudgetObserver = args[0] === "api" && ["rate_limit", "user"].includes(apiInvocation?.path);

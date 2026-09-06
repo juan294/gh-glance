@@ -2824,7 +2824,7 @@ test("tab and auxiliary operation costs have one explicit registry", () => {
   assert.deepEqual(operationCost("open:prs"), { core: 0, graphql: 2 });
   assert.deepEqual(operationCost("doctor:security-endpoint"), { core: 1, graphql: 0 });
   assert.deepEqual(operationCost("budget-core-observer"), { core: 1, graphql: 0 });
-  for (const free of ["rate-limit", "version", "auth-status", "local-git", "failure-context:auth"]) {
+  for (const free of ["rate-limit", "version", "local-git"]) {
     assert.deepEqual(operationCost(free), { core: 0, graphql: 0 });
   }
   assert.equal(operationCost("undeclared"), null);
@@ -2850,7 +2850,6 @@ test("every production runGh call site declares a registry operation", () => {
   }
   for (const delegated of [
     "version",
-    "auth-status",
     "doctor:repository",
     "doctor:actions-runs",
     "doctor:actions-workflows",

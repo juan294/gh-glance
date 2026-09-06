@@ -20,6 +20,7 @@ import {
   resourceReserve,
 } from "../../index.mjs";
 import { captureAsync } from "./capture.mjs";
+import { seedKnownHeldIdentity } from "./fixtures/known-identity.mjs";
 
 const STATE_HELPER = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "gh-state.mjs");
 
@@ -35,14 +36,15 @@ function fixture(t, overrides = {}) {
     events: [],
     ...overrides,
   };
+  if (state.core.remaining === 0) seedKnownHeldIdentity(root, state, now);
   writeFileSync(statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
   return {
     root,
     statePath,
     read: () => JSON.parse(readFileSync(statePath, "utf8")),
     readGovernor: () => {
-      const directory = join(root, "gh-glance");
-      const name = readdirSync(directory).find((entry) => entry.startsWith("rate-governor-v1-"));
+      const directory = join(root, "gh-glance", "coordination-v2");
+      const name = readdirSync(directory).find((entry) => /^quota-[a-f0-9]{64}\.json$/.test(entry));
       return JSON.parse(readFileSync(join(directory, name), "utf8"));
     },
   };
@@ -110,7 +112,7 @@ test("the shared fixture recovers a dead private lock without using governor sta
     mode: 0o600,
   });
   execFileSync(process.execPath, [STATE_HELPER, "--version"], {
-    env: { ...process.env, GH_GLANCE_FIXTURE_STATE: box.statePath },
+    env: { GH_GLANCE_FIXTURE_STATE: box.statePath },
   });
   assert.equal(starts(box.read(), "--version").length, 1);
   assert.equal(existsSync(lockPath), false);
@@ -125,7 +127,7 @@ test("the shared fixture recovers an exact dead recovery marker", (t) => {
     nonce: "dead-recovery",
   })}\n`, { mode: 0o600 });
   execFileSync(process.execPath, [STATE_HELPER, "--version"], {
-    env: { ...process.env, GH_GLANCE_FIXTURE_STATE: box.statePath },
+    env: { GH_GLANCE_FIXTURE_STATE: box.statePath },
   });
   assert.equal(starts(box.read(), "--version").length, 1);
   assert.equal(existsSync(recoveryPath), false);
@@ -160,7 +162,8 @@ test("manual refresh bursts create one unchanged held-sample probe demand", asyn
   const startupPublication = await observeUntil(
     box.readGovernor,
     (governor) => governor?.budgets?.core?.remaining === 0 &&
-      governor.budgets.core.observedAt >= setupAt,
+      governor.budgets.core.observedAt >= setupAt &&
+      governor.budgets.graphql?.observedAt >= setupAt,
     setupAt + 20_000,
   );
   const startupObservedAt = startupPublication.matched
@@ -259,7 +262,8 @@ test("a real reset gets one fresh probe then one phased active request per pane"
   const progress = Number.isFinite(laneInterval)
     ? await observeUntil(
       box.read,
-      (state) => new Set(actionsRuns(state).map((event) => event.pane)).size >= 3,
+      (state) => new Set(actionsRuns(state).map((event) => event.pane)).size >= 3 &&
+        dataStarts(state).length >= 6,
       progressDeadline,
     )
     : null;

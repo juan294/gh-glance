@@ -70,22 +70,18 @@ test("healthy startup does not probe optional failure context", () => {
   );
 });
 
-test("an inaccessible repository uses free auth context without crossing a paced repo slot", () => {
+test("an inaccessible repository uses cached auth context without crossing a paced repo slot", () => {
   const calls = inaccessibleRepository.fixtureCalls;
   assert.ok(calls.some((call) => call.startsWith("issue list")), "Issues did not fail");
-  assert.ok(
-    calls.some((call) => call.startsWith("auth status") && call.includes("--json hosts")),
-    "auth context was not read",
+  assert.equal(
+    calls.filter((call) => call.startsWith("auth status")).length,
+    0,
+    "failure diagnosis made an unadmitted auth status request",
   );
   assert.equal(
     calls.filter((call) => call.startsWith("repo view")).length,
     0,
     "repository context crossed its future paced slot",
-  );
-  assert.ok(
-    calls.filter((call) => call.startsWith("auth status") && call.includes("--json hosts")).length <=
-      1,
-    "auth context was read more than once",
   );
 });
 

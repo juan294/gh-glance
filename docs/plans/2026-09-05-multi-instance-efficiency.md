@@ -3,7 +3,7 @@
 Date: 2026-09-05  
 Source: `develop` at `b819f42e87922671a35bb72052bd0ede445b74be` (0.11.2)  
 Research: [multi-instance API efficiency and architecture](../research/2026-09-05-multi-instance-api-efficiency-and-architecture.md)  
-Status: Implementation underway; phase 1 completed and locally verified.
+Status: Implementation underway; phases 1 and 2 completed and locally verified.
 
 ## Outcome and scope
 
@@ -169,7 +169,7 @@ Record requests, charged units, observers, coalesced consumers, queue wait, sour
 Planning review is complete. Independent controller and whole-plan reviews identified and resolved bootstrap allowance, phase prerequisite, installation observer, provider/socket routing, chunked-frame, reconnect freshness, Width-mode key precedence, and webhook deadline issues. Plan links, phase dependencies, code-reference ranges, Markdown fences and unresolved-marker checks were verified locally. This review validates the specification; implementation/runtime acceptance remains unchecked below.
 
 - [x] Phase 1
-- [ ] Phase 2
+- [x] Phase 2
 - [ ] Phase 3
 - [ ] Phase 4
 - [ ] Phase 5

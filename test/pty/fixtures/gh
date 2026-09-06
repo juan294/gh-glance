@@ -241,6 +241,10 @@ case "$gh_command" in
     fi
     ;;
   auth)
+    if [ "${2:-}" = "token" ]; then
+      printf '%s\n' "${GH_GLANCE_FIXTURE_TOKEN:-fixture-keyring-token}"
+      exit 0
+    fi
     if [ "${2:-}" = "status" ] && [ "${3:-}" = "--active" ] &&
       [ "${4:-}" = "--json" ] && [ "${5:-}" = "hosts" ]; then
       echo '[{"host":"github.com","login":"octocat"}]'
@@ -256,6 +260,10 @@ case "$gh_command" in
     # budget with no admission hold.
     : "${GH_GLANCE_FIXTURE_RATE_REMAINING:=5000}"
     case "$api_path" in
+      user)
+        emit_api_text '"fixture-user-v1"' "$(printf '{"id":%s,"login":"%s"}' "${GH_GLANCE_FIXTURE_USER_ID:-1}" "${GH_GLANCE_FIXTURE_LOGIN:-octocat}")"
+        exit 0
+        ;;
       rate_limit)
         reset=$(( $(date +%s) + 3600 ))
         rate_used=0
