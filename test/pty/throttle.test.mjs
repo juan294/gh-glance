@@ -575,12 +575,12 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
   const blockResult = await observeUntil(
     box.readGovernor,
     (governor) => governor?.budgets?.core?.blockReason === "rate-limit" &&
-      Number.isFinite(governor?.probeOutcome?.nextAt),
+      Number.isFinite(governor?.observers?.graphql?.nextAt),
     Math.min(firstStartHorizon, startupOuterDeadline),
   );
   const blockedGovernor = blockResult.matched ? blockResult.value : null;
   const blockObservedAt = blockResult.matched ? Date.now() : null;
-  const initialProbeNextAt = blockedGovernor?.probeOutcome?.nextAt;
+  const initialProbeNextAt = blockedGovernor?.observers?.graphql?.nextAt;
   const boundedDeadline = Math.min(
     Number.isFinite(initialProbeNextAt) ? initialProbeNextAt + 45_000 : setupAt + 50_000,
     setupAt + 125_000,
@@ -629,7 +629,7 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
     JSON.stringify({
       createdAt: state.createdAt,
       probeTimes: probes.map(({ at }) => at),
-      outcome: governor.probeOutcome,
+      observers: governor.observers,
       core: governor.budgets.core,
     }));
   assert.ok(probes[1].at - probes[0].at >= 59_500,

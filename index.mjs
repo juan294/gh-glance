@@ -2465,7 +2465,7 @@ function inspectLegacyMigration(root, state, now) {
     // binary fail closed on its own gate, but this side must still recognise
     // that binary's file well enough to see it holds a live lease.
     const legacy = LEGACY_GOVERNOR_VERSIONS
-      .map((version) => normalizeGovernorState(raw, now, { prune: false, acceptVersion: version }))
+      .map((version) => readLegacyGovernorState(raw, now, version))
       .find(Boolean) ?? migrateGovernorState(raw, now);
     if (legacy && raw.version === 1 && raw.budgets?.core) {
       const core = raw.budgets.core;
@@ -2936,6 +2936,9 @@ const GOVERNOR_STATE_VERSION = 4;
 // holds. Recognising that such a pane owns a live lease is what the restart
 // boundary depends on.
 const LEGACY_GOVERNOR_VERSIONS = [GOVERNOR_STATE_VERSION, 3, 2];
+// The first version whose file is already in the per-resource observer shape.
+// Anything below it is adapted before it can be read; see readLegacyGovernorState.
+const GOVERNOR_OBSERVER_SPLIT_VERSION = 4;
 const GOVERNOR_MAX_LEASES = 128;
 const GOVERNOR_MAX_INTENTS = 512;
 const GOVERNOR_MAX_RESERVATIONS = 512;
@@ -3283,6 +3286,53 @@ function normalizeGovernorState(raw, nowMs, { prune = true, acceptVersion = GOVE
   state.manualProbe = normalizeManualProbe(raw.manualProbe, nowMs);
   if (state.manualProbe === undefined) return null;
   return state;
+}
+
+// Reads a still-running older pane's file as evidence. A version number alone
+// is not enough to identify a document: versions 2 and 3 share a *shape* that
+// version 4 replaced, so accepting their version against the current key set
+// would reject every real file they wrote. Read-only -- the result is never
+// published and the file is never rewritten.
+function readLegacyGovernorState(raw, nowMs, version) {
+  if (!isRecord(raw) || raw.version !== version) return null;
+  const options = { prune: false, acceptVersion: version };
+  if (version >= GOVERNOR_OBSERVER_SPLIT_VERSION) return normalizeGovernorState(raw, nowMs, options);
+  const adapted = adaptPreSplitGovernorShape(raw);
+  return adapted ? normalizeGovernorState(adapted, nowMs, options) : null;
+}
+
+// Versions 2 and 3 held one observer for core, a differently shaped
+// `probeOutcome` standing in for GraphQL, and a single claim naming the
+// resources it covered. Rewrite that into the current shape so the inspector
+// above can see the leases, deadlines and uncertain work such a pane holds.
+// The claim's own `resources` list says which resources it covered, so
+// splitting it in two reads the file rather than guessing at it.
+function adaptPreSplitGovernorShape(raw) {
+  if (!exactKeys(raw, [
+    "version", "epochs", "budgets", "observers", "probeClaim", "probeOutcome",
+    "leases", "intents", "reservations", "manualProbe",
+  ])) return null;
+  if (!exactKeys(raw.observers, ["core"])) return null;
+  if (!exactKeys(raw.probeOutcome, ["status", "at", "nextAt"])) return null;
+  if (raw.probeClaim !== null && !isRecord(raw.probeClaim)) return null;
+  const { resources, ...claim } = raw.probeClaim ?? {};
+  const covered = Array.isArray(resources) ? resources : [];
+  const adapted = structuredClone(raw);
+  delete adapted.probeClaim;
+  delete adapted.probeOutcome;
+  adapted.observers = {
+    core: raw.observers.core,
+    graphql: {
+      etag: null,
+      outcome: raw.probeOutcome.status,
+      at: raw.probeOutcome.at,
+      nextAt: raw.probeOutcome.nextAt,
+    },
+  };
+  adapted.probeClaims = Object.fromEntries(RATE_RESOURCES.map((resource) => [
+    resource, raw.probeClaim && covered.includes(resource) ? structuredClone(claim) : null,
+  ]));
+  return adapted;
 }
 
 function serializeGovernorState(state) {
@@ -7517,9 +7567,15 @@ function retryPollAfterAdmissionFailure({
 
 function governorWakeTimes(state, nowMs, floorMs, leaseId = null) {
   const budgets = Object.values(state?.budgets ?? {});
-  const observedCandidates = state?.observers?.graphql?.outcome === "failed"
-    ? []
-    : budgets.map((budget) => budget.observedAt + BUDGET_PROBE_MS);
+  // A failed observer's own retry, not its stale sample's cadence, says when
+  // that resource is next worth reading. Suppress the cadence per resource: a
+  // global suppression let one failure silence a healthy lane's wake, and no
+  // suppression let the failed lane spin on the sample it already knows is old.
+  const observedCandidates = RATE_RESOURCES.flatMap((resource) => {
+    const budget = state?.budgets?.[resource];
+    if (!budget || state?.observers?.[resource]?.outcome === "failed") return [];
+    return [budget.observedAt + BUDGET_PROBE_MS];
+  });
   const controlAt = Math.min(
     ...observedCandidates,
     ...budgets.map((budget) => budget.resetMs + BUDGET_RESET_GRACE_MS),

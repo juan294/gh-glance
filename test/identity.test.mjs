@@ -155,15 +155,27 @@ test("ID-05 pinned legacy v1 core cooldown survives migration inspection without
   const coordinator = createIdentityCoordinator({ host: "github.com", pathOptions, env: { GH_TOKEN: "synthetic-one" }, now: () => NOW, requestIdentity: async () => proof() });
   await coordinator.refresh();
   const scope = createQuotaScope(coordinator.current(), { root: coordinator.root, now: () => NOW });
-  const legacy = structuredClone(inspectGovernor(scope, NOW).value);
-  legacy.version = 1;
-  delete legacy.observers;
-  legacy.reservations = {};
-  for (const budget of Object.values(legacy.budgets)) {
+  const current = structuredClone(inspectGovernor(scope, NOW).value);
+  for (const budget of Object.values(current.budgets)) {
     delete budget.source; delete budget.factorBaseline; delete budget.knownLocalUsed;
   }
-  legacy.budgets.core.blockUntil = NOW + 120_000;
-  legacy.budgets.core.blockReason = "secondary-rate-limit";
+  current.budgets.core.blockUntil = NOW + 120_000;
+  current.budgets.core.blockReason = "secondary-rate-limit";
+  // The v1 document is spelled out rather than derived from the current one:
+  // one claim covering both resources, a separately shaped probeOutcome and no
+  // per-resource observers. Deriving it would let it silently track whatever
+  // shape the governor writes today, which is the opposite of pinning it.
+  const legacy = {
+    version: 1,
+    epochs: current.epochs,
+    budgets: current.budgets,
+    probeClaim: null,
+    probeOutcome: { status: "idle", at: 0, nextAt: 0 },
+    leases: {},
+    intents: {},
+    reservations: {},
+    manualProbe: null,
+  };
   const path = join(coordinator.root, "..", `rate-governor-v1-${"a".repeat(64)}.json`);
   const raw = JSON.stringify(legacy);
   writeFileSync(path, raw, { mode: 0o600 });
