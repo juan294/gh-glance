@@ -60,14 +60,17 @@ function waitForNotModified(count = 2) {
   );
 }
 
-test("a quiet Actions tab spends nothing after its first fetch across three refresh cycles", (t) => {
+// Three checks: the unconditional first and two conditional 304s. A fourth
+// would wait out the whole quiet interval the adaptive cadence now applies once
+// two checks in a row come back unchanged, and prove nothing the third does not.
+test("a quiet Actions tab spends nothing after its first fetch", (t) => {
   const box = fixture(t);
   const result = capture({
     cols: 80,
     rows: 24,
     signal: "none",
     settle: 30,
-    stdin: waitForActionsRuns(4) + "sleep .3; printf q",
+    stdin: waitForActionsRuns(3) + "sleep .3; printf q",
     args: "--repo acme/widget --refresh 5 --tab actions",
     configHome: box.root,
     env: {
@@ -78,7 +81,7 @@ test("a quiet Actions tab spends nothing after its first fetch across three refr
   const state = box.read();
   const runs = pathEvents(state, RUNS_PATH);
 
-  assert.ok(runs.length >= 4, `Actions runs calls: ${runs.length}`);
+  assert.ok(runs.length >= 3, `Actions runs calls: ${runs.length}`);
   assert.equal(runs[0].cost.core, 1);
   assert.ok(runs.slice(1).every((event) => event.cost.core === 0 && isConditional(event)));
   // The workflow catalog is not part of a quiet tab's cost at all any more: it

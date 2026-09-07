@@ -180,13 +180,17 @@ test("POLL-03 a missing name asks for the catalog once and reuses it", (t) => {
     rows: 24,
     signal: "none",
     settle: 20,
-    stdin: waitForActionsRuns(4) + "sleep .3; printf q",
+    // Three checks, not four. The body never changes, so the third observation
+    // is the one that takes the tab into quiet mode -- waiting for a fourth
+    // waits out the whole 30-second interval for no additional evidence. Two
+    // polls after the catalog arrives already prove it was reused.
+    stdin: waitForActionsRuns(3) + "sleep .3; printf q",
     args: "--repo acme/widget --refresh 2 --tab actions",
     configHome: box.root,
     env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1", GH_GLANCE_FIXTURE_STATE: box.statePath },
   });
   const state = box.read();
-  assert.ok(pathEvents(state, RUNS_PATH).length >= 4);
+  assert.ok(pathEvents(state, RUNS_PATH).length >= 3);
   assert.equal(pathEvents(state, WORKFLOWS_PATH).length, 1,
     "the 15-minute catalog TTL did not hold across polls");
   assert.match(result.finalFrame.lines.join("\n"), /CI/);
