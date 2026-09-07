@@ -2528,7 +2528,19 @@ function inspectLegacyMigration(root, state, now) {
       const uncertain = Object.values(legacy.reservations).some((reservation) =>
         ["started", "completed"].includes(reservation.status) && reservationCost(reservation, resource, legacy.leases, now) > 0);
       if (uncertain) {
-        const reset = budget?.resetMs;
+        // The deadline may only be read from the migrated view for resources the
+        // migration kept. A v1 file's budgets are dropped on purpose -- they came
+        // from /rate_limit and are not spendable capacity -- but the reset they
+        // record is still a fact about when that window ended, and using it as a
+        // deadline is not the same as admitting work against it. Core already had
+        // a reconstruction above; GraphQL never did, so a v1 file holding any
+        // uncertain GraphQL charge asked a dropped budget for its reset, found
+        // none, and reported legacy-unresolved -- which has no deadline and so
+        // never cleared. The file it came from had a perfectly good reset in it
+        // the whole time.
+        const reset = Number.isFinite(budget?.resetMs)
+          ? budget.resetMs
+          : Number(raw?.budgets?.[resource]?.resetMs);
         if (!Number.isFinite(reset)) return { ok: false, reason: "legacy-unresolved" };
         holdUntil = Math.max(holdUntil, reset + BUDGET_RESET_GRACE_MS);
       }

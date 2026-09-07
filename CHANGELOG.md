@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-09-07
+
+### Fixed
+
+- **"Upgrade waiting for legacy quota reset" could never clear.** A pane holding
+  a pre-0.12.0 ledger with unsettled GraphQL charges waited on a deadline that
+  did not exist, so the message stayed for as long as that file was present --
+  weeks, in one case, long after the quota windows it was waiting for had ended.
+  Migrating such a ledger deliberately drops its budgets, because their numbers
+  came from `/rate_limit` and were never spendable capacity; the reset times
+  recorded alongside them are still facts about when those windows closed, and
+  are now read as the deadline they always were. Reading a reset is not the same
+  as spending against it. Affected panes clear themselves on the next launch.
+
 ## [0.13.1] - 2026-09-07
 
 ### Fixed
@@ -926,7 +940,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.13.1...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.13.2...HEAD
+[0.13.2]: https://github.com/juan294/gh-glance/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/juan294/gh-glance/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/juan294/gh-glance/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/juan294/gh-glance/compare/v0.11.2...v0.12.0
