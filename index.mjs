@@ -4478,6 +4478,15 @@ function completeReservation(scope, reservationId, completion, nowMs) {
     reservation.outcome = completion.outcome;
     reservation.actualCosts = { ...measured };
     reservation.accountedCosts = { core: 0, graphql: 0 };
+    // The same rule as the observing settlement path: this one narrows the
+    // charge in exactly the same way, so it releases the pacing in exactly the
+    // same way. Wiring it into only one of the two settlement paths left every
+    // doctor probe and manual operation paying for capacity it did not use.
+    if (completion.outcome === "measured-success") {
+      for (const resource of RATE_RESOURCES) {
+        returnPacingCredit(state, resource, reservation.costs[resource] - measured[resource], at);
+      }
+    }
     return { value: { status: "completed", actualCosts: reservation.actualCosts } };
   });
 }
