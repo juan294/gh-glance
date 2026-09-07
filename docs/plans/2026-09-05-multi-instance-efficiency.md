@@ -122,6 +122,23 @@ All phases execute sequentially. None is `[batch-eligible]`: production changes 
 
 Phases 1–7 form a useful standalone milestone, 8–9 add shared collection, and 10–11 add opt-in integrations. Milestones permit review; they do not authorize partial remote pushes or releases. The requested complete scope is all 12 phases.
 
+### Scope decision, 2026-09-06
+
+All twelve phases are confirmed, taken deliberately rather than by momentum.
+Phases 8–11 were re-examined first because each one changes the premise the
+tool has held so far: gh-glance shells out to `gh`, holds no credential of its
+own, and runs no network service. A local collector is a long-running daemon,
+SSH clients add a cross-machine transport, webhook invalidation adds an ingress
+path, and an App installation provider puts credentials at rest. That is a
+materially larger security surface than "a terminal dashboard that calls `gh`".
+
+Confirming the scope is therefore also a standing instruction about how those
+four are built: each is designed with that scrutiny explicitly, not treated as
+a routine feature phase. Concretely, each of 8–11 states its trust boundary,
+what listens and on what, what is stored and where, and what an attacker who
+reaches it gains — before implementation, in its phase document. Phases 1–7 are
+unaffected and remain the standalone milestone; 0.12.0 released phases 1–3.
+
 ## Migration, rollback, and compatibility
 
 Changing only the filename hash would create a second governor. Phase 2 therefore introduces an explicit migration gate and a stable versioned coordination root. Do not claim safe arbitrary coexistence with old binaries: their code cannot honor new sentinels. Refuse transition while discoverable legacy leases are live, require restarting old panes, preserve legacy evidence, and obtain clean observations after outstanding legacy uncertainty is reconciled or its window ends. Old versions in another root remain external consumers. Never kill user panes automatically.

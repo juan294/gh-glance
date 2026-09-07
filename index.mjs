@@ -2098,6 +2098,7 @@ function scheduleIntents({
   cursors = {},
   nowMs,
   maxGrants = Number.POSITIVE_INFINITY,
+  manualStreak = 0,
 }) {
   const valid = [];
   const prunedIntentIds = [];
@@ -2138,11 +2139,29 @@ function scheduleIntents({
   const liveLeaseCount = countLiveLeases(leases, nowMs);
   const priorities = [...new Set(valid.map((intent) => intent.normalizedPriority))].sort((a, b) => a - b);
 
-  for (const priority of priorities) {
-    const pending = valid.filter((intent) => intent.normalizedPriority === priority);
+  let streak = Number.isSafeInteger(manualStreak) && manualStreak > 0 ? manualStreak : 0;
+  const grantedIds = new Set();
+  // Priority still decides every other question. This says only that "higher
+  // priority" cannot mean "always": once manual work has taken the last three
+  // turns and an active owner is waiting, that owner takes this one. The turn
+  // is a single grant, and it is subject to exactly the same budget, phase and
+  // lane checks as any other -- fairness reorders work, it never admits work
+  // that could not otherwise be paid for.
+  const owedActiveTurn = streak >= MANUAL_GRANT_STREAK_LIMIT &&
+    valid.some((intent) => intent.normalizedPriority === REQUEST_PRIORITIES.active);
+  const passes = owedActiveTurn
+    ? [{ priority: REQUEST_PRIORITIES.active, limit: 1, record: false },
+      ...priorities.map((priority) => ({ priority, limit: Number.POSITIVE_INFINITY, record: true }))]
+    : priorities.map((priority) => ({ priority, limit: Number.POSITIVE_INFINITY, record: true }));
+
+  for (const pass of passes) {
+    const priority = pass.priority;
+    const pending = valid.filter((intent) =>
+      intent.normalizedPriority === priority && !grantedIds.has(intent.id));
     const roundRobinState = createRoundRobinState(pending, updatedCursors);
+    let grantedThisPass = 0;
     while (pending.length > 0) {
-      if (grants.length >= maxGrants) break;
+      if (grants.length >= maxGrants || grantedThisPass >= pass.limit) break;
       const intent = pending.splice(nextRoundRobinIndex(pending, roundRobinState), 1)[0];
       const resources = RATE_RESOURCES.filter((resource) => intent.costs[resource] > 0);
       const decisions = Object.fromEntries(resources.map((resource) => [
@@ -2158,7 +2177,10 @@ function scheduleIntents({
       ]));
       const blocked = resources.find((resource) => decisions[resource].mode !== "open");
       if (blocked) {
-        denied.push({ intentId: intent.id, resource: blocked, ...decisions[blocked] });
+        // Only the ordinary pass records a denial. The owed-turn pass looks at
+        // the same intents again immediately afterwards, and recording here
+        // would report every one of them twice.
+        if (pass.record) denied.push({ intentId: intent.id, resource: blocked, ...decisions[blocked] });
         continue;
       }
 
@@ -2173,6 +2195,7 @@ function scheduleIntents({
       );
       const expiring = resources.find((resource) => notBefore >= decisions[resource].resetMs);
       if (expiring) {
+        if (!pass.record) continue;
         denied.push({
           intentId: intent.id,
           resource: expiring,
@@ -2207,6 +2230,12 @@ function scheduleIntents({
         reservation.sharingOwnerLeaseIds = sharingOwnerLeaseIds;
       }
       grants.push(reservation);
+      grantedIds.add(intent.id);
+      grantedThisPass += 1;
+      // A manual grant extends the run; anything else ends it. The counter has
+      // to persist, because the run this bounds is one manual intent per
+      // planning pass rather than several within one.
+      streak = priority === REQUEST_PRIORITIES.manual ? streak + 1 : 0;
       for (const resource of resources) {
         chargedTotals[resource] += intent.costs[resource];
         updatedLanes[resource] = {
@@ -2225,6 +2254,7 @@ function scheduleIntents({
     cursors: updatedCursors,
     denied,
     prunedIntentIds,
+    manualStreak: streak,
   };
 }
 
@@ -2373,10 +2403,16 @@ function normalizeIdentityRegistry(raw) {
     if (!isRecord(transport)) return null;
     const keys = ["lastStartedAt", "cooldownUntil", "permit"];
     if (Object.hasOwn(transport, "waiters")) keys.push("waiters");
+    if (Object.hasOwn(transport, "throttle")) keys.push("throttle");
     if (!normalizeHost(host) || !exactKeys(transport, keys) ||
         !time(transport.lastStartedAt) || !time(transport.cooldownUntil)) return null;
     if (transport.permit !== null && (!exactKeys(transport.permit, ["pid", "nonce", "startedAt"]) ||
         !Number.isSafeInteger(transport.permit.pid) || transport.permit.pid < 1 || !validGovernorId(transport.permit.nonce) || !time(transport.permit.startedAt))) return null;
+    if (!Object.hasOwn(transport, "throttle")) transport.throttle = emptyTransportThrottle();
+    if (!isRecord(transport.throttle) || !exactKeys(transport.throttle, ["attempts", "lastAt", "paused"]) ||
+        !Number.isSafeInteger(transport.throttle.attempts) || transport.throttle.attempts < 0 ||
+        transport.throttle.attempts > THROTTLE_PAUSE_AFTER ||
+        !time(transport.throttle.lastAt) || typeof transport.throttle.paused !== "boolean") return null;
     if (!Object.hasOwn(transport, "waiters")) transport.waiters = [];
     if (!Array.isArray(transport.waiters) || transport.waiters.length > HTTP_MAX_WAITERS ||
         new Set(transport.waiters.map((waiter) => waiter?.nonce)).size !== transport.waiters.length ||
@@ -2474,7 +2510,7 @@ function inspectLegacyMigration(root, state, now) {
     // binary fail closed on its own gate, but this side must still recognise
     // that binary's file well enough to see it holds a live lease.
     const legacy = LEGACY_GOVERNOR_VERSIONS
-      .map((version) => normalizeGovernorState(raw, now, { prune: false, acceptVersion: version }))
+      .map((version) => readLegacyGovernorState(raw, now, version))
       .find(Boolean) ?? migrateGovernorState(raw, now);
     if (legacy && raw.version === 1 && raw.budgets?.core) {
       const core = raw.budgets.core;
@@ -2840,7 +2876,13 @@ async function acquireIdentityHttpPermit(coordinator, { signal, now = Date.now }
         const migration = inspectLegacyMigration(coordinator.root, state, now());
         if (!migration.ok) return migration;
         if (now() >= deadline) return { ok: false, reason: "transport-busy", retryAt: deadline };
-        const transport = state.hosts[identity.host] ??= { lastStartedAt: 0, cooldownUntil: 0, permit: null, waiters: [] };
+        const transport = state.hosts[identity.host] ??= { lastStartedAt: 0, cooldownUntil: 0, permit: null, waiters: [], throttle: emptyTransportThrottle() };
+        // Five consecutive throttles means the ladder has stopped being useful.
+        // Waiting out the deadline is what produced the last one, so the pause
+        // holds until a person retries or a primary reset opens a recovery.
+        if (transport.throttle?.paused) {
+          return { ok: false, reason: "throttle-paused", retryAt: transport.cooldownUntil };
+        }
         if (transport.permit && staleHttpPermit(transport.permit, now())) transport.permit = null;
         // Admission can happen during the mandatory start gap. Persist call
         // order once so later polling cannot overtake an earlier caller.
@@ -2886,17 +2928,92 @@ async function acquireIdentityHttpPermit(coordinator, { signal, now = Date.now }
 // stops applying to the other.
 const SECONDARY_LIMIT_PATTERN = /secondary rate|abuse/i;
 
-function transportCooldownDeadline({ retryAfter, status, secondary, at }) {
-  const deadline = typeof retryAfter === "string" && /^\d+(?:\.\d+)?$/.test(retryAfter)
+// The locally chosen delay climbs by consecutive throttle and stops climbing at
+// fifteen minutes. The cap bounds only what this client invents for itself: a
+// server that asks for two hours is given two hours, because it knows something
+// we do not.
+const THROTTLE_LADDER_MS = [60_000, 120_000, 240_000, 480_000, 900_000];
+// After this many consecutive throttles the transport stops choosing new delays
+// and waits for a person or a primary reset. Climbing forever keeps a wedged
+// credential politely hammering a limit it has no way to satisfy.
+const THROTTLE_PAUSE_AFTER = 5;
+
+function throttleLadderMs(priorThrottles) {
+  const step = Number.isSafeInteger(priorThrottles) && priorThrottles > 0 ? priorThrottles : 0;
+  return THROTTLE_LADDER_MS[Math.min(step, THROTTLE_LADDER_MS.length - 1)];
+}
+
+// Reads throttle evidence without inventing any. The case this exists to get
+// right is the permission-only 403: it carries the same status as an exhausted
+// primary limit and is not a throttle at all, so treating it as one pauses a
+// pane that was never limited -- it was just not allowed.
+function classifyThrottle({ status = null, headers = null, graphqlErrors = null, stderr = "", body = null } = {}) {
+  const header = (name) => {
+    const value = headers?.[name];
+    return typeof value === "string" ? value.trim() : null;
+  };
+  const integer = (name) => {
+    const value = Number(header(name));
+    return Number.isSafeInteger(value) ? value : null;
+  };
+  const secondary = SECONDARY_LIMIT_PATTERN.test([
+    String(body?.message ?? ""),
+    String(stderr ?? ""),
+    ...(Array.isArray(graphqlErrors)
+      ? graphqlErrors.map((error) => `${error?.type ?? ""} ${error?.message ?? ""}`)
+      : []),
+  ].join("\n"));
+  const retryAfter = header("retry-after");
+  const remaining = integer("x-ratelimit-remaining");
+  const reset = integer("x-ratelimit-reset");
+  const resource = header("x-ratelimit-resource")?.toLowerCase() ?? null;
+  // The counter itself says there is nothing left. That holds its own resource
+  // until its own reset, and says nothing about the other one.
+  if (!secondary && remaining === 0 && reset !== null && RATE_RESOURCES.includes(resource) &&
+      (status === 403 || status === 429)) {
+    return { kind: "primary", resource, resetMs: reset * 1000 };
+  }
+  if (retryAfter !== null || secondary || status === 429) {
+    return { kind: "secondary", retryAfter, secondary, status };
+  }
+  return { kind: "none" };
+}
+
+function transportCooldownDeadline({ retryAfter, status, secondary, at, attempts = 0 }) {
+  const supplied = typeof retryAfter === "string" && /^\d+(?:\.\d+)?$/.test(retryAfter)
     ? at + Number(retryAfter) * 1000
     : Date.parse(retryAfter ?? "");
-  if (Number.isFinite(deadline)) return deadline;
-  return status === 429 || secondary === true ? at + 60_000 : null;
+  // A deadline the server supplied is honoured exactly, however long. Only the
+  // delay chosen here is laddered, and only it is capped.
+  if (Number.isFinite(supplied)) return supplied;
+  return status === 429 || secondary === true ? at + throttleLadderMs(attempts) : null;
+}
+
+function emptyTransportThrottle() {
+  return { attempts: 0, lastAt: 0, paused: false };
 }
 
 function applyTransportCooldown(transport, evidence) {
-  const deadline = transportCooldownDeadline(evidence);
-  if (deadline !== null) transport.cooldownUntil = Math.max(transport.cooldownUntil, deadline);
+  const throttle = transport.throttle ?? emptyTransportThrottle();
+  const deadline = transportCooldownDeadline({ ...evidence, attempts: throttle.attempts });
+  if (deadline === null) return null;
+  // Merged by maximum, so a shorter concurrent error never shortens a hold
+  // another response already established, and the hold survives a primary epoch
+  // change: secondary limits are not accounted in the primary counter.
+  transport.cooldownUntil = Math.max(transport.cooldownUntil, deadline);
+  const attempts = Math.min(throttle.attempts + 1, THROTTLE_PAUSE_AFTER);
+  transport.throttle = { attempts, lastAt: evidence.at, paused: attempts >= THROTTLE_PAUSE_AFTER };
+  return transport.cooldownUntil;
+}
+
+// A request that came back carrying no throttle evidence is the only thing that
+// proves the hold is over, so it is the only thing that resets the ladder.
+// Merely waiting out a deadline does not: that is what produced the next
+// throttle last time.
+function clearTransportThrottle(transport) {
+  if (transport && transport.throttle && transport.throttle.attempts > 0) {
+    transport.throttle = emptyTransportThrottle();
+  }
 }
 
 function releaseIdentityHttpPermit(coordinator, permit, error = null) {
@@ -2905,15 +3022,40 @@ function releaseIdentityHttpPermit(coordinator, permit, error = null) {
     if (transport?.permit?.nonce === permit.nonce) transport.permit = null;
     if (transport && error) {
       const response = parseGhApiResponse(error.stdout ?? "");
-      applyTransportCooldown(transport, {
-        retryAfter: response.headers["retry-after"],
+      const verdict = classifyThrottle({
         status: response.status,
-        secondary: SECONDARY_LIMIT_PATTERN.test(String(error.stderr ?? "")),
-        at: Date.now(),
+        headers: response.headers,
+        stderr: error.stderr,
       });
+      // A permission-only 403 reaches here too. It is a failure, but it is not a
+      // throttle, and holding the shared transport for it would pause every
+      // pane over one repository the user cannot read.
+      if (verdict.kind === "secondary") {
+        applyTransportCooldown(transport, {
+          retryAfter: verdict.retryAfter,
+          status: verdict.status,
+          secondary: verdict.secondary,
+          at: Date.now(),
+        });
+      }
+    } else if (transport && !error) {
+      clearTransportThrottle(transport);
     }
     return { ok: true };
   });
+}
+
+// The explicit retry a paused transport waits for. Clears the ladder and the
+// deadline together: a person choosing to retry is choosing to spend the next
+// request finding out, which is exactly the recovery election the pause defers.
+function retryThrottledTransport(root, host, { now = Date.now } = {}) {
+  return withIdentityRegistry(root, (state) => {
+    const transport = state.hosts[host];
+    if (!transport?.throttle?.paused) return { ok: true, value: { resumed: false } };
+    transport.throttle = emptyTransportThrottle();
+    transport.cooldownUntil = Math.min(transport.cooldownUntil, now());
+    return { ok: true, value: { resumed: true } };
+  }, { now: now() });
 }
 
 function identityCoordinationMessage(reason) {
@@ -2921,6 +3063,7 @@ function identityCoordinationMessage(reason) {
   if (["migration-hold", "legacy-unresolved"].includes(reason)) return "Upgrade waiting for legacy quota reset";
   if (["legacy-corrupt", "corrupt"].includes(reason)) return "Coordination state unavailable; evidence preserved";
   if (reason === "transport-busy") return "Shared HTTP request or cooldown in progress";
+  if (reason === "throttle-paused") return "Paused after repeated rate limits; refresh to retry";
   if (retryableCoordination(reason)) return "Coordinating with your other panes";
   if (reason === "identity-capacity") return "Coordination state full; retrying after the current window";
   return "Verified identity unavailable; waiting to retry";
@@ -2937,9 +3080,27 @@ const GOVERNOR_SCOPE_VERSION = 1;
 // turns one rejected budget into total loss, discarding every live pane's
 // leases, intents and reservations. The version gate makes it fail closed on the
 // file instead, which is the whole point of having one.
-const GOVERNOR_STATE_VERSION = 3;
-// Readable-as-evidence, never written: 2 is the shape a 0.11.x pane still holds.
-const LEGACY_GOVERNOR_VERSIONS = [GOVERNOR_STATE_VERSION, 2];
+// 4: observer claims, readiness and outcomes are per resource, so the schema
+// shape changed rather than a field's contents. Replaced atomically -- an older
+// build must fail closed on the version gate rather than half-read it.
+// 5: scheduling fairness is persisted, because the starvation it prevents
+// happens *between* planning passes -- each manual refresh is its own pass, so
+// a counter that lives only inside one cannot see a run of them.
+const GOVERNOR_STATE_VERSION = 5;
+// Readable-as-evidence, never written: the shapes a still-running older pane
+// holds. Recognising that such a pane owns a live lease is what the restart
+// boundary depends on.
+const LEGACY_GOVERNOR_VERSIONS = [GOVERNOR_STATE_VERSION, 4, 3, 2];
+// The first version whose file is already in the per-resource observer shape.
+// Anything below it is adapted before it can be read; see readLegacyGovernorState.
+const GOVERNOR_OBSERVER_SPLIT_VERSION = 4;
+// The first version carrying persisted scheduling fairness. A version 4 file is
+// otherwise in the current shape and only wants the field defaulted.
+const GOVERNOR_FAIRNESS_VERSION = 5;
+// Manual work outranks active work, which is right until it means "always". A
+// user holding the refresh key issues one manual intent per planning pass, and
+// without a bound the active owner behind them never gets a turn at all.
+const MANUAL_GRANT_STREAK_LIMIT = 3;
 const GOVERNOR_MAX_LEASES = 128;
 const GOVERNOR_MAX_INTENTS = 512;
 const GOVERNOR_MAX_RESERVATIONS = 512;
@@ -3052,11 +3213,16 @@ function emptyGovernorState() {
     version: GOVERNOR_STATE_VERSION,
     epochs: { core: null, graphql: null },
     budgets: {},
-    observers: {
-      core: { etag: null, outcome: "idle", at: 0, nextAt: 0 },
-    },
-    probeClaim: null,
-    probeOutcome: { status: "idle", at: 0, nextAt: 0 },
+    fairness: { manualStreak: 0 },
+    // Symmetric on purpose. Core observer state lived in `observers.core` while
+    // the GraphQL one lived in a differently-shaped `probeOutcome`, and a single
+    // `probeClaim` serialized both -- so a slow or failed observer for one
+    // resource held up the other's readiness for no reason the resources
+    // themselves impose.
+    observers: Object.fromEntries(RATE_RESOURCES.map((resource) => [
+      resource, { etag: null, outcome: "idle", at: 0, nextAt: 0 },
+    ])),
+    probeClaims: Object.fromEntries(RATE_RESOURCES.map((resource) => [resource, null])),
     leases: {},
     intents: {},
     reservations: {},
@@ -3180,7 +3346,7 @@ function normalizeGovernorReservation(raw, nowMs) {
   return { ...raw, costs, actualCosts, accountedCosts, epochs };
 }
 
-function normalizeCoreObserver(raw, nowMs) {
+function normalizeResourceObserver(raw, nowMs) {
   if (!exactKeys(raw, ["etag", "outcome", "at", "nextAt"])) return null;
   if (
     raw.etag !== null && (typeof raw.etag !== "string" || raw.etag.length === 0) ||
@@ -3194,24 +3360,19 @@ function normalizeCoreObserver(raw, nowMs) {
 function normalizeProbeClaim(raw, nowMs) {
   if (raw === null) return null;
   if (!exactKeys(raw, [
-    "ownerLeaseId", "nonce", "leaseUntil", "nextAt", "claimAt", "startedReservationIds", "resources",
+    "ownerLeaseId", "nonce", "leaseUntil", "nextAt", "claimAt", "startedReservationIds",
   ])) {
     return undefined;
   }
-  const resources = Array.isArray(raw.resources) && raw.resources.length > 0 &&
-    raw.resources.every((resource) => RATE_RESOURCES.includes(resource))
-    ? [...new Set(raw.resources)]
-    : null;
   if (
     !validGovernorId(raw.ownerLeaseId) || !validGovernorId(raw.nonce) ||
     finiteTimestamp(raw.leaseUntil, nowMs) === undefined ||
     finiteTimestamp(raw.nextAt, nowMs) === undefined ||
     finiteTimestamp(raw.claimAt, nowMs) === undefined || raw.claimAt > nowMs ||
     !Array.isArray(raw.startedReservationIds) || raw.startedReservationIds.length > GOVERNOR_MAX_RESERVATIONS ||
-    raw.startedReservationIds.some((id) => !id.startsWith("reservation:") || !validGovernorId(id.slice(12))) ||
-    !resources
+    raw.startedReservationIds.some((id) => !id.startsWith("reservation:") || !validGovernorId(id.slice(12)))
   ) return undefined;
-  return { ...raw, startedReservationIds: [...new Set(raw.startedReservationIds)], resources };
+  return { ...raw, startedReservationIds: [...new Set(raw.startedReservationIds)] };
 }
 
 function normalizeManualProbe(raw, nowMs) {
@@ -3232,27 +3393,28 @@ function normalizeManualProbe(raw, nowMs) {
 // version this build does not write is unreadable and fails closed.
 function normalizeGovernorState(raw, nowMs, { prune = true, acceptVersion = GOVERNOR_STATE_VERSION } = {}) {
   if (!exactKeys(raw, [
-    "version", "epochs", "budgets", "observers", "probeClaim", "probeOutcome", "leases",
+    "version", "epochs", "budgets", "fairness", "observers", "probeClaims", "leases",
     "intents", "reservations", "manualProbe",
   ]) || raw.version !== acceptVersion) return null;
+  if (!exactKeys(raw.fairness, ["manualStreak"]) ||
+      !Number.isSafeInteger(raw.fairness.manualStreak) || raw.fairness.manualStreak < 0) return null;
   if (
     !exactKeys(raw.epochs, RATE_RESOURCES) ||
     RATE_RESOURCES.some((resource) => raw.epochs[resource] !== null && !validGovernorEpoch(raw.epochs[resource])) ||
     !isRecord(raw.budgets) || Object.keys(raw.budgets).some((resource) => !RATE_RESOURCES.includes(resource)) ||
-    !exactKeys(raw.observers, ["core"]) ||
-    !isRecord(raw.leases) || !isRecord(raw.intents) || !isRecord(raw.reservations) ||
-    !exactKeys(raw.probeOutcome, ["status", "at", "nextAt"]) ||
-    !GOVERNOR_PROBE_STATUSES.has(raw.probeOutcome.status) ||
-    finiteTimestamp(raw.probeOutcome.at, nowMs) === undefined ||
-    raw.probeOutcome.at > nowMs ||
-    finiteTimestamp(raw.probeOutcome.nextAt, nowMs) === undefined
+    !exactKeys(raw.observers, RATE_RESOURCES) ||
+    !exactKeys(raw.probeClaims, RATE_RESOURCES) ||
+    !isRecord(raw.leases) || !isRecord(raw.intents) || !isRecord(raw.reservations)
   ) return null;
 
   const state = emptyGovernorState();
   state.epochs = { ...raw.epochs };
-  state.probeOutcome = { ...raw.probeOutcome };
-  state.observers.core = normalizeCoreObserver(raw.observers.core, nowMs);
-  if (!state.observers.core) return null;
+  state.fairness = { ...raw.fairness };
+  for (const resource of RATE_RESOURCES) {
+    const observer = normalizeResourceObserver(raw.observers[resource], nowMs);
+    if (!observer) return null;
+    state.observers[resource] = observer;
+  }
   for (const resource of Object.keys(raw.budgets)) {
     const budget = normalizeGovernorBudget(raw.budgets[resource], nowMs, resource);
     if (!budget) return null;
@@ -3282,12 +3444,66 @@ function normalizeGovernorState(raw, nowMs, { prune = true, acceptVersion = GOVE
     ) state.reservations[id] = reservation;
   }
   if (Object.keys(state.reservations).length > GOVERNOR_MAX_RESERVATIONS) return null;
-  state.probeClaim = normalizeProbeClaim(raw.probeClaim, nowMs);
-  if (state.probeClaim === undefined) return null;
-  if (state.probeClaim?.leaseUntil <= nowMs) state.probeClaim = null;
+  for (const resource of RATE_RESOURCES) {
+    const claim = normalizeProbeClaim(raw.probeClaims[resource], nowMs);
+    if (claim === undefined) return null;
+    state.probeClaims[resource] = claim?.leaseUntil > nowMs ? claim : null;
+  }
   state.manualProbe = normalizeManualProbe(raw.manualProbe, nowMs);
   if (state.manualProbe === undefined) return null;
   return state;
+}
+
+// Reads a still-running older pane's file as evidence. A version number alone
+// is not enough to identify a document: versions 2 and 3 share a *shape* that
+// version 4 replaced, so accepting their version against the current key set
+// would reject every real file they wrote. Read-only -- the result is never
+// published and the file is never rewritten.
+function readLegacyGovernorState(raw, nowMs, version) {
+  if (!isRecord(raw) || raw.version !== version) return null;
+  const options = { prune: false, acceptVersion: version };
+  if (version >= GOVERNOR_FAIRNESS_VERSION) return normalizeGovernorState(raw, nowMs, options);
+  // A version 4 file is already in the per-resource observer shape and differs
+  // only by the field this version added, so defaulting it is the whole
+  // adaptation. Older files need their observer shape rewritten first.
+  const shaped = version >= GOVERNOR_OBSERVER_SPLIT_VERSION ? { ...raw } : adaptPreSplitGovernorShape(raw);
+  if (!shaped) return null;
+  shaped.fairness = { manualStreak: 0 };
+  return normalizeGovernorState(shaped, nowMs, options);
+}
+
+// Versions 2 and 3 held one observer for core, a differently shaped
+// `probeOutcome` standing in for GraphQL, and a single claim naming the
+// resources it covered. Rewrite that into the current shape so the inspector
+// above can see the leases, deadlines and uncertain work such a pane holds.
+// The claim's own `resources` list says which resources it covered, so
+// splitting it in two reads the file rather than guessing at it.
+function adaptPreSplitGovernorShape(raw) {
+  if (!exactKeys(raw, [
+    "version", "epochs", "budgets", "observers", "probeClaim", "probeOutcome",
+    "leases", "intents", "reservations", "manualProbe",
+  ])) return null;
+  if (!exactKeys(raw.observers, ["core"])) return null;
+  if (!exactKeys(raw.probeOutcome, ["status", "at", "nextAt"])) return null;
+  if (raw.probeClaim !== null && !isRecord(raw.probeClaim)) return null;
+  const { resources, ...claim } = raw.probeClaim ?? {};
+  const covered = Array.isArray(resources) ? resources : [];
+  const adapted = structuredClone(raw);
+  delete adapted.probeClaim;
+  delete adapted.probeOutcome;
+  adapted.observers = {
+    core: raw.observers.core,
+    graphql: {
+      etag: null,
+      outcome: raw.probeOutcome.status,
+      at: raw.probeOutcome.at,
+      nextAt: raw.probeOutcome.nextAt,
+    },
+  };
+  adapted.probeClaims = Object.fromEntries(RATE_RESOURCES.map((resource) => [
+    resource, raw.probeClaim && covered.includes(resource) ? structuredClone(claim) : null,
+  ]));
+  return adapted;
 }
 
 function serializeGovernorState(state) {
@@ -3296,7 +3512,7 @@ function serializeGovernorState(state) {
 
 function migrateGovernorState(raw, nowMs) {
   if (!exactKeys(raw, [
-    "version", "epochs", "budgets", "probeClaim", "probeOutcome", "leases",
+    "version", "epochs", "budgets", "probeClaim", "probeOutcome", "leases",  // v1 shape
     "intents", "reservations", "manualProbe",
   ]) || raw.version !== 1 || !isRecord(raw.budgets) || !isRecord(raw.reservations)) return null;
   const migrated = structuredClone(raw);
@@ -3318,7 +3534,16 @@ function migrateGovernorState(raw, nowMs) {
   for (const reservation of Object.values(migrated.reservations)) {
     reservation.accountedCosts = { core: 0, graphql: 0 };
   }
-  if (migrated.probeClaim) migrated.probeClaim.resources = [...RATE_RESOURCES];
+  // v1 carried one claim for both resources; the new shape has one per resource
+  // and a migrated claim belongs to neither, so it is dropped rather than
+  // guessed at. The next probe re-claims what is actually due.
+  delete migrated.probeClaim;
+  delete migrated.probeOutcome;
+  migrated.observers = Object.fromEntries(RATE_RESOURCES.map((resource) => [
+    resource, { etag: null, outcome: "idle", at: 0, nextAt: 0 },
+  ]));
+  migrated.probeClaims = Object.fromEntries(RATE_RESOURCES.map((resource) => [resource, null]));
+  migrated.fairness = { manualStreak: 0 };
   return normalizeGovernorState(migrated, nowMs);
 }
 
@@ -3601,6 +3826,33 @@ function mutateGovernor(scope, nowMs, mutate) {
   });
 }
 
+// The largest single operation the governor will ever admit. Returned pacing is
+// capped at one of these so an idle stretch cannot accumulate into a burst: at
+// most one operation's worth of the lane is ever given back at a time.
+const GOVERNOR_MAX_ATOMIC_COST = Math.max(...Object.values(OPERATION_COSTS)
+  .flatMap((costs) => RATE_RESOURCES.map((resource) => costs?.[resource] ?? 0)));
+
+// A grant paces the lane by what it *reserved*, which is a worst case. When the
+// request costs less than that -- a 304 costs nothing -- or never happens at
+// all, the difference is capacity paced away for nobody, and the next request
+// waits out a slot no one used.
+//
+// The lane is never pulled earlier than the transport gap, which is what keeps
+// this from becoming a burst. Recomputing the rate here can differ from the
+// rate at grant time if capacity has since changed, so the returned credit is
+// an estimate rather than an exact reversal; that is safe because admission
+// still re-checks affordability against the reserve before anything starts.
+// Pacing decides when work may go, never whether it may.
+function returnPacingCredit(state, resource, unusedCost, nowMs) {
+  const budget = state.budgets[resource];
+  if (!budget || !(unusedCost > 0)) return;
+  const decision = resourceDecision({ budget, resource, nowMs, cost: 0, chargedCost: 0 });
+  const callsPerMs = decision?.callsPerMs;
+  if (!Number.isFinite(callsPerMs) || callsPerMs <= 0) return;
+  const credit = Math.min(unusedCost, GOVERNOR_MAX_ATOMIC_COST) / callsPerMs;
+  budget.laneNextAt = Math.max(nowMs + HTTP_START_GAP_MS, budget.laneNextAt - credit);
+}
+
 function scheduleGovernorState(state, nowMs) {
   if (Object.keys(state.intents).length === 0) return { grants: [], denied: [] };
   let reservationCount = Object.keys(state.reservations).length;
@@ -3612,7 +3864,7 @@ function scheduleGovernorState(state, nowMs) {
       ? [[resource, state.budgets[resource].roundRobinCursor]]
       : [],
   ));
-  const deferredBackground = state.probeOutcome.status === "failed"
+  const deferredBackground = state.observers.graphql.outcome === "failed"
     ? Object.entries(state.intents)
       .filter(([, intent]) => intentPriority(intent) === REQUEST_PRIORITIES.background)
       .map(([id]) => id)
@@ -3633,7 +3885,9 @@ function scheduleGovernorState(state, nowMs) {
     cursors,
     nowMs,
     maxGrants: GOVERNOR_MAX_RESERVATIONS - reservationCount,
+    manualStreak: state.fairness.manualStreak,
   });
+  state.fairness.manualStreak = result.manualStreak;
   result.denied.push(...deferredBackground.map((intentId) => ({
     intentId,
     mode: "paused",
@@ -3720,76 +3974,79 @@ function maintainControlLease(scope, leaseId, floorMs, activeTab, nowMs) {
     : registered;
 }
 
-function claimProbe(scope, leaseId, nowMs) {
+// Claims the observer for one resource. Independence is the point: a slow or
+// failed GraphQL observer must not hold up core readiness, because nothing about
+// the resources themselves couples them. What still couples them is the shared
+// HTTP permit and any account-wide secondary hold, and those are enforced
+// elsewhere -- not by making one claim stand for both.
+function claimProbe(scope, leaseId, nowMs, resource) {
+  if (!RATE_RESOURCES.includes(resource)) return { ok: false, reason: "corrupt" };
   return mutateGovernor(scope, nowMs, (state, at) => {
     if (!state.leases[leaseId]) return { ok: false, reason: "stale" };
-    if (state.probeClaim && state.probeClaim.leaseUntil > at) {
-      return { value: { status: "waiting", leaseUntil: state.probeClaim.leaseUntil } };
+    const held = state.probeClaims[resource];
+    if (held && held.leaseUntil > at) {
+      return { value: { status: "waiting", leaseUntil: held.leaseUntil } };
     }
+    const resetAt = Number.isFinite(state.budgets[resource]?.resetMs)
+      ? state.budgets[resource].resetMs + BUDGET_RESET_GRACE_MS
+      : Number.POSITIVE_INFINITY;
+    // A core reset starts a new shared accounting epoch, so the GraphQL counter
+    // is also due then: external-spend baselines and the protected
+    // one-publication reset contract have to advance together.
     const coreResetAt = Number.isFinite(state.budgets.core?.resetMs)
       ? state.budgets.core.resetMs + BUDGET_RESET_GRACE_MS
       : Number.POSITIVE_INFINITY;
-    const graphqlResetAt = Number.isFinite(state.budgets.graphql?.resetMs)
-      ? state.budgets.graphql.resetMs + BUDGET_RESET_GRACE_MS
+    // ...but only until it has actually observed since that reset. Left
+    // unqualified, every pane keeps qualifying for as long as core has not
+    // published its new epoch, so a reset draws a stampede of GraphQL observers
+    // instead of the one the shared epoch needs. The publication used to close
+    // that window as a side effect of being read first; saying it here means it
+    // does not depend on which resource a refresh happens to reach first.
+    const dueAtCoreReset = resource === "graphql" &&
+      state.observers.graphql.at < coreResetAt
+      ? coreResetAt
       : Number.POSITIVE_INFINITY;
-    const dueAt = {
-      core: Math.min(
-        state.observers.core.nextAt,
-        coreResetAt,
-      ),
-      graphql: Math.min(
-        state.probeOutcome.nextAt,
-        graphqlResetAt,
-        // A core reset starts a new shared accounting epoch. Refresh the free
-        // GraphQL counter in that same nonce so external-spend baselines and
-        // the protected one-publication reset contract advance together.
-        coreResetAt,
-      ),
-    };
-    const nextAt = Math.min(...Object.values(dueAt));
+    const nextAt = Math.min(
+      state.observers[resource].nextAt,
+      resetAt,
+      dueAtCoreReset,
+    );
     if (nextAt > at) return { value: { status: "waiting", nextAt } };
-    // One nonce owns the control-plane transition, but only the sources whose
-    // persisted clocks are due may be read. In particular, a GraphQL minute
-    // sample cannot spend or retry the held core observer before its reset.
-    const resources = RATE_RESOURCES.filter((resource) => dueAt[resource] <= at);
     const nonce = randomUUID();
     const startedReservationIds = Object.entries(state.reservations)
       // An expired owner can no longer settle its request. Keep that uncertain
       // cost charged, but do not make every later probe wait for it to finish.
+      // Only work charging this resource is drained -- an unrelated lane's
+      // outstanding request says nothing about this counter.
       .filter(([, reservation]) => reservation.status === "started" &&
-        state.leases[reservation.leaseId]?.expiresAt > at)
+        state.leases[reservation.leaseId]?.expiresAt > at &&
+        reservationCost(reservation, resource, state.leases, at) > 0)
       .map(([id]) => id);
-    state.probeClaim = {
+    state.probeClaims[resource] = {
       ownerLeaseId: leaseId,
       nonce,
       leaseUntil: at + GOVERNOR_PROBE_LEASE_MS,
       nextAt: at,
       claimAt: at,
       startedReservationIds,
-      resources,
     };
-    if (resources.includes("core")) {
-      state.observers.core.outcome = "waiting";
-      state.observers.core.at = at;
-      state.observers.core.nextAt = at + GOVERNOR_PROBE_LEASE_MS;
-    }
-    if (resources.includes("graphql")) {
-      state.probeOutcome = { status: "waiting", at, nextAt: at + GOVERNOR_PROBE_LEASE_MS };
-    }
+    state.observers[resource].outcome = "waiting";
+    state.observers[resource].at = at;
+    state.observers[resource].nextAt = at + GOVERNOR_PROBE_LEASE_MS;
     return { value: {
       status: "claimed",
       nonce,
-      leaseUntil: state.probeClaim.leaseUntil,
+      resource,
+      leaseUntil: state.probeClaims[resource].leaseUntil,
       startedReservationIds,
-      resources,
-      coreEtag: state.observers.core.etag,
+      coreEtag: state.observers[resource].etag,
     } };
   });
 }
 
-function renewProbeClaim(scope, leaseId, nonce, nowMs) {
+function renewProbeClaim(scope, leaseId, nonce, nowMs, resource) {
   return mutateGovernor(scope, nowMs, (state, at) => {
-    const claim = state.probeClaim;
+    const claim = state.probeClaims[resource];
     if (!claim || claim.ownerLeaseId !== leaseId || claim.nonce !== nonce || claim.leaseUntil <= at) {
       return { ok: false, reason: "stale" };
     }
@@ -3847,7 +4104,13 @@ function budgetFromObservation(raw, previous, nowMs, {
     blockReason: blockActive ? previous.blockReason : null,
     laneNextAt: epochChanged ? nowMs : previous.laneNextAt,
     roundRobinCursor: previous?.roundRobinCursor ?? null,
-    lastExternalFactor: previous?.lastExternalFactor ?? 1,
+    // A new epoch is a new accounting window, so what other clients did in the
+    // last one is not evidence about this one. The baseline and the local
+    // accumulation below are already reset here; carrying the factor across
+    // kept throttling this window on a ratio measured in a window that is over.
+    // Only a claimed observer can open an epoch, so this cannot be moved by a
+    // stale or reordered response.
+    lastExternalFactor: epochChanged ? 1 : (previous?.lastExternalFactor ?? 1),
     epoch,
     source,
     factorBaseline: epochChanged || !previous?.factorBaseline
@@ -3858,23 +4121,23 @@ function budgetFromObservation(raw, previous, nowMs, {
   return { status: "accepted", budget: next, epochChanged };
 }
 
-function publishProbe(scope, leaseId, nonce, budgets, nowMs) {
+function publishProbe(scope, leaseId, nonce, budgets, nowMs, resource) {
   return mutateGovernor(scope, nowMs, (state, at) => {
-    const claim = state.probeClaim;
+    const claim = state.probeClaims[resource];
     if (!claim || claim.ownerLeaseId !== leaseId || claim.nonce !== nonce || claim.leaseUntil <= at) {
       return { ok: false, reason: "stale" };
     }
     const nextBudgets = { ...state.budgets };
     const nextEpochs = { ...state.epochs };
+    // Captured before the publication overwrites it: the reset this epoch
+    // change supersedes is the boundary the GraphQL observer is measured against.
+    const supersededCoreResetMs = state.budgets.core?.resetMs;
     const changedResources = [];
     const resetResources = [];
-    if (!claim.resources.every((resource) => budgets?.[resource])) {
-      return { ok: false, reason: "corrupt" };
-    }
+    if (!budgets?.[resource]) return { ok: false, reason: "corrupt" };
     const observerCosts = {};
-    for (const resource of claim.resources) {
-      const supplied = budgets?.[resource];
-      if (!supplied) continue;
+    {
+      const supplied = budgets[resource];
       const raw = supplied.budget ?? supplied;
       // The owner source names what actually established the number. Calling a
       // GraphQL budget a "rate-limit-probe" was accurate when /rate_limit supplied
@@ -3890,19 +4153,20 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs) {
         allowEpochChange: true,
       });
       if (observed.status === "invalid") return { ok: false, reason: "corrupt" };
-      if (observed.status === "ignored") continue;
-      // The observer's own cost is local spend. Left out, the external-factor
-      // reconciliation below attributes it to other clients, and the governor
-      // throttles the user's real work to make room for its own probing.
-      observerCosts[resource] = Number.isSafeInteger(supplied.cost) && supplied.cost > 0 ? supplied.cost : 0;
-      nextBudgets[resource] = observed.budget;
-      if (resource === "core" && supplied.blocked === true) {
-        nextBudgets[resource].blockUntil = observed.budget.resetMs;
-        nextBudgets[resource].blockReason = "rate-limit";
+      if (observed.status !== "ignored") {
+        // The observer's own cost is local spend. Left out, the external-factor
+        // reconciliation below attributes it to other clients, and the governor
+        // throttles the user's real work to make room for its own probing.
+        observerCosts[resource] = Number.isSafeInteger(supplied.cost) && supplied.cost > 0 ? supplied.cost : 0;
+        nextBudgets[resource] = observed.budget;
+        if (resource === "core" && supplied.blocked === true) {
+          nextBudgets[resource].blockUntil = observed.budget.resetMs;
+          nextBudgets[resource].blockReason = "rate-limit";
+        }
+        nextEpochs[resource] = observed.budget.epoch;
+        changedResources.push(resource);
+        if (observed.epochChanged && state.epochs[resource] !== null) resetResources.push(resource);
       }
-      nextEpochs[resource] = observed.budget.epoch;
-      changedResources.push(resource);
-      if (observed.epochChanged && state.epochs[resource] !== null) resetResources.push(resource);
     }
     if (changedResources.length === 0) return { ok: false, reason: "corrupt" };
     const completedBeforeClaim = Object.entries(state.reservations)
@@ -3920,19 +4184,32 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs) {
           total + (reservation.completedAt > baseline.observedAt
             ? reservationCost(reservation, resource, state.leases, at)
             : 0), 0);
+      const globalUsedDelta = nextBudgets[resource].used - baseline.used;
+      const sharedCompletedDelta = previous.knownLocalUsed + legacyCompletedDelta + (observerCosts[resource] ?? 0);
       const factor = nextExternalFactor({
         lastExternalFactor: previous.lastExternalFactor,
-        globalUsedDelta: nextBudgets[resource].used - baseline.used,
-        sharedCompletedDelta: previous.knownLocalUsed + legacyCompletedDelta + (observerCosts[resource] ?? 0),
+        globalUsedDelta,
+        sharedCompletedDelta,
       });
       if (factor === null) return { ok: false, reason: "corrupt" };
       nextBudgets[resource].lastExternalFactor = factor;
-      nextBudgets[resource].factorBaseline = {
-        epoch: nextBudgets[resource].epoch,
-        used: nextBudgets[resource].used,
-        observedAt: nextBudgets[resource].observedAt,
-      };
-      nextBudgets[resource].knownLocalUsed = 0;
+      // Closing the window costs the evidence in it, so only a window that
+      // actually reconciled may close. Four local units observed twice are
+      // eight, and eight are enough; discarding each four because neither
+      // reached five on its own is what kept a factor of seven alive through
+      // any amount of purely local spend.
+      if (externalSampleIsUsable({ globalUsedDelta, sharedCompletedDelta })) {
+        nextBudgets[resource].factorBaseline = {
+          epoch: nextBudgets[resource].epoch,
+          used: nextBudgets[resource].used,
+          observedAt: nextBudgets[resource].observedAt,
+        };
+        nextBudgets[resource].knownLocalUsed = 0;
+      }
+      // Otherwise both are left exactly as the observation produced them, which
+      // is the previous baseline and the previous local total. Rewriting them
+      // here would count the same completed reservations twice: they are still
+      // in the ledger precisely because the baseline did not advance past them.
     }
     for (const [id, reservation] of completedBeforeClaim) {
       const accountedByEveryResource = RATE_RESOURCES.every((resource) =>
@@ -3942,24 +4219,41 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs) {
     }
     state.budgets = nextBudgets;
     state.epochs = nextEpochs;
-    state.probeClaim = null;
-    if (claim.resources.includes("core")) {
-      const core = nextBudgets.core;
-      state.observers.core = {
-        etag: typeof budgets.core.etag === "string" ? budgets.core.etag : state.observers.core.etag,
+    state.probeClaims[resource] = null;
+    {
+      const published = nextBudgets[resource];
+      state.observers[resource] = {
+        etag: typeof budgets[resource].etag === "string" ? budgets[resource].etag : state.observers[resource].etag,
         outcome: "healthy",
         at,
-        nextAt: core.remaining === 0
-          ? core.resetMs + BUDGET_RESET_GRACE_MS
+        // A resource observed as empty is due again at its own reset, not at the
+        // ordinary cadence: probing an exhausted counter to be told it is still
+        // exhausted spends against it for nothing.
+        nextAt: published.remaining === 0
+          ? published.resetMs + BUDGET_RESET_GRACE_MS
           : at + BUDGET_PROBE_MS,
       };
     }
-    if (claim.resources.includes("graphql")) {
-      state.probeOutcome = {
-        status: "healthy",
-        at,
-        nextAt: at + BUDGET_PROBE_MS,
-      };
+    // A core reset opens a new shared accounting epoch, so the GraphQL counter
+    // is due with it: external-spend baselines and the protected
+    // one-publication reset contract have to advance together. A refresh that
+    // reads GraphQL before core has already done this, because core's old reset
+    // time still said GraphQL was due when that claim was evaluated. What
+    // cannot see it is a pane whose GraphQL observer last ran before the reset
+    // -- another pane published this epoch first, moving the reset out of
+    // reach. Only that case still owes an observation, so only that case is
+    // pulled forward; marking it unconditionally spends a second point to
+    // re-read a counter this same cycle has just read. An exhausted GraphQL
+    // counter waits for its own reset either way.
+    if (resource === "core" && resetResources.includes("core")) {
+      const graphql = nextBudgets.graphql;
+      const heldToReset = graphql && graphql.remaining === 0 &&
+        at < graphql.resetMs + BUDGET_RESET_GRACE_MS;
+      const observedSinceReset = Number.isFinite(supersededCoreResetMs) &&
+        state.observers.graphql.at >= supersededCoreResetMs;
+      if (!heldToReset && !observedSinceReset) {
+        state.observers.graphql.nextAt = Math.min(state.observers.graphql.nextAt || at, at);
+      }
     }
     if (resetResources.length > 0) state.manualProbe = null;
     else if (state.manualProbe &&
@@ -3976,24 +4270,22 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs) {
   });
 }
 
-function failProbeClaim(scope, leaseId, nonce, nowMs) {
+function failProbeClaim(scope, leaseId, nonce, nowMs, resource) {
   return mutateGovernor(scope, nowMs, (state, at) => {
-    const claim = state.probeClaim;
+    const claim = state.probeClaims[resource];
     if (!claim || claim.ownerLeaseId !== leaseId || claim.nonce !== nonce) {
       return { ok: false, reason: "stale" };
     }
-    state.probeClaim = null;
-    if (claim.resources.includes("graphql")) {
-      state.probeOutcome = { status: "failed", at, nextAt: at + BUDGET_PROBE_MS };
-    }
-    if (claim.resources.includes("core")) {
-      state.observers.core = {
-        ...state.observers.core,
-        outcome: "failed",
-        at,
-        nextAt: at + BUDGET_PROBE_MS,
-      };
-    }
+    // Only this resource's readiness is affected. A failed GraphQL observer that
+    // also marked core failed would erase authority core had legitimately
+    // established, and stall a lane with nothing wrong with it.
+    state.probeClaims[resource] = null;
+    state.observers[resource] = {
+      ...state.observers[resource],
+      outcome: "failed",
+      at,
+      nextAt: at + BUDGET_PROBE_MS,
+    };
     return { value: { retryAt: at + BUDGET_PROBE_MS } };
   });
 }
@@ -4015,7 +4307,7 @@ function requestManualProbe(scope, leaseId, epoch, observedAt, nowMs) {
         : Math.min(state.observers.core.nextAt || at, at);
     }
     if (state.epochs.graphql === epoch) {
-      state.probeOutcome.nextAt = Math.min(state.probeOutcome.nextAt || at, at);
+      state.observers.graphql.nextAt = Math.min(state.observers.graphql.nextAt || at, at);
     }
     return { value: { status: "pending", ...state.manualProbe } };
   });
@@ -4118,6 +4410,10 @@ function cancelIntent(scope, intentId, nowMs) {
       return { ok: false, reason: "stale" };
     }
     delete state.reservations[reservationId];
+    // The request never started, so the whole slot it was paced into is free.
+    for (const resource of RATE_RESOURCES) {
+      returnPacingCredit(state, resource, reservation.costs[resource], nowMs ?? Date.now());
+    }
     return { value: { status: "cancelled", intentId, reservationId } };
   });
 }
@@ -4131,8 +4427,14 @@ function startReservation(scope, reservationId, nowMs) {
       return { ok: false, reason: "stale", write: Boolean(reservation) };
     }
     if (reservation.notBefore > at) return { value: { status: "waiting", notBefore: reservation.notBefore } };
-    if (state.probeClaim && state.probeClaim.leaseUntil > at) {
-      return { value: { status: "waiting", reason: "probe", notBefore: state.probeClaim.leaseUntil } };
+    // Any live observer claim defers a start: the claim owns the shared HTTP
+    // permit for its window, so starting here would contend for it.
+    const liveClaim = RATE_RESOURCES
+      .map((resource) => state.probeClaims[resource])
+      .filter((claim) => claim && claim.leaseUntil > at)
+      .sort((left, right) => right.leaseUntil - left.leaseUntil)[0];
+    if (liveClaim) {
+      return { value: { status: "waiting", reason: "probe", notBefore: liveClaim.leaseUntil } };
     }
     for (const resource of RATE_RESOURCES.filter((name) => reservation.costs[name] > 0)) {
       const budget = state.budgets[resource];
@@ -4267,6 +4569,15 @@ function settleReservationWithBudgetObservations(
         acceptedAfterBaseline[resource],
       );
     }
+    // Only a measured outcome knows what it spent. A timeout, abort or process
+    // loss proves nothing, so its worst case stays charged and its pacing stays
+    // spent -- refunding there would let a run of timeouts pace as though
+    // nothing had been sent.
+    if (completion.outcome === "measured-success") {
+      for (const resource of RATE_RESOURCES) {
+        returnPacingCredit(state, resource, reservation.costs[resource] - measured[resource], at);
+      }
+    }
     scheduleGovernorState(state, at);
     return { value: {
       status: "completed",
@@ -4289,8 +4600,8 @@ function recordResourceBlock(scope, resource, resetMs, reason) {
         resetMs + BUDGET_RESET_GRACE_MS,
       );
     } else {
-      state.probeOutcome.nextAt = Math.min(
-        state.probeOutcome.nextAt || resetMs + BUDGET_RESET_GRACE_MS,
+      state.observers.graphql.nextAt = Math.min(
+        state.observers.graphql.nextAt || resetMs + BUDGET_RESET_GRACE_MS,
         resetMs + BUDGET_RESET_GRACE_MS,
       );
     }
@@ -4326,7 +4637,7 @@ function governorHealth(result, nowMs = Date.now()) {
   if (!result?.ok) return { status: "unavailable", leases: 0, resources: {} };
   const state = result.value;
   let status = "healthy";
-  if (state.probeClaim?.leaseUntil > nowMs) status = "waiting for probe";
+  if (RATE_RESOURCES.some((resource) => state.probeClaims[resource]?.leaseUntil > nowMs)) status = "waiting for probe";
   else if (RATE_RESOURCES.some((resource) => !state.budgets[resource] ||
     nowMs - state.budgets[resource].observedAt > budgetSnapshotTtl(resource))) status = "stale";
   else if (RATE_RESOURCES.some((resource) => state.budgets[resource].blockUntil > nowMs)) status = "blocked";
@@ -4354,7 +4665,40 @@ async function retryGovernorMutation(run, { now, wait, deadline, signal }) {
   return result;
 }
 
-async function refreshSharedBudget(scope, leaseId, signal, {
+// Each resource refreshes on its own claim. A slow or failing observer for one
+// must not delay or invalidate the other's readiness -- nothing about the
+// resources couples them. What still couples them is the shared HTTP permit and
+// any account-wide secondary hold, and those are enforced where they belong.
+// Core is refreshed last because its publication is what reopens data
+// admission. Finishing the cycle's control work before that happens stops a
+// pane that merely published the reset from getting a head start, over the
+// shared permit, on higher-priority work waiting for the same lane. It is also
+// the order readSharedBudgetSources reads its sources in, and the order the
+// single claim this replaced already used, so the sequence of actual HTTP
+// calls is unchanged.
+const BUDGET_REFRESH_ORDER = ["graphql", "core"];
+
+async function refreshSharedBudget(scope, leaseId, signal, options = {}) {
+  const outcomes = [];
+  for (const resource of BUDGET_REFRESH_ORDER) {
+    outcomes.push([resource, await refreshResourceBudget(scope, leaseId, signal, resource, options)]);
+  }
+  const published = outcomes.filter(([, result]) => result.ok);
+  if (published.length === 0) return outcomes[0][1];
+  const inspect = options.inspect ?? inspectGovernor;
+  const now = options.now ?? (() => scopeNow(scope));
+  const snapshot = inspect(scope, now());
+  return {
+    ok: true,
+    value: {
+      status: "published",
+      budgets: snapshot.ok ? snapshot.value.budgets : {},
+      resources: published.map(([resource]) => resource),
+    },
+  };
+}
+
+async function refreshResourceBudget(scope, leaseId, signal, resource, {
   readBudgets = readSharedBudgetSources,
   now = () => scopeNow(scope),
   wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -4363,7 +4707,7 @@ async function refreshSharedBudget(scope, leaseId, signal, {
   publish = publishProbe,
   fail = failProbeClaim,
 } = {}) {
-  let claim = claimProbe(scope, leaseId, now());
+  let claim = claimProbe(scope, leaseId, now(), resource);
   if (!claim.ok) return claim;
   if (claim.value.status !== "claimed") {
     const startedAt = now();
@@ -4376,32 +4720,33 @@ async function refreshSharedBudget(scope, leaseId, signal, {
       inspections += 1;
       const snapshot = inspect(scope, now());
       if (!snapshot.ok) return snapshot;
+      // Only this resource's freshness matters here. Waiting on the other's
+      // observer is what made one failing lane stall an unrelated healthy one.
       if (
-        RATE_RESOURCES.every((resource) =>
-          snapshot.value.budgets[resource] &&
-          now() - snapshot.value.budgets[resource].observedAt <= budgetSnapshotTtl(resource),
-        ) && snapshot.value.probeOutcome.status === "healthy"
+        snapshot.value.budgets[resource] &&
+        now() - snapshot.value.budgets[resource].observedAt <= budgetSnapshotTtl(resource) &&
+        snapshot.value.observers[resource].outcome === "healthy"
       ) {
         return { ok: true, value: { status: "published", budgets: snapshot.value.budgets } };
       }
       if (now() >= deadline || inspections >= 10) break;
       await wait(Math.min(100, Math.max(1, deadline - now())));
     }
-    claim = claimProbe(scope, leaseId, now());
+    claim = claimProbe(scope, leaseId, now(), resource);
     if (!claim.ok || claim.value.status !== "claimed") return claim;
   }
-  const { nonce, startedReservationIds, resources = RATE_RESOURCES, coreEtag = null } = claim.value;
+  const { nonce, startedReservationIds, coreEtag = null } = claim.value;
   const drainUntil = now() + GOVERNOR_PROBE_DRAIN_MS;
   while (startedReservationIds.length > 0 && now() < drainUntil) {
     const snapshot = inspect(scope, now());
     if (!snapshot.ok) {
-      failProbeClaim(scope, leaseId, nonce, now());
+      failProbeClaim(scope, leaseId, nonce, now(), resource);
       return snapshot;
     }
     const stillStarted = startedReservationIds.some((id) => snapshot.value.reservations[id]?.status === "started");
     if (!stillStarted) break;
     if (signal?.aborted) {
-      failProbeClaim(scope, leaseId, nonce, now());
+      failProbeClaim(scope, leaseId, nonce, now(), resource);
       return { ok: false, reason: "stale" };
     }
     await wait(Math.min(100, Math.max(1, drainUntil - now())));
@@ -4412,11 +4757,11 @@ async function refreshSharedBudget(scope, leaseId, signal, {
     renewalStartedAt + GOVERNOR_PROBE_TRANSITION_MS,
   );
   const renewed = await retryGovernorMutation(
-    () => renew(scope, leaseId, nonce, now()),
+    () => renew(scope, leaseId, nonce, now(), resource),
     { now, wait, deadline: renewalDeadline, signal },
   );
   if (!renewed.ok) {
-    failProbeClaim(scope, leaseId, nonce, now());
+    failProbeClaim(scope, leaseId, nonce, now(), resource);
     return renewed;
   }
   // Known exhaustion waits for its actual reset. The GraphQL observer costs a
@@ -4424,24 +4769,23 @@ async function refreshSharedBudget(scope, leaseId, signal, {
   // the hole deeper -- the /rate_limit read this replaced was free and could
   // afford to be unconditional.
   const beforeRead = inspect(scope, now());
-  const spendable = resources.filter((resource) => {
-    if (resource !== "graphql" || !beforeRead.ok) return true;
-    const budget = beforeRead.value.budgets.graphql;
-    return !(budget && budget.remaining <= 0 && now() < budget.resetMs + BUDGET_RESET_GRACE_MS);
-  });
-  if (spendable.length === 0) {
-    failProbeClaim(scope, leaseId, nonce, now());
+  const exhausted = resource === "graphql" && beforeRead.ok &&
+    beforeRead.value.budgets.graphql &&
+    beforeRead.value.budgets.graphql.remaining <= 0 &&
+    now() < beforeRead.value.budgets.graphql.resetMs + BUDGET_RESET_GRACE_MS;
+  if (exhausted) {
+    failProbeClaim(scope, leaseId, nonce, now(), resource);
     return { ok: false, reason: "budget-reset" };
   }
   let budgets;
   try {
     budgets = await requestIdentityStorage.run(scope, () => readBudgets(signal, scope.host, {
-      resources: spendable,
+      resources: [resource],
       coreEtag,
       renewClaim: async () => {
         const startedAt = now();
         const extended = await retryGovernorMutation(
-          () => renew(scope, leaseId, nonce, now()),
+          () => renew(scope, leaseId, nonce, now(), resource),
           {
             now,
             wait,
@@ -4462,7 +4806,7 @@ async function refreshSharedBudget(scope, leaseId, signal, {
       now() + GOVERNOR_PROBE_TRANSITION_MS,
     );
     await retryGovernorMutation(
-      () => fail(scope, leaseId, nonce, now()),
+      () => fail(scope, leaseId, nonce, now(), resource),
       { now, wait, deadline: failureDeadline, signal },
     );
     return { ok: false, reason: "stale" };
@@ -4472,12 +4816,12 @@ async function refreshSharedBudget(scope, leaseId, signal, {
     now() + GOVERNOR_PROBE_TRANSITION_MS,
   );
   const published = await retryGovernorMutation(
-    () => publish(scope, leaseId, nonce, budgets, now()),
+    () => publish(scope, leaseId, nonce, budgets, now(), resource),
     { now, wait, deadline: transitionDeadline, signal },
   );
   if (!published.ok) {
     await retryGovernorMutation(
-      () => fail(scope, leaseId, nonce, now()),
+      () => fail(scope, leaseId, nonce, now(), resource),
       { now, wait, deadline: transitionDeadline, signal },
     );
   }
@@ -7499,14 +7843,20 @@ function retryPollAfterAdmissionFailure({
 
 function governorWakeTimes(state, nowMs, floorMs, leaseId = null) {
   const budgets = Object.values(state?.budgets ?? {});
-  const observedCandidates = state?.probeOutcome?.status === "failed"
-    ? []
-    : budgets.map((budget) => budget.observedAt + BUDGET_PROBE_MS);
+  // A failed observer's own retry, not its stale sample's cadence, says when
+  // that resource is next worth reading. Suppress the cadence per resource: a
+  // global suppression let one failure silence a healthy lane's wake, and no
+  // suppression let the failed lane spin on the sample it already knows is old.
+  const observedCandidates = RATE_RESOURCES.flatMap((resource) => {
+    const budget = state?.budgets?.[resource];
+    if (!budget || state?.observers?.[resource]?.outcome === "failed") return [];
+    return [budget.observedAt + BUDGET_PROBE_MS];
+  });
   const controlAt = Math.min(
     ...observedCandidates,
     ...budgets.map((budget) => budget.resetMs + BUDGET_RESET_GRACE_MS),
-    state?.probeClaim?.leaseUntil ?? Number.POSITIVE_INFINITY,
-    state?.probeOutcome?.nextAt ?? Number.POSITIVE_INFINITY,
+    ...RATE_RESOURCES.map((resource) => state?.probeClaims?.[resource]?.leaseUntil ?? Number.POSITIVE_INFINITY),
+    ...RATE_RESOURCES.map((resource) => state?.observers?.[resource]?.nextAt ?? Number.POSITIVE_INFINITY),
   );
   const reservationAt = Object.values(state?.reservations ?? {})
     .filter((reservation) => reservation.status === "scheduled" &&
@@ -7521,7 +7871,8 @@ function governorWakeTimes(state, nowMs, floorMs, leaseId = null) {
 function governorProtocolReady(refreshResult, snapshot, nowMs) {
   if (!refreshResult?.ok || !snapshot?.ok) return false;
   if (["waiting", "paused", "probe"].includes(refreshResult.value?.status)) return false;
-  if (snapshot.value.probeClaim || snapshot.value.probeOutcome?.status !== "healthy") return false;
+  if (RATE_RESOURCES.some((resource) => snapshot.value.probeClaims[resource]) ||
+    RATE_RESOURCES.some((resource) => snapshot.value.observers[resource]?.outcome !== "healthy")) return false;
   return RATE_RESOURCES.every((resource) => {
     const budget = snapshot.value.budgets[resource];
     return budget && nowMs - budget.observedAt <= budgetSnapshotTtl(resource);
@@ -7691,7 +8042,7 @@ function rateLimitBlockDecision(results, resetMs) {
 const IDENTITY_COORDINATION_REASONS = [
   "restart-required", "migration-hold", "legacy-unresolved", "legacy-corrupt",
   "credential-unavailable", "identity-backoff", "identity-busy",
-  "identity-unavailable", "identity-capacity", "transport-busy",
+  "identity-unavailable", "identity-capacity", "transport-busy", "throttle-paused",
 ];
 
 function coordinationNotice(reason) {
@@ -10776,6 +11127,7 @@ export {
   governorPhaseOffset,
   scheduleIntents,
   GOVERNOR_STATE_VERSION,
+  RATE_RESOURCES,
   GOVERNOR_MAX_LEASES,
   GOVERNOR_MAX_INTENTS,
   GOVERNOR_MAX_RESERVATIONS,
@@ -10801,6 +11153,16 @@ export {
   heartbeatLease,
   maintainControlLease,
   claimProbe,
+  classifyThrottle,
+  applyTransportCooldown,
+  clearTransportThrottle,
+  emptyTransportThrottle,
+  throttleLadderMs,
+  transportCooldownDeadline,
+  retryThrottledTransport,
+  THROTTLE_LADDER_MS,
+  THROTTLE_PAUSE_AFTER,
+  MANUAL_GRANT_STREAK_LIMIT,
   renewProbeClaim,
   publishProbe,
   failProbeClaim,

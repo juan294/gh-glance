@@ -192,22 +192,36 @@ test("--doctor claims the core observer and uses its persisted ETag before calli
     phaseSeed: { seed: leaseId, registeredAt: now },
     demand: { core: 2, graphql: 0 },
   }).ok, true);
-  const claim = claimProbe(scope, leaseId, now);
+  // Seeding the identity already published the core observer and its ETag, so
+  // core is not due again for a minute; GraphQL never has been. Claim and
+  // publish GraphQL alone -- the ledger then holds a GraphQL budget that only
+  // the doctor's own claimed observer can move, which is what the used-count
+  // assertion below actually tests.
+  const claim = claimProbe(scope, leaseId, now, "graphql");
   assert.equal(claim.value.status, "claimed");
   const resetMs = Math.floor((now + 3_600_000) / 1_000) * 1_000;
   assert.equal(publishProbe(scope, leaseId, claim.value.nonce, {
-    core: {
-      source: "core-observer",
-      etag: '"fixture-user-v1"',
-      budget: { limit: 5000, used: 1, remaining: 4999, resetMs },
-    },
     graphql: {
       source: "graphql-observer",
       budget: { limit: 5000, used: 0, remaining: 5000, resetMs },
     },
-  }, now).ok, true);
-  const core = inspectGovernor(scope, now).value.budgets.core;
-  assert.equal(requestManualProbe(scope, leaseId, core.epoch, core.observedAt, Date.now()).ok, true);
+  }, now, "graphql").ok, true);
+  // Both observers have to be due, and each is made due by naming its own
+  // epoch: requestManualProbe only pulls an observer forward when the epoch it
+  // is given matches that resource's. Asking with core's epoch alone worked
+  // only when both resources happened to share one, which they do only when the
+  // fixture derived both resets inside the same second -- every call computes
+  // its own `now + 3600s`. Straddling a second boundary left GraphQL not due,
+  // doctor rightly skipped its observer, and this test failed on CI for a race
+  // in its own setup.
+  const budgets = inspectGovernor(scope, now).value.budgets;
+  for (const resource of ["core", "graphql"]) {
+    assert.equal(
+      requestManualProbe(scope, leaseId, budgets[resource].epoch, budgets[resource].observedAt, Date.now()).ok,
+      true,
+      resource,
+    );
+  }
 
   await doctor({
     env: {
@@ -228,7 +242,13 @@ test("--doctor claims the core observer and uses its persisted ETag before calli
   assert.equal(calls.filter((line) => /api rate_limit(?: |$)/.test(line)).length, 1);
   assert.ok(
     calls.some((line) => /^api -i graphql --input -/.test(line)),
-    "doctor did not run the claimed GraphQL observer",
+    // This has failed on CI and never locally, so the failure has to carry its
+    // own diagnosis: which gh calls were made, and what the governor thought
+    // when it decided. Without them the next occurrence says only "no GraphQL
+    // call happened", which is where the last investigation ran out of road.
+    `doctor did not run the claimed GraphQL observer.\ngh calls:\n${
+      calls.filter(Boolean).map((line) => `  ${line}`).join("\n") || "  (none)"
+    }\ngovernor: ${JSON.stringify(inspectGovernor(scope, Date.now()).value, null, 1)}`,
   );
   const state = inspectGovernor(scope, Date.now()).value;
   // 1, from the observer's own meter -- not 10, which was the display probe's

@@ -32,6 +32,9 @@ if (!scopeResult.ok) {
 }
 
 const scope = scopeResult.value;
+// Observers are claimed per resource. Commands that do not name one mean core,
+// which is what every caller predating the split was asking for.
+const resource = command.resource ?? "core";
 let result;
 const waitCell = new Int32Array(new SharedArrayBuffer(4));
 function retryBusy(operation) {
@@ -47,7 +50,7 @@ switch (command.operation) {
   case "register-claim": {
     const registered = retryBusy(() => registerLease(scope, command.lease));
     result = registered.ok
-      ? { registered, claim: retryBusy(() => claimProbe(scope, command.lease.id, command.now)) }
+      ? { registered, claim: retryBusy(() => claimProbe(scope, command.lease.id, command.now, resource)) }
       : { registered };
     break;
   }
@@ -61,7 +64,7 @@ switch (command.operation) {
   case "claim-hold": {
     const registered = retryBusy(() => registerLease(scope, command.lease));
     const claim = registered.ok
-      ? retryBusy(() => claimProbe(scope, command.lease.id, command.now))
+      ? retryBusy(() => claimProbe(scope, command.lease.id, command.now, resource))
       : registered;
     process.stdout.write(`${JSON.stringify({ ready: true, registered, claim })}\n`);
     Atomics.wait(waitCell, 0, 0, command.holdMs ?? 10_000);
@@ -77,8 +80,8 @@ switch (command.operation) {
   }
   case "registerLease": result = retryBusy(() => registerLease(scope, command.payload)); break;
   case "heartbeatLease": result = retryBusy(() => heartbeatLease(scope, command.leaseId, command.demand, command.now)); break;
-  case "claimProbe": result = retryBusy(() => claimProbe(scope, command.leaseId, command.now)); break;
-  case "publishProbe": result = retryBusy(() => publishProbe(scope, command.leaseId, command.nonce, command.budgets, command.now)); break;
+  case "claimProbe": result = retryBusy(() => claimProbe(scope, command.leaseId, command.now, resource)); break;
+  case "publishProbe": result = retryBusy(() => publishProbe(scope, command.leaseId, command.nonce, command.budgets, command.now, resource)); break;
   case "requestManualProbe": result = retryBusy(() => requestManualProbe(scope, command.leaseId, command.epoch, command.observedAt, command.now)); break;
   case "registerIntent": result = retryBusy(() => registerIntent(scope, command.payload)); break;
   case "readIntentDecision": result = retryBusy(() => readIntentDecision(scope, command.intentId, command.now)); break;
