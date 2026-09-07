@@ -449,6 +449,15 @@ test("coordination notices translate raw reasons without exposing internal vocab
   for (const reason of ["corrupt", "unwritable", "unknown-host", "new-internal-reason"]) {
     assert.equal(coordinationNotice(reason), "Can't coordinate API use — retrying");
   }
+  // Waiting and being stuck are different things, and sharing one message meant
+  // a hold with no deadline read as a temporary one -- for weeks, in a real
+  // case. Only the first of these ends on its own.
+  assert.equal(coordinationNotice("migration-hold"), "Upgrade waiting for legacy quota reset");
+  assert.equal(
+    coordinationNotice("legacy-unresolved"),
+    "Upgrade blocked: older spend cannot be settled or waited out",
+  );
+  assert.notEqual(coordinationNotice("legacy-unresolved"), coordinationNotice("migration-hold"));
 });
 
 test("structured tab errors select actionable one-line remedies", () => {

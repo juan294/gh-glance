@@ -3072,7 +3072,14 @@ function retryThrottledTransport(root, host, { now = Date.now } = {}) {
 
 function identityCoordinationMessage(reason) {
   if (reason === "restart-required") return "Restart required: close older gh-glance panes";
-  if (["migration-hold", "legacy-unresolved"].includes(reason)) return "Upgrade waiting for legacy quota reset";
+  // These two were one message for a long time, and the difference between them
+  // is the difference between waiting and being stuck. A migration hold has a
+  // deadline and ends by itself. An unresolved legacy ledger has no deadline at
+  // all -- it holds unsettled spend with no reset recorded to wait for -- so the
+  // same wording had people waiting weeks for something that was never going to
+  // arrive. Say which one it is.
+  if (reason === "migration-hold") return "Upgrade waiting for legacy quota reset";
+  if (reason === "legacy-unresolved") return "Upgrade blocked: older spend cannot be settled or waited out";
   if (["legacy-corrupt", "corrupt"].includes(reason)) return "Coordination state unavailable; evidence preserved";
   if (reason === "transport-busy") return "Shared HTTP request or cooldown in progress";
   if (reason === "throttle-paused") return "Paused after repeated rate limits; refresh to retry";
