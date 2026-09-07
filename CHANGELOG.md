@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-09-07
+
+### Fixed
+
+- **Upgrading from 0.12.0 no longer leaves every pane unable to coordinate.**
+  0.13.0 moved the coordination protocol from version 3 to 5 but could migrate
+  only version 1, and unlike earlier protocol changes it kept the state file in
+  the same place. A pane upgrading therefore read its own file, could neither
+  validate nor migrate it, and reported unusable coordination state on every
+  launch from then on -- the read happens before any write, so nothing ever
+  replaced the file. Versions 2, 3 and 4 now upgrade in place, keeping the
+  unsettled charges and observed budgets they hold. A file from a *newer*
+  protocol is still refused, which is the recoverable direction: the newer build
+  is still there to rewrite it.
+
+- **Diagnostics and manual actions no longer pace as though they spent their
+  worst case.** Work is admitted against the most it could cost, and the
+  difference is returned once the real cost is known. That return was wired
+  into only one of the two settlement paths, so every `--doctor` probe and
+  manual operation kept paying for capacity it had not used, delaying later
+  requests for no reason.
+
 ## [0.13.0] - 2026-09-06
 
 ### Changed
@@ -904,7 +926,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/juan294/gh-glance/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/juan294/gh-glance/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/juan294/gh-glance/compare/v0.11.2...v0.12.0
 [0.11.2]: https://github.com/juan294/gh-glance/compare/v0.11.1...v0.11.2

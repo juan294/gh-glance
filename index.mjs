@@ -3510,7 +3510,36 @@ function serializeGovernorState(state) {
   return `${JSON.stringify(state)}\n`;
 }
 
+// Failing closed on a version this build does not write is right in one
+// direction only. An *older* binary meeting a newer file must refuse it, because
+// it cannot know what the new fields mean. A *newer* binary meeting an older
+// file at its own canonical path has to migrate it: the read happens before any
+// write, so refusing leaves the file in place and the pane never recovers. It is
+// not a transient failure, it is a permanent one, and every later launch repeats
+// it.
+//
+// That asymmetry was missed when the observer split moved the protocol from 3 to
+// 5. Versions 1 and 2 escaped it only because the file moved path at the same
+// time, so a new build simply found nothing and started clean; 3 onwards share a
+// path with 5 and collided.
 function migrateGovernorState(raw, nowMs) {
+  if (!isRecord(raw) || !Number.isSafeInteger(raw.version) || raw.version < 1) return null;
+  if (raw.version >= GOVERNOR_STATE_VERSION) return null;
+  if (raw.version === 1) return migrateV1GovernorState(raw, nowMs);
+  // Everything from 2 onwards is this build's shape or one adaptation away from
+  // it, and what it holds is worth keeping: the uncertain reservations are debts
+  // that must not be forgiven by an upgrade, and the budgets were written by the
+  // same observers this build trusts.
+  const shaped = raw.version >= GOVERNOR_OBSERVER_SPLIT_VERSION
+    ? structuredClone(raw)
+    : adaptPreSplitGovernorShape(raw);
+  if (!shaped) return null;
+  if (!isRecord(shaped.fairness)) shaped.fairness = { manualStreak: 0 };
+  shaped.version = GOVERNOR_STATE_VERSION;
+  return normalizeGovernorState(shaped, nowMs);
+}
+
+function migrateV1GovernorState(raw, nowMs) {
   if (!exactKeys(raw, [
     "version", "epochs", "budgets", "probeClaim", "probeOutcome", "leases",  // v1 shape
     "intents", "reservations", "manualProbe",
@@ -4478,6 +4507,15 @@ function completeReservation(scope, reservationId, completion, nowMs) {
     reservation.outcome = completion.outcome;
     reservation.actualCosts = { ...measured };
     reservation.accountedCosts = { core: 0, graphql: 0 };
+    // The same rule as the observing settlement path: this one narrows the
+    // charge in exactly the same way, so it releases the pacing in exactly the
+    // same way. Wiring it into only one of the two settlement paths left every
+    // doctor probe and manual operation paying for capacity it did not use.
+    if (completion.outcome === "measured-success") {
+      for (const resource of RATE_RESOURCES) {
+        returnPacingCredit(state, resource, reservation.costs[resource] - measured[resource], at);
+      }
+    }
     return { value: { status: "completed", actualCosts: reservation.actualCosts } };
   });
 }

@@ -19,6 +19,8 @@ import {
   cancelIntent,
   claimProbe,
   createGovernorScope,
+  writeGovernorState,
+  GOVERNOR_STATE_VERSION,
   inspectGovernor,
   publishProbe,
   registerIntent,
@@ -435,4 +437,63 @@ test("SCHED-02 a replan never refunds work whose real cost is unknown", (t) => {
   // timeouts pace as though nothing had been sent at all.
   startAndSettle(box, leaseId, grant, { outcome: "timeout" });
   assert.equal(laneOf(box), paced, "uncertain work must keep its reserved pacing");
+});
+
+// --- Upgrading in place ------------------------------------------------------
+
+// Shipped broken in 0.13.0: the protocol moved 3 -> 5 while the state file kept
+// its path, and migration accepted version 1 only. A pane upgrading from 0.12.0
+// therefore read its own file, failed to normalise it, failed to migrate it, and
+// reported corrupt state on every launch thereafter -- the read happens before
+// any write, so nothing ever replaced the file. Versions 1 and 2 had escaped it
+// only because the file moved path at the same time.
+function asVersion(state, version) {
+  const older = structuredClone(state);
+  older.version = version;
+  delete older.fairness;
+  if (version < 4) {
+    // The pre-split shape: one observer for core, a differently shaped
+    // probeOutcome standing in for GraphQL, and a single claim naming both.
+    delete older.observers;
+    delete older.probeClaims;
+    older.observers = { core: { etag: null, outcome: "idle", at: 0, nextAt: 0 } };
+    older.probeClaim = null;
+    older.probeOutcome = { status: "idle", at: 0, nextAt: 0 };
+  }
+  return older;
+}
+
+for (const version of [2, 3, 4]) {
+  test(`a version ${version} state file upgrades in place instead of reading as corrupt`, (t) => {
+    const box = sandbox(t, `upgrade-from-${version}`);
+    const leaseId = randomUUID();
+    lease(box, leaseId);
+    publishCore(box, leaseId, { used: 10 });
+    publishGraphql(box, leaseId);
+    const before = inspectGovernor(box.scope, box.at()).value;
+
+    assert.equal(writeGovernorState(box.scope.path, asVersion(before, version)).ok, true);
+    const migrated = inspectGovernor(box.scope, box.at());
+    assert.equal(migrated.ok, true, `version ${version} did not migrate: ${migrated.reason}`);
+    assert.equal(migrated.value.version, GOVERNOR_STATE_VERSION);
+    // The debts an upgrade must not forgive: uncertain work stays charged and
+    // the lease that owns it survives, rather than being cleared with the file.
+    assert.deepEqual(Object.keys(migrated.value.leases), [leaseId]);
+    assert.equal(migrated.value.fairness.manualStreak, 0);
+  });
+}
+
+test("a state file from a newer protocol is still refused rather than half-read", (t) => {
+  const box = sandbox(t, "upgrade-from-future");
+  const leaseId = randomUUID();
+  lease(box, leaseId);
+  publishCore(box, leaseId, { used: 10 });
+  publishGraphql(box, leaseId);
+  const future = structuredClone(inspectGovernor(box.scope, box.at()).value);
+  future.version = GOVERNOR_STATE_VERSION + 1;
+  assert.equal(writeGovernorState(box.scope.path, future).ok, true);
+  // The other direction of the same rule. This build cannot know what a later
+  // one added, so it must not guess -- and unlike the case above, refusing is
+  // recoverable: the newer build is still there to rewrite the file.
+  assert.equal(inspectGovernor(box.scope, box.at()).reason, "corrupt");
 });
