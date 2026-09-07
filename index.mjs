@@ -92,13 +92,18 @@ const ICON_HINT_AFTER_MS = 3000;
 // rows was paying several seconds per refresh for rows nobody sees. Actions is
 // a scrolling log whose count is arbitrary anyway, so it fetches only what the
 // pane can show -- one extra row tells us whether to render the count as "n+".
-const MIN_RUN_LIMIT = 20;
+// One stable request, not a pane-height-derived one. The limit used to track
+// the terminal's height, which meant two panes of different sizes asked two
+// different questions about the same repository: neither could reuse the
+// other's validator, and a resize invalidated the ETag for nothing. 60 is the
+// old ceiling -- above it a fetch outlasts REFRESH_MS and ticks are absorbed by
+// the in-flight guard -- and it comfortably covers the tallest pane.
+const ACTIONS_RUN_LIMIT = 60;
 
-// Ceiling on the pane-height-derived run limit. Without it a very tall terminal
-// asks for enough runs that the fetch outlasts REFRESH_MS, at which point ticks
-// are permanently absorbed by the in-flight guard and the effective refresh rate
-// silently becomes whatever `gh` can sustain.
-const MAX_RUN_LIMIT = 60;
+// The workflow catalog is now a fallback for runs whose own `name` is missing,
+// so it is worth caching for long enough that it costs nothing on a normal
+// session and short enough that a workflow renamed today shows up today.
+const WORKFLOW_CATALOG_TTL_MS = 15 * 60_000;
 
 // Issues and PRs are sets rather than logs: the count *is* the signal, so these
 // stay generous. They are also far cheaper, being bounded by what's open.
@@ -117,11 +122,37 @@ const ALERT_PER_PAGE = 100;
 const ALERT_QUERY = `?state=open&per_page=${ALERT_PER_PAGE}&sort=created&direction=desc`;
 
 // Inactive tabs only feed the tab-bar counts. One rotating background tab is
-// considered every four active floors, so each inactive tab is considered
-// about every Nth floor instead of all three starting together. The shared
-// governor can schedule either active or background demand later when that is
-// the safe resource slot.
+// considered per wake, so each inactive tab is considered about every Nth floor
+// instead of all three starting together. The shared governor can schedule
+// either active or background demand later when that is the safe resource slot.
 const BACKGROUND_EVERY = 12;
+
+// The cadence table. A floor is a floor and never a ceiling: every entry below
+// is the *earliest* normal check, so `--refresh 120` still means 120 seconds.
+//
+// Running or queued Actions are the one thing worth asking about faster than a
+// quiet repository, and 5s is fast enough that a run's transition is visible
+// while it still means something.
+const POLL_ACTIVE_CI_MS = 5_000;
+// Two successful unchanged observations, not one. A single 304 is not evidence
+// that a repository is quiet, and slowing to the quiet cadence on it would
+// delay the first real change by a whole interval for no reason.
+const POLL_QUIET_AFTER = 2;
+const POLL_QUIET_MS = Object.freeze({
+  actions: 30_000,
+  issues: 30_000,
+  prs: 30_000,
+  // Alerts are the slowest-moving surface here and the most expensive to read.
+  security: 60_000,
+});
+// Inactive demand only feeds the tab-bar counts, so it is paced by whichever is
+// slower: this app's own background interval, or BACKGROUND_EVERY floors.
+const POLL_BACKGROUND_MS = Object.freeze({
+  actions: 120_000,
+  issues: 120_000,
+  prs: 120_000,
+  security: 300_000,
+});
 // What one fetch of each tab costs lives in REST_PER_FETCH / GRAPHQL_PER_FETCH,
 // declared with ALERT_SOURCES below because the security figure derives from it.
 
@@ -129,7 +160,7 @@ const BACKGROUND_EVERY = 12;
 // the in-flight guard was never cleared and that tab stopped fetching for the
 // life of the process while the spinner kept insisting it was working. The
 // timeout has to clear the slowest *legitimate* fetch by a wide margin -- the
-// MIN_RUN_LIMIT note above measures ~4.9s at 150 runs -- so it sits far above
+// ACTIONS_RUN_LIMIT note above measures ~4.9s at 150 runs -- so it sits far above
 // REFRESH_MS rather than near it. SIGKILL because `gh` mid-TLS-handshake can
 // ignore SIGTERM.
 const GH_TIMEOUT_MS = 30_000;
@@ -181,6 +212,7 @@ const runtime = {
   host: null,
   repoExplicit: false,
   refreshMs: REFRESH_MS,
+  background: "all",
   verbose: false,
   initialTabIndex: 0,
 };
@@ -850,7 +882,7 @@ async function ghApi(args, { operation, signal, etag = null, run = runGh } = {})
 
 // The version travels in the query key, so a changed document invalidates its
 // cursors instead of paging a new shape with an old cursor.
-const GRAPHQL_QUERY_VERSION = 1;
+const GRAPHQL_QUERY_VERSION = 2;
 // GitHub prices a connection by the pages it could return, and the row's single
 // label is a nested connection of its own. Two points is the conservative bound
 // for one page; the observer selects nothing but the meter and costs one.
@@ -1243,9 +1275,9 @@ function createFailureContextCoordinator({ resolve, commit, fallback }) {
   return { ensure, invalidate };
 }
 
-function actionsRunsArgs(limit) {
+function actionsRunsArgs() {
   return [
-    apiPath(`repos/{owner}/{repo}/actions/runs?exclude_pull_requests=true&per_page=${limit}`),
+    apiPath(`repos/{owner}/{repo}/actions/runs?exclude_pull_requests=true&per_page=${ACTIONS_RUN_LIMIT}`),
     ...apiHostArgs(),
     "--jq",
     // html_url is projected because a run's page must come from the row itself.
@@ -1253,7 +1285,11 @@ function actionsRunsArgs(limit) {
     // with an inferred repository the app never learns the slug, and the row is
     // the one place the answer is always present. It costs nothing extra: the
     // field is already in the response being parsed.
-    "[.workflow_runs[] | {databaseId: .id, displayTitle: .display_title, number: .run_number, headBranch: .head_branch, status, conclusion, startedAt: .run_started_at, updatedAt: .updated_at, workflowId: .workflow_id, url: .html_url}]",
+    //
+    // `name` is the workflow's name as of the run. Selecting it here is what
+    // turns the workflow catalog from an unconditional second request into a
+    // fallback for the rows that lack one.
+    "[.workflow_runs[] | {databaseId: .id, displayTitle: .display_title, workflowName: .name, number: .run_number, headBranch: .head_branch, status, conclusion, startedAt: .run_started_at, updatedAt: .updated_at, workflowId: .workflow_id, url: .html_url}]",
   ];
 }
 
@@ -1266,15 +1302,11 @@ function actionsWorkflowsArgs() {
   ];
 }
 
-function parseActionsBodies(runsBody, workflowsBody) {
-  const workflows = new Map(parseJsonOutput(workflowsBody).map((workflow) => [
-    workflow.id,
-    safe(workflow.name),
-  ]));
+function parseActionsRuns(runsBody) {
   return parseJsonOutput(runsBody).map((run) => ({
     databaseId: run.databaseId,
     displayTitle: safe(run.displayTitle),
-    workflowName: workflows.get(run.workflowId) ?? "",
+    workflowName: safe(run.workflowName ?? ""),
     number: run.number,
     headBranch: safe(run.headBranch),
     status: run.status,
@@ -1282,7 +1314,54 @@ function parseActionsBodies(runsBody, workflowsBody) {
     startedAt: run.startedAt,
     updatedAt: run.updatedAt,
     url: safe(run.url ?? ""),
+    workflowId: run.workflowId,
   }));
+}
+
+function parseWorkflowCatalog(workflowsBody, at, previous = null) {
+  // An attempt that produced no usable body still closes the TTL window, and
+  // keeps whatever names were already known. Re-asking once per poll for a
+  // catalog the server will not serve is the failure mode this replaces.
+  if (typeof workflowsBody !== "string" || workflowsBody.length === 0) {
+    return { at, names: previous?.names instanceof Map ? previous.names : new Map() };
+  }
+  return {
+    at,
+    names: new Map(parseJsonOutput(workflowsBody).map((workflow) => [workflow.id, safe(workflow.name)])),
+  };
+}
+
+function catalogNames(catalog) {
+  return catalog?.names instanceof Map ? catalog.names : new Map();
+}
+
+// The catalog is worth a request only when a run carries no name of its own and
+// its workflow id is not already known. A server that answers with names -- the
+// normal case -- never asks for it at all.
+function workflowCatalogDemand({ runs = [], catalog = null, nowMs = Date.now() }) {
+  const fresh = catalog && Number.isFinite(catalog.at) &&
+    nowMs - catalog.at < WORKFLOW_CATALOG_TTL_MS;
+  if (fresh) return false;
+  const names = catalogNames(catalog);
+  return runs.some((run) => !run.workflowName && !names.has(run.workflowId));
+}
+
+// A missing name renders empty rather than blocking the row. Everything else a
+// run carries -- its status, conclusion and title -- is exactly as useful
+// without the workflow's name, so an unreadable catalog must not cost CI status.
+function resolveWorkflowNames(runs, catalog) {
+  const names = catalogNames(catalog);
+  return runs.map(({ workflowId, ...run }) => ({
+    ...run,
+    workflowName: run.workflowName || names.get(workflowId) || "",
+  }));
+}
+
+function parseActionsBodies(runsBody, workflowsBody) {
+  return resolveWorkflowNames(
+    parseActionsRuns(runsBody),
+    parseWorkflowCatalog(workflowsBody, 0),
+  );
 }
 
 function entityKey(tab, path) {
@@ -1315,12 +1394,24 @@ async function fetchConditionalEntity({
     response.status === 200 ? 1 : 0,
   );
   if (response.status === 304) {
+    // An entity that is present but empty is not an answer either: it parses to
+    // nothing, and the validator that named it is never refreshed, so the tab
+    // asks the same unanswerable question at every poll forever.
+    const recovery = conditionalRecoveryPlan({ status: 304, entity: cached?.body });
+    // A validator naming an entity this pane no longer holds describes a
+    // question with no possible answer: the server will keep saying "unchanged"
+    // and there is nothing here for that to mean. Drop the validator now --
+    // directly, not through the staged publication, which only runs on a usable
+    // transition -- so the next admitted check is unconditional. One recovery,
+    // and the tab reports unusable in the meantime rather than looping.
+    if (recovery.recover && entities instanceof Map) entities.delete(entityKey(tab, path));
     return {
       path,
       status: 304,
-      body: cached?.body ?? null,
+      body: recovery.recover ? null : cached.body,
       staged: null,
       observations: observation ? [observation] : [],
+      recovered: recovery.recover,
     };
   }
   return {
@@ -1371,39 +1462,92 @@ function publishStagedEntities(entities, staged, transitionKind) {
   return true;
 }
 
-async function fetchActions(limit, signal, {
+const ACTIONS_QUERY_VERSION = 2;
+
+async function fetchActions(signal, {
   entities = new Map(),
   force = false,
   previousRaw = null,
+  catalog = null,
+  governor = null,
+  // Seams, so the conditional catalog fallback can be exercised without a live
+  // governor or a subprocess.
+  request = ghApi,
+  admit = runAdmittedOperation,
 } = {}) {
-  const responses = await Promise.all([
-    fetchConditionalEntity({
-      tab: "actions",
-      args: actionsRunsArgs(limit),
-      operation: "tab:actions-runs",
+  const runsResponse = await fetchConditionalEntity({
+    tab: "actions",
+    args: actionsRunsArgs(),
+    operation: "tab:actions-runs",
+    signal,
+    force,
+    entities,
+    request,
+  });
+  if (typeof runsResponse.body !== "string") {
+    // The broken validator has already been dropped above, so the next admitted
+    // check is unconditional. This poll reports unusable, which keeps the
+    // last-good rows and their freshness clock rather than blanking the tab.
+    return {
+      raw: null,
+      limit: ACTIONS_RUN_LIMIT,
+      restSpent: 0,
+      graphqlSpent: GRAPHQL_PER_FETCH.actions,
+      stagedEntities: null,
+      observations: runsResponse.observations,
+      catalog,
+      parse: () => parseActionsRuns(runsResponse.body ?? ""),
+    };
+  }
+  const responses = [runsResponse];
+  const runs = parseActionsRuns(runsResponse.body);
+  const startedAt = Date.now();
+  let nextCatalog = catalog;
+  if (governor && workflowCatalogDemand({ runs, catalog, nowMs: startedAt })) {
+    // Separately admitted, like a later GraphQL page: the catalog is a fallback,
+    // so a budget decision about it settles against its own reservation and can
+    // never take the run list -- or the tab's own settlement -- down with it.
+    const admitted = await admit({
+      ...governor,
+      operation: "catalog:actions-workflows",
+      priority: "background",
       signal,
-      force,
-      entities,
-    }),
-    fetchConditionalEntity({
-      tab: "actions",
-      args: actionsWorkflowsArgs(),
-      operation: "tab:actions-workflows",
-      signal,
-      force,
-      entities,
-    }),
-  ]);
-  const [runs, workflows] = responses;
-  const batch = conditionalBatchResult(responses, previousRaw);
+      waitMs: GOVERNOR_ADMISSION_WAIT_MS,
+      run: (admittedSignal) => fetchConditionalEntity({
+        tab: "actions",
+        args: actionsWorkflowsArgs(),
+        operation: "catalog:actions-workflows",
+        signal: admittedSignal,
+        force,
+        entities,
+        request,
+      }),
+    });
+    if (admitted.ok && admitted.value) {
+      responses.push(admitted.value);
+      nextCatalog = parseWorkflowCatalog(admitted.value.body, startedAt, catalog);
+    }
+    // A refusal leaves the catalog exactly as it was. Closing the TTL on a
+    // scheduling outcome would hide missing names for fifteen minutes over a
+    // moment of budget pressure.
+  }
+  const rows = resolveWorkflowNames(runs, nextCatalog);
+  // The payload identity is what is rendered, not the concatenated bodies. The
+  // catalog is fetched on some polls and not others, and joining raw bodies
+  // made that alternation look like a content change every time.
+  const raw = JSON.stringify({ v: ACTIONS_QUERY_VERSION, rows });
+  const batch = conditionalBatchResult(responses, previousRaw, raw);
   return {
     raw: batch.raw,
-    limit,
-    restSpent: batch.restSpent,
+    limit: ACTIONS_RUN_LIMIT,
+    // The tab settles for its own request. The catalog settled against the
+    // reservation it opened for itself.
+    restSpent: runsResponse.status === 200 ? 1 : 0,
     graphqlSpent: GRAPHQL_PER_FETCH.actions,
     stagedEntities: batch.stagedEntities,
     observations: batch.observations,
-    parse: () => parseActionsBodies(runs.body ?? "", workflows.body ?? ""),
+    catalog: nextCatalog,
+    parse: () => rows,
   };
 }
 
@@ -1487,15 +1631,101 @@ const PR_ROW = (node) => ({
   url: safe(node.url ?? ""),
 });
 
-// Walks the connection one explicitly admitted page at a time. The first page
-// is covered by the tab's own reservation; each later page reserves its own
-// envelope, so a denial there is an ordinary scheduling outcome rather than a
-// hidden overspend. Rows already collected survive that denial and the result
-// is marked incomplete rather than being published as a complete tab.
+// How close to the end of the loaded rows the cursor must come before another
+// page is worth acquiring. Ten rows is roughly half a pane, so the next page
+// arrives before the user reaches the bottom without being fetched for a list
+// nobody scrolled.
+const PAGE_DEMAND_THRESHOLD = 10;
+
+// A traversal's identity is the identity of its first page. A cursor is only
+// meaningful against the ordering that produced it, so when the first page
+// changes underneath an in-flight later page, that page describes a list that
+// no longer exists.
+function pageGeneration(rows) {
+  return (Array.isArray(rows) ? rows : [])
+    .map((row) => String(itemKey(row)))
+    .join("\u0000");
+}
+
+function paginationDemand({
+  selectedIndex,
+  loadedRows,
+  hasNextPage,
+  cap = LIST_LIMIT,
+  threshold = PAGE_DEMAND_THRESHOLD,
+}) {
+  if (hasNextPage !== true) return false;
+  if (loadedRows >= cap) return false;
+  return Number.isSafeInteger(selectedIndex) && selectedIndex >= loadedRows - threshold;
+}
+
+// Demand is a page count, not an event, which is what makes it coalesce:
+// holding `j` near the end asks for one more page however many times it fires.
+function demandedPageCount(previous, {
+  selectedIndex,
+  loadedRows,
+  hasNextPage,
+  cap = LIST_LIMIT,
+  pageSize = GRAPHQL_PAGE_SIZE,
+}) {
+  const current = Number.isSafeInteger(previous) && previous > 0 ? previous : 1;
+  const max = Math.max(1, Math.ceil(cap / pageSize));
+  if (!paginationDemand({ selectedIndex, loadedRows, hasNextPage, cap })) {
+    return Math.min(current, max);
+  }
+  return Math.min(Math.max(current, Math.ceil(loadedRows / pageSize) + 1), max);
+}
+
+function mergeDemandedPages({ pages = [], cap = LIST_LIMIT, keyOf = itemKey }) {
+  const list = (Array.isArray(pages) ? pages : []).filter(Boolean);
+  const base = list[0] ?? null;
+  const rows = [];
+  const seen = new Set();
+  let accepted = 0;
+  let hasNextPage = false;
+  let capped = false;
+  for (const value of list) {
+    if (value.generation !== base.generation) break;
+    accepted += 1;
+    hasNextPage = value.pageInfo?.hasNextPage === true;
+    for (const row of value.rows ?? []) {
+      const key = keyOf(row);
+      // A node can legitimately appear on two pages when the list shifted
+      // between them. Publishing it twice is a rendering bug, not extra data.
+      if (key != null) {
+        if (seen.has(key)) continue;
+        seen.add(key);
+      }
+      if (rows.length >= cap) { capped = true; break; }
+      rows.push(row);
+    }
+    if (capped) break;
+  }
+  return {
+    rows,
+    pages: accepted,
+    // A capped or short merge is not a complete list, and must never render as
+    // one: "50 of 999" and "50 open issues" are different claims.
+    hasNextPage: hasNextPage || capped,
+    incomplete: hasNextPage || capped || accepted < list.length,
+    generation: base?.generation ?? null,
+  };
+}
+
+// Acquires exactly the pages demand asks for, one explicitly admitted page at a
+// time. The first page is covered by the tab's own reservation; each later page
+// reserves its own envelope, so a denial there is an ordinary scheduling
+// outcome rather than a hidden overspend. Rows already collected survive that
+// denial and the result is marked incomplete rather than published as complete.
 async function fetchGraphqlList(kind, mapRow, {
   signal,
   governor = null,
   previousRaw = null,
+  // How many pages the viewport has actually asked for. One, until a cursor
+  // comes within PAGE_DEMAND_THRESHOLD rows of the end. The walk used to run to
+  // LIST_LIMIT on the very first paint -- three requests for a pane showing
+  // about twenty rows, on every tab, forever.
+  pages = 1,
   // Seams, so the paging loop can be exercised without a live governor: the
   // settlement figure it produces was wrong for months of repositories with
   // more than one page, and nothing could see it.
@@ -1510,7 +1740,6 @@ async function fetchGraphqlList(kind, mapRow, {
     error.budgetObservations = first.observations;
     throw error;
   }
-  const rows = [];
   const observations = [...first.observations];
   // Only the first page. Pages past it opened their own reservation inside
   // runAdmittedOperation and settle against it, so adding them here charges the
@@ -1519,20 +1748,32 @@ async function fetchGraphqlList(kind, mapRow, {
   // budget observation the fetch gathered.
   const envelopeSpent = first.observedCost;
   let spent = first.observedCost;
-  let page = graphqlConnection(first, connection);
-  let incomplete = false;
   let overrun = first.overrun;
-  let totalCount = page?.totalCount ?? null;
-  for (const node of page?.nodes ?? []) rows.push(mapRow(node));
-  while (page?.pageInfo?.hasNextPage && rows.length < LIST_LIMIT) {
-    const cursor = page.pageInfo.endCursor;
-    if (typeof cursor !== "string" || cursor.length === 0) { incomplete = true; break; }
-    if (!governor) { incomplete = true; break; }
+  let current = graphqlConnection(first, connection);
+  const totalCount = current?.totalCount ?? null;
+  const generation = pageGeneration((current?.nodes ?? []).map(mapRow));
+  const wanted = Math.min(
+    Math.max(1, Number.isSafeInteger(pages) ? pages : 1),
+    Math.max(1, Math.ceil(LIST_LIMIT / GRAPHQL_PAGE_SIZE)),
+  );
+  const acquired = [];
+  const collect = (value) => acquired.push({
+    generation,
+    rows: (value?.nodes ?? []).map(mapRow),
+    pageInfo: value?.pageInfo ?? null,
+  });
+  let truncatedWalk = false;
+  if (current) collect(current); else truncatedWalk = true;
+  while (acquired.length < wanted && current?.pageInfo?.hasNextPage) {
+    const cursor = current.pageInfo.endCursor;
+    if (typeof cursor !== "string" || cursor.length === 0) { truncatedWalk = true; break; }
+    if (!governor) { truncatedWalk = true; break; }
     const admitted = await admit({
       ...governor,
       operation: `page:${kind}`,
       priority: "background",
       signal,
+      waitMs: GOVERNOR_ADMISSION_WAIT_MS,
       run: (admittedSignal) => fetchPage(kind, { signal: admittedSignal, after: cursor, operation: `page:${kind}` }),
     });
     // A later page that is denied, fails, or returns errors leaves the rows
@@ -1548,47 +1789,57 @@ async function fetchGraphqlList(kind, mapRow, {
     // it will not do.
     if (admitted.value?.observations) observations.push(...admitted.value.observations);
     if (admitted.value?.overrun) overrun = true;
-    if (!admitted.ok || !admitted.value?.ok) { incomplete = true; break; }
-    const next = admitted.value;
-    spent += next.observedCost;
-    page = graphqlConnection(next, connection);
-    if (!page) { incomplete = true; break; }
-    for (const node of page.nodes) rows.push(mapRow(node));
+    if (!admitted.ok || !admitted.value?.ok) { truncatedWalk = true; break; }
+    spent += admitted.value.observedCost;
+    current = graphqlConnection(admitted.value, connection);
+    if (!current) { truncatedWalk = true; break; }
+    collect(current);
   }
-  if (page?.pageInfo?.hasNextPage && rows.length >= LIST_LIMIT) incomplete = true;
   if (overrun) {
     // Recorded at its real cost above; suspended here until the resource resets,
     // which is the soonest a corrected bound could be trusted again.
     const reset = observations.at(-1)?.resetMs;
     pauseOperation(operation, Number.isFinite(reset) ? reset + BUDGET_RESET_GRACE_MS : Date.now() + BUDGET_PROBE_MS);
   }
-  const limited = rows.slice(0, LIST_LIMIT);
+  const merged = mergeDemandedPages({ pages: acquired, cap: LIST_LIMIT });
+  const incomplete = merged.incomplete || truncatedWalk;
   // Serialized rows are the payload identity the unchanged-frame suppression
-  // and the cache both compare on, so it must cover exactly what is rendered.
-  const raw = JSON.stringify({ v: GRAPHQL_QUERY_VERSION, totalCount, incomplete, rows: limited });
+  // and the cache both compare on, so it must cover exactly what is rendered --
+  // including the markers that say the list is not all of it.
+  const raw = JSON.stringify({
+    v: GRAPHQL_QUERY_VERSION,
+    totalCount,
+    incomplete,
+    hasNextPage: merged.hasNextPage,
+    rows: merged.rows,
+  });
   return {
     raw: raw === previousRaw ? previousRaw : raw,
     // An incomplete walk reports the rows it has as its own limit, so the
     // existing truncation indicator fires. "More rows exist than are shown" is
     // exactly what incomplete means, and publishing 50 of 150 rows as a
     // complete tab is indistinguishable from a repository with 50 open issues.
-    limit: incomplete ? limited.length : LIST_LIMIT,
+    limit: incomplete ? merged.rows.length : LIST_LIMIT,
     restSpent: 0,
     graphqlSpent: envelopeSpent,
     // What the whole walk cost, for reporting. Never the settlement figure.
     graphqlSpentTotal: spent,
     observations,
     incomplete,
-    parse: () => limited,
+    totalCount,
+    hasNextPage: merged.hasNextPage,
+    generation: merged.generation,
+    loadedPages: merged.pages,
+    parse: () => merged.rows,
   };
 }
 
-async function fetchIssues(signal, { governor = null, previousRaw = null } = {}) {
-  return fetchGraphqlList("issues", ISSUE_ROW, { signal, governor, previousRaw });
+async function fetchIssues(signal, { governor = null, previousRaw = null, pages = 1 } = {}) {
+  return fetchGraphqlList("issues", ISSUE_ROW, { signal, governor, previousRaw, pages });
 }
 
-async function fetchPRs(signal, { governor = null, previousRaw = null } = {}) {
-  return fetchGraphqlList("prs", PR_ROW, { signal, governor, previousRaw });
+async function fetchPRs(signal, { governor = null, previousRaw = null, pages = 1 } = {}) {
+  return fetchGraphqlList("prs", PR_ROW, { signal, governor, previousRaw, pages });
 }
 
 // The three alert endpoints were three near-identical 26-line blocks that had
@@ -1662,10 +1913,10 @@ const ALERT_SOURCES = [
 // `projectedHourlyCost` derives the hourly figure from it and the spend meter
 // bills against it, so a corrected number cannot reach one and miss the other.
 //
-// actions is 2, not 1: measured 2026-08-10 with `GH_DEBUG=api`, `gh run list`
-// issues GET /actions/runs *and* GET /actions/workflows. The 1 that stood here
-// understated the default tab -- the tab every pane starts on, since
-// initialTabIndex defaults to 0 -- by half.
+// actions was 2 for as long as every fetch made both calls: measured
+// 2026-08-10 with `GH_DEBUG=api`, `gh run list` issued GET /actions/runs *and*
+// GET /actions/workflows. The catalog is now a conditional fallback with its
+// own reservation, so the tab reserves for the one call it always makes.
 //
 // issues and prs are 0 REST because SORT_RECENT's --search routes both through
 // GraphQL entirely (2 POSTs each, confirmed by the same measurement).
@@ -1673,7 +1924,10 @@ const SECURITY_REQUESTS_PER_FETCH = ALERT_SOURCES.reduce(
   (total, source) => total + 1 + source.priorityQueries.length,
   0,
 );
-const REST_PER_FETCH = { actions: 2, issues: 0, prs: 0, security: SECURITY_REQUESTS_PER_FETCH };
+// Actions is one request now: the workflow catalog became a conditional
+// fallback that opens its own reservation, so the tab no longer reserves for
+// a second call it usually does not make.
+const REST_PER_FETCH = { actions: 1, issues: 0, prs: 0, security: SECURITY_REQUESTS_PER_FETCH };
 const GRAPHQL_PER_FETCH = { actions: 0, issues: 2, prs: 2, security: 0 };
 
 function tabRequestCost(tab) {
@@ -1688,7 +1942,9 @@ function tabRequestCost(tab) {
 const OPERATION_COSTS = Object.freeze({
   ...Object.fromEntries(TAB_KEYS.map((tab) => [`tab:${tab}`, tabRequestCost(tab)])),
   "tab:actions-runs": { core: 1, graphql: 0 },
-  "tab:actions-workflows": { core: 1, graphql: 0 },
+  // Separately admitted, like a later list page: only fetched when a run has
+  // no name of its own, and settled against its own reservation.
+  "catalog:actions-workflows": { core: 1, graphql: 0 },
   "tab:security-endpoint": { core: 1, graphql: 0 },
   "failure-context:repository": { core: 0, graphql: GRAPHQL_OBSERVER_POINTS },
   // Each page past the first reserves its own envelope, so a denial there is a
@@ -3105,17 +3361,23 @@ const GOVERNOR_SCOPE_VERSION = 1;
 // 5: scheduling fairness is persisted, because the starvation it prevents
 // happens *between* planning passes -- each manual refresh is its own pass, so
 // a counter that lives only inside one cannot see a run of them.
-const GOVERNOR_STATE_VERSION = 5;
+const GOVERNOR_STATE_VERSION = 6;
 // Readable-as-evidence, never written: the shapes a still-running older pane
 // holds. Recognising that such a pane owns a live lease is what the restart
 // boundary depends on.
-const LEGACY_GOVERNOR_VERSIONS = [GOVERNOR_STATE_VERSION, 4, 3, 2];
+const LEGACY_GOVERNOR_VERSIONS = [GOVERNOR_STATE_VERSION, 5, 4, 3, 2];
 // The first version whose file is already in the per-resource observer shape.
 // Anything below it is adapted before it can be read; see readLegacyGovernorState.
 const GOVERNOR_OBSERVER_SPLIT_VERSION = 4;
 // The first version carrying persisted scheduling fairness. A version 4 file is
 // otherwise in the current shape and only wants the field defaulted.
 const GOVERNOR_FAIRNESS_VERSION = 5;
+// The first version whose intents are priced by this build's cost table. An
+// intent must declare exactly what its tab costs, so a build that re-prices a
+// tab cannot read a live older pane's pending intents -- and that pane's file is
+// precisely the one carrying the leases and uncertain debts this build must see.
+// Bumping the version is what turns "corrupt" back into "older, and adaptable".
+const GOVERNOR_TAB_COST_VERSION = 6;
 // Manual work outranks active work, which is right until it means "always". A
 // user holding the refresh key issues one manual intent per planning pass, and
 // without a bound the active owner behind them never gets a turn at all.
@@ -3481,14 +3743,41 @@ function normalizeGovernorState(raw, nowMs, { prune = true, acceptVersion = GOVE
 function readLegacyGovernorState(raw, nowMs, version) {
   if (!isRecord(raw) || raw.version !== version) return null;
   const options = { prune: false, acceptVersion: version };
-  if (version >= GOVERNOR_FAIRNESS_VERSION) return normalizeGovernorState(raw, nowMs, options);
-  // A version 4 file is already in the per-resource observer shape and differs
-  // only by the field this version added, so defaulting it is the whole
-  // adaptation. Older files need their observer shape rewritten first.
-  const shaped = version >= GOVERNOR_OBSERVER_SPLIT_VERSION ? { ...raw } : adaptPreSplitGovernorShape(raw);
+  if (version >= GOVERNOR_TAB_COST_VERSION) return normalizeGovernorState(raw, nowMs, options);
+  // A version 5 file is in the current shape and differs only in what it
+  // believes a tab costs. Version 4 additionally wants the fairness field
+  // defaulted; anything older needs its observer shape rewritten first.
+  const shaped = version >= GOVERNOR_OBSERVER_SPLIT_VERSION
+    ? { ...raw }
+    : adaptPreSplitGovernorShape(raw);
   if (!shaped) return null;
-  shaped.fairness = { manualStreak: 0 };
-  return normalizeGovernorState(shaped, nowMs, options);
+  if (version < GOVERNOR_FAIRNESS_VERSION) shaped.fairness = { manualStreak: 0 };
+  return normalizeGovernorState(dropSupersededTabCosts(shaped), nowMs, options);
+}
+
+// An intent priced by a build that costed its tab differently. It is a pending
+// request and nothing more: an intent still in the file has not been granted,
+// because scheduleGovernorState deletes each one as it creates its reservation.
+// So dropping it releases nothing and forgives nothing -- the pane that
+// registered it re-registers at the current price on its next wake. Re-pricing
+// it here would be the one unsafe option, because the older pane will still make
+// the number of calls its own build declares.
+function dropSupersededTabCosts(raw) {
+  if (!isRecord(raw.intents)) return raw;
+  const intents = {};
+  for (const [id, intent] of Object.entries(raw.intents)) {
+    const expected = TAB_KEYS.includes(intent?.tab)
+      ? tabRequestCost(intent.tab)
+      : operationCost(intent?.tab);
+    const declared = exactResourceCosts(intent?.costs);
+    // Anything unrecognisable is left exactly as it is, so normalization still
+    // rejects a genuinely corrupt document rather than having it quietly pruned.
+    if (!expected || !declared ||
+      RATE_RESOURCES.every((resource) => expected[resource] === declared[resource])) {
+      intents[id] = intent;
+    }
+  }
+  return { ...raw, intents };
 }
 
 // Versions 2 and 3 held one observer for core, a differently shaped
@@ -3555,7 +3844,7 @@ function migrateGovernorState(raw, nowMs) {
   if (!shaped) return null;
   if (!isRecord(shaped.fairness)) shaped.fairness = { manualStreak: 0 };
   shaped.version = GOVERNOR_STATE_VERSION;
-  return normalizeGovernorState(shaped, nowMs);
+  return normalizeGovernorState(dropSupersededTabCosts(shaped), nowMs);
 }
 
 function migrateV1GovernorState(raw, nowMs) {
@@ -4897,14 +5186,6 @@ function externalSampleIsUsable(sample) {
   );
 }
 
-function resourcePerTick(table, activeKey) {
-  let cost = table[activeKey] ?? 0;
-  for (const key of TAB_KEYS) {
-    if (key !== activeKey) cost += (table[key] ?? 0) / BACKGROUND_EVERY;
-  }
-  return cost;
-}
-
 function alertArgs(source, path = source.path) {
   return [apiPath(path), ...apiHostArgs(), "--jq", source.jq];
 }
@@ -5658,12 +5939,36 @@ async function readSharedBudgetSources(signal, host = effectiveRuntimeHost(), {
 // and left to rot. The governor can admit less demand; this projection explains
 // pressure, not actual granted spend. The per-fetch prices come from
 // REST_PER_FETCH and GRAPHQL_PER_FETCH, which also feed the operation registry.
-function projectedHourlyCost(activeKey) {
-  const perHour = 3_600_000 / runtime.refreshMs;
+function projectedHourlyCost(activeKey, {
+  floorMs = runtime.refreshMs,
+  background = runtime.background,
+} = {}) {
+  const perHour = (intervalMs) =>
+    Number.isFinite(intervalMs) && intervalMs > 0 ? 3_600_000 / intervalMs : 0;
+  const totals = { rest: { min: 0, max: 0 }, graphql: { min: 0, max: 0 } };
+  for (const tab of TAB_KEYS) {
+    const demand = tab === activeKey ? "active" : "inactive";
+    // Fastest: nothing has been observed unchanged yet, and Actions has work in
+    // flight. Slowest: the quiet cadence this tab settles into.
+    const fastest = pollPolicyInterval({
+      tab, floorMs, demand, unchangedCount: 0, inProgressCI: true, background,
+    });
+    const slowest = pollPolicyInterval({
+      tab, floorMs, demand, unchangedCount: POLL_QUIET_AFTER, background,
+    });
+    totals.rest.min += REST_PER_FETCH[tab] * perHour(slowest);
+    totals.rest.max += REST_PER_FETCH[tab] * perHour(fastest);
+    totals.graphql.min += GRAPHQL_PER_FETCH[tab] * perHour(slowest);
+    totals.graphql.max += GRAPHQL_PER_FETCH[tab] * perHour(fastest);
+  }
   return {
-    rest: Math.round(resourcePerTick(REST_PER_FETCH, activeKey) * perHour),
-    graphql: Math.round(resourcePerTick(GRAPHQL_PER_FETCH, activeKey) * perHour),
+    rest: { min: Math.round(totals.rest.min), max: Math.round(totals.rest.max) },
+    graphql: { min: Math.round(totals.graphql.min), max: Math.round(totals.graphql.max) },
   };
+}
+
+function formatProjectedRange({ min, max }) {
+  return min === max ? `~${max}` : `~${min}-${max}`;
 }
 
 function doctorProbePlan() {
@@ -5678,7 +5983,7 @@ function doctorProbePlan() {
     // Issues/PRs entries ran `gh issue list`/`gh pr list`, whose `--search`
     // routed through GraphQL at a price the report could not name.
     ["Repository access", graphqlArgs(), "doctor:repository", document("repository", graphqlRepositoryVariables(target)), "repository"],
-    ["Actions runs", ghApiArgs(actionsRunsArgs(MIN_RUN_LIMIT)), "doctor:actions-runs"],
+    ["Actions runs", ghApiArgs(actionsRunsArgs()), "doctor:actions-runs"],
     ["Actions workflows", ghApiArgs(actionsWorkflowsArgs()), "doctor:actions-workflows"],
     ["Issues (first page)", graphqlArgs(), "doctor:issues", document("issues", graphqlPageVariables(null, target)), "issues"],
     ["Pull requests (first page)", graphqlArgs(), "doctor:prs", document("prs", graphqlPageVariables(null, target)), "prs"],
@@ -5830,11 +6135,16 @@ async function runDoctor() {
     field("REST core", budget.core),
     field("GraphQL", budget.graphql),
     field(
-      "this config spends",
+      "projected demand",
       (() => {
         const active = TAB_KEYS[runtime.initialTabIndex] ?? TAB_KEYS[0];
         const { rest, graphql } = projectedHourlyCost(active);
-        return `~${rest} REST + ~${graphql} GraphQL per hour (refresh ${runtime.refreshMs / 1000}s, "${active}" active)`;
+        // A range, because the cadence now depends on what the repository is
+        // doing. Labelled "projected" rather than "spends": the governor admits
+        // less than this, and the API governor section below carries what was
+        // actually charged.
+        return `${formatProjectedRange(rest)} REST + ${formatProjectedRange(graphql)} GraphQL per hour ` +
+          `(floor ${runtime.refreshMs / 1000}s, background ${runtime.background}, "${active}" active)`;
       })(),
     ),
     "",
@@ -5943,6 +6253,7 @@ function parseRepoTarget(value) {
 // in-flight guard absorbs every other one and the effective rate is whatever
 // `gh` can sustain -- the requested interval silently stops being real. Clamping
 // with a stated minimum is honest where silently accepting it would not be.
+const BACKGROUND_MODES = ["all", "off"];
 const MIN_REFRESH_SECONDS = 2;
 const MAX_REFRESH_SECONDS = 3600;
 
@@ -5963,6 +6274,10 @@ function parseArgs(argv) {
     // parseArgs returns stays stated in one place.
     refreshSource: null,
     tab: null,
+    // Whether inactive tabs are polled at all. `off` never requests data for a
+    // tab you are not looking at; its counts stay at whatever was last known,
+    // visibly aged.
+    background: null,
     verbose: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -5990,6 +6305,8 @@ function parseArgs(argv) {
       opts.refresh = takeValue("--refresh");
     } else if (arg === "--tab" || arg.startsWith("--tab=")) {
       opts.tab = takeValue("--tab");
+    } else if (arg === "--background" || arg.startsWith("--background=")) {
+      opts.background = takeValue("--background");
     } else {
       throw new Error(`unknown argument: ${arg}`);
     }
@@ -5997,7 +6314,7 @@ function parseArgs(argv) {
   return opts;
 }
 
-// Returns { repo, refreshMs, tabKey, verbose } or throws with a message that
+// Returns { repo, refreshMs, tabKey, background, verbose } or throws with a message that
 // says what to do about it.
 function validateArgs(opts, tabKeys) {
   const { host, slug } = opts.repo !== null ? parseRepoTarget(opts.repo) : { host: null, slug: null };
@@ -6023,6 +6340,10 @@ function validateArgs(opts, tabKeys) {
     throw new Error(`--tab must be one of ${tabKeys.join(", ")}, got: ${opts.tab}`);
   }
 
+  if (opts.background !== null && !BACKGROUND_MODES.includes(opts.background)) {
+    throw new Error(`--background must be one of ${BACKGROUND_MODES.join(", ")}, got: ${opts.background}`);
+  }
+
   return {
     help: opts.help,
     showVersion: opts.showVersion,
@@ -6031,6 +6352,7 @@ function validateArgs(opts, tabKeys) {
     host,
     refreshMs,
     tabKey: opts.tab,
+    background: opts.background,
     verbose: opts.verbose,
   };
 }
@@ -6051,6 +6373,7 @@ const KEY_TABLE = [
   ["PgUp / PgDn", "Move a page at a time"],
   ["Enter", "Open the selected item or accept a prompt"],
   ["r", "Refresh the current tab when a safe grant is available"],
+  ["R", "Resynchronize the current tab, ignoring cached validators and backoff"],
   ["w", "Adjust table column widths"],
   ["?", "Show the keys (any key closes it)"],
   ["q / Esc / Ctrl+C", "Quit (Esc leaves width mode)"],
@@ -6058,22 +6381,39 @@ const KEY_TABLE = [
 const KEY_COL = Math.max(...KEY_TABLE.map(([k]) => k.length)) + 3;
 const keyTableLines = () => KEY_TABLE.map(([k, d]) => `${k.padEnd(KEY_COL)}${d}`);
 
+// Which bindings survive a short pane, most important first. Named rather than
+// indexed into KEY_TABLE: the order used to be a list of positions, so adding a
+// key silently reassigned every entry after it -- which is exactly how `R`
+// pushed Quit out of the four-row overlay.
+const HELP_PRIORITY = [
+  "q / Esc / Ctrl+C",
+  "r",
+  "Enter",
+  "Up / Down, j / k",
+  "1 2 3 4",
+  "w",
+  "?",
+  "Left / Right",
+  "Tab / Shift+Tab",
+  "PgUp / PgDn",
+  "R",
+];
+
 function helpLines(maxRows) {
   const rows = Math.max(1, Number.isSafeInteger(maxRows) ? maxRows : 1);
   const all = keyTableLines();
+  const lineFor = (binding) => all[KEY_TABLE.findIndex(([key]) => key === binding)];
   if (all.length <= rows) return all;
   if (rows === 1) return [`… ${all.length} keys: gh-glance --help`];
   if (rows === 4) {
     return [
-      all[9],
-      all[6],
+      lineFor("q / Esc / Ctrl+C"),
+      lineFor("r"),
       "Ent/jk Open the selected/Move the cursor",
       `… ${all.length - 4} more: gh-glance --help`,
     ];
   }
-  const priority = [9, 6, 5, 3, 0, 7, 8, 1, 2, 4]
-    .slice(0, rows - 1)
-    .map((index) => all[index]);
+  const priority = HELP_PRIORITY.slice(0, rows - 1).map(lineFor);
   return [...priority, `… ${all.length - priority.length} more: gh-glance --help`];
 }
 
@@ -6084,6 +6424,7 @@ Usage:
   gh-glance --repo owner/name   Watch a specific repository instead
   gh-glance --refresh 15        Set a 15-second active-tab poll floor
   gh-glance --tab security      Start on a specific tab
+  gh-glance --background off    Poll only the tab you are looking at
   gh-glance --verbose 2>log     Log every gh call to a file (see below)
   gh-glance --doctor            Print a diagnostic report and exit
   gh-glance --help              Show this help
@@ -6098,10 +6439,14 @@ Options:
                            and is unnecessary when running inside a clone of
                            that repository.
   --refresh <seconds>      Minimum active-tab poll interval (${MIN_REFRESH_SECONDS}-${MAX_REFRESH_SECONDS},
-                           default ${REFRESH_MS / 1000}). Safe shared grants may
-                           run later; each background tab is considered about
-                           every ${BACKGROUND_EVERY} floors.
+                           default ${REFRESH_MS / 1000}). A floor, never a ceiling:
+                           a quiet tab slows to ${POLL_QUIET_MS.actions / 1000}s (${POLL_QUIET_MS.security / 1000}s for Security),
+                           and running Actions are checked every ${POLL_ACTIVE_CI_MS / 1000}s.
+                           Safe shared grants may run later.
   --tab <name>             Tab to start on: ${TAB_KEYS.join(", ")}.
+  --background <mode>      ${BACKGROUND_MODES.join(" or ")} (default all). \`off\` never requests data
+                           for a tab you are not looking at; its count stays at
+                           the last known value and visibly ages.
   --verbose                Write one line per gh invocation to stderr. stderr
                            must be redirected -- writing it to the terminal
                            would draw over the dashboard, so this refuses to
@@ -6117,10 +6462,12 @@ Run it from inside a locally cloned GitHub repository; the repo is inferred
 from the git remote, the same way \`gh\` does it. Requires the \`gh\` CLI
 (2.20 or newer), authenticated via \`gh auth login\`.
 
-On a healthy single pane, the active tab is considered every ${REFRESH_MS / 1000}s and each
-background tab about every ${(REFRESH_MS * BACKGROUND_EVERY) / 1000}s. Quota-consuming calls still
-need a shared, resource-specific grant that preserves a hard reserve. Scheduled
-checks and manual refresh do not bypass that safety check.
+On a healthy single pane, the active tab is considered every ${REFRESH_MS / 1000}s while its
+content is changing, then every ${POLL_QUIET_MS.actions / 1000}s once two checks in a row come back
+unchanged; each background tab is considered about every ${Math.max(REFRESH_MS * BACKGROUND_EVERY, POLL_BACKGROUND_MS.actions) / 1000}s. Quota-consuming
+calls still need a shared, resource-specific grant that preserves a hard reserve.
+Scheduled checks and manual refresh do not bypass that safety check: neither
+refresh key can spend past the reserve.
 
 Row icons are GitHub Octicons and need a Nerd Font. Without one, set
 GH_GLANCE_ICONS=unicode for Unicode status glyphs and text row substitutes, or
@@ -6195,6 +6542,7 @@ if (IS_MAIN) {
   runtime.verbose = opts.verbose;
   if (opts.refreshMs !== null) runtime.refreshMs = opts.refreshMs;
   if (opts.tabKey !== null) runtime.initialTabIndex = TAB_KEYS.indexOf(opts.tabKey);
+  if (opts.background !== null) runtime.background = opts.background;
 
   // Checked after parsing rather than before, so `gh-glance --repo` with no
   // value reports the missing value rather than silently printing help.
@@ -6933,7 +7281,7 @@ const MemoSecurityRow = React.memo(SecurityRow);
 const TABS = [
   {
     key: "actions",
-    fetch: ({ signal, runLimit, ...options }) => fetchActions(runLimit, signal, options),
+    fetch: ({ signal, ...options }) => fetchActions(signal, options),
     label: "Actions",
     short: "Actions",
     header: ACTIONS_HEADER,
@@ -6943,7 +7291,8 @@ const TABS = [
   },
   {
     key: "issues",
-    fetch: ({ signal, governor, previousRaw }) => fetchIssues(signal, { governor, previousRaw }),
+    fetch: ({ signal, governor, previousRaw, pages }) =>
+      fetchIssues(signal, { governor, previousRaw, pages }),
     label: "Issues",
     short: "Issues",
     header: ISSUES_HEADER,
@@ -6953,7 +7302,8 @@ const TABS = [
   },
   {
     key: "prs",
-    fetch: ({ signal, governor, previousRaw }) => fetchPRs(signal, { governor, previousRaw }),
+    fetch: ({ signal, governor, previousRaw, pages }) =>
+      fetchPRs(signal, { governor, previousRaw, pages }),
     label: "Pull requests",
     short: "PRs",
     header: PRS_HEADER,
@@ -7788,19 +8138,92 @@ function nextSecurityRaw(previousRaw, raw, blind) {
 }
 
 const CACHE_FRESHNESS_CHECKPOINT_MS = 60_000;
-const SECURITY_UNCHANGED_POLL_MS = 60_000;
 
 function shouldCheckpointFreshness({ persistedAt, completedAt }) {
   return !Number.isFinite(persistedAt) || completedAt - persistedAt >= CACHE_FRESHNESS_CHECKPOINT_MS;
 }
 
-function securityPollDelay({ unchangedPolls, floorMs, force = false }) {
-  if (force) return 0;
-  return unchangedPolls > 0 ? Math.max(floorMs, SECURITY_UNCHANGED_POLL_MS) : floorMs;
+// The one place the cadence table is decided. It used to be spread across a
+// fixed active floor, a fixed four-floor background slot, and a Security-only
+// unchanged rule -- three policies that could disagree, and did: Security
+// slowed after a single unchanged poll while every other tab never slowed at
+// all. Everything now derives from this function, so a resource's cadence is
+// stated once and read everywhere.
+function pollPolicyInterval({
+  tab,
+  floorMs,
+  demand = "active",
+  unchangedCount = 0,
+  inProgressCI = false,
+  background = "all",
+}) {
+  if (demand === "none") return Number.POSITIVE_INFINITY;
+  if (demand === "inactive") {
+    if (background === "off") return Number.POSITIVE_INFINITY;
+    return Math.max(BACKGROUND_EVERY * floorMs, pick(POLL_BACKGROUND_MS, tab, 0));
+  }
+  // Work in flight outranks the quiet counter: a repository whose list has not
+  // changed in an hour still has a run finishing right now.
+  if (tab === "actions" && inProgressCI === true) return Math.max(floorMs, POLL_ACTIVE_CI_MS);
+  if (unchangedCount >= POLL_QUIET_AFTER) return Math.max(floorMs, pick(POLL_QUIET_MS, tab, 0));
+  return floorMs;
 }
 
-function shouldShowFetchLoading({ hasData, force }) {
-  return !hasData || force === true;
+// Only a validated observation moves this counter. An error, a blind Security
+// source, or an unusable payload is the absence of evidence, not evidence of
+// quiet -- counting them would slow a tab precisely because it is broken.
+function advanceUnchangedCount(previous, outcome) {
+  const current = Number.isSafeInteger(previous) && previous > 0 ? previous : 0;
+  if (outcome === "unchanged") return current + 1;
+  if (outcome === "changed" || outcome === "subscribed") return 0;
+  return current;
+}
+
+// Two manual intentions, deliberately separated. `r` used to mean both "check
+// now" and "throw away every validator", so the key that a user presses on a
+// quiet repository -- the one case where a conditional check is free -- was the
+// key guaranteed to spend.
+function refreshIntent(input, { widthMode = false } = {}) {
+  // Width mode owns both keys: `r` resets the selected column and `R` resets
+  // the tab's widths. Leaking a refresh into either would make a layout action
+  // spend quota.
+  if (widthMode === true) return null;
+  if (input === "r") return "conditional";
+  if (input === "R") return "resync";
+  return null;
+}
+
+function manualRefreshRequest(intent) {
+  if (intent === "conditional") {
+    return { kind: "manual", force: false, dropValidators: false, clearCapabilityBackoff: false };
+  }
+  if (intent === "resync") {
+    return { kind: "manual", force: true, dropValidators: true, clearCapabilityBackoff: true };
+  }
+  return null;
+}
+
+// A press during automatic work either rides that work or schedules exactly one
+// follow-up. Without the follow-up, pressing `r` while a poll that started
+// before the press was still running silently did nothing.
+function planManualRefresh({ requestedAt, inFlightStartedAt = null, followUpPending = false }) {
+  if (!Number.isFinite(inFlightStartedAt)) return { join: false, start: true, followUp: false };
+  if (inFlightStartedAt >= requestedAt) return { join: true, start: false, followUp: false };
+  return { join: followUpPending, start: false, followUp: !followUpPending };
+}
+
+// A 304 whose entity is gone is a broken pair, not data. One unconditional
+// recovery, separately admitted, and then the tab says so -- because the
+// alternative is a conditional request that can never be satisfied, retried at
+// the poll cadence forever.
+function conditionalRecoveryPlan({ status, entity, hasEntity = typeof entity === "string" && entity.length > 0, attempts = 0 }) {
+  if (status !== 304 || hasEntity === true) return { recover: false, unusable: false };
+  if (!Number.isSafeInteger(attempts) || attempts <= 0) return { recover: true, unusable: false };
+  return { recover: false, unusable: true };
+}
+
+function shouldShowFetchLoading({ hasData, manual }) {
+  return !hasData || manual === true;
 }
 
 function tabHold(tab, heldResources = {}) {
@@ -7820,82 +8243,92 @@ function tabHold(tab, heldResources = {}) {
   };
 }
 
+function rotateFrom(keys, index) {
+  if (keys.length === 0) return keys;
+  const start = ((Number.isSafeInteger(index) ? index : 0) % keys.length + keys.length) % keys.length;
+  return keys.map((_, offset) => keys[(start + offset) % keys.length]);
+}
+
+// Every tab now carries its own deadline rather than sharing one active slot
+// and one rotating background slot. That is what lets the cadence differ per
+// resource: a quiet Security tab at 300s and an Actions tab watching a running
+// job at 5s cannot be expressed by two shared timers.
 function pollSchedule({
   nowMs,
   floorMs,
   activeKey,
-  activeAt = nowMs,
-  backgroundAt = nowMs + 4 * floorMs,
+  dueAt = {},
   backgroundIndex = 0,
   heldResources = {},
+  background = "all",
+  states = {},
 }) {
   const due = [];
-  let nextActiveAt = activeAt;
-  let nextBackgroundAt = backgroundAt;
+  const next = {};
+  const backgroundKeys = TAB_KEYS.filter((key) => key !== activeKey);
   let nextBackgroundIndex = backgroundIndex;
-  if (activeAt <= nowMs) {
-    const activeHold = tabHold(activeKey, heldResources);
-    if (activeHold.held) nextActiveAt = activeHold.retryAt;
-    else {
-      due.push({ key: activeKey, kind: "active" });
-      nextActiveAt = nowMs + floorMs;
+  // At most one inactive tab per wake, still round robin. Three inactive tabs
+  // all becoming due together would otherwise open three concurrent panes of
+  // demand against one lane slot.
+  let backgroundTaken = false;
+
+  for (const key of [activeKey, ...rotateFrom(backgroundKeys, backgroundIndex)]) {
+    const isActive = key === activeKey;
+    const step = pollPolicyInterval({
+      tab: key,
+      floorMs,
+      demand: isActive ? "active" : "inactive",
+      unchangedCount: states[key]?.unchangedCount ?? 0,
+      inProgressCI: states[key]?.inProgressCI === true,
+      background,
+    });
+    if (!Number.isFinite(step)) {
+      next[key] = Number.POSITIVE_INFINITY;
+      continue;
     }
-  }
-  // Three inactive tabs share one background slot every four active periods.
-  // Select at most one usable tab and retain the cursor for the next slot.
-  if (backgroundAt <= nowMs) {
-    const background = TAB_KEYS.filter((key) => key !== activeKey);
-    let selected = -1;
-    for (let offset = 0; offset < background.length; offset += 1) {
-      const index = (backgroundIndex + offset) % background.length;
-      if (!tabHold(background[index], heldResources).held) {
-        selected = index;
-        break;
+    const at = Number.isFinite(dueAt[key]) ? dueAt[key] : nowMs;
+    if (at > nowMs) {
+      next[key] = at;
+      continue;
+    }
+    const hold = tabHold(key, heldResources);
+    if (hold.held) {
+      next[key] = hold.retryAt;
+      continue;
+    }
+    if (!isActive) {
+      if (backgroundTaken) {
+        next[key] = at;
+        continue;
       }
+      backgroundTaken = true;
+      nextBackgroundIndex = (backgroundKeys.indexOf(key) + 1) % backgroundKeys.length;
     }
-    if (selected >= 0) {
-      due.push({ key: background[selected], kind: "background" });
-      nextBackgroundIndex = (selected + 1) % background.length;
-      nextBackgroundAt = nowMs + 4 * floorMs;
-    } else {
-      nextBackgroundAt = background.reduce(
-        (earliest, key) => Math.min(earliest, tabHold(key, heldResources).retryAt),
-        Number.POSITIVE_INFINITY,
-      );
-    }
+    due.push({ key, kind: isActive ? "active" : "background" });
+    next[key] = nowMs + step;
   }
   return {
     due,
-    activeAt: nextActiveAt,
-    backgroundAt: nextBackgroundAt,
+    dueAt: next,
     backgroundIndex: nextBackgroundIndex,
-    nextAt: Math.min(nextActiveAt, nextBackgroundAt),
+    nextAt: Math.min(...Object.values(next)),
   };
 }
 
 function retryPollAfterAdmissionFailure({
+  key,
   kind,
   retryAt,
-  activeAt,
-  backgroundAt,
+  dueAt,
   backgroundIndex,
   previousBackgroundIndex,
 }) {
-  if (kind === "active") {
-    return {
-      activeAt: Math.min(activeAt, retryAt),
-      backgroundAt,
-      backgroundIndex,
-    };
-  }
-  if (kind === "background") {
-    return {
-      activeAt,
-      backgroundAt: Math.min(backgroundAt, retryAt),
-      backgroundIndex: previousBackgroundIndex,
-    };
-  }
-  return { activeAt, backgroundAt, backgroundIndex };
+  const previous = Number.isFinite(dueAt?.[key]) ? dueAt[key] : Number.POSITIVE_INFINITY;
+  return {
+    dueAt: { ...dueAt, [key]: Math.min(previous, retryAt) },
+    // A background tab that could not be admitted did not consume its turn.
+    backgroundIndex: kind === "background" ? previousBackgroundIndex : backgroundIndex,
+  };
 }
 
 function governorWakeTimes(state, nowMs, floorMs, leaseId = null) {
@@ -8175,12 +8608,55 @@ function rateLimitBlockProbeRecovered(pending, state, nowMs) {
   });
 }
 
-async function runAdmittedOperation({ scope, leaseId, operation, priority = "manual", signal, run }) {
-  const admitted = admitGovernorOperation(scope, leaseId, operation, priority, Date.now());
-  if (!admitted.ok || admitted.value.status !== "started") {
-    if (validGovernorId(admitted.value?.intentId)) {
-      cancelIntent(scope, admitted.value.intentId, Date.now());
+// How long a separately admitted operation may wait for a lane slot the
+// governor has already granted it. Every request inside one tab fetch asks a
+// moment after the tab's own grant advanced the lane, so without this the second
+// request -- a later list page, or the workflow catalog -- is refused every
+// single time and the feature never runs at all. A named `notBefore` is a
+// schedule, not a refusal; anything past this bound still declines, and
+// startReservation revalidates the budget when the wait is over.
+const GOVERNOR_ADMISSION_WAIT_MS = 2_000;
+
+async function runAdmittedOperation({
+  scope,
+  leaseId,
+  operation,
+  priority = "manual",
+  signal,
+  run,
+  waitMs = 0,
+  // One clock for the whole admission, so the wait below is measured against
+  // the same time the governor scheduled the slot on.
+  now = Date.now,
+  wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+}) {
+  let admitted = admitGovernorOperation(scope, leaseId, operation, priority, now());
+  const scheduled = admitted.ok &&
+    ["scheduled", "waiting"].includes(admitted.value?.status) &&
+    typeof admitted.value.reservationId === "string" &&
+    Number.isFinite(admitted.value.notBefore)
+      ? admitted.value
+      : null;
+  if (waitMs > 0 && scheduled) {
+    // The named slot can already have arrived while the intent was being
+    // persisted, so a delay that is gone is retried at once rather than treated
+    // as a refusal -- that race alone made this path intermittent.
+    const delay = scheduled.notBefore - now();
+    if (delay <= waitMs) {
+      if (delay > 0) await wait(delay);
+      if (!signal?.aborted) {
+        admitted = startReservation(scope, scheduled.reservationId, now());
+      }
     }
+  }
+  if (!admitted.ok || admitted.value.status !== "started") {
+    // The reservation is named by its intent, so a slot this call decided not
+    // to take is released rather than left scheduled against the budget.
+    const abandoned = admitted.value?.intentId ??
+      (typeof admitted.value?.reservationId === "string"
+        ? admitted.value.reservationId.slice(12)
+        : scheduled?.reservationId?.slice(12));
+    if (validGovernorId(abandoned)) cancelIntent(scope, abandoned, now());
     const detail = admitted.value?.resetMs
       ? ` until ${new Date(admitted.value.resetMs).toISOString()}`
       : admitted.value?.notBefore ? ` until ${new Date(admitted.value.notBefore).toISOString()}` : "";
@@ -8194,11 +8670,11 @@ async function runAdmittedOperation({ scope, leaseId, operation, priority = "man
     completeReservation(settlementScope, reservationId, {
       outcome: "measured-success",
       actualCost: costs,
-    }, Date.now());
+    }, now());
     if (scope.accessKey && scope.accessKey !== runtimeIdentityCoordinator?.current()?.accessKey) return { ok: false, error: new Error("Credential changed"), reservationId };
     return { ok: true, value, reservationId };
   } catch (error) {
-    completeReservation(settlementScope, reservationId, { outcome: governorOutcomeForError(error) }, Date.now());
+    completeReservation(settlementScope, reservationId, { outcome: governorOutcomeForError(error) }, now());
     return { ok: false, error, reservationId };
   }
 }
@@ -8884,6 +9360,14 @@ function App({ onCreateRemote = () => {} } = {}) {
   );
   const dataRef = useRef(data);
   dataRef.current = data;
+  // The workflow catalog, kept across polls so a repository whose runs carry no
+  // name of their own asks for it once every fifteen minutes rather than twice
+  // per poll. A ref because it must not redraw anything by itself.
+  const workflowCatalogRef = useRef(null);
+  // What each paged tab has actually loaded, and whether more exists. Demand is
+  // a page count so that holding `j` near the end asks for one more page rather
+  // than one per keystroke.
+  const pageStateRef = useRef({});
   const [meta, setMeta] = useState(() =>
     Object.fromEntries(TABS.map((candidate) => [candidate.key, cachedEntry?.tabs[candidate.key]?.meta ?? null])),
   );
@@ -8969,8 +9453,6 @@ function App({ onCreateRemote = () => {} } = {}) {
   // Read at fetch time rather than being a hook dependency, so dragging the
   // pane wider doesn't cancel and restart in-flight requests -- the next tick
   // simply asks for the new size.
-  const runLimitRef = useRef(0);
-  runLimitRef.current = Math.min(Math.max(bodyRows + 1, MIN_RUN_LIMIT), MAX_RUN_LIMIT);
 
   // Read inside the polling closure, which is created once on mount and must
   // not be torn down and rebuilt every time you press a tab key.
@@ -9012,7 +9494,7 @@ function App({ onCreateRemote = () => {} } = {}) {
 
   // useInput's handler is created before the render body computes the visible
   // slice, so the movement handlers read through a ref -- the same pattern the
-  // poll loop uses for runLimitRef and activeIndexRef, and for the same reason:
+  // poll loop uses for activeIndexRef, and for the same reason:
   // the closure must see current values without being rebuilt on every change.
   const navRef = useRef({ items: [], key: null, bodyRows: 1, tabKey: "actions", offset: 0 });
   navRef.current = {
@@ -9234,6 +9716,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           : Math.min(items.length - 1, start + rows_ - 1)
         : Math.min(items.length - 1, Math.max(0, current + delta));
     setSelected((s) => ({ ...s, [tabKey]: itemKey(items[next]) }));
+    demandPages(tabKey, next, items.length);
     // Keep the cursor on screen. Only the offset needed to reveal it changes,
     // so scrolling never jumps further than it has to.
     setOffset((o) => {
@@ -9246,6 +9729,24 @@ function App({ onCreateRemote = () => {} } = {}) {
     });
   }
 
+  // A cursor within PAGE_DEMAND_THRESHOLD rows of the end is the only thing
+  // that asks for another page. Demand is a count rather than an event, so ten
+  // keystrokes near the bottom acquire one page, and a tab nobody scrolled
+  // never acquires a second one at all.
+  function demandPages(tabKey, selectedIndex, loadedRows) {
+    const state = pageStateRef.current[tabKey];
+    if (!state) return;
+    const wanted = demandedPageCount(state.pages, {
+      selectedIndex,
+      loadedRows,
+      hasNextPage: state.hasNextPage,
+    });
+    if (wanted <= state.pages) return;
+    state.pages = wanted;
+    // Manual priority: the user is scrolling toward rows that are not loaded.
+    fetchTabRef.current?.(tabKey, { kind: "manual" });
+  }
+
   // Rearms on every call to moveSelection (it's the only thing that changes
   // `selected`), so this fires exactly 60s after the *last* movement -- tab
   // switches and Enter don't count as activity and don't push it back. Clears
@@ -9253,7 +9754,12 @@ function App({ onCreateRemote = () => {} } = {}) {
   // switch back to after being idle doesn't still show a stale row marked.
   useEffect(() => {
     if (Object.keys(selected).length === 0) return;
-    const timer = setTimeout(() => setSelected({}), SELECTION_IDLE_MS);
+    const timer = setTimeout(() => {
+      setSelected({});
+      // Extra pages are held for a cursor. With no cursor there is nothing to
+      // scroll toward, so they stop being refreshed on the next poll.
+      for (const state of Object.values(pageStateRef.current)) state.pages = 1;
+    }, SELECTION_IDLE_MS);
     return () => clearTimeout(timer);
   }, [selected]);
 
@@ -9341,13 +9847,16 @@ function App({ onCreateRemote = () => {} } = {}) {
       } else if (key.return) {
         if (remoteSetupRef.current) onCreateRemote(suspendTerminal);
         else openSelected();
-      } else if (input === "r") {
+      } else if (input === "r" || input === "R") {
         // Goes through the same per-tab in-flight guard as the poll loop, so
-        // holding the key down cannot stack concurrent subprocesses. `force`
-        // bypasses (and clears) any failure backoff: this key is the user saying
-        // "try again now", and a refresh that silently declined to refresh would
-        // be worse than no key at all.
-        fetchTabRef.current?.(TABS[activeIndexRef.current].key, { force: true });
+        // holding the key down cannot stack concurrent subprocesses. Both keys
+        // bypass the scheduled deadline and the tab's failure ladder -- the user
+        // is saying "try again now", and a refresh that silently declined to
+        // refresh would be worse than no key at all. Only `R` also drops the
+        // validators: `r` on a quiet repository answers 304 and costs nothing,
+        // which is exactly when the key is most likely to be pressed.
+        const request = manualRefreshRequest(refreshIntent(input));
+        if (request) fetchTabRef.current?.(TABS[activeIndexRef.current].key, request);
       } else if (input >= "1" && input <= String(TABS.length)) {
         setActiveIndex(Number(input) - 1);
       } else if (key.tab && key.shift) {
@@ -9428,8 +9937,6 @@ function App({ onCreateRemote = () => {} } = {}) {
     // a Promise.allSettled barrier. Actions is by far the slowest fetch, so
     // barrelling everything together meant the three fast tabs sat invisible
     // behind it and nothing at all appeared until the slowest call returned.
-    let securityUnchangedPolls = 0;
-    let securityNextPollAt = 0;
 
     function setTabGovernorDecision(key, decision) {
       setGovernorDecisions((current) => sameVisibleGovernorDecision(current[key], decision)
@@ -9542,6 +10049,7 @@ function App({ onCreateRemote = () => {} } = {}) {
 
     function commit(key, run, {
       force = false,
+      manual = false,
       scope,
       reservationId,
       admittedAt,
@@ -9556,7 +10064,8 @@ function App({ onCreateRemote = () => {} } = {}) {
       const settlementScope = settlement.scope;
       const currentAccess = settlement.isCurrent;
       inFlightRef.current[key] = true;
-      if (force) manualInFlight.add(key);
+      inFlightStartedAt[key] = admittedAt;
+      if (manual) manualInFlight.add(key);
       admittedCadenceRef.current[key] = nextAdmittedCadence(
         admittedCadenceRef.current[key],
         admittedAt,
@@ -9564,7 +10073,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       clearForcedBackoffAfterStart(key, force, "started");
       const visibleLoading = shouldShowFetchLoading({
         hasData: dataRef.current[key] !== null,
-        force,
+        manual,
       });
       if (visibleLoading) setLoading((l) => (l[key] ? l : { ...l, [key]: true }));
       const retainDeferredHold = retainDeferredGovernorHold({
@@ -9632,15 +10141,21 @@ function App({ onCreateRemote = () => {} } = {}) {
             limit,
             completedAt,
           });
-          if (key === "security") {
-            securityUnchangedPolls = transition.kind === "unchanged" ? securityUnchangedPolls + 1 : 0;
-            securityNextPollAt =
-              performance.now() +
-              securityPollDelay({
-                unchangedPolls: securityUnchangedPolls,
-                floorMs: runtime.refreshMs,
-                force,
-              });
+          // The cadence follows the observation, not the tab: an error or an
+          // unusable payload leaves the counter where it was, so a broken tab
+          // is never slowed down for looking quiet.
+          unchangedPolls[key] = advanceUnchangedCount(unchangedPolls[key], transition.kind);
+          // Recomputed now that the outcome is known: the schedule chose this
+          // tab's deadline before the observation that decides its cadence.
+          rescheduleTab(key, admittedAt, {
+            actionRows: key === "actions" && transition.kind === "changed" ? transition.data : undefined,
+          });
+          if (result?.catalog) workflowCatalogRef.current = result.catalog;
+          if (Number.isFinite(result?.loadedPages)) {
+            pageStateRef.current[key] = {
+              pages: result.loadedPages,
+              hasNextPage: result.hasNextPage === true,
+            };
           }
           publishStagedEntities(entityRef.current, stagedEntities, transition.kind);
           if (transition.kind === "unchanged") {
@@ -9674,7 +10189,6 @@ function App({ onCreateRemote = () => {} } = {}) {
           // so the next admitted tick parses its response instead of taking the
           // identical-output fast path.
           if (transition.kind === "unusable") {
-            if (key === "security") securityNextPollAt = 0;
             rawRef.current[key] = transition.nextRaw;
             setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
             return;
@@ -9747,6 +10261,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         })
         .finally(() => {
           inFlightRef.current[key] = false;
+          delete inFlightStartedAt[key];
           if (!currentAccess() && !Object.values(inFlightRef.current).some(Boolean) && runtimeIdentityCoordinator?.current()?.quotaKey !== settlementScope.quotaKey) releaseLease(settlementScope, leaseId);
           manualInFlight.delete(key);
           onSettled?.();
@@ -9764,19 +10279,27 @@ function App({ onCreateRemote = () => {} } = {}) {
                   : current);
             }
           }
-          if (!cancelled && queuedManual.delete(key)) {
-            void requestTab(key, "manual", { force: true });
+          const queued = queuedManual.get(key);
+          if (!cancelled && queued) {
+            queuedManual.delete(key);
+            void requestTab(key, "manual", { force: queued.force });
           }
         });
     }
 
     const leaseId = governorId();
     const pending = new Map();
-    // One manual handoff per tab. A keypress during an automatic request must
-    // not be lost, but repeated keypresses during the forced request itself
-    // must not create a trailing second batch.
-    const queuedManual = new Set();
+    // One manual handoff per tab, carrying which key produced it. A keypress
+    // during an automatic request must not be lost, but repeated keypresses
+    // during the manual request itself must not create a trailing second batch.
+    // The intention has to travel with the handoff: replaying every queued press
+    // as a resynchronization made `r` drop validators whenever it happened to
+    // land while an automatic poll was in flight.
+    const queuedManual = new Map();
     const manualInFlight = new Set();
+    // When the work currently in flight for each tab was admitted, so a press
+    // can tell an acquisition that already answers it from one that predates it.
+    const inFlightStartedAt = {};
     const wakeScheduler = createWakeScheduler();
     let scope = null;
     let cleanupScope = null;
@@ -9788,10 +10311,65 @@ function App({ onCreateRemote = () => {} } = {}) {
     let remoteUrls = [];
     let liveScheduling = false;
     let controlEpochs = null;
-    let activePollAt = Number.POSITIVE_INFINITY;
-    let backgroundPollAt = Number.POSITIVE_INFINITY;
+    // One deadline per tab, not one active slot and one rotating background
+    // slot. Two shared timers cannot express a Security tab quiet at 300s next
+    // to an Actions tab watching a running job at 5s, which is the whole point
+    // of the cadence table.
+    const NEVER_DUE = Object.fromEntries(TAB_KEYS.map((key) => [key, Number.POSITIVE_INFINITY]));
+    let pollDueAt = { ...NEVER_DUE };
     let backgroundIndex = 0;
+    // Only the unchanged run counts live here. Whether Actions has work in
+    // flight is read from the rows themselves, so there is no second copy of it
+    // to fall out of step with what is on screen.
+    const unchangedPolls = Object.fromEntries(TAB_KEYS.map((key) => [key, 0]));
     let pendingBlockPublications = new Map();
+
+    // Rows are the only record of whether CI is busy, so this reads them rather
+    // than keeping a second copy that can fall out of step with the screen. A
+    // caller that has just parsed newer rows passes them, because dataRef only
+    // catches up on the next render.
+    function actionsInProgress(rows = dataRef.current.actions) {
+      return Array.isArray(rows) && rows.some((row) => row.status !== "completed");
+    }
+
+    function pollIntervalFor(key, activeKey, { actionRows } = {}) {
+      return pollPolicyInterval({
+        tab: key,
+        floorMs: runtime.refreshMs,
+        demand: key === activeKey ? "active" : "inactive",
+        unchangedCount: unchangedPolls[key],
+        inProgressCI: key === "actions" && actionsInProgress(actionRows),
+        background: runtime.background,
+      });
+    }
+
+    function rescheduleTab(key, at, options = {}) {
+      const step = pollIntervalFor(key, TABS[activeIndexRef.current].key, options);
+      pollDueAt = {
+        ...pollDueAt,
+        [key]: Number.isFinite(step) ? at + step : Number.POSITIVE_INFINITY,
+      };
+    }
+
+    // Polling opens with the active tab immediately and the inactive ones
+    // staggered one background slot apart, exactly as the single rotating slot
+    // used to place them. Opening them all at the same deadline would start
+    // three fetches within one wake -- the herd the rotation exists to prevent,
+    // and it only diverges again once each tab has taken its own interval.
+    function openPollDeadlines(at) {
+      const activeKey = TABS[activeIndexRef.current].key;
+      const opened = { ...NEVER_DUE };
+      opened[activeKey] = at + 1;
+      let slot = 1;
+      for (const key of TAB_KEYS) {
+        if (key === activeKey) continue;
+        opened[key] = Number.isFinite(pollIntervalFor(key, activeKey))
+          ? at + slot * 4 * runtime.refreshMs
+          : Number.POSITIVE_INFINITY;
+        slot += 1;
+      }
+      pollDueAt = opened;
+    }
 
     function armWake(kind, at, run) {
       if (!cancelled) wakeScheduler.arm(kind, at, run);
@@ -9800,8 +10378,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     function failClosedRateLimit(key, reason) {
       liveScheduling = false;
       controlEpochs = null;
-      activePollAt = Number.POSITIVE_INFINITY;
-      backgroundPollAt = Number.POSITIVE_INFINITY;
+      pollDueAt = { ...NEVER_DUE };
       wakeScheduler.clear("data");
       pauseCoordination(key, reason);
       armWake("control", governorControlRetryAt(Date.now(), runtime.refreshMs), controlWake);
@@ -9876,6 +10453,12 @@ function App({ onCreateRemote = () => {} } = {}) {
         rawRef.current = {};
         entityRef.current.clear();
         lastOkRef.current = {};
+        // The workflow catalog is repository payload, not scheduling state, so
+        // it is fenced with the rows rather than carried into whatever account
+        // this pane now holds. The page counts go with it: demand measured
+        // against a list that has been discarded describes nothing.
+        workflowCatalogRef.current = null;
+        pageStateRef.current = {};
         setData(Object.fromEntries(TAB_KEYS.map((key) => [key, null])));
         setMeta({});
         setSecurityNotes([]);
@@ -9884,8 +10467,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       }
       pendingBlockPublications.clear();
       liveScheduling = false;
-      activePollAt = Number.POSITIVE_INFINITY;
-      backgroundPollAt = Number.POSITIVE_INFINITY;
+      pollDueAt = { ...NEVER_DUE };
       wakeScheduler.clear("data");
       wakeScheduler.clear("heartbeat");
       wakeScheduler.clear("control");
@@ -9993,7 +10575,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       publishGovernorEpochs(snapshot);
       const wakes = governorWakeTimes(snapshot.value, nowMs, runtime.refreshMs, leaseId);
       armWake("control", wakes.controlAt, controlWake);
-      const nextDataAt = Math.min(wakes.dataAt, activePollAt, backgroundPollAt);
+      const nextDataAt = Math.min(wakes.dataAt, ...Object.values(pollDueAt));
       if (liveScheduling) armWake("data", nextDataAt, dataWake);
     }
 
@@ -10002,39 +10584,55 @@ function App({ onCreateRemote = () => {} } = {}) {
       armFromState();
     }
 
+    // Manual and tab-switch work replaces the automatic check that would
+    // otherwise be due, rather than being added to it.
     function replaceActivePoll(kind, at) {
       if (["manual", "tab-switch"].includes(kind)) {
-        activePollAt = at + runtime.refreshMs;
+        rescheduleTab(TABS[activeIndexRef.current].key, at);
       }
     }
 
+    // `manual` is the user asking now: it bypasses the scheduled deadline and
+    // the tab's failure ladder. `force` is the separate, stronger request that
+    // also drops validators -- the `R` key. `r` is manual and not forced, which
+    // is what makes a quiet refresh cost nothing.
     function requestTab(key, kind = "active", { force = false } = {}) {
+      const manual = kind === "manual";
       const signal = controller.signal;
       const descriptor = tabForKey(key);
       const monotonicNow = performance.now();
       if (pendingBlockPublications.size > 0) {
         pauseCoordination(key, "block-unpublished");
-        return Promise.resolve({ persisted: false, retry: false, kind });
+        return Promise.resolve({ persisted: false, retry: false, kind, key });
       }
       if (inFlightRef.current[key]) {
-        if (force && !manualInFlight.has(key)) queuedManual.add(key);
-        return Promise.resolve({ persisted: false, retry: false, kind });
+        // A manual acquisition already in flight is work this user asked for,
+        // so the press joins it. Automatic work that started before the press
+        // cannot answer it, so schedule exactly one follow-up; further presses
+        // coalesce into that one, and the stronger intention wins.
+        if (manual && !manualInFlight.has(key)) {
+          const plan = planManualRefresh({
+            requestedAt: Date.now(),
+            inFlightStartedAt: inFlightStartedAt[key] ?? null,
+            followUpPending: queuedManual.has(key),
+          });
+          if (plan.followUp) queuedManual.set(key, { force });
+        }
+        if (force && queuedManual.has(key)) queuedManual.get(key).force = true;
+        return Promise.resolve({ persisted: false, retry: false, kind, key });
       }
-      if (!force && backoffActive(`tab:${key}`, monotonicNow)) {
-        return Promise.resolve({ persisted: false, retry: false, kind });
-      }
-      if (!force && key === "security" && monotonicNow < securityNextPollAt) {
-        return Promise.resolve({ persisted: false, retry: false, kind });
+      if (!manual && backoffActive(`tab:${key}`, monotonicNow)) {
+        return Promise.resolve({ persisted: false, retry: false, kind, key });
       }
       const nowMs = Date.now();
       const currentScope = ensureScope(nowMs);
       if (!currentScope) {
         pauseCoordination(key, "unknown-scope");
-        return Promise.resolve({ persisted: false, retry: true, kind });
+        return Promise.resolve({ persisted: false, retry: true, kind, key });
       }
       let protocolReady = liveScheduling;
       let resourceReady = liveScheduling;
-      if (!liveScheduling || force) {
+      if (!liveScheduling || manual) {
         const snapshot = inspectGovernor(currentScope, nowMs);
         protocolReady = governorProtocolReady(
           { ok: true, value: { status: "published" } },
@@ -10045,13 +10643,12 @@ function App({ onCreateRemote = () => {} } = {}) {
           { ok: true, value: { status: "published" } }, snapshot, key, nowMs);
         if (!liveScheduling && resourceReady) {
           liveScheduling = true;
-          activePollAt = nowMs;
-          backgroundPollAt = nowMs + 4 * runtime.refreshMs;
+          openPollDeadlines(nowMs - 1);
           armWake("heartbeat", nowMs + GOVERNOR_HEARTBEAT_MS, heartbeatWake);
         }
       }
-      const intentGate = runtimeIntentGate(liveScheduling, { force, protocolReady });
-      if (intentGate.requestProbe || force && !resourceReady) {
+      const intentGate = runtimeIntentGate(liveScheduling, { force: manual, protocolReady });
+      if (intentGate.requestProbe || manual && !resourceReady) {
         const snapshot = inspectGovernor(currentScope, nowMs);
         const costs = tabRequestCost(key);
         for (const resource of RATE_RESOURCES) {
@@ -10065,12 +10662,12 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (!intentGate.registerIntent) {
         setTabGovernorDecision(key, { mode: "waiting", probing: true });
         setTabWaiting(key, true);
-        return Promise.resolve({ persisted: false, retry: false, kind });
+        return Promise.resolve({ persisted: false, retry: false, kind, key });
       }
       const existing = pending.get(key);
       if (existing) {
-        if (!force || existing.kind === "manual") {
-          return Promise.resolve({ persisted: true, retry: false, kind });
+        if (!manual || existing.kind === "manual") {
+          return Promise.resolve({ persisted: true, retry: false, kind, key });
         }
         cancelIntent(currentScope, existing.intentId, nowMs);
         pending.delete(key);
@@ -10088,13 +10685,14 @@ function App({ onCreateRemote = () => {} } = {}) {
       const registered = registerIntent(currentScope, request);
       if (!registered.ok) {
         pauseCoordination(key, registered.reason);
-        return Promise.resolve({ persisted: false, retry: true, kind });
+        return Promise.resolve({ persisted: false, retry: true, kind, key });
       }
       const decision = registered.value;
       pending.set(key, {
         intentId,
         kind,
         force,
+        manual,
         wasDeferred: false,
         ...sharedLaneEvidence(decision),
       });
@@ -10103,20 +10701,20 @@ function App({ onCreateRemote = () => {} } = {}) {
         if (item) item.wasDeferred = true;
         setTabGovernorDecision(key, visibleGovernorDecision(decision));
         setTabWaiting(key, true);
-        if (force && decision.resource) {
+        if (manual && decision.resource) {
           const budget = inspectGovernor(currentScope, nowMs).value?.budgets?.[decision.resource];
           if (budget) requestManualProbe(currentScope, leaseId, budget.epoch, budget.observedAt, nowMs);
         }
         armWake("data", decision.retryAt ?? decision.notBefore ?? nowMs + runtime.refreshMs, dataWake);
         armFromState(nowMs);
-        return Promise.resolve({ persisted: true, retry: false, kind });
+        return Promise.resolve({ persisted: true, retry: false, kind, key });
       }
       const started = startReservation(currentScope, decision.reservationId, nowMs);
       if (!started.ok) {
         pauseCoordination(key, started.reason);
         if (pendingFailureIsTerminal(started.reason)) finishPending(key, intentId);
         else armWake("data", governorControlRetryAt(nowMs, runtime.refreshMs), dataWake);
-        return Promise.resolve({ persisted: true, retry: false, kind });
+        return Promise.resolve({ persisted: true, retry: false, kind, key });
       }
       if (started.value.status !== "started") {
         const item = pending.get(key);
@@ -10126,7 +10724,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           ...started.value,
         }));
         armWake("data", started.value.notBefore ?? nowMs + runtime.refreshMs, dataWake);
-        return Promise.resolve({ persisted: true, retry: false, kind });
+        return Promise.resolve({ persisted: true, retry: false, kind, key });
       }
       setTabWaiting(key, false);
       replaceActivePoll(kind, nowMs);
@@ -10135,23 +10733,31 @@ function App({ onCreateRemote = () => {} } = {}) {
         key,
         () => descriptor.fetch({
           signal,
-          runLimit: runLimitRef.current,
           entities: entityRef.current,
           force,
+          catalog: workflowCatalogRef.current,
+          pages: pageStateRef.current[key]?.pages ?? 1,
           governor: { scope: currentScope, leaseId },
           previousRaw: rawRef.current[key] ?? null,
         }),
         {
           force,
+          manual,
           scope: currentScope,
           reservationId: decision.reservationId,
           admittedAt: nowMs,
           automaticStatusVisible: false,
           onSettled: () => finishPending(key, intentId),
         },
-      ).then(() => ({ persisted: true, retry: false, kind }));
+      ).then(() => ({ persisted: true, retry: false, kind, key }));
     }
     fetchTabRef.current = (key, { force = false, kind = force ? "manual" : "active" } = {}) => {
+      if (kind === "tab-switch") {
+        // A newly active subscription is not evidence of quiet: the tab you
+        // just opened deserves a check at the floor, not at the interval it
+        // earned while nobody was looking at it.
+        unchangedPolls[key] = advanceUnchangedCount(unchangedPolls[key], "subscribed");
+      }
       const requestedAt = Date.now();
       // Manual work replaces the active poll that would otherwise be due. Move
       // that deadline before touching the governor so a data wake already in
@@ -10222,14 +10828,16 @@ function App({ onCreateRemote = () => {} } = {}) {
           key,
           () => descriptor.fetch({
             signal: controller.signal,
-            runLimit: runLimitRef.current,
             entities: entityRef.current,
             force: item.force,
+            catalog: workflowCatalogRef.current,
+            pages: pageStateRef.current[key]?.pages ?? 1,
             governor: { scope: currentScope, leaseId },
             previousRaw: rawRef.current[key] ?? null,
           }),
           {
             force: item.force,
+            manual: item.manual === true,
             scope: currentScope,
             reservationId: decision.value.reservationId,
             admittedAt: nowMs,
@@ -10266,13 +10874,16 @@ function App({ onCreateRemote = () => {} } = {}) {
         nowMs,
         floorMs: runtime.refreshMs,
         activeKey: active,
-        activeAt: activePollAt,
-        backgroundAt: backgroundPollAt,
+        dueAt: pollDueAt,
         backgroundIndex,
         heldResources,
+        background: runtime.background,
+        states: Object.fromEntries(TAB_KEYS.map((key) => [key, {
+          unchangedCount: unchangedPolls[key],
+          inProgressCI: key === "actions" && actionsInProgress(),
+        }])),
       });
-      activePollAt = planned.activeAt;
-      backgroundPollAt = planned.backgroundAt;
+      pollDueAt = planned.dueAt;
       backgroundIndex = planned.backgroundIndex;
       const outcomes = await Promise.allSettled(
         planned.due.map(({ key, kind }) => requestTab(key, kind)),
@@ -10281,15 +10892,14 @@ function App({ onCreateRemote = () => {} } = {}) {
       let retryNeeded = false;
       for (const outcome of outcomes) {
         if (outcome.status !== "fulfilled" || outcome.value?.retry !== true) continue;
-        ({ activeAt: activePollAt, backgroundAt: backgroundPollAt, backgroundIndex } =
-          retryPollAfterAdmissionFailure({
-            kind: outcome.value.kind,
-            retryAt,
-            activeAt: activePollAt,
-            backgroundAt: backgroundPollAt,
-            backgroundIndex,
-            previousBackgroundIndex,
-          }));
+        ({ dueAt: pollDueAt, backgroundIndex } = retryPollAfterAdmissionFailure({
+          key: outcome.value.key,
+          kind: outcome.value.kind,
+          retryAt,
+          dueAt: pollDueAt,
+          backgroundIndex,
+          previousBackgroundIndex,
+        }));
         retryNeeded = true;
       }
       if (retryNeeded) armWake("data", retryAt, dataWake);
@@ -10346,10 +10956,15 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (controlReady && (!liveScheduling || activeEpochChanged)) {
         const starting = !liveScheduling;
         liveScheduling = true;
-        activePollAt = checkedAt + 1;
         if (starting) {
-          backgroundPollAt = checkedAt + 4 * runtime.refreshMs;
+          openPollDeadlines(checkedAt);
           armWake("heartbeat", checkedAt + GOVERNOR_HEARTBEAT_MS, heartbeatWake);
+        } else {
+          // A new accounting epoch for a resource the active tab spends: check
+          // it now rather than at whatever cadence it had settled into. Set
+          // directly rather than through rescheduleTab, whose whole job is to
+          // apply that cadence.
+          pollDueAt = { ...pollDueAt, [TABS[activeIndexRef.current].key]: checkedAt + 1 };
         }
       }
       if (!refreshed.ok) {
@@ -10396,8 +11011,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (controlReady) {
         controlEpochs = { ...snapshot.value.epochs };
         liveScheduling = true;
-        activePollAt = checkedAt + 1;
-        backgroundPollAt = checkedAt + 4 * runtime.refreshMs;
+        openPollDeadlines(checkedAt);
         armWake("heartbeat", checkedAt + GOVERNOR_HEARTBEAT_MS, heartbeatWake);
       }
       if (!refreshed.ok) {
@@ -11149,6 +11763,7 @@ export {
   HOST_PATTERN,
   MIN_REFRESH_SECONDS,
   MAX_REFRESH_SECONDS,
+  BACKGROUND_MODES,
   TAB_KEYS,
   ALERT_SOURCES,
   REST_PER_FETCH,
@@ -11269,6 +11884,13 @@ export {
   actionsRunsArgs,
   actionsWorkflowsArgs,
   parseActionsBodies,
+  parseActionsRuns,
+  parseWorkflowCatalog,
+  resolveWorkflowNames,
+  workflowCatalogDemand,
+  fetchActions,
+  ACTIONS_RUN_LIMIT,
+  WORKFLOW_CATALOG_TTL_MS,
   entityKey,
   fetchConditionalEntity,
   conditionalBatchResult,
@@ -11309,8 +11931,17 @@ export {
   mergeDashboardCacheSnapshots,
   nextSecurityRaw,
   shouldCheckpointFreshness,
-  securityPollDelay,
+  pollPolicyInterval,
+  advanceUnchangedCount,
+  POLL_ACTIVE_CI_MS,
+  POLL_QUIET_AFTER,
+  POLL_QUIET_MS,
+  POLL_BACKGROUND_MS,
   shouldShowFetchLoading,
+  refreshIntent,
+  manualRefreshRequest,
+  planManualRefresh,
+  conditionalRecoveryPlan,
   pollSchedule,
   retryPollAfterAdmissionFailure,
   governorWakeTimes,
@@ -11330,6 +11961,7 @@ export {
   rateLimitBlockProbeRecovered,
   admitGovernorOperation,
   runAdmittedOperation,
+  GOVERNOR_ADMISSION_WAIT_MS,
   pollResultTransition,
   forcedBackoffKeys,
   clearForcedBackoffAfterStart,
@@ -11345,6 +11977,11 @@ export {
   graphqlArgs,
   fetchGraphqlPage,
   fetchGraphqlList,
+  PAGE_DEMAND_THRESHOLD,
+  pageGeneration,
+  paginationDemand,
+  demandedPageCount,
+  mergeDemandedPages,
   operationPausedUntil,
   LIST_LIMIT,
   readGraphqlObserver,

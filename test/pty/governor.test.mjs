@@ -12,7 +12,7 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { resourceReserve } from "../../index.mjs";
+import { resourceReserve, tabRequestCost } from "../../index.mjs";
 import { captureAsync } from "./capture.mjs";
 import { seedKnownHeldIdentity } from "./fixtures/known-identity.mjs";
 
@@ -20,6 +20,16 @@ const STATE_HELPER = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "
 const LIMIT = 10_000;
 const WINDOW_MS = 600_000;
 const CAPTURE_ARGS = "--repo acme/widget --refresh 40";
+// One Actions fetch is one REST call now that the workflow catalog is a
+// conditional fallback, so twelve panes make twelve data starts rather than
+// twenty-four. Read from the cost table so re-pricing the tab cannot leave a
+// literal behind.
+const PANE_COUNT = 12;
+const ACTIONS_CALLS = tabRequestCost("actions").core;
+const STARTUP_DATA_STARTS = PANE_COUNT * ACTIONS_CALLS;
+// What the external burn below deliberately leaves spendable: room for two
+// Actions batches and no more.
+const BURN_HEADROOM = 2 * ACTIONS_CALLS;
 
 function fixture(t, overrides = {}) {
   const root = mkdtempSync(join(tmpdir(), "gh-glance-governor-pty-"));
@@ -212,8 +222,8 @@ test("twelve real panes share one startup probe and every active pane progresses
     startupGovernor = scheduled.governor;
     progress = await observeUntil(
       box.read,
-      (state) => dataStarts(state).length >= 24 &&
-        new Set(dataStarts(state).map((event) => event.pane)).size === 12,
+      (state) => dataStarts(state).length >= STARTUP_DATA_STARTS &&
+        new Set(dataStarts(state).map((event) => event.pane)).size === PANE_COUNT,
       reservationHorizon(startupGovernor, "core"),
     );
   } finally {
@@ -222,7 +232,7 @@ test("twelve real panes share one startup probe and every active pane progresses
 
   const data = dataStarts(progress);
   assert.equal(probes(progress).length, 1, `startup probes: ${JSON.stringify(probes(progress))}`);
-  assert.equal(data.length, 24, "startup launched background or duplicate data work");
+  assert.equal(data.length, STARTUP_DATA_STARTS, "startup launched background or duplicate data work");
   assert.equal(new Set(data.map((event) => event.pane)).size, 12);
   assert.ok(data.every(isActionsEndpoint), "a non-active tab ran at startup");
   assertDebitsStayOutsideReserve(data);
@@ -473,7 +483,7 @@ test("a real reset resumes all panes, while atomic external burn limits the next
   const resetData = dataStarts(resetProgress);
   const resetRuns = actionsRuns(resetProgress);
   assert.equal(resetRuns.length, 12, "reset launched duplicate Actions batches");
-  assert.ok(resetData.length >= 12 && resetData.length <= 24,
+  assert.ok(resetData.length >= PANE_COUNT && resetData.length <= STARTUP_DATA_STARTS,
     "reset launched work outside the twelve Actions batches");
   assert.equal(new Set(resetData.map((event) => event.pane)).size, 12);
   assertDebitsStayOutsideReserve(resetData);
@@ -503,7 +513,12 @@ test("a real reset resumes all panes, while atomic external burn limits the next
       resolve,
       Math.max(0, anchored.createdAt + 10_700 - Date.now()),
     ));
-    execFileSync(process.execPath, [STATE_HELPER, "--fixture-burn", "core", "7996"], {
+    execFileSync(process.execPath, [
+      STATE_HELPER,
+      "--fixture-burn",
+      "core",
+      String(LIMIT - resourceReserve(LIMIT) - BURN_HEADROOM),
+    ], {
       env: { GH_GLANCE_FIXTURE_STATE: burnBox.statePath },
     });
     burned = await observeUntil(
@@ -520,11 +535,11 @@ test("a real reset resumes all panes, while atomic external burn limits the next
   const burnEvent = finalBurn.events.find((event) => event.type === "external-burn");
   const burnData = dataStarts(finalBurn);
   const burnRuns = actionsRuns(finalBurn);
-  assert.equal(burnEvent.amount, 7996);
-  assert.equal(burnEvent.after.core.remaining, resourceReserve(LIMIT) + 4);
+  assert.equal(burnEvent.amount, LIMIT - resourceReserve(LIMIT) - BURN_HEADROOM);
+  assert.equal(burnEvent.after.core.remaining, resourceReserve(LIMIT) + BURN_HEADROOM);
   assert.ok(burnRuns.length >= 1 && burnRuns.length <= 2,
     `burn admitted ${burnRuns.length} Actions batches`);
-  assert.equal(burnData.length, burnRuns.length * 2,
+  assert.equal(burnData.length, burnRuns.length * ACTIONS_CALLS,
     `burn admitted incomplete Actions batches: ${burnData.length} calls`);
   assert.equal(probes(burned).length, 2);
   assertDebitsStayOutsideReserve(burnData);

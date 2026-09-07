@@ -399,14 +399,29 @@ test("--doctor reports the host-qualified target it was given", async () => {
 test("GH_GLANCE_REFRESH sets the interval and is reported by name", async () => {
   const report = await doctor({ env: { GH_GLANCE_REFRESH: "30" } });
   assert.match(report, /GH_GLANCE_REFRESH\s+30/);
-  assert.match(report, /this config spends .*refresh 30s/);
-  // 1800 REST/hour at the default 5s, so a sixth of it at 30s.
-  assert.match(report, /~300 REST/);
+  assert.match(report, /projected demand .*floor 30s/);
+  // At a 30s floor every cadence in the table is the floor itself -- 30s is
+  // already slower than the quiet interval and the running-CI interval -- so
+  // the range collapses to a single figure: 120/h for Actions plus 12/h x 6
+  // for background Security.
+  assert.match(report, /~180 REST \+ ~40 GraphQL per hour/);
+  assert.doesNotMatch(report, /this config spends/);
 });
 
 test("--refresh beats GH_GLANCE_REFRESH", async () => {
   const report = await doctor({ env: { GH_GLANCE_REFRESH: "30" }, args: ["--refresh", "10"] });
-  assert.match(report, /this config spends .*refresh 10s/);
+  assert.match(report, /projected demand .*floor 10s/);
+  // A 10s floor is slower than the 5s running-CI interval but faster than the
+  // 30s quiet one, so Actions alone spans 360-720 REST per hour.
+  assert.match(report, /~192-432 REST/);
+});
+
+test("--background off is reported and removes inactive demand from the projection", async () => {
+  const report = await doctor({ args: ["--background", "off"] });
+  assert.match(report, /projected demand .*background off/);
+  // Only the tab being watched is requested at all, so GraphQL -- which only
+  // Issues and Pull requests spend -- projects to nothing.
+  assert.match(report, /~120-720 REST \+ ~0 GraphQL per hour/);
 });
 
 test("an out-of-range GH_GLANCE_REFRESH exits 2 naming the variable", async () => {

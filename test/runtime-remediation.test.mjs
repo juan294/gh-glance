@@ -21,10 +21,12 @@ import {
   mergeWidthPreferenceSnapshots,
   pollResultTransition,
   pollSchedule,
+  TAB_KEYS,
   mapAllSettledBounded,
   reconcileSelectionViewport,
   resourceDecision,
-  securityPollDelay,
+  pollPolicyInterval,
+  advanceUnchangedCount,
   selectionLabel,
   shouldCheckpointFreshness,
   shouldEnableMouseReporting,
@@ -117,11 +119,23 @@ test("a 304 Security primary reuses its path-keyed body to decide priority work"
   assert.equal(result.parse().alerts.length, 101);
 });
 
-test("unchanged Security data uses a slower bounded cadence and force bypasses it", () => {
-  assert.equal(securityPollDelay({ unchangedPolls: 0, floorMs: 5000 }), 5000);
-  assert.equal(securityPollDelay({ unchangedPolls: 1, floorMs: 5000 }), 60_000);
-  assert.equal(securityPollDelay({ unchangedPolls: 5, floorMs: 120_000 }), 120_000);
-  assert.equal(securityPollDelay({ unchangedPolls: 5, floorMs: 5000, force: true }), 0);
+test("unchanged Security data uses a slower bounded cadence, and only proven quiet earns it", () => {
+  const security = (unchangedCount) =>
+    pollPolicyInterval({ tab: "security", floorMs: 5000, demand: "active", unchangedCount });
+  // One unchanged observation is not evidence of a quiet repository; two is.
+  assert.equal(security(0), 5000);
+  assert.equal(security(1), 5000);
+  assert.equal(security(2), 60_000);
+  // The floor still wins when it is the slower of the two.
+  assert.equal(
+    pollPolicyInterval({ tab: "security", floorMs: 120_000, demand: "active", unchangedCount: 5 }),
+    120_000,
+  );
+  // And an error never counts toward it, so a tab that cannot be read is never
+  // slowed down for looking quiet.
+  assert.equal(advanceUnchangedCount(1, "unusable"), 1);
+  assert.equal(advanceUnchangedCount(1, "unchanged"), 2);
+  assert.equal(advanceUnchangedCount(1, "changed"), 0);
 });
 
 test("cache identity follows the effective gh account namespace without storing a token", () => {
@@ -241,9 +255,10 @@ test("tab resource decisions keep GraphQL and REST independent", () => {
 });
 
 test("settled automatic polling stays invisible while first load and manual refresh stay visible", () => {
-  assert.equal(shouldShowFetchLoading({ hasData: false, force: false }), true);
-  assert.equal(shouldShowFetchLoading({ hasData: true, force: false }), false);
-  assert.equal(shouldShowFetchLoading({ hasData: true, force: true }), true);
+  assert.equal(shouldShowFetchLoading({ hasData: false, manual: false }), true);
+  assert.equal(shouldShowFetchLoading({ hasData: true, manual: false }), false);
+  // Both `r` and `R` are manual, so both show that something is happening.
+  assert.equal(shouldShowFetchLoading({ hasData: true, manual: true }), true);
 });
 
 test("doctor summaries preserve diagnostic identity without local path or network disclosure", () => {
@@ -281,12 +296,12 @@ test("the poll controller keeps unchanged, blind, and changed transitions separa
   assert.equal(blind.kind, "blind");
   assert.equal(blind.nextRaw, null);
 
+  const allDue = (nowMs) => Object.fromEntries(TAB_KEYS.map((key) => [key, nowMs]));
   let schedule = pollSchedule({
     nowMs: 0,
     floorMs: 5,
     activeKey: "issues",
-    activeAt: 0,
-    backgroundAt: 20,
+    dueAt: { ...allDue(0), actions: 20, prs: 20, security: 20 },
   });
   assert.deepEqual(schedule.due, [{ key: "issues", kind: "active" }]);
   const rotations = [];
@@ -295,40 +310,40 @@ test("the poll controller keeps unchanged, blind, and changed transitions separa
       nowMs,
       floorMs: 5,
       activeKey: "issues",
-      activeAt: nowMs,
-      backgroundAt: nowMs,
+      dueAt: allDue(nowMs),
       backgroundIndex: schedule.backgroundIndex,
     });
     rotations.push(schedule.due);
   }
+  // One background tab per wake, in rotation, so three inactive tabs falling due
+  // together never open three concurrent fetches.
   assert.deepEqual(rotations, [
     [{ key: "issues", kind: "active" }, { key: "actions", kind: "background" }],
     [{ key: "issues", kind: "active" }, { key: "prs", kind: "background" }],
     [{ key: "issues", kind: "active" }, { key: "security", kind: "background" }],
   ]);
+  // A held core resource skips the tabs that spend it. Issues is GraphQL only,
+  // so it still runs; Actions and Security are deferred to the hold's retry.
   assert.deepEqual(
     pollSchedule({
       nowMs: 20,
       floorMs: 5,
       activeKey: "issues",
-      activeAt: 20,
-      backgroundAt: 20,
+      dueAt: allDue(20),
       heldResources: { core: { held: true, retryAt: 100 } },
     }).due,
     [{ key: "issues", kind: "active" }, { key: "prs", kind: "background" }],
   );
 
-  assert.deepEqual(
-    pollSchedule({
-      nowMs: 20,
-      floorMs: 5,
-      activeKey: "actions",
-      activeAt: 20,
-      backgroundAt: 20,
-      heldResources: { core: { held: true, retryAt: 100 } },
-    }).due,
-    [{ key: "issues", kind: "background" }],
-  );
+  const heldActive = pollSchedule({
+    nowMs: 20,
+    floorMs: 5,
+    activeKey: "actions",
+    dueAt: allDue(20),
+    heldResources: { core: { held: true, retryAt: 100 } },
+  });
+  assert.deepEqual(heldActive.due, [{ key: "issues", kind: "background" }]);
+  assert.equal(heldActive.dueAt.actions, 100, "a held tab waits for the hold, not the floor");
 });
 
 test("manual delay preserves backoff until the reservation actually starts", () => {

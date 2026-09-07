@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { capture, captureAsync } from "./capture.mjs";
 
-const RUNS = "repos/acme/widget/actions/runs?exclude_pull_requests=true&per_page=20";
+const RUNS = "repos/acme/widget/actions/runs?exclude_pull_requests=true&per_page=60";
 const TOKENS = ["private-fixture-account-a", "private-fixture-account-b", "private-fixture-account-c"];
 
 function account(token, id, title) {
@@ -13,7 +13,11 @@ function account(token, id, title) {
     [RUNS]: { body: JSON.stringify([{
       databaseId: id * 100, displayTitle: title, number: 1, headBranch: "develop",
       status: "completed", conclusion: "success", startedAt: "2026-09-01T10:00:00Z",
-      updatedAt: "2026-09-01T10:01:00Z", workflowId: 10,
+      // The run carries its own workflow name, so this pane makes exactly one
+      // core request per Actions fetch. Without it the conditional catalog
+      // fallback would add a second "actions" call -- delayed by the same
+      // fixture delay, and matching the reservation search below.
+      updatedAt: "2026-09-01T10:01:00Z", workflowId: 10, workflowName: "CI",
     }]) },
   } };
 }
@@ -29,16 +33,22 @@ async function quitWhenSwitchSettled(root) {
   const { join } = await import("node:path");
   const directory = join(root, "gh-glance", "coordination-v2");
   const deadline = Date.now() + 60_000;
-  let reservationId = null;
   while (Date.now() < deadline) {
     try {
       const registry = JSON.parse(readFileSync(join(directory, "registry.json"), "utf8"));
       const old = Object.values(registry.identities).find((identity) => identity.id === 1);
       if (old) {
         const ledger = JSON.parse(readFileSync(join(directory, `quota-${old.quotaKey}.json`), "utf8"));
-        reservationId ??= Object.entries(ledger.reservations)
-          .find(([, reservation]) => reservation.costs.core >= 2)?.[0] ?? null;
-        const settled = reservationId !== null && ledger.reservations[reservationId]?.status === "completed";
+        // The newest core-charging reservation, not the first one found. The
+        // identity bootstrap also charges one core unit and stays started
+        // across the switch by design, so "the first reservation that spends
+        // core" names the wrong request -- and waits forever for a charge that
+        // is meant to remain uncertain. Nothing new starts in the abandoned
+        // scope after the switch, so the newest is the delayed Actions request.
+        const newest = Object.values(ledger.reservations)
+          .filter((reservation) => reservation.costs.core >= 1 && reservation.startedAt !== null)
+          .sort((left, right) => right.startedAt - left.startedAt)[0];
+        const settled = newest?.status === "completed";
         const rendered = readFileSync(process.env.GH_GLANCE_CAPTURE_OUT, "utf8").includes("NEW_PRIVATE_ROW");
         if (settled && rendered) break;
       }
@@ -117,8 +127,11 @@ test("ID-02/03/06: switched accounts fence delayed rows, settle the old ledger, 
   await waitFor(readState, (state) => state.events.some((event) => event.type === "start" && event.argv.includes(RUNS)), "old account's delayed Actions request");
   const oldIdentity = Object.values(readRegistry().identities).find((identity) => identity.id === 1);
   assert.ok(oldIdentity);
+  // The newest started reservation that charges core: the identity bootstrap
+  // charges one unit too, and it is meant to stay uncertain across the switch.
   const oldReservation = Object.entries(readLedger(oldIdentity).reservations)
-    .find(([, reservation]) => reservation.status === "started" && reservation.costs.core >= 2);
+    .filter(([, reservation]) => reservation.status === "started" && reservation.costs.core >= 1)
+    .sort(([, left], [, right]) => right.startedAt - left.startedAt)[0];
   assert.ok(oldReservation, "old request had no durable quota reservation");
   switchAccount(account(TOKENS[1], 2, "NEW_PRIVATE_ROW"));
   const result = await running;

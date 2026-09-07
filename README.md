@@ -247,7 +247,8 @@ stdout isn't a terminal rather than streaming redraw frames into a pipe.
 | `↑` / `↓` or `j` / `k` | Move the cursor between rows |
 | `PgUp` / `PgDn` | Move a page at a time |
 | `Enter` | Open the selected item, or accept an onboarding prompt |
-| `r` | Request a current-tab refresh; a safe grant is still required. |
+| `r` | Request a current-tab refresh. It sends the cached validators, so an unchanged tab answers `304` and spends nothing. A safe grant is still required. |
+| `R` | Resynchronize the current tab: one generation without validators, and the only key that clears a negative capability backoff. Still subject to the budget and the secondary cooldown. |
 | `w` | Adjust table column widths |
 | `?` | Show the keys without leaving the dashboard (any key closes it) |
 | `q` / `Esc` / `Ctrl+C` | Quit (`Esc` leaves width mode) |
@@ -317,8 +318,9 @@ pane definition. Flags are there when you want them:
 | Flag | Effect |
 |---|---|
 | `-R`, `--repo [host/]owner/name` | Watch a specific repository instead of the current directory's. Works from anywhere -- you do not need a local clone. The optional host targets a GitHub Enterprise or EMU data-residency tenant, e.g. `tenant.ghe.com/acme/widget`. |
-| `--refresh <seconds>` | Minimum active-tab poll interval, 2-3600, default 5. Safe shared grants can make a check later; each background tab is considered about every 12 floors. |
+| `--refresh <seconds>` | Minimum active-tab poll interval, 2-3600, default 5. A floor, never a ceiling: a tab whose content is unchanged twice in a row slows to 30 seconds (60 for Security), and Actions with a running or queued job is checked every 5. Safe shared grants can make any check later. |
 | `--tab <name>` | Start on `actions`, `issues`, `prs` or `security`. |
+| `--background <mode>` | `all` (default) or `off`. `off` never requests data for a tab you are not looking at. Its count keeps the last known value and ages visibly, and switching to the tab fetches it. |
 | `--verbose` | Log one line per dashboard `gh` call to stderr, with timing and outcome. Credential lookup and the account-identity proof are deliberately excluded, so that they cannot log anything derived from a token. stderr must be redirected: `gh-glance --verbose 2>gh-glance.log`. |
 | `--doctor` | Print a diagnostic report and exit. See [Diagnostics](#diagnostics). |
 
@@ -528,9 +530,23 @@ printed if `gh-glance` crashes.
 The default five seconds is a healthy single-pane floor, not an unconditional
 request frequency. Each check first needs an atomic grant from the private
 governor shared by local panes using the same effective host and account
-namespace. The active tab is considered at its floor. One rotating inactive tab
-is considered every four floors, so each of the three background tabs is
-considered about every 12 floors without starting them together.
+namespace. Beyond that floor, the cadence follows what the repository is
+actually doing:
+
+| State | Earliest normal check |
+|---|---|
+| New subscription, or active data that just changed | Immediately once, then the floor |
+| Actions with a running or queued run | `max(floor, 5s)` |
+| Active Actions, Issues or Pull Requests unchanged twice | `max(floor, 30s)` |
+| Active Security unchanged twice | `max(floor, 60s)` |
+| Inactive Actions, Issues or Pull Requests | `max(12 x floor, 120s)` |
+| Inactive Security | `max(12 x floor, 300s)` |
+| `--background off`, any inactive tab | Never |
+
+Two unchanged observations are required, not one, and an error or an unreadable
+payload never counts as one: a tab that cannot be read is not a quiet tab. One
+inactive tab is considered per wake, in rotation, so three of them falling due
+together do not start together.
 
 The resources are independent. Actions and Security spend REST `core` calls;
 Issues and Pull Requests are sorted with `--search`, which routes them through
@@ -540,9 +556,14 @@ floor:
 
 | Visible tab | REST / hour | GraphQL / hour |
 |---|---|---|
-| Actions | up to ~1,800 | ~240 |
-| Issues or Pull Requests | up to ~480 | ~1,560 |
-| Security | ~2,280 normally; up to ~4,440 | ~240 |
+| Actions | ~192 quiet, up to ~792 | ~120 |
+| Issues or Pull Requests | ~102 | ~300 quiet, up to ~1,500 |
+| Security | ~390 quiet, up to ~4,350 | ~120 |
+
+The lower figure in each range is every tab at its quiet cadence; the upper is
+the active tab at its floor with Actions busy. `--doctor` prints the same range
+for the configuration you actually run, labelled `projected demand` to keep it
+distinct from the charges the governor section reports.
 
 Security is the most expensive. A repository whose newest alert pages are not
 full uses the three base endpoint calls and lands near 2,280 REST requests per
@@ -577,10 +598,11 @@ probe, but it cannot yet prove the account-wide GraphQL reserve.
 
 One pane owns the free `rate_limit` probe for a control window and publishes it
 for the others. Manual and diagnostic work is considered before tab-switch,
-active, and background work; equal-priority panes rotate fairly. Manual `r`
-coalesces repeated presses, gives immediate Watching or Paused feedback, and
-clears an endpoint backoff only after admission. It cannot bypass a held budget
-or force a request into the reserve.
+active, and background work; equal-priority panes rotate fairly. Both refresh
+keys coalesce repeated presses -- a press during work that predates it schedules
+exactly one follow-up -- and give immediate Watching or Paused feedback. Only
+`R` clears validators and an endpoint backoff, and only after admission. Neither
+can bypass a held budget or force a request into the reserve.
 
 The shared lane uses spendable capacity, time to reset, outstanding
 reservations, and observed external spend. Startup and each new reset epoch add
@@ -645,10 +667,16 @@ floor and shows Watching between checks.
   reporting only after `w` enters width mode, and disable it when that mode or
   the app exits. See [Adjusting column widths](#adjusting-column-widths) for
   text-selection behavior while it is active.
-- Issues and pull requests are fetched 150 at a time. Each Security source has
-  a newest-100 lane; full Dependabot and code-scanning pages activate bounded
-  priority lanes. A count is shown as `n+` when any lane fills, so the number is
-  never presented as exact when it is not.
+- Issues and pull requests are fetched 50 at a time, up to 150 rows. Scrolling
+  within ten rows of what is loaded acquires the next page; a tab nobody scrolls
+  never asks for one. Each Security source has a newest-100 lane; full
+  Dependabot and code-scanning pages activate bounded priority lanes. A count is
+  shown as `n+` when any lane fills, so the number is never presented as exact
+  when it is not.
+- Actions asks for the newest 60 runs, whatever the pane's height. Each run
+  carries its own workflow name; when a run has none, the workflow catalog is
+  fetched once and reused for 15 minutes, and a catalog that cannot be read
+  leaves the run's other columns intact.
 - The Actions **TIME** column measures from the run's start to its last update.
   `gh` exposes no completion timestamp, so a workflow that was re-run later
   reports the span up to the re-run rather than its original duration.
@@ -690,7 +718,7 @@ GH_GLANCE_ICONS=ascii gh-glance
 | `the gh CLI is not installed` | Install it from [cli.github.com](https://cli.github.com), then `gh auth login`. |
 | `not inside a git repository` | Run it from a cloned GitHub repository, or set `GH_REPO=owner/name`. |
 | `No GitHub remote found` | Press `Enter` to start `gh repo create`, then choose **Push an existing local repository**. Or press `q` and run `gh-glance --repo owner/name` to watch an existing repository without attaching this folder. |
-| `GitHub login or authorization required` | Run `gh auth status`. With no account, run `gh auth login`; with an expired authorization, run `gh auth refresh`; then press `r`. |
+| `GitHub login or authorization required` | Run `gh auth status`. With no account, run `gh auth login`; with an expired authorization, run `gh auth refresh`; then press `R`, which also clears the endpoint backoff the failures accrued. |
 | `Repository not found or inaccessible to the active gh account` | The active identity cannot resolve the target. Check `gh auth status`, `git remote -v` or the explicit `--repo`, and use `gh auth switch` only if the wrong account is active. |
 | `GraphQL: Could not resolve to a Repository...` in older gh-glance versions | The response has the same ambiguity: a missing or renamed target, or a private repository not visible to the active account. Run `gh-glance --doctor`. |
 | Actions says `not available for this repository` while Repository access is `ok` | The repository resolved, but that endpoint is unavailable; inspect the corresponding doctor block. |
@@ -705,7 +733,7 @@ GH_GLANCE_ICONS=ascii gh-glance
 | `Watching` with `sharing 4` | Four local panes share this account governor, and another pane owns the lane immediately ahead of this grant. This is pacing, not quota scarcity. |
 | `Paused` with a reset time | The active tab's REST or GraphQL resource is at its reserve, exhausted, or under a shared rate-limit block. Wait for the stated reset/probe. Other tabs can continue when they use the healthy resource. |
 | `Paused` without a reset time | Budget or coordinator evidence is unknown, corrupt, locked, or unwritable. No data call is started. Run `gh-glance --doctor`; also check the config directory permissions and whether another live process owns its private lock. |
-| A failing tab seems to have stopped retrying | Recognized endpoint failures back off rather than re-spawning `gh` at the floor. Press `r` to request a higher-priority retry; the backoff clears only after a safe grant, so the tab remains Watching or Paused. |
+| A failing tab seems to have stopped retrying | Recognized endpoint failures back off rather than re-spawning `gh` at the floor. Press `r` to request a higher-priority retry, or `R` to also clear the endpoint backoff; either way the retry waits for a safe grant, so the tab remains Watching or Paused. |
 | `unknown argument: -v` | `-v` used to mean `--version` and no longer does, because this CLI also has `--verbose`. Use `--version` or `--verbose` explicitly. |
 | Cached rows plus `Paused` and `stale 2m` | The rows came from the separate last-known-good dashboard cache, while the live request is blocked or unsafe. Stale age is not extended by a pause. The error and footer describe current coordination; cached data never means the live check succeeded. |
 | Repeated GitHub rate-limit messages | A classified rate-limit response is published as one shared resource block. Local panes make no data retry before that block's probe/reset deadline. Use `--doctor` to inspect the resource and reset; repeated manual refresh cannot override it. |

@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--background all|off`.** `off` never requests data for a tab you are not
+  looking at. Its tab-bar count keeps the last known value and ages visibly, and
+  switching to the tab fetches it. `--doctor` reports the setting alongside the
+  projected demand it changes.
+- **`R` resynchronizes the current tab.** One generation without cached
+  validators, and the only key that clears a negative capability backoff -- so
+  an endpoint that answered "not enabled" can be re-asked on demand. Still
+  subject to the budget and the secondary cooldown.
+
+### Changed
+
+- **The refresh floor is a floor, not a frequency.** A tab whose content is
+  unchanged twice in a row slows to 30 seconds (60 for Security), Actions with a
+  running or queued job is checked every 5, and an inactive tab is considered
+  every `max(12 x floor, 120s)` -- 300s for Security. An error or an unreadable
+  payload never counts as an unchanged observation, so a tab that cannot be read
+  is never slowed down for looking quiet. The one shared active floor and
+  rotating four-floor background slot could not express any of that, and only
+  Security ever slowed at all -- after a single unchanged poll, on a rule that
+  applied to nothing else.
+- **`r` sends cached validators instead of throwing them away.** It remains a
+  prioritized refresh that bypasses the scheduled deadline and the tab's failure
+  ladder, but an unchanged tab now answers `304` and spends nothing -- the case
+  where the key is most likely to be pressed. Dropping validators is `R`. A
+  press arriving while automatic work that predates it is running schedules
+  exactly one follow-up rather than being lost, and further presses coalesce
+  into it.
+- **Actions asks for one request, not two.** The runs list carries each run's
+  workflow name, so the workflow catalog became a conditional fallback for runs
+  that have none, cached for 15 minutes and separately admitted. The request is
+  also a stable 60-row variant rather than one derived from the pane's height,
+  so two differently sized panes ask the same question and can reuse each
+  other's validators. A catalog that cannot be read leaves the run list intact
+  with a missing or last-known name rather than blocking CI status.
+- **Issues and Pull Requests load one 50-row page and page on demand.** The
+  first paint used to walk to 150 rows -- three requests for a pane showing
+  about twenty. Scrolling within ten rows of the end acquires exactly one more
+  page, capped at 150 rows, and repeated scrolling coalesces into a single
+  request. Rows carry truthful `totalCount`/`hasNextPage` markers, duplicates
+  across pages are removed, and a page from a traversal whose first page changed
+  underneath it is rejected rather than joined onto the new one.
+- **`--doctor` reports a projected demand range.** The old line printed one
+  fixed figure as "this config spends", which read as a measurement; the cadence
+  now depends on what the repository is doing, so the report gives the range and
+  labels it a projection. Actual charges remain in the API governor section.
+
+### Fixed
+
+- **A separately admitted request was refused every single time.** Any second
+  request inside one tab fetch -- a later list page, the workflow catalog --
+  asks a moment after the tab's own grant advanced the shared lane, so the
+  governor answered with a slot a fraction of a second away. That answer was
+  treated as a refusal, which meant paged lists never paged and workflow names
+  never arrived. A named slot within a two-second bound is now waited out and
+  revalidated; a longer gap still declines, and a slot the request decides not
+  to take is released rather than left reserved against the budget.
+- **Scrolling toward the end of a list re-fetched the same page.** The demanded
+  page count was computed and stored, then dropped by the Issues and Pull
+  requests tab definitions one call short of the fetcher, so a longer list could
+  never be paged into at all.
+- **A refresh keypress arriving during a fetch was replayed as the stronger
+  key.** The queued handoff always resynchronized, so `r` dropped its validators
+  whenever it happened to land while an automatic poll was in flight. The queue
+  now carries which key was pressed.
+- **A pane running an older build no longer makes the shared ledger
+  unreadable.** A pending request records exactly what its tab costs, so
+  changing that cost made every file written by a still-running older pane read
+  as corrupt -- discarding the leases and unsettled spend the restart boundary
+  depends on. Such a file is now recognized as older and adapted: its
+  differently priced pending requests are dropped, and every lease, budget and
+  unsettled charge is kept.
+
 ## [0.13.3] - 2026-09-07
 
 ### Changed

@@ -175,10 +175,11 @@ function publishGraphql(box, leaseId, at = box.at()) {
   }, at, "graphql").ok, true);
 }
 
-// One Actions fetch is two core units, and an intent's costs must match the
-// tab's declared cost exactly, so local spend is counted in fetches. Settling
-// each one is what makes the charge definite -- reconciled, not inferred.
-const FETCH_COST = 2;
+// One Actions fetch is one core unit -- the workflow catalog became a
+// separately admitted fallback -- and an intent's costs must match the tab's
+// declared cost exactly, so local spend is counted in fetches. Settling each
+// one is what makes the charge definite: reconciled, not inferred.
+const FETCH_COST = 1;
 
 function spendLocally(box, leaseId, fetches) {
   let settledAt = box.at();
@@ -224,7 +225,7 @@ test("SCHED-03 undersized local samples accumulate instead of being discarded", 
 
   // One reconciled window: six local units against forty-two observed, so
   // other clients are spending six units for every one of ours.
-  spendLocally(box, leaseId, 3);
+  spendLocally(box, leaseId, 6);
   box.setNow(box.at() + 1);
   publishCore(box, leaseId, { used: 42 });
   assert.equal(factorOf(box).lastExternalFactor, 7);
@@ -234,7 +235,7 @@ test("SCHED-03 undersized local samples accumulate instead of being discarded", 
   // Now windows of a single fetch, with the counter moving by exactly that
   // fetch. Two units is below the five-unit minimum, so neither of the first
   // two closes the window -- and crucially neither costs the evidence in it.
-  for (const used of [44, 46]) {
+  for (const used of [43, 44]) {
     spendLocally(box, leaseId, 1);
     box.setNow(box.at() + 1);
     publishCore(box, leaseId, { used });
@@ -242,9 +243,9 @@ test("SCHED-03 undersized local samples accumulate instead of being discarded", 
     assert.equal(factorOf(box).factorBaseline.used, 42, "an undersized sample must not close the window");
   }
 
-  // The third takes the accumulation to six units against six observed, which
-  // reconciles: there was no external use at all.
-  spendLocally(box, leaseId, 1);
+  // The next four take the accumulation to six units against six observed,
+  // which reconciles: there was no external use at all.
+  spendLocally(box, leaseId, 4);
   box.setNow(box.at() + 1);
   publishCore(box, leaseId, { used: 48 });
   assert.equal(factorOf(box).lastExternalFactor, 1,
@@ -258,7 +259,7 @@ test("SCHED-03 an authoritative new epoch resets the factor with the sample", (t
   lease(box, leaseId);
   publishCore(box, leaseId, { used: 0 });
   publishGraphql(box, leaseId);
-  spendLocally(box, leaseId, 3);
+  spendLocally(box, leaseId, 6);
   box.setNow(box.at() + 1);
   publishCore(box, leaseId, { used: 42 });
   assert.equal(factorOf(box).lastExternalFactor, 7);
