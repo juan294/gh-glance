@@ -1,0 +1,6 @@
+[
+  {"databaseId":301,"displayTitle":"deploy the staging bundle","workflowName":"CI","number":501,"headBranch":"develop","status":"in_progress","conclusion":null,"startedAt":"2026-08-01T11:00:00Z","updatedAt":"2026-08-01T11:00:05Z","workflowId":10,"url":"https://github.com/acme/widget/actions/runs/301"},
+  {"databaseId":302,"displayTitle":"queue the nightly sweep","workflowName":"CodeQL","number":500,"headBranch":"develop","status":"queued","conclusion":null,"startedAt":"2026-08-01T10:59:00Z","updatedAt":"2026-08-01T10:59:00Z","workflowId":20,"url":"https://github.com/acme/widget/actions/runs/302"},
+  {"databaseId":101,"displayTitle":"ci: pin actions to commit SHAs","workflowName":"CI","number":443,"headBranch":"develop","status":"completed","conclusion":"success","startedAt":"2026-08-01T10:00:00Z","updatedAt":"2026-08-01T10:01:20Z","workflowId":10,"url":"https://github.com/acme/widget/actions/runs/101"},
+  {"databaseId":102,"displayTitle":"fix: restore the primary buffer on signal","workflowName":"CodeQL","number":442,"headBranch":"develop","status":"completed","conclusion":"failure","startedAt":"2026-08-01T09:00:00Z","updatedAt":"2026-08-01T09:01:28Z","workflowId":20,"url":"https://github.com/acme/widget/actions/runs/102"}
+]

@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { resourceReserve } from "../../index.mjs";
+import { resourceReserve, tabRequestCost } from "../../index.mjs";
 import { captureAsync } from "./capture.mjs";
 
 // Pacing credit returns the difference between what a request reserved and what
@@ -29,8 +29,14 @@ const SPENDABLE = 200;
 const WINDOW_MS = 600_000;
 const UNITS_PER_MS = SPENDABLE / WINDOW_MS;
 const SOAK_MS = 40_000;
+const PANES = 4;
+// Each pane can hold one grant that was paced *after* it started, so the
+// measured spend may lead the allowance by that much without any of it having
+// escaped the lane. Written as panes x the declared cost rather than as a
+// literal, because re-pricing a tab silently rescales it.
+const PACING_TOLERANCE = PANES * tabRequestCost("actions").core;
 const DATA_PATH = /\/actions\/(runs|workflows)/;
-const RUNS_PATH = "repos/acme/widget/actions/runs?exclude_pull_requests=true&per_page=20";
+const RUNS_PATH = "repos/acme/widget/actions/runs?exclude_pull_requests=true&per_page=60";
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 // Runs changes on every fetch and workflows never does, so one path is charged
@@ -75,7 +81,7 @@ function fixture(t) {
 test("a sustained run of 304s returns pacing without letting charged work outrun it", async (t) => {
   const box = fixture(t);
   const readyPath = join(box.root, "soak-ready");
-  const panes = Promise.all(Array.from({ length: 4 }, (_, index) => captureAsync({
+  const panes = Promise.all(Array.from({ length: PANES }, (_, index) => captureAsync({
     cols: 80,
     rows: 24,
     signal: "none",
@@ -115,10 +121,10 @@ test("a sustained run of 304s returns pacing without letting charged work outrun
   assert.ok(spent >= 4, `the soak never sustained charged traffic: ${spent} units`);
 
   // Charged work stays inside its paced allowance. A return that gave back more
-  // than the request spent would show up as spend outrunning the rate; the
-  // tolerance is one operation's worth, because a grant is paced after it starts.
-  assert.ok(spent <= allowance + 2,
-    `charged spend outran its pacing: ${spent} units in ${elapsed}ms, allowance ${allowance.toFixed(1)}`);
+  // than the request spent would show up as spend outrunning the rate.
+  assert.ok(spent <= allowance + PACING_TOLERANCE,
+    `charged spend outran its pacing: ${spent} units in ${elapsed}ms, ` +
+    `allowance ${allowance.toFixed(1)} +${PACING_TOLERANCE}`);
 
   // What this test deliberately does NOT claim to catch: a return that never
   // happens. Removing the return entirely produces the same spend, the same

@@ -2604,10 +2604,13 @@ test("the per-fetch cost tables cover every tab and nothing else", () => {
   assert.deepEqual(Object.keys(GRAPHQL_PER_FETCH).sort(), [...TAB_KEYS].sort());
 });
 
-test("an actions fetch costs two REST calls", () => {
-  // Measured 2026-08-10: gh run list issues /actions/runs and
-  // /actions/workflows. Pinned because the shared governor reserves this cost.
-  assert.equal(REST_PER_FETCH.actions, 2);
+test("an actions fetch costs one REST call, with the catalog reserved separately", () => {
+  // It was two while every fetch made both calls (measured 2026-08-10: gh run
+  // list issued /actions/runs and /actions/workflows). The catalog is now a
+  // conditional fallback that opens its own reservation, so the tab reserves
+  // for the one call it always makes.
+  assert.equal(REST_PER_FETCH.actions, 1);
+  assert.deepEqual(operationCost("catalog:actions-workflows"), { core: 1, graphql: 0 });
 });
 
 test("issues and prs cost no REST and two GraphQL, because --search routes them", () => {
@@ -2622,13 +2625,37 @@ test("security costs one bounded request per newest and priority lane", () => {
   assert.ok(REST_PER_FETCH.security > ALERT_SOURCES.length);
 });
 
-test("projected hourly cost, per active tab, at the default refresh", () => {
+test("projected hourly demand is a policy-derived range, not one fixed figure", () => {
   // runtime.refreshMs is REFRESH_MS on an imported module (the argv block is
-  // gated on IS_MAIN), so these are the default-refresh figures.
-  assert.deepEqual(projectedHourlyCost("actions"), { rest: 1800, graphql: 240 });
-  assert.deepEqual(projectedHourlyCost("issues"), { rest: 480, graphql: 1560 });
-  assert.deepEqual(projectedHourlyCost("prs"), { rest: 480, graphql: 1560 });
-  assert.deepEqual(projectedHourlyCost("security"), { rest: 4440, graphql: 240 });
+  // gated on IS_MAIN), so these are the default-floor figures. The maximum is
+  // the fastest cadence the policy allows -- the active tab at its floor, with
+  // Actions treated as busy -- and the minimum is the quiet cadence each tab
+  // settles into. Inactive tabs contribute their background interval to both.
+  //
+  // Actions active: 720/h at the 5s floor, or 120/h once quiet, plus Security
+  // at 12/h x 6 calls in the background. Issues and PRs are GraphQL only.
+  assert.deepEqual(projectedHourlyCost("actions"), {
+    rest: { min: 192, max: 792 },
+    graphql: { min: 120, max: 120 },
+  });
+  assert.deepEqual(projectedHourlyCost("issues"), {
+    rest: { min: 102, max: 102 },
+    graphql: { min: 300, max: 1500 },
+  });
+  assert.deepEqual(projectedHourlyCost("prs"), {
+    rest: { min: 102, max: 102 },
+    graphql: { min: 300, max: 1500 },
+  });
+  assert.deepEqual(projectedHourlyCost("security"), {
+    rest: { min: 390, max: 4350 },
+    graphql: { min: 120, max: 120 },
+  });
+  // Nothing inactive is requested with background polling off, so the range
+  // collapses onto the one tab being watched.
+  assert.deepEqual(projectedHourlyCost("actions", { background: "off" }), {
+    rest: { min: 120, max: 720 },
+    graphql: { min: 0, max: 0 },
+  });
 });
 
 const POLICY_NOW = 1_000_000;
@@ -2798,7 +2825,7 @@ test("a suffixed rollback epoch survives normalization into grants", () => {
       leaseId: "rollback-lease",
       tab: "actions",
       priority: "active",
-      costs: { core: 2, graphql: 0 },
+      costs: { core: 1, graphql: 0 },
       requestedAt: POLICY_NOW,
       expiresAt: POLICY_NOW + 10_000,
     }],
@@ -2824,7 +2851,7 @@ test("tab and auxiliary operation costs have one explicit registry", () => {
   assert.deepEqual(operationCost("tab:security"), { core: 6, graphql: 0 });
   for (const operation of [
     "tab:actions-runs",
-    "tab:actions-workflows",
+    "catalog:actions-workflows",
     "doctor:actions-runs",
     "doctor:actions-workflows",
   ]) {

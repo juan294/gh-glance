@@ -25,6 +25,7 @@ import {
   OPERATION_COSTS,
   GOVERNOR_ACTIVE_PROBE_LEASE_MS,
   GOVERNOR_LEASE_TTL_MS,
+  GOVERNOR_PHASE_WINDOW_MS,
   GOVERNOR_STATE_VERSION,
   RATE_RESOURCES,
   GOVERNOR_MAX_LEASES,
@@ -78,6 +79,7 @@ import {
   retryRateLimitBlockPublication,
   runtimeIntentGate,
   runAdmittedOperation,
+  GOVERNOR_ADMISSION_WAIT_MS,
   resolveFailureContext,
   resolveEffectiveHost,
   startReservation,
@@ -85,6 +87,7 @@ import {
   tabEpochChanged,
   withGovernorLock,
   writeGovernorState,
+  readGovernorState,
 } from "../index.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -118,7 +121,7 @@ function lease(id, now = NOW, overrides = {}) {
     floorMs: 5000,
     activeTab: "actions",
     phaseSeed: { seed: id, registeredAt: now },
-    demand: { core: 2, graphql: 0 },
+    demand: { core: 1, graphql: 0 },
     ...overrides,
   };
 }
@@ -188,7 +191,7 @@ function intent(id, leaseId, now = NOW, overrides = {}) {
     leaseId,
     tab: "actions",
     priority: "active",
-    costs: { core: 2, graphql: 0 },
+    costs: { core: 1, graphql: 0 },
     requestedAt: now,
     expiresAt: now + GOVERNOR_LEASE_TTL_MS,
     ...overrides,
@@ -261,7 +264,7 @@ test("lease, probe, intent, reservation, completion, and reconciliation form one
   assert.equal(registered.ok, true);
   assert.equal(registered.value.status, "scheduled");
   const reservationId = registered.value.reservationId;
-  assert.deepEqual(registered.value.costs, { core: 2, graphql: 0 });
+  assert.deepEqual(registered.value.costs, { core: 1, graphql: 0 });
   assert.equal(readIntentDecision(scope, intentId, NOW).value.reservationId, reservationId);
   assert.equal(startReservation(scope, reservationId, registered.value.notBefore - 1).value.status, "waiting");
   assert.equal(startReservation(scope, reservationId, registered.value.notBefore).value.status, "started");
@@ -335,7 +338,9 @@ test("only measured success can reduce the worst-case reservation", (t) => {
   const { scope } = sandbox(t);
   const leaseId = randomUUID();
   registerLease(scope, lease(leaseId));
-  publishInitial(scope, leaseId, NOW, budgets(NOW, { remaining: 1007 }));
+  // Exactly enough headroom for the six-call Security fetch and nothing more,
+  // so a retained worst-case charge is what pauses the Actions intent below.
+  publishInitial(scope, leaseId, NOW, budgets(NOW, { remaining: 1006 }));
   const intentId = randomUUID();
   const scheduled = registerIntent(scope, intent(intentId, leaseId, NOW, {
     tab: "security",
@@ -352,7 +357,7 @@ test("only measured success can reduce the worst-case reservation", (t) => {
   const measuredBox = sandbox(t, { authIdentity: "auth-measured" });
   const measuredLeaseId = randomUUID();
   registerLease(measuredBox.scope, lease(measuredLeaseId));
-  publishInitial(measuredBox.scope, measuredLeaseId, NOW, budgets(NOW, { remaining: 1007 }));
+  publishInitial(measuredBox.scope, measuredLeaseId, NOW, budgets(NOW, { remaining: 1006 }));
   const measuredGrant = registerIntent(measuredBox.scope, intent(randomUUID(), measuredLeaseId, NOW, {
     tab: "security",
     costs: { core: 6, graphql: 0 },
@@ -473,6 +478,155 @@ test("an unsafe admitted operation performs zero calls and independent wakes rem
   const wakes = governorWakeTimes(state, now, 5000);
   assert.ok(wakes.controlAt > now);
   assert.ok(wakes.dataAt > now);
+});
+
+test("a separately admitted operation waits out a lane gap instead of being refused", async (t) => {
+  const now = Date.now();
+  const box = sandbox(t, { now, authIdentity: "admission-wait" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId, now));
+  publishInitial(box.scope, leaseId, now);
+
+  // The shape every second request inside one tab fetch meets: the tab's own
+  // grant has just paced the lane, so the next operation is a moment early.
+  // Without a wait it is refused, and a feature built on a second admitted
+  // request -- a later list page, the workflow catalog -- never runs at all.
+  // A pane's first grant carries its stable epoch phase, which is minutes wide
+  // by design. Waiting past the ordinary bound here is what puts the lane at a
+  // known point; the gap this test is about is the one *after* it.
+  const first = await runAdmittedOperation({
+    scope: box.scope,
+    leaseId,
+    operation: "tab:actions-runs",
+    waitMs: GOVERNOR_PHASE_WINDOW_MS + 3_600_000,
+    now: box.now,
+    wait: async (ms) => box.setNow(box.now() + ms + 1),
+    run: async () => "runs",
+  });
+  assert.equal(first.ok, true, JSON.stringify(first.decision ?? first.error?.message));
+
+  let refusedCalls = 0;
+  const refused = await runAdmittedOperation({
+    scope: box.scope,
+    leaseId,
+    operation: "catalog:actions-workflows",
+    priority: "background",
+    now: box.now,
+    run: async () => { refusedCalls += 1; },
+  });
+  assert.equal(refused.skipped, true, "the lane gap was expected to defer this grant");
+  assert.equal(refusedCalls, 0);
+  // A slot this call declined to take is released rather than left scheduled
+  // against the budget.
+  assert.equal(
+    Object.values(inspectGovernor(box.scope, box.now()).value.reservations)
+      .filter((reservation) => reservation.status === "scheduled").length,
+    0,
+    "a declined grant left its reservation holding budget",
+  );
+
+  const waited = [];
+  const admitted = await runAdmittedOperation({
+    scope: box.scope,
+    leaseId,
+    operation: "catalog:actions-workflows",
+    priority: "background",
+    waitMs: GOVERNOR_ADMISSION_WAIT_MS,
+    now: box.now,
+    // Stands in for the real sleep: move the shared clock forward by exactly
+    // the delay the governor named, rather than spending it.
+    wait: async (ms) => { waited.push(ms); box.setNow(box.now() + ms); },
+    run: async () => "catalog",
+  });
+  assert.equal(admitted.ok, true, JSON.stringify(admitted.decision ?? admitted.error?.message));
+  assert.equal(admitted.value, "catalog");
+  assert.ok(waited.every((ms) => ms > 0 && ms <= GOVERNOR_ADMISSION_WAIT_MS), `waited ${waited}`);
+});
+
+test("a lane gap past the admission bound is still declined, not waited out", async (t) => {
+  const now = Date.now();
+  // Barely above the reserve, so one unit of spendable capacity has to last the
+  // rest of the window and the lane gap is far longer than the bound.
+  const box = sandbox(t, { now, authIdentity: "admission-wait-bound" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId, now));
+  publishInitial(box.scope, leaseId, now, budgets(now, { remaining: 1010 }));
+  // A pane's first grant carries its stable epoch phase, which is minutes wide
+  // by design. Waiting past the ordinary bound here is what puts the lane at a
+  // known point; the gap this test is about is the one *after* it.
+  const first = await runAdmittedOperation({
+    scope: box.scope,
+    leaseId,
+    operation: "tab:actions-runs",
+    waitMs: GOVERNOR_PHASE_WINDOW_MS + 3_600_000,
+    now: box.now,
+    wait: async (ms) => box.setNow(box.now() + ms + 1),
+    run: async () => "runs",
+  });
+  assert.equal(first.ok, true, JSON.stringify(first.decision ?? first.error?.message));
+
+  // Waiting is for a slot the governor already named within the bound, never a
+  // way to sit on one it placed minutes away.
+  const beyond = await runAdmittedOperation({
+    scope: box.scope,
+    leaseId,
+    operation: "catalog:actions-workflows",
+    priority: "background",
+    waitMs: GOVERNOR_ADMISSION_WAIT_MS,
+    now: box.now,
+    wait: async () => assert.fail("a gap past the bound must not be waited out"),
+    run: async () => assert.fail("a gap past the bound must not run"),
+  });
+  assert.equal(beyond.skipped, true);
+});
+
+test("a live pane's file stays readable across a change to what a tab costs", (t) => {
+  // The regression this guards is the one an intent's exact-cost rule creates:
+  // an intent must declare exactly what its tab costs, so a build that re-prices
+  // a tab cannot read a still-running older pane's pending intents -- and that
+  // pane's file is precisely the one carrying the leases and uncertain debts the
+  // restart boundary must see. Refusing it as "corrupt" is the worst outcome
+  // available, because it discards evidence rather than adapting to it.
+  const box = sandbox(t, { authIdentity: "superseded-tab-costs" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const started = registerIntent(box.scope, intent(randomUUID(), leaseId)).value;
+  assert.equal(startReservation(box.scope, started.reservationId, started.notBefore).value.status, "started");
+
+  const current = inspectGovernor(box.scope, started.notBefore);
+  assert.equal(current.ok, true, JSON.stringify(current));
+  const olderPaneFile = structuredClone(current.value);
+  olderPaneFile.version = GOVERNOR_STATE_VERSION - 1;
+  const pendingId = randomUUID();
+  olderPaneFile.intents[pendingId] = {
+    leaseId,
+    tab: "actions",
+    priority: "active",
+    // What the previous build believed one Actions fetch cost.
+    costs: { core: 2, graphql: 0 },
+    requestedAt: NOW,
+    expiresAt: NOW + GOVERNOR_LEASE_TTL_MS,
+  };
+  writeFileSync(box.scope.path, `${JSON.stringify(olderPaneFile)}\n`, { mode: 0o600 });
+
+  const read = readGovernorState(box.scope.path, started.notBefore, { persistMigration: false });
+  assert.equal(read.ok, true, `an older pane's file read as ${read.reason}`);
+  assert.equal(read.migrated, true);
+  assert.equal(read.value.version, GOVERNOR_STATE_VERSION);
+  // The lease and the started debt survive; only the pending intent is dropped,
+  // and dropping it forgives nothing: an intent still in the file has not been
+  // granted, so the pane that registered it re-registers at the current price.
+  assert.deepEqual(Object.keys(read.value.leases), [leaseId]);
+  assert.equal(read.value.reservations[started.reservationId]?.status, "started");
+  assert.equal(read.value.intents[pendingId], undefined);
+
+  // An intent whose costs still agree is kept exactly as it was.
+  olderPaneFile.intents[pendingId].costs = { core: 1, graphql: 0 };
+  writeFileSync(box.scope.path, `${JSON.stringify(olderPaneFile)}\n`, { mode: 0o600 });
+  const kept = readGovernorState(box.scope.path, started.notBefore, { persistMigration: false });
+  assert.equal(kept.ok, true);
+  assert.deepEqual(kept.value.intents[pendingId]?.costs, { core: 1, graphql: 0 });
 });
 
 test("failed probes wait for their persisted retry instead of spinning on an old sample", (t) => {
@@ -793,26 +947,26 @@ test("a due poll retries a pre-persistence admission failure without waiting for
   publishInitial(box.scope, leaseId);
 
   const floorMs = 40_000;
-  const first = pollSchedule({
-    nowMs: NOW,
-    floorMs,
-    activeKey: "actions",
-    activeAt: NOW,
-    backgroundAt: NOW + 4 * floorMs,
-  });
+  const dueAt = {
+    actions: NOW,
+    issues: NOW + 4 * floorMs,
+    prs: NOW + 4 * floorMs,
+    security: NOW + 4 * floorMs,
+  };
+  const first = pollSchedule({ nowMs: NOW, floorMs, activeKey: "actions", dueAt });
   assert.deepEqual(first.due, [{ key: "actions", kind: "active" }]);
   assert.equal(Object.keys(inspectGovernor(box.scope, NOW).value.reservations).length, 0);
 
   const retryAt = governorControlRetryAt(NOW, floorMs);
   const retry = retryPollAfterAdmissionFailure({
+    key: "actions",
     kind: "active",
     retryAt,
-    activeAt: first.activeAt,
-    backgroundAt: first.backgroundAt,
+    dueAt: first.dueAt,
     backgroundIndex: first.backgroundIndex,
     previousBackgroundIndex: 0,
   });
-  assert.equal(retry.activeAt, retryAt);
+  assert.equal(retry.dueAt.actions, retryAt);
   assert.ok(retryAt - NOW <= 1_000);
 
   const second = pollSchedule({
@@ -825,7 +979,7 @@ test("a due poll retries a pre-persistence admission failure without waiting for
   const registered = registerIntent(box.scope, intent(randomUUID(), leaseId, retryAt, {
     tab: "actions",
     priority: "active",
-    costs: { core: 2, graphql: 0 },
+    costs: { core: 1, graphql: 0 },
   }));
   assert.equal(registered.ok, true);
   assert.equal(Object.keys(inspectGovernor(box.scope, retryAt).value.reservations).length, 1);
@@ -834,8 +988,7 @@ test("a due poll retries a pre-persistence admission failure without waiting for
     nowMs: retryAt,
     floorMs,
     activeKey: "actions",
-    activeAt: second.activeAt,
-    backgroundAt: second.backgroundAt,
+    dueAt: second.dueAt,
     backgroundIndex: second.backgroundIndex,
   });
   assert.deepEqual(duplicate.due, []);
@@ -971,7 +1124,7 @@ test("a lease migrates into a new auth scope without sharing old state", (t) => 
   assert.equal(releaseLease(original, leaseId).ok, true);
 
   identity = { effectiveHost: "github.com", authIdentity: "auth-after" };
-  assert.equal(heartbeatLease(original, leaseId, { core: 2, graphql: 0 }, NOW).reason, "stale");
+  assert.equal(heartbeatLease(original, leaseId, { core: 1, graphql: 0 }, NOW).reason, "stale");
   const migrated = createGovernorScope({
     ...identity,
     identityProvider: () => identity,
@@ -1442,7 +1595,7 @@ test("planned-to-start revalidation fails closed after stale budget, block, or s
 
   const freshAt = NOW + BUDGET_SNAPSHOT_TTL_MS + 2;
   box.setNow(freshAt);
-  heartbeatLease(box.scope, leaseId, { core: 2, graphql: 0 }, freshAt);
+  heartbeatLease(box.scope, leaseId, { core: 1, graphql: 0 }, freshAt);
   const claim = claimProbe(box.scope, leaseId, freshAt, "core");
   publishProbe(box.scope, leaseId, claim.value.nonce, budgets(freshAt), freshAt, "core");
   const blockedGrant = registerIntent(box.scope, intent(randomUUID(), leaseId, freshAt)).value;
@@ -1576,7 +1729,7 @@ test("probe watermark retires only completions whose ordering is certain", (t) =
 
   const before = registerIntent(scope, intent(randomUUID(), leaseId)).value;
   startReservation(scope, before.reservationId, before.notBefore);
-  completeReservation(scope, before.reservationId, { outcome: "measured-success", actualCost: { core: 2, graphql: 0 } }, before.notBefore + 1);
+  completeReservation(scope, before.reservationId, { outcome: "measured-success", actualCost: { core: 1, graphql: 0 } }, before.notBefore + 1);
   const claimAt = before.notBefore + 2;
   const claim = claimNow(scope, leaseId, claimAt);
 
@@ -1596,7 +1749,7 @@ test("probe watermark retires only completions whose ordering is certain", (t) =
   const sameClaim = claimNow(scope, leaseId, sameClaimAt);
   completeReservation(scope, sameMillisecond.reservationId, {
     outcome: "measured-success",
-    actualCost: { core: 2, graphql: 0 },
+    actualCost: { core: 1, graphql: 0 },
   }, sameClaimAt);
   publishProbe(scope, leaseId, sameClaim.value.nonce, budgets(sameClaimAt + 1), sameClaimAt + 1, "core");
   assert.equal(
@@ -1935,7 +2088,7 @@ test("missing and partial response observations partition local cost exactly onc
     }];
     assert.equal(settleReservationWithBudgetObservations(box.scope, leaseId, grant.reservationId, {
       outcome: "measured-success",
-      actualCosts: { core: 2, graphql: 0 },
+      actualCosts: { core: 1, graphql: 0 },
       observations,
     }, settledAt).ok, true);
     box.setNow(settledAt);
@@ -1945,7 +2098,7 @@ test("missing and partial response observations partition local cost exactly onc
     assert.equal(state.budgets.core.knownLocalUsed, observedCost);
     assert.equal(
       state.budgets.core.knownLocalUsed + reservation.actualCosts.core - reservation.accountedCosts.core,
-      2,
+      1,
       "accepted header cost plus residual reservation cost must equal measured local cost",
     );
 
@@ -1977,7 +2130,7 @@ test("response settlement ignores a rewound reset and retains its residual charg
   const settledAt = grant.notBefore + 1;
   assert.equal(settleReservationWithBudgetObservations(box.scope, leaseId, grant.reservationId, {
     outcome: "measured-success",
-    actualCosts: { core: 2, graphql: 0 },
+    actualCosts: { core: 1, graphql: 0 },
     observations: [{
       resource: "core",
       limit: 5000,
@@ -1986,7 +2139,7 @@ test("response settlement ignores a rewound reset and retains its residual charg
       resetMs: initial.resetMs - 1_000,
       receivedAt: settledAt,
       source: "response-header",
-      cost: 2,
+      cost: 1,
     }],
   }, settledAt).ok, true);
   const state = inspectGovernor(box.scope, settledAt).value;
@@ -1994,7 +2147,7 @@ test("response settlement ignores a rewound reset and retains its residual charg
   assert.equal(state.budgets.core.used, initial.used);
   assert.equal(state.budgets.core.knownLocalUsed, 0);
   assert.equal(state.reservations[grant.reservationId].accountedCosts.core, 0);
-  assert.equal(state.reservations[grant.reservationId].actualCosts.core, 2);
+  assert.equal(state.reservations[grant.reservationId].actualCosts.core, 1);
 });
 
 test("response settlement cannot advance the core epoch ahead of the claimed observer", (t) => {
@@ -2160,7 +2313,7 @@ test("schema, bounds, corrupt data, and future timestamps fail closed", (t) => {
   mismatched.reservations[mismatchedReservationId] = {
     leaseId: mismatchedLeaseId,
     intentId: intendedIntentId,
-    costs: { core: 2, graphql: 0 },
+    costs: { core: 1, graphql: 0 },
     actualCosts: null,
     accountedCosts: { core: 0, graphql: 0 },
     notBefore: NOW,
@@ -2197,7 +2350,7 @@ test("schema, bounds, corrupt data, and future timestamps fail closed", (t) => {
       leaseId,
       tab: "actions",
       priority: "active",
-      costs: { core: 2, graphql: 0 },
+      costs: { core: 1, graphql: 0 },
       requestedAt: NOW,
       expiresAt: NOW + GOVERNOR_LEASE_TTL_MS,
     };
@@ -2212,7 +2365,7 @@ test("schema, bounds, corrupt data, and future timestamps fail closed", (t) => {
     oversizedReservations.reservations[`reservation:${intentId}`] = {
       leaseId,
       intentId,
-      costs: { core: 2, graphql: 0 },
+      costs: { core: 1, graphql: 0 },
       actualCosts: null,
       accountedCosts: { core: 0, graphql: 0 },
       notBefore: NOW,
@@ -2431,27 +2584,27 @@ test("twelve worker settlements preserve counters and account their accepted res
     reservationId: grant.reservationId,
     completion: {
       outcome: "measured-success",
-      actualCosts: { core: 2, graphql: 0 },
+      actualCosts: { core: 1, graphql: 0 },
       observations: [{
         resource: "core",
         limit: 5000,
-        used: (index + 1) * 2,
-        remaining: 5000 - (index + 1) * 2,
+        used: index + 1,
+        remaining: 5000 - (index + 1),
         resetMs,
         receivedAt: settlementAt,
         source: "response-header",
-        cost: 2,
+        cost: 1,
       }],
     },
   })));
   assert.ok(results.every((result) => result.ok), JSON.stringify(results));
   const state = inspectGovernor(box.scope, settlementAt).value;
-  assert.equal(state.budgets.core.used, 24);
-  assert.equal(state.budgets.core.knownLocalUsed, 24);
+  assert.equal(state.budgets.core.used, 12);
+  assert.equal(state.budgets.core.knownLocalUsed, 12);
   assert.equal(Object.values(state.reservations).reduce(
     (total, reservation) => total + reservation.accountedCosts.core,
     0,
-  ), 24);
+  ), 12);
 });
 
 test("twelve real workers share one probe, preserve state, pace grants, and isolate scopes", async (t) => {
@@ -2702,22 +2855,22 @@ test("a queued HTTP call rechecks a newly shared resource block without changing
   const at = grant.notBefore;
   box.setNow(at);
   assert.equal(startReservation(box.scope, grant.reservationId, at).value.status, "started");
-  assert.equal(inspectAdmittedHttpStart(box.scope, "tab:actions-workflows", at).ok, true);
+  assert.equal(inspectAdmittedHttpStart(box.scope, "catalog:actions-workflows", at).ok, true);
   const resetMs = inspectGovernor(box.scope, at).value.budgets.core.resetMs;
   const crossingClock = [resetMs - 1, resetMs];
-  assert.equal(inspectAdmittedHttpStart(box.scope, "tab:actions-workflows", () => crossingClock.shift()).reason, "budget-reset",
+  assert.equal(inspectAdmittedHttpStart(box.scope, "catalog:actions-workflows", () => crossingClock.shift()).reason, "budget-reset",
     "a reset crossed during inspection must prevent the actual HTTP start");
   assert.equal(crossingClock.length, 0);
   assert.equal(recordResourceBlock(box.scope, "core", resetMs, "rate-limit").ok, true);
-  assert.deepEqual(inspectAdmittedHttpStart(box.scope, "tab:actions-workflows", at), {
+  assert.deepEqual(inspectAdmittedHttpStart(box.scope, "catalog:actions-workflows", at), {
     ok: false, reason: "blocked", resource: "core", retryAt: resetMs,
   });
   assert.equal(inspectAdmittedHttpStart(box.scope, "tab:issues", at).ok, true);
   assert.equal(inspectAdmittedHttpStart(box.scope, "tab:actions-runs", resetMs).reason, "budget-reset");
   const reservation = inspectGovernor(box.scope, at).value.reservations[grant.reservationId];
   assert.equal(reservation.status, "started");
-  assert.deepEqual(reservation.costs, { core: 2, graphql: 0 });
+  assert.deepEqual(reservation.costs, { core: 1, graphql: 0 });
   assert.equal(reservation.actualCosts, null);
   assert.equal(completeReservation(box.scope, grant.reservationId, { outcome: "rejected" }, at).ok, true);
-  assert.deepEqual(inspectGovernor(box.scope, at).value.reservations[grant.reservationId].actualCosts, { core: 2, graphql: 0 });
+  assert.deepEqual(inspectGovernor(box.scope, at).value.reservations[grant.reservationId].actualCosts, { core: 1, graphql: 0 });
 });

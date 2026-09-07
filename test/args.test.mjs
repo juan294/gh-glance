@@ -217,8 +217,18 @@ test("--tab accepts exactly the four tab keys", () => {
   assert.throws(() => parse(["--tab", "nope"]), /--tab must be one of/);
 });
 
+test("--background accepts exactly all and off, and defaults to neither", () => {
+  // null rather than "all" so the entry block can tell "the user asked for the
+  // default" from "the user said nothing", the same way --refresh does.
+  assert.equal(parse([]).background, null);
+  assert.equal(parse(["--background", "all"]).background, "all");
+  assert.equal(parse(["--background=off"]).background, "off");
+  assert.throws(() => parse(["--background", "none"]), /--background must be one of all, off/);
+  assert.throws(() => parse(["--background", "Off"]), /--background must be one of/, "case sensitive");
+});
+
 test("a flag missing its value is an error, not a silent default", () => {
-  for (const bad of [["--repo"], ["--refresh"], ["--tab"], ["-R"]]) {
+  for (const bad of [["--repo"], ["--refresh"], ["--tab"], ["-R"], ["--background"]]) {
     assert.throws(() => parse(bad), /needs a value/, JSON.stringify(bad));
   }
 });
@@ -234,12 +244,18 @@ test("--help and --version survive validation", () => {
 test("--help describes refresh as a shared-governor floor", () => {
   const help = execFileSync(process.execPath, [ENTRY, "--help"], { encoding: "utf8" });
   assert.match(help, /Set a 15-second active-tab poll floor/);
-  assert.match(help, /Safe shared grants may\n\s+run later/);
+  assert.match(help, /Safe shared grants may run later/);
   assert.match(help, /preserves a hard reserve/);
   assert.match(help, /manual refresh do not bypass that safety check/);
   assert.match(help, /A qualified GH_REPO also\n\s+supplies the host/);
   assert.match(help, /Stop motion; semantic status words remain/);
   assert.match(help, /^[ \t]*r[ \t]+Refresh the current tab when a safe grant is available$/m);
+  // The two manual intentions are separate keys, and --help is the one place
+  // that has to say so: `r` is a conditional check, `R` throws the cache away.
+  assert.match(help, /^[ \t]*R[ \t]+Resynchronize the current tab, ignoring cached validators and backoff$/m);
+  assert.match(help, /--background <mode>\s+all or off \(default all\)/);
+  assert.match(help, /never requests data\n\s+for a tab you are not looking at/);
+  assert.match(help, /a quiet tab slows to 30s \(60s for Security\),\n\s+and running Actions are checked every 5s/);
   assert.match(help, /GH_GLANCE_ICONS=unicode\s+Unicode status glyphs and text row substitutes/);
   assert.match(help, /GH_GLANCE_ICONS=ascii\s+ASCII-only status and row icons/);
   assert.doesNotMatch(help, /other three refresh every|does not route `gh api`|Freeze the spinner/);

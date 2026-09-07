@@ -295,3 +295,64 @@ whether it may: the reserve is enforced by admission, which re-checks
 affordability immediately before any request begins. A too-generous return can
 therefore make work start sooner than it strictly should, and cannot make it
 start at all when the budget could not pay for it.
+
+## Amendment: adaptive demand and bounded admission waits (phase 5)
+
+Demand is no longer a single interval applied to every resource. The configured
+refresh is a floor and never a ceiling: two consecutive unchanged observations
+take a tab to its quiet cadence, running or queued Actions hold it at five
+seconds, and an inactive tab is paced by whichever is slower, twelve floors or
+its own background interval. Only a validated observation moves the unchanged
+count. An error, a blind Security source and an unparseable payload all leave it
+where it was, because the absence of evidence is not evidence of quiet — the
+alternative slows a tab precisely because it is broken.
+
+One consequence is worth stating separately: the cadence table is decided in one
+function that every scheduling site reads. The three policies it replaced could
+disagree, and did. Only Security ever slowed, after a single unchanged poll, on
+a rule that applied to nothing else.
+
+An Actions fetch reserves one core call rather than two. The runs list carries
+each run's own workflow name, so the workflow catalog became a conditional
+fallback for the rows that have none: cached for fifteen minutes, admitted
+separately, and never allowed to take the run list down with it. Re-pricing a
+tab is a protocol change, not a local one, because an intent must declare
+exactly what its tab costs. A pane running the older build writes intents this
+build cannot normalize, and its file is precisely the one carrying the leases
+and unsettled charges the restart boundary must read. `GOVERNOR_STATE_VERSION`
+therefore moves to 6, version 5 joins the readable-as-evidence set, and the
+adaptation drops pending intents priced by a superseded table. Dropping them
+forgives nothing: an intent still in the file has not been granted, because
+scheduling deletes each one as it creates its reservation. Re-pricing them would
+be the unsafe option, since the older pane still makes the number of calls its
+own build declares.
+
+A grant's `notBefore` is a schedule, not a refusal. Every request after the
+first inside one tab fetch asks a moment after that tab's own grant advanced the
+lane, so treating a named slot as a denial refused the second request every
+single time — the workflow catalog and every list page past the first, on every
+poll, forever. A separately admitted operation may now wait a bounded two
+seconds for the slot the governor already gave it, and then re-enters admission,
+which revalidates the budget, the epoch and the block state exactly as a first
+attempt would. A longer gap still declines, and a slot the caller decides not to
+take is released rather than left reserved against the budget. Waiting changes
+when admitted work starts, never whether it may start.
+
+Refresh is two intentions rather than one. Ordinary refresh is a prioritized
+*conditional* check: it bypasses the scheduled deadline and the tab's failure
+ladder but keeps its validators, so the press most likely to happen on a quiet
+repository is the one that costs nothing there. Resynchronization is the
+separate, explicit key, and the only one that drops validators or clears a
+negative capability backoff. Both preserve the reserve and the secondary
+cooldown. A press arriving while work that predates it is running schedules at
+most one follow-up, and the queued handoff carries which intention was pressed —
+replaying every queued press as the stronger one made the conditional key drop
+its validators whenever it happened to land during an automatic poll.
+
+Finally, a validator naming an entity that is absent or empty describes a
+question with no possible answer: the server keeps answering "unchanged" and
+nothing here can be published, while the validator itself is only ever refreshed
+by a 200. Such a validator is dropped on the spot rather than through the staged
+publication, which runs only on a usable transition, and the tab reports unusable
+for that poll — keeping its last-good rows and their freshness clock. One
+recovery, and the next admitted check is unconditional.

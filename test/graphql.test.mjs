@@ -200,6 +200,10 @@ test("GQL-03 the tab envelope is charged for its own page only, never for pages 
     governor: { scope: {}, leaseId: "lease" },
     fetchPage,
     admit,
+    // Three pages are walked only because three were demanded. The walk used to
+    // run to LIST_LIMIT unconditionally on the first paint; what it charges for
+    // each page it does fetch is what this test is about.
+    pages: 3,
   });
   // Three pages were walked, each with an explicit cursor.
   assert.deepEqual(seen, [null, "cursor:1", "cursor:2"]);
@@ -224,6 +228,7 @@ test("GQL-03 a denied later page keeps the rows already gathered and says so", a
     governor: { scope: {}, leaseId: "lease" },
     fetchPage,
     admit: denied,
+    pages: 2,
   });
   // Page one survives a refusal of page two -- losing it would turn a budget
   // decision into data loss.
@@ -240,7 +245,7 @@ test("GQL-03 walking without a governor stops after the first page instead of pa
     page([node(1)], { hasNextPage: true, cursor: "cursor:1" }),
     page([node(2)], { hasNextPage: false, cursor: null }),
   ]);
-  const result = await fetchGraphqlList("issues", (n) => ({ number: n.number }), { fetchPage });
+  const result = await fetchGraphqlList("issues", (n) => ({ number: n.number }), { fetchPage, pages: 2 });
   assert.deepEqual(seen, [null]);
   assert.equal(result.incomplete, true);
   assert.equal(result.graphqlSpent, 2);

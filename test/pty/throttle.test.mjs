@@ -18,11 +18,16 @@ import {
   GOVERNOR_PHASE_WINDOW_MS,
   resourceDecision,
   resourceReserve,
+  tabRequestCost,
 } from "../../index.mjs";
 import { captureAsync } from "./capture.mjs";
 import { seedKnownHeldIdentity } from "./fixtures/known-identity.mjs";
 
 const STATE_HELPER = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "gh-state.mjs");
+// What one Actions fetch reserves, read from the same table the governor paces
+// against. It was written here as a literal 2, and re-pricing the tab silently
+// doubled every expected lane gap in this file.
+const ACTIONS_CORE_COST = tabRequestCost("actions").core;
 
 function fixture(t, overrides = {}) {
   const root = mkdtempSync(join(tmpdir(), "gh-glance-shared-pty-"));
@@ -282,7 +287,9 @@ test("a real reset gets one fresh probe then one phased active request per pane"
     cost: 2,
     chargedCost: 0,
   });
-  const laneInterval = resetDecision?.mode === "open" ? 2 / resetDecision.callsPerMs : null;
+  const laneInterval = resetDecision?.mode === "open"
+    ? ACTIONS_CORE_COST / resetDecision.callsPerMs
+    : null;
   const progressDeadline = Number.isFinite(laneInterval)
     ? publishedCore.observedAt + GOVERNOR_PHASE_WINDOW_MS + 2 * laneInterval + 40_000
     : Date.now();
@@ -290,13 +297,20 @@ test("a real reset gets one fresh probe then one phased active request per pane"
     ? await observeUntil(
       box.read,
       (state) => new Set(actionsRuns(state).map((event) => event.pane)).size >= 3 &&
-        dataStarts(state).length >= 6,
+        dataStarts(state).length >= 3 * ACTIONS_CORE_COST,
       progressDeadline,
     )
     : null;
   const preReleaseGovernor = progress?.matched ? box.readGovernor() : null;
+  // The slots the reopened lane granted, which is what phasing is asserted on.
+  // Cost alone no longer names them: one Actions fetch and one control-plane
+  // call both reserve a single core unit, so the filter also drops anything the
+  // lane placed before this reset's publication -- a leftover from the old
+  // epoch, and the observer whose own publication reopened the lane.
   const plannedReservations = Object.values(preReleaseGovernor?.reservations ?? {})
-    .filter((reservation) => reservation.costs.core === 2 && reservation.costs.graphql === 0)
+    .filter((reservation) => reservation.costs.core === ACTIONS_CORE_COST &&
+      reservation.costs.graphql === 0 &&
+      reservation.notBefore >= publishedCore.observedAt)
     .sort((left, right) => left.notBefore - right.notBefore);
   writeFileSync(readyPath, "ready\n", { mode: 0o600 });
   await captures;
@@ -316,7 +330,8 @@ test("a real reset gets one fresh probe then one phased active request per pane"
   assert.ok(probes.length >= 2, `expected reset probe, got ${probes.length}`);
   assert.equal(runs.length, 3, `expected one active request per pane, got ${runs.length}`);
   assert.equal(new Set(runs.map((event) => event.pane)).size, 3);
-  assert.equal(dataStarts(state).length, runs.length * 2, "background work joined the reset phase");
+  assert.equal(dataStarts(state).length, runs.length * ACTIONS_CORE_COST,
+    "background work joined the reset phase");
   assert.ok(publishedCore.observedAt <= runs[0].at, "data raced the reset publication");
   assert.equal(state.maxDataConcurrency, 1, "governed Actions batches overlapped");
   assert.equal(plannedReservations.length, 3, "reset reservations were not retained before teardown");
@@ -356,7 +371,7 @@ test("twelve panes share probe ownership and start bounded phased work", async (
     cost: 2,
     chargedCost: 0,
   });
-  const laneInterval = 2 / decision.callsPerMs;
+  const laneInterval = ACTIONS_CORE_COST / decision.callsPerMs;
   const captures = capturePanes(12, box, "pane", {
     signal: "none",
     settle: 35,
@@ -486,7 +501,10 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
   const readyPath = join(tmpdir(), `gh-glance-block-ready-${process.pid}-${setupAt}`);
   t.after(() => rmSync(readyPath, { force: true }));
   const coreLimit = 5000;
-  const spendableCalls = 26;
+  // Twelve Actions requests demand all but one of these, so the fixture
+  // exercises capacity while keeping the initial lane wider than process-start
+  // jitter. Derived, because it was 26 when one Actions fetch cost two calls.
+  const spendableCalls = 12 * ACTIONS_CORE_COST + 1;
   const coreRemaining = resourceReserve(coreLimit) + spendableCalls;
   const resetMs = setupAt + 120_000;
   const setupDecision = resourceDecision({
@@ -510,13 +528,10 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
   });
   assert.equal(coreRemaining - resourceReserve(coreLimit), spendableCalls);
   assert.equal(setupDecision.mode, "open");
-  assert.ok(2 / setupDecision.callsPerMs >= 9_000, "setup core lane is too narrow");
+  assert.ok(ACTIONS_CORE_COST / setupDecision.callsPerMs >= 9_000, "setup core lane is too narrow");
   const box = fixture(t, {
     core: {
       limit: coreLimit,
-      // Twelve Actions requests demand 24 of the 26 calls above the hard
-      // reserve, so this exercises capacity while keeping the initial lane
-      // wider than process-start jitter.
       used: coreLimit - coreRemaining,
       remaining: coreRemaining,
       resetMs,
@@ -567,7 +582,7 @@ test("twelve panes preserve one runtime rate-limit block across the minute", asy
     chargedCost: 0,
   });
   const firstLaneInterval = firstDecision?.mode === "open"
-    ? (relevantReservation?.costs?.core ?? 2) / firstDecision.callsPerMs
+    ? (relevantReservation?.costs?.core ?? ACTIONS_CORE_COST) / firstDecision.callsPerMs
     : null;
   const processStartMarginMs = 3_000;
   const firstStartHorizon = Number.isFinite(publicationAt) && Number.isFinite(registeredAt) &&

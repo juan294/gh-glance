@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { capture, waitForAwk } from "./capture.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const RUNS_PATH = "repos/acme/widget/actions/runs?exclude_pull_requests=true&per_page=20";
+const RUNS_PATH = "repos/acme/widget/actions/runs?exclude_pull_requests=true&per_page=60";
 const WORKFLOWS_PATH = "repos/acme/widget/actions/workflows?page=1&per_page=100";
 
 function fixture(t, overrides = {}) {
@@ -60,14 +60,17 @@ function waitForNotModified(count = 2) {
   );
 }
 
-test("a quiet Actions tab spends nothing after its first fetch across three refresh cycles", (t) => {
+// Three checks: the unconditional first and two conditional 304s. A fourth
+// would wait out the whole quiet interval the adaptive cadence now applies once
+// two checks in a row come back unchanged, and prove nothing the third does not.
+test("a quiet Actions tab spends nothing after its first fetch", (t) => {
   const box = fixture(t);
   const result = capture({
     cols: 80,
     rows: 24,
     signal: "none",
     settle: 30,
-    stdin: waitForActionsRuns(4) + "sleep .3; printf q",
+    stdin: waitForActionsRuns(3) + "sleep .3; printf q",
     args: "--repo acme/widget --refresh 5 --tab actions",
     configHome: box.root,
     env: {
@@ -77,15 +80,18 @@ test("a quiet Actions tab spends nothing after its first fetch across three refr
   });
   const state = box.read();
   const runs = pathEvents(state, RUNS_PATH);
-  const workflows = pathEvents(state, WORKFLOWS_PATH);
 
-  assert.ok(runs.length >= 4, `Actions runs calls: ${runs.length}`);
-  assert.ok(workflows.length >= 4, `Actions workflows calls: ${workflows.length}`);
+  assert.ok(runs.length >= 3, `Actions runs calls: ${runs.length}`);
   assert.equal(runs[0].cost.core, 1);
-  assert.equal(workflows[0].cost.core, 1);
   assert.ok(runs.slice(1).every((event) => event.cost.core === 0 && isConditional(event)));
-  assert.ok(workflows.slice(1).every((event) => event.cost.core === 0 && isConditional(event)));
-  assert.equal(state.core.used, 3);
+  // The workflow catalog is not part of a quiet tab's cost at all any more: it
+  // is a conditional fallback for runs with no name of their own, and every run
+  // in this fixture carries one.
+  assert.equal(pathEvents(state, WORKFLOWS_PATH).length, 0);
+  // The repository bootstrap plus the one unconditional runs request. Inactive
+  // tabs are staggered a background slot apart, so Security -- the only other
+  // core spender -- is not reached inside this window.
+  assert.equal(state.core.used, 2);
   const governor = box.readGovernor();
   assert.equal(governor.budgets.core.used, state.core.used);
   assert.equal(governor.budgets.core.source, "response-header");
@@ -133,14 +139,19 @@ test("a changed Actions runs entity returns 200 and publishes the new row", (t) 
   assert.match(result.finalFrame.lines.join("\n"), /new run one/);
 });
 
-test("manual refresh drops If-None-Match on a quiet tab and spends again", (t) => {
+// This used to assert that `r` dropped If-None-Match. It no longer does: `r` is
+// a prioritized *conditional* check, so the key most likely to be pressed on a
+// quiet repository is now the one that costs nothing there. Dropping validators
+// is the separate, explicit `R`, and that is what this exercises. The `r` half
+// of the split lives in adaptive-polling.test.mjs (REFRESH-01).
+test("R resynchronizes a quiet tab by dropping If-None-Match and spending again", (t) => {
   const box = fixture(t);
   const result = capture({
     cols: 80,
     rows: 24,
     signal: "none",
     settle: 20,
-    stdin: waitForActionsRuns(2) + waitForNotModified() + "printf r; " +
+    stdin: waitForActionsRuns(2) + waitForNotModified() + "printf R; " +
       waitForActionsRuns(3) + "sleep .3; printf q",
     args: "--repo acme/widget --refresh 5 --tab actions",
     configHome: box.root,
@@ -148,18 +159,19 @@ test("manual refresh drops If-None-Match on a quiet tab and spends again", (t) =
   });
   const state = box.read();
   const runs = pathEvents(state, RUNS_PATH);
-  const workflows = pathEvents(state, WORKFLOWS_PATH);
-  const forcedRuns = runs.filter((event) => !isConditional(event));
-  const forcedWorkflows = workflows.filter((event) => !isConditional(event));
+  const unconditional = runs.filter((event) => !isConditional(event));
   const forcedEnd = pathEvents(state, RUNS_PATH, "end")
-    .find((event) => event.sequence === forcedRuns.at(-1)?.sequence);
+    .find((event) => event.sequence === unconditional.at(-1)?.sequence);
 
   assert.ok(runs.some(isConditional), "the tab never reached a conditional 304");
-  assert.equal(forcedRuns.length, 2, "manual refresh kept the Actions runs ETag");
-  assert.equal(forcedWorkflows.length, 2, "manual refresh kept the workflows ETag");
-  assert.equal(forcedRuns.at(-1).cost.core, 1);
-  assert.equal(forcedWorkflows.at(-1).cost.core, 1);
+  assert.equal(unconditional.length, 2, "R did not drop the Actions runs ETag exactly once");
+  assert.equal(unconditional.at(-1).cost.core, 1);
   assert.equal(forcedEnd?.status, 200);
-  assert.equal(state.core.used, 5);
+  // The workflow catalog is never asked for: every run in this fixture carries
+  // its own name, so `R` has no second entity to resynchronize.
+  assert.equal(pathEvents(state, WORKFLOWS_PATH).length, 0);
+  // The repository bootstrap, the first unconditional runs request, and the one
+  // `R` produced. Every other check answered 304 and cost nothing.
+  assert.equal(state.core.used, 3);
   assert.match(result.finalFrame.lines.join("\n"), /ci: pin actions to commit/);
 });

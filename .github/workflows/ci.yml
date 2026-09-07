@@ -132,8 +132,17 @@ jobs:
     name: PTY
     runs-on: ubuntu-latest
     # PTY files are serialized because individual files already create real
-    # concurrent panes. The full suite currently takes about 13 minutes.
-    timeout-minutes: 20
+    # concurrent panes, and that is a correctness constraint rather than a
+    # scheduling preference: parallel files starve each other's real deadlines.
+    #
+    # Measured 20-21 minutes locally at 124 tests, up from about 13 at 115. The
+    # growth is mostly deliberate -- the adaptive-cadence scenarios have to wait
+    # out a real 30-second quiet interval to observe one -- and a CI runner is
+    # slower than a workstation at spawning this many processes. A 20-minute cap
+    # cancelled the job mid-suite twice, which reads as a flake and is not one,
+    # so the ceiling is now well clear of the measurement rather than beside it.
+    # If a run ever approaches this, split the job rather than raise it again.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7

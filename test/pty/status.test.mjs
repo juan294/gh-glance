@@ -10,8 +10,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
+import { resourceReserve, tabRequestCost } from "../../index.mjs";
 import { capture, captureAsync, isStatusLine, waitForAwk } from "./capture.mjs";
 import { seedKnownHeldIdentity } from "./fixtures/known-identity.mjs";
+
+// What one Actions fetch reserves. Read from the cost table rather than written
+// as a literal, so re-pricing the tab cannot leave this searching for a
+// reservation shape that no longer exists.
+const ACTIONS_CORE_COST = tabRequestCost("actions").core;
 
 function configRoot(t, prefix) {
   const root = mkdtempSync(join(tmpdir(), prefix));
@@ -338,8 +344,16 @@ test("manual refresh waits without motion and animates only after admission", as
   const box = sharedFixture(t, {
     // The keypress is released from the persisted scheduled reservation below,
     // with enough lead time for the terminal status to render before the lane
-    // can start on either GNU or BSD script(1).
-    core: { limit: 5000, used: 3980, remaining: 1020, resetMs: now + 100_000 },
+    // can start on either GNU or BSD script(1). The spendable capacity is what
+    // sets that lead: ten Actions fetches across the hundred-second window pace
+    // one about every ten seconds. Derived from the cost, because halving the
+    // price of a fetch would otherwise halve the window this test observes in.
+    core: {
+      limit: 5000,
+      used: 5000 - (resourceReserve(5000) + 10 * ACTIONS_CORE_COST),
+      remaining: resourceReserve(5000) + 10 * ACTIONS_CORE_COST,
+      resetMs: now + 100_000,
+    },
     delayByCommand: { actions: 3_000 },
   });
   capture({
@@ -390,7 +404,7 @@ test("manual refresh waits without motion and animates only after admission", as
       const state = JSON.parse(readFileSync(governorPath(box.root), "utf8"));
       const observedAt = Date.now();
       const held = Object.values(state.reservations ?? {}).filter((reservation) =>
-        reservation.status === "scheduled" && reservation.costs?.core === 2);
+        reservation.status === "scheduled" && reservation.costs?.core === ACTIONS_CORE_COST);
       largestLeadMs = Math.max(
         largestLeadMs,
         ...held.map((reservation) => reservation.notBefore - observedAt),

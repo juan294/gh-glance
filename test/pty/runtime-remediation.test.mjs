@@ -76,7 +76,10 @@ const recoveredSecurityCache = (cache) => Object.values(cache?.targets ?? {}).so
 
 // This fixed stdin driver observes completed UI/cache evidence. It emits no
 // manual key while the initial failed batch is still running, and never waits
-// long enough for the source auth ladder to recover without that key.
+// long enough for the source auth ladder to recover without that key. The key
+// is `R`: `r` is now an ordinary conditional check at manual priority, and
+// clearing a negative capability backoff is what distinguishes the stronger
+// resynchronization from it.
 function forceSecurityAfterFailure(waitMs, recovered) {
   const { readFileSync } = require("node:fs");
   const waitCell = new Int32Array(new SharedArrayBuffer(4));
@@ -90,7 +93,7 @@ function forceSecurityAfterFailure(waitMs, recovered) {
   };
   const failed = waitFor(() => /Dependabot.*not logged/.test(readFileSync(process.env.GH_GLANCE_CAPTURE_OUT, "utf8")));
   if (failed) {
-    process.stdout.write("r");
+    process.stdout.write("R");
     waitFor(() => recovered(JSON.parse(readFileSync(`${process.env.XDG_CONFIG_HOME}/gh-glance/dashboard-cache.json`, "utf8"))));
     Atomics.wait(waitCell, 0, 0, 300);
   }
@@ -319,7 +322,7 @@ test("empty Security source output preserves rows and retries without an interna
   }
 });
 
-test("manual Security refresh bypasses a source auth backoff", () => {
+test("R bypasses a source auth backoff that r deliberately leaves in place", () => {
   assert.ok(2 * securityReadyMs + 300 < AUTH_RETRY_MS[0], "readiness cannot outlast the auth backoff");
   assert.match(strip(forcedSecurity.raw), /Dependabot.*not logged/, "manual input must follow the rendered initial auth failure");
   assert.equal(forcedSecurity.securityRecovered, true, "forced refresh did not publish a complete successful Security snapshot");
