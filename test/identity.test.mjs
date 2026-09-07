@@ -589,3 +589,54 @@ test("ID-05 an unknown legacy protocol version fails closed without rewriting it
   assert.equal(readFileSync(legacy, "utf8"), evidence);
   assert.equal(Object.keys(inspectIdentityRegistry(root, { now: NOW }).value.attempts).length, 0);
 });
+
+test("ID-05 a v1 ledger with uncertain GraphQL charges clears once its window is past", async (t) => {
+  const { pathOptions } = box(t);
+  const coordinator = createIdentityCoordinator({ host: "github.com", pathOptions, env: { GH_TOKEN: "synthetic-one" }, now: () => NOW, requestIdentity: async () => proof() });
+  await coordinator.refresh();
+  // Both windows ended hours ago, which is the whole point: there is nothing
+  // left to wait for. Written in the v1 shape by hand -- v1 budgets predate
+  // source, factorBaseline and knownLocalUsed.
+  const ended = NOW - 4 * 3_600_000;
+  const v1Budget = (resetMs) => ({
+    limit: 5000, remaining: 4000, used: 1000, resetMs, observedAt: NOW - 5 * 3_600_000,
+    blockUntil: null, blockReason: null, laneNextAt: NOW - 5 * 3_600_000,
+    roundRobinCursor: null, lastExternalFactor: 1, epoch: `5000:${resetMs}`,
+  });
+  const current = {
+    epochs: { core: `5000:${ended}`, graphql: `5000:${ended}` },
+    budgets: { core: v1Budget(ended), graphql: v1Budget(ended) },
+  };
+  const leaseId = randomUUID();
+  const legacy = {
+    version: 1,
+    epochs: current.epochs,
+    budgets: current.budgets,
+    probeClaim: null,
+    probeOutcome: { status: "idle", at: 0, nextAt: 0 },
+    leases: {},
+    intents: {},
+    // An uncertain charge against GraphQL. v1 migration drops both budgets, and
+    // only core was ever reconstructed, so this asked a budget that no longer
+    // existed for its reset and got legacy-unresolved -- a hold with no deadline,
+    // which never cleared on any later launch.
+    reservations: {
+      [`reservation:${leaseId}`]: {
+        leaseId, intentId: leaseId, costs: { core: 0, graphql: 2 },
+        actualCosts: null, accountedCosts: { core: 0, graphql: 0 },
+        notBefore: NOW - 5 * 3_600_000, status: "started",
+        epochs: { core: null, graphql: null },
+        startedAt: NOW - 5 * 3_600_000, completedAt: null, outcome: null,
+      },
+    },
+    manualProbe: null,
+  };
+  writeFileSync(join(coordinator.root, "..", `rate-governor-v1-${"d".repeat(64)}.json`),
+    JSON.stringify(legacy), { mode: 0o600 });
+
+  const claimed = claimIdentityBootstrap(coordinator.root, { credentialKey: "e".repeat(64), host: "github.com", now: NOW + 250 });
+  assert.notEqual(claimed.reason, "legacy-unresolved",
+    "a past window must not hold admission open-endedly");
+  assert.notEqual(claimed.reason, "migration-hold",
+    `the window ended hours ago: retryAt ${claimed.retryAt}`);
+});
