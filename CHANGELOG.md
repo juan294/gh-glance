@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-09-07
+
+### Changed
+
+- **An upgrade hold now says whether it will clear or is stuck.** Two different
+  states shared the message `Upgrade waiting for legacy quota reset`: one has a
+  deadline and ends by itself, the other holds unsettled spend with no reset
+  recorded to wait for and never clears. The second now reads `Upgrade blocked:
+  older spend cannot be settled or waited out`, and the troubleshooting table
+  gives its recovery -- quit every pane and delete the leftover
+  `rate-governor-v1-*.json` files. Sharing one message meant a permanently
+  blocked pane looked like a temporary wait.
+
 ## [0.13.2] - 2026-09-07
 
 ### Fixed
@@ -940,7 +953,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.13.2...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.13.3...HEAD
+[0.13.3]: https://github.com/juan294/gh-glance/compare/v0.13.2...v0.13.3
 [0.13.2]: https://github.com/juan294/gh-glance/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/juan294/gh-glance/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/juan294/gh-glance/compare/v0.12.0...v0.13.0
