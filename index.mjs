@@ -428,6 +428,9 @@ function isAuthProblem(err) {
 function isMissingRemote(err) {
   return /(?:failed to determine base repo:\s*)?no git remotes found/i.test(errText(err));
 }
+// The shorter of the two, so a verdict recorded without a gh subprocess reads
+// exactly like one gh produced and classifies the same way.
+const NO_REMOTE_ERROR_TEXT = "no git remotes found";
 
 const UNUSABLE_OUTPUT_CODE = "GH_GLANCE_UNUSABLE_OUTPUT";
 
@@ -1059,6 +1062,25 @@ function resolveEffectiveHost({
 }
 
 const UNRESOLVED_REPOSITORY = "Repository could not be resolved; pass --repo owner/name";
+
+// Whether there is a repository to talk about at all. A folder with no git
+// remote, no --repo and no GH_REPO is the onboarding state the no-remote verdict
+// renders -- but that verdict was only ever produced from a gh error, and with
+// no remote there is no host to verify an identity against, so no gh command
+// ran: the coordinator reported unknown-host and the dashboard sat on a generic
+// "retrying" notice, waiting for a budget it could never resolve. Decided from
+// the same inputs as the host so the two cannot disagree; an ambiguous set of
+// remotes is still a coordination question, not this one.
+function noRepositoryTarget({ runtimeRepo = null, ghRepo = null, remoteUrls = [] } = {}) {
+  return !runtimeRepo && !ghRepo && remoteUrls.length === 0;
+}
+
+function runtimeHasNoRepositoryTarget(remoteUrls = runtimeRemoteUrls) {
+  return noRepositoryTarget({ runtimeRepo: runtime.repo, ghRepo: process.env.GH_REPO, remoteUrls });
+}
+
+const NO_REPOSITORY_TARGET_REPORT =
+  "no repository target: this folder has no git remote (run `gh repo create`, or pass --repo owner/name)";
 
 // The owner/name half of the same question resolveEffectiveHost answers for the
 // host, and in the same precedence: an explicit --repo, then GH_REPO, then an
@@ -2781,9 +2803,9 @@ function inspectLegacyMigration(root, state, now) {
     for (const resource of RATE_RESOURCES) {
       const budget = legacy.budgets[resource];
       holdUntil = Math.max(holdUntil, budget?.blockUntil ?? 0);
-      const uncertain = Object.values(legacy.reservations).some((reservation) =>
+      const uncertain = Object.values(legacy.reservations).filter((reservation) =>
         ["started", "completed"].includes(reservation.status) && reservationCost(reservation, resource, legacy.leases, now) > 0);
-      if (uncertain) {
+      if (uncertain.length > 0) {
         // The deadline may only be read from the migrated view for resources the
         // migration kept. A v1 file's budgets are dropped on purpose -- they came
         // from /rate_limit and are not spendable capacity -- but the reset they
@@ -2794,9 +2816,22 @@ function inspectLegacyMigration(root, state, now) {
         // none, and reported legacy-unresolved -- which has no deadline and so
         // never cleared. The file it came from had a perfectly good reset in it
         // the whole time.
+        //
+        // A file can also simply never have recorded a budget for the resource:
+        // a v2 ledger whose panes only ever observed GraphQL still charged core
+        // per request, so its core reservations exist without a core budget to
+        // ask. Each reservation records the epoch it was admitted against, and
+        // that epoch's reset is when its window ended -- the same fact, kept in
+        // the other place. Only a reservation with no budget *and* no epoch is
+        // genuinely undated.
+        const recorded = uncertain
+          .map((reservation) => Number(String(reservation.epochs?.[resource] ?? "").split(":")[1]))
+          .filter(Number.isFinite);
         const reset = Number.isFinite(budget?.resetMs)
           ? budget.resetMs
-          : Number(raw?.budgets?.[resource]?.resetMs);
+          : Number.isFinite(Number(raw?.budgets?.[resource]?.resetMs))
+            ? Number(raw.budgets[resource].resetMs)
+            : recorded.length > 0 ? Math.max(...recorded) : NaN;
         if (!Number.isFinite(reset)) return { ok: false, reason: "legacy-unresolved" };
         holdUntil = Math.max(holdUntil, reset + BUDGET_RESET_GRACE_MS);
       }
@@ -6046,7 +6081,9 @@ async function runDoctor() {
   runtimeIdentityCoordinator = createIdentityCoordinator({ host: effectiveHost });
   const verified = await runtimeIdentityCoordinator.refresh();
   const verifiedIdentity = runtimeIdentityCoordinator.current();
-  const authStatus = verifiedIdentity ? `${verifiedIdentity.host}: ${verifiedIdentity.login} (verified)` : identityCoordinationMessage(verified.reason);
+  const authStatus = verifiedIdentity
+    ? `${verifiedIdentity.host}: ${verifiedIdentity.login} (verified)`
+    : runtimeHasNoRepositoryTarget(remoteUrls) ? NO_REPOSITORY_TARGET_REPORT : identityCoordinationMessage(verified.reason);
   const resources = verifiedIdentity ? await readRateLimitResources(undefined, effectiveHost).catch(() => null) : null;
   const budget = resources
     ? await rateBudget(resources)
@@ -9987,6 +10024,18 @@ function App({ onCreateRemote = () => {} } = {}) {
       });
     }
 
+    // A folder with no repository target goes straight to setup. The no-remote
+    // verdict is normally a fetch failure, but nothing can be fetched here --
+    // there is no host to verify against -- so the same verdict is recorded on
+    // every tab before coordination is attempted. remoteSetupRef then keeps the
+    // scheduler out, and the Enter hint hands off to `gh repo create`.
+    function enterRemoteSetup() {
+      if (!runtimeHasNoRepositoryTarget()) return false;
+      const failure = toTabError(new Error(NO_REMOTE_ERROR_TEXT));
+      setErrors(Object.fromEntries(TABS.map((t) => [t.key, failure])));
+      return true;
+    }
+
     function publishControlStatus(key, refreshed, snapshot, nowMs) {
       if (pendingBlockPublications.size > 0) {
         pauseCoordination(key, "block-unpublished");
@@ -10989,6 +11038,8 @@ function App({ onCreateRemote = () => {} } = {}) {
     async function bootstrap() {
       remoteUrls = runtimeRemoteUrls.length > 0 ? runtimeRemoteUrls : await gitRemoteUrls();
       runtimeRemoteUrls = remoteUrls;
+      if (cancelled) return;
+      if (enterRemoteSetup()) return;
       await runtimeIdentityCoordinator.refresh();
       if (cancelled) return;
       const currentScope = ensureScope(Date.now());
@@ -11859,6 +11910,7 @@ export {
   isRateLimited,
   isAuthProblem,
   isMissingRemote,
+  noRepositoryTarget,
   isUnusableOutput,
   forwardSignalToChild,
   toTabError,

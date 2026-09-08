@@ -640,3 +640,53 @@ test("ID-05 a v1 ledger with uncertain GraphQL charges clears once its window is
   assert.notEqual(claimed.reason, "migration-hold",
     `the window ended hours ago: retryAt ${claimed.retryAt}`);
 });
+
+test("ID-06 a ledger with no budget for a charged resource dates the charge by its own epoch", async (t) => {
+  const { pathOptions } = box(t);
+  const coordinator = createIdentityCoordinator({ host: "github.com", pathOptions, env: { GH_TOKEN: "synthetic-one" }, now: () => NOW, requestIdentity: async () => proof() });
+  await coordinator.refresh();
+  // A v2 file whose panes only ever observed GraphQL: a graphql budget, no
+  // core budget at all, and started reservations that charged core anyway.
+  // Neither the migrated view nor the raw file has a core reset to wait for,
+  // but every reservation names the core epoch it was admitted against, and
+  // that window ended hours ago.
+  const ended = NOW - 4 * 3_600_000;
+  const leaseId = randomUUID();
+  const legacy = {
+    version: 2,
+    epochs: { core: null, graphql: `5000:${ended}` },
+    budgets: {
+      graphql: {
+        limit: 5000, remaining: 5000, used: 0, resetMs: ended, observedAt: NOW - 5 * 3_600_000,
+        blockUntil: null, blockReason: null, laneNextAt: NOW - 5 * 3_600_000, roundRobinCursor: null,
+        lastExternalFactor: 1, epoch: `5000:${ended}`, source: "rate-limit-probe",
+        factorBaseline: { epoch: `5000:${ended}`, used: 0, observedAt: NOW - 5 * 3_600_000 }, knownLocalUsed: 0,
+      },
+    },
+    // The pre-split observer shape a real 0.12 file carries; without it the
+    // v2 reader rejects the document and the fixture stops being that file.
+    observers: { core: { etag: null, outcome: "idle", at: 0, nextAt: 0 } },
+    probeClaim: null,
+    probeOutcome: { status: "idle", at: 0, nextAt: 0 },
+    leases: {},
+    intents: {},
+    reservations: {
+      [`reservation:${leaseId}`]: {
+        leaseId, intentId: leaseId, costs: { core: 2, graphql: 0 },
+        actualCosts: null, accountedCosts: { core: 0, graphql: 0 },
+        notBefore: NOW - 5 * 3_600_000, status: "started",
+        epochs: { core: `5000:${ended}`, graphql: null },
+        startedAt: NOW - 5 * 3_600_000, completedAt: null, outcome: null,
+      },
+    },
+    manualProbe: null,
+  };
+  writeFileSync(join(coordinator.root, "..", `rate-governor-v1-${"f".repeat(64)}.json`),
+    JSON.stringify(legacy), { mode: 0o600 });
+
+  const claimed = claimIdentityBootstrap(coordinator.root, { credentialKey: "e".repeat(64), host: "github.com", now: NOW + 250 });
+  assert.notEqual(claimed.reason, "legacy-unresolved",
+    "a reservation that names its own epoch is not undated");
+  assert.notEqual(claimed.reason, "migration-hold",
+    `the reservation's window ended hours ago: retryAt ${claimed.retryAt}`);
+});

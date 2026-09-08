@@ -19,6 +19,7 @@ import {
   isRateLimited,
   isAuthProblem,
   isMissingRemote,
+  noRepositoryTarget,
   isUnusableOutput,
   forwardSignalToChild,
   classify,
@@ -266,6 +267,13 @@ test("fresh gh login failures are auth problems", () => {
 });
 
 test("a local repository without remotes is an onboarding state", () => {
+  // Decided from the same inputs as the host: only the folder with nothing at
+  // all is the onboarding state; an explicit target or any remote is not.
+  assert.equal(noRepositoryTarget({}), true);
+  assert.equal(noRepositoryTarget({ remoteUrls: [] }), true);
+  assert.equal(noRepositoryTarget({ runtimeRepo: "acme/widget" }), false);
+  assert.equal(noRepositoryTarget({ ghRepo: "acme/widget" }), false);
+  assert.equal(noRepositoryTarget({ remoteUrls: ["git@github.com:acme/widget.git"] }), false);
   for (const message of [NO_REMOTE_ERROR, "no git remotes found"]) {
     const error = { stderr: message };
     assert.equal(isMissingRemote(error), true, message);

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-09-08
+
+### Fixed
+
+- **A folder with no git remote opens in setup, not in a coordination wait.**
+  The onboarding prompt (`No GitHub remote found -- press Enter to create one`)
+  was only ever produced from a `gh` error, and with no remote there is no host
+  to verify an identity against, so no `gh` command ever ran: the dashboard sat
+  on "Can't coordinate API use -- retrying" and "waiting for API budget…" for a
+  repository that did not exist. The target is now decided before any
+  coordination -- no remote, no `--repo`, no `GH_REPO` means setup -- and
+  `--doctor` says so in the same words instead of reporting an unavailable
+  identity.
+- **An upgrade no longer stalls on a ledger that never recorded a budget for a
+  resource it charged.** A 0.12-era file whose panes only ever observed GraphQL
+  holds core reservations with no core budget to date them by, so the migration
+  reported "older spend cannot be settled or waited out" -- a hold with no
+  deadline, on every launch, forever. Each reservation records the epoch it was
+  admitted against; that epoch's reset now serves as the deadline, and a window
+  that ended weeks ago clears at once.
+
 ## [0.14.0] - 2026-09-07
 
 ### Added
@@ -1029,7 +1050,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.14.1...HEAD
+[0.14.1]: https://github.com/juan294/gh-glance/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/juan294/gh-glance/compare/v0.13.3...v0.14.0
 [0.13.3]: https://github.com/juan294/gh-glance/compare/v0.13.2...v0.13.3
 [0.13.2]: https://github.com/juan294/gh-glance/compare/v0.13.1...v0.13.2
