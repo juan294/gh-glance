@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An upgrade no longer stalls on a ledger that never recorded a budget for a
+  resource it charged.** A 0.12-era file whose panes only ever observed GraphQL
+  holds core reservations with no core budget to date them by, so the migration
+  reported "older spend cannot be settled or waited out" -- a hold with no
+  deadline, on every launch, forever. Each reservation records the epoch it was
+  admitted against; that epoch's reset now serves as the deadline, and a window
+  that ended weeks ago clears at once.
+
 ## [0.14.0] - 2026-09-07
 
 ### Added

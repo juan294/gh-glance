@@ -2781,9 +2781,9 @@ function inspectLegacyMigration(root, state, now) {
     for (const resource of RATE_RESOURCES) {
       const budget = legacy.budgets[resource];
       holdUntil = Math.max(holdUntil, budget?.blockUntil ?? 0);
-      const uncertain = Object.values(legacy.reservations).some((reservation) =>
+      const uncertain = Object.values(legacy.reservations).filter((reservation) =>
         ["started", "completed"].includes(reservation.status) && reservationCost(reservation, resource, legacy.leases, now) > 0);
-      if (uncertain) {
+      if (uncertain.length > 0) {
         // The deadline may only be read from the migrated view for resources the
         // migration kept. A v1 file's budgets are dropped on purpose -- they came
         // from /rate_limit and are not spendable capacity -- but the reset they
@@ -2794,9 +2794,22 @@ function inspectLegacyMigration(root, state, now) {
         // none, and reported legacy-unresolved -- which has no deadline and so
         // never cleared. The file it came from had a perfectly good reset in it
         // the whole time.
+        //
+        // A file can also simply never have recorded a budget for the resource:
+        // a v2 ledger whose panes only ever observed GraphQL still charged core
+        // per request, so its core reservations exist without a core budget to
+        // ask. Each reservation records the epoch it was admitted against, and
+        // that epoch's reset is when its window ended -- the same fact, kept in
+        // the other place. Only a reservation with no budget *and* no epoch is
+        // genuinely undated.
+        const recorded = uncertain
+          .map((reservation) => Number(String(reservation.epochs?.[resource] ?? "").split(":")[1]))
+          .filter(Number.isFinite);
         const reset = Number.isFinite(budget?.resetMs)
           ? budget.resetMs
-          : Number(raw?.budgets?.[resource]?.resetMs);
+          : Number.isFinite(Number(raw?.budgets?.[resource]?.resetMs))
+            ? Number(raw.budgets[resource].resetMs)
+            : recorded.length > 0 ? Math.max(...recorded) : NaN;
         if (!Number.isFinite(reset)) return { ok: false, reason: "legacy-unresolved" };
         holdUntil = Math.max(holdUntil, reset + BUDGET_RESET_GRACE_MS);
       }
