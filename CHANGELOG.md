@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A folder with no git remote opens in setup, not in a coordination wait.**
+  The onboarding prompt (`No GitHub remote found -- press Enter to create one`)
+  was only ever produced from a `gh` error, and with no remote there is no host
+  to verify an identity against, so no `gh` command ever ran: the dashboard sat
+  on "Can't coordinate API use -- retrying" and "waiting for API budget…" for a
+  repository that did not exist. The target is now decided before any
+  coordination -- no remote, no `--repo`, no `GH_REPO` means setup -- and
+  `--doctor` says so in the same words instead of reporting an unavailable
+  identity.
 - **An upgrade no longer stalls on a ledger that never recorded a budget for a
   resource it charged.** A 0.12-era file whose panes only ever observed GraphQL
   holds core reservations with no core budget to date them by, so the migration

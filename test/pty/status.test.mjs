@@ -9,6 +9,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { execFileSync } from "node:child_process";
 
 import { resourceReserve, tabRequestCost } from "../../index.mjs";
 import { capture, captureAsync, isStatusLine, waitForAwk } from "./capture.mjs";
@@ -219,6 +220,28 @@ test("Setup and NO_COLOR footers keep explicit semantic labels", (t) => {
   assert.match(statusLine(noColor) ?? "", /^· Watching/);
   assert.match(statusLine(noColor) ?? "", /(?:Refresh: )?r(?:\s|$)/);
   assert.match(statusLine(noColor) ?? "", /(?:Quit: )?q(?:\s|$)/);
+});
+
+test("A folder with no remote enters setup before any coordination", (t) => {
+  // A fresh checkout with no remote, no --repo and no GH_REPO. There is no host
+  // to verify an identity against, so no gh call can be made -- and before this
+  // the dashboard reported that as a coordination failure and waited for a
+  // budget forever. The onboarding prompt must come up without one.
+  const folder = configRoot(t, "gh-glance-status-no-target-");
+  execFileSync("git", ["init", "-q", folder]);
+  const result = capture({
+    cols: 80,
+    rows: 24,
+    signal: "none",
+    settle: 8,
+    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Setup") { ok=1 }') + "printf q",
+    configHome: configRoot(t, "gh-glance-status-no-target-config-"),
+    env: { GH_GLANCE_CAPTURE_CWD: folder, GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
+  });
+  assert.match(statusLine(result) ?? "", /^· Setup/);
+  const frame = result.finalFrame.lines.join("\n");
+  assert.match(frame, /No GitHub remote found/);
+  assert.doesNotMatch(frame, /Can't coordinate API use|waiting for API budget/);
 });
 
 test("ASCII profile keeps the same status label and a width-one marker", (t) => {

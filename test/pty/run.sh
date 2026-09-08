@@ -86,6 +86,10 @@ LOG="${OUT}.calls"
 : > "$LOG"
 
 cd "$REPO" || exit 1
+# The app normally starts from the checkout, which has a remote. A caller that
+# needs the no-remote onboarding state names another working directory here;
+# index.mjs is still the checkout's.
+APP_CWD="${GH_GLANCE_CAPTURE_CWD:-$REPO}"
 
 # GH_GLANCE_NO_ANIMATION removes the 100ms spinner, the single largest source of
 # frame-to-frame variance (index.mjs:206).
@@ -123,12 +127,14 @@ ENV_PREFIX="export PATH=\"$HERE/fixtures:\$PATH\";
 if [ "$SIGNAL" = "none" ]; then
   INNER="$ENV_PREFIX
     stty cols $COLS rows $ROWS;
-    env -u CI -u CONTINUOUS_INTEGRATION node index.mjs $APP_ARGS;
+    cd \"$APP_CWD\";
+    env -u CI -u CONTINUOUS_INTEGRATION node \"$REPO/index.mjs\" $APP_ARGS;
     printf '\nEXITCODE=%s\n' \"\$?\""
 else
   INNER="$ENV_PREFIX
     stty cols $COLS rows $ROWS;
-    env -u CI -u CONTINUOUS_INTEGRATION node index.mjs $APP_ARGS &
+    cd \"$APP_CWD\";
+    env -u CI -u CONTINUOUS_INTEGRATION node \"$REPO/index.mjs\" $APP_ARGS &
     p=\$!;
     sleep $SETTLE;
     kill -$SIGNAL \$p 2>/dev/null;
