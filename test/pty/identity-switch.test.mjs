@@ -119,7 +119,9 @@ test("ID-02/03/06: switched accounts fence delayed rows, settle the old ledger, 
   };
   const running = captureAsync({
     ...options,
-    settle: 30,
+    // captureAsync adds 25 seconds to this value for its outer process timeout.
+    // Keep that ceiling beyond quitWhenSwitchSettled's 60-second condition.
+    settle: 40,
     stdin: `node -e '(${quitWhenSwitchSettled.toString()})(${JSON.stringify(root)})'`,
   });
   activeCapture = running;

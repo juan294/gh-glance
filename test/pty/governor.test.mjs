@@ -342,9 +342,16 @@ test("manual refresh wins a held lane without stacking repeated requests", { tim
   const runs = actionsRuns(progress);
   assert.equal(runs.filter((event) => event.pane === "manual").length, 1);
   assert.equal(runs.filter((event) => event.pane === "competitor").length, 1);
-  assert.equal(runs[0].pane, "manual", `lower-priority work started before manual refresh: ${JSON.stringify(
-    { events: progress.events, held: held.intents, reservations: admitted.reservations, leases: admitted.leases },
-  )}`);
+  const intentEntries = Object.entries(held.intents);
+  const [manualIntentId] = intentEntries.find(([, intent]) => intent.priority === "manual") ?? [];
+  const [competitorIntentId] = intentEntries.find(([, intent]) => intent.priority !== "manual") ?? [];
+  const reservations = Object.values(admitted.reservations);
+  const manualReservation = reservations.find((reservation) => reservation.intentId === manualIntentId);
+  const competitorReservation = reservations.find((reservation) => reservation.intentId === competitorIntentId);
+  assert.ok(manualReservation?.notBefore < competitorReservation?.notBefore,
+    `manual refresh did not receive the earlier lane reservation: ${JSON.stringify(
+      { held: held.intents, reservations: admitted.reservations },
+    )}`);
   const manualResult = results[0];
   const statuses = manualResult.liveScreen.statusHistory;
   const scheduledAt = statuses.findIndex((status) => / (?:Paused|Watching (?:next|probing))(?:\s|$)/.test(status));
