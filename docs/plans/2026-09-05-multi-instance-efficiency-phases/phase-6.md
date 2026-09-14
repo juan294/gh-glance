@@ -58,6 +58,6 @@ None. Separate processes and private fixture directories exercise ownership and 
 
 ## Completion
 
-- [ ] Shared engine/store, fencing, capability reuse and retention implemented.
-- [ ] SHARE scenarios and parent local gates passed.
-- [ ] Independent compliance/quality review complete; integrated locally; stop.
+- [x] Shared engine/store, fencing, capability reuse and retention implemented.
+- [x] SHARE scenarios pass in targeted unit, separate-process and PTY gates; the parent full-suite gates remain for final integration.
+- [x] Independent compliance/quality review complete; integrated locally; stop.

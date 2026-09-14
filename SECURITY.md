@@ -105,7 +105,7 @@ Successfully parsed rows can be persisted in an authorization-and-target-scoped
 `dashboard-cache.json` beside the width-preference file. The cache contains
 sanitized repository data such as titles, authors, branches, and Security
 findings, but it never contains a GitHub token or other credential. It retains
-at most five repository targets and 60 rows per tab. The account namespace is
+at most 32 repository targets and 60 rows per tab. The account namespace is
 derived from the effective host, a one-way SHA-256 digest of the selected
 credential, and its authorization generation. Two credentials for the same
 verified account share quota coordination but cannot hydrate each other's
@@ -118,6 +118,33 @@ at once. Missing, corrupt, future-version, locked, or unwritable state is
 advisory: it is ignored rather than weakening authentication or preventing
 startup. A failed or blind Security observation never replaces a
 last-known-good alert set with an empty one.
+
+Live panes also coordinate through a private `coordination-v2/acquisition.json`
+store. A versioned query key binds host, admitted repository identity, access
+partition, resource, projection, page size, filters, and cursor generation.
+That lightweight file contains claims, subscriptions, generations, bounded
+content digests, and references to private per-query snapshot artifacts. Each
+artifact contains only sanitized rows and validated ETag/body pairs. A producer
+writes the artifact before atomically publishing its metadata reference, so a
+reader sees the complete old or new generation rather than a partial pair.
+Unreferenced artifacts are removed after publication. Neither layer persists
+raw credentials or reuses saved rate-limit headers as authority. Source success
+and content-change timestamps remain separate, so a conditional 304 updates
+freshness without pretending the display changed.
+
+One nonce-fenced producer owns each due query generation. Its 45-second claim
+is heartbeated every ten seconds, and expiration alone cannot transfer
+ownership: takeover also requires PID-confirmed death or explicit cancellation.
+An indeterminate or suspended owner therefore pauses duplicate acquisition.
+No store lock is held during governor admission or network I/O. Busy, corrupt,
+unwritable, malformed, oversized, or capacity-exhausted state fails closed and
+never falls back to independent pane polling.
+
+Shared acquisition is bounded to 32 MiB total, 1 MiB per entity, 512 entities,
+32 live targets, and 128 active subscriptions. Live targets are pinned;
+inactive least-recently-used generations are evicted first. Payloads and
+capability observations remain access-partitioned. The existing display cache
+can migrate validated rows, but it cannot invent validators that were absent.
 
 API admission uses a separate `coordination-v2/quota-<scope hash>.json` file in
 the same private directory. Its SHA-256 scope binds the effective host to the

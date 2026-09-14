@@ -12,7 +12,12 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { resourceReserve, tabRequestCost } from "../../index.mjs";
+import {
+  ACQUISITION_CLAIM_TTL_MS,
+  loadAcquisitionStore,
+  resourceReserve,
+  tabRequestCost,
+} from "../../index.mjs";
 import { captureAsync } from "./capture.mjs";
 import { seedKnownHeldIdentity } from "./fixtures/known-identity.mjs";
 
@@ -20,13 +25,12 @@ const STATE_HELPER = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "
 const LIMIT = 10_000;
 const WINDOW_MS = 600_000;
 const CAPTURE_ARGS = "--repo acme/widget --refresh 40";
-// One Actions fetch is one REST call now that the workflow catalog is a
-// conditional fallback, so twelve panes make twelve data starts rather than
-// twenty-four. Read from the cost table so re-pricing the tab cannot leave a
-// literal behind.
+// Phase 6 makes duplicate panes followers of one acquisition generation. The
+// one producer owns the governor reservation and every follower consumes its
+// published snapshot.
 const PANE_COUNT = 12;
 const ACTIONS_CALLS = tabRequestCost("actions").core;
-const STARTUP_DATA_STARTS = PANE_COUNT * ACTIONS_CALLS;
+const STARTUP_DATA_STARTS = ACTIONS_CALLS;
 // What the external burn below deliberately leaves spendable: room for two
 // Actions batches and no more.
 const BURN_HEADROOM = 2 * ACTIONS_CALLS;
@@ -54,6 +58,9 @@ function fixture(t, overrides = {}) {
       const name = readdirSync(directory).find((entry) => /^quota-[a-f0-9]{64}\.json$/.test(entry));
       return JSON.parse(readFileSync(join(directory, name), "utf8"));
     },
+    readAcquisition: () => loadAcquisitionStore(
+      join(root, "gh-glance", "coordination-v2", "acquisition.json"),
+    ).value,
   };
 }
 
@@ -105,15 +112,16 @@ async function observeUntil(read, predicate, timeoutMs) {
   );
 }
 
-function readyInput(path, attempts = 1_000) {
+function readyInput(path, attempts = 1_000, delaySeconds = 0) {
   return `i=0; while [ ! -f "${path}" ] && [ "$i" -lt ${attempts} ]; do ` +
-    "sleep .05; i=$((i + 1)); done; printf q";
+    `sleep .05; i=$((i + 1)); done; sleep ${delaySeconds}; printf q`;
 }
 
 function startPane(box, pane, {
   tab = "actions",
   readyPath,
   readyAttempts = 1_000,
+  readyDelay = 0,
   settle = 45,
   stdin = null,
   animation = false,
@@ -124,7 +132,7 @@ function startPane(box, pane, {
     rows: 20,
     signal: "none",
     settle,
-    stdin: stdin ?? (readyPath ? readyInput(readyPath, readyAttempts) : "sleep 120"),
+    stdin: stdin ?? (readyPath ? readyInput(readyPath, readyAttempts, readyDelay) : "sleep 120"),
     args: `${CAPTURE_ARGS} --tab ${tab}`,
     animation,
     configHome: box.root,
@@ -186,6 +194,7 @@ function assertPhasedStarts(governor, events, resource, expected, label) {
   for (let index = 0; index < expected; index += 1) {
     assert.ok(actual[index] >= slots[index], `${label} start ${index} preceded its persisted slot`);
   }
+  if (expected === 1) return;
   const plannedSpan = slots.at(-1) - slots[0];
   const actualSpan = actual.at(-1) - actual[0];
   assert.ok(plannedSpan > 0, `${label} persisted no phase or lane spacing`);
@@ -209,34 +218,55 @@ test("twelve real panes share one startup probe and every active pane progresses
   const box = fixture(t, { delayMs: 20 });
   const readyPath = join(box.root, "startup-ready");
   const captures = Array.from({ length: 12 }, (_, index) =>
-    startPane(box, `startup-${index}`, { readyPath }));
+    startPane(box, `startup-${index}`, { readyPath, readyDelay: 2 }));
 
   let progress;
   let startupGovernor;
+  let acquisition;
+  let panes;
   try {
     const scheduled = await observeUntil(
       () => ({ fixture: box.read(), governor: box.readGovernor() }),
-      ({ governor }) => reservationSlots(governor, "core").length === 12,
+      ({ governor }) => reservationSlots(governor, "core").length === 1,
       30_000,
     );
     startupGovernor = scheduled.governor;
-    progress = await observeUntil(
-      box.read,
-      (state) => dataStarts(state).length >= STARTUP_DATA_STARTS &&
-        new Set(dataStarts(state).map((event) => event.pane)).size === PANE_COUNT,
+    const completed = await observeUntil(
+      () => ({ fixture: box.read(), governor: box.readGovernor(), acquisition: box.readAcquisition() }),
+      ({ fixture, governor, acquisition: shared }) =>
+        dataStarts(fixture).length >= STARTUP_DATA_STARTS &&
+        Object.values(governor.reservations).filter((reservation) =>
+          reservation.costs?.core > 0 && reservation.status === "completed").length === 1 &&
+        Object.keys(shared.subscriptions).length === PANE_COUNT &&
+        Object.values(shared.queries).some((record) => record.snapshot?.rows?.length > 0),
       reservationHorizon(startupGovernor, "core"),
     );
+    progress = completed.fixture;
+    startupGovernor = completed.governor;
+    acquisition = completed.acquisition;
   } finally {
-    await releasePanes(readyPath, captures);
+    panes = await releasePanes(readyPath, captures);
   }
 
   const data = dataStarts(progress);
   assert.equal(probes(progress).length, 1, `startup probes: ${JSON.stringify(probes(progress))}`);
   assert.equal(data.length, STARTUP_DATA_STARTS, "startup launched background or duplicate data work");
-  assert.equal(new Set(data.map((event) => event.pane)).size, 12);
+  assert.equal(new Set(data.map((event) => event.pane)).size, 1);
   assert.ok(data.every(isActionsEndpoint), "a non-active tab ran at startup");
   assertDebitsStayOutsideReserve(data);
-  assertPhasedStarts(startupGovernor, actionsRuns(progress), "core", 12, "startup");
+  assertPhasedStarts(startupGovernor, actionsRuns(progress), "core", 1, "startup");
+  const settlements = Object.values(startupGovernor.reservations).filter((reservation) =>
+    reservation.costs?.core > 0 && reservation.status === "completed");
+  assert.equal(settlements.length, 1, "the shared generation settled quota more than once");
+  assert.equal(Object.values(acquisition.queries).filter((record) => record.snapshot).length, 1);
+  assert.equal(Object.keys(acquisition.subscriptions).length, PANE_COUNT);
+  assert.ok(panes.every((pane) => {
+    const screen = pane.finalFrame.lines.join("\n");
+    return screen.includes("ci: pin actions") && screen.includes("#443");
+  }),
+    `every pane must render the shared published row before exit: ${JSON.stringify(
+      panes.map((pane) => pane.finalFrame.lines),
+    )}`);
 });
 
 test("twelve mixed active panes pace core and GraphQL without consuming either reserve", async (t) => {
@@ -253,18 +283,20 @@ test("twelve mixed active panes pace core and GraphQL without consuming either r
       const tab = tabs[index % tabs.length];
       return startPane(box, `mixed-${tab}-${index}`, { tab, readyPath });
     }));
-    progress = await observeUntil(
-      box.read,
-      (state) => new Set(dataStarts(state).map((event) => event.pane)).size === 12,
-      30_000,
-    );
+    progress = await observeUntil(box.read, (state) => {
+      const data = dataStarts(state);
+      return actionsRuns(state).length === 1 &&
+        data.filter((event) => event.graphqlOperation === "issues.page").length === 1 &&
+        data.filter((event) => event.graphqlOperation === "pulls.page").length === 1 &&
+        data.filter((event) => event.pane.includes("-security-")).length === 3;
+    }, 30_000);
   } finally {
     await releasePanes(readyPath, captures);
   }
 
   const data = dataStarts(progress);
   const seen = new Set(data.map((event) => event.pane));
-  assert.equal(seen.size, 12);
+  assert.equal(seen.size, 4, "one producer should serve each distinct active resource query");
   assert.ok(data.some((event) => event.cost.core > 0));
   assert.ok(data.some((event) => event.cost.graphql > 0));
   for (const event of data) {
@@ -299,7 +331,7 @@ test("manual refresh wins a held lane without stacking repeated requests", { tim
     "i=0; while [ $i -lt 8 ]; do printf r; i=$((i + 1)); sleep .03; done; " +
     "i=0; while ! grep -Fq '\"pane\":\"manual\",\"argv\":[\"api\",\"-i\",\"repos/acme/widget/actions/runs?' " +
     "\"$GH_GLANCE_FIXTURE_STATE\" 2>/dev/null && [ $i -lt 300 ]; " +
-    "do i=$((i + 1)); sleep .1; done; sleep .5; printf q";
+    "do i=$((i + 1)); sleep .1; done; sleep 1.5; printf q";
   const captures = [startPane(box, "manual", {
     stdin: manualInput,
     animation: true,
@@ -320,38 +352,37 @@ test("manual refresh wins a held lane without stacking repeated requests", { tim
     );
     captures.push(startPane(box, "competitor", { readyPath: competitorReady, settle: 40 }));
     held = await observeUntil(
-      box.readGovernor,
-      (governor) => {
-        const priorities = Object.values(governor.intents ?? {}).map((intent) => intent.priority);
-        return priorities.length === 2 && priorities.includes("manual") &&
-          priorities.some((priority) => priority !== "manual");
-      },
+      () => ({ governor: box.readGovernor(), acquisition: box.readAcquisition() }),
+      ({ governor, acquisition }) =>
+        Object.values(governor.intents ?? {}).filter((intent) => intent.priority === "manual").length === 1 &&
+        Object.keys(acquisition.subscriptions ?? {}).length === 2,
       10_000,
     );
-    progress = await observeUntil(
-      box.read,
-      (state) => new Set(actionsRuns(state).map((event) => event.pane)).size === 2,
+    const completed = await observeUntil(
+      () => ({ fixture: box.read(), acquisition: box.readAcquisition() }),
+      ({ fixture, acquisition }) => actionsRuns(fixture).length === 1 &&
+        Object.values(acquisition.queries ?? {}).some((record) => record.snapshot?.rows?.length > 0),
       30_000,
     );
+    progress = completed.fixture;
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
     admitted = box.readGovernor();
   } finally {
     results = await releasePanes(competitorReady, captures);
   }
 
-  assert.equal(Object.values(held.intents).filter((intent) => intent.priority === "manual").length, 1);
+  assert.equal(Object.values(held.governor.intents)
+    .filter((intent) => intent.priority === "manual").length, 1);
   const runs = actionsRuns(progress);
   assert.equal(runs.filter((event) => event.pane === "manual").length, 1);
-  assert.equal(runs.filter((event) => event.pane === "competitor").length, 1);
-  const intentEntries = Object.entries(held.intents);
+  assert.equal(runs.filter((event) => event.pane === "competitor").length, 0);
+  const intentEntries = Object.entries(held.governor.intents);
   const [manualIntentId] = intentEntries.find(([, intent]) => intent.priority === "manual") ?? [];
-  const [competitorIntentId] = intentEntries.find(([, intent]) => intent.priority !== "manual") ?? [];
   const reservations = Object.values(admitted.reservations);
   const manualReservation = reservations.find((reservation) => reservation.intentId === manualIntentId);
-  const competitorReservation = reservations.find((reservation) => reservation.intentId === competitorIntentId);
-  assert.ok(manualReservation?.notBefore < competitorReservation?.notBefore,
-    `manual refresh did not receive the earlier lane reservation: ${JSON.stringify(
-      { held: held.intents, reservations: admitted.reservations },
-    )}`);
+  assert.equal(manualReservation?.status, "completed");
+  assert.ok(results.every((result) => result.finalFrame.lines.join("\n").includes("ci: pin actions")),
+    "the manual producer and its follower must both render the shared result");
   const manualResult = results[0];
   const statuses = manualResult.liveScreen.statusHistory;
   const scheduledAt = statuses.findIndex((status) => / (?:Paused|Watching (?:next|probing))(?:\s|$)/.test(status));
@@ -471,14 +502,13 @@ test("a real reset resumes all panes, while atomic external burn limits the next
       (governor) => governor?.epochs?.core !== firstEpoch &&
         Object.values(governor.reservations ?? {}).filter(
           (reservation) => reservation.epochs?.core === governor.epochs.core,
-        ).length === 12,
+        ).length === 1,
       30_000,
     );
     resetSchedule = scheduled;
     resetProgress = await observeUntil(
       resetBox.read,
-      (state) => probes(state).length === 2 &&
-        new Set(actionsRuns(state).map((event) => event.pane)).size === 12,
+      (state) => probes(state).length === 2 && actionsRuns(state).length === 1,
       reservationHorizon(scheduled, "core"),
     );
   } finally {
@@ -489,12 +519,12 @@ test("a real reset resumes all panes, while atomic external burn limits the next
   assert.equal(probes(resetProgress).length, 2);
   const resetData = dataStarts(resetProgress);
   const resetRuns = actionsRuns(resetProgress);
-  assert.equal(resetRuns.length, 12, "reset launched duplicate Actions batches");
-  assert.ok(resetData.length >= PANE_COUNT && resetData.length <= STARTUP_DATA_STARTS,
-    "reset launched work outside the twelve Actions batches");
-  assert.equal(new Set(resetData.map((event) => event.pane)).size, 12);
+  assert.equal(resetRuns.length, 1, "reset launched duplicate Actions batches");
+  assert.equal(resetData.length, STARTUP_DATA_STARTS,
+    "reset launched work outside the shared Actions batch");
+  assert.equal(new Set(resetData.map((event) => event.pane)).size, 1);
   assertDebitsStayOutsideReserve(resetData);
-  assertPhasedStarts(resetSchedule, resetRuns, "core", 12, "reset");
+  assertPhasedStarts(resetSchedule, resetRuns, "core", 1, "reset");
 
   const burnBox = fixture(t, {
     anchorAtFirstProbe: true,
@@ -552,7 +582,7 @@ test("a real reset resumes all panes, while atomic external burn limits the next
   assertDebitsStayOutsideReserve(burnData);
 });
 
-test("probe and reservation owner crashes recover without optimistic spend", { timeout: 120_000 }, async (t) => {
+test("probe and reservation owner crashes recover without optimistic spend", { timeout: 240_000 }, async (t) => {
   const probeBox = fixture(t, {
     // The shared budget probe is the claimed GraphQL observer now, so that is
     // the call this test has to hold open long enough to kill its owner.
@@ -606,6 +636,11 @@ test("probe and reservation owner crashes recover without optimistic spend", { t
   );
   const crashedReservation = dataStarts(reservationStartState)
     .find((event) => event.pane === "reservation-owner");
+  const crashedClaim = Object.values(reservationBox.readAcquisition().queries)
+    .find((record) => record.query.resource === "actions")?.claim;
+  assert.ok(crashedClaim, "the crashed owner had no durable acquisition claim");
+  assert.ok(crashedClaim.leaseUntil - crashedClaim.claimedAt >= ACQUISITION_CLAIM_TTL_MS,
+    "the durable claim did not retain the required crash-recovery window");
   killRecordedProcess(crashedReservation);
   writeFileSync(reservationOwnerReady, "ready\n", { mode: 0o600 });
   await crashedReservationCapture;
@@ -613,7 +648,8 @@ test("probe and reservation owner crashes recover without optimistic spend", { t
   const reservationReady = join(reservationBox.root, "reservation-survivor-ready");
   const reservationSurvivor = startPane(reservationBox, "reservation-survivor", {
     readyPath: reservationReady,
-    settle: 35,
+    readyAttempts: 2_000,
+    settle: 130,
   });
   let recoveredReservation;
   try {
@@ -621,7 +657,7 @@ test("probe and reservation owner crashes recover without optimistic spend", { t
       reservationBox.read,
       (state) => dataStarts(state).some((event) => event.pane === "reservation-survivor") &&
         state.active === 0 && state.dataActive === 0,
-      20_000,
+      115_000,
     );
   } finally {
     await releasePanes(reservationReady, [reservationSurvivor]);
@@ -629,6 +665,10 @@ test("probe and reservation owner crashes recover without optimistic spend", { t
   const reservationGovernor = reservationBox.readGovernor();
   assert.ok(Object.values(reservationGovernor.reservations).some((reservation) =>
     reservation.status === "started" && reservation.outcome === null));
+  const survivorStart = dataStarts(recoveredReservation)
+    .find((event) => event.pane === "reservation-survivor");
+  assert.ok(survivorStart.at >= crashedClaim.leaseUntil,
+    `survivor started before the dead claim expired: ${survivorStart.at} < ${crashedClaim.leaseUntil}`);
   assert.equal(recoveredReservation.active, 0);
   assert.equal(recoveredReservation.dataActive, 0);
   assertDebitsStayOutsideReserve(dataStarts(recoveredReservation));

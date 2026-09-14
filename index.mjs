@@ -1763,6 +1763,7 @@ async function fetchGraphqlList(kind, mapRow, {
     throw error;
   }
   const observations = [...first.observations];
+  const repositoryIdentity = normalizeRepositoryIdentity(first.data?.repository);
   // Only the first page. Pages past it opened their own reservation inside
   // runAdmittedOperation and settle against it, so adding them here charges the
   // same work twice -- and a settlement above its reservation is rejected as
@@ -1848,6 +1849,7 @@ async function fetchGraphqlList(kind, mapRow, {
     graphqlSpentTotal: spent,
     observations,
     incomplete,
+    repositoryIdentity,
     totalCount,
     hasNextPage: merged.hasNextPage,
     generation: merged.generation,
@@ -5444,8 +5446,20 @@ async function fetchSecurity(signal, {
   // for the mirror-image reason: a sleep gap is the thing it reports, and
   // performance.now() does not advance across suspend.
   const now = performance.now();
-  const parts = await Promise.all(ALERT_SOURCES.map((source) =>
-    fetchAlertSource(source, signal, now, { entities, force })));
+  const parts = await Promise.all(ALERT_SOURCES.map(async (source) => ({
+    ...await fetchAlertSource(source, signal, now, { entities, force }),
+    sourceKey: source.key,
+  })));
+  const capabilities = Object.fromEntries(parts.flatMap((part) => {
+    if (part.verdict !== "unavailable") return [];
+    const state = alertBackoff.get(backoffStorageKey(part.sourceKey));
+    return state ? [[part.sourceKey, {
+      verdict: "unavailable",
+      note: state.note,
+      step: state.step,
+      until: Date.now() + Math.max(0, state.until - now),
+    }]] : [];
+  }));
   const allNotModified = parts.length > 0 && parts.every((part) => part.allNotModified);
   const stagedEntities = new Map(parts.flatMap((part) => [...part.stagedEntities]));
   return {
@@ -5463,6 +5477,7 @@ async function fetchSecurity(signal, {
     rateLimited: parts.some((part) => part.verdict === "rate-limited"),
     stagedEntities,
     observations: parts.flatMap((part) => part.observations ?? []),
+    capabilities,
     parse: () => {
       if (parts.some((part) => part.verdict === "unusable-output")) return { unusable: true };
       const parsed = parts.map((p) => p.parse());
@@ -7892,7 +7907,7 @@ const createWidthPreferenceWriter = createCoalescedWriter;
 
 // 3: cached rows carry their page URL, without which they cannot be opened.
 const DASHBOARD_CACHE_VERSION = 3;
-const MAX_DASHBOARD_CACHE_TARGETS = 5;
+const MAX_DASHBOARD_CACHE_TARGETS = 32;
 const MAX_DASHBOARD_CACHE_ROWS_PER_TAB = 60;
 let dashboardCacheTempSequence = 0;
 
@@ -8178,6 +8193,1104 @@ const CACHE_FRESHNESS_CHECKPOINT_MS = 60_000;
 
 function shouldCheckpointFreshness({ persistedAt, completedAt }) {
   return !Number.isFinite(persistedAt) || completedAt - persistedAt >= CACHE_FRESHNESS_CHECKPOINT_MS;
+}
+
+// ---------- Shared acquisition store ----------
+
+// This store is data coordination, not quota authority. It may be discarded as
+// a unit with its validators, but an inability to claim it must never fall back
+// to an independent request: that would defeat its only security property.
+const ACQUISITION_STORE_VERSION = 1;
+const ACQUISITION_CLAIM_TTL_MS = 45_000;
+const ACQUISITION_HEARTBEAT_MS = 10_000;
+const ACQUISITION_INSPECT_MS = 1_000;
+const ACQUISITION_MAX_BYTES = 32 * 1024 * 1024;
+const ACQUISITION_MAX_ENTITY_BYTES = 1024 * 1024;
+const ACQUISITION_MAX_ENTITIES = 512;
+const ACQUISITION_MAX_LIVE_TARGETS = 32;
+const ACQUISITION_MAX_SUBSCRIPTIONS = 128;
+let acquisitionTempSequence = 0;
+
+function acquisitionStorePath(options = {}) {
+  return join(identityRegistryRoot(options), "acquisition.json");
+}
+
+function emptyAcquisitionStore() {
+  return {
+    version: ACQUISITION_STORE_VERSION,
+    producerEpoch: governorId(),
+    subscriptions: {},
+    queries: {},
+    aliases: {},
+  };
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalJson(value[key])]));
+}
+
+function acquisitionQueryKey(input) {
+  const host = normalizeHost(input?.host);
+  const repositoryId = typeof input?.repositoryId === "string" && input.repositoryId.length > 0
+    ? input.repositoryId : null;
+  const accessKey = typeof input?.accessKey === "string" && input.accessKey.length > 0
+    ? privateIdentityDigest("acquisition-access-v1", input.accessKey) : null;
+  const resource = TAB_KEYS.includes(input?.resource) ? input.resource : null;
+  const queryVersion = Number.isSafeInteger(input?.queryVersion) && input.queryVersion > 0
+    ? input.queryVersion : null;
+  const pageSize = Number.isSafeInteger(input?.pageSize) && input.pageSize > 0 ? input.pageSize : null;
+  const cursorGeneration = typeof input?.cursorGeneration === "string" && input.cursorGeneration.length > 0
+    ? input.cursorGeneration : null;
+  if (!host || !repositoryId || !accessKey || !resource || !queryVersion || !pageSize || !cursorGeneration ||
+      !isRecord(input?.filters ?? {})) return null;
+  return privateIdentityDigest(
+    "query-v1",
+    host,
+    repositoryId,
+    accessKey,
+    resource,
+    String(queryVersion),
+    JSON.stringify(canonicalJson(input.filters ?? {})),
+    String(pageSize),
+    cursorGeneration,
+  );
+}
+
+function acquisitionQueryForTab(key, identity, repository, pages = 1) {
+  if (!TAB_KEYS.includes(key) || !identity?.host || !identity?.accessKey || !repository) return null;
+  const normalizedRepository = repository.toLowerCase();
+  return {
+    host: identity.host,
+    // The admitted owner/name is the conservative identity until GitHub returns
+    // a database ID. Explicit --repo, GH_REPO and an unambiguous remote converge
+    // here; unresolved aliases intentionally remain separate.
+    repositoryId: `slug:${normalizedRepository}`,
+    repository: normalizedRepository,
+    accessKey: identity.accessKey,
+    targetKey: privateIdentityDigest("acquisition-target-v1", identity.host, normalizedRepository),
+    resource: key,
+    queryVersion: key === "actions" ? ACTIONS_QUERY_VERSION : GRAPHQL_QUERY_VERSION,
+    filters: {},
+    pageSize: key === "actions" ? ACTIONS_RUN_LIMIT : key === "security" ? ALERT_PER_PAGE : GRAPHQL_PAGE_SIZE,
+    cursorGeneration: "first",
+    pages,
+  };
+}
+
+function acquisitionAliasKey(host, repository) {
+  return `${normalizeHost(host)}\0${String(repository).toLowerCase()}`;
+}
+
+function normalizeRepositoryIdentity(raw) {
+  if (!isRecord(raw) || typeof raw.id !== "string" || raw.id.length === 0 ||
+      typeof raw.nameWithOwner !== "string" || !REPO_PATTERN.test(raw.nameWithOwner)) return null;
+  return { id: raw.id, nameWithOwner: raw.nameWithOwner.toLowerCase() };
+}
+
+function admitAcquisitionRepositoryIdentity(state, evidence) {
+  const identity = normalizeRepositoryIdentity(evidence?.identity);
+  const host = normalizeHost(evidence?.host);
+  const repository = typeof evidence?.repository === "string" ? evidence.repository.toLowerCase() : null;
+  const source = state.queries[evidence?.queryKey];
+  if (!identity || !host || !repository || !source || source.query.host !== host) {
+    return { ok: false, reason: "invalid" };
+  }
+  const targetKey = privateIdentityDigest("acquisition-target-v1", host, identity.id);
+  const canonicalQuery = {
+    ...source.query,
+    repositoryId: identity.id,
+    repository: identity.nameWithOwner,
+    targetKey,
+  };
+  canonicalQuery.queryKey = acquisitionQueryKey(canonicalQuery);
+  const related = Object.entries(state.queries).filter(([key, record]) => {
+    if (key === canonicalQuery.queryKey || key === evidence.queryKey) return true;
+    const knownId = state.aliases[acquisitionAliasKey(host, record.query.repository)];
+    if (record.query.host !== host ||
+        record.query.repositoryId !== identity.id && record.query.repository !== identity.nameWithOwner &&
+          knownId !== identity.id) return false;
+    return acquisitionQueryKey({
+      ...record.query,
+      repositoryId: identity.id,
+      repository: identity.nameWithOwner,
+      targetKey,
+    }) === canonicalQuery.queryKey;
+  });
+  const generation = Math.max(...related.map(([, record]) => record.generation));
+  const claimed = related.map(([, record]) => record.claim)
+    .find((claim) => claim?.nonce === evidence.claimNonce);
+  if (!claimed) return { ok: false, reason: "stale" };
+  const snapshotRecord = related.map(([, record]) => record)
+    .filter((record) => record.snapshot)
+    .sort((left, right) => right.snapshot.lastSuccessAt - left.snapshot.lastSuccessAt ||
+      right.generation - left.generation)[0] ?? null;
+  const snapshot = snapshotRecord?.snapshot
+    ? { ...snapshotRecord.snapshot, queryKey: canonicalQuery.queryKey, generation }
+    : null;
+  const merged = {
+    query: canonicalQuery,
+    generation,
+    claim: { ...claimed, generation: generation + 1 },
+    snapshot,
+    lastUsedAt: Math.max(...related.map(([, record]) => record.lastUsedAt)),
+  };
+  const remapped = {};
+  const relatedByKey = new Map(related);
+  for (const [oldKey, record] of related) {
+    state.aliases[acquisitionAliasKey(host, record.query.repository)] = identity.id;
+    if (oldKey !== canonicalQuery.queryKey) remapped[oldKey] = canonicalQuery.queryKey;
+    delete state.queries[oldKey];
+  }
+  for (const subscription of Object.values(state.subscriptions)) {
+    const oldRecord = relatedByKey.get(subscription.queryKey);
+    if (!oldRecord) continue;
+    const unsatisfied = subscription.requestedGeneration > oldRecord.generation;
+    subscription.queryKey = canonicalQuery.queryKey;
+    subscription.requestedGeneration = unsatisfied ? merged.claim.generation : generation;
+  }
+  state.aliases[acquisitionAliasKey(host, repository)] = identity.id;
+  state.aliases[acquisitionAliasKey(host, identity.nameWithOwner)] = identity.id;
+  state.queries[canonicalQuery.queryKey] = merged;
+  return { ok: true, remapped, generation: merged.claim.generation };
+}
+
+function normalizeAcquisitionDemand(raw) {
+  if (!isRecord(raw)) return null;
+  const active = raw.active === true;
+  const floorMs = Number.isFinite(raw.floorMs) && raw.floorMs >= MIN_REFRESH_SECONDS * 1000
+    ? raw.floorMs : null;
+  const pages = raw.pages === undefined ? 1 : raw.pages;
+  if (floorMs === null || !Number.isSafeInteger(pages) || pages < 1 || pages > 3) return null;
+  return { active, floorMs, pages };
+}
+
+function normalizeAcquisitionQuery(raw) {
+  if (!isRecord(raw)) return null;
+  const queryKey = acquisitionQueryKey(raw);
+  if (!queryKey || raw.queryKey !== queryKey || typeof raw.repository !== "string" ||
+      typeof raw.targetKey !== "string" || raw.targetKey.length === 0) return null;
+  return {
+    queryKey,
+    host: normalizeHost(raw.host),
+    repositoryId: raw.repositoryId,
+    repository: safe(raw.repository),
+    accessKey: raw.accessKey,
+    targetKey: raw.targetKey,
+    resource: raw.resource,
+    queryVersion: raw.queryVersion,
+    filters: canonicalJson(raw.filters ?? {}),
+    pageSize: raw.pageSize,
+    cursorGeneration: raw.cursorGeneration,
+  };
+}
+
+function sanitizeAcquisitionJson(value, depth = 0) {
+  if (depth > 8) return null;
+  if (value === null || typeof value === "boolean" || Number.isFinite(value)) return value;
+  if (typeof value === "string") return safe(value);
+  if (Array.isArray(value)) {
+    if (value.length > ACQUISITION_MAX_ENTITIES) return null;
+    const items = value.map((item) => sanitizeAcquisitionJson(item, depth + 1));
+    return items.some((item, index) => item === null && value[index] !== null) ? null : items;
+  }
+  if (!isRecord(value) || Object.keys(value).length > 64) return null;
+  const result = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key.length > 100 || ["__proto__", "constructor", "prototype"].includes(key)) return null;
+    const sanitized = sanitizeAcquisitionJson(item, depth + 1);
+    if (sanitized === null && item !== null) return null;
+    result[key] = sanitized;
+  }
+  return result;
+}
+
+function normalizeAcquisitionEntity(raw, resource) {
+  if (!isRecord(raw) || typeof raw.key !== "string" || raw.key.length === 0 ||
+      typeof raw.etag !== "string" || raw.etag.length === 0 || typeof raw.body !== "string") return null;
+  if (!raw.key.startsWith(`${resource}\0`) || raw.key.length > 2_048 || raw.etag.length > 1_024 ||
+      Buffer.byteLength(raw.body) > ACQUISITION_MAX_ENTITY_BYTES) return null;
+  let parsed;
+  try { parsed = JSON.parse(raw.body); } catch { return null; }
+  const sanitized = sanitizeAcquisitionJson(parsed);
+  if (sanitized === null) return null;
+  const body = JSON.stringify(sanitized);
+  if (Buffer.byteLength(body) > ACQUISITION_MAX_ENTITY_BYTES) return null;
+  return { key: raw.key, etag: safe(raw.etag), body };
+}
+
+function normalizeAcquisitionPageInfo(raw) {
+  if (raw === null) return null;
+  if (!isRecord(raw) || Object.keys(raw).some((key) => !["loadedPages", "hasNextPage"].includes(key)) ||
+      !Number.isSafeInteger(raw.loadedPages) || raw.loadedPages < 1 || raw.loadedPages > 3 ||
+      typeof raw.hasNextPage !== "boolean") return null;
+  return { loadedPages: raw.loadedPages, hasNextPage: raw.hasNextPage };
+}
+
+function normalizeAcquisitionCapabilities(raw) {
+  if (!isRecord(raw) || Object.keys(raw).length > ALERT_SOURCES.length) return null;
+  const result = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!ALERT_SOURCES.some((source) => source.key === key) || !isRecord(value) ||
+        value.verdict !== "unavailable" || !Number.isFinite(value.until) ||
+        !Number.isSafeInteger(value.step) || value.step < 0 || value.step >= BACKOFF_STEPS_MS.length ||
+        typeof value.note !== "string") return null;
+    result[key] = { verdict: value.verdict, until: value.until, step: value.step, note: safe(value.note) };
+  }
+  return result;
+}
+
+function normalizeAcquisitionSnapshot(raw, query, generation, producerEpoch) {
+  if (!isRecord(raw) || !Array.isArray(raw.rows) || !Array.isArray(raw.entities) ||
+      !Number.isFinite(raw.lastSuccessAt) || !Number.isFinite(raw.lastChangedAt) ||
+      !Number.isFinite(raw.nextDueAt) || raw.lastChangedAt > raw.lastSuccessAt ||
+      raw.raw !== undefined && typeof raw.raw !== "string" || !isRecord(raw.capabilities ?? {}) ||
+      !isRecord(raw.meta) || !Number.isFinite(raw.meta.at) || typeof raw.meta.truncated !== "boolean" ||
+      !Array.isArray(raw.securityNotes) || typeof raw.securityBlind !== "boolean") return null;
+  const rows = raw.rows.map((row) => normalizeCachedItem(query.resource, row));
+  const entities = raw.entities.map((entity) => normalizeAcquisitionEntity(entity, query.resource));
+  if (rows.some((row) => row === null) || entities.some((entity) => entity === null)) return null;
+  const pageInfo = normalizeAcquisitionPageInfo(raw.pageInfo);
+  if (raw.pageInfo !== null && pageInfo === null) return null;
+  if (raw.hold !== null) return null;
+  const capabilities = normalizeAcquisitionCapabilities(raw.capabilities ?? {});
+  if (capabilities === null || query.resource !== "security" && Object.keys(capabilities).length > 0) return null;
+  const content = JSON.stringify(rows);
+  const contentDigest = createHash("sha256").update(content).digest("hex");
+  if (raw.raw === undefined && raw.contentDigest !== contentDigest) return null;
+  return {
+    schema: 1,
+    producerEpoch,
+    queryKey: query.queryKey,
+    generation,
+    rows,
+    pageInfo,
+    raw: content,
+    contentDigest,
+    entities,
+    lastSuccessAt: raw.lastSuccessAt,
+    lastChangedAt: raw.lastChangedAt,
+    nextDueAt: raw.nextDueAt,
+    hold: null,
+    capabilities,
+    meta: { at: raw.meta.at, truncated: raw.meta.truncated },
+    securityNotes: raw.securityNotes.filter((note) => typeof note === "string").map(safe),
+    securityBlind: raw.securityBlind,
+  };
+}
+
+function acquisitionSnapshotRoot(path) {
+  return `${path}.snapshots`;
+}
+
+function normalizeAcquisitionSnapshotRef(raw, queryKey, generation) {
+  if (!isRecord(raw) || raw.generation !== generation ||
+      typeof raw.artifact !== "string" ||
+      raw.artifact !== `${queryKey}.${generation}.${raw.digest}.json` ||
+      typeof raw.digest !== "string" || !/^[a-f0-9]{64}$/.test(raw.digest) ||
+      !Number.isSafeInteger(raw.bytes) || raw.bytes < 1 || raw.bytes > ACQUISITION_MAX_BYTES ||
+      !Number.isSafeInteger(raw.entityCount) || raw.entityCount < 0 ||
+      raw.entityCount > ACQUISITION_MAX_ENTITIES ||
+      typeof raw.contentDigest !== "string" || !/^[a-f0-9]{64}$/.test(raw.contentDigest) ||
+      !Number.isFinite(raw.lastSuccessAt) || !Number.isFinite(raw.lastChangedAt) ||
+      !Number.isFinite(raw.nextDueAt)) return null;
+  return { ...raw };
+}
+
+function acquisitionSnapshotPayload(snapshot) {
+  const payload = { ...snapshot };
+  delete payload.raw;
+  return payload;
+}
+
+function prepareAcquisitionSnapshot(queryKey, snapshot) {
+  const payload = JSON.stringify(acquisitionSnapshotPayload(snapshot));
+  const bytes = Buffer.byteLength(payload);
+  const digest = createHash("sha256").update(payload).digest("hex");
+  return {
+    payload,
+    descriptor: {
+      artifact: `${queryKey}.${snapshot.generation}.${digest}.json`,
+      generation: snapshot.generation,
+      digest,
+      bytes,
+      entityCount: snapshot.entities.length,
+      contentDigest: snapshot.contentDigest,
+      lastSuccessAt: snapshot.lastSuccessAt,
+      lastChangedAt: snapshot.lastChangedAt,
+      nextDueAt: snapshot.nextDueAt,
+    },
+  };
+}
+
+function normalizeAcquisitionStore(raw) {
+  if (!isRecord(raw) || raw.version !== ACQUISITION_STORE_VERSION || !validGovernorId(raw.producerEpoch) ||
+      !isRecord(raw.subscriptions) || !isRecord(raw.queries) || !isRecord(raw.aliases)) return null;
+  const state = {
+    version: ACQUISITION_STORE_VERSION,
+    producerEpoch: raw.producerEpoch,
+    subscriptions: {},
+    queries: {},
+    aliases: {},
+  };
+  for (const [key, value] of Object.entries(raw.aliases)) {
+    if (typeof key !== "string" || typeof value !== "string") return null;
+    state.aliases[key] = value;
+  }
+  for (const [key, value] of Object.entries(raw.queries)) {
+    if (!isRecord(value)) return null;
+    const query = normalizeAcquisitionQuery(value.query);
+    if (!query || key !== query.queryKey || !Number.isSafeInteger(value.generation) || value.generation < 0 ||
+        !Number.isFinite(value.lastUsedAt)) return null;
+    let claim = null;
+    if (value.claim !== null) {
+      const candidate = value.claim;
+      if (!isRecord(candidate) || !Number.isSafeInteger(candidate.pid) || candidate.pid <= 0 ||
+          !validGovernorId(candidate.nonce) || !Number.isSafeInteger(candidate.generation) ||
+          candidate.generation !== value.generation + 1 || !Number.isFinite(candidate.claimedAt) ||
+          !Number.isFinite(candidate.leaseUntil) || candidate.leaseUntil < candidate.claimedAt ||
+          typeof candidate.started !== "boolean") return null;
+      claim = { ...candidate };
+    }
+    const snapshot = value.snapshot === null ? null
+      : value.snapshot?.artifact
+        ? normalizeAcquisitionSnapshotRef(value.snapshot, query.queryKey, value.generation)
+        : normalizeAcquisitionSnapshot(value.snapshot, query, value.generation, raw.producerEpoch);
+    if (value.snapshot !== null && !snapshot) return null;
+    state.queries[key] = { query, generation: value.generation, claim, snapshot, lastUsedAt: value.lastUsedAt };
+  }
+  for (const [id, value] of Object.entries(raw.subscriptions)) {
+    const demand = normalizeAcquisitionDemand(value?.demand);
+    const record = state.queries[value?.queryKey];
+    const requestedGeneration = value?.requestedGeneration === undefined
+      ? record?.generation
+      : value.requestedGeneration;
+    if (!validGovernorId(id) || !isRecord(value) || !Number.isSafeInteger(value.pid) || value.pid <= 0 ||
+        !validGovernorId(value.nonce) || !record || !demand ||
+        !Number.isSafeInteger(requestedGeneration) || requestedGeneration < 0 ||
+        requestedGeneration > record.generation + 1 ||
+        !Number.isFinite(value.expiresAt) || !Number.isFinite(value.lastSeenAt)) return null;
+    state.subscriptions[id] = { ...value, demand, requestedGeneration };
+  }
+  if (Object.keys(state.subscriptions).length > ACQUISITION_MAX_SUBSCRIPTIONS ||
+      Object.keys(state.queries).length > ACQUISITION_MAX_ENTITIES) return null;
+  return state;
+}
+
+function loadAcquisitionMetadata(path) {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    const value = normalizeAcquisitionStore(parsed);
+    return value ? { ok: true, value } : { ok: false, reason: "corrupt" };
+  } catch (error) {
+    return error?.code === "ENOENT"
+      ? { ok: true, value: emptyAcquisitionStore(), missing: true }
+      : { ok: false, reason: "corrupt", error };
+  }
+}
+
+function readAcquisitionSnapshot(path, record) {
+  if (!record?.snapshot) return { ok: true, value: null };
+  if (Array.isArray(record.snapshot.rows)) return { ok: true, value: record.snapshot };
+  try {
+    const raw = readFileSync(join(acquisitionSnapshotRoot(path), record.snapshot.artifact), "utf8");
+    if (Buffer.byteLength(raw) !== record.snapshot.bytes ||
+        createHash("sha256").update(raw).digest("hex") !== record.snapshot.digest) {
+      return { ok: false, reason: "corrupt" };
+    }
+    const parsed = JSON.parse(raw);
+    const snapshot = normalizeAcquisitionSnapshot(
+      parsed, record.query, record.generation, parsed.producerEpoch,
+    );
+    return snapshot ? { ok: true, value: snapshot } : { ok: false, reason: "corrupt" };
+  } catch (error) {
+    return { ok: false, reason: "corrupt", error };
+  }
+}
+
+function hydrateAcquisitionStore(path, state) {
+  for (const record of Object.values(state.queries)) {
+    const loaded = readAcquisitionSnapshot(path, record);
+    if (!loaded.ok) return loaded;
+    record.snapshot = loaded.value;
+  }
+  return { ok: true, value: state };
+}
+
+function loadAcquisitionStore(path) {
+  const loaded = loadAcquisitionMetadata(path);
+  return loaded.ok ? hydrateAcquisitionStore(path, loaded.value) : loaded;
+}
+
+function writeAcquisitionArtifact(root, artifact, payload) {
+  let tempPath = null;
+  try {
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    if (process.platform !== "win32") chmodSync(root, 0o700);
+    acquisitionTempSequence += 1;
+    const path = join(root, artifact);
+    tempPath = `${path}.${process.pid}.${Date.now()}.${acquisitionTempSequence}.tmp`;
+    writeFileSync(tempPath, payload, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    renameSync(tempPath, path);
+    return { ok: true };
+  } catch (error) {
+    if (tempPath !== null) {
+      try { unlinkSync(tempPath); } catch { /* exact operation-owned path */ }
+    }
+    return { ok: false, reason: "unwritable", error };
+  }
+}
+
+function writeAcquisitionStore(path, state) {
+  const persisted = { ...state, queries: {} };
+  const staged = [];
+  let snapshotBytes = 0;
+  for (const [queryKey, record] of Object.entries(state.queries)) {
+    let snapshot = record.snapshot;
+    if (snapshot && Array.isArray(snapshot.rows)) {
+      const prepared = prepareAcquisitionSnapshot(queryKey, snapshot);
+      if (prepared.descriptor.bytes > ACQUISITION_MAX_BYTES) return { ok: false, reason: "capacity" };
+      staged.push(prepared);
+      snapshot = prepared.descriptor;
+    }
+    snapshotBytes += snapshot?.bytes ?? 0;
+    persisted.queries[queryKey] = { ...record, snapshot };
+  }
+  const payload = `${JSON.stringify(persisted)}\n`;
+  if (Buffer.byteLength(payload) + snapshotBytes > ACQUISITION_MAX_BYTES) {
+    return { ok: false, reason: "capacity" };
+  }
+  const parent = dirname(path);
+  let tempPath = null;
+  try {
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    if (process.platform !== "win32") chmodSync(parent, 0o700);
+    const snapshotRoot = acquisitionSnapshotRoot(path);
+    for (const prepared of staged) {
+      const written = writeAcquisitionArtifact(snapshotRoot, prepared.descriptor.artifact, prepared.payload);
+      if (!written.ok) return written;
+    }
+    acquisitionTempSequence += 1;
+    tempPath = `${path}.${process.pid}.${Date.now()}.${acquisitionTempSequence}.tmp`;
+    writeFileSync(tempPath, payload, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    renameSync(tempPath, path);
+    const retained = new Set(Object.values(persisted.queries)
+      .map((record) => record.snapshot?.artifact).filter(Boolean));
+    try {
+      for (const artifact of readdirSync(snapshotRoot)) {
+        if (!retained.has(artifact)) {
+          try { unlinkSync(join(snapshotRoot, artifact)); } catch { /* exact private artifact */ }
+        }
+      }
+    } catch { /* no snapshot directory yet */ }
+    return { ok: true, persisted };
+  } catch (error) {
+    if (tempPath !== null) {
+      try { unlinkSync(tempPath); } catch { /* exact operation-owned path */ }
+    }
+    return { ok: false, reason: "unwritable", error };
+  }
+}
+
+function acquisitionLockOwner(path) {
+  const owner = lockOwner(path);
+  return owner && validGovernorId(owner.nonce) ? owner : null;
+}
+
+function withAcquisitionStore(path, operation, {
+  now = Date.now(),
+  pid = process.pid,
+  kill = process.kill.bind(process),
+} = {}) {
+  const lockPath = `${path}.lock`;
+  const nonce = governorId();
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      writeFileSync(lockPath, JSON.stringify({ pid, nonce }), { encoding: "utf8", mode: 0o600, flag: "wx" });
+      break;
+    } catch (error) {
+      if (error?.code !== "EEXIST") return { ok: false, reason: "unwritable", error };
+      const owner = acquisitionLockOwner(lockPath);
+      // Another process can observe the lock file between its exclusive create
+      // and completed JSON write. Treat an unreadable owner as contention; it
+      // cannot authorize stealing and must not turn a healthy race into a
+      // corrupt-store verdict.
+      if (!owner || !pidIsDead(owner.pid, kill)) return { ok: false, reason: "busy" };
+      const abandoned = `${lockPath}.dead-${owner.nonce}`;
+      try { renameSync(lockPath, abandoned); } catch { continue; }
+      try { unlinkSync(abandoned); } catch { /* exact quarantined path */ }
+    }
+  }
+  if (acquisitionLockOwner(lockPath)?.nonce !== nonce) return { ok: false, reason: "busy" };
+  try {
+    const loaded = loadAcquisitionMetadata(path, { now });
+    if (!loaded.ok) return loaded;
+    const result = operation(loaded.value);
+    if (result?.ok === false) return result;
+    if (result?.changed === false) {
+      return { ok: true, value: result?.value, state: loaded.value, written: false };
+    }
+    const written = writeAcquisitionStore(path, loaded.value);
+    return written.ok ? { ok: true, value: result?.value, state: written.persisted, written: true } : written;
+  } finally {
+    if (acquisitionLockOwner(lockPath)?.nonce === nonce) {
+      try { unlinkSync(lockPath); } catch { /* exact owned lock */ }
+    }
+  }
+}
+
+function acquisitionOwnerStatus(pid, kill) {
+  try {
+    kill(pid, 0);
+    return "live";
+  } catch (error) {
+    if (error?.code === "ESRCH") return "dead";
+    return "unknown";
+  }
+}
+
+function reapAcquisitionSubscriptions(state, at, kill) {
+  let removed = 0;
+  for (const [id, subscription] of Object.entries(state.subscriptions)) {
+    if (subscription.expiresAt > at || acquisitionOwnerStatus(subscription.pid, kill) !== "dead") continue;
+    delete state.subscriptions[id];
+    removed += 1;
+  }
+  return removed;
+}
+
+function aggregateAcquisitionDemand(state, queryKey) {
+  const demand = Object.values(state.subscriptions)
+    .filter((subscription) => subscription.queryKey === queryKey)
+    .map((subscription) => subscription.demand);
+  if (demand.length === 0) return null;
+  return {
+    active: demand.some((value) => value.active),
+    floorMs: Math.min(...demand.map((value) => value.floorMs)),
+    pages: Math.max(...demand.map((value) => value.pages)),
+  };
+}
+
+function acquisitionSharingCount(state, queryKey) {
+  return Object.values(state.subscriptions)
+    .filter((subscription) => subscription.queryKey === queryKey).length;
+}
+
+function trimAcquisitionStore(state, protectedQueryKey = null) {
+  const pinned = new Set(Object.values(state.subscriptions).map((subscription) =>
+    state.queries[subscription.queryKey]?.query.targetKey).filter(Boolean));
+  const targets = new Map();
+  const entries = Object.entries(state.queries).map(([key, query]) => {
+    const prepared = query.snapshot && Array.isArray(query.snapshot.rows)
+      ? prepareAcquisitionSnapshot(key, query.snapshot) : null;
+    const snapshotBytes = prepared?.descriptor.bytes ?? query.snapshot?.bytes ?? 0;
+    const entityCount = prepared?.descriptor.entityCount ?? query.snapshot?.entityCount ?? 0;
+    const metadataRecord = { ...query, snapshot: prepared?.descriptor ?? query.snapshot };
+    const metadataBytes = Buffer.byteLength(JSON.stringify([key, metadataRecord]));
+    targets.set(query.query.targetKey, (targets.get(query.query.targetKey) ?? 0) + 1);
+    return { key, query, snapshotBytes, entityCount, metadataBytes };
+  });
+  let queryCount = entries.length;
+  let entityCount = entries.reduce((total, entry) => total + entry.entityCount, 0);
+  let byteCount = Buffer.byteLength(JSON.stringify({
+    version: state.version,
+    producerEpoch: state.producerEpoch,
+    subscriptions: state.subscriptions,
+    queries: {},
+    aliases: state.aliases,
+  })) + entries.reduce((total, entry) => total + entry.metadataBytes + entry.snapshotBytes, 0);
+  const over = () => queryCount > ACQUISITION_MAX_ENTITIES ||
+    targets.size > ACQUISITION_MAX_LIVE_TARGETS ||
+    entityCount > ACQUISITION_MAX_ENTITIES || byteCount > ACQUISITION_MAX_BYTES;
+  const evictable = entries.filter(({ key, query }) =>
+    !pinned.has(query.query.targetKey) && key !== protectedQueryKey)
+    .sort((left, right) => left.query.lastUsedAt - right.query.lastUsedAt);
+  for (const entry of evictable) {
+    if (!over()) break;
+    const { key, query, snapshotBytes, entityCount: removedEntities, metadataBytes } = entry;
+    delete state.queries[key];
+    queryCount -= 1;
+    entityCount -= removedEntities;
+    byteCount -= metadataBytes + snapshotBytes;
+    const remainingForTarget = targets.get(query.query.targetKey) - 1;
+    if (remainingForTarget === 0) targets.delete(query.query.targetKey);
+    else targets.set(query.query.targetKey, remainingForTarget);
+  }
+  return !over();
+}
+
+async function runStartedAcquisitionTransport(markStarted, transport) {
+  const started = await markStarted();
+  if (!started.ok) return started;
+  return { ok: true, value: await transport() };
+}
+
+function createAcquisitionEngine({
+  pathOptions = {},
+  transport = null,
+  storage = null,
+  now = Date.now,
+  pid = process.pid,
+  kill = process.kill.bind(process),
+  setInterval: setInterval_ = setInterval,
+  clearInterval: clearInterval_ = clearInterval,
+} = {}) {
+  const path = acquisitionStorePath(pathOptions);
+  const local = new Map();
+  let closed = false;
+  let closing = false;
+  let timer = null;
+
+  const transact = (operation, options = {}) => {
+    if (closed) return { ok: false, reason: "closed" };
+    return storage?.transact
+      ? storage.transact(operation, { now: now(), pid, kill, path, ...options })
+      : withAcquisitionStore(path, operation, { now: now(), pid, kill, ...options });
+  };
+  const load = () => storage?.load
+    ? storage.load({ now: now(), path })
+    : loadAcquisitionMetadata(path);
+
+  function loadRecordSnapshot(record) {
+    return storage ? { ok: true, value: record?.snapshot ?? null } : readAcquisitionSnapshot(path, record);
+  }
+
+  function releaseDetachedLocal(id, item) {
+    if (item.detached && item.claimNonce === null && !item.cleanupPending) local.delete(id);
+  }
+
+  function remapLocalQueries(remapped = {}) {
+    for (const item of local.values()) item.queryKey = remapped[item.queryKey] ?? item.queryKey;
+  }
+
+  function deliver(id, record) {
+    const item = local.get(id);
+    if (!item || item.detached || !record?.snapshot || item.generation === record.generation) {
+      return { ok: true, value: false };
+    }
+    const loaded = loadRecordSnapshot(record);
+    if (!loaded.ok) return loaded;
+    item.generation = record.generation;
+    try { item.callback?.(loaded.value); } catch { /* subscriber callback is isolated */ }
+    return { ok: true, value: true, snapshot: loaded.value };
+  }
+
+  function inspect(id = null) {
+    const loaded = load();
+    if (!loaded.ok) return loaded;
+    const ids = id === null ? [...local.keys()] : [id];
+    for (const subscriberId of ids) {
+      const item = local.get(subscriberId);
+      const shared = loaded.value.subscriptions[subscriberId];
+      if (item && shared?.nonce === item.nonce) item.queryKey = shared.queryKey;
+      if (item) {
+        const delivered = deliver(subscriberId, loaded.value.queries[item.queryKey]);
+        if (!delivered.ok) return delivered;
+      }
+    }
+    if (id === null) return loaded;
+    const item = local.get(id);
+    if (!item) return { ok: false, reason: "stale" };
+    const record = loaded.value.queries[item.queryKey] ?? null;
+    if (!record?.snapshot) return { ok: true, value: record };
+    const snapshot = loadRecordSnapshot(record);
+    return snapshot.ok ? { ok: true, value: { ...record, snapshot: snapshot.value } } : snapshot;
+  }
+
+  function heartbeat() {
+    if (closed || local.size === 0) return;
+    const at = now();
+    const heartbeatResult = transact((state) => {
+      let changed = reapAcquisitionSubscriptions(state, at, kill) > 0;
+      for (const [id, item] of local) {
+        const subscription = state.subscriptions[id];
+        if (subscription?.nonce === item.nonce) {
+          if (subscription.lastSeenAt !== at || subscription.expiresAt !== at + ACQUISITION_CLAIM_TTL_MS) {
+            subscription.lastSeenAt = at;
+            subscription.expiresAt = at + ACQUISITION_CLAIM_TTL_MS;
+            changed = true;
+          }
+        }
+        const query = state.queries[item.queryKey];
+        if (query?.claim?.pid === pid && query.claim.nonce === item.claimNonce &&
+            query.claim.leaseUntil !== at + ACQUISITION_CLAIM_TTL_MS) {
+          query.claim.leaseUntil = at + ACQUISITION_CLAIM_TTL_MS;
+          changed = true;
+        }
+      }
+      return { changed, value: true };
+    });
+    if (heartbeatResult.ok) {
+      for (const [id, item] of local) deliver(id, heartbeatResult.state.queries[item.queryKey]);
+    }
+    for (const [id, item] of local) {
+      retryPending(id, item);
+    }
+    for (const [id, item] of [...local]) {
+      if (item.cleanupPending) unsubscribe(id);
+    }
+    finishClose();
+  }
+
+  function ensureTimer() {
+    if (timer !== null) return;
+    let heartbeatAt = now() + ACQUISITION_HEARTBEAT_MS;
+    timer = setInterval_(() => {
+      if (now() >= heartbeatAt) {
+        heartbeatAt = now() + ACQUISITION_HEARTBEAT_MS;
+        heartbeat();
+      } else {
+        inspect();
+      }
+    }, ACQUISITION_INSPECT_MS);
+    timer?.unref?.();
+  }
+
+  function subscribe(queryInput, demandInput, callback = null) {
+    if (closing) return { ok: false, reason: "closed" };
+    const demand = normalizeAcquisitionDemand(demandInput);
+    const preliminaryKey = acquisitionQueryKey(queryInput);
+    if (!preliminaryKey || !demand || callback !== null && typeof callback !== "function") {
+      return { ok: false, reason: "invalid" };
+    }
+    const id = governorId();
+    const nonce = governorId();
+    const result = transact((state) => {
+      reapAcquisitionSubscriptions(state, now(), kill);
+      const repositoryId = state.aliases[acquisitionAliasKey(queryInput.host, queryInput.repository)] ??
+        queryInput.repositoryId;
+      const queryKey = acquisitionQueryKey({ ...queryInput, repositoryId });
+      const query = queryKey ? normalizeAcquisitionQuery({ ...queryInput, repositoryId, queryKey }) : null;
+      if (!query) return { ok: false, reason: "invalid" };
+      if (Object.keys(state.subscriptions).length >= ACQUISITION_MAX_SUBSCRIPTIONS) {
+        return { ok: false, reason: "capacity" };
+      }
+      const liveTargets = new Set(Object.values(state.subscriptions).map((subscription) =>
+        state.queries[subscription.queryKey]?.query.targetKey).filter(Boolean));
+      if (!liveTargets.has(query.targetKey) && liveTargets.size >= ACQUISITION_MAX_LIVE_TARGETS) {
+        return { ok: false, reason: "capacity" };
+      }
+      const existingQuery = state.queries[queryKey];
+      state.queries[queryKey] ??= { query, generation: 0, claim: null, snapshot: null, lastUsedAt: now() };
+      if (!trimAcquisitionStore(state, queryKey)) {
+        if (!existingQuery) delete state.queries[queryKey];
+        return { ok: false, reason: "capacity" };
+      }
+      const requestedGeneration = state.queries[queryKey].claim?.generation ??
+        state.queries[queryKey].generation + 1;
+      state.subscriptions[id] = {
+        pid,
+        nonce,
+        queryKey,
+        demand,
+        requestedGeneration,
+        lastSeenAt: now(),
+        expiresAt: now() + ACQUISITION_CLAIM_TTL_MS,
+      };
+      state.queries[queryKey].lastUsedAt = now();
+      return { value: { id, queryKey, snapshot: state.queries[queryKey].snapshot } };
+    });
+    if (!result.ok) return result;
+    const record = result.state.queries[result.value.queryKey];
+    const loadedSnapshot = loadRecordSnapshot(record);
+    if (!loadedSnapshot.ok) return loadedSnapshot;
+    result.value.snapshot = loadedSnapshot.value;
+    local.set(id, { nonce, queryKey: result.value.queryKey, callback, generation: record?.generation ?? 0,
+      claimNonce: null, pending: null });
+    ensureTimer();
+    return result;
+  }
+
+  function updateDemand(id, demandInput) {
+    const demand = normalizeAcquisitionDemand(demandInput);
+    const item = local.get(id);
+    if (!item || item.detached || closing || !demand) return { ok: false, reason: "invalid" };
+    const result = transact((state) => {
+      const reaped = reapAcquisitionSubscriptions(state, now(), kill);
+      const subscription = state.subscriptions[id];
+      if (!subscription || subscription.nonce !== item.nonce) return { ok: false, reason: "stale" };
+      const unchanged = subscription.demand.active === demand.active &&
+        subscription.demand.floorMs === demand.floorMs && subscription.demand.pages === demand.pages;
+      if (!unchanged) subscription.demand = demand;
+      return { changed: reaped > 0 || !unchanged, value: { queryKey: subscription.queryKey,
+        demand: aggregateAcquisitionDemand(state, subscription.queryKey) } };
+    });
+    if (result.ok) item.queryKey = result.value.queryKey;
+    return result;
+  }
+
+  function publish(id, claim, produced) {
+    const item = local.get(id);
+    if (!item || !isRecord(claim)) return { ok: false, reason: "invalid" };
+    const committed = transact((state) => {
+      let record = state.queries[item.queryKey];
+      if (!record || record.claim?.nonce !== claim.nonce ||
+          record.claim.generation !== claim.generation || record.query.accessKey !== claim.accessKey) {
+        return { value: { ok: false, reason: "stale", definitive: true } };
+      }
+      let remapped = {};
+      let effectiveClaim = claim;
+      if (produced?.repositoryIdentity !== undefined) {
+        const admitted = admitAcquisitionRepositoryIdentity(state, {
+          host: record.query.host,
+          repository: record.query.repository,
+          identity: produced.repositoryIdentity,
+          queryKey: item.queryKey,
+          claimNonce: claim.nonce,
+        });
+        if (!admitted.ok) {
+          return admitted.reason === "stale"
+            ? { value: { ok: false, reason: "stale", definitive: true } }
+            : admitted;
+        }
+        remapped = admitted.remapped;
+        record = state.queries[remapped[item.queryKey] ?? item.queryKey];
+        effectiveClaim = { ...claim, generation: admitted.generation };
+      }
+      const loadedPrevious = loadRecordSnapshot(record);
+      if (!loadedPrevious.ok) return loadedPrevious;
+      if (loadedPrevious.value) record.snapshot = loadedPrevious.value;
+      let snapshot = normalizeAcquisitionSnapshot(
+        produced,
+        record.query,
+        effectiveClaim.generation,
+        state.producerEpoch,
+      );
+      if (snapshot && record.snapshot?.contentDigest === snapshot.contentDigest) {
+        snapshot = { ...snapshot, lastChangedAt: loadedPrevious.value.lastChangedAt };
+      }
+      if (!snapshot) {
+        record.claim = null;
+        return { value: { ok: false, reason: "invalid" } };
+      }
+      const previous = record.snapshot;
+      const previousClaim = record.claim;
+      record.generation = effectiveClaim.generation;
+      record.snapshot = snapshot;
+      record.claim = null;
+      record.lastUsedAt = now();
+      if (!trimAcquisitionStore(state, record.query.queryKey)) {
+        record.snapshot = previous;
+        record.generation -= 1;
+        record.claim = previousClaim;
+        return { value: { ok: false, reason: "capacity", retryClaim: effectiveClaim, remapped } };
+      }
+      return { value: { ok: true, value: { role: "producer", snapshot,
+        queryKey: record.query.queryKey, remapped } } };
+    });
+    const rawResult = committed.ok ? committed.value : committed;
+    const { definitive: _definitive, retryClaim, remapped: committedRemap, ...result } = rawResult;
+    const ownsLocalClaim = claim.nonce === item.claimNonce;
+    if (committed.ok && committedRemap) {
+      remapLocalQueries(committedRemap);
+    }
+    if (ownsLocalClaim && committed.ok && (result.ok || result.reason === "invalid" || _definitive === true)) {
+      item.claimNonce = null;
+      item.pending = null;
+    } else if (ownsLocalClaim) {
+      item.pending = { kind: "publish", claim: retryClaim ?? claim, produced };
+    }
+    if (result.ok) {
+      remapLocalQueries(result.value.remapped);
+      deliver(id, { generation: result.value.snapshot.generation, snapshot: result.value.snapshot });
+    }
+    releaseDetachedLocal(id, item);
+    return result;
+  }
+
+  function cancel(id, claim) {
+    const item = local.get(id);
+    if (!item || !isRecord(claim)) return { ok: false, reason: "invalid" };
+    const result = transact((state) => {
+      const record = state.queries[item.queryKey];
+      if (!record || record.claim?.nonce !== claim.nonce || record.claim.generation !== claim.generation) {
+        return { value: { ok: false, reason: "stale", definitive: true } };
+      }
+      record.claim = null;
+      return { value: { ok: true, value: true, definitive: true } };
+    });
+    const rawResult = result.ok ? result.value : result;
+    const { definitive: _definitive, ...value } = rawResult;
+    if (result.ok && _definitive === true) {
+      item.claimNonce = null;
+      item.pending = null;
+    } else {
+      item.pending = { kind: "cancel", claim };
+    }
+    releaseDetachedLocal(id, item);
+    return value;
+  }
+
+  function markStarted(id, claim) {
+    const item = local.get(id);
+    if (!item || !isRecord(claim)) return { ok: false, reason: "invalid" };
+    return transact((state) => {
+      const record = state.queries[item.queryKey];
+      if (!record || record.claim?.nonce !== claim.nonce || record.claim.generation !== claim.generation) {
+        return { ok: false, reason: "stale" };
+      }
+      if (record.claim.started) return { changed: false, value: true };
+      record.claim.started = true;
+      return { value: true };
+    });
+  }
+
+  function retryPending(id, item = local.get(id)) {
+    const pending = item?.pending;
+    if (!pending) return { ok: true, value: false };
+    return pending.kind === "publish"
+      ? publish(id, pending.claim, pending.produced)
+      : cancel(id, pending.claim);
+  }
+
+  async function refresh(id, { force = false, acquire = null, claim = null, publish: publication,
+    cancel: cancellation = null, started = null } = {}) {
+    const item = local.get(id);
+    if (!item || acquire !== null && typeof acquire !== "function") return { ok: false, reason: "invalid" };
+    // A retired scope cannot start new work, but its already-started producer
+    // must still be able to publish for remaining consumers or cancel its
+    // durable claim. The callback was detached synchronously by unsubscribe,
+    // so neither terminal action can repopulate the retired UI.
+    if (publication !== undefined) return publish(id, claim, publication);
+    if (cancellation !== null) return cancel(id, cancellation);
+    if (started !== null) return markStarted(id, started);
+    if (item.detached || closing) return { ok: false, reason: closing ? "closed" : "invalid" };
+    if (item.pending) {
+      const pending = item.pending;
+      const retried = retryPending(id, item);
+      if (!retried.ok || pending.kind === "publish") return retried;
+    }
+    const claimed = transact((state) => {
+      const reaped = reapAcquisitionSubscriptions(state, now(), kill);
+      const subscription = state.subscriptions[id];
+      const record = state.queries[item.queryKey];
+      if (!subscription || subscription.nonce !== item.nonce || !record) return { ok: false, reason: "stale" };
+      const requestedGeneration = force
+        ? Math.max(subscription.requestedGeneration,
+          record.claim?.generation ?? record.generation + 1)
+        : subscription.requestedGeneration;
+      const demandChanged = requestedGeneration !== subscription.requestedGeneration;
+      if (demandChanged) {
+        subscription.requestedGeneration = requestedGeneration;
+      }
+      if (requestedGeneration <= record.generation && record.snapshot?.nextDueAt > now()) {
+        return { changed: reaped > 0 || demandChanged,
+          value: { role: "follower", reason: "fresh", snapshot: record.snapshot,
+            sharingCount: acquisitionSharingCount(state, item.queryKey) } };
+      }
+      if (record.claim) {
+        const expired = record.claim.leaseUntil <= now();
+        const owner = acquisitionOwnerStatus(record.claim.pid, kill);
+        if (!expired || owner !== "dead") {
+          return { changed: reaped > 0 || demandChanged,
+            value: { role: "follower", reason: expired ? `owner-${owner}` : "claimed",
+            snapshot: record.snapshot, sharingCount: acquisitionSharingCount(state, item.queryKey) } };
+        }
+      }
+      const nonce = governorId();
+      record.claim = {
+        pid,
+        nonce,
+        generation: record.generation + 1,
+        claimedAt: now(),
+        leaseUntil: now() + ACQUISITION_CLAIM_TTL_MS,
+        started: false,
+      };
+      record.lastUsedAt = now();
+      return { value: { role: "producer", nonce, generation: record.claim.generation,
+        query: record.query, snapshot: record.snapshot, demand: aggregateAcquisitionDemand(state, item.queryKey),
+        sharingCount: acquisitionSharingCount(state, item.queryKey) } };
+    });
+    if (claimed.ok && claimed.value?.snapshot) {
+      const record = claimed.state.queries[item.queryKey];
+      const loadedSnapshot = loadRecordSnapshot(record);
+      if (!loadedSnapshot.ok) return loadedSnapshot;
+      claimed.value.snapshot = loadedSnapshot.value;
+    }
+    if (!claimed.ok || claimed.value.role !== "producer") {
+      if (claimed.value?.snapshot) deliver(id, { generation: claimed.value.snapshot.generation, snapshot: claimed.value.snapshot });
+      return claimed;
+    }
+    item.claimNonce = claimed.value.nonce;
+    const acquire_ = acquire ?? transport;
+    if (acquire_ === null) return claimed;
+    let produced;
+    try {
+      const startedTransport = await runStartedAcquisitionTransport(
+        () => markStarted(id, claimed.value),
+        () => acquire_({
+          query: claimed.value.query,
+          snapshot: claimed.value.snapshot,
+          demand: claimed.value.demand,
+          claim: { nonce: claimed.value.nonce, generation: claimed.value.generation },
+        }),
+      );
+      if (!startedTransport.ok) {
+        cancel(id, { nonce: claimed.value.nonce, generation: claimed.value.generation });
+        return startedTransport;
+      }
+      produced = startedTransport.value;
+    } catch (error) {
+      cancel(id, { nonce: claimed.value.nonce, generation: claimed.value.generation });
+      throw error;
+    }
+    return publish(id, {
+      nonce: claimed.value.nonce,
+      generation: claimed.value.generation,
+      accessKey: claimed.value.query.accessKey,
+    }, produced);
+  }
+
+  function unsubscribe(id) {
+    const item = local.get(id);
+    if (!item) return { ok: false, reason: "stale" };
+    item.callback = null;
+    item.detached = true;
+    const result = transact((state) => {
+      const subscription = state.subscriptions[id];
+      let changed = false;
+      if (subscription?.nonce === item.nonce) {
+        delete state.subscriptions[id];
+        changed = true;
+      }
+      const record = state.queries[item.queryKey];
+      const ownsClaim = record?.claim?.pid === pid && record.claim.nonce === item.claimNonce;
+      const retainedClaim = ownsClaim && aggregateAcquisitionDemand(state, item.queryKey) !== null;
+      if (ownsClaim && !retainedClaim) {
+        record.claim = null;
+        changed = true;
+      }
+      return { changed, value: { id, retainedClaim } };
+    });
+    if (result.ok) {
+      item.cleanupPending = false;
+      if (!result.value.retainedClaim) item.claimNonce = null;
+    } else {
+      item.cleanupPending = true;
+      ensureTimer();
+    }
+    releaseDetachedLocal(id, item);
+    finishClose();
+    return result;
+  }
+
+  function finishClose() {
+    if (!closing || local.size > 0 || closed) return;
+    closed = true;
+    if (timer !== null) clearInterval_(timer);
+    timer = null;
+  }
+
+  function close() {
+    if (closed || closing) return;
+    closing = true;
+    for (const id of [...local.keys()]) unsubscribe(id);
+    finishClose();
+  }
+
+  return { subscribe, updateDemand, refresh, unsubscribe, inspect, close, path };
 }
 
 // The one place the cadence table is decided. It used to be spread across a
@@ -8501,6 +9614,13 @@ function createSingleFlightWake(run, onSettled = () => {}) {
 
 function pendingFailureIsTerminal(reason) {
   return reason === "stale";
+}
+
+function cancelCoordinatedPending(item, { cancelGovernor, cancelAcquisition: cancelShared } = {}) {
+  if (!item) return false;
+  cancelGovernor?.(item.intentId);
+  cancelShared?.(item.acquisition);
+  return true;
 }
 
 function runtimeIntentGate(liveScheduling, { force = false, protocolReady = false } = {}) {
@@ -9368,6 +10488,8 @@ function App({ onCreateRemote = () => {} } = {}) {
     }),
   );
   const [loadedCache] = useState(() => loadDashboardCache(cachePath, cacheTarget));
+  const [acquisitionEngine] = useState(() => createAcquisitionEngine());
+  useEffect(() => () => acquisitionEngine.close(), [acquisitionEngine]);
   const dashboardCacheRef = useRef(loadedCache.cache);
   const dashboardCachePersistedRef = useRef(loadedCache.cache);
   const dashboardCacheTargetRef = useRef(cacheTarget);
@@ -10102,6 +11224,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       scope,
       reservationId,
       admittedAt,
+      acquisition = null,
       onSettled,
       automaticStatusVisible = false,
     } = {}) {
@@ -10139,7 +11262,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         }));
       }
       return requestIdentityStorage.run(scope, run)
-        .then((result) => {
+        .then(async (result) => {
           settleReservationWithBudgetObservations(settlementScope, leaseId, reservationId, result?.measuredSuccess === false
             ? { outcome: "rejected", observations: result?.observations ?? [] }
             : {
@@ -10150,7 +11273,10 @@ function App({ onCreateRemote = () => {} } = {}) {
                 },
                 observations: result?.observations ?? [],
               }, Date.now());
-          if (!currentAccess()) return;
+          if (!currentAccess()) {
+            cancelAcquisition(acquisition);
+            return;
+          }
           if (result?.rateLimited) {
             const blockAt = Date.now();
             const budget = inspectGovernor(scope, blockAt).value?.budgets?.core;
@@ -10162,6 +11288,10 @@ function App({ onCreateRemote = () => {} } = {}) {
           }
           if (cancelled) return;
           const { raw, parse, limit, stagedEntities } = result;
+          if (acquisition) {
+            acquisition.capabilities = result.capabilities ?? {};
+            acquisition.repositoryIdentity = result.repositoryIdentity;
+          }
           // Identical payload: skip the parse *and* the state update. Returning
           // the same state object makes React bail out of the re-render, so an
           // idle repo stops redrawing the pane entirely.
@@ -10196,7 +11326,11 @@ function App({ onCreateRemote = () => {} } = {}) {
           unchangedPolls[key] = advanceUnchangedCount(unchangedPolls[key], transition.kind);
           // Recomputed now that the outcome is known: the schedule chose this
           // tab's deadline before the observation that decides its cadence.
-          rescheduleTab(key, admittedAt, {
+          // Shared snapshots publish a deadline from completion. Anchor the
+          // local wake to that same observation so waking just before the
+          // shared deadline cannot consume a fresh follower result and add a
+          // second full cadence interval.
+          rescheduleTab(key, completedAt, {
             actionRows: key === "actions" && transition.kind === "changed" ? transition.data : undefined,
           });
           if (result?.catalog) workflowCatalogRef.current = result.catalog;
@@ -10209,6 +11343,8 @@ function App({ onCreateRemote = () => {} } = {}) {
           publishStagedEntities(entityRef.current, stagedEntities, transition.kind);
           if (transition.kind === "unchanged") {
             lastOkRef.current[key] = completedAt;
+            const publication = await finishAcquisition(key, acquisition, transition, completedAt);
+            if (!publication.ok) pauseCoordination(key, publication.reason);
             // Clear on the first success or a single failure latches the ladder.
             clearBackoff(`tab:${key}`);
             setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
@@ -10238,6 +11374,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           // so the next admitted tick parses its response instead of taking the
           // identical-output fast path.
           if (transition.kind === "unusable") {
+            cancelAcquisition(acquisition);
             rawRef.current[key] = transition.nextRaw;
             setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
             return;
@@ -10248,6 +11385,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           // freshness. Do not retain its raw value either, so the next source
           // retry is parsed instead of taking the identical-payload fast path.
           if (transition.kind === "blind") {
+            cancelAcquisition(acquisition);
             rawRef.current[key] = transition.nextRaw;
             setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
             setSecurityNotes(transition.notes);
@@ -10266,12 +11404,15 @@ function App({ onCreateRemote = () => {} } = {}) {
           if (key === "security") {
             setSecurityBlind((b) => (b === transition.blind ? b : transition.blind));
           }
+          const publication = await finishAcquisition(key, acquisition, transition, completedAt);
+          if (!publication.ok) pauseCoordination(key, publication.reason);
           cacheSuccessfulTab(key, tabData, tabMeta, completedAt, {
             notes: transition.notes,
             blind: transition.blind,
           });
         })
         .catch((err) => {
+          cancelAcquisition(acquisition);
           settleReservationWithBudgetObservations(settlementScope, leaseId, reservationId, {
             outcome: governorOutcomeForError(err),
             observations: err?.budgetObservations ?? [],
@@ -10372,6 +11513,176 @@ function App({ onCreateRemote = () => {} } = {}) {
     // to fall out of step with what is on screen.
     const unchangedPolls = Object.fromEntries(TAB_KEYS.map((key) => [key, 0]));
     let pendingBlockPublications = new Map();
+    const acquisitionSubscriptions = new Map();
+
+    function adoptAcquisitionSnapshot(key, snapshot) {
+      if (!snapshot || cancelled) return;
+      lastOkRef.current[key] = snapshot.lastSuccessAt;
+      for (const entity of snapshot.entities ?? []) {
+        entityRef.current.set(entity.key, { etag: entity.etag, body: entity.body });
+      }
+      const sameRows = JSON.stringify(dataRef.current[key]) === JSON.stringify(snapshot.rows);
+      if (!sameRows) setData((current) => ({ ...current, [key]: snapshot.rows }));
+      setMeta((current) => current[key]?.at === snapshot.meta.at &&
+        current[key]?.truncated === snapshot.meta.truncated
+        ? current : { ...current, [key]: snapshot.meta });
+      if (key === "security") {
+        const accessKey = identity()?.accessKey;
+        if (accessKey) {
+          for (const [sourceKey, capability] of Object.entries(snapshot.capabilities ?? {})) {
+            alertBackoff.set(`${accessKey}\0${sourceKey}`, {
+              ...capability,
+              until: performance.now() + Math.max(0, capability.until - Date.now()),
+            });
+          }
+        }
+        setSecurityNotes(snapshot.securityNotes);
+        setSecurityBlind(snapshot.securityBlind);
+      }
+      if (snapshot.pageInfo && Number.isFinite(snapshot.pageInfo.loadedPages)) {
+        pageStateRef.current[key] = {
+          pages: snapshot.pageInfo.loadedPages,
+          hasNextPage: snapshot.pageInfo.hasNextPage === true,
+        };
+      }
+    }
+
+    function ensureAcquisitionSubscription(key, currentIdentity) {
+      const repository = effectiveRuntimeRepository({ remoteUrls });
+      const pages = pageStateRef.current[key]?.pages ?? 1;
+      const query = acquisitionQueryForTab(key, currentIdentity, repository, pages);
+      if (!query) return null;
+      const queryKey = acquisitionQueryKey(query);
+      let subscription = acquisitionSubscriptions.get(key);
+      if (subscription && (subscription.requestedKey ?? subscription.queryKey) !== queryKey) {
+        acquisitionEngine.unsubscribe(subscription.id);
+        acquisitionSubscriptions.delete(key);
+        subscription = null;
+      }
+      const demand = {
+        active: TABS[activeIndexRef.current].key === key,
+        floorMs: runtime.refreshMs,
+        pages,
+      };
+      if (!subscription) {
+        const registered = acquisitionEngine.subscribe(query, demand, (snapshot) =>
+          adoptAcquisitionSnapshot(key, snapshot));
+        if (!registered.ok) return registered;
+        subscription = { ...registered.value, requestedKey: queryKey };
+        acquisitionSubscriptions.set(key, subscription);
+        if (subscription.snapshot) adoptAcquisitionSnapshot(key, subscription.snapshot);
+      } else {
+        const updated = acquisitionEngine.updateDemand(subscription.id, demand);
+        if (!updated.ok) return updated;
+      }
+      for (const [candidateKey, candidate] of acquisitionSubscriptions) {
+        if (candidateKey === key) continue;
+        acquisitionEngine.updateDemand(candidate.id, {
+          active: TABS[activeIndexRef.current].key === candidateKey,
+          floorMs: runtime.refreshMs,
+          pages: pageStateRef.current[candidateKey]?.pages ?? 1,
+        });
+      }
+      return { ok: true, value: subscription };
+    }
+
+    function acquisitionPublication(key, acquisition, transition, completedAt) {
+      const rows = transition.kind === "changed" ? transition.data : dataRef.current[key];
+      const meta = transition.kind === "changed" ? transition.meta : metaRef.current[key];
+      if (!Array.isArray(rows) || !meta) return null;
+      const prefix = `${key}\0`;
+      const entities = [...entityRef.current.entries()]
+        .filter(([entityKey_]) => entityKey_.startsWith(prefix))
+        .map(([entityKey_, entity]) => ({ key: entityKey_, etag: entity.etag, body: entity.body }));
+      return {
+        rows,
+        pageInfo: {
+          loadedPages: pageStateRef.current[key]?.pages ?? 1,
+          hasNextPage: pageStateRef.current[key]?.hasNextPage === true,
+        },
+        raw: JSON.stringify(rows),
+        entities,
+        lastSuccessAt: completedAt,
+        lastChangedAt: transition.kind === "changed" ? completedAt : meta.at,
+        nextDueAt: completedAt + pollPolicyInterval({
+          tab: key,
+          floorMs: acquisition.demand?.floorMs ?? runtime.refreshMs,
+          demand: acquisition.demand?.active ? "active" : "inactive",
+          unchangedCount: unchangedPolls[key],
+          inProgressCI: key === "actions" && actionsInProgress(rows),
+          background: runtime.background,
+        }),
+        hold: null,
+        capabilities: acquisition.capabilities ?? {},
+        repositoryIdentity: acquisition.repositoryIdentity,
+        meta,
+        securityNotes: key === "security"
+          ? transition.notes ?? securityNotesRef.current
+          : [],
+        securityBlind: key === "security"
+          ? transition.blind ?? securityBlindRef.current
+          : false,
+      };
+    }
+
+    function finishAcquisition(key, acquisition, transition, completedAt) {
+      if (!acquisition) return { ok: true };
+      const publication = acquisitionPublication(key, acquisition, transition, completedAt);
+      if (!publication) {
+        return acquisitionEngine.refresh(acquisition.id, { cancel: acquisition.claim });
+      }
+      return acquisitionEngine.refresh(acquisition.id, {
+        claim: acquisition.claim,
+        publish: publication,
+      });
+    }
+
+    function cancelAcquisition(acquisition) {
+      if (acquisition) void acquisitionEngine.refresh(acquisition.id, { cancel: acquisition.claim });
+    }
+
+    async function startPendingAcquisitionTransport(key, item, currentScope, reservationId, nowMs, signal,
+      automaticStatusVisible) {
+      const descriptor = tabForKey(key);
+      const transported = await runStartedAcquisitionTransport(
+        () => acquisitionEngine.refresh(item.acquisition.id, { started: item.acquisition.claim }),
+        () => {
+          replaceActivePoll(item.kind, nowMs);
+          if (item.force) coordinator.invalidate();
+          return commit(
+            key,
+            () => descriptor.fetch({
+              signal,
+              entities: entityRef.current,
+              force: item.force,
+              catalog: workflowCatalogRef.current,
+              pages: item.acquisition.demand?.pages ?? pageStateRef.current[key]?.pages ?? 1,
+              governor: { scope: currentScope, leaseId },
+              previousRaw: rawRef.current[key] ?? null,
+            }),
+            {
+              force: item.force,
+              manual: item.manual === true,
+              scope: currentScope,
+              reservationId,
+              admittedAt: nowMs,
+              automaticStatusVisible,
+              acquisition: item.acquisition,
+              onSettled: () => finishPending(key, item.intentId),
+            },
+          );
+        },
+      );
+      if (transported.ok) return transported;
+      pauseCoordination(key, transported.reason);
+      if (pendingFailureIsTerminal(transported.reason)) {
+        cancelAcquisition(item.acquisition);
+        finishPending(key, item.intentId);
+      } else {
+        armWake("data", governorControlRetryAt(nowMs, runtime.refreshMs), dataWake);
+      }
+      return transported;
+    }
 
     // Rows are the only record of whether CI is busy, so this reads them rather
     // than keeping a second copy that can fall out of step with the screen. A
@@ -10485,7 +11796,11 @@ function App({ onCreateRemote = () => {} } = {}) {
 
     function retireCurrentScope() {
       if (!cleanupScope || !registeredScopeHash) return;
-      for (const item of pending.values()) cancelIntent(cleanupScope, item.intentId, Date.now());
+      for (const key of [...pending.keys()]) cancelPending(key, cleanupScope);
+      for (const subscription of acquisitionSubscriptions.values()) {
+        acquisitionEngine.unsubscribe(subscription.id);
+      }
+      acquisitionSubscriptions.clear();
       if (!Object.values(inFlightRef.current).some(Boolean)) releaseLease(cleanupScope, leaseId);
     }
 
@@ -10633,6 +11948,16 @@ function App({ onCreateRemote = () => {} } = {}) {
       armFromState();
     }
 
+    function cancelPending(key, currentScope, at = Date.now()) {
+      const item = pending.get(key);
+      if (!cancelCoordinatedPending(item, {
+        cancelGovernor: (intentId) => cancelIntent(currentScope, intentId, at),
+        cancelAcquisition,
+      })) return false;
+      pending.delete(key);
+      return true;
+    }
+
     // Manual and tab-switch work replaces the automatic check that would
     // otherwise be due, rather than being added to it.
     function replaceActivePoll(kind, at) {
@@ -10645,10 +11970,9 @@ function App({ onCreateRemote = () => {} } = {}) {
     // the tab's failure ladder. `force` is the separate, stronger request that
     // also drops validators -- the `R` key. `r` is manual and not forced, which
     // is what makes a quiet refresh cost nothing.
-    function requestTab(key, kind = "active", { force = false } = {}) {
+    async function requestTab(key, kind = "active", { force = false } = {}) {
       const manual = kind === "manual";
       const signal = controller.signal;
-      const descriptor = tabForKey(key);
       const monotonicNow = performance.now();
       if (pendingBlockPublications.size > 0) {
         pauseCoordination(key, "block-unpublished");
@@ -10718,21 +12042,63 @@ function App({ onCreateRemote = () => {} } = {}) {
         if (!manual || existing.kind === "manual") {
           return Promise.resolve({ persisted: true, retry: false, kind, key });
         }
-        cancelIntent(currentScope, existing.intentId, nowMs);
-        pending.delete(key);
+        cancelPending(key, currentScope, nowMs);
       }
+      const acquisitionSubscription = ensureAcquisitionSubscription(key, identity());
+      if (!acquisitionSubscription?.ok) {
+        pauseCoordination(key, acquisitionSubscription?.reason ?? "acquisition-unavailable");
+        return { persisted: false, retry: true, kind, key };
+      }
+      const ownership = await acquisitionEngine.refresh(acquisitionSubscription.value.id, {
+        // Manual refresh and viewport page demand both request a new shared
+        // generation now. Only uppercase R sets transport `force` below and
+        // drops validators; lowercase r and pagination remain conditional.
+        force: manual || force,
+      });
+      if (!ownership.ok) {
+        pauseCoordination(key, ownership.reason);
+        return { persisted: false, retry: true, kind, key };
+      }
+      if (ownership.value.role !== "producer") {
+        if (ownership.value.snapshot) adoptAcquisitionSnapshot(key, ownership.value.snapshot);
+        if (ownership.value.sharingCount > 1) {
+          setTabGovernorDecision(key, {
+            mode: "waiting",
+            waitCause: "shared-lane",
+            sharingCount: ownership.value.sharingCount,
+          });
+        } else if (ownership.value.reason === "fresh" &&
+            ownership.value.snapshot?.nextDueAt > nowMs) {
+          setTabGovernorDecision(key, { mode: "waiting", notBefore: ownership.value.snapshot.nextDueAt });
+        } else {
+          setTabGovernorDecision(key, null);
+        }
+        setTabWaiting(key, false);
+        rescheduleTab(key, nowMs);
+        return { persisted: true, retry: false, kind, key };
+      }
+      const acquisition = {
+        id: acquisitionSubscription.value.id,
+        demand: ownership.value.demand,
+        claim: {
+          nonce: ownership.value.nonce,
+          generation: ownership.value.generation,
+          accessKey: currentScope.accessKey,
+        },
+      };
       const intentId = governorId();
       const request = {
         id: intentId,
         leaseId,
         tab: key,
-        priority: kind,
+        priority: manual ? "manual" : ownership.value.demand?.active ? "active" : "background",
         costs: tabRequestCost(key),
         requestedAt: nowMs,
         expiresAt: nowMs + GOVERNOR_LEASE_TTL_MS,
       };
       const registered = registerIntent(currentScope, request);
       if (!registered.ok) {
+        cancelAcquisition(acquisition);
         pauseCoordination(key, registered.reason);
         return Promise.resolve({ persisted: false, retry: true, kind, key });
       }
@@ -10742,6 +12108,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         kind,
         force,
         manual,
+        acquisition,
         wasDeferred: false,
         ...sharedLaneEvidence(decision),
       });
@@ -10761,7 +12128,10 @@ function App({ onCreateRemote = () => {} } = {}) {
       const started = startReservation(currentScope, decision.reservationId, nowMs);
       if (!started.ok) {
         pauseCoordination(key, started.reason);
-        if (pendingFailureIsTerminal(started.reason)) finishPending(key, intentId);
+        if (pendingFailureIsTerminal(started.reason)) {
+          cancelAcquisition(acquisition);
+          finishPending(key, intentId);
+        }
         else armWake("data", governorControlRetryAt(nowMs, runtime.refreshMs), dataWake);
         return Promise.resolve({ persisted: true, retry: false, kind, key });
       }
@@ -10776,29 +12146,12 @@ function App({ onCreateRemote = () => {} } = {}) {
         return Promise.resolve({ persisted: true, retry: false, kind, key });
       }
       setTabWaiting(key, false);
-      replaceActivePoll(kind, nowMs);
-      if (force) coordinator.invalidate();
-      return commit(
-        key,
-        () => descriptor.fetch({
-          signal,
-          entities: entityRef.current,
-          force,
-          catalog: workflowCatalogRef.current,
-          pages: pageStateRef.current[key]?.pages ?? 1,
-          governor: { scope: currentScope, leaseId },
-          previousRaw: rawRef.current[key] ?? null,
-        }),
-        {
-          force,
-          manual,
-          scope: currentScope,
-          reservationId: decision.reservationId,
-          admittedAt: nowMs,
-          automaticStatusVisible: false,
-          onSettled: () => finishPending(key, intentId),
-        },
-      ).then(() => ({ persisted: true, retry: false, kind, key }));
+      const item = pending.get(key);
+      if (!item) return { persisted: false, retry: false, kind, key };
+      await startPendingAcquisitionTransport(
+        key, item, currentScope, decision.reservationId, nowMs, signal, false,
+      );
+      return { persisted: true, retry: false, kind, key };
     }
     fetchTabRef.current = (key, { force = false, kind = force ? "manual" : "active" } = {}) => {
       if (kind === "tab-switch") {
@@ -10819,8 +12172,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         if (kind === "tab-switch") {
           for (const [pendingKey, item] of [...pending]) {
             if (pendingKey !== key && ["active", "tab-switch"].includes(item.kind)) {
-              cancelIntent(currentScope, item.intentId, requestedAt);
-              pending.delete(pendingKey);
+              cancelPending(pendingKey, currentScope, requestedAt);
             }
           }
         }
@@ -10836,7 +12188,10 @@ function App({ onCreateRemote = () => {} } = {}) {
         const decision = readIntentDecision(currentScope, item.intentId, nowMs, item);
         if (!decision.ok) {
           pauseCoordination(key, decision.reason);
-          if (pendingFailureIsTerminal(decision.reason)) pending.delete(key);
+          if (pendingFailureIsTerminal(decision.reason)) {
+            cancelAcquisition(item.acquisition);
+            pending.delete(key);
+          }
           else armWake("data", governorControlRetryAt(nowMs, runtime.refreshMs), dataWake);
           continue;
         }
@@ -10854,7 +12209,10 @@ function App({ onCreateRemote = () => {} } = {}) {
         const started = startReservation(currentScope, decision.value.reservationId, nowMs);
         if (!started.ok) {
           pauseCoordination(key, started.reason);
-          if (pendingFailureIsTerminal(started.reason)) pending.delete(key);
+          if (pendingFailureIsTerminal(started.reason)) {
+            cancelAcquisition(item.acquisition);
+            pending.delete(key);
+          }
           else armWake("data", governorControlRetryAt(nowMs, runtime.refreshMs), dataWake);
           armFromState(nowMs);
           continue;
@@ -10870,29 +12228,14 @@ function App({ onCreateRemote = () => {} } = {}) {
           continue;
         }
         setTabWaiting(key, false);
-        replaceActivePoll(item.kind, nowMs);
-        if (item.force) coordinator.invalidate();
-        const descriptor = tabForKey(key);
-        void commit(
+        void startPendingAcquisitionTransport(
           key,
-          () => descriptor.fetch({
-            signal: controller.signal,
-            entities: entityRef.current,
-            force: item.force,
-            catalog: workflowCatalogRef.current,
-            pages: pageStateRef.current[key]?.pages ?? 1,
-            governor: { scope: currentScope, leaseId },
-            previousRaw: rawRef.current[key] ?? null,
-          }),
-          {
-            force: item.force,
-            manual: item.manual === true,
-            scope: currentScope,
-            reservationId: decision.value.reservationId,
-            admittedAt: nowMs,
-            automaticStatusVisible: item.wasDeferred && !item.force,
-            onSettled: () => finishPending(key, item.intentId),
-          },
+          item,
+          currentScope,
+          decision.value.reservationId,
+          nowMs,
+          controller.signal,
+          item.wasDeferred && !item.force,
         );
       }
     }
@@ -11077,7 +12420,11 @@ function App({ onCreateRemote = () => {} } = {}) {
       queuedManual.clear();
       manualInFlight.clear();
       wakeScheduler.clearAll();
-      for (const item of pending.values()) cancelIntent(cleanupScope, item.intentId, Date.now());
+      for (const key of [...pending.keys()]) cancelPending(key, cleanupScope);
+      for (const subscription of acquisitionSubscriptions.values()) {
+        acquisitionEngine.unsubscribe(subscription.id);
+      }
+      acquisitionSubscriptions.clear();
       if (cleanupScope && registeredScopeHash) releaseLease(cleanupScope, leaseId);
       if (governorRef.current?.leaseId === leaseId) governorRef.current = null;
       if (contextCoordinatorRef.current === coordinator) contextCoordinatorRef.current = null;
@@ -11087,7 +12434,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       // needed.
       controller.abort();
     };
-  }, [dashboardCacheWriter, screenReader]);
+  }, [acquisitionEngine, dashboardCacheWriter, screenReader]);
 
   // Background tabs can be up to BACKGROUND_EVERY ticks stale, so the tab you
   // switch to refreshes straight away rather than showing old data until its
@@ -11983,6 +13330,18 @@ export {
   mergeDashboardCacheSnapshots,
   nextSecurityRaw,
   shouldCheckpointFreshness,
+  ACQUISITION_STORE_VERSION,
+  ACQUISITION_CLAIM_TTL_MS,
+  ACQUISITION_HEARTBEAT_MS,
+  ACQUISITION_MAX_BYTES,
+  ACQUISITION_MAX_ENTITY_BYTES,
+  ACQUISITION_MAX_ENTITIES,
+  ACQUISITION_MAX_LIVE_TARGETS,
+  ACQUISITION_MAX_SUBSCRIPTIONS,
+  acquisitionStorePath,
+  acquisitionQueryKey,
+  loadAcquisitionStore,
+  createAcquisitionEngine,
   pollPolicyInterval,
   advanceUnchangedCount,
   POLL_ACTIVE_CI_MS,
@@ -12004,6 +13363,7 @@ export {
   createWakeScheduler,
   createSingleFlightWake,
   pendingFailureIsTerminal,
+  cancelCoordinatedPending,
   runtimeIntentGate,
   rateLimitBlockDecision,
   coordinationNotice,

@@ -263,15 +263,21 @@ test("ASCII profile keeps the same status label and a width-one marker", (t) => 
 
 test("delayed admitted startup animates Checking and settles to Watching", (t) => {
   const box = sharedFixture(t, { delayByCommand: { actions: 1_200 } });
+  const output = '"$GH_GLANCE_CAPTURE_OUT"';
   const result = capture({
     cols: 80,
     rows: 24,
     signal: "none",
-    settle: 12,
-    stdin: "sleep 9; printf q",
+    settle: 20,
+    stdin: waitForAwk(output,
+      'index($0, "Checking") { checking=1 } checking && index($0, "Watching") { ok=1 }',
+      200) + "sleep .2; printf q",
     animation: true,
     configHome: box.root,
-    env: { GH_GLANCE_FIXTURE_STATE: box.statePath },
+    env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+      GH_GLANCE_FIXTURE_STATE: box.statePath,
+    },
   });
   const checking = result.liveScreen.statusHistory.filter((line) => / Checking(?:\s|$)/.test(line));
   assert.ok(new Set(checking.map((line) => [...line][0])).size > 1, checking.join(" -> "));

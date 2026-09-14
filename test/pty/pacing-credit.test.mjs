@@ -30,13 +30,15 @@ const WINDOW_MS = 600_000;
 const UNITS_PER_MS = SPENDABLE / WINDOW_MS;
 const SOAK_MS = 40_000;
 const PANES = 4;
-// Each pane can hold one grant that was paced *after* it started, so the
-// measured spend may lead the allowance by that much without any of it having
-// escaped the lane. Written as panes x the declared cost rather than as a
-// literal, because re-pricing a tab silently rescales it.
-const PACING_TOLERANCE = PANES * tabRequestCost("actions").core;
+// The shared lane can hold one grant that was paced *after* it started, so the
+// measured spend may lead the allowance by that request's cost without any of
+// it having escaped the lane. Repository streams are distinct below, but their
+// starts are still serialized through this one quota partition.
+const PACING_TOLERANCE = tabRequestCost("actions").core;
 const DATA_PATH = /\/actions\/(runs|workflows)/;
-const RUNS_PATH = "repos/acme/widget/actions/runs?exclude_pull_requests=true&per_page=60";
+const REPOSITORIES = Array.from({ length: PANES }, (_, index) => `acme/widget-${index}`);
+const runsPath = (repository) =>
+  `repos/${repository}/actions/runs?exclude_pull_requests=true&per_page=60`;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 // Runs changes on every fetch and workflows never does, so one path is charged
@@ -48,6 +50,11 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 function changingRuns() {
   const body = readFileSync(join(HERE, "fixtures", "actions-runs.json"), "utf8");
   return { sequence: Array.from({ length: 200 }, (_, index) => ({ etag: `"runs-v${index}"`, body })) };
+}
+
+function stableRuns() {
+  const body = readFileSync(join(HERE, "fixtures", "actions-runs.json"), "utf8");
+  return { etag: '"runs-stable"', body };
 }
 
 function fixture(t) {
@@ -62,7 +69,8 @@ function fixture(t) {
     // pane waiting for a reset the fixture never delivers.
     core: { limit: 5000, used: 5000 - 1200, remaining: 1200, resetMs: now + WINDOW_MS },
     graphql: { limit: 5000, used: 0, remaining: 5000, resetMs: now + 3_600_000 },
-    apiEntities: { [RUNS_PATH]: changingRuns() },
+    apiEntities: Object.fromEntries(REPOSITORIES.map((repository, index) =>
+      [runsPath(repository), index === 0 ? stableRuns() : changingRuns()])),
     events: [],
   })}\n`, { mode: 0o600 });
   return {
@@ -89,7 +97,7 @@ test("a sustained run of 304s returns pacing without letting charged work outrun
     stdin:
       "i=0; while [ ! -f \"$GH_GLANCE_FIXTURE_READY\" ] && [ \"$i\" -lt 1500 ]; do " +
       "sleep .1; i=$((i + 1)); done; printf q",
-    args: "--repo acme/widget --refresh 2 --tab actions",
+    args: `--repo ${REPOSITORIES[index]} --refresh 2 --background off --tab actions`,
     configHome: box.root,
     env: {
       GH_GLANCE_FIXTURE_STATE: box.statePath,
@@ -99,6 +107,7 @@ test("a sustained run of 304s returns pacing without letting charged work outrun
   })));
 
   await new Promise((resolve) => setTimeout(resolve, SOAK_MS));
+  const cutoffAt = Date.now();
   const state = box.read();
   const governor = box.readGovernor();
   writeFileSync(readyPath, "ready\n", { mode: 0o600 });
@@ -109,16 +118,27 @@ test("a sustained run of 304s returns pacing without letting charged work outrun
     .sort((left, right) => left.at - right.at);
   const data = starts.filter((event) => event.argv.some((argument) => DATA_PATH.test(argument)));
   const conditional = data.filter((event) => event.argv.some((argument) => /^If-None-Match:/i.test(argument)));
-  const elapsed = SOAK_MS;
+  const ends = new Map(state.events.filter((event) => event.type === "end")
+    .map((event) => [event.sequence, event]));
+  const notModified = data.filter((event) => ends.get(event.sequence)?.status === 304);
+  const elapsed = Math.max(0, cutoffAt - (data[0]?.at ?? cutoffAt));
   const allowance = elapsed * UNITS_PER_MS;
-  const spent = state.core.used - (5000 - 1200);
+  const totalSpent = state.core.used - (5000 - 1200);
+  // The fixture's initial `api user` identity observation is deliberately not
+  // a data-lane grant. Measure the charged acquisition calls that the pacing
+  // assertion governs instead of charging that bootstrap observation to them.
+  const spent = data.reduce((total, event) => total + event.cost.core, 0);
 
-  t.diagnostic(`spent=${spent} allowance=${allowance.toFixed(1)} data=${data.length} ` +
-    `conditional=${conditional.length} elapsed=${elapsed}`);
+  t.diagnostic(`spent=${spent} total=${totalSpent} allowance=${allowance.toFixed(1)} data=${data.length} ` +
+    `conditional=${conditional.length} notModified=${notModified.length} elapsed=${elapsed}`);
   assert.ok(data.length >= 8, `the soak made too little data traffic to judge: ${data.length} calls`);
   assert.ok(conditional.length >= 2,
     `the soak never re-fetched an unchanged entity: ${conditional.length} conditional of ${data.length}`);
+  assert.ok(notModified.length >= 2,
+    `the soak did not complete enough 304 responses: ${notModified.length} of ${data.length}`);
   assert.ok(spent >= 4, `the soak never sustained charged traffic: ${spent} units`);
+  assert.equal(totalSpent, spent + 1,
+    "non-data core spend was not exactly the one identity bootstrap observation");
 
   // Charged work stays inside its paced allowance. A return that gave back more
   // than the request spent would show up as spend outrunning the rate.

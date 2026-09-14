@@ -153,3 +153,36 @@ a run's page is derived from the repository and its databaseId. Every URL is
 admitted before use -- https only, and only the host this pane is talking to --
 because a row is remote data, and an unadmitted `url` would let a crafted row
 point the user's browser anywhere or hand a `file:` URL to the platform opener.
+
+## Amendment: shared acquisition ownership (phase 6)
+
+The access identity now also partitions a private, file-backed acquisition
+store. Query identity includes host, admitted repository identity, resource,
+projection version, filters, page size, and cursor generation. Equivalent
+explicit and inferred repository names converge on the same conservative slug
+identity until admitted GitHub evidence provides a stable database ID; an
+unresolved alias is never guessed across targets.
+
+Each due query generation has one producer claim, identified by PID, nonce and
+generation. Claims live for 45 seconds and are heartbeated every ten seconds.
+Expiry is necessary but not sufficient for takeover: the local PID must also be
+confirmed dead. An inaccessible or suspended process retains ownership, while
+an explicit cancellation releases it. Publication checks nonce, generation and
+access partition, so an old completion cannot overwrite newer evidence.
+
+Claiming, governor admission, transport, settlement, and publication are
+separate operations. The acquisition lock is never held across GitHub I/O, and
+only the producer obtains and settles the quota reservation. Followers inspect
+generation metadata at most once per second, adopt validated snapshots, and do
+not fall back to their own request when coordination is busy or unwritable.
+
+The coordination file contains lightweight claim, subscription, generation and
+bounded-digest metadata. Sanitized parsed rows and each validator with the
+bounded validated body it governs live in private per-query artifacts. The
+artifact is complete before an atomic coordination-file replacement publishes
+its reference; followers inspect only metadata until the generation changes.
+A 304 advances `lastSuccessAt` while preserving `lastChangedAt`; a changed
+representation advances both. Persisted quota headers are not replayed.
+Storage is capped at 32 MiB total, 1 MiB per entity, 512 entities, 32 live
+targets, and 128 subscriptions. Active targets are pinned and inactive
+least-recently-used generations are evicted first.
