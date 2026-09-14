@@ -11,7 +11,13 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
 
-import { resourceReserve, tabRequestCost } from "../../index.mjs";
+import {
+  acquisitionStorePath,
+  dashboardCacheTarget,
+  loadAcquisitionStore,
+  resourceReserve,
+  tabRequestCost,
+} from "../../index.mjs";
 import { capture, captureAsync, isStatusLine, waitForAwk } from "./capture.mjs";
 import { seedKnownHeldIdentity } from "./fixtures/known-identity.mjs";
 
@@ -162,7 +168,7 @@ test("four ample panes explain a shared lane without moving the hint group", asy
       settle: 45,
       stdin: waitForAwk(
         '"$GH_GLANCE_CAPTURE_OUT"',
-        'index($0, "Watching sharing 4") { ok=1 }',
+        'index($0, "sharing 4") { ok=1 }',
         400,
       ) + "printf q",
       args: "--refresh 40 --tab security",
@@ -183,12 +189,158 @@ test("four ample panes explain a shared lane without moving the hint group", asy
     );
   }
   const statuses = observer.liveScreen.statusHistory;
-  const sharing = statuses.find((line) => /^· Watching sharing 4/.test(line));
+  const sharing = statuses.find((line) => /^· (?:Watching|Shared) sharing 4/.test(line));
   const baseline = statuses.find((line) => !line.includes("sharing 4") && line.includes("Refresh"));
   assert.ok(sharing, statuses.join(" -> "));
   assert.ok(baseline, statuses.join(" -> "));
   assert.ok(sharing.indexOf("Refresh") >= 0, sharing);
   assert.equal(sharing.indexOf("Refresh"), baseline.indexOf("Refresh"));
+});
+
+test("a matching subscriber labels reused acquisition data Shared, not Watching", async (t) => {
+  const box = sharedFixture(t);
+  const releasePath = join(box.root, "release-acquisition-owner");
+  const refreshPath = join(box.root, "refresh-acquisition-owner");
+  const acquisitionPath = acquisitionStorePath({ env: { XDG_CONFIG_HOME: box.root } });
+  const owner = captureAsync({
+    cols: 80,
+    rows: 20,
+    signal: "none",
+    settle: 20,
+    stdin: `i=0; while [ ! -f "${refreshPath}" ] && [ "$i" -lt 100 ]; do ` +
+      "i=$((i + 1)); sleep .1; done; printf r; " +
+      `i=0; while [ ! -f "${releasePath}" ] && [ "$i" -lt 200 ]; do ` +
+      "i=$((i + 1)); sleep .1; done; printf q",
+    args: "--tab actions",
+    configHome: box.root,
+    env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+      GH_GLANCE_FIXTURE_STATE: box.statePath,
+      GH_GLANCE_FIXTURE_PANE: "acquisition-owner",
+    },
+  });
+  let follower;
+  try {
+    const deadline = Date.now() + 10_000;
+    let published = false;
+    while (Date.now() < deadline) {
+      const loaded = loadAcquisitionStore(acquisitionPath);
+      published = loaded.ok && Object.values(loaded.value.queries)
+        .some((query) => query.query.resource === "actions" && query.snapshot !== null);
+      if (published) break;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    assert.equal(published, true, "owner did not publish an Actions acquisition snapshot");
+    const fixture = box.read();
+    fixture.delayByCommand = { actions: { ms: 5_000, remaining: 1 } };
+    writeFileSync(box.statePath, `${JSON.stringify(fixture)}\n`, { mode: 0o600 });
+    writeFileSync(refreshPath, "refresh\n", { mode: 0o600 });
+    let claimed = false;
+    while (Date.now() < deadline) {
+      const loaded = loadAcquisitionStore(acquisitionPath);
+      claimed = loaded.ok && Object.values(loaded.value.queries)
+        .some((query) => query.query.resource === "actions" && query.claim?.started === true);
+      if (claimed) break;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    assert.equal(claimed, true, "owner did not start the delayed shared generation");
+    follower = await captureAsync({
+      cols: 80,
+      rows: 20,
+      signal: "none",
+      settle: 12,
+      stdin: waitForAwk(
+        '"$GH_GLANCE_CAPTURE_OUT"',
+        'index($0, "Shared") { ok=1 }',
+      ) + "sleep .3; printf q",
+      args: "--tab actions",
+      configHome: box.root,
+      env: {
+        GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+        GH_GLANCE_FIXTURE_STATE: box.statePath,
+        GH_GLANCE_FIXTURE_PANE: "acquisition-follower",
+      },
+    });
+  } finally {
+    writeFileSync(releasePath, "release\n", { mode: 0o600 });
+    await owner;
+  }
+  const statuses = follower.liveScreen.statusHistory;
+  assert.ok(
+    statuses.some((line) => /^· Shared(?:\s|$)/.test(line)),
+    statuses.join(" -> "),
+  );
+  assert.doesNotMatch(statuses.join("\n"), /Watching.*(?:stale|Disconnected)/);
+});
+
+test("cached rows with no connected identity say Disconnected, never Watching", (t) => {
+  const root = configRoot(t, "gh-glance-status-disconnected-");
+  capture({
+    cols: 80,
+    rows: 20,
+    signal: "none",
+    settle: 15,
+    stdin: quitAfterCached("actions"),
+    args: "--repo acme/widget",
+    configHome: root,
+  });
+  const cachePath = join(root, "gh-glance", "dashboard-cache.json");
+  const document = JSON.parse(readFileSync(cachePath, "utf8"));
+  const cached = Object.values(document.targets)[0];
+  const localTarget = dashboardCacheTarget({
+    repo: "acme/widget",
+    host: "github.com",
+    account: "unverified",
+  });
+  document.targets[localTarget] = cached;
+  writeFileSync(cachePath, `${JSON.stringify(document)}\n`, { mode: 0o600 });
+  rmSync(join(root, "gh-glance", "coordination-v2"), { recursive: true, force: true });
+
+  const disconnected = capture({
+    cols: 80,
+    rows: 20,
+    signal: "none",
+    settle: 12,
+    stdin: waitForAwk(
+      '"$GH_GLANCE_CAPTURE_OUT"',
+      'index($0, "Disconnected") { ok=1 }',
+    ) + "sleep .3; printf q",
+    args: "--repo acme/widget",
+    configHome: root,
+    env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+      GH_GLANCE_FIXTURE_FAIL: "credential helper unavailable",
+      GH_GLANCE_FIXTURE_FAIL_ON: "auth",
+    },
+  });
+  assert.ok(
+    disconnected.liveScreen.statusHistory.some((line) => / Disconnected(?:\s|$)/.test(line)),
+    disconnected.liveScreen.statusHistory.join(" -> "),
+  );
+  assert.doesNotMatch(disconnected.raw, /Watching.*(?:stale|Disconnected)/);
+  assert.match(disconnected.finalFrame.lines.join("\n"), /ci: pin actions to commit/);
+});
+
+test("raw internal budget reasons never render in a PTY frame", (t) => {
+  const result = capture({
+    cols: 80,
+    rows: 20,
+    signal: "none",
+    settle: 12,
+    stdin: waitForAwk(
+      '"$GH_GLANCE_CAPTURE_OUT"',
+      'index($0, "GitHub checks are paused until the shared API budget allows them") { ok=1 }',
+    ) + "sleep .3; printf q",
+    args: "--tab actions",
+    configHome: configRoot(t, "gh-glance-status-internal-error-"),
+    env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+      GH_GLANCE_FIXTURE_FAIL: "API budget paused (budget-reset)",
+      GH_GLANCE_FIXTURE_FAIL_ON: "actions",
+    },
+  });
+  assert.match(result.raw, /GitHub checks are paused until the shared API budget allows them/);
+  assert.doesNotMatch(result.raw, /API budget paused \(budget-reset\)/);
 });
 
 test("Setup and NO_COLOR footers keep explicit semantic labels", (t) => {

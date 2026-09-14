@@ -556,6 +556,9 @@ function unavailableRemedy(accounts, targetHost) {
 function formatTabError(error, failureContext = null) {
   if (error == null) return null;
   if (error.kind === "text") return error.text;
+  if (/^API budget paused(?:\s|\()/i.test(error.raw ?? "")) {
+    return "GitHub checks are paused until the shared API budget allows them";
+  }
   if (error.verdict === "other") return error.raw;
   if (error.verdict === "unavailable" && failureContext?.repo?.ok) {
     return "not available for this repository";
@@ -635,12 +638,15 @@ function redact(text) {
 // here. The README tells users to run `--verbose 2>gh-glance.log` and attach the
 // result to a bug report, so this is one of the three artifacts that leave the
 // machine, and it was the only one with no redaction boundary.
+function verboseLogLine(args, startedAt, outcome, nowMs = Date.now()) {
+  return redact(
+    `${new Date(nowMs).toISOString()} gh ${args.join(" ")} -- ${outcome} in ${nowMs - startedAt}ms\n`,
+  );
+}
+
 function logGh(args, startedAt, outcome) {
   if (!runtime.verbose) return;
-  const ms = Date.now() - startedAt;
-  process.stderr.write(
-    `${new Date().toISOString()} gh ${args.join(" ")} -- ${redact(outcome)} in ${ms}ms\n`,
-  );
+  process.stderr.write(verboseLogLine(args, startedAt, outcome));
 }
 
 // The poll loop's AbortController, published here so the crash handlers can
@@ -740,6 +746,7 @@ async function runGh(args, { signal, operation, input = null } = {}) {
   const startedAt = Date.now();
   let requestError = null;
   let requestStdout = null;
+  let requestStarted = false;
   try {
     assertBoundCredential(bound);
     if (runtimeIdentityCoordinator && operation === "budget-core-observer") {
@@ -766,6 +773,7 @@ async function runGh(args, { signal, operation, input = null } = {}) {
       env: { ...process.env, ...GH_ENV_OVERRIDES },
       signal,
     });
+    requestStarted = true;
     if (typeof input === "string") {
       // A child killed by the timeout or the abort signal closes stdin under
       // us; that EPIPE is the kill's consequence, not the failure worth
@@ -779,6 +787,7 @@ async function runGh(args, { signal, operation, input = null } = {}) {
     return stdout;
   } catch (err) {
     requestError = err;
+    if (requestStarted && isRecord(err)) err.httpStarted = true;
     logGh(args, startedAt, `FAILED ${shortErr(err)}`);
     throw err;
   } finally {
@@ -869,6 +878,14 @@ async function ghApi(args, { operation, signal, etag = null, run = runGh } = {})
         etag: parsed.headers.etag ?? null,
         rateLimit: pickRateLimit(parsed.headers),
         body: "",
+      };
+    }
+    if (error?.httpStarted || parsed.status !== null) {
+      error.requestMetrics = {
+        httpRequests: 1,
+        rest200: parsed.status === 200 ? 1 : 0,
+        rest304: parsed.status === 304 ? 1 : 0,
+        failedRequests: 1,
       };
     }
     if (parsed.status !== null) {
@@ -1433,6 +1450,7 @@ async function fetchConditionalEntity({
       body: recovery.recover ? null : cached.body,
       staged: null,
       observations: observation ? [observation] : [],
+      requestMetrics: restResponseRequestMetrics(response),
       recovered: recovery.recover,
     };
   }
@@ -1446,6 +1464,7 @@ async function fetchConditionalEntity({
           : null]
       : null,
     observations: observation ? [observation] : [],
+    requestMetrics: restResponseRequestMetrics(response),
   };
 }
 
@@ -1453,11 +1472,13 @@ function conditionalBatchResult(responses, previousRaw, joinedRaw = null) {
   const list = Array.isArray(responses) ? responses : [];
   let allNotModified = list.length > 0;
   let restSpent = 0;
+  let restNotModified = 0;
   let stagedEntities = null;
   const observations = [];
   for (const response of list) {
     if (response?.status !== 304 || typeof response.body !== "string") allNotModified = false;
     if (response?.status === 200) restSpent += 1;
+    if (response?.status === 304) restNotModified += 1;
     if (Array.isArray(response?.observations)) observations.push(...response.observations);
     if (!response?.staged) continue;
     stagedEntities ??= new Map();
@@ -1469,8 +1490,43 @@ function conditionalBatchResult(responses, previousRaw, joinedRaw = null) {
       : joinedRaw ?? list.map((response) => response?.body ?? "").join("\0"),
     allNotModified,
     restSpent,
+    restNotModified,
+    httpRequests: list.length,
     stagedEntities,
     observations,
+  };
+}
+
+function mergeAcquisitionRequestMetrics(...values) {
+  const merged = {};
+  for (const value of values) {
+    const normalized = normalizeAcquisitionMetrics(value ?? {}, { partial: true });
+    if (normalized === null) continue;
+    for (const [key, amount] of Object.entries(normalized)) merged[key] = (merged[key] ?? 0) + amount;
+  }
+  return merged;
+}
+
+function restResponseRequestMetrics(response) {
+  if (!Number.isSafeInteger(response?.status)) return {};
+  return {
+    httpRequests: 1,
+    rest200: response.status === 200 ? 1 : 0,
+    rest304: response.status === 304 ? 1 : 0,
+    coreUnits: response.status === 200 ? 1 : 0,
+    failedRequests: response.status === 200 || response.status === 304 ? 0 : 1,
+  };
+}
+
+function graphqlPageRequestMetrics(page) {
+  const attempted = page?.status !== null || page?.failure?.httpStarted || page?.ok === true;
+  if (!attempted) return {};
+  return {
+    httpRequests: 1,
+    failedRequests: page.ok ? 0 : 1,
+    ...(Array.isArray(page.observations) && page.observations.length > 0
+      ? { graphqlUnits: page.observedCost }
+      : {}),
   };
 }
 
@@ -1514,6 +1570,12 @@ async function fetchActions(signal, {
       raw: null,
       limit: ACTIONS_RUN_LIMIT,
       restSpent: 0,
+      rest200: runsResponse.requestMetrics?.rest200 ?? 0,
+      restNotModified: runsResponse.requestMetrics?.rest304 ?? (runsResponse.status === 304 ? 1 : 0),
+      httpRequests: runsResponse.requestMetrics?.httpRequests ?? 1,
+      failedRequests: runsResponse.requestMetrics?.failedRequests ?? 0,
+      coreUnitsTotal: runsResponse.requestMetrics?.coreUnits ?? 0,
+      requestMetrics: runsResponse.requestMetrics ?? restResponseRequestMetrics(runsResponse),
       graphqlSpent: GRAPHQL_PER_FETCH.actions,
       stagedEntities: null,
       observations: runsResponse.observations,
@@ -1522,6 +1584,8 @@ async function fetchActions(signal, {
     };
   }
   const responses = [runsResponse];
+  let requestMetrics = runsResponse.requestMetrics ?? restResponseRequestMetrics(runsResponse);
+  const uncertainReceipts = [];
   const runs = parseActionsRuns(runsResponse.body);
   const startedAt = Date.now();
   let nextCatalog = catalog;
@@ -1545,9 +1609,16 @@ async function fetchActions(signal, {
         request,
       }),
     });
+    uncertainReceipts.push(...(admitted.uncertainReceipts ?? []));
     if (admitted.ok && admitted.value) {
       responses.push(admitted.value);
+      requestMetrics = mergeAcquisitionRequestMetrics(
+        requestMetrics,
+        admitted.value.requestMetrics ?? restResponseRequestMetrics(admitted.value),
+      );
       nextCatalog = parseWorkflowCatalog(admitted.value.body, startedAt, catalog);
+    } else {
+      requestMetrics = mergeAcquisitionRequestMetrics(requestMetrics, admitted.error?.requestMetrics);
     }
     // A refusal leaves the catalog exactly as it was. Closing the TTL on a
     // scheduling outcome would hide missing names for fifteen minutes over a
@@ -1565,6 +1636,13 @@ async function fetchActions(signal, {
     // The tab settles for its own request. The catalog settled against the
     // reservation it opened for itself.
     restSpent: runsResponse.status === 200 ? 1 : 0,
+    rest200: requestMetrics.rest200 ?? batch.restSpent,
+    restNotModified: requestMetrics.rest304 ?? batch.restNotModified,
+    httpRequests: requestMetrics.httpRequests ?? 0,
+    failedRequests: requestMetrics.failedRequests ?? 0,
+    coreUnitsTotal: requestMetrics.coreUnits ?? 0,
+    requestMetrics,
+    uncertainReceipts,
     graphqlSpent: GRAPHQL_PER_FETCH.actions,
     stagedEntities: batch.stagedEntities,
     observations: batch.observations,
@@ -1760,9 +1838,11 @@ async function fetchGraphqlList(kind, mapRow, {
   if (!first.ok) {
     const error = first.failure ?? new Error(`GraphQL ${kind} page unavailable (${first.reason})`);
     error.budgetObservations = first.observations;
+    error.requestMetrics = graphqlPageRequestMetrics(first);
     throw error;
   }
   const observations = [...first.observations];
+  const uncertainReceipts = [];
   const repositoryIdentity = normalizeRepositoryIdentity(first.data?.repository);
   // Only the first page. Pages past it opened their own reservation inside
   // runAdmittedOperation and settle against it, so adding them here charges the
@@ -1771,6 +1851,7 @@ async function fetchGraphqlList(kind, mapRow, {
   // budget observation the fetch gathered.
   const envelopeSpent = first.observedCost;
   let spent = first.observedCost;
+  let requestMetrics = graphqlPageRequestMetrics(first);
   let overrun = first.overrun;
   let current = graphqlConnection(first, connection);
   const totalCount = current?.totalCount ?? null;
@@ -1799,18 +1880,21 @@ async function fetchGraphqlList(kind, mapRow, {
       waitMs: GOVERNOR_ADMISSION_WAIT_MS,
       run: (admittedSignal) => fetchPage(kind, { signal: admittedSignal, after: cursor, operation: `page:${kind}` }),
     });
+    uncertainReceipts.push(...(admitted.uncertainReceipts ?? []));
     // A later page that is denied, fails, or returns errors leaves the rows
     // already gathered exactly as they are. Losing page one because page two
     // was refused would turn a budget decision into data loss.
     //
-    // Note that runAdmittedOperation settles these at their *declared* cost, not
-    // their observed one -- conservative, so never an under-charge. A later
-    // page's real meter reaches the ledger through the observations forwarded to
-    // the tab settlement rather than through its own reservation.
-    // Evidence first, and unconditionally: a page that failed as data still
-    // observed the meter, and dropping that is the one thing this phase says
-    // it will not do.
+    // runAdmittedOperation settles each later page from that page's evidence.
+    // Keep its observations as well so the shared budget observer can reconcile
+    // the same request without treating a data failure as missing meter data.
     if (admitted.value?.observations) observations.push(...admitted.value.observations);
+    requestMetrics = mergeAcquisitionRequestMetrics(
+      requestMetrics,
+      admitted.ok
+        ? graphqlPageRequestMetrics(admitted.value)
+        : admitted.error?.requestMetrics,
+    );
     if (admitted.value?.overrun) overrun = true;
     if (!admitted.ok || !admitted.value?.ok) { truncatedWalk = true; break; }
     spent += admitted.value.observedCost;
@@ -1847,6 +1931,10 @@ async function fetchGraphqlList(kind, mapRow, {
     graphqlSpent: envelopeSpent,
     // What the whole walk cost, for reporting. Never the settlement figure.
     graphqlSpentTotal: spent,
+    httpRequests: requestMetrics.httpRequests ?? 0,
+    failedRequests: requestMetrics.failedRequests ?? 0,
+    requestMetrics,
+    uncertainReceipts,
     observations,
     incomplete,
     repositoryIdentity,
@@ -4841,8 +4929,11 @@ function completeReservation(scope, reservationId, completion, nowMs) {
     if (!reservation || reservation.status !== "started" || !GOVERNOR_OUTCOMES.has(completion?.outcome)) {
       return { ok: false, reason: "stale" };
     }
+    const suppliedActual = completion.actualCost === undefined
+      ? null : exactResourceCosts(completion.actualCost);
+    if (completion.actualCost !== undefined && !suppliedActual) return { ok: false, reason: "corrupt" };
     const measured = completion.outcome === "measured-success"
-      ? exactResourceCosts(completion.actualCost)
+      ? suppliedActual
       : reservation.costs;
     if (!measured || RATE_RESOURCES.some((resource) => measured[resource] > reservation.costs[resource])) {
       return { ok: false, reason: "corrupt" };
@@ -5083,6 +5174,7 @@ async function refreshSharedBudget(scope, leaseId, signal, options = {}) {
 
 async function refreshResourceBudget(scope, leaseId, signal, resource, {
   readBudgets = readSharedBudgetSources,
+  onObserverCall = null,
   now = () => scopeNow(scope),
   wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   inspect = inspectGovernor,
@@ -5162,6 +5254,7 @@ async function refreshResourceBudget(scope, leaseId, signal, resource, {
   }
   let budgets;
   try {
+    try { onObserverCall?.(resource); } catch { /* diagnostics cannot block a budget observer */ }
     budgets = await requestIdentityStorage.run(scope, () => readBudgets(signal, scope.host, {
       resources: [resource],
       coreEtag,
@@ -5319,13 +5412,21 @@ async function fetchAlertSource(source, signal, now, {
     return {
       raw: `backoff:${note}`,
       completedCalls: 0,
+      httpRequests: 0,
+      rest200: 0,
+      rest304: 0,
       verdict,
       allNotModified: false,
       stagedEntities: new Map(),
+      requestMetrics: {},
       parse: () => ({ alerts: [], note, verdict, truncated: false }),
     };
   }
   let completedCalls = 0;
+  let httpRequests = 0;
+  let rest200 = 0;
+  let rest304 = 0;
+  let requestMetrics = {};
   const observations = [];
   try {
     const requests = alertRequestArgs(source);
@@ -5334,8 +5435,9 @@ async function fetchAlertSource(source, signal, now, {
     const responses = [];
     for (const [index, args] of requests.entries()) {
       if (index > 0 && !shouldFetchAlertPriorityLanes(groups[0]?.length ?? 0)) break;
-      let response = null;
+      let response;
       try {
+        httpRequests += 1;
         response = await request({
           tab: "security",
           args,
@@ -5344,16 +5446,31 @@ async function fetchAlertSource(source, signal, now, {
           force,
           entities,
         });
-        if (response.status === 200) completedCalls += 1;
-        observations.push(...(response.observations ?? []));
-        responses.push(response);
-        payloads.push(response.body ?? "");
-        groups.push(parseJsonOutput(response.body ?? "").filter((alert) => alert.state === "open"));
       } catch (error) {
-        if (response === null) completedCalls += 1;
+        completedCalls += 1;
         observations.push(...(error.budgetObservations ?? []));
+        const failedMetrics = mergeAcquisitionRequestMetrics(
+          error.requestMetrics ?? { httpRequests: 1, failedRequests: 1 },
+        );
+        if (!Object.hasOwn(failedMetrics, "coreUnits")) {
+          failedMetrics.uncertainCoreUnits = failedMetrics.httpRequests ?? 1;
+        }
+        requestMetrics = mergeAcquisitionRequestMetrics(requestMetrics, failedMetrics);
         throw error;
       }
+      if (response.status === 200) {
+        completedCalls += 1;
+        rest200 += 1;
+      }
+      if (response.status === 304) rest304 += 1;
+      observations.push(...(response.observations ?? []));
+      requestMetrics = mergeAcquisitionRequestMetrics(
+        requestMetrics,
+        response.requestMetrics ?? restResponseRequestMetrics(response),
+      );
+      responses.push(response);
+      payloads.push(response.body ?? "");
+      groups.push(parseJsonOutput(response.body ?? "").filter((alert) => alert.state === "open"));
     }
     const raw = payloads.join("\0");
     clearBackoff(source.key);
@@ -5361,6 +5478,9 @@ async function fetchAlertSource(source, signal, now, {
     return {
       raw,
       completedCalls,
+      httpRequests,
+      rest200,
+      rest304,
       verdict: "ok",
       allNotModified: batch.allNotModified,
       // Every other fetchAlertSource path returns a Map. An all-304 batch has
@@ -5368,6 +5488,7 @@ async function fetchAlertSource(source, signal, now, {
       // here before fetchSecurity merges the independently fetched sources.
       stagedEntities: batch.stagedEntities ?? new Map(),
       observations,
+      requestMetrics,
       parse: () => {
         const rows = mergeAlertRows(groups);
         return {
@@ -5388,10 +5509,14 @@ async function fetchAlertSource(source, signal, now, {
       return {
         raw: "unusable-output",
         completedCalls,
+        httpRequests,
+        rest200,
+        rest304,
         verdict,
         allNotModified: false,
         stagedEntities: new Map(),
         observations,
+        requestMetrics,
         parse: () => ({
           alerts: [],
           note: null,
@@ -5412,10 +5537,14 @@ async function fetchAlertSource(source, signal, now, {
       // A failed call still bills: the request reached GitHub and was counted
       // whether it returned data, `[]`, or a 403.
       completedCalls,
+      httpRequests,
+      rest200,
+      rest304,
       verdict,
       allNotModified: false,
       stagedEntities: new Map(),
       observations,
+      requestMetrics,
       parse: () => ({ alerts: [], note, verdict, truncated: false }),
     };
   }
@@ -5437,6 +5566,8 @@ async function fetchSecurity(signal, {
   entities = new Map(),
   force = false,
   previousRaw = null,
+  sources = ALERT_SOURCES,
+  request = fetchConditionalEntity,
 } = {}) {
   // Monotonic, not wall-clock. These deadlines measure *elapsed* time, and
   // Date.now() can jump: a laptop resume or an NTP correction stepping the clock
@@ -5446,8 +5577,8 @@ async function fetchSecurity(signal, {
   // for the mirror-image reason: a sleep gap is the thing it reports, and
   // performance.now() does not advance across suspend.
   const now = performance.now();
-  const parts = await Promise.all(ALERT_SOURCES.map(async (source) => ({
-    ...await fetchAlertSource(source, signal, now, { entities, force }),
+  const parts = await Promise.all(sources.map(async (source) => ({
+    ...await fetchAlertSource(source, signal, now, { entities, force, request }),
     sourceKey: source.key,
   })));
   const capabilities = Object.fromEntries(parts.flatMap((part) => {
@@ -5462,6 +5593,7 @@ async function fetchSecurity(signal, {
   }));
   const allNotModified = parts.length > 0 && parts.every((part) => part.allNotModified);
   const stagedEntities = new Map(parts.flatMap((part) => [...part.stagedEntities]));
+  const requestMetrics = mergeAcquisitionRequestMetrics(...parts.map((part) => part.requestMetrics));
   return {
     // Joined with a NUL so a change in any one of the three shows up as a
     // change in the combined payload, without risk of two different splits
@@ -5472,6 +5604,12 @@ async function fetchSecurity(signal, {
     // ALERT_SOURCES.length: a source held off by backoff spawned nothing and
     // must not be billed for it.
     restSpent: parts.reduce((total, part) => total + part.completedCalls, 0),
+    restNotModified: parts.reduce((total, part) => total + part.rest304, 0),
+    httpRequests: parts.reduce((total, part) => total + part.httpRequests, 0),
+    rest200: parts.reduce((total, part) => total + part.rest200, 0),
+    failedRequests: parts.reduce((total, part) =>
+      total + Math.max(0, part.httpRequests - part.rest200 - part.rest304), 0),
+    requestMetrics,
     graphqlSpent: 0,
     measuredSuccess: parts.every((part) => part.verdict === "ok"),
     rateLimited: parts.some((part) => part.verdict === "rate-limited"),
@@ -6078,12 +6216,104 @@ function skippedDoctorProbe(name, args, admitted) {
   };
 }
 
-async function runDoctor() {
+const ACQUISITION_METRIC_KEYS = [
+  "httpRequests", "rest200", "rest304", "coreUnits", "graphqlUnits",
+  "uncertainCoreUnits", "uncertainGraphqlUnits", "failedRequests", "observerCalls", "cacheHits",
+  "joinedFollowers", "queueWaitMs",
+];
+const ACQUISITION_HOLD_REASONS = new Set([
+  "observer", "primary", "secondary", "disconnected", "coordination",
+]);
+const ACQUISITION_STORE_VERSION = 1;
+const ACQUISITION_MAX_UNCERTAIN_RECEIPTS = 1024;
+
+function normalizeAcquisitionDiagnosticMetadata(raw) {
+  if (!isRecord(raw) || raw.version !== ACQUISITION_STORE_VERSION ||
+      typeof raw.producerEpoch !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(raw.producerEpoch) ||
+      !isRecord(raw.subscriptions) || !isRecord(raw.queries)) return null;
+  const metrics = normalizeAcquisitionMetrics(raw.metrics);
+  if (!metrics) return null;
+  const receipts = raw.uncertainReceipts ?? {};
+  if (!isRecord(receipts) || Object.keys(receipts).length > ACQUISITION_MAX_UNCERTAIN_RECEIPTS) return null;
+  const uncertainReceipts = {};
+  const outstanding = { core: 0, graphql: 0 };
+  for (const [id, receipt] of Object.entries(receipts)) {
+    const normalized = normalizeAcquisitionReceipt(receipt, id);
+    if (!normalized) return null;
+    uncertainReceipts[id] = normalized;
+    outstanding[normalized.resource] += normalized.units;
+  }
+  if (metrics.uncertainCoreUnits !== outstanding.core ||
+      metrics.uncertainGraphqlUnits !== outstanding.graphql) return null;
+  const queries = {};
+  for (const [queryKey, value] of Object.entries(raw.queries)) {
+    if (!isRecord(value) || !isRecord(value.query) || value.query.queryKey !== queryKey ||
+        !TAB_KEYS.includes(value.query.resource)) return null;
+    const hold = normalizeAcquisitionHold(value.hold);
+    if (value.hold !== undefined && value.hold !== null && !hold) return null;
+    const snapshot = value.snapshot;
+    if (snapshot !== null && (!isRecord(snapshot) ||
+        !Number.isFinite(snapshot.lastSuccessAt) || !Number.isFinite(snapshot.lastChangedAt) ||
+        !Number.isFinite(snapshot.nextDueAt))) return null;
+    const claim = value.claim;
+    if (claim !== null && (!isRecord(claim) || !Number.isSafeInteger(claim.generation) ||
+        (claim.receiptIds !== undefined && (!Array.isArray(claim.receiptIds) ||
+          claim.receiptIds.some((id) => typeof id !== "string" || !uncertainReceipts[id]))))) return null;
+    queries[queryKey] = {
+      query: { queryKey, resource: value.query.resource },
+      snapshot: snapshot === null ? null : {
+        lastSuccessAt: snapshot.lastSuccessAt,
+        lastChangedAt: snapshot.lastChangedAt,
+        nextDueAt: snapshot.nextDueAt,
+      },
+      claim: claim === null ? null : { generation: claim.generation },
+      hold,
+    };
+  }
+  const subscriptions = {};
+  for (const [id, value] of Object.entries(raw.subscriptions)) {
+    if (!isRecord(value) || !queries[value.queryKey] || !Number.isFinite(value.expiresAt)) return null;
+    const waitingGeneration = value.waitingGeneration ?? null;
+    const waitingSinceAt = value.waitingSinceAt ?? null;
+    if (waitingGeneration !== null && (!Number.isSafeInteger(waitingGeneration) ||
+        !Number.isFinite(waitingSinceAt))) return null;
+    if (waitingGeneration === null && waitingSinceAt !== null) return null;
+    subscriptions[id] = {
+      queryKey: value.queryKey,
+      expiresAt: value.expiresAt,
+      waitingGeneration,
+      waitingSinceAt,
+    };
+  }
+  return { producerEpoch: raw.producerEpoch, metrics, uncertainReceipts, queries, subscriptions };
+}
+
+function unavailableAcquisitionDiagnostic(reason) {
+  return { source: "standalone", status: reason, epoch: null, activeQueries: 0,
+    activeSubscribers: 0, metrics: emptyAcquisitionMetrics(), queries: [] };
+}
+
+function doctorAcquisitionDiagnostic({ nowMs = Date.now() } = {}) {
+  try {
+    const raw = JSON.parse(readFileSync(join(identityRegistryRoot(), "acquisition.json"), "utf8"));
+    const normalized = normalizeAcquisitionDiagnosticMetadata(raw);
+    return normalized
+      ? acquisitionDiagnostics(normalized, { nowMs })
+      : unavailableAcquisitionDiagnostic("corrupt");
+  } catch (error) {
+    return unavailableAcquisitionDiagnostic(error?.code === "ENOENT"
+      ? "missing"
+      : error instanceof SyntaxError ? "corrupt" : "unreadable");
+  }
+}
+
+async function runDoctor({ probeEndpoints = false } = {}) {
   // A live backoff would make an alert probe silently skip and report nothing,
   // which is the opposite of what a diagnostic run is for.
   alertBackoff.clear();
 
-  const probes = doctorProbePlan();
+  const probes = probeEndpoints ? doctorProbePlan() : [];
 
   // Free checks run first. The display rate_limit read is report data only;
   // admission re-reads its GraphQL source after owning the shared claim.
@@ -6093,22 +6323,28 @@ async function runDoctor() {
     gitRemoteUrls(),
   ]);
   const effectiveHost = effectiveRuntimeHost({ remoteUrls });
-  runtimeIdentityCoordinator = createIdentityCoordinator({ host: effectiveHost });
-  const verified = await runtimeIdentityCoordinator.refresh();
-  const verifiedIdentity = runtimeIdentityCoordinator.current();
-  const authStatus = verifiedIdentity
-    ? `${verifiedIdentity.host}: ${verifiedIdentity.login} (verified)`
-    : runtimeHasNoRepositoryTarget(remoteUrls) ? NO_REPOSITORY_TARGET_REPORT : identityCoordinationMessage(verified.reason);
-  const resources = verifiedIdentity ? await readRateLimitResources(undefined, effectiveHost).catch(() => null) : null;
+  runtimeIdentityCoordinator = probeEndpoints ? createIdentityCoordinator({ host: effectiveHost }) : null;
+  const verified = probeEndpoints
+    ? await runtimeIdentityCoordinator.refresh()
+    : { ok: false, reason: "probe-disabled" };
+  const verifiedIdentity = runtimeIdentityCoordinator?.current() ?? null;
+  const authStatus = !probeEndpoints
+    ? "not probed (--probe not requested)"
+    : verifiedIdentity
+      ? `${verifiedIdentity.host}: ${verifiedIdentity.login} (verified)`
+      : runtimeHasNoRepositoryTarget(remoteUrls) ? NO_REPOSITORY_TARGET_REPORT : identityCoordinationMessage(verified.reason);
+  const resources = probeEndpoints && verifiedIdentity
+    ? await readRateLimitResources(undefined, effectiveHost).catch(() => null)
+    : null;
   const budget = resources
     ? await rateBudget(resources)
     : { core: "unavailable", graphql: "unavailable" };
-  const scopeResult = verifiedIdentity
+  const scopeResult = probeEndpoints && verifiedIdentity
     ? { ok: true, value: createQuotaScope(verifiedIdentity, { root: runtimeIdentityCoordinator.root, identityProvider: runtimeIdentityCoordinator.current }) }
     : verified;
   let governorResult = scopeResult;
   let results = [];
-  if (scopeResult.ok) {
+  if (probeEndpoints && scopeResult.ok) {
     const scope = scopeResult.value;
     const leaseId = governorId();
     const nowMs = Date.now();
@@ -6160,7 +6396,10 @@ async function runDoctor() {
       governorResult = inspectGovernor(cleanup, Date.now());
     }
   }
-  const governor = governorHealth(governorResult, Date.now());
+  const governor = probeEndpoints
+    ? governorHealth(governorResult, Date.now())
+    : { status: "not inspected (--probe not requested)", leases: 0, resources: {} };
+  const acquisitionDiagnostic = doctorAcquisitionDiagnostic();
 
   const lines = [
     "gh-glance doctor",
@@ -6213,11 +6452,35 @@ async function runDoctor() {
       );
     }),
     "",
+    ...section("Acquisition metrics"),
+    field("source", acquisitionDiagnostic?.source ?? "standalone"),
+    field("status", acquisitionDiagnostic?.status ?? "unavailable"),
+    field("epoch", acquisitionDiagnostic?.epoch ?? "unavailable"),
+    field("active queries", acquisitionDiagnostic?.activeQueries ?? 0),
+    field("subscribers", acquisitionDiagnostic?.activeSubscribers ?? 0),
+    field("HTTP attempts", acquisitionDiagnostic?.metrics.httpRequests ?? 0),
+    field("failed requests", acquisitionDiagnostic?.metrics.failedRequests ?? 0),
+    field("REST actual 200/304", `${acquisitionDiagnostic?.metrics.rest200 ?? 0}/${acquisitionDiagnostic?.metrics.rest304 ?? 0}`),
+    field("proven actual units", `${acquisitionDiagnostic?.metrics.coreUnits ?? 0} core + ${acquisitionDiagnostic?.metrics.graphqlUnits ?? 0} GraphQL`),
+    field("conservative outstanding", `${acquisitionDiagnostic?.metrics.uncertainCoreUnits ?? 0} core + ${acquisitionDiagnostic?.metrics.uncertainGraphqlUnits ?? 0} GraphQL`),
+    field("observer calls", acquisitionDiagnostic?.metrics.observerCalls ?? 0),
+    field("cache/followers", `${acquisitionDiagnostic?.metrics.cacheHits ?? 0}/${acquisitionDiagnostic?.metrics.joinedFollowers ?? 0}`),
+    field("queue wait (measured)", `${acquisitionDiagnostic?.metrics.queueWaitMs ?? 0}ms`),
+    ...((acquisitionDiagnostic?.queries ?? []).flatMap((query) => [
+      field("query", `${query.resource}: ${query.hold ?? "open"}`),
+      field("last success", query.lastSuccessAt ? new Date(query.lastSuccessAt).toISOString() : "never"),
+      field("last change", query.lastChangedAt ? new Date(query.lastChangedAt).toISOString() : "never"),
+      field("next due", query.nextDueAt ? new Date(query.nextDueAt).toISOString() : "unknown"),
+      field("consumers", query.coalescedConsumers),
+    ])),
+    "",
     ...section("Environment"),
     ...doctorEnvNames().map((name) => field(name, envValue(name))),
     "",
     ...section("Endpoint probes"),
   ];
+
+  if (!probeEndpoints) lines.push("  disabled (use --doctor --probe)", "");
 
   const probeLine = (label, value) => lines.push(`  ${field(label, value, PROBE_LABEL_WIDTH)}`);
   for (const result of results) {
@@ -6318,6 +6581,7 @@ function parseArgs(argv) {
     help: false,
     showVersion: false,
     doctor: false,
+    probe: false,
     repo: null,
     refresh: null,
     // Which surface supplied `refresh`, so validateArgs can name it in the
@@ -6351,6 +6615,7 @@ function parseArgs(argv) {
     else if (arg === "--version") opts.showVersion = true;
     else if (arg === "--verbose") opts.verbose = true;
     else if (arg === "--doctor") opts.doctor = true;
+    else if (arg === "--probe") opts.probe = true;
     else if (arg === "--repo" || arg === "-R" || arg.startsWith("--repo=")) {
       opts.repo = takeValue("--repo");
     } else if (arg === "--refresh" || arg.startsWith("--refresh=")) {
@@ -6395,11 +6660,13 @@ function validateArgs(opts, tabKeys) {
   if (opts.background !== null && !BACKGROUND_MODES.includes(opts.background)) {
     throw new Error(`--background must be one of ${BACKGROUND_MODES.join(", ")}, got: ${opts.background}`);
   }
+  if (opts.probe && !opts.doctor) throw new Error("--probe requires --doctor");
 
   return {
     help: opts.help,
     showVersion: opts.showVersion,
     doctor: opts.doctor,
+    probe: opts.probe,
     repo: slug,
     host,
     refreshMs,
@@ -6479,6 +6746,7 @@ Usage:
   gh-glance --background off    Poll only the tab you are looking at
   gh-glance --verbose 2>log     Log every gh call to a file (see below)
   gh-glance --doctor            Print a diagnostic report and exit
+  gh-glance --doctor --probe    Run bounded, admitted GitHub capability probes
   gh-glance --help              Show this help
   gh-glance --version           Show the version
 
@@ -6503,9 +6771,10 @@ Options:
                            must be redirected -- writing it to the terminal
                            would draw over the dashboard, so this refuses to
                            start otherwise.
-  --doctor                 Gather versions, authenticated hosts, the resolved
-                           repo target, API governor health and one safely
-                           admitted probe per endpoint, then exit.
+  --doctor                 Inspect local versions, configuration, acquisition
+                           freshness and metrics without GitHub API requests.
+  --probe                  With --doctor, run one bounded, safely admitted
+                           capability probe per endpoint.
                            Safe to redirect to a file and share -- tokens are
                            never printed, proxy credentials are stripped, and
                            no response bodies are included.
@@ -6613,7 +6882,7 @@ if (IS_MAIN) {
   // missing gh and a cwd outside a repository are exactly the conditions worth
   // reporting rather than exiting 3 over.
   if (opts.doctor) {
-    console.log(await runDoctor());
+    console.log(await runDoctor({ probeEndpoints: opts.probe }));
     process.exit(0);
   }
 
@@ -8200,7 +8469,6 @@ function shouldCheckpointFreshness({ persistedAt, completedAt }) {
 // This store is data coordination, not quota authority. It may be discarded as
 // a unit with its validators, but an inability to claim it must never fall back
 // to an independent request: that would defeat its only security property.
-const ACQUISITION_STORE_VERSION = 1;
 const ACQUISITION_CLAIM_TTL_MS = 45_000;
 const ACQUISITION_HEARTBEAT_MS = 10_000;
 const ACQUISITION_INSPECT_MS = 1_000;
@@ -8219,9 +8487,251 @@ function emptyAcquisitionStore() {
   return {
     version: ACQUISITION_STORE_VERSION,
     producerEpoch: governorId(),
+    metrics: emptyAcquisitionMetrics(),
+    uncertainReceipts: {},
     subscriptions: {},
     queries: {},
     aliases: {},
+  };
+}
+
+function emptyAcquisitionMetrics() {
+  return Object.fromEntries(ACQUISITION_METRIC_KEYS.map((key) => [key, 0]));
+}
+
+function normalizeAcquisitionMetrics(raw, { partial = false } = {}) {
+  if (raw === undefined && !partial) return emptyAcquisitionMetrics();
+  if (!isRecord(raw) || Object.keys(raw).some((key) => !ACQUISITION_METRIC_KEYS.includes(key))) return null;
+  const metrics = partial ? {} : emptyAcquisitionMetrics();
+  for (const key of ACQUISITION_METRIC_KEYS) {
+    if (!Object.hasOwn(raw, key)) continue;
+    if (!Number.isSafeInteger(raw[key]) || raw[key] < 0) return null;
+    metrics[key] = raw[key];
+  }
+  return metrics;
+}
+
+function acquisitionMetricState(state) {
+  state.metrics ??= emptyAcquisitionMetrics();
+  return state.metrics;
+}
+
+function removeAcquisitionReceipt(state, id) {
+  const receipt = state.uncertainReceipts?.[id];
+  if (!receipt) return false;
+  const metrics = acquisitionMetricState(state);
+  const key = receipt.resource === "core" ? "uncertainCoreUnits" : "uncertainGraphqlUnits";
+  metrics[key] = Math.max(0, metrics[key] - receipt.units);
+  delete state.uncertainReceipts[id];
+  for (const record of Object.values(state.queries ?? {})) {
+    if (record.claim?.receiptIds?.includes(id)) {
+      record.claim.receiptIds = record.claim.receiptIds.filter((receiptId) => receiptId !== id);
+    }
+  }
+  return true;
+}
+
+function addAcquisitionReceipt(state, receipt) {
+  state.uncertainReceipts ??= {};
+  if (state.uncertainReceipts[receipt.id]) return true;
+  if (Object.keys(state.uncertainReceipts).length >= ACQUISITION_MAX_UNCERTAIN_RECEIPTS) return false;
+  state.uncertainReceipts[receipt.id] = receipt;
+  const metrics = acquisitionMetricState(state);
+  const key = receipt.resource === "core" ? "uncertainCoreUnits" : "uncertainGraphqlUnits";
+  metrics[key] += receipt.units;
+  return true;
+}
+
+function normalizeAcquisitionReceipt(raw, expectedId = raw?.id) {
+  if (!isRecord(raw) || raw.id !== expectedId || typeof raw.id !== "string" || raw.id.length > 240 ||
+      typeof raw.reservationId !== "string" || raw.reservationId.length < 1 ||
+      raw.reservationId.length > 200 || typeof raw.accessKey !== "string" ||
+      raw.accessKey.length < 1 || raw.accessKey.length > 128 || !RATE_RESOURCES.includes(raw.resource) ||
+      typeof raw.epoch !== "string" || raw.epoch.length < 1 || raw.epoch.length > 128 ||
+      !Number.isSafeInteger(raw.units) || raw.units < 1 || !Number.isFinite(raw.startedAt)) return null;
+  return { ...raw };
+}
+
+function addAcquisitionMetrics(state, delta) {
+  const normalized = normalizeAcquisitionMetrics(delta, { partial: true });
+  if (normalized === null) return false;
+  const metrics = acquisitionMetricState(state);
+  for (const [key, value] of Object.entries(normalized)) metrics[key] += value;
+  return true;
+}
+
+function addAcquisitionRequestMetrics(state, delta) {
+  const observed = Object.fromEntries(Object.entries(delta ?? {}).filter(([key]) =>
+    key !== "uncertainCoreUnits" && key !== "uncertainGraphqlUnits"));
+  return addAcquisitionMetrics(state, observed);
+}
+
+function releaseAcquisitionUncertainty(state, record) {
+  if (!record?.claim?.started) return;
+  const receiptIds = record.claim.receiptIds ?? [];
+  if (Object.hasOwn(record.claim, "receiptIds")) {
+    for (const id of receiptIds) removeAcquisitionReceipt(state, id);
+    return;
+  }
+  const costs = tabRequestCost(record.query.resource);
+  const metrics = acquisitionMetricState(state);
+  metrics.uncertainCoreUnits = Math.max(0, metrics.uncertainCoreUnits - costs.core);
+  metrics.uncertainGraphqlUnits = Math.max(0, metrics.uncertainGraphqlUnits - costs.graphql);
+}
+
+function releaseKnownAcquisitionUncertainty(state, record, requestMetrics) {
+  if (!record?.claim?.started) return;
+  const receiptIds = record.claim.receiptIds ?? [];
+  if (Object.hasOwn(record.claim, "receiptIds")) {
+    for (const resource of RATE_RESOURCES) {
+      const metricKey = resource === "core" ? "coreUnits" : "graphqlUnits";
+      const uncertainKey = resource === "core" ? "uncertainCoreUnits" : "uncertainGraphqlUnits";
+      const resourceReceipts = receiptIds
+        .map((id) => state.uncertainReceipts?.[id])
+        .filter((receipt) => receipt?.resource === resource);
+      if (Object.hasOwn(requestMetrics, uncertainKey)) {
+        let remaining = requestMetrics[uncertainKey];
+        for (const receipt of resourceReceipts) {
+          const retained = Math.min(receipt.units, remaining);
+          const released = receipt.units - retained;
+          remaining -= retained;
+          if (retained === 0) removeAcquisitionReceipt(state, receipt.id);
+          else if (released > 0) {
+            receipt.units = retained;
+            acquisitionMetricState(state)[uncertainKey] -= released;
+          }
+        }
+        continue;
+      }
+      if (Object.hasOwn(requestMetrics, metricKey)) {
+        for (const receipt of resourceReceipts) removeAcquisitionReceipt(state, receipt.id);
+      }
+    }
+    return;
+  }
+  const declared = tabRequestCost(record.query.resource);
+  const metrics = acquisitionMetricState(state);
+  if (Object.hasOwn(requestMetrics, "uncertainCoreUnits")) {
+    metrics.uncertainCoreUnits = Math.min(declared.core, requestMetrics.uncertainCoreUnits);
+  } else if (Object.hasOwn(requestMetrics, "coreUnits")) {
+    metrics.uncertainCoreUnits = Math.max(0, metrics.uncertainCoreUnits - declared.core);
+  }
+  if (Object.hasOwn(requestMetrics, "uncertainGraphqlUnits")) {
+    metrics.uncertainGraphqlUnits = Math.min(declared.graphql, requestMetrics.uncertainGraphqlUnits);
+  } else if (Object.hasOwn(requestMetrics, "graphqlUnits")) {
+    metrics.uncertainGraphqlUnits = Math.max(0, metrics.uncertainGraphqlUnits - declared.graphql);
+  }
+}
+
+function settleAcquisitionWaiters(state, queryKey, generation, at) {
+  let queueWaitMs = 0;
+  for (const subscription of Object.values(state.subscriptions)) {
+    if (subscription.queryKey !== queryKey || subscription.waitingGeneration !== generation ||
+        !Number.isFinite(subscription.waitingSinceAt)) continue;
+    queueWaitMs += Math.max(0, Math.floor(at - subscription.waitingSinceAt));
+    subscription.waitingGeneration = null;
+    subscription.waitingSinceAt = null;
+  }
+  acquisitionMetricState(state).queueWaitMs += queueWaitMs;
+}
+
+function settleInvalidAcquisitionPublication(state, record, claim, requestMetrics, receipts, at) {
+  const normalized = requestMetrics ?? {};
+  addAcquisitionRequestMetrics(state, {
+    ...normalized,
+    failedRequests: Math.max(1, normalized.failedRequests ?? 0),
+  });
+  releaseKnownAcquisitionUncertainty(state, record, normalized);
+  for (const receipt of receipts ?? []) addAcquisitionReceipt(state, receipt);
+  settleAcquisitionWaiters(state, record.query.queryKey, claim.generation, at);
+  record.claim = null;
+  record.hold = { reason: "primary", at };
+  record.lastUsedAt = at;
+}
+
+function normalizeAcquisitionHold(raw) {
+  if (raw === null || raw === undefined) return null;
+  if (!isRecord(raw) || !ACQUISITION_HOLD_REASONS.has(raw.reason) || !Number.isFinite(raw.at)) return null;
+  return { reason: raw.reason, at: raw.at };
+}
+
+function acquisitionHold(record, subscriptions = []) {
+  if (subscriptions.length === 0 && record?.snapshot) return "cache-only";
+  const persisted = normalizeAcquisitionHold(record?.hold)?.reason ?? null;
+  if (persisted) return persisted;
+  const waiting = subscriptions.some((subscription) =>
+    subscription.waitingGeneration === record?.claim?.generation &&
+    Number.isFinite(subscription.waitingSinceAt));
+  if (record?.claim && waiting) return "shared-wait";
+  if (record?.claim) return "coordination";
+  return null;
+}
+
+function acquisitionDiagnostics(state, { source = "standalone", nowMs = Date.now() } = {}) {
+  const normalizedSource = ["standalone", "local collector", "SSH collector"].includes(source)
+    ? source : "standalone";
+  const subscriptions = Object.values(state?.subscriptions ?? {}).filter((subscription) =>
+    Number.isFinite(subscription?.expiresAt) && subscription.expiresAt > nowMs);
+  const subscriptionsByQuery = new Map();
+  for (const subscription of subscriptions) {
+    const grouped = subscriptionsByQuery.get(subscription.queryKey) ?? [];
+    grouped.push(subscription);
+    subscriptionsByQuery.set(subscription.queryKey, grouped);
+  }
+  const activeQueryKeys = new Set(subscriptions.map((subscription) => subscription.queryKey));
+  const queries = Object.values(state?.queries ?? {}).map((record) => {
+    const snapshot = record.snapshot;
+    const consumers = subscriptionsByQuery.get(record.query.queryKey) ?? [];
+    return {
+      resource: record.query.resource,
+      lastSuccessAt: snapshot?.lastSuccessAt ?? null,
+      lastChangedAt: snapshot?.lastChangedAt ?? null,
+      nextDueAt: snapshot?.nextDueAt ?? null,
+      hold: acquisitionHold(record, consumers),
+      observedRequests: state?.metrics?.httpRequests ?? 0,
+      provenPrimaryCost: {
+        core: state?.metrics?.coreUnits ?? 0,
+        graphql: state?.metrics?.graphqlUnits ?? 0,
+      },
+      uncertainCost: {
+        core: state?.metrics?.uncertainCoreUnits ?? 0,
+        graphql: state?.metrics?.uncertainGraphqlUnits ?? 0,
+      },
+      coalescedConsumers: consumers.length,
+    };
+  });
+  return {
+    source: normalizedSource,
+    status: "healthy",
+    epoch: validGovernorId(state?.producerEpoch) ? state.producerEpoch : null,
+    activeQueries: activeQueryKeys.size,
+    activeSubscribers: subscriptions.length,
+    metrics: normalizeAcquisitionMetrics(state?.metrics) ?? emptyAcquisitionMetrics(),
+    queries,
+  };
+}
+
+function acquisitionFailureHold(error) {
+  if (SECONDARY_LIMIT_PATTERN.test(errText(error))) return "secondary";
+  if (isRateLimited(error) || /API budget paused/i.test(errText(error))) return "primary";
+  const attemptedHttp = Number.isSafeInteger(error?.requestMetrics?.httpRequests) &&
+    error.requestMetrics.httpRequests > 0;
+  if ((!error?.apiResponse && !attemptedHttp) || isAuthProblem(error)) return "disconnected";
+  return "primary";
+}
+
+function acquisitionRequestMetrics(result) {
+  if (result?.requestMetrics) return mergeAcquisitionRequestMetrics(result.requestMetrics);
+  const httpRequests = result?.httpRequests ?? 0;
+  const rest200 = result?.rest200 ?? result?.restSpent ?? 0;
+  const rest304 = result?.restNotModified ?? 0;
+  return {
+    httpRequests,
+    rest200,
+    rest304,
+    coreUnits: result?.coreUnitsTotal ?? result?.restSpent ?? 0,
+    graphqlUnits: result?.graphqlSpentTotal ?? result?.graphqlSpent ?? 0,
+    failedRequests: result?.failedRequests ?? 0,
   };
 }
 
@@ -8334,6 +8844,7 @@ function admitAcquisitionRepositoryIdentity(state, evidence) {
     generation,
     claim: { ...claimed, generation: generation + 1 },
     snapshot,
+    hold: related.map(([, record]) => record.hold).find(Boolean) ?? null,
     lastUsedAt: Math.max(...related.map(([, record]) => record.lastUsedAt)),
   };
   const remapped = {};
@@ -8349,6 +8860,9 @@ function admitAcquisitionRepositoryIdentity(state, evidence) {
     const unsatisfied = subscription.requestedGeneration > oldRecord.generation;
     subscription.queryKey = canonicalQuery.queryKey;
     subscription.requestedGeneration = unsatisfied ? merged.claim.generation : generation;
+    if (subscription.waitingGeneration !== null) {
+      subscription.waitingGeneration = merged.claim.generation;
+    }
   }
   state.aliases[acquisitionAliasKey(host, repository)] = identity.id;
   state.aliases[acquisitionAliasKey(host, identity.nameWithOwner)] = identity.id;
@@ -8530,10 +9044,28 @@ function normalizeAcquisitionStore(raw) {
   const state = {
     version: ACQUISITION_STORE_VERSION,
     producerEpoch: raw.producerEpoch,
+    metrics: normalizeAcquisitionMetrics(raw.metrics),
+    uncertainReceipts: {},
     subscriptions: {},
     queries: {},
     aliases: {},
   };
+  if (state.metrics === null) return null;
+  const receipts = raw.uncertainReceipts ?? {};
+  if (!isRecord(receipts) || Object.keys(receipts).length > ACQUISITION_MAX_UNCERTAIN_RECEIPTS) return null;
+  for (const [id, receipt] of Object.entries(receipts)) {
+    const normalized = normalizeAcquisitionReceipt(receipt, id);
+    if (!normalized) return null;
+    state.uncertainReceipts[id] = normalized;
+  }
+  if (raw.uncertainReceipts !== undefined) {
+    const outstanding = Object.values(state.uncertainReceipts).reduce((total, receipt) => {
+      total[receipt.resource] += receipt.units;
+      return total;
+    }, { core: 0, graphql: 0 });
+    if (state.metrics.uncertainCoreUnits !== outstanding.core ||
+        state.metrics.uncertainGraphqlUnits !== outstanding.graphql) return null;
+  }
   for (const [key, value] of Object.entries(raw.aliases)) {
     if (typeof key !== "string" || typeof value !== "string") return null;
     state.aliases[key] = value;
@@ -8551,14 +9083,20 @@ function normalizeAcquisitionStore(raw) {
           candidate.generation !== value.generation + 1 || !Number.isFinite(candidate.claimedAt) ||
           !Number.isFinite(candidate.leaseUntil) || candidate.leaseUntil < candidate.claimedAt ||
           typeof candidate.started !== "boolean") return null;
-      claim = { ...candidate };
+      const hasReceiptIds = Object.hasOwn(candidate, "receiptIds");
+      const receiptIds = candidate.receiptIds ?? [];
+      if (!Array.isArray(receiptIds) || receiptIds.some((id) => typeof id !== "string" ||
+          !state.uncertainReceipts[id])) return null;
+      claim = { ...candidate, ...(hasReceiptIds ? { receiptIds } : {}) };
     }
     const snapshot = value.snapshot === null ? null
       : value.snapshot?.artifact
         ? normalizeAcquisitionSnapshotRef(value.snapshot, query.queryKey, value.generation)
         : normalizeAcquisitionSnapshot(value.snapshot, query, value.generation, raw.producerEpoch);
     if (value.snapshot !== null && !snapshot) return null;
-    state.queries[key] = { query, generation: value.generation, claim, snapshot, lastUsedAt: value.lastUsedAt };
+    const hold = normalizeAcquisitionHold(value.hold);
+    if (value.hold !== undefined && value.hold !== null && hold === null) return null;
+    state.queries[key] = { query, generation: value.generation, claim, snapshot, hold, lastUsedAt: value.lastUsedAt };
   }
   for (const [id, value] of Object.entries(raw.subscriptions)) {
     const demand = normalizeAcquisitionDemand(value?.demand);
@@ -8571,7 +9109,19 @@ function normalizeAcquisitionStore(raw) {
         !Number.isSafeInteger(requestedGeneration) || requestedGeneration < 0 ||
         requestedGeneration > record.generation + 1 ||
         !Number.isFinite(value.expiresAt) || !Number.isFinite(value.lastSeenAt)) return null;
-    state.subscriptions[id] = { ...value, demand, requestedGeneration };
+    const waitingGeneration = value.waitingGeneration ?? null;
+    const waitingSinceAt = value.waitingSinceAt ?? null;
+    if (waitingGeneration !== null && (!Number.isSafeInteger(waitingGeneration) ||
+        waitingGeneration < 1 || waitingGeneration > record.generation + 1 ||
+        !Number.isFinite(waitingSinceAt))) return null;
+    if (waitingGeneration === null && waitingSinceAt !== null) return null;
+    state.subscriptions[id] = {
+      ...value,
+      demand,
+      requestedGeneration,
+      waitingGeneration,
+      waitingSinceAt,
+    };
   }
   if (Object.keys(state.subscriptions).length > ACQUISITION_MAX_SUBSCRIPTIONS ||
       Object.keys(state.queries).length > ACQUISITION_MAX_ENTITIES) return null;
@@ -8973,7 +9523,14 @@ function createAcquisitionEngine({
         return { ok: false, reason: "capacity" };
       }
       const existingQuery = state.queries[queryKey];
-      state.queries[queryKey] ??= { query, generation: 0, claim: null, snapshot: null, lastUsedAt: now() };
+      state.queries[queryKey] ??= {
+        query,
+        generation: 0,
+        claim: null,
+        snapshot: null,
+        hold: null,
+        lastUsedAt: now(),
+      };
       if (!trimAcquisitionStore(state, queryKey)) {
         if (!existingQuery) delete state.queries[queryKey];
         return { ok: false, reason: "capacity" };
@@ -8986,10 +9543,13 @@ function createAcquisitionEngine({
         queryKey,
         demand,
         requestedGeneration,
+        waitingGeneration: null,
+        waitingSinceAt: null,
         lastSeenAt: now(),
         expiresAt: now() + ACQUISITION_CLAIM_TTL_MS,
       };
       state.queries[queryKey].lastUsedAt = now();
+      if (existingQuery?.snapshot) acquisitionMetricState(state).cacheHits += 1;
       return { value: { id, queryKey, snapshot: state.queries[queryKey].snapshot } };
     });
     if (!result.ok) return result;
@@ -9049,6 +9609,14 @@ function createAcquisitionEngine({
         record = state.queries[remapped[item.queryKey] ?? item.queryKey];
         effectiveClaim = { ...claim, generation: admitted.generation };
       }
+      const requestMetrics = produced?.requestMetrics === undefined
+        ? {}
+        : normalizeAcquisitionMetrics(produced.requestMetrics, { partial: true });
+      const receiptInputs = produced?.uncertainReceipts ?? [];
+      const receipts = Array.isArray(receiptInputs)
+        ? receiptInputs.map((receipt) => normalizeAcquisitionReceipt(receipt)) : null;
+      const receiptsValid = receipts && !receipts.includes(null) &&
+        receipts.every((receipt) => receipt.accessKey === record.query.accessKey);
       const loadedPrevious = loadRecordSnapshot(record);
       if (!loadedPrevious.ok) return loadedPrevious;
       if (loadedPrevious.value) record.snapshot = loadedPrevious.value;
@@ -9062,14 +9630,24 @@ function createAcquisitionEngine({
         snapshot = { ...snapshot, lastChangedAt: loadedPrevious.value.lastChangedAt };
       }
       if (!snapshot) {
-        record.claim = null;
+        settleInvalidAcquisitionPublication(state, record, effectiveClaim, requestMetrics, receiptsValid ? receipts : [], now());
         return { value: { ok: false, reason: "invalid" } };
       }
       const previous = record.snapshot;
       const previousClaim = record.claim;
+      if (requestMetrics === null || !receiptsValid) {
+        settleInvalidAcquisitionPublication(state, record, effectiveClaim, requestMetrics ?? {}, [], now());
+        return { value: { ok: false, reason: "invalid" } };
+      }
+      const receiptIds = new Set(Object.keys(state.uncertainReceipts ?? {}));
+      const novelReceipts = receipts.filter((receipt) => !receiptIds.has(receipt.id));
+      if (receiptIds.size + novelReceipts.length > ACQUISITION_MAX_UNCERTAIN_RECEIPTS) {
+        return { value: { ok: false, reason: "capacity", retryClaim: effectiveClaim, remapped } };
+      }
       record.generation = effectiveClaim.generation;
       record.snapshot = snapshot;
       record.claim = null;
+      record.hold = null;
       record.lastUsedAt = now();
       if (!trimAcquisitionStore(state, record.query.queryKey)) {
         record.snapshot = previous;
@@ -9077,6 +9655,15 @@ function createAcquisitionEngine({
         record.claim = previousClaim;
         return { value: { ok: false, reason: "capacity", retryClaim: effectiveClaim, remapped } };
       }
+      if (Object.hasOwn(requestMetrics, "uncertainCoreUnits") ||
+          Object.hasOwn(requestMetrics, "uncertainGraphqlUnits")) {
+        releaseKnownAcquisitionUncertainty(state, { ...record, claim: previousClaim }, requestMetrics);
+      } else {
+        releaseAcquisitionUncertainty(state, { ...record, claim: previousClaim });
+      }
+      addAcquisitionRequestMetrics(state, requestMetrics);
+      for (const receipt of receipts) addAcquisitionReceipt(state, receipt);
+      settleAcquisitionWaiters(state, record.query.queryKey, effectiveClaim.generation, now());
       return { value: { ok: true, value: { role: "producer", snapshot,
         queryKey: record.query.queryKey, remapped } } };
     });
@@ -9123,6 +9710,65 @@ function createAcquisitionEngine({
     return value;
   }
 
+  function settleFailure(id, claim, failure) {
+    const item = local.get(id);
+    const requestMetrics = normalizeAcquisitionMetrics(failure?.requestMetrics ?? {}, { partial: true });
+    const receipts = Array.isArray(failure?.uncertainReceipts ?? [])
+      ? (failure?.uncertainReceipts ?? []).map((receipt) => normalizeAcquisitionReceipt(receipt)) : null;
+    const hold = failure?.hold ?? "primary";
+    if (!item || !isRecord(claim) || requestMetrics === null || !receipts || receipts.includes(null) ||
+        !ACQUISITION_HOLD_REASONS.has(hold)) {
+      return { ok: false, reason: "invalid" };
+    }
+    const result = transact((state) => {
+      const record = state.queries[item.queryKey];
+      if (!record || record.claim?.nonce !== claim.nonce || record.claim.generation !== claim.generation) {
+        return { value: { ok: false, reason: "stale", definitive: true } };
+      }
+      if (receipts.some((receipt) => receipt.accessKey !== record.query.accessKey) ||
+          Object.keys(state.uncertainReceipts ?? {}).length +
+            receipts.filter((receipt) => !state.uncertainReceipts?.[receipt.id]).length >
+              ACQUISITION_MAX_UNCERTAIN_RECEIPTS) return { ok: false, reason: "capacity" };
+      addAcquisitionRequestMetrics(state, requestMetrics);
+      releaseKnownAcquisitionUncertainty(state, record, requestMetrics);
+      for (const receipt of receipts) addAcquisitionReceipt(state, receipt);
+      settleAcquisitionWaiters(state, record.query.queryKey, claim.generation, now());
+      record.claim = null;
+      record.hold = { reason: hold, at: now() };
+      record.lastUsedAt = now();
+      return { value: { ok: true, value: true, definitive: true } };
+    });
+    const rawResult = result.ok ? result.value : result;
+    const { definitive: _definitive, ...value } = rawResult;
+    if (result.ok && _definitive === true) {
+      item.claimNonce = null;
+      item.pending = null;
+    } else {
+      item.pending = { kind: "failure", claim, failure };
+    }
+    releaseDetachedLocal(id, item);
+    return value;
+  }
+
+  function setHold(id, reason, expected = null) {
+    const item = local.get(id);
+    if (!item || reason !== null && !ACQUISITION_HOLD_REASONS.has(reason) ||
+        expected !== null && (!isRecord(expected) || !TAB_KEYS.includes(expected.resource) ||
+          typeof expected.accessKey !== "string" || expected.accessKey.length === 0)) {
+      return { ok: false, reason: "invalid" };
+    }
+    return transact((state) => {
+      const record = state.queries[item.queryKey];
+      if (!record) return { ok: false, reason: "stale" };
+      if (expected && (record.query.resource !== expected.resource ||
+          record.query.accessKey !== expected.accessKey)) return { ok: false, reason: "stale-access" };
+      if ((record.hold?.reason ?? null) === reason) return { changed: false, value: true };
+      const next = reason === null ? null : { reason, at: now() };
+      record.hold = next;
+      return { value: true };
+    });
+  }
+
   function markStarted(id, claim) {
     const item = local.get(id);
     if (!item || !isRecord(claim)) return { ok: false, reason: "invalid" };
@@ -9132,7 +9778,31 @@ function createAcquisitionEngine({
         return { ok: false, reason: "stale" };
       }
       if (record.claim.started) return { changed: false, value: true };
+      const costs = tabRequestCost(record.query.resource);
+      const supplied = claim.receipt;
+      if (supplied !== undefined && (!isRecord(supplied) || supplied.accessKey !== record.query.accessKey ||
+          typeof supplied.reservationId !== "string" || supplied.reservationId.length < 1 ||
+          !isRecord(supplied.epochs))) return { ok: false, reason: "invalid" };
+      const reservationId = supplied?.reservationId ?? `claim:${record.claim.nonce}`;
+      const receiptIds = [];
+      for (const resource of RATE_RESOURCES) {
+        if (costs[resource] <= 0) continue;
+        const epoch = typeof supplied?.epochs?.[resource] === "string" && supplied.epochs[resource].length > 0
+          ? supplied.epochs[resource] : "unknown";
+        const receipt = {
+          id: `${reservationId}:${resource}`,
+          reservationId,
+          accessKey: record.query.accessKey,
+          resource,
+          epoch,
+          units: costs[resource],
+          startedAt: now(),
+        };
+        if (!addAcquisitionReceipt(state, receipt)) return { ok: false, reason: "capacity" };
+        receiptIds.push(receipt.id);
+      }
       record.claim.started = true;
+      record.claim.receiptIds = receiptIds;
       return { value: true };
     });
   }
@@ -9140,13 +9810,13 @@ function createAcquisitionEngine({
   function retryPending(id, item = local.get(id)) {
     const pending = item?.pending;
     if (!pending) return { ok: true, value: false };
-    return pending.kind === "publish"
-      ? publish(id, pending.claim, pending.produced)
-      : cancel(id, pending.claim);
+    if (pending.kind === "publish") return publish(id, pending.claim, pending.produced);
+    if (pending.kind === "failure") return settleFailure(id, pending.claim, pending.failure);
+    return cancel(id, pending.claim);
   }
 
   async function refresh(id, { force = false, acquire = null, claim = null, publish: publication,
-    cancel: cancellation = null, started = null } = {}) {
+    cancel: cancellation = null, failure = null, started = null } = {}) {
     const item = local.get(id);
     if (!item || acquire !== null && typeof acquire !== "function") return { ok: false, reason: "invalid" };
     // A retired scope cannot start new work, but its already-started producer
@@ -9154,6 +9824,7 @@ function createAcquisitionEngine({
     // durable claim. The callback was detached synchronously by unsubscribe,
     // so neither terminal action can repopulate the retired UI.
     if (publication !== undefined) return publish(id, claim, publication);
+    if (failure !== null) return settleFailure(id, claim, failure);
     if (cancellation !== null) return cancel(id, cancellation);
     if (started !== null) return markStarted(id, started);
     if (item.detached || closing) return { ok: false, reason: closing ? "closed" : "invalid" };
@@ -9184,7 +9855,13 @@ function createAcquisitionEngine({
         const expired = record.claim.leaseUntil <= now();
         const owner = acquisitionOwnerStatus(record.claim.pid, kill);
         if (!expired || owner !== "dead") {
-          return { changed: reaped > 0 || demandChanged,
+          const joined = subscription.waitingGeneration !== record.claim.generation;
+          if (joined) {
+            subscription.waitingGeneration = record.claim.generation;
+            subscription.waitingSinceAt = now();
+            acquisitionMetricState(state).joinedFollowers += 1;
+          }
+          return { changed: reaped > 0 || demandChanged || joined,
             value: { role: "follower", reason: expired ? `owner-${owner}` : "claimed",
             snapshot: record.snapshot, sharingCount: acquisitionSharingCount(state, item.queryKey) } };
         }
@@ -9198,6 +9875,9 @@ function createAcquisitionEngine({
         leaseUntil: now() + ACQUISITION_CLAIM_TTL_MS,
         started: false,
       };
+      record.hold = null;
+      subscription.waitingGeneration = null;
+      subscription.waitingSinceAt = null;
       record.lastUsedAt = now();
       return { value: { role: "producer", nonce, generation: record.claim.generation,
         query: record.query, snapshot: record.snapshot, demand: aggregateAcquisitionDemand(state, item.queryKey),
@@ -9233,7 +9913,13 @@ function createAcquisitionEngine({
       }
       produced = startedTransport.value;
     } catch (error) {
-      cancel(id, { nonce: claimed.value.nonce, generation: claimed.value.generation });
+      settleFailure(id, {
+        nonce: claimed.value.nonce,
+        generation: claimed.value.generation,
+      }, {
+        hold: acquisitionFailureHold(error),
+        requestMetrics: error?.requestMetrics ?? {},
+      });
       throw error;
     }
     return publish(id, {
@@ -9290,7 +9976,62 @@ function createAcquisitionEngine({
     finishClose();
   }
 
-  return { subscribe, updateDemand, refresh, unsubscribe, inspect, close, path };
+  function diagnostics(options = {}) {
+    const loaded = load();
+    return loaded.ok
+      ? { ok: true, value: acquisitionDiagnostics(loaded.value, { nowMs: now(), ...options }) }
+      : loaded;
+  }
+
+  function recordMetrics(delta) {
+    const metrics = normalizeAcquisitionMetrics(delta, { partial: true });
+    if (metrics === null) return { ok: false, reason: "invalid" };
+    return transact((state) => {
+      addAcquisitionMetrics(state, metrics);
+      return { value: { ...state.metrics } };
+    });
+  }
+
+  function reconcileUncertainty(accessKey, evidence) {
+    if (typeof accessKey !== "string" || accessKey.length === 0 || !isRecord(evidence)) {
+      return { ok: false, reason: "invalid" };
+    }
+    return transact((state) => {
+      let changed = false;
+      for (const [id, receipt] of Object.entries(state.uncertainReceipts ?? {})) {
+        const observed = evidence[receipt.resource];
+        if (receipt.accessKey !== accessKey || !isRecord(observed) ||
+            typeof observed.epoch !== "string" || !Number.isFinite(observed.observedAt)) continue;
+        const reset = receipt.epoch !== "unknown" && observed.epoch !== receipt.epoch;
+        if (!reset && observed.observedAt < receipt.startedAt) continue;
+        changed = removeAcquisitionReceipt(state, id) || changed;
+      }
+      return { changed, value: { ...state.metrics } };
+    });
+  }
+
+  return {
+    subscribe,
+    updateDemand,
+    refresh,
+    unsubscribe,
+    inspect,
+    diagnostics,
+    recordMetrics,
+    reconcileUncertainty,
+    setHold,
+    close,
+    path,
+  };
+}
+
+function setRuntimeAcquisitionHold(engine, subscriptions, resource, reason, accessKey) {
+  const subscription = subscriptions?.get(resource);
+  if (!subscription?.id) return { ok: false, reason: "stale" };
+  if (typeof accessKey !== "string" || accessKey.length === 0) {
+    return { ok: false, reason: "stale-access" };
+  }
+  return engine.setHold(subscription.id, reason, { resource, accessKey });
 }
 
 // The one place the cadence table is decided. It used to be spread across a
@@ -9774,6 +10515,43 @@ function rateLimitBlockProbeRecovered(pending, state, nowMs) {
 // startReservation revalidates the budget when the wait is over.
 const GOVERNOR_ADMISSION_WAIT_MS = 2_000;
 
+function measuredNestedOperationCost(operation, value) {
+  const declared = operationCost(operation);
+  if (!declared) return null;
+  const metrics = value?.requestMetrics ?? (
+    operation.startsWith("page:") ? graphqlPageRequestMetrics(value) : restResponseRequestMetrics(value)
+  );
+  const actual = { core: 0, graphql: 0 };
+  if (declared.core > 0) {
+    if (!Object.hasOwn(metrics, "coreUnits")) return null;
+    actual.core = metrics.coreUnits;
+  }
+  if (declared.graphql > 0) {
+    if (!Object.hasOwn(metrics, "graphqlUnits")) return null;
+    actual.graphql = metrics.graphqlUnits;
+  }
+  return actual;
+}
+
+function uncertainReservationReceipts(scope, reservationId, nowMs) {
+  const snapshot = inspectGovernor(scope, nowMs);
+  const reservation = snapshot.ok ? snapshot.value.reservations?.[reservationId] : null;
+  const accessKey = scope.accessKey ?? scope.hash;
+  if (!reservation || typeof accessKey !== "string") return [];
+  return RATE_RESOURCES.flatMap((resource) => {
+    if (reservation.costs[resource] <= 0) return [];
+    return [{
+      id: `${reservationId}:${resource}`,
+      reservationId,
+      accessKey,
+      resource,
+      epoch: reservation.epochs[resource],
+      units: reservation.costs[resource],
+      startedAt: reservation.startedAt,
+    }];
+  });
+}
+
 async function runAdmittedOperation({
   scope,
   leaseId,
@@ -9821,18 +10599,27 @@ async function runAdmittedOperation({
   }
   const reservationId = admitted.value.reservationId;
   const settlementScope = { ...scope, identityProvider: null };
+  const pendingReceipts = uncertainReservationReceipts(scope, reservationId, now());
   try {
     const value = await requestIdentityStorage.run(scope, () => run(signal));
-    const costs = operationCost(operation);
+    const measured = measuredNestedOperationCost(operation, value);
+    const costs = measured ?? operationCost(operation);
+    const outcome = value?.ok === false ? governorOutcomeForError(value.failure) : "measured-success";
     completeReservation(settlementScope, reservationId, {
-      outcome: "measured-success",
-      actualCost: costs,
+      outcome,
+      ...(measured || outcome === "measured-success" ? { actualCost: costs } : {}),
     }, now());
     if (scope.accessKey && scope.accessKey !== runtimeIdentityCoordinator?.current()?.accessKey) return { ok: false, error: new Error("Credential changed"), reservationId };
-    return { ok: true, value, reservationId };
+    return { ok: true, value, reservationId,
+      uncertainReceipts: measured ? [] : pendingReceipts };
   } catch (error) {
-    completeReservation(settlementScope, reservationId, { outcome: governorOutcomeForError(error) }, now());
-    return { ok: false, error, reservationId };
+    const actualCost = measuredNestedOperationCost(operation, { requestMetrics: error?.requestMetrics });
+    const uncertainReceipts = actualCost ? [] : pendingReceipts;
+    completeReservation(settlementScope, reservationId, {
+      outcome: governorOutcomeForError(error),
+      ...(actualCost ? { actualCost } : {}),
+    }, now());
+    return { ok: false, error, reservationId, uncertainReceipts };
   }
 }
 
@@ -10045,6 +10832,9 @@ function refreshStatus({
   governorDecision = null,
   activeError = null,
   securityIncomplete = false,
+  sharedData = false,
+  stale = false,
+  disconnected = false,
   screenReader = false,
 } = {}) {
   const status = (kind, glyphKind, label, tone, animate = false, detailKind = null) => ({
@@ -10073,6 +10863,11 @@ function refreshStatus({
   if (mode === "paused" || activeError?.verdict === "rate-limited") {
     return status("paused", "paused", "Paused", "attention", false, detailKind);
   }
+  if (disconnected) {
+    return status("disconnected", "failed", "Disconnected", "attention", false, stale ? "stale" : null);
+  }
+  if (stale) return status("stale", "limited", "Stale", "attention", false, "stale");
+  if (sharedData) return status("shared", "watching", "Shared", "inert", false, "sharing");
   if (["waiting", "pending", "probe"].includes(mode)) {
     const sharing = sharedLaneProvenance(governorDecision).waitCause === "shared-lane";
     const watchingDetail = sharing
@@ -10243,6 +11038,7 @@ function sameVisibleGovernorDecision(left, right) {
     "detailKind",
     "waitCause",
     "sharingCount",
+    "sharedData",
     "coordinationError",
     "reservationId",
   ]) {
@@ -11138,7 +11934,23 @@ function App({ onCreateRemote = () => {} } = {}) {
       return null;
     }
 
-    function pauseCoordination(key, reason) {
+    function pauseCoordination(key, reason, diagnosticHold = null) {
+      const hold = diagnosticHold ?? (
+        /secondary|abuse/.test(reason ?? "")
+          ? "secondary"
+          : /budget-reset|rate-limit|reset/.test(reason ?? "")
+            ? "primary"
+            : /identity|unknown-scope|credential/.test(reason ?? "")
+              ? "disconnected"
+              : "coordination"
+      );
+      setRuntimeAcquisitionHold(
+        acquisitionEngine,
+        acquisitionSubscriptions,
+        key,
+        hold,
+        identity()?.accessKey ?? null,
+      );
       setTabGovernorDecision(key, {
         mode: "paused",
         reason: reason ?? "unavailable",
@@ -11164,7 +11976,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         return;
       }
       if (!refreshed?.ok) {
-        pauseCoordination(key, refreshed?.reason);
+        pauseCoordination(key, refreshed?.reason, "observer");
         return;
       }
       if (!snapshot?.ok) {
@@ -11207,6 +12019,15 @@ function App({ onCreateRemote = () => {} } = {}) {
         if (decision.mode === "open") continue;
         const resetHold = ["budget-reset", "reset", "rate-limit"].includes(decision.reason) ||
           budget?.blockUntil > nowMs;
+        setRuntimeAcquisitionHold(
+          acquisitionEngine,
+          acquisitionSubscriptions,
+          key,
+          /secondary|abuse/.test(budget?.blockReason ?? decision.reason ?? "")
+            ? "secondary"
+            : resetHold || decision.mode === "paused" ? "primary" : "coordination",
+          identity()?.accessKey ?? null,
+        );
         setTabGovernorDecision(key, {
           mode: resetHold || decision.mode === "paused" ? "paused" : "waiting",
           reason: decision.reason,
@@ -11215,7 +12036,34 @@ function App({ onCreateRemote = () => {} } = {}) {
         });
         return;
       }
+      setRuntimeAcquisitionHold(
+        acquisitionEngine,
+        acquisitionSubscriptions,
+        key,
+        null,
+        identity()?.accessKey ?? null,
+      );
       setTabGovernorDecision(key, null);
+    }
+
+    async function refreshRuntimeBudget(currentScope) {
+      let observerCalls = 0;
+      const refreshed = await refreshSharedBudget(currentScope, leaseId, controller.signal, {
+        onObserverCall: () => { observerCalls += 1; },
+      });
+      if (observerCalls > 0) acquisitionEngine.recordMetrics({ observerCalls });
+      return refreshed;
+    }
+
+    function reconcileRuntimeUncertainty(currentScope, snapshot) {
+      if (!snapshot?.ok) return;
+      const evidence = Object.fromEntries(RATE_RESOURCES.flatMap((resource) => {
+        const observer = snapshot.value.observers?.[resource];
+        const epoch = snapshot.value.epochs?.[resource];
+        return observer?.outcome === "healthy" && typeof epoch === "string" && Number.isFinite(observer.at)
+          ? [[resource, { epoch, observedAt: observer.at }]] : [];
+      }));
+      acquisitionEngine.reconcileUncertainty(currentScope.accessKey, evidence);
     }
 
     function commit(key, run, {
@@ -11274,7 +12122,10 @@ function App({ onCreateRemote = () => {} } = {}) {
                 observations: result?.observations ?? [],
               }, Date.now());
           if (!currentAccess()) {
-            cancelAcquisition(acquisition);
+            failAcquisition(acquisition, {
+              requestMetrics: acquisitionRequestMetrics(result),
+              hold: "disconnected",
+            });
             return;
           }
           if (result?.rateLimited) {
@@ -11291,6 +12142,8 @@ function App({ onCreateRemote = () => {} } = {}) {
           if (acquisition) {
             acquisition.capabilities = result.capabilities ?? {};
             acquisition.repositoryIdentity = result.repositoryIdentity;
+            acquisition.requestMetrics = acquisitionRequestMetrics(result);
+            acquisition.uncertainReceipts = result.uncertainReceipts ?? [];
           }
           // Identical payload: skip the parse *and* the state update. Returning
           // the same state object makes React bail out of the re-render, so an
@@ -11374,7 +12227,11 @@ function App({ onCreateRemote = () => {} } = {}) {
           // so the next admitted tick parses its response instead of taking the
           // identical-output fast path.
           if (transition.kind === "unusable") {
-            cancelAcquisition(acquisition);
+            failAcquisition(acquisition, {
+              requestMetrics: acquisition?.requestMetrics ?? {},
+              uncertainReceipts: acquisition?.uncertainReceipts ?? [],
+              hold: "primary",
+            });
             rawRef.current[key] = transition.nextRaw;
             setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
             return;
@@ -11385,7 +12242,11 @@ function App({ onCreateRemote = () => {} } = {}) {
           // freshness. Do not retain its raw value either, so the next source
           // retry is parsed instead of taking the identical-payload fast path.
           if (transition.kind === "blind") {
-            cancelAcquisition(acquisition);
+            failAcquisition(acquisition, {
+              requestMetrics: acquisition?.requestMetrics ?? {},
+              uncertainReceipts: acquisition?.uncertainReceipts ?? [],
+              hold: "primary",
+            });
             rawRef.current[key] = transition.nextRaw;
             setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
             setSecurityNotes(transition.notes);
@@ -11412,7 +12273,10 @@ function App({ onCreateRemote = () => {} } = {}) {
           });
         })
         .catch((err) => {
-          cancelAcquisition(acquisition);
+          failAcquisition(acquisition, {
+            requestMetrics: err?.requestMetrics ?? {},
+            hold: acquisitionFailureHold(err),
+          });
           settleReservationWithBudgetObservations(settlementScope, leaseId, reservationId, {
             outcome: governorOutcomeForError(err),
             observations: err?.budgetObservations ?? [],
@@ -11547,7 +12411,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       }
     }
 
-    function ensureAcquisitionSubscription(key, currentIdentity) {
+    function ensureAcquisitionSubscription(key, currentIdentity, { synchronizeDemand = true } = {}) {
       const repository = effectiveRuntimeRepository({ remoteUrls });
       const pages = pageStateRef.current[key]?.pages ?? 1;
       const query = acquisitionQueryForTab(key, currentIdentity, repository, pages);
@@ -11571,10 +12435,11 @@ function App({ onCreateRemote = () => {} } = {}) {
         subscription = { ...registered.value, requestedKey: queryKey };
         acquisitionSubscriptions.set(key, subscription);
         if (subscription.snapshot) adoptAcquisitionSnapshot(key, subscription.snapshot);
-      } else {
+      } else if (synchronizeDemand) {
         const updated = acquisitionEngine.updateDemand(subscription.id, demand);
         if (!updated.ok) return updated;
       }
+      if (!synchronizeDemand) return { ok: true, value: subscription };
       for (const [candidateKey, candidate] of acquisitionSubscriptions) {
         if (candidateKey === key) continue;
         acquisitionEngine.updateDemand(candidate.id, {
@@ -11614,6 +12479,8 @@ function App({ onCreateRemote = () => {} } = {}) {
         }),
         hold: null,
         capabilities: acquisition.capabilities ?? {},
+        requestMetrics: acquisition.requestMetrics ?? {},
+        uncertainReceipts: acquisition.uncertainReceipts ?? [],
         repositoryIdentity: acquisition.repositoryIdentity,
         meta,
         securityNotes: key === "security"
@@ -11641,11 +12508,29 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (acquisition) void acquisitionEngine.refresh(acquisition.id, { cancel: acquisition.claim });
     }
 
+    function failAcquisition(acquisition, failure) {
+      if (acquisition) void acquisitionEngine.refresh(acquisition.id, {
+        claim: acquisition.claim,
+        failure,
+      });
+    }
+
     async function startPendingAcquisitionTransport(key, item, currentScope, reservationId, nowMs, signal,
       automaticStatusVisible) {
       const descriptor = tabForKey(key);
       const transported = await runStartedAcquisitionTransport(
-        () => acquisitionEngine.refresh(item.acquisition.id, { started: item.acquisition.claim }),
+        () => {
+          const admitted = inspectGovernor(currentScope, nowMs);
+          if (!admitted.ok) return admitted;
+          return acquisitionEngine.refresh(item.acquisition.id, { started: {
+            ...item.acquisition.claim,
+            receipt: {
+              reservationId,
+              accessKey: currentScope.accessKey,
+              epochs: admitted.value.epochs,
+            },
+          } });
+        },
         () => {
           replaceActivePoll(item.kind, nowMs);
           if (item.force) coordinator.invalidate();
@@ -12059,6 +12944,13 @@ function App({ onCreateRemote = () => {} } = {}) {
         pauseCoordination(key, ownership.reason);
         return { persisted: false, retry: true, kind, key };
       }
+      setRuntimeAcquisitionHold(
+        acquisitionEngine,
+        acquisitionSubscriptions,
+        key,
+        null,
+        currentScope.accessKey,
+      );
       if (ownership.value.role !== "producer") {
         if (ownership.value.snapshot) adoptAcquisitionSnapshot(key, ownership.value.snapshot);
         if (ownership.value.sharingCount > 1) {
@@ -12066,6 +12958,7 @@ function App({ onCreateRemote = () => {} } = {}) {
             mode: "waiting",
             waitCause: "shared-lane",
             sharingCount: ownership.value.sharingCount,
+            sharedData: Boolean(ownership.value.snapshot),
           });
         } else if (ownership.value.reason === "fresh" &&
             ownership.value.snapshot?.nextDueAt > nowMs) {
@@ -12317,6 +13210,8 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (cancelled) return;
       const nowMs = Date.now();
       const currentScope = ensureScope(nowMs, { maintain: true });
+      const activeKey = TABS[activeIndexRef.current].key;
+      if (currentScope) ensureAcquisitionSubscription(activeKey, identity(), { synchronizeDemand: false });
       if (currentScope && pendingBlockPublications.size > 0) {
         const beforeProbe = inspectGovernor(currentScope, nowMs);
         attemptPendingBlockPublications(
@@ -12327,12 +13222,12 @@ function App({ onCreateRemote = () => {} } = {}) {
         );
       }
       const refreshed = currentScope
-        ? await refreshSharedBudget(currentScope, leaseId, controller.signal)
+        ? await refreshRuntimeBudget(currentScope)
         : { ok: false, reason: runtimeIdentityCoordinator?.inspect()?.reason ?? "stale" };
       if (cancelled) return;
       const checkedAt = Date.now();
       const snapshot = currentScope ? inspectGovernor(currentScope, checkedAt) : refreshed;
-      const activeKey = TABS[activeIndexRef.current].key;
+      if (currentScope) reconcileRuntimeUncertainty(currentScope, snapshot);
       if (currentScope && snapshot.ok && pendingBlockPublications.size > 0) {
         attemptPendingBlockPublications(currentScope, checkedAt, snapshot.value);
       }
@@ -12391,11 +13286,13 @@ function App({ onCreateRemote = () => {} } = {}) {
         armWake("control", governorControlRetryAt(Date.now(), runtime.refreshMs), controlWake);
         return;
       }
-      const refreshed = await refreshSharedBudget(currentScope, leaseId, controller.signal);
+      const activeKey = TABS[activeIndexRef.current].key;
+      ensureAcquisitionSubscription(activeKey, identity(), { synchronizeDemand: false });
+      const refreshed = await refreshRuntimeBudget(currentScope);
       if (cancelled) return;
       const checkedAt = Date.now();
       const snapshot = inspectGovernor(currentScope, checkedAt);
-      const activeKey = TABS[activeIndexRef.current].key;
+      reconcileRuntimeUncertainty(currentScope, snapshot);
       publishControlStatus(activeKey, refreshed, snapshot, checkedAt);
       const controlReady = governorControlReady(
         refreshed,
@@ -12463,7 +13360,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     TABS.map((t) => [t.key, data[t.key] == null && !errors[t.key] && loading[t.key]]),
   );
   const anyFirstLoad = Object.values(firstLoad).some(Boolean);
-  const semanticStatus = refreshStatus({
+  let semanticStatus = refreshStatus({
     widthMode: resizeRef.current.active,
     remoteSetup,
     visibleLoading: Boolean(loading[tab.key]),
@@ -12473,6 +13370,8 @@ function App({ onCreateRemote = () => {} } = {}) {
     activeError: tabError,
     securityIncomplete:
       tab.key === "security" && securityBlind,
+    sharedData: activeGovernorDecision?.sharedData === true,
+    disconnected: data[tab.key] !== null && !runtimeIdentityCoordinator?.current(),
     screenReader,
   });
   const showSpinner = !remoteSetup && ANIMATE && (semanticStatus.animate || hasRunningVisible);
@@ -12582,6 +13481,12 @@ function App({ onCreateRemote = () => {} } = {}) {
     staleFor != null && staleAt != null && now.getTime() > staleAt
       ? `stale ${formatDuration(Math.min(staleFor, 359_999_000))}`
       : null;
+  if (staleLabel && ["watching", "shared"].includes(semanticStatus.kind)) {
+    semanticStatus = refreshStatus({
+      stale: true,
+      disconnected: data[tab.key] !== null && !runtimeIdentityCoordinator?.current(),
+    });
+  }
 
   const allItems = items ?? [];
   const tabOffsetRaw = offset[tab.key] ?? 0;
@@ -12974,6 +13879,13 @@ function restoreScreen() {
 // Both messages go through redact(): a stack can carry a URL with inline
 // credentials, and this output is what a user pastes into a bug report -- the
 // same reasoning --doctor already applies to its own report.
+function crashDiagnostic(label, err) {
+  return [
+    `gh-glance: ${label}`,
+    redact(err instanceof Error ? (err.stack ?? err.message) : String(err)),
+  ].join("\n");
+}
+
 function installCrashHandlers(unmountApp) {
   const fail = (label) => (err) => {
     unmountApp();
@@ -12983,8 +13895,7 @@ function installCrashHandlers(unmountApp) {
     } catch {
       // Nothing useful to do about a failure here, and the stack below matters more.
     }
-    console.error(`gh-glance: ${label}`);
-    console.error(redact(err instanceof Error ? (err.stack ?? err.message) : String(err)));
+    console.error(crashDiagnostic(label, err));
     process.exit(1);
   };
   process.on("uncaughtException", fail("crashed"));
@@ -13274,6 +14185,8 @@ export {
   AUTH_RETRY_MS,
   BACKOFF_STEPS_MS,
   redact,
+  verboseLogLine,
+  crashDiagnostic,
   classify,
   parseJsonOutput,
   parseGhApiResponse,
@@ -13295,6 +14208,7 @@ export {
   conditionalBatchResult,
   publishStagedEntities,
   fetchAlertSource,
+  fetchSecurity,
   formatAge,
   formatDuration,
   usableSize,
@@ -13340,6 +14254,11 @@ export {
   ACQUISITION_MAX_SUBSCRIPTIONS,
   acquisitionStorePath,
   acquisitionQueryKey,
+  acquisitionHold,
+  acquisitionDiagnostics,
+  acquisitionRequestMetrics,
+  acquisitionFailureHold,
+  setRuntimeAcquisitionHold,
   loadAcquisitionStore,
   createAcquisitionEngine,
   pollPolicyInterval,

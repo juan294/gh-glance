@@ -207,8 +207,11 @@ which is what keeps a three-part typo a rejected typo rather than a request to
 somewhere else -- and it is **never** interpolated into a request path. It is
 passed to `gh` as a `--hostname` argument instead.
 
-`--doctor` prints a report intended to be attached to a bug report, and it never
-prints credentials. Environment values are printed only for a short curated list
+Plain `--doctor` prints a report intended to be attached to a bug report. It
+reads local evidence and starts no GitHub API request or credential resolution.
+The explicit `--doctor --probe` form performs bounded capability requests only
+after shared-governor admission. Neither mode prints credentials. Environment
+values are printed only for a short curated list
 -- the variables that are themselves the thing being diagnosed, such as
 `GH_HOST`, `GH_REPO` and `NO_COLOR`. Every other variable it finds, including any
 `GH_*`/`GITHUB_*` name it was never told about, is reported as present or absent

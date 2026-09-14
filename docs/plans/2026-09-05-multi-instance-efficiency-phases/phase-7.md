@@ -48,6 +48,12 @@ None required for correctness. Optional visual inspection may refine copy, but d
 
 ## Completion
 
-- [ ] Metrics and explicit diagnostic modes implemented and documented.
-- [ ] OBS scenarios and parent local gates passed.
-- [ ] Independent compliance/quality review complete; integrated locally; stop.
+Source-to-display p50/p95 latency and sustained CPU/RSS comparison remain
+explicitly deferred to Phase 12's compatible one-hour workload and
+`measure:efficiency` artifact. Phase 7 exposes the clocks and measured queue
+delay that workload will consume; it does not fabricate a percentile or a
+machine-independent resource claim from targeted fixtures.
+
+- [x] Metrics and explicit diagnostic modes implemented and documented.
+- [x] OBS scenarios and parent local gates passed: 465 unit/integration tests and 129 serial PTY tests, with Node 22/24 compatibility smoke.
+- [x] Independent compliance/quality review complete; integrated locally; stop.

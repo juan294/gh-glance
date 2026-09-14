@@ -99,6 +99,17 @@ so it cannot hide a lost update in the mechanism it is validating. PTY files
 run serially; their individual cases still create the required concurrent
 panes.
 
+Acquisition diagnostics are measured, not projected. Tests that change a
+fetcher must reconcile HTTP attempts, REST 200/304 outcomes, actual core and
+GraphQL units, outstanding estimates, observer calls, cache hits, joined
+followers, failed outcomes, and measured follower queue time against an
+explicit oracle. A cache reader is not a joined follower, and retained cache
+records do not count as active queries. Failed or malformed data must leave the
+last-good snapshot untouched and retain any cost that lacks proof. Keep `lastSuccessAt`,
+`lastChangedAt`, `nextDueAt`, and the current hold independent. Plain
+`--doctor` must stay local-only; live endpoint checks belong behind the explicit
+`--doctor --probe` admission path.
+
 Direct SGR mouse tests must enter width mode before sending reports, then send
 each logical report through the foreground pty as its own timed write, plus one
 intentionally split report that exercises the pending token boundary. Assert

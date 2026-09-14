@@ -34,6 +34,13 @@ test("no arguments keeps every default", () => {
   assert.equal(opts.refreshMs, null);
   assert.equal(opts.tabKey, null);
   assert.equal(opts.verbose, false);
+  assert.equal(opts.probe, false);
+});
+
+test("--probe is an explicit doctor-only opt in", () => {
+  assert.equal(parse(["--doctor"]).probe, false);
+  assert.equal(parse(["--doctor", "--probe"]).probe, true);
+  assert.throws(() => parse(["--probe"]), /--probe requires --doctor/);
 });
 
 test("unknown arguments are still rejected", () => {
@@ -255,6 +262,7 @@ test("--help describes refresh as a shared-governor floor", () => {
   assert.match(help, /^[ \t]*R[ \t]+Resynchronize the current tab, ignoring cached validators and backoff$/m);
   assert.match(help, /--background <mode>\s+all or off \(default all\)/);
   assert.match(help, /never requests data\n\s+for a tab you are not looking at/);
+  assert.match(help, /--doctor --probe\s+Run bounded, admitted GitHub capability probes/);
   assert.match(help, /a quiet tab slows to 30s \(60s for Security\),\n\s+and running Actions are checked every 5s/);
   assert.match(help, /GH_GLANCE_ICONS=unicode\s+Unicode status glyphs and text row substitutes/);
   assert.match(help, /GH_GLANCE_ICONS=ascii\s+ASCII-only status and row icons/);

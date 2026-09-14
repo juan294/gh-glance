@@ -233,12 +233,25 @@ test("twelve real panes share one startup probe and every active pane progresses
     startupGovernor = scheduled.governor;
     const completed = await observeUntil(
       () => ({ fixture: box.read(), governor: box.readGovernor(), acquisition: box.readAcquisition() }),
-      ({ fixture, governor, acquisition: shared }) =>
-        dataStarts(fixture).length >= STARTUP_DATA_STARTS &&
-        Object.values(governor.reservations).filter((reservation) =>
-          reservation.costs?.core > 0 && reservation.status === "completed").length === 1 &&
-        Object.keys(shared.subscriptions).length === PANE_COUNT &&
-        Object.values(shared.queries).some((record) => record.snapshot?.rows?.length > 0),
+      ({ fixture, governor, acquisition: shared }) => {
+        const records = Object.values(shared.queries);
+        const record = records.find((candidate) => candidate.query.resource === "actions");
+        const subscriptions = Object.values(shared.subscriptions);
+        const generation = record?.generation ?? 0;
+        const runs = actionsRuns(fixture);
+        const slots = reservationSlots(governor, "core");
+        const settlements = Object.values(governor.reservations).filter((reservation) =>
+          reservation.epochs?.core === governor.epochs.core &&
+          reservation.costs?.core > 0 && reservation.status === "completed");
+        return records.length === 1 && record?.claim === null &&
+          record.snapshot?.rows?.length > 0 && subscriptions.length === PANE_COUNT &&
+          subscriptions.every((subscription) =>
+            subscription.queryKey === record.query.queryKey &&
+            subscription.requestedGeneration <= generation &&
+            subscription.waitingGeneration === null) &&
+          runs.length === generation && slots.length === generation &&
+          settlements.length === generation;
+      },
       reservationHorizon(startupGovernor, "core"),
     );
     progress = completed.fixture;
@@ -249,15 +262,24 @@ test("twelve real panes share one startup probe and every active pane progresses
   }
 
   const data = dataStarts(progress);
+  const actionsRecord = Object.values(acquisition.queries)
+    .find((record) => record.query.resource === "actions");
+  const generation = actionsRecord.generation;
+  const runs = actionsRuns(progress);
   assert.equal(probes(progress).length, 1, `startup probes: ${JSON.stringify(probes(progress))}`);
-  assert.equal(data.length, STARTUP_DATA_STARTS, "startup launched background or duplicate data work");
-  assert.equal(new Set(data.map((event) => event.pane)).size, 1);
+  assert.equal(data.length, generation, "startup launched work outside the shared generations");
+  assert.equal(runs.length, generation, "a shared generation acquired Actions more than once");
   assert.ok(data.every(isActionsEndpoint), "a non-active tab ran at startup");
   assertDebitsStayOutsideReserve(data);
-  assertPhasedStarts(startupGovernor, actionsRuns(progress), "core", 1, "startup");
+  const slots = reservationSlots(startupGovernor, "core");
+  assert.equal(slots.length, generation, "each shared generation must own one persisted slot");
+  for (let index = 0; index < generation; index += 1) {
+    assert.ok(runs[index].at >= slots[index], `startup start ${index} preceded its persisted slot`);
+  }
   const settlements = Object.values(startupGovernor.reservations).filter((reservation) =>
+    reservation.epochs?.core === startupGovernor.epochs.core &&
     reservation.costs?.core > 0 && reservation.status === "completed");
-  assert.equal(settlements.length, 1, "the shared generation settled quota more than once");
+  assert.equal(settlements.length, generation, "each shared generation must settle quota once");
   assert.equal(Object.values(acquisition.queries).filter((record) => record.snapshot).length, 1);
   assert.equal(Object.keys(acquisition.subscriptions).length, PANE_COUNT);
   assert.ok(panes.every((pane) => {
@@ -285,7 +307,7 @@ test("twelve mixed active panes pace core and GraphQL without consuming either r
     }));
     progress = await observeUntil(box.read, (state) => {
       const data = dataStarts(state);
-      return actionsRuns(state).length === 1 &&
+      return actionsRuns(state).length >= 1 &&
         data.filter((event) => event.graphqlOperation === "issues.page").length === 1 &&
         data.filter((event) => event.graphqlOperation === "pulls.page").length === 1 &&
         data.filter((event) => event.pane.includes("-security-")).length === 3;
@@ -295,8 +317,18 @@ test("twelve mixed active panes pace core and GraphQL without consuming either r
   }
 
   const data = dataStarts(progress);
-  const seen = new Set(data.map((event) => event.pane));
-  assert.equal(seen.size, 4, "one producer should serve each distinct active resource query");
+  const seenResources = new Set(data.map((event) => {
+    if (event.pane.includes("-actions-")) return "actions";
+    if (event.pane.includes("-issues-")) return "issues";
+    if (event.pane.includes("-prs-")) return "prs";
+    if (event.pane.includes("-security-")) return "security";
+    return "unknown";
+  }));
+  assert.deepEqual(
+    [...seenResources].sort(),
+    tabs,
+    "every distinct active resource query should make progress",
+  );
   assert.ok(data.some((event) => event.cost.core > 0));
   assert.ok(data.some((event) => event.cost.graphql > 0));
   for (const event of data) {

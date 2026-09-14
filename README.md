@@ -25,10 +25,10 @@ without switching to the browser.
 ╭─ Actions · owner/repo ──────────────────────────────────────────────────╮
 │     TITLE                  │WORKFLOW  │BRANCH        │TIME   │UPDATED   │
 │ ─────────────────────────────────────────────────────────────────────── │
-│ >+  ci: pin actions to com… #443 CI    develop        1m20s   28d ago   │
-│  x  fix: restore the prima… #442 Code… develop        1m28s   28d ago   │
-│  +  chore: bump dependenci… #441 CI    dependa…int-10 30s     28d ago   │
-│  -  docs: update the readme #440 CI    develop        15s     29d ago   │
+│ >+  ci: pin actions to com… #443 CI    develop        1m20s   44d ago   │
+│  x  fix: restore the prima… #442 Code… develop        1m28s   44d ago   │
+│  +  chore: bump dependenci… #441 CI    dependa…int-10 30s     44d ago   │
+│  -  docs: update the readme #440 CI    develop        15s     45d ago   │
 │                                                                         │
 │                                                                         │
 ╰──────────────────────────────────────────────────────────────── 4 of 4 ─╯
@@ -323,6 +323,7 @@ pane definition. Flags are there when you want them:
 | `--background <mode>` | `all` (default) or `off`. `off` never requests data for a tab you are not looking at. Its count keeps the last known value and ages visibly, and switching to the tab fetches it. |
 | `--verbose` | Log one line per dashboard `gh` call to stderr, with timing and outcome. Credential lookup and the account-identity proof are deliberately excluded, so that they cannot log anything derived from a token. stderr must be redirected: `gh-glance --verbose 2>gh-glance.log`. |
 | `--doctor` | Print a diagnostic report and exit. See [Diagnostics](#diagnostics). |
+| `--doctor --probe` | Add bounded, admitted GitHub capability probes to the local diagnostic report. |
 
 An unrecognised flag exits 2 rather than being ignored, so a typo fails loudly.
 
@@ -486,30 +487,38 @@ It will not claim a feature is "not enabled" because of a lapse.
 gh-glance --doctor > report.txt
 ```
 
-Collects, in one plain-text block: the `gh-glance`, Node and `gh` versions;
-which hosts `gh` is authenticated for; how the repository target resolved and
-from where; your remaining REST and GraphQL budget plus the configuration's
-unpaced cost projection; shared governor health; the relevant environment
-variables; a read-only `Repository access` probe; and each bounded dashboard
-probe, including the Security priority lanes, with the exact argv it sent, its
-outcome, and how any error was classified (`unavailable`, `rate-limited`,
-`auth-problem` or `other`).
+By default, doctor reads only local evidence. It reports the executable and
+configuration context, repository target, and shared-acquisition metrics and
+freshness without making a GitHub API request or resolving a credential. The
+acquisition section keeps the last successful observation, last payload change,
+next due time, current hold, active query/subscriber count, request outcomes,
+known charges, conservative outstanding charges, cache hits, joined followers,
+measured queue time, observer calls, and producer epoch separate. A joined
+follower is counted only when it waits on an existing producer generation; a
+cached subscription is a cache hit, not a coalesced request. Active queries are
+queries with a live subscriber. Retained queries remain listed as `cache-only`
+without inflating that count. Holds distinguish observer failure, primary and
+secondary limits, disconnected acquisition, shared producer waits, and local
+coordination.
 
-Doctor first makes one free `rate_limit` request to the effective host. It then
-uses an ephemeral governor lease and admits every quota-consuming endpoint at
-its exact declared cost. A probe whose safe slot is later, whose resource is
-held, or whose budget is unavailable is reported as `SKIPPED`; diagnostics do
-not bypass the reserve. The `API governor` section reports `healthy`, `waiting
-for probe`, `stale`, `blocked`, or `unavailable`, plus the number of live leases
-and each resource's remaining calls, hard reserve, and reset. It does not print
-the scope hash, account identity, state path, lock owner, or reservation IDs.
+Use `gh-glance --doctor --probe` when live capability evidence is needed. Probe
+mode uses an ephemeral governor lease and admits every quota-consuming endpoint
+at its exact declared cost. It includes the repository and bounded dashboard
+probes, including Security priority lanes, with the exact argv, outcome, and
+classification (`unavailable`, `rate-limited`, `auth-problem` or `other`). A
+probe whose safe slot is later, whose resource is held, or whose budget is
+unavailable is reported as `SKIPPED`; diagnostics do not bypass the reserve.
+The `API governor` section then reports its measured health and resource state.
+Neither mode prints scope hashes, account identity keys, state paths, lock
+owners, reservation IDs, response bodies, or credentials.
 
 The `Repository access` probe shows whether the target resolves for the active
 `gh` credentials. A failed GitHub resolution response cannot distinguish a
 nonexistent, renamed, or stale target from a private repository hidden from
 that identity.
 
-Add `--verbose` to get a log of every `gh` call it makes alongside the report.
+Add `--verbose` to probe mode to get a log of every `gh` call it makes alongside
+the report. Plain doctor has no GitHub API calls to log.
 
 It exits 0 and prints a report even when `gh` is missing or you are outside a
 git repository -- those are conditions worth reporting rather than failing on --
@@ -548,30 +557,24 @@ payload never counts as one: a tab that cannot be read is not a quiet tab. One
 inactive tab is considered per wake, in rotation, so three of them falling due
 together do not start together.
 
-The resources are independent. Actions and Security spend REST `core` calls;
-Issues and Pull Requests are sorted with `--search`, which routes them through
-GraphQL. The following table is the conservative demand before shared pacing,
-not a promise that the governor will start every listed request. At the default
-floor:
+The resources are independent. Actions and Security use REST `core`; Issues
+and Pull Requests use explicit GraphQL documents. The governor's declared costs
+are conservative admission bounds. They are not presented as fixed hourly
+charges because pagination, conditional REST 304 responses, quiet cadence,
+workflow-name fallback, capability backoff, and shared followers all change
+the actual result.
 
-| Visible tab | REST / hour | GraphQL / hour |
-|---|---|---|
-| Actions | ~192 quiet, up to ~792 | ~120 |
-| Issues or Pull Requests | ~102 | ~300 quiet, up to ~1,500 |
-| Security | ~390 quiet, up to ~4,350 | ~120 |
+Plain `--doctor` reports reconciled local acquisition totals: HTTP attempts,
+failed outcomes, REST 200/304 outcomes, proven actual core and GraphQL units,
+conservative outstanding units, and measured follower queue delay. Probe mode
+adds live governor evidence. These measured
+figures stay separate from the policy-derived `projected demand` range.
 
-The lower figure in each range is every tab at its quiet cadence; the upper is
-the active tab at its floor with Actions busy. `--doctor` prints the same range
-for the configuration you actually run, labelled `projected demand` to keep it
-distinct from the charges the governor section reports.
-
-Security is the most expensive. A repository whose newest alert pages are not
-full uses the three base endpoint calls and lands near 2,280 REST requests per
-hour. A full page activates bounded critical/high lanes for Dependabot and code
-scanning, raising the safe projection to about 4,440. Actions is not cheap
-either: one `gh run list` issues two REST requests. `gh-glance --doctor` reports
-this projection beside the server's actual REST and GraphQL budgets. Enterprise
-ceilings can differ from 5,000.
+Security can require the most REST work: each source starts with one newest
+page, and full pages can activate bounded critical/high lanes for Dependabot
+and code scanning. Actions normally requests its runs endpoint and admits a
+separate conditional workflow-catalog request only when displayed runs lack a
+known workflow name. Enterprise ceilings can differ from GitHub.com's.
 
 For each resource, gh-glance calculates 20% of the reported limit for other work:
 
@@ -720,23 +723,23 @@ GH_GLANCE_ICONS=ascii gh-glance
 | `No GitHub remote found` | Press `Enter` to start `gh repo create`, then choose **Push an existing local repository**. Or press `q` and run `gh-glance --repo owner/name` to watch an existing repository without attaching this folder. |
 | `GitHub login or authorization required` | Run `gh auth status`. With no account, run `gh auth login`; with an expired authorization, run `gh auth refresh`; then press `R`, which also clears the endpoint backoff the failures accrued. |
 | `Repository not found or inaccessible to the active gh account` | The active identity cannot resolve the target. Check `gh auth status`, `git remote -v` or the explicit `--repo`, and use `gh auth switch` only if the wrong account is active. |
-| `GraphQL: Could not resolve to a Repository...` in older gh-glance versions | The response has the same ambiguity: a missing or renamed target, or a private repository not visible to the active account. Run `gh-glance --doctor`. |
-| Actions says `not available for this repository` while Repository access is `ok` | The repository resolved, but that endpoint is unavailable; inspect the corresponding doctor block. |
+| `GraphQL: Could not resolve to a Repository...` in older gh-glance versions | The response has the same ambiguity: a missing or renamed target, or a private repository not visible to the active account. Run `gh-glance --doctor --probe`. |
+| Actions says `not available for this repository` while Repository access is `ok` | The repository resolved, but that endpoint is unavailable; inspect the corresponding `--doctor --probe` block. |
 | Row icons are blank boxes | Your terminal font is not a Nerd Font. Use `GH_GLANCE_ICONS=unicode`. |
 | Security tab shows a "not enabled" note | Code scanning and secret scanning need GitHub Advanced Security. Dependabot alerts work independently. The note now appears only when the feature genuinely is unavailable: auth, SSO and network failures show the real error instead. |
 | `none of the git remotes ... point to a known GitHub host` | `gh` is not authenticated for that host. Run `gh auth login --hostname <host>`. |
 | Security tab empty on an enterprise host in an older gh-glance version | Older versions could route alert endpoints separately. Current gh-glance routes every API call and the governor to one effective host; use `--repo host/owner/name`, `GH_HOST`, or a qualified `GH_REPO`, then confirm the resolved host with `--doctor`. |
-| Tabs start failing after working for a while | The enterprise SAML session lapsed. Re-authorize in the browser; the dashboard recovers within about 30 seconds. Run `gh-glance --doctor` to confirm. |
+| Tabs start failing after working for a while | The enterprise SAML session lapsed. Re-authorize in the browser; the dashboard recovers within about 30 seconds. Run `gh-glance --doctor --probe` to confirm. |
 | A tab's count is red | That tab's last fetch failed. The error itself is shown when you switch to it, translated into what to do about it where `gh-glance` recognises the failure. |
-| Security tab shows `?` instead of a number | The alert endpoints could not be read at all -- an expired SAML session, a token without `security_events`, or an org OAuth restriction. `?` means "unknown", not "zero"; run `gh-glance --doctor` to see which probe failed and how it was classified. |
+| Security tab shows `?` instead of a number | The alert endpoints could not be read at all -- an expired SAML session, a token without `security_events`, or an org OAuth restriction. `?` means "unknown", not "zero"; run `gh-glance --doctor --probe` to see which probe failed and how it was classified. |
 | `Watching` with `next 2m` | The active tab has a shared budget probe or safe grant scheduled. The interval names this grant only; it is not a recurring polling interval. Pressing `r` raises safe priority but cannot bypass the lane or reserve. |
-| `Watching` with `sharing 4` | Four local panes share this account governor, and another pane owns the lane immediately ahead of this grant. This is pacing, not quota scarcity. |
+| `Shared` | This pane is using a generation acquired for matching local subscribers. This is coalescing, not quota scarcity. |
 | `Paused` with a reset time | The active tab's REST or GraphQL resource is at its reserve, exhausted, or under a shared rate-limit block. Wait for the stated reset/probe. Other tabs can continue when they use the healthy resource. |
 | `Paused` without a reset time | Budget or coordinator evidence is unknown, corrupt, locked, or unwritable. No data call is started. Run `gh-glance --doctor`; also check the config directory permissions and whether another live process owns its private lock. |
 | A failing tab seems to have stopped retrying | Recognized endpoint failures back off rather than re-spawning `gh` at the floor. Press `r` to request a higher-priority retry, or `R` to also clear the endpoint backoff; either way the retry waits for a safe grant, so the tab remains Watching or Paused. |
 | `unknown argument: -v` | `-v` used to mean `--version` and no longer does, because this CLI also has `--verbose`. Use `--version` or `--verbose` explicitly. |
-| Cached rows plus `Paused` and `stale 2m` | The rows came from the separate last-known-good dashboard cache, while the live request is blocked or unsafe. Stale age is not extended by a pause. The error and footer describe current coordination; cached data never means the live check succeeded. |
-| Repeated GitHub rate-limit messages | A classified rate-limit response is published as one shared resource block. Local panes make no data retry before that block's probe/reset deadline. Use `--doctor` to inspect the resource and reset; repeated manual refresh cannot override it. |
+| Cached rows plus `Paused`, `Stale`, or `Disconnected` | The rows are last-known-good data while the live source is blocked, overdue, or unavailable. A cache read never advances source success. The footer never calls stale or disconnected rows `Watching`. |
+| Repeated GitHub rate-limit messages | A classified rate-limit response is published as one shared resource block. Local panes make no data retry before that block's probe/reset deadline. Use `--doctor --probe` to inspect the live resource and reset; repeated manual refresh cannot override it. |
 | It exits immediately when piped | Intentional. It is a full-screen dashboard, not a reporting command. |
 | `Restart required: close older gh-glance panes` | A pane from an older release still holds a live lease in the previous coordination format, which this version cannot join. Quit those panes; this one resumes on its own. Nothing is killed for you, and no state needs deleting. |
 | `Upgrade waiting for legacy quota reset` | The older panes are gone, but left spend that cannot be proven settled. It waits for the affected rate-limit window to reset rather than assume the quota is free. This one has a deadline and clears itself. |

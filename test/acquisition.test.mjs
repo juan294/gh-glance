@@ -15,19 +15,27 @@ import {
   ACQUISITION_STORE_VERSION,
   GOVERNOR_LEASE_TTL_MS,
   acquisitionQueryKey,
+  acquisitionDiagnostics,
+  acquisitionRequestMetrics,
   acquisitionStorePath,
   actionsRunsArgs,
+  actionsWorkflowsArgs,
   claimProbe,
   cancelCoordinatedPending,
   createAcquisitionEngine,
   createGovernorScope,
   fetchActions,
+  fetchSecurity,
+  fetchGraphqlList,
+  ghApi,
   inspectGovernor,
   loadAcquisitionStore,
   publishProbe,
+  publishStagedEntities,
   registerIntent,
   registerLease,
   startReservation,
+  setRuntimeAcquisitionHold,
 } from "../index.mjs";
 
 const NOW = 1_800_000_000_000;
@@ -246,7 +254,8 @@ test("SHARE-03: concurrent old and new slugs merge into one canonical generation
   const box = fixture(t);
   const oldEngine = createAcquisitionEngine(box);
   const newEngine = createAcquisitionEngine(box);
-  t.after(() => { oldEngine.close(); newEngine.close(); });
+  const waitingEngine = createAcquisitionEngine(box);
+  t.after(() => { oldEngine.close(); newEngine.close(); waitingEngine.close(); });
   const oldQuery = query("slug:acme/old", "actions", {
     repository: "acme/old",
     targetKey: "github.com\0slug:acme/old",
@@ -259,6 +268,9 @@ test("SHARE-03: concurrent old and new slugs merge into one canonical generation
   const newSubscription = newEngine.subscribe(newQuery, { active: true, floorMs: 5_000 });
   const oldClaim = await oldEngine.refresh(oldSubscription.value.id);
   const newClaim = await newEngine.refresh(newSubscription.value.id);
+  const waitingSubscription = waitingEngine.subscribe(oldQuery, { active: true, floorMs: 5_000 });
+  await waitingEngine.refresh(waitingSubscription.value.id);
+  box.setNow(NOW + 25);
   const identity = { id: "R_CANONICAL", nameWithOwner: "acme/new" };
 
   const first = await newEngine.refresh(newSubscription.value.id, {
@@ -279,6 +291,8 @@ test("SHARE-03: concurrent old and new slugs merge into one canonical generation
   assert.equal(oldView.value.snapshot.rows[0].displayTitle, "old slug completion");
   const stored = loadAcquisitionStore(acquisitionStorePath(box.pathOptions));
   assert.equal(Object.keys(stored.value.queries).length, 1);
+  assert.equal(stored.value.subscriptions[waitingSubscription.value.id].waitingGeneration, null);
+  assert.ok(stored.value.metrics.queueWaitMs >= 25);
 
   const restarted = createAcquisitionEngine(box);
   t.after(() => restarted.close());
@@ -638,6 +652,440 @@ test("SHARE-04/08: unchanged publication advances success without changing conte
   assert.equal(second.value.snapshot.lastChangedAt, NOW);
 });
 
+test("OBS-01/03/04: diagnostics reconcile measured cost, sharing, freshness, and hold", async (t) => {
+  const box = fixture(t);
+  const storage = memoryStorage();
+  const producer = createAcquisitionEngine({ ...box, storage, pid: 101, kill: () => {} });
+  const follower = createAcquisitionEngine({ ...box, storage, pid: 102, kill: () => {} });
+  t.after(() => { producer.close(); follower.close(); });
+  const owned = producer.subscribe(query(), { active: true, floorMs: 5_000 });
+  const joined = follower.subscribe(query(), { active: true, floorMs: 5_000 });
+  const claim = await producer.refresh(owned.value.id);
+  await producer.refresh(owned.value.id, { started: claim.value });
+  box.setNow(NOW + 100);
+  const waiting = await follower.refresh(joined.value.id);
+  assert.equal(waiting.value.role, "follower");
+  await follower.refresh(joined.value.id);
+  assert.equal(producer.recordMetrics({ observerCalls: 1 }).ok, true);
+  box.setNow(NOW + 500);
+  const published = await producer.refresh(owned.value.id, {
+    claim: { ...claim.value, accessKey: ACCESS },
+    publish: {
+      ...snapshot("measured"),
+      requestMetrics: {
+        httpRequests: 5,
+        rest200: 2,
+        rest304: 1,
+        coreUnits: 2,
+        graphqlUnits: 7,
+      },
+    },
+  });
+  assert.equal(published.ok, true, JSON.stringify(published));
+  const diagnostic = acquisitionDiagnostics(storage.load().value, {
+    source: "standalone",
+    nowMs: box.now(),
+  });
+  assert.deepEqual(diagnostic.metrics, {
+    httpRequests: 5,
+    rest200: 2,
+    rest304: 1,
+    coreUnits: 2,
+    graphqlUnits: 7,
+    failedRequests: 0,
+    uncertainCoreUnits: 0,
+    uncertainGraphqlUnits: 0,
+    observerCalls: 1,
+    cacheHits: 0,
+    joinedFollowers: 1,
+    queueWaitMs: 400,
+  });
+  assert.equal(diagnostic.source, "standalone");
+  assert.equal(diagnostic.activeQueries, 1);
+  assert.equal(diagnostic.activeSubscribers, 2);
+  assert.equal(diagnostic.queries[0].lastSuccessAt, NOW);
+  assert.equal(diagnostic.queries[0].lastChangedAt, NOW);
+  assert.equal(diagnostic.queries[0].coalescedConsumers, 2);
+  assert.equal(diagnostic.queries[0].hold, null);
+});
+
+test("OBS-01: cached subscribers are cache hits, not joined producer followers", async (t) => {
+  const box = fixture(t);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  const producer = engine.subscribe(query(), { active: true, floorMs: 5_000 });
+  await engine.refresh(producer.value.id, { acquire: async () => snapshot("cached") });
+  const cached = engine.subscribe(query(), { active: true, floorMs: 5_000 });
+  assert.equal(cached.ok, true);
+  const metrics = engine.diagnostics().value.metrics;
+  assert.equal(metrics.cacheHits, 1);
+  assert.equal(metrics.joinedFollowers, 0);
+});
+
+test("OBS-01: failed requests preserve last-good data and only release proven cost", async (t) => {
+  const box = fixture(t);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  const subscription = engine.subscribe(query(), { active: true, floorMs: 5_000 });
+  await engine.refresh(subscription.value.id, { acquire: async () => snapshot("last good") });
+  box.setNow(NOW + 5_001);
+  const first = await engine.refresh(subscription.value.id, { force: true });
+  await engine.refresh(subscription.value.id, { started: first.value });
+  const failed = await engine.refresh(subscription.value.id, {
+    claim: { ...first.value, accessKey: ACCESS },
+    failure: { hold: "primary", requestMetrics: { httpRequests: 1, failedRequests: 1 } },
+  });
+  assert.equal(failed.ok, true);
+  assert.equal(engine.inspect(subscription.value.id).value.snapshot.rows[0].displayTitle, "last good");
+  let diagnostic = engine.diagnostics().value;
+  assert.equal(diagnostic.metrics.httpRequests, 1);
+  assert.equal(diagnostic.metrics.failedRequests, 1);
+  assert.equal(diagnostic.metrics.uncertainCoreUnits, 1);
+  assert.equal(diagnostic.queries[0].hold, "primary");
+
+  const second = await engine.refresh(subscription.value.id, { force: true });
+  await engine.refresh(subscription.value.id, { started: second.value });
+  await engine.refresh(subscription.value.id, {
+    claim: { ...second.value, accessKey: ACCESS },
+    failure: {
+      hold: "secondary",
+      requestMetrics: { httpRequests: 1, failedRequests: 1, coreUnits: 1 },
+    },
+  });
+  diagnostic = engine.diagnostics().value;
+  assert.equal(diagnostic.metrics.httpRequests, 2);
+  assert.equal(diagnostic.metrics.failedRequests, 2);
+  assert.equal(diagnostic.metrics.coreUnits, 1);
+  assert.equal(diagnostic.metrics.uncertainCoreUnits, 1);
+  assert.equal(diagnostic.queries[0].hold, "secondary");
+});
+
+test("OBS-01: authoritative observer evidence retires bounded uncertainty by access and epoch", async (t) => {
+  const box = fixture(t);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  const accessA = engine.subscribe(query("R_receipt", "actions", { accessKey: "a".repeat(64) }),
+    { active: true, floorMs: 5_000 });
+  const accessB = engine.subscribe(query("R_receipt", "actions", { accessKey: "b".repeat(64) }),
+    { active: true, floorMs: 5_000 });
+  for (const [index, subscribed] of [accessA, accessB].entries()) {
+    const claim = await engine.refresh(subscribed.value.id, { force: true });
+    const accessKey = index === 0 ? "a".repeat(64) : "b".repeat(64);
+    await engine.refresh(subscribed.value.id, { started: {
+      ...claim.value,
+      receipt: { reservationId: `reservation:${index}`, accessKey, epochs: { core: "core:one" } },
+    } });
+    await engine.refresh(subscribed.value.id, {
+      claim: { ...claim.value, accessKey },
+      failure: { hold: "disconnected", requestMetrics: { httpRequests: 1, failedRequests: 1 } },
+    });
+  }
+  assert.equal(engine.diagnostics().value.metrics.uncertainCoreUnits, 2);
+  assert.equal(engine.reconcileUncertainty("a".repeat(64), {
+    core: { epoch: "core:one", observedAt: NOW - 1 },
+  }).ok, true);
+  assert.equal(engine.diagnostics().value.metrics.uncertainCoreUnits, 2);
+  box.setNow(NOW + 1);
+  engine.reconcileUncertainty("a".repeat(64), {
+    core: { epoch: "core:one", observedAt: box.now() },
+  });
+  assert.equal(engine.diagnostics().value.metrics.uncertainCoreUnits, 1);
+  engine.reconcileUncertainty("b".repeat(64), {
+    core: { epoch: "core:two", observedAt: NOW - 1 },
+  });
+  assert.equal(engine.diagnostics().value.metrics.uncertainCoreUnits, 0);
+  assert.deepEqual(loadAcquisitionStore(acquisitionStorePath(box.pathOptions)).value.uncertainReceipts, {});
+});
+
+test("OBS-01: production fetch seams reconcile 200, 304, GraphQL, and failed HTTP", async (t) => {
+  const box = fixture(t);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  const entities = new Map();
+  const actionBody = snapshot("production metrics").raw;
+  const first = await fetchActions(undefined, {
+    entities,
+    request: async () => ({ status: 200, body: actionBody, etag: '"runs-v1"', rateLimit: null }),
+  });
+  publishStagedEntities(entities, first.stagedEntities, "changed");
+  const second = await fetchActions(undefined, {
+    entities,
+    previousRaw: first.raw,
+    request: async (_args, { etag }) => ({ status: 304, body: "", etag, rateLimit: null }),
+  });
+  const graphql = await fetchGraphqlList("issues", (node) => ({ number: node.number }), {
+    fetchPage: async () => ({
+      ok: true,
+      status: 200,
+      observedCost: 2,
+      overrun: false,
+      observations: [{ resource: "graphql", limit: 5_000, used: 2, remaining: 4_998,
+        resetMs: NOW + 3_600_000, source: "response-header", receivedAt: NOW, cost: 2 }],
+      data: {
+        repository: {
+          issues: {
+            totalCount: 1,
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: [{ number: 7 }],
+          },
+        },
+      },
+    }),
+  });
+  for (const result of [first, second, graphql]) {
+    assert.equal(engine.recordMetrics(acquisitionRequestMetrics(result)).ok, true);
+  }
+
+  const failedResponse = async (statusText) => {
+    try {
+      await fetchActions(undefined, {
+        request: (args, options) => ghApi(args, {
+          ...options,
+          run: async () => {
+            const error = new Error(statusText);
+            error.httpStarted = true;
+            error.stdout = statusText.startsWith("HTTP/") ? `${statusText}\r\n\r\nfailed` : "";
+            throw error;
+          },
+        }),
+      });
+    } catch (error) {
+      return error;
+    }
+    assert.fail("failed request unexpectedly resolved");
+  };
+  const subscription = engine.subscribe(query(), { active: true, floorMs: 5_000 });
+  for (const error of [
+    await failedResponse("HTTP/1.1 403 Forbidden"),
+    await failedResponse("HTTP/1.1 429 Too Many Requests"),
+    await failedResponse("HTTP/1.1 503 Service Unavailable"),
+    await failedResponse("socket closed"),
+  ]) {
+    assert.equal(Object.hasOwn(error.requestMetrics, "coreUnits"), false);
+    const claim = await engine.refresh(subscription.value.id, { force: true });
+    await engine.refresh(subscription.value.id, { started: claim.value });
+    await engine.refresh(subscription.value.id, {
+      claim: { ...claim.value, accessKey: ACCESS },
+      failure: { hold: "primary", requestMetrics: error.requestMetrics },
+    });
+  }
+  const metrics = engine.diagnostics().value.metrics;
+  assert.deepEqual(metrics, {
+    httpRequests: 7,
+    rest200: 1,
+    rest304: 1,
+    coreUnits: 1,
+    graphqlUnits: 2,
+    uncertainCoreUnits: 4,
+    uncertainGraphqlUnits: 0,
+    failedRequests: 4,
+    observerCalls: 0,
+    cacheHits: 0,
+    joinedFollowers: 0,
+    queueWaitMs: 0,
+  });
+});
+
+test("OBS-01: Actions catalog metrics include mixed and failed admitted requests", async () => {
+  const runsBody = JSON.stringify([{ databaseId: 1, displayTitle: "CI", workflowName: "",
+    workflowId: 10, number: 1, headBranch: "develop", status: "completed", conclusion: "success",
+    startedAt: "2026-09-05T00:00:00Z", updatedAt: "2026-09-05T00:01:00Z", url: "" }]);
+  const workflowPath = actionsWorkflowsArgs()[0];
+  const entities = new Map([[`actions\0${workflowPath}`, {
+    etag: '"catalog"', body: JSON.stringify([{ id: 10, name: "Checks" }]),
+  }]]);
+  const mixed = await fetchActions(undefined, {
+    entities,
+    governor: { scope: {}, leaseId: "lease" },
+    request: async (args) => args[0] === workflowPath
+      ? { status: 304, body: "", etag: '"catalog"', rateLimit: null }
+      : { status: 200, body: runsBody, etag: '"runs"', rateLimit: null },
+    admit: async ({ run }) => ({ ok: true, value: await run(undefined), reservationId: "reservation:catalog" }),
+  });
+  assert.equal(mixed.restSpent, 1, "the tab reservation settles only the runs request");
+  assert.deepEqual(acquisitionRequestMetrics(mixed), {
+    httpRequests: 2, rest200: 1, rest304: 1, coreUnits: 1, failedRequests: 0,
+  });
+
+  const failed = await fetchActions(undefined, {
+    governor: { scope: {}, leaseId: "lease" },
+    request: async (args) => {
+      if (args[0] !== workflowPath) return { status: 200, body: runsBody, etag: '"runs"', rateLimit: null };
+      throw Object.assign(new Error("socket closed"), {
+        requestMetrics: { httpRequests: 1, failedRequests: 1 },
+      });
+    },
+    admit: async ({ run }) => {
+      try { return { ok: true, value: await run(undefined), reservationId: "reservation:catalog" }; }
+      catch (error) { return { ok: false, error, reservationId: "reservation:catalog" }; }
+    },
+  });
+  assert.deepEqual(acquisitionRequestMetrics(failed), {
+    httpRequests: 2, rest200: 1, rest304: 0, coreUnits: 1, failedRequests: 1,
+  });
+});
+
+test("OBS-01: mixed Security endpoints retain only failed request uncertainty", async (t) => {
+  const sources = [
+    { key: "security-ok", name: "Security ok", path: "ok", priorityQueries: [], jq: ".",
+      unavailable: "unavailable", map: (row) => row },
+    { key: "security-failed", name: "Security failed", path: "failed", priorityQueries: [], jq: ".",
+      unavailable: "unavailable", map: (row) => row },
+  ];
+  const result = await fetchSecurity(null, {
+    sources,
+    request: async ({ args }) => {
+      if (args[0] === "ok") return {
+        status: 200,
+        body: "[]",
+        staged: null,
+        observations: [],
+        requestMetrics: { httpRequests: 1, rest200: 1, coreUnits: 1, failedRequests: 0 },
+      };
+      throw Object.assign(new Error("socket closed"), {
+        httpStarted: true,
+        requestMetrics: { httpRequests: 1, failedRequests: 1 },
+      });
+    },
+  });
+  assert.deepEqual(result.requestMetrics, {
+    httpRequests: 2,
+    rest200: 1,
+    coreUnits: 1,
+    failedRequests: 1,
+    uncertainCoreUnits: 1,
+  });
+
+  const box = fixture(t);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  const subscribed = engine.subscribe(query("R_security", "security"),
+    { active: true, floorMs: 5_000 });
+  const claim = await engine.refresh(subscribed.value.id, { force: true });
+  await engine.refresh(subscribed.value.id, { started: {
+    ...claim.value,
+    receipt: {
+      reservationId: "reservation:security",
+      accessKey: ACCESS,
+      epochs: { core: "core:security" },
+    },
+  } });
+  await engine.refresh(subscribed.value.id, {
+    claim: { ...claim.value, accessKey: ACCESS },
+    failure: { hold: "primary", requestMetrics: result.requestMetrics },
+  });
+  const metrics = engine.diagnostics().value.metrics;
+  assert.equal(metrics.httpRequests, 2);
+  assert.equal(metrics.rest200, 1);
+  assert.equal(metrics.coreUnits, 1);
+  assert.equal(metrics.failedRequests, 1);
+  assert.equal(metrics.uncertainCoreUnits, 1);
+});
+
+test("OBS-01: invalid Security JSON counts its received 200 exactly once", async () => {
+  const source = {
+    key: "security-invalid-json",
+    name: "Security invalid JSON",
+    path: "invalid-json",
+    priorityQueries: [],
+    jq: ".",
+    unavailable: "unavailable",
+    map: (row) => row,
+  };
+  const result = await fetchSecurity(null, {
+    sources: [source],
+    request: async () => ({
+      status: 200,
+      body: "not-json",
+      staged: null,
+      observations: [],
+      requestMetrics: { httpRequests: 1, rest200: 1, coreUnits: 1, failedRequests: 0 },
+    }),
+  });
+  assert.deepEqual(result.requestMetrics, {
+    httpRequests: 1,
+    rest200: 1,
+    coreUnits: 1,
+    failedRequests: 0,
+  });
+  assert.equal(result.httpRequests, 1);
+  assert.equal(result.rest200, 1);
+  assert.equal(result.failedRequests, 0);
+  assert.equal(result.parse().unusable, true);
+});
+
+test("OBS-03: persisted and derived holds use acquisition state", async (t) => {
+  const box = fixture(t);
+  const owner = createAcquisitionEngine(box);
+  const follower = createAcquisitionEngine(box);
+  t.after(() => { owner.close(); follower.close(); });
+  const subscribed = owner.subscribe(query(), { active: true, floorMs: 5_000 });
+  for (const reason of ["observer", "primary", "secondary", "disconnected"]) {
+    assert.equal(owner.setHold(subscribed.value.id, reason).ok, true);
+    assert.equal(owner.diagnostics().value.queries[0].hold, reason);
+  }
+  assert.equal(owner.setHold(subscribed.value.id, null).ok, true);
+  await owner.refresh(subscribed.value.id, { acquire: async () => snapshot("cache-only") });
+  box.setNow(NOW + 5_001);
+  const joined = follower.subscribe(query(), { active: true, floorMs: 5_000 });
+  const claim = await owner.refresh(subscribed.value.id, { force: true });
+  await follower.refresh(joined.value.id);
+  assert.equal(owner.diagnostics().value.queries[0].hold, "shared-wait");
+  await owner.refresh(subscribed.value.id, { cancel: claim.value });
+  assert.equal(owner.setHold(subscribed.value.id, "observer").ok, true);
+  assert.equal(owner.unsubscribe(subscribed.value.id).ok, true);
+  assert.equal(follower.unsubscribe(joined.value.id).ok, true);
+  const cached = owner.diagnostics().value;
+  assert.equal(cached.activeQueries, 0);
+  assert.equal(cached.activeSubscribers, 0);
+  assert.equal(cached.queries[0].hold, "cache-only");
+});
+
+test("OBS-03: runtime holds target one access partition and clear on cached follower recovery", async (t) => {
+  const box = fixture(t);
+  const runtime = createAcquisitionEngine(box);
+  t.after(() => runtime.close());
+  const accessA = runtime.subscribe(query("R_widget", "actions", { accessKey: "a".repeat(64) }),
+    { active: true, floorMs: 5_000 });
+  const accessB = runtime.subscribe(query("R_widget", "actions", { accessKey: "b".repeat(64) }),
+    { active: true, floorMs: 5_000 });
+  await runtime.refresh(accessA.value.id, { acquire: async () => snapshot("access A") });
+  await runtime.refresh(accessB.value.id, { acquire: async () => snapshot("access B") });
+
+  const current = new Map([["actions", accessA.value]]);
+  assert.equal(setRuntimeAcquisitionHold(runtime, current, "actions", "observer", "a".repeat(64)).ok, true);
+  let diagnostics = runtime.diagnostics().value.queries;
+  assert.equal(diagnostics.find((item) => item.resource === "actions" && item.hold === "observer")?.hold,
+    "observer");
+  assert.equal(diagnostics.filter((item) => item.hold === "observer").length, 1);
+
+  assert.equal(setRuntimeAcquisitionHold(runtime, current, "actions", null, "a".repeat(64)).ok, true);
+  assert.equal(setRuntimeAcquisitionHold(
+    runtime,
+    new Map([["issues", accessA.value]]),
+    "issues",
+    "primary",
+    "a".repeat(64),
+  ).reason, "stale-access");
+  current.set("actions", accessB.value);
+  assert.equal(setRuntimeAcquisitionHold(runtime, current, "actions", "primary", null).reason,
+    "stale-access");
+  assert.equal(setRuntimeAcquisitionHold(runtime, current, "actions", "primary", "a".repeat(64)).reason,
+    "stale-access");
+  assert.equal(setRuntimeAcquisitionHold(runtime, current, "actions", "primary", "b".repeat(64)).ok, true);
+  diagnostics = runtime.diagnostics().value.queries;
+  assert.equal(diagnostics.filter((item) => item.hold === "primary").length, 1);
+  assert.equal(runtime.inspect(accessA.value.id).value.hold, null);
+
+  const reused = await runtime.refresh(accessB.value.id);
+  assert.equal(reused.value.role, "follower");
+  assert.equal(reused.value.reason, "fresh");
+  assert.equal(setRuntimeAcquisitionHold(runtime, current, "actions", null, "b".repeat(64)).ok, true);
+  assert.equal(runtime.inspect(accessB.value.id).value.hold, null);
+  diagnostics = runtime.diagnostics().value.queries;
+  assert.equal(diagnostics.some((item) => item.hold === "observer" || item.hold === "primary"), false);
+});
+
 test("SHARE-05: a suspended live owner is not stolen, but a confirmed dead owner is fenced", async (t) => {
   const box = fixture(t);
   const owner = createAcquisitionEngine({ ...box, pid: 111, kill: () => {} });
@@ -738,7 +1186,10 @@ test("SHARE-05: delayed publication is nonce fenced and malformed data cancels i
   const engine = createAcquisitionEngine(box);
   t.after(() => engine.close());
   const subscribed = engine.subscribe(query(), { active: true, floorMs: 5_000 });
-  const claimed = await engine.refresh(subscribed.value.id);
+  await engine.refresh(subscribed.value.id, { acquire: async () => snapshot("last good") });
+  box.setNow(NOW + 5_001);
+  const claimed = await engine.refresh(subscribed.value.id, { force: true });
+  await engine.refresh(subscribed.value.id, { started: claimed.value });
 
   const stale = await engine.refresh(subscribed.value.id, {
     publish: snapshot("stale"),
@@ -748,13 +1199,19 @@ test("SHARE-05: delayed publication is nonce fenced and malformed data cancels i
   assert.equal(stale.reason, "stale");
 
   const invalid = await engine.refresh(subscribed.value.id, {
-    publish: { ...snapshot("unsafe"), entities: [{ key: "bad", etag: "", body: "unchecked" }] },
+    publish: { ...snapshot("unsafe"), entities: [{ key: "bad", etag: "", body: "unchecked" }],
+      requestMetrics: { httpRequests: 1, rest200: 1, coreUnits: 1, failedRequests: 0 } },
     claim: { nonce: claimed.value.nonce, generation: claimed.value.generation, accessKey: query().accessKey },
   });
   assert.equal(invalid.reason, "invalid");
   const record = engine.inspect(subscribed.value.id).value;
   assert.equal(record.claim, null);
-  assert.equal(record.snapshot, null);
+  assert.equal(record.snapshot.rows[0].displayTitle, "last good");
+  const metrics = engine.diagnostics().value.metrics;
+  assert.equal(metrics.httpRequests, 1);
+  assert.equal(metrics.coreUnits, 1);
+  assert.equal(metrics.failedRequests, 1);
+  assert.equal(metrics.uncertainCoreUnits, 0);
 });
 
 test("SHARE-05: a busy publication keeps ownership and retries without wedging a live owner", async (t) => {

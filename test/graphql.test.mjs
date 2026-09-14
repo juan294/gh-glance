@@ -213,9 +213,41 @@ test("GQL-03 the tab envelope is charged for its own page only, never for pages 
   // work twice, and a settlement above its reservation is rejected as corrupt.
   assert.equal(result.graphqlSpent, 2);
   assert.equal(result.graphqlSpentTotal, 6);
+  assert.equal(result.httpRequests, 3);
+  assert.deepEqual(result.requestMetrics, {
+    httpRequests: 3,
+    failedRequests: 0,
+    graphqlUnits: 6,
+  });
   assert.equal(result.observations.length, 3);
   assert.equal(result.incomplete, false);
   assert.equal(result.limit, LIST_LIMIT);
+});
+
+test("OBS-01: a failed admitted GraphQL page keeps its own request outcome and cost", async () => {
+  const failedPage = {
+    ok: false,
+    status: 200,
+    observedCost: 2,
+    observations: [{ resource: "graphql", limit: 5000, used: 4, remaining: 4996,
+      resetMs: Date.now() + 3_600_000, source: "response-header", receivedAt: Date.now(), cost: 2 }],
+    failure: new Error("GraphQL errors"),
+  };
+  const { fetchPage } = pagedFetcher([
+    page([node(1)], { hasNextPage: true, cursor: "cursor:1" }),
+    failedPage,
+  ]);
+  const admit = async ({ run }) => ({ ok: true, value: await run(undefined), reservationId: "reservation:nested" });
+  const result = await fetchGraphqlList("issues", (n) => ({ number: n.number }), {
+    governor: { scope: {}, leaseId: "lease" }, fetchPage, admit, pages: 2,
+  });
+  assert.deepEqual(result.parse(), [{ number: 1 }]);
+  assert.equal(result.incomplete, true);
+  assert.deepEqual(result.requestMetrics, {
+    httpRequests: 2,
+    failedRequests: 1,
+    graphqlUnits: 4,
+  });
 });
 
 test("GQL-03 a denied later page keeps the rows already gathered and says so", async () => {
@@ -238,6 +270,7 @@ test("GQL-03 a denied later page keeps the rows already gathered and says so", a
   // rather than presenting a partial list as a complete one.
   assert.equal(result.limit, 1);
   assert.equal(result.graphqlSpent, 2);
+  assert.equal(result.httpRequests, 1);
 });
 
 test("GQL-03 walking without a governor stops after the first page instead of paging unadmitted", async () => {
