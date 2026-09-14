@@ -246,6 +246,20 @@ test("OBS-02: plain --doctor is local-only and invokes no GitHub API command", a
   assert.ok(calls.every((line) => !line.includes('"api"') && !line.includes('"auth"')), calls.join("\n"));
 });
 
+test("COL-02/05: local collector doctor reports source and never probes GitHub", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-collector-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const log = join(root, "gh.log");
+  const out = await doctor({ probe: false, args: ["--connect", "local"],
+    env: { XDG_CONFIG_HOME: root, GH_GLANCE_FIXTURE_LOG: log } });
+  assert.match(out, /^source\s+local collector$/m);
+  assert.match(out, /Local collector\n---------------/);
+  assert.match(out, /^socket\s+not running$/m);
+  assert.match(out, /^fallback\s+disabled$/m);
+  const calls = readFileSync(log, "utf8").trim().split("\n").filter(Boolean);
+  assert.ok(calls.every((line) => !line.includes('"api"') && !line.includes('"auth"')));
+});
+
 test("OBS-03: doctor reports corrupt acquisition metadata instead of healthy zeros", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-corrupt-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));

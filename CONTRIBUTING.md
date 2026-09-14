@@ -120,6 +120,16 @@ that transcript is not dashboard frame geometry; assert its after-restore tail
 separately. For an interactive child, synchronize input with an explicit
 fixture-ready marker instead of guessing when the child owns the terminal.
 
+Collector changes must keep `test/collector-protocol.test.mjs` independent from
+the socket lifecycle tests in `test/collector.test.mjs`. Protocol tests cover
+exact message schemas, byte limits, chunk order/digest, epoch/generation fences,
+and slow-client queue bounds. Lifecycle tests cover private ownership, stale
+recovery, allowlisted subscriptions, canonical provider fencing, and shared
+acquisition with standalone processes. `test/pty/collector.test.mjs` must prove
+headless serve/bridge behavior and a real local dashboard, including an empty
+client-side `gh` call log. `test/package-boundary.test.mjs` keeps the installed
+package to one executable while checking every collector mode remains present.
+
 Two things to know before editing it:
 
 - `script(1)` is mutually incompatible between macOS (BSD) and Linux (GNU) --

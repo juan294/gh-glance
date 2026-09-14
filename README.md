@@ -324,8 +324,47 @@ pane definition. Flags are there when you want them:
 | `--verbose` | Log one line per dashboard `gh` call to stderr, with timing and outcome. Credential lookup and the account-identity proof are deliberately excluded, so that they cannot log anything derived from a token. stderr must be redirected: `gh-glance --verbose 2>gh-glance.log`. |
 | `--doctor` | Print a diagnostic report and exit. See [Diagnostics](#diagnostics). |
 | `--doctor --probe` | Add bounded, admitted GitHub capability probes to the local diagnostic report. |
+| `--serve --config <path>` | Run the optional local collector in the foreground from a private, versioned JSON allowlist. |
+| `--connect local` | Subscribe the dashboard to the current OS user's collector. No GitHub request runs in the client process. |
+| `--collector-stdio` | Bridge bounded newline JSON on stdin/stdout to an already running local collector. |
 
 An unrecognised flag exits 2 rather than being ignored, so a typo fails loudly.
+
+### Optional local collector
+
+The collector is opt-in and stays in the foreground. It is supported on macOS
+and Linux. Windows continues to support the standalone dashboard, but rejects
+collector hosting and bridge modes. The endpoint is always
+`collector-v1.sock` inside gh-glance's private config directory; there is no TCP
+listener or custom socket flag.
+
+Create a mode-0600 configuration file:
+
+```json
+{
+  "version": 1,
+  "providers": {
+    "personal": { "type": "gh", "host": "github.com" }
+  },
+  "targets": [
+    { "host": "github.com", "repo": "owner/repository", "provider": "personal" }
+  ]
+}
+```
+
+Then run the service and dashboard in separate terminals:
+
+```sh
+gh-glance --serve --config ~/.config/gh-glance/collector.json
+gh-glance --connect local --repo owner/repository
+```
+
+Providers use the server OS user's existing host-specific `gh` login. Clients
+select only an allowlisted `(host, repo)` pair and cannot submit credentials,
+providers, API paths, queries, commands, or filesystem paths. Renamed aliases
+that resolve to one repository cannot cross provider ownership. Disconnecting
+keeps last-known-good rows and their source age, then reconnects to a new server
+epoch without silently falling back to standalone polling.
 
 Environment variables work too, and the flags take precedence:
 

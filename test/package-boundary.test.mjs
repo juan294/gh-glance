@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { once } from "node:events";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -22,6 +23,30 @@ function parsePackManifest(stdout, packageName) {
   const manifest = Array.isArray(payload) ? payload[0] : payload?.[packageName];
   assert.ok(manifest && typeof manifest === "object", "npm pack must report the package manifest");
   return manifest;
+}
+
+async function waitForOutput(child, stream, pattern) {
+  let output = "";
+  stream.on("data", (chunk) => { output += chunk; });
+  for (let index = 0; index < 200 && !pattern.test(output); index += 1) {
+    if (child.exitCode !== null) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.match(output, pattern);
+  return output;
+}
+
+async function waitForExit(child, timeoutMs = 5_000) {
+  if (child.exitCode !== null) return child.exitCode;
+  let timer;
+  try {
+    return await Promise.race([
+      once(child, "exit").then(([code]) => code),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("child exit timed out")), timeoutMs); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 test("npm pack manifests support npm 11 and npm 12 JSON shapes", () => {
@@ -78,6 +103,58 @@ test("the installed package supports only the gh-glance executable", async () =>
       (await run("npx", ["--no-install", "gh-glance", "--version"], { cwd: installRoot })).stdout.trim(),
       expectedVersion,
     );
+    const help = (await run(bin, ["--help"], { cwd: installRoot })).stdout;
+    assert.match(help, /--serve --config (?:PATH|<path>)/);
+    assert.match(help, /--connect local/);
+    assert.match(help, /--collector-stdio/);
+
+    // Exercise the installed artifact's three Phase 8 entry routes. This is
+    // intentionally more than a manifest/help check: the foreground process
+    // owns the packaged socket, the packaged stdio bridge completes a real
+    // handshake through it, and the packaged local-client route reaches its
+    // dashboard boundary with a resolved offline target.
+    // Unix-domain socket paths are short on macOS. Keep the runtime root out
+    // of npm's already-long package test directory so this tests the artifact,
+    // not the platform pathname ceiling.
+    const configHome = await mkdtemp("/tmp/ggcp-package-");
+    const configPath = join(root, "collector.json");
+    await writeFile(configPath, JSON.stringify({
+      version: 1,
+      providers: { personal: { type: "gh", host: "github.com" } },
+      targets: [{ host: "github.com", repo: "acme/widget", provider: "personal" }],
+    }), { mode: 0o600 });
+    const env = { ...process.env, XDG_CONFIG_HOME: configHome };
+    const serve = spawn(bin, ["--serve", "--config", configPath], {
+      cwd: installRoot, env, stdio: ["ignore", "ignore", "pipe"],
+    });
+    try {
+      await waitForOutput(serve, serve.stderr, /collector listening/);
+      const bridge = spawn(bin, ["--collector-stdio"], {
+        cwd: installRoot, env, stdio: ["pipe", "pipe", "pipe"],
+      });
+      let bridgeOutput = "";
+      bridge.stdout.on("data", (chunk) => { bridgeOutput += chunk; });
+      bridge.stdin.end('{"type":"hello","protocolVersion":1}\n');
+      try { await waitForExit(bridge); }
+      finally { if (bridge.exitCode === null) bridge.kill("SIGTERM"); }
+      assert.match(bridgeOutput, /"type":"welcome"/);
+
+      const doctor = await run(bin, ["--connect", "local", "--repo", "acme/widget", "--doctor"], {
+        cwd: installRoot, env,
+      });
+      assert.match(doctor.stdout, /local collector/i);
+      await assert.rejects(
+        run(bin, ["--connect", "local", "--repo", "acme/widget"], { cwd: installRoot, env }),
+        (error) => {
+          assert.match(error.stderr, /stdout is not a terminal/);
+          return true;
+        },
+      );
+    } finally {
+      serve.kill("SIGTERM");
+      if (serve.exitCode === null) await waitForExit(serve);
+      await rm(configHome, { recursive: true, force: true });
+    }
 
     for (const specifier of ["gh-glance", "gh-glance/index.mjs"]) {
       await assert.rejects(

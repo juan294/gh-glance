@@ -26,9 +26,12 @@ import { execFile, spawn } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  constants as fsConstants,
   chmodSync,
   closeSync,
+  fstatSync,
   mkdirSync,
+  lstatSync,
   openSync,
   readFileSync,
   readdirSync,
@@ -40,6 +43,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
+import { createConnection, createServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -214,6 +218,7 @@ const runtime = {
   refreshMs: REFRESH_MS,
   background: "all",
   verbose: false,
+  connect: null,
   initialTabIndex: 0,
 };
 let runtimeRemoteUrls = [];
@@ -694,7 +699,8 @@ function inspectAdmittedHttpStart(scope, operation, now = Date.now) {
 // that the account can change in between. One definition so the three checks
 // cannot drift, and so a request costs one identity snapshot instead of three.
 function assertBoundCredential(bound) {
-  if (bound?.accessKey && bound.accessKey !== runtimeIdentityCoordinator?.current()?.accessKey) {
+  const coordinator = bound?.identityCoordinator ?? runtimeIdentityCoordinator;
+  if (bound?.accessKey && bound.accessKey !== coordinator?.current()?.accessKey) {
     throw new Error("Credential changed before request start");
   }
 }
@@ -741,16 +747,17 @@ async function runGh(args, { signal, operation, input = null } = {}) {
   assertBoundCredential(bound);
   const local = ["version", "local-git"].includes(operation);
   let control = null;
-  const permit = runtimeIdentityCoordinator && !local
-    ? await acquireIdentityHttpPermit(runtimeIdentityCoordinator, { signal }) : null;
+  const identityCoordinator = bound?.identityCoordinator ?? runtimeIdentityCoordinator;
+  const permit = identityCoordinator && !local
+    ? await acquireIdentityHttpPermit(identityCoordinator, { signal }) : null;
   const startedAt = Date.now();
   let requestError = null;
   let requestStdout = null;
   let requestStarted = false;
   try {
     assertBoundCredential(bound);
-    if (runtimeIdentityCoordinator && operation === "budget-core-observer") {
-      control = startIdentityControl(runtimeIdentityCoordinator);
+    if (identityCoordinator && operation === "budget-core-observer") {
+      control = startIdentityControl(identityCoordinator);
       if (!control.ok) throw new Error(identityCoordinationMessage(control.reason));
     }
     // Admission can precede this per-call transport slot by many seconds.
@@ -792,14 +799,14 @@ async function runGh(args, { signal, operation, input = null } = {}) {
     throw err;
   } finally {
     if (permit) {
-      const release = () => releaseIdentityHttpPermit(runtimeIdentityCoordinator, permit, requestError);
-      const released = await retryIdentityCompletion(release, { timeoutMs: IDENTITY_RELEASE_WAIT_MS, shouldRetry: () => !runtimeIdentityCoordinator.isClosed() });
-      if (!released.ok) runtimeIdentityCoordinator.deferCompletion(`permit:${permit.nonce}`, release);
+      const release = () => releaseIdentityHttpPermit(identityCoordinator, permit, requestError);
+      const released = await retryIdentityCompletion(release, { timeoutMs: IDENTITY_RELEASE_WAIT_MS, shouldRetry: () => !identityCoordinator.isClosed() });
+      if (!released.ok) identityCoordinator.deferCompletion(`permit:${permit.nonce}`, release);
     }
     if (control?.ok) {
-      const settle = () => settleIdentityControl(runtimeIdentityCoordinator, control.value, requestStdout ?? requestError?.stdout);
-      const settled = await retryIdentityCompletion(settle, { timeoutMs: IDENTITY_RELEASE_WAIT_MS, shouldRetry: () => !runtimeIdentityCoordinator.isClosed() });
-      if (!settled.ok) runtimeIdentityCoordinator.deferCompletion(`control:${control.value.id}`, settle);
+      const settle = () => settleIdentityControl(identityCoordinator, control.value, requestStdout ?? requestError?.stdout);
+      const settled = await retryIdentityCompletion(settle, { timeoutMs: IDENTITY_RELEASE_WAIT_MS, shouldRetry: () => !identityCoordinator.isClosed() });
+      if (!settled.ok) identityCoordinator.deferCompletion(`control:${control.value.id}`, settle);
     }
   }
 }
@@ -1134,8 +1141,9 @@ function resolveEffectiveRepository({ runtimeRepo = null, ghRepo = null, remoteU
 }
 
 function effectiveRuntimeRepository(options = {}) {
+  const bound = requestIdentityStorage.getStore();
   return resolveEffectiveRepository({
-    runtimeRepo: runtime.repo,
+    runtimeRepo: bound?.repository ?? runtime.repo,
     ghRepo: process.env.GH_REPO,
     remoteUrls: runtimeRemoteUrls,
     ...options,
@@ -1143,10 +1151,11 @@ function effectiveRuntimeRepository(options = {}) {
 }
 
 function effectiveRuntimeHost(options = {}) {
+  const bound = requestIdentityStorage.getStore();
   return resolveEffectiveHost({
-    runtimeHost: runtime.host,
-    runtimeRepo: runtime.repo,
-    repoExplicit: runtime.repoExplicit,
+    runtimeHost: bound?.host ?? runtime.host,
+    runtimeRepo: bound?.repository ?? runtime.repo,
+    repoExplicit: bound?.repository ? true : runtime.repoExplicit,
     ghHost: process.env.GH_HOST,
     ghRepo: process.env.GH_REPO,
     remoteUrls: runtimeRemoteUrls,
@@ -1172,7 +1181,8 @@ function apiHostArgs(host = effectiveRuntimeHost()) {
 // a request path -- and note it is the bare slug that goes in, never the host,
 // which travels as an argument rather than as path text.
 function apiPath(path) {
-  return runtime.repo ? path.replace("{owner}/{repo}", runtime.repo) : path;
+  const repository = effectiveRuntimeRepository();
+  return repository ? path.replace("{owner}/{repo}", repository) : path;
 }
 
 // ---------- Data fetchers ----------
@@ -5402,7 +5412,7 @@ async function fetchAlertSource(source, signal, now, {
   force = false,
   request = fetchConditionalEntity,
 } = {}) {
-  if (backoffActive(source.key, now)) {
+  if (!force && backoffActive(source.key, now)) {
     const { note, verdict } = alertBackoff.get(backoffStorageKey(source.key));
     // The verdict is replayed alongside the note. Replaying only the note left
     // the tab unable to tell "Dependabot is switched off here" from "we cannot
@@ -5795,6 +5805,1712 @@ async function preflight() {
     );
   }
   return null;
+}
+
+function localCollectorPreflight(remoteUrls = []) {
+  if (effectiveRuntimeRepository({ remoteUrls })) return null;
+  return (
+    "gh-glance: local collector repository could not be resolved.\n" +
+    "Run it from a checkout with one usable GitHub remote, or pass --repo owner/name."
+  );
+}
+
+// ---------- Optional local collector ----------
+
+const COLLECTOR_PROTOCOL_VERSION = 1;
+const COLLECTOR_FRAME_MAX_BYTES = 1024 * 1024;
+const COLLECTOR_CHUNK_FRAME_MAX_BYTES = 512 * 1024;
+const COLLECTOR_ASSEMBLY_MAX_BYTES = 8 * 1024 * 1024;
+const COLLECTOR_ASSEMBLY_TIMEOUT_MS = 10_000;
+const COLLECTOR_MAX_CLIENT_SUBSCRIPTIONS = 64;
+const COLLECTOR_MAX_CLIENT_QUEUE_FRAMES = 64;
+const COLLECTOR_MAX_CLIENT_QUEUE_BYTES = 4 * 1024 * 1024;
+const COLLECTOR_MAX_AGGREGATE_QUEUE_BYTES = 64 * 1024 * 1024;
+const COLLECTOR_DRAIN_TIMEOUT_MS = 10_000;
+const COLLECTOR_HOLD_REASONS = new Set([
+  "observer", "primary", "secondary", "disconnected", "coordination", "shared-wait", "cache-only",
+]);
+const COLLECTOR_ROW_KEYS = Object.freeze({
+  actions: ["databaseId", "displayTitle", "workflowName", "number", "headBranch", "status", "conclusion",
+    "startedAt", "updatedAt", "url"],
+  issues: ["number", "title", "author", "label", "updatedAt", "url"],
+  prs: ["number", "title", "author", "headRefName", "isDraft", "reviewDecision", "updatedAt", "url"],
+  security: ["id", "kind", "severity", "title", "detail", "createdAt"],
+});
+const COLLECTOR_DIAGNOSTIC_STATUSES = new Set([
+  "initializing", "healthy", "waiting", "unavailable", ...COLLECTOR_HOLD_REASONS,
+]);
+
+function collectorSocketPath(pathOptions = {}) {
+  return join(dirname(widthPreferencesPath(pathOptions)), "collector-v1.sock");
+}
+
+function collectorOwnershipPath(pathOptions = {}) {
+  return join(dirname(widthPreferencesPath(pathOptions)), "collector-ownership-v1.json");
+}
+
+function loadCollectorCanonicalOwnership(pathOptions, target) {
+  const path = collectorOwnershipPath(pathOptions);
+  try {
+    const loaded = JSON.parse(readFileSync(path, "utf8"));
+    if (!isRecord(loaded) || loaded.version !== 1 || !isRecord(loaded.owners) ||
+        !isRecord(loaded.aliases ?? {}) || Object.keys(loaded).some((key) => !["version", "owners", "aliases"].includes(key))) {
+      return { ok: false, reason: "corrupt" };
+    }
+    const textual = `${target.host}/${target.repo.toLowerCase()}`;
+    if (loaded.owners[textual] && loaded.owners[textual] !== target.provider) {
+      return { ok: false, reason: "provider-conflict" };
+    }
+    const identity = loaded.aliases?.[textual];
+    return identity === undefined
+      ? { ok: true, value: null }
+      : normalizeRepositoryIdentity(identity)
+        ? { ok: true, value: normalizeRepositoryIdentity(identity) }
+        : { ok: false, reason: "corrupt" };
+  } catch (error) {
+    return error?.code === "ENOENT" ? { ok: true, value: null } : { ok: false, reason: "unreadable" };
+  }
+}
+
+function admitCollectorCanonicalOwnership(pathOptions, target, repositoryIdentity) {
+  const identity = normalizeRepositoryIdentity(repositoryIdentity);
+  if (!identity) return { ok: false, reason: "identity" };
+  const path = collectorOwnershipPath(pathOptions);
+  ensurePrivateCollectorRoot(dirname(path), pathOptions.platform);
+  return withPersistenceLock(path, () => {
+    let state = { version: 1, owners: {}, aliases: {} };
+    try {
+      const loaded = JSON.parse(readFileSync(path, "utf8"));
+      if (!isRecord(loaded) || loaded.version !== 1 || !isRecord(loaded.owners) ||
+          !isRecord(loaded.aliases ?? {}) || Object.keys(loaded).some((key) => !["version", "owners", "aliases"].includes(key)) ||
+          Object.entries(loaded.owners).some(([key, value]) => key.length > 512 || !validCollectorId(value))) {
+        return { ok: false, reason: "corrupt" };
+      }
+      state = { ...loaded, aliases: loaded.aliases ?? {} };
+    } catch (error) {
+      if (error?.code !== "ENOENT") return { ok: false, reason: "unreadable" };
+    }
+    const textual = `${target.host}/${target.repo.toLowerCase()}`;
+    const canonical = `${target.host}/${identity.nameWithOwner.toLowerCase()}`;
+    const keys = [textual, canonical, `${target.host}/id:${identity.id}`];
+    if (keys.some((key) => state.owners[key] && state.owners[key] !== target.provider)) {
+      return { ok: false, reason: "provider-conflict" };
+    }
+    let changed = false;
+    for (const key of keys) {
+      if (state.owners[key] !== target.provider) { state.owners[key] = target.provider; changed = true; }
+    }
+    for (const alias of [textual, canonical]) {
+      if (JSON.stringify(state.aliases[alias]) !== JSON.stringify(identity)) {
+        state.aliases[alias] = identity;
+        changed = true;
+      }
+    }
+    if (!changed) return { ok: true, value: identity };
+    const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temp, `${JSON.stringify(state)}\n`, { mode: 0o600, flag: "wx" });
+      renameSync(temp, path);
+      return { ok: true, value: identity };
+    } catch (error) {
+      try { unlinkSync(temp); } catch { /* exact operation-owned temp */ }
+      return { ok: false, reason: "unwritable", error };
+    }
+  });
+}
+
+function normalizeCollectorConfig(raw, { aliases = {} } = {}) {
+  if (!exactKeys(raw, ["version", "providers", "targets"]) || raw.version !== 1 ||
+      !isRecord(raw.providers) || !Array.isArray(raw.targets) || raw.targets.length > 32) return null;
+  const providers = {};
+  for (const [name, provider] of Object.entries(raw.providers)) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) ||
+        !exactKeys(provider, ["type", "host"]) || provider.type !== "gh") return null;
+    const host = normalizeHost(provider.host);
+    if (!host) return null;
+    providers[name] = { type: "gh", host };
+  }
+  if (Object.keys(providers).length === 0) return null;
+  const targets = [];
+  const ownership = new Map();
+  for (const target of raw.targets) {
+    if (!exactKeys(target, ["host", "repo", "provider"]) || !providers[target.provider]) return null;
+    const host = normalizeHost(target.host);
+    let repo;
+    try { repo = parseRepoTarget(target.repo).slug; } catch { return null; }
+    if (!host || providers[target.provider].host !== host) return null;
+    const textual = `${host}/${repo.toLowerCase()}`;
+    const canonical = aliases[textual] ?? textual;
+    const owner = ownership.get(canonical);
+    if (owner && owner !== target.provider) return null;
+    if (owner) return null;
+    ownership.set(canonical, target.provider);
+    targets.push({ host, repo, provider: target.provider, canonical });
+  }
+  if (targets.length === 0) return null;
+  return { version: 1, providers, targets };
+}
+
+function loadCollectorConfig(path, options = {}) {
+  if (typeof path !== "string" || path.length === 0) return { ok: false, reason: "invalid" };
+  let fd = null;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return { ok: false, reason: "invalid" };
+    if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+      return { ok: false, reason: "ownership" };
+    }
+    if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
+      return { ok: false, reason: "permissions" };
+    }
+    if (stat.size > COLLECTOR_FRAME_MAX_BYTES) return { ok: false, reason: "size" };
+    const value = normalizeCollectorConfig(JSON.parse(readFileSync(fd, "utf8")), options);
+    return value ? { ok: true, value } : { ok: false, reason: "invalid" };
+  } catch (error) {
+    return { ok: false, reason: error instanceof SyntaxError ? "invalid" : "unreadable", error };
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+function encodeCollectorFrame(frame) {
+  const line = `${JSON.stringify(frame)}\n`;
+  if (Buffer.byteLength(line) > COLLECTOR_FRAME_MAX_BYTES) throw new Error("collector frame too large");
+  return line;
+}
+
+function createCollectorFrameDecoder({ onFrame, onError = () => {} } = {}) {
+  if (typeof onFrame !== "function") throw new TypeError("onFrame must be a function");
+  let parts = [];
+  let pendingBytes = 0;
+  let failed = false;
+  const reject = (reason) => {
+    if (failed) return;
+    failed = true;
+    parts = [];
+    pendingBytes = 0;
+    onError(new Error(reason));
+  };
+  const acceptLine = (part, newlineBytes) => {
+    const total = pendingBytes + newlineBytes;
+    if (total + 1 > COLLECTOR_FRAME_MAX_BYTES) { reject("collector frame too large"); return false; }
+    if (newlineBytes > 0) parts.push(part);
+    const line = parts.length === 0 ? "" : parts.length === 1
+      ? parts[0].toString("utf8")
+      : Buffer.concat(parts, total).toString("utf8");
+    parts = [];
+    pendingBytes = 0;
+    try {
+      const value = JSON.parse(line);
+      if (!isRecord(value)) throw new Error("frame must be an object");
+      onFrame(value);
+      return true;
+    } catch {
+      reject("invalid collector JSON");
+      return false;
+    }
+  };
+  return {
+    push(chunk) {
+      if (failed || !Buffer.isBuffer(chunk) && !(chunk instanceof Uint8Array)) return false;
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      let offset = 0;
+      let newline;
+      while ((newline = buffer.indexOf(0x0a, offset)) >= 0) {
+        const segment = buffer.subarray(offset, newline);
+        if (!acceptLine(segment, segment.length)) return false;
+        offset = newline + 1;
+      }
+      if (offset < buffer.length) {
+        const remainder = buffer.subarray(offset);
+        pendingBytes += remainder.length;
+        if (pendingBytes >= COLLECTOR_FRAME_MAX_BYTES) { reject("collector frame too large"); return false; }
+        parts.push(remainder);
+      }
+      return true;
+    },
+    end() {
+      if (!failed && pendingBytes > 0) reject("incomplete collector frame");
+      return !failed;
+    },
+  };
+}
+
+function normalizeCollectorDemand(raw) {
+  if (!exactKeys(raw, ["active", "background", "floorMs", "pages"]) || typeof raw.active !== "boolean" ||
+      typeof raw.background !== "boolean" ||
+      !Number.isSafeInteger(raw.floorMs) || raw.floorMs < MIN_REFRESH_SECONDS * 1000 ||
+      raw.floorMs > MAX_REFRESH_SECONDS * 1000 || !Number.isSafeInteger(raw.pages) ||
+      raw.pages < 1 || raw.pages > 3) return null;
+  return { active: raw.active, background: raw.background, floorMs: raw.floorMs, pages: raw.pages };
+}
+
+function normalizeCollectorSubscription(raw) {
+  if (!isRecord(raw) || !validCollectorId(raw.id) || !TAB_KEYS.includes(raw.resource)) return null;
+  const host = normalizeHost(raw.host);
+  const demand = normalizeCollectorDemand(raw.demand);
+  let repo = null;
+  try { repo = parseRepoTarget(raw.repo).slug; } catch { /* rejected below */ }
+  return host && repo && demand ? { id: raw.id, host, repo, resource: raw.resource, demand } : null;
+}
+
+function validCollectorId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
+}
+
+function validateCollectorClientMessage(raw) {
+  if (!isRecord(raw) || typeof raw.type !== "string") return null;
+  if (raw.type === "hello") {
+    return exactKeys(raw, ["type", "protocolVersion"]) && raw.protocolVersion === 1 ? { ...raw } : null;
+  }
+  if (["unsubscribe", "inspect"].includes(raw.type)) {
+    return exactKeys(raw, ["type", "id"]) && validCollectorId(raw.id) ? { ...raw } : null;
+  }
+  if (raw.type === "refresh") {
+    return exactKeys(raw, ["type", "id", "force"]) && validCollectorId(raw.id) &&
+      typeof raw.force === "boolean" ? { ...raw } : null;
+  }
+  if (raw.type === "demand") {
+    const demand = normalizeCollectorDemand(raw.demand);
+    return exactKeys(raw, ["type", "id", "demand"]) && validCollectorId(raw.id) && demand
+      ? { type: raw.type, id: raw.id, demand } : null;
+  }
+  if (raw.type === "subscribe") {
+    const subscription = normalizeCollectorSubscription(raw);
+    return exactKeys(raw, ["type", "id", "host", "repo", "resource", "demand"]) && subscription
+      ? { type: raw.type, ...subscription } : null;
+  }
+  return null;
+}
+
+function normalizeCollectorSnapshot(raw, expectedResource = null) {
+  const keys = ["resource", "generation", "rows", "pageInfo", "lastSuccessAt", "lastChangedAt", "nextDueAt",
+    "hold", "meta", "securityNotes", "securityBlind", "capabilities"];
+  if (!exactKeys(raw, keys) || !TAB_KEYS.includes(raw.resource) ||
+      expectedResource !== null && raw.resource !== expectedResource ||
+      !Number.isSafeInteger(raw.generation) || raw.generation < 0 ||
+      !Array.isArray(raw.rows) || raw.rows.length > ACQUISITION_MAX_ENTITIES ||
+      !Number.isFinite(raw.lastSuccessAt) || !Number.isFinite(raw.lastChangedAt) ||
+      raw.lastChangedAt > raw.lastSuccessAt || !Number.isFinite(raw.nextDueAt) ||
+      raw.hold !== null && !ACQUISITION_HOLD_REASONS.has(raw.hold) ||
+      !exactKeys(raw.meta, ["at", "truncated"]) || !Number.isFinite(raw.meta.at) ||
+      typeof raw.meta.truncated !== "boolean" || !Array.isArray(raw.securityNotes) || raw.securityNotes.length > 256 ||
+      raw.securityNotes.some((note) => typeof note !== "string") || typeof raw.securityBlind !== "boolean") return null;
+  if (raw.rows.some((row) => !exactKeys(row, COLLECTOR_ROW_KEYS[raw.resource]))) return null;
+  const rows = raw.rows.map((row) => normalizeCachedItem(raw.resource, row));
+  const capabilities = normalizeAcquisitionCapabilities(raw.capabilities);
+  const pageInfo = normalizeAcquisitionPageInfo(raw.pageInfo);
+  if (rows.some((row) => row === null) || capabilities === null ||
+      raw.resource !== "security" && Object.keys(capabilities).length > 0 ||
+      raw.pageInfo !== null && pageInfo === null) return null;
+  return {
+    resource: raw.resource,
+    generation: raw.generation,
+    rows,
+    pageInfo,
+    lastSuccessAt: raw.lastSuccessAt,
+    lastChangedAt: raw.lastChangedAt,
+    nextDueAt: raw.nextDueAt,
+    hold: raw.hold,
+    meta: { at: raw.meta.at, truncated: raw.meta.truncated },
+    securityNotes: raw.securityNotes.map(safe),
+    securityBlind: raw.securityBlind,
+    capabilities,
+  };
+}
+
+function projectCollectorSnapshot(snapshot, resource = snapshot?.resource) {
+  if (!isRecord(snapshot) || !TAB_KEYS.includes(resource)) return null;
+  return normalizeCollectorSnapshot({
+    resource,
+    generation: snapshot.generation,
+    rows: snapshot.rows,
+    pageInfo: snapshot.pageInfo ?? null,
+    lastSuccessAt: snapshot.lastSuccessAt,
+    lastChangedAt: snapshot.lastChangedAt,
+    nextDueAt: snapshot.nextDueAt,
+    hold: snapshot.hold ?? null,
+    meta: snapshot.meta ?? { at: snapshot.lastChangedAt, truncated: false },
+    securityNotes: snapshot.securityNotes ?? [],
+    securityBlind: snapshot.securityBlind ?? false,
+    capabilities: snapshot.capabilities ?? {},
+  });
+}
+
+function prepareCollectorSnapshot(input, resource = input?.resource) {
+  const snapshot = projectCollectorSnapshot(input, resource);
+  if (!snapshot) throw new Error("invalid collector snapshot");
+  const json = JSON.stringify(snapshot);
+  const payload = Buffer.from(json);
+  if (payload.length > COLLECTOR_ASSEMBLY_MAX_BYTES) throw new Error("collector snapshot too large");
+  return { snapshot, json, payload };
+}
+
+function createCollectorSnapshotEncodingCache() {
+  const entries = new WeakMap();
+  let preparations = 0;
+  let references = 0;
+  return {
+    acquire(input, resource = input?.resource) {
+      if (!isRecord(input)) throw new Error("invalid collector snapshot");
+      let byResource = entries.get(input);
+      if (!byResource) { byResource = new Map(); entries.set(input, byResource); }
+      let entry = byResource.get(resource);
+      if (!entry) {
+        entry = { prepared: prepareCollectorSnapshot(input, resource), refs: 0 };
+        byResource.set(resource, entry);
+        preparations += 1;
+      }
+      entry.refs += 1;
+      references += 1;
+      let released = false;
+      return {
+        value: entry.prepared,
+        release() {
+          if (released) return;
+          released = true;
+          entry.refs -= 1;
+          references -= 1;
+          if (entry.refs === 0) queueMicrotask(() => {
+            if (entry.refs === 0 && byResource.get(resource) === entry) byResource.delete(resource);
+          });
+        },
+      };
+    },
+    inspect() { return { preparations, references }; },
+  };
+}
+
+function *collectorSnapshotLineIterator(id, serverEpoch, prepared) {
+  if (!validCollectorId(id) || !validGovernorId(serverEpoch) && !validCollectorId(serverEpoch)) {
+    throw new Error("invalid collector snapshot");
+  }
+  const { snapshot, json, payload } = prepared;
+  const small = `{"type":"snapshot","id":${JSON.stringify(id)},"serverEpoch":${JSON.stringify(serverEpoch)},` +
+    `"generation":${snapshot.generation},"snapshot":${json}}\n`;
+  if (Buffer.byteLength(small) <= COLLECTOR_FRAME_MAX_BYTES) { yield small; return; }
+  const snapshotId = randomUUID();
+  const digest = createHash("sha256").update(payload).digest("hex");
+  const rawChunkBytes = 360 * 1024;
+  const partCount = Math.ceil(payload.length / rawChunkBytes);
+  yield encodeCollectorFrame({ type: "snapshot-begin", id, serverEpoch, resource: snapshot.resource,
+    generation: snapshot.generation, snapshotId, totalBytes: payload.length, digest, parts: partCount });
+  for (let index = 0, offset = 0; offset < payload.length; index += 1, offset += rawChunkBytes) {
+    const line = encodeCollectorFrame({ type: "snapshot-part", id, serverEpoch, resource: snapshot.resource,
+      generation: snapshot.generation, snapshotId, index,
+      data: payload.subarray(offset, offset + rawChunkBytes).toString("base64") });
+    if (Buffer.byteLength(line) > COLLECTOR_CHUNK_FRAME_MAX_BYTES) throw new Error("collector chunk frame too large");
+    yield line;
+  }
+  yield encodeCollectorFrame({ type: "snapshot-end", id, serverEpoch, resource: snapshot.resource,
+    generation: snapshot.generation, snapshotId });
+}
+
+function *collectorSnapshotFrameIterator(id, serverEpoch, input, resource = input?.resource) {
+  const prepared = prepareCollectorSnapshot(input, resource);
+  const { snapshot, payload } = prepared;
+  if (!validCollectorId(id) || !validGovernorId(serverEpoch) && !validCollectorId(serverEpoch) ||
+      !snapshot) throw new Error("invalid collector snapshot");
+  const small = { type: "snapshot", id, serverEpoch, generation: snapshot.generation, snapshot };
+  try { encodeCollectorFrame(small); yield small; return; } catch (error) {
+    if (!/frame too large/.test(error.message)) throw error;
+  }
+  const snapshotId = randomUUID();
+  const digest = createHash("sha256").update(payload).digest("hex");
+  const rawChunkBytes = 360 * 1024;
+  const partCount = Math.ceil(payload.length / rawChunkBytes);
+  yield { type: "snapshot-begin", id, serverEpoch, resource: snapshot.resource, generation: snapshot.generation,
+    snapshotId, totalBytes: payload.length, digest, parts: partCount };
+  for (let index = 0, offset = 0; offset < payload.length; index += 1, offset += rawChunkBytes) {
+    const data = payload.subarray(offset, offset + rawChunkBytes).toString("base64");
+    const frame = { type: "snapshot-part", id, serverEpoch, resource: snapshot.resource, generation: snapshot.generation,
+      snapshotId, index, data };
+    if (Buffer.byteLength(encodeCollectorFrame(frame)) > COLLECTOR_CHUNK_FRAME_MAX_BYTES) {
+      throw new Error("collector chunk frame too large");
+    }
+    yield frame;
+  }
+  yield { type: "snapshot-end", id, serverEpoch, resource: snapshot.resource,
+    generation: snapshot.generation, snapshotId };
+}
+
+function encodeCollectorSnapshotFrames(id, serverEpoch, snapshot) {
+  return [...collectorSnapshotFrameIterator(id, serverEpoch, snapshot)];
+}
+
+function createCollectorSnapshotAssembler({ onSnapshot, now = Date.now, setTimeout: setTimeout_ = setTimeout,
+  clearTimeout: clearTimeout_ = clearTimeout, resourceForId = () => null } = {}) {
+  if (typeof onSnapshot !== "function") throw new TypeError("onSnapshot must be a function");
+  const pending = new Map();
+  const fail = (id, reason) => {
+    const state = pending.get(id);
+    if (state?.timer !== undefined) clearTimeout_(state.timer);
+    pending.delete(id);
+    return { ok: false, reason };
+  };
+  return {
+    accept(frame) {
+      if (!isRecord(frame) || !validCollectorId(frame.id) ||
+          !validGovernorId(frame.serverEpoch) && !validCollectorId(frame.serverEpoch) ||
+          !Number.isSafeInteger(frame.generation) || frame.generation < 0) return { ok: false, reason: "invalid" };
+      if (frame.type === "snapshot") {
+        if (!exactKeys(frame, ["type", "id", "serverEpoch", "generation", "snapshot"])) {
+          return { ok: false, reason: "invalid" };
+        }
+        const snapshot = normalizeCollectorSnapshot(frame.snapshot, resourceForId(frame.id));
+        if (!snapshot || snapshot.generation !== frame.generation) return { ok: false, reason: "invalid" };
+        onSnapshot(snapshot, frame);
+        return { ok: true, complete: true };
+      }
+      if (frame.type === "snapshot-begin") {
+        if (!exactKeys(frame, ["type", "id", "serverEpoch", "resource", "generation", "snapshotId", "totalBytes", "digest", "parts"]) ||
+            pending.has(frame.id) || pending.size >= COLLECTOR_MAX_CLIENT_SUBSCRIPTIONS ||
+            !TAB_KEYS.includes(frame.resource) || resourceForId(frame.id) !== null && resourceForId(frame.id) !== frame.resource ||
+            !validCollectorId(frame.snapshotId) ||
+            !Number.isSafeInteger(frame.totalBytes) || frame.totalBytes < 1 ||
+            frame.totalBytes > COLLECTOR_ASSEMBLY_MAX_BYTES || !Number.isSafeInteger(frame.parts) ||
+            frame.parts < 1 || frame.parts > 32 || !/^[0-9a-f]{64}$/.test(frame.digest)) return fail(frame.id, "invalid");
+        const state = { ...frame, next: 0, bytes: 0, chunks: [], startedAt: now(), timer: null };
+        state.timer = setTimeout_(() => fail(frame.id, "timeout"), COLLECTOR_ASSEMBLY_TIMEOUT_MS);
+        state.timer?.unref?.();
+        pending.set(frame.id, state);
+        return { ok: true };
+      }
+      const state = pending.get(frame.id);
+      if (!state || frame.snapshotId !== state.snapshotId || frame.serverEpoch !== state.serverEpoch ||
+          frame.generation !== state.generation || frame.resource !== state.resource ||
+          now() - state.startedAt > COLLECTOR_ASSEMBLY_TIMEOUT_MS) {
+        return fail(frame.id, "stale");
+      }
+      if (frame.type === "snapshot-part") {
+        if (!exactKeys(frame, ["type", "id", "serverEpoch", "resource", "generation", "snapshotId", "index", "data"]) ||
+            frame.index !== state.next || frame.index >= state.parts || typeof frame.data !== "string" ||
+            frame.data.length === 0 || frame.data.length % 4 !== 0 ||
+            !/^[A-Za-z0-9+/]+={0,2}$/.test(frame.data) ||
+            Buffer.byteLength(encodeCollectorFrame(frame)) > COLLECTOR_CHUNK_FRAME_MAX_BYTES) return fail(frame.id, "order");
+        const chunk = Buffer.from(frame.data, "base64");
+        state.chunks.push(chunk);
+        state.next += 1;
+        state.bytes += chunk.length;
+        if (state.bytes > state.totalBytes) {
+          return fail(frame.id, "size");
+        }
+        return { ok: true };
+      }
+      if (frame.type !== "snapshot-end" ||
+          !exactKeys(frame, ["type", "id", "serverEpoch", "resource", "generation", "snapshotId"]) ||
+          state.next !== state.parts) return fail(frame.id, "incomplete");
+      const payload = Buffer.concat(state.chunks);
+      fail(frame.id, "complete");
+      if (payload.length !== state.totalBytes ||
+          createHash("sha256").update(payload).digest("hex") !== state.digest) return { ok: false, reason: "digest" };
+      try {
+        const snapshot = normalizeCollectorSnapshot(JSON.parse(payload.toString("utf8")), state.resource);
+        if (!snapshot || snapshot.generation !== state.generation) return { ok: false, reason: "schema" };
+        onSnapshot(snapshot, state);
+        return { ok: true, complete: true };
+      } catch {
+        return { ok: false, reason: "schema" };
+      }
+    },
+    cancel(id) { fail(id, "cancelled"); },
+    reset() { for (const id of [...pending.keys()]) fail(id, "reset"); },
+    inspect() { return { pending: pending.size }; },
+  };
+}
+
+function createCollectorSender(socket, aggregate = { bytes: 0 }, {
+  setTimeout: setTimeout_ = setTimeout,
+  clearTimeout: clearTimeout_ = clearTimeout,
+  drainTimeoutMs = COLLECTOR_DRAIN_TIMEOUT_MS,
+  snapshotCache = createCollectorSnapshotEncodingCache(),
+} = {}) {
+  const queue = [];
+  const pendingSnapshots = new Map();
+  const snapshotOrder = [];
+  let queuedFrames = 0;
+  let queuedBytes = 0;
+  let active = false;
+  let closed = false;
+  let currentTask = null;
+  let currentSnapshotTask = null;
+
+  const release = (frames, bytes) => {
+    queuedFrames = Math.max(0, queuedFrames - frames);
+    queuedBytes = Math.max(0, queuedBytes - bytes);
+    aggregate.bytes = Math.max(0, aggregate.bytes - bytes);
+  };
+  const releaseTask = (task) => {
+    if (!task || task.released) return;
+    task.released = true;
+    release(task.frameCount, task.bytes);
+    task.release?.();
+  };
+  const reserveTask = (task, replaced = null) => {
+    const priorFrames = replaced?.frameCount ?? 0;
+    const priorBytes = replaced?.bytes ?? 0;
+    if (queuedFrames - priorFrames + task.frameCount > COLLECTOR_MAX_CLIENT_QUEUE_FRAMES ||
+        queuedBytes - priorBytes + task.bytes > COLLECTOR_MAX_CLIENT_QUEUE_BYTES ||
+        aggregate.bytes - priorBytes + task.bytes > COLLECTOR_MAX_AGGREGATE_QUEUE_BYTES) return false;
+    if (replaced) releaseTask(replaced);
+    queuedFrames += task.frameCount;
+    queuedBytes += task.bytes;
+    aggregate.bytes += task.bytes;
+    return true;
+  };
+  const fail = () => {
+    if (closed) return;
+    closed = true;
+    releaseTask(currentTask);
+    releaseTask(currentSnapshotTask);
+    for (const task of queue.splice(0)) releaseTask(task);
+    for (const task of pendingSnapshots.values()) releaseTask(task);
+    pendingSnapshots.clear();
+    snapshotOrder.length = 0;
+    if (!socket.destroyed) socket.destroy();
+  };
+  const waitForDrain = () => new Promise((resolve, reject) => {
+    let timer = null;
+    const cleanup = () => {
+      socket.off?.("drain", drained);
+      socket.off?.("error", failed);
+      socket.off?.("close", closedSocket);
+      if (timer !== null) clearTimeout_(timer);
+    };
+    const drained = () => { cleanup(); resolve(); };
+    const failed = (error) => { cleanup(); reject(error); };
+    const closedSocket = () => { cleanup(); reject(new Error("collector socket closed")); };
+    socket.once("drain", drained);
+    socket.once("error", failed);
+    socket.once("close", closedSocket);
+    timer = setTimeout_(() => failed(new Error("collector drain timeout")), drainTimeoutMs);
+    timer?.unref?.();
+  });
+  const writeLine = async (line, reserved = false) => {
+    const bytes = Buffer.byteLength(line);
+    if (!reserved) {
+      if (aggregate.bytes + bytes > COLLECTOR_MAX_AGGREGATE_QUEUE_BYTES) throw new Error("collector aggregate stalled");
+      aggregate.bytes += bytes;
+    }
+    try {
+      if (!socket.write(line)) await waitForDrain();
+    } finally {
+      if (!reserved) aggregate.bytes -= bytes;
+    }
+  };
+  const pump = async () => {
+    if (active || closed) return;
+    active = true;
+    try {
+      while (!closed && (queue.length > 0 || snapshotOrder.length > 0)) {
+        const task = queue.length > 0 ? queue.shift() : pendingSnapshots.get(snapshotOrder.shift());
+        if (!task) continue;
+        currentTask = task;
+        if (task.kind === "snapshot") {
+          pendingSnapshots.delete(task.id);
+          currentSnapshotTask = task;
+        }
+        if (task.kind === "lines") {
+          for (const line of task.lines) await writeLine(line, true);
+        } else {
+          for (const line of task.lines()) {
+            const encoded = { frameCount: 1, bytes: Buffer.byteLength(line), released: false };
+            if (!reserveTask(encoded)) throw new Error("collector client stalled");
+            currentTask = encoded;
+            try {
+              await writeLine(line, true);
+            } finally {
+              releaseTask(encoded);
+              currentTask = task;
+            }
+          }
+        }
+        releaseTask(task);
+        currentTask = null;
+        currentSnapshotTask = null;
+      }
+    } catch {
+      fail();
+    } finally {
+      active = false;
+    }
+  };
+  return {
+    send(frames) {
+      if (closed) return false;
+      const lines = (Array.isArray(frames) ? frames : [frames]).map(encodeCollectorFrame);
+      const bytes = lines.reduce((total, line) => total + Buffer.byteLength(line), 0);
+      if (queuedFrames + lines.length > COLLECTOR_MAX_CLIENT_QUEUE_FRAMES ||
+          queuedBytes + bytes > COLLECTOR_MAX_CLIENT_QUEUE_BYTES ||
+          aggregate.bytes + bytes > COLLECTOR_MAX_AGGREGATE_QUEUE_BYTES) {
+        fail();
+        return false;
+      }
+      const task = { kind: "lines", lines, bytes, frameCount: lines.length, released: false };
+      if (!reserveTask(task)) { fail(); return false; }
+      queue.push(task);
+      void pump();
+      return true;
+    },
+    sendSnapshot(id, serverEpoch, snapshot, resource = snapshot?.resource) {
+      if (closed) return false;
+      const encoding = snapshotCache.acquire(snapshot, resource);
+      const task = { kind: "snapshot", id, generation: encoding.value.snapshot.generation,
+        bytes: 0, frameCount: 0, released: false,
+        release: encoding.release,
+        lines: () => collectorSnapshotLineIterator(id, serverEpoch, encoding.value) };
+      if (pendingSnapshots.has(id)) {
+        const previous = pendingSnapshots.get(id);
+        if (previous.generation > task.generation) { releaseTask(task); return true; }
+        releaseTask(previous);
+        pendingSnapshots.set(id, task);
+      } else {
+        if (pendingSnapshots.size >= COLLECTOR_MAX_CLIENT_SUBSCRIPTIONS) {
+          releaseTask(task); fail(); return false;
+        }
+        pendingSnapshots.set(id, task);
+        snapshotOrder.push(id);
+      }
+      void pump();
+      return true;
+    },
+    close: fail,
+    inspect() { return { active, queuedFrames, queuedBytes, pendingSnapshots: pendingSnapshots.size, closed }; },
+  };
+}
+
+function collectorTarget(config, host, repo) {
+  return config.targets.find((target) => target.host === host && target.repo.toLowerCase() === repo.toLowerCase()) ?? null;
+}
+
+function normalizeCollectorDiagnostic(raw, expectedResource = null) {
+  if (!exactKeys(raw, ["source", "status", "resource", "generation", "lastSuccessAt", "lastChangedAt"]) ||
+      raw.source !== "local collector" || !TAB_KEYS.includes(raw.resource) ||
+      expectedResource !== null && raw.resource !== expectedResource ||
+      !COLLECTOR_DIAGNOSTIC_STATUSES.has(raw.status) ||
+      !Number.isSafeInteger(raw.generation) || raw.generation < 0 ||
+      raw.lastSuccessAt !== null && !Number.isFinite(raw.lastSuccessAt) ||
+      raw.lastChangedAt !== null && !Number.isFinite(raw.lastChangedAt)) return null;
+  return { source: raw.source, status: safe(raw.status), resource: raw.resource,
+    generation: raw.generation, lastSuccessAt: raw.lastSuccessAt, lastChangedAt: raw.lastChangedAt };
+}
+
+function ensurePrivateCollectorRoot(root, platform = process.platform) {
+  try {
+    const current = lstatSync(root);
+    if (!current.isDirectory() || current.isSymbolicLink() ||
+        typeof process.getuid === "function" && current.uid !== process.getuid()) {
+      throw new Error("collector config root is not privately owned");
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+  }
+  if (platform !== "win32") chmodSync(root, 0o700);
+}
+
+async function removeUnownedStaleSocket(socketPath) {
+  let identity;
+  try {
+    identity = lstatSync(socketPath);
+    if (!identity.isSocket() || identity.isSymbolicLink()) throw new Error("collector endpoint is unsafe");
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  const live = await new Promise((resolve) => {
+    const probe = createConnection(socketPath);
+    const finish = (value) => { probe.destroy(); resolve(value); };
+    probe.once("connect", () => finish(true));
+    probe.once("error", () => finish(false));
+    probe.setTimeout(250, () => finish(true));
+  });
+  if (live) throw new Error("collector endpoint already active");
+  if (!unlinkMatchingInode(socketPath, identity)) throw new Error("collector endpoint ownership changed");
+}
+
+function unlinkMatchingInode(path, identity) {
+  if (!identity) return false;
+  try {
+    const current = lstatSync(path);
+    if (current.dev !== identity.dev || current.ino !== identity.ino) return false;
+    unlinkSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readCollectorLock(lockPath) {
+  let fd = null;
+  try {
+    fd = openSync(lockPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const identity = fstatSync(fd);
+    if (!identity.isFile() || typeof process.getuid === "function" && identity.uid !== process.getuid() ||
+        process.platform !== "win32" && (identity.mode & 0o077) !== 0) return null;
+    const owner = JSON.parse(readFileSync(fd, "utf8"));
+    return { owner, identity };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+function removeOwnedCollectorLock(lockPath, nonce) {
+  const loaded = readCollectorLock(lockPath);
+  if (loaded?.owner?.nonce !== nonce) return false;
+  return unlinkMatchingInode(lockPath, loaded.identity);
+}
+
+async function createCollectorService({ config, pathOptions = {}, runtime, platform = process.platform,
+  pid = process.pid, kill = process.kill.bind(process), createServer: createServer_ = createServer,
+  chmod: chmod_ = chmodSync } = {}) {
+  if (!config || !runtime || typeof runtime.subscribe !== "function") throw new Error("invalid collector service");
+  if (platform === "win32") throw new Error("collector mode is unsupported on Windows");
+  const socketPath = collectorSocketPath(pathOptions);
+  const root = dirname(socketPath);
+  ensurePrivateCollectorRoot(root, platform);
+  const lockPath = `${socketPath}.lock`;
+  const nonce = randomUUID();
+  const serverEpoch = randomUUID();
+  let lockFd;
+  try {
+    lockFd = openSync(lockPath, "wx", 0o600);
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    const loadedLock = readCollectorLock(lockPath);
+    const owner = loadedLock?.owner;
+    if (!Number.isSafeInteger(owner?.pid) || !pidIsDead(owner.pid, kill)) {
+      throw new Error("collector already running", { cause: error });
+    }
+    const staleLock = loadedLock.identity;
+    if (!staleLock.isFile() || staleLock.isSymbolicLink()) {
+      throw new Error("collector lock is unsafe", { cause: error });
+    }
+    await removeUnownedStaleSocket(socketPath);
+    const currentLock = lstatSync(lockPath);
+    if (currentLock.dev !== staleLock.dev || currentLock.ino !== staleLock.ino) {
+      throw new Error("collector lock ownership changed", { cause: error });
+    }
+    unlinkSync(lockPath);
+    lockFd = openSync(lockPath, "wx", 0o600);
+  }
+  const createdLockIdentity = fstatSync(lockFd);
+  try {
+    writeFileSync(lockFd, JSON.stringify({ pid, nonce, serverEpoch }), { mode: 0o600 });
+  } catch (error) {
+    try { closeSync(lockFd); } catch { /* already closed */ }
+    unlinkMatchingInode(lockPath, createdLockIdentity);
+    throw error;
+  }
+  closeSync(lockFd);
+  try {
+    await removeUnownedStaleSocket(socketPath);
+  } catch (error) {
+    removeOwnedCollectorLock(lockPath, nonce);
+    throw error;
+  }
+  const aggregate = { bytes: 0 };
+  const snapshotCache = createCollectorSnapshotEncodingCache();
+  const clients = new Set();
+  const server = createServer_((socket) => {
+    clients.add(socket);
+    const subscriptions = new Map();
+    const generations = new Map();
+    let welcomed = false;
+    const sender = createCollectorSender(socket, aggregate, { snapshotCache });
+    const send = (frames) => sender.send(frames);
+    const error = (id, code) => {
+      const normalizedId = validCollectorId(id) ? id : "protocol";
+      return send({ type: "error", id: normalizedId, serverEpoch,
+        generation: generations.get(normalizedId) ?? 0, code: safe(code) });
+    };
+    const decoder = createCollectorFrameDecoder({
+      onError: () => { error("protocol", "invalid-frame"); socket.end(); },
+      onFrame(raw) {
+        const message = validateCollectorClientMessage(raw);
+        if (!message) { error(raw?.id, "invalid-message"); return; }
+        if (!welcomed) {
+          if (message.type !== "hello") { error(message.id, "handshake-required"); return; }
+          welcomed = true;
+          send({ type: "welcome", protocolVersion: COLLECTOR_PROTOCOL_VERSION, serverEpoch,
+            capabilities: { chunks: true, maxSubscriptions: COLLECTOR_MAX_CLIENT_SUBSCRIPTIONS } });
+          return;
+        }
+        if (message.type === "hello") { error("protocol", "already-welcomed"); return; }
+        if (message.type === "subscribe") {
+          if (subscriptions.has(message.id) || subscriptions.size >= COLLECTOR_MAX_CLIENT_SUBSCRIPTIONS) {
+            error(message.id, "subscription-limit"); return;
+          }
+          const target = collectorTarget(config, message.host, message.repo);
+          if (!target) { error(message.id, "target-not-allowed"); return; }
+          generations.set(message.id, 0);
+          let handle;
+          try {
+            handle = runtime.subscribe({ target, resource: message.resource, demand: message.demand,
+              onSnapshot(snapshot) {
+                generations.set(message.id, Math.max(generations.get(message.id) ?? 0, snapshot.generation ?? 0));
+                try { sender.sendSnapshot(message.id, serverEpoch, snapshot, message.resource); }
+                catch (snapshotError) { error(message.id, /too large/.test(snapshotError.message) ? "bounded-result" : "invalid-snapshot"); }
+              },
+              onHold(hold) {
+                if (!COLLECTOR_HOLD_REASONS.has(hold)) { error(message.id, "invalid-hold"); return; }
+                send({ type: "hold", id: message.id, serverEpoch,
+                  generation: generations.get(message.id) ?? 0, hold });
+              },
+            });
+          } catch {
+            generations.delete(message.id);
+            error(message.id, "subscription-unavailable");
+            return;
+          }
+          if (!handle || typeof handle !== "object") { error(message.id, "subscription-unavailable"); return; }
+          subscriptions.set(message.id, handle);
+          return;
+        }
+        const handle = subscriptions.get(message.id);
+        if (!handle) { error(message.id, "unknown-subscription"); return; }
+        if (message.type === "unsubscribe") {
+          handle.close?.();
+          subscriptions.delete(message.id);
+          generations.delete(message.id);
+        } else if (message.type === "demand") handle.updateDemand?.(message.demand);
+        else if (message.type === "refresh") handle.refresh?.(message.force);
+        else if (message.type === "inspect") {
+          const diagnostic = normalizeCollectorDiagnostic(handle.inspect?.(), message.resource);
+          if (diagnostic) send({ type: "diagnostic", id: message.id, serverEpoch,
+            generation: diagnostic.generation, diagnostic });
+          else error(message.id, "invalid-diagnostic");
+        }
+      },
+    });
+    socket.on("data", (chunk) => decoder.push(chunk));
+    socket.on("end", () => decoder.end());
+    socket.on("error", () => sender.close());
+    socket.on("close", () => {
+      sender.close();
+      clients.delete(socket);
+      for (const handle of subscriptions.values()) handle.close?.();
+      subscriptions.clear();
+      generations.clear();
+    });
+  });
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, () => { server.off("error", reject); resolve(); });
+    });
+  } catch (error) {
+    try { await new Promise((resolve) => server.close(() => resolve())); } catch { /* never started */ }
+    removeOwnedCollectorLock(lockPath, nonce);
+    await runtime.close?.();
+    throw error;
+  }
+  let boundSocketIdentity = null;
+  let socketIdentity;
+  try {
+    boundSocketIdentity = lstatSync(socketPath);
+    if (!boundSocketIdentity.isSocket() || boundSocketIdentity.isSymbolicLink()) {
+      throw new Error("collector endpoint ownership changed");
+    }
+    chmod_(socketPath, 0o600);
+    socketIdentity = lstatSync(socketPath);
+    if (!socketIdentity.isSocket() || socketIdentity.dev !== boundSocketIdentity.dev ||
+        socketIdentity.ino !== boundSocketIdentity.ino) throw new Error("collector endpoint ownership changed");
+  } catch (error) {
+    await new Promise((resolve) => server.close(resolve));
+    removeOwnedCollectorLock(lockPath, nonce);
+    await runtime.close?.();
+    if (boundSocketIdentity) unlinkMatchingInode(socketPath, boundSocketIdentity);
+    throw error;
+  }
+  let closed = false;
+  return {
+    socketPath,
+    serverEpoch,
+    async close() {
+      if (closed) return;
+      closed = true;
+      for (const client of clients) client.destroy();
+      const replacementPath = `${socketPath}.replacement-${nonce}`;
+      let parkedReplacement = false;
+      try {
+        const current = lstatSync(socketPath);
+        if (current.dev !== socketIdentity.dev || current.ino !== socketIdentity.ino) {
+          renameSync(socketPath, replacementPath);
+          parkedReplacement = true;
+        }
+      } catch { /* the owned endpoint may already be absent */ }
+      let closeError = null;
+      try {
+        await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      } catch (error) {
+        closeError = error;
+      }
+      try {
+        await runtime.close?.();
+      } catch (error) {
+        closeError ??= error;
+      } finally {
+        removeOwnedCollectorLock(lockPath, nonce);
+        unlinkMatchingInode(socketPath, socketIdentity);
+        if (parkedReplacement) {
+          try { renameSync(replacementPath, socketPath); }
+          catch { /* retain replacement under its recovery name rather than overwrite a new owner */ }
+        }
+      }
+      if (closeError) throw closeError;
+    },
+  };
+}
+
+function collectorPublicationFromResult(resource, result, previous, demand, completedAt, state = {}) {
+  const transition = pollResultTransition({
+    key: resource,
+    previousRaw: previous?.raw ?? null,
+    raw: result.raw,
+    parse: result.parse,
+    limit: result.limit,
+    completedAt,
+  });
+  if (!["changed", "unchanged"].includes(transition.kind)) {
+    const error = new Error("collector received unusable data");
+    error.requestMetrics = acquisitionRequestMetrics(result);
+    error.uncertainReceipts = result.uncertainReceipts ?? [];
+    throw error;
+  }
+  const rows = transition.kind === "changed" ? transition.data : previous?.rows;
+  const meta = transition.kind === "changed" ? transition.meta : previous?.meta;
+  if (!Array.isArray(rows) || !meta) throw new Error("collector has no valid snapshot");
+  const entitiesByKey = new Map((previous?.entities ?? []).map((entity) => [entity.key, entity]));
+  publishStagedEntities(entitiesByKey, result.stagedEntities, transition.kind);
+  const entities = [...entitiesByKey.entries()].map(([key, entity]) => ({ key, etag: entity.etag, body: entity.body }));
+  const lastChangedAt = transition.kind === "changed" ? completedAt : previous.lastChangedAt;
+  state.unchangedCount = advanceUnchangedCount(state.unchangedCount ?? 0, transition.kind);
+  return {
+    rows,
+    pageInfo: {
+      loadedPages: result.loadedPages ?? previous?.pageInfo?.loadedPages ?? demand.pages,
+      hasNextPage: result.hasNextPage === true,
+    },
+    raw: transition.kind === "changed" ? transition.nextRaw : previous.raw,
+    entities,
+    lastSuccessAt: completedAt,
+    lastChangedAt,
+    nextDueAt: completedAt + pollPolicyInterval({
+      tab: resource,
+      floorMs: demand.floorMs,
+      demand: demand.active ? "active" : "inactive",
+      unchangedCount: state.unchangedCount,
+      inProgressCI: resource === "actions" && hasActionsInProgress(rows),
+      background: demand.background ? "all" : "off",
+    }),
+    hold: null,
+    capabilities: result.capabilities ?? previous?.capabilities ?? {},
+    requestMetrics: acquisitionRequestMetrics(result),
+    uncertainReceipts: result.uncertainReceipts ?? [],
+    repositoryIdentity: result.repositoryIdentity,
+    meta,
+    securityNotes: resource === "security"
+      ? transition.notes ?? previous?.securityNotes ?? [] : [],
+    securityBlind: resource === "security"
+      ? transition.blind ?? previous?.securityBlind ?? false : false,
+  };
+}
+
+function createCollectorAcquisitionRuntime({
+  config,
+  pathOptions = {},
+  resolveProvider = null,
+  refreshProvider = null,
+  resolveTargetIdentity = null,
+  produce = null,
+  now = Date.now,
+  setTimeout: setTimeout_ = setTimeout,
+  clearTimeout: clearTimeout_ = clearTimeout,
+  onDiagnostic = () => {},
+} = {}) {
+  if (!config || !Array.isArray(config.targets)) throw new Error("invalid collector runtime config");
+  const engine = createAcquisitionEngine({ pathOptions, now });
+  const providerContexts = new Map();
+  const targetInitializations = new Map();
+  const canonicalOwners = new Map(config.targets.map((target) => [target.canonical, target.provider]));
+  const items = new Set();
+  let closed = false;
+
+  async function defaultResolve(target) {
+    let context = providerContexts.get(target.provider);
+    if (!context) {
+      const coordinator = createIdentityCoordinator({ host: target.host, pathOptions, now });
+      context = { coordinator, identity: null, scope: null, leaseId: governorId() };
+      providerContexts.set(target.provider, context);
+    }
+    const resolved = await context.coordinator.refresh();
+    if (!resolved.ok || resolved.value.host !== target.host) throw new Error("collector provider unavailable");
+    context.identity = resolved.value;
+    context.scope = {
+      ...createQuotaScope(resolved.value, {
+        root: context.coordinator.root,
+        now,
+        identityProvider: context.coordinator.current,
+      }),
+      identityCoordinator: context.coordinator,
+      repository: target.repo,
+    };
+    return context;
+  }
+
+  async function defaultProduce({ target, resource, demand, snapshot, claim, markStarted, provider, signal, force }) {
+    const context = provider?.scope ? provider : await defaultResolve(target);
+    const at = now();
+    const lease = maintainControlLease(context.scope, context.leaseId, demand.floorMs, resource, at);
+    if (!lease.ok) throw new Error("collector governor unavailable");
+    const refreshed = await refreshSharedBudget(context.scope, context.leaseId, signal);
+    if (!refreshed.ok) throw new Error("collector budget unavailable");
+    let admitted = admitGovernorOperation(
+      context.scope,
+      context.leaseId,
+      `tab:${resource}`,
+      demand.active ? "active" : "background",
+      now(),
+    );
+    if (admitted.ok && admitted.value.status === "scheduled" &&
+        admitted.value.notBefore - now() <= GOVERNOR_ADMISSION_WAIT_MS) {
+      const delay = admitted.value.notBefore - now();
+      const elapsed = delay <= 0 || await abortableDelay(delay, signal, {
+        setTimeout: setTimeout_, clearTimeout: clearTimeout_,
+      });
+      if (!elapsed || signal?.aborted) {
+        const intentId = admitted.value.reservationId?.slice("reservation:".length);
+        if (validGovernorId(intentId)) cancelIntent(context.scope, intentId, now());
+        const error = new Error("collector admission aborted");
+        error.name = "AbortError";
+        error.notStarted = true;
+        error.retryAt = admitted.value.notBefore;
+        throw error;
+      }
+      admitted = startReservation(context.scope, admitted.value.reservationId, now());
+    }
+    if (!admitted.ok || admitted.value.status !== "started") {
+      const error = new Error("collector admission deferred");
+      error.notStarted = true;
+      error.retryAt = admitted.value?.notBefore ?? admitted.retryAt ?? now() + 1_000;
+      throw error;
+    }
+    const reservationId = admitted.value.reservationId;
+    const governor = inspectGovernor(context.scope, now());
+    const started = await markStarted({
+      reservationId,
+      accessKey: context.identity.accessKey,
+      epochs: governor.ok ? governor.value.epochs : {},
+    });
+    if (!started.ok) {
+      completeReservation({ ...context.scope, identityProvider: null }, reservationId,
+        { outcome: "rejected" }, now());
+      throw new Error("collector acquisition start failed");
+    }
+    const descriptor = tabForKey(resource);
+    try {
+      const entities = new Map((force ? [] : snapshot?.entities ?? []).map((entity) => [entity.key, entity]));
+      const result = await requestIdentityStorage.run(context.scope, () => descriptor.fetch({
+        signal,
+        entities,
+        previousRaw: force ? null : snapshot?.raw ?? null,
+        force,
+        pages: demand.pages,
+        governor: { scope: context.scope, leaseId: context.leaseId },
+      }));
+      settleReservationWithBudgetObservations(
+        { ...context.scope, identityProvider: null },
+        context.leaseId,
+        reservationId,
+        result?.measuredSuccess === false
+          ? { outcome: "rejected", observations: result.observations ?? [] }
+          : {
+              outcome: "measured-success",
+              actualCosts: {
+                core: result.restSpent ?? REST_PER_FETCH[resource] ?? 0,
+                graphql: result.graphqlSpent ?? GRAPHQL_PER_FETCH[resource] ?? 0,
+              },
+              observations: result.observations ?? [],
+            },
+        now(),
+      );
+      return collectorPublicationFromResult(resource, result, snapshot, demand, now(), claim.state);
+    } catch (error) {
+      settleReservationWithBudgetObservations(
+        { ...context.scope, identityProvider: null }, context.leaseId, reservationId,
+        { outcome: governorOutcomeForError(error), observations: error.budgetObservations ?? [] }, now(),
+      );
+      throw error;
+    }
+  }
+
+  async function defaultTargetIdentity(target, provider, signal) {
+    const context = provider?.scope ? provider : await defaultResolve(target);
+    const lease = maintainControlLease(context.scope, context.leaseId, REFRESH_MS, "issues", now());
+    if (!lease.ok) throw new Error("collector identity governor unavailable");
+    const refreshed = await refreshSharedBudget(context.scope, context.leaseId, signal);
+    if (!refreshed.ok) throw new Error("collector identity budget unavailable");
+    const result = await runAdmittedOperation({
+      scope: context.scope,
+      leaseId: context.leaseId,
+      operation: "failure-context:repository",
+      priority: "active",
+      signal,
+      waitMs: GOVERNOR_ADMISSION_WAIT_MS,
+      now,
+      run: (admittedSignal) => fetchGraphqlPage("repository", {
+        signal: admittedSignal,
+        operation: "failure-context:repository",
+      }),
+    });
+    const identity = normalizeRepositoryIdentity(result.value?.data?.repository);
+    if (!result.ok || !identity) throw result.error ?? new Error("collector target identity unavailable");
+    return identity;
+  }
+
+  function canonicalCollectorQuery(resource, identity, targetIdentity, demand) {
+    const query = acquisitionQueryForTab(resource, identity, targetIdentity.nameWithOwner, demand.pages);
+    if (!query) return null;
+    return {
+      ...query,
+      repositoryId: targetIdentity.id,
+      targetKey: privateIdentityDigest("acquisition-target-v1", identity.host, targetIdentity.id),
+    };
+  }
+
+  function targetInitializationKey(target) {
+    return `${target.provider}\0${target.host}\0${target.repo.toLowerCase()}`;
+  }
+
+  function resolveCollectorTarget(target) {
+    const key = targetInitializationKey(target);
+    const current = targetInitializations.get(key);
+    if (current) return current.promise;
+    const controller = new AbortController();
+    const entry = { controller, promise: null };
+    entry.promise = (async () => {
+      // A textual target is already enough to reject a provider conflict.
+      // Consult the durable fence before resolving credentials or making any
+      // provider/identity request, so a rejected namespace cannot observe or
+      // spend through the conflicting provider.
+      const persisted = loadCollectorCanonicalOwnership(pathOptions, target);
+      if (!persisted.ok) throw new Error(`collector canonical ${persisted.reason}`);
+      const provider = resolveProvider
+        ? await resolveProvider(target.provider, target, { signal: controller.signal })
+        : await defaultResolve(target);
+      const identity = provider?.identity ?? provider;
+      const discovered = persisted.value ?? (resolveTargetIdentity
+        ? await resolveTargetIdentity({ target, provider, signal: controller.signal })
+        : resolveProvider
+          ? { id: `slug:${target.repo.toLowerCase()}`, nameWithOwner: target.repo }
+          : await defaultTargetIdentity(target, provider, controller.signal));
+      const admitted = admitCollectorCanonicalOwnership(pathOptions, target, discovered);
+      if (!admitted.ok || !admitCanonical(target, admitted.value)) {
+        throw new Error("collector canonical provider conflict");
+      }
+      return { provider, identity, targetIdentity: admitted.value };
+    })().finally(() => {
+      // This map is a single-flight latch, not an identity cache. A later
+      // subscription must validate the provider's current access generation
+      // before it can bind to an acquisition partition.
+      if (targetInitializations.get(key) === entry) targetInitializations.delete(key);
+    });
+    targetInitializations.set(key, entry);
+    return entry.promise;
+  }
+
+  function admitCanonical(target, repositoryIdentity) {
+    const identity = normalizeRepositoryIdentity(repositoryIdentity);
+    if (!identity) return true;
+    const keys = [
+      `${target.host}/${identity.nameWithOwner}`,
+      `${target.host}/id:${identity.id}`,
+    ];
+    if (keys.some((key) => canonicalOwners.has(key) && canonicalOwners.get(key) !== target.provider)) return false;
+    for (const key of keys) canonicalOwners.set(key, target.provider);
+    return true;
+  }
+
+  function demandEnabled(demand) {
+    return demand.active || demand.background;
+  }
+
+  function startPoll(item, { manual = false, force = false } = {}) {
+    if (item.pollPromise) {
+      if (manual) item.queuedRefresh = { force: force || item.queuedRefresh?.force === true };
+      return item.pollPromise;
+    }
+    if (closed || item.closed || !demandEnabled(item.demand)) return null;
+    item.pollPromise = poll(item, { manual, force }).finally(() => {
+      item.pollPromise = null;
+      const queued = item.queuedRefresh;
+      item.queuedRefresh = null;
+      if (queued && !closed && !item.closed) queueMicrotask(() => startPoll(item, { manual: true, force: queued.force }));
+    });
+    return item.pollPromise;
+  }
+
+  function schedule(item, delay, operation = () => startPoll(item)) {
+    if (closed || item.closed || !demandEnabled(item.demand)) return;
+    if (item.timer !== null) clearTimeout_(item.timer);
+    item.timer = setTimeout_(() => {
+      item.timer = null;
+      void operation();
+    }, Math.max(1, Math.min(delay, item.demand.floorMs)));
+    item.timer?.unref?.();
+  }
+
+  async function poll(item, { manual = false, force = false } = {}) {
+    if (closed || item.closed || !item.id || item.polling) return;
+    if (item.timer !== null) {
+      clearTimeout_(item.timer);
+      item.timer = null;
+    }
+    item.polling = true;
+    let retryIn = item.demand.floorMs;
+    let claim = null;
+    try {
+      const refreshedProvider = refreshProvider
+        ? await refreshProvider(item.target.provider, item.target)
+        : !resolveProvider ? await defaultResolve(item.target) : item.provider;
+      const refreshedIdentity = refreshedProvider?.identity ?? refreshedProvider;
+      if (refreshedIdentity?.accessKey !== item.identity?.accessKey ||
+          refreshedIdentity?.generation !== item.identity?.generation) {
+        engine.unsubscribe(item.id);
+        item.id = null;
+        targetInitializations.delete(targetInitializationKey(item.target));
+        item.onHold?.("shared-wait");
+        retryIn = 1;
+        return;
+      }
+      item.provider = refreshedProvider;
+      const ownership = await engine.refresh(item.id, { force: manual });
+      if (!ownership.ok) { item.onHold?.("disconnected"); retryIn = 1_000; return; }
+      if (ownership.value.role !== "producer") {
+        if (ownership.value.snapshot) item.onSnapshot(ownership.value.snapshot);
+        if (ownership.value.reason !== "fresh") {
+          item.onHold?.("shared-wait");
+          retryIn = ACQUISITION_INSPECT_MS;
+        } else if (Number.isFinite(ownership.value.snapshot?.nextDueAt)) {
+          retryIn = Math.max(1, ownership.value.snapshot.nextDueAt - now());
+        }
+        return;
+      }
+      claim = {
+        nonce: ownership.value.nonce,
+        generation: ownership.value.generation,
+        accessKey: item.identity.accessKey,
+      };
+      const producer = produce ?? defaultProduce;
+      item.controller = new AbortController();
+      try {
+        const produced = await producer({
+          target: item.target,
+          resource: item.resource,
+          demand: ownership.value.demand,
+          snapshot: ownership.value.snapshot,
+          claim: { ...claim, state: item },
+          provider: item.provider,
+          signal: item.controller.signal,
+          force,
+          markStarted: (receipt) => engine.refresh(item.id, { started: { ...claim, ...(receipt ? { receipt } : {}) } }),
+        });
+        if (!admitCanonical(item.target, produced.repositoryIdentity)) {
+          engine.refresh(item.id, { claim, failure: {
+            hold: "disconnected",
+            requestMetrics: produced.requestMetrics ?? {},
+            uncertainReceipts: produced.uncertainReceipts ?? [],
+          } });
+          item.onHold?.("disconnected");
+          retryIn = item.demand.floorMs;
+          return;
+        }
+        const published = await engine.refresh(item.id, { claim, publish: produced });
+        if (!published.ok) { item.onHold?.("disconnected"); retryIn = 1_000; }
+        else retryIn = Math.max(1, published.value.snapshot.nextDueAt - now());
+      } catch (error) {
+        const hold = error?.notStarted ? "shared-wait" : acquisitionFailureHold(error);
+        if (claim && error?.notStarted) engine.refresh(item.id, { cancel: claim });
+        else if (claim) engine.refresh(item.id, { claim, failure: {
+          hold,
+          requestMetrics: error?.requestMetrics ?? {},
+          uncertainReceipts: error?.uncertainReceipts ?? [],
+        } });
+        else engine.setHold(item.id, hold, { resource: item.resource, accessKey: item.identity.accessKey });
+        item.onHold?.(hold);
+        try { onDiagnostic({ stage: "acquire", reason: redact(shortErr(error)) }); } catch { /* diagnostics are isolated */ }
+        retryIn = error?.notStarted && Number.isFinite(error.retryAt)
+          ? Math.max(1, error.retryAt - now()) : Math.min(1_000, item.demand.floorMs);
+      } finally {
+        item.controller = null;
+      }
+    } catch (error) {
+      // Provider/access refresh runs before a producer claim exists. Keep that
+      // failure inside this subscription's exact access partition and retry it
+      // on the bounded collector cadence; letting it escape startPoll created
+      // an unhandled rejection and permanently stopped the stream.
+      const hold = acquisitionFailureHold(error);
+      if (item.id && item.identity?.accessKey) {
+        engine.setHold(item.id, hold, { resource: item.resource, accessKey: item.identity.accessKey });
+      }
+      item.onHold?.(hold);
+      try { onDiagnostic({ stage: "provider-refresh", reason: redact(shortErr(error)) }); } catch { /* isolated */ }
+      retryIn = Math.min(1_000, item.demand.floorMs);
+    } finally {
+      item.polling = false;
+      schedule(item, retryIn, item.id ? () => startPoll(item) : () => startInitialize(item));
+    }
+  }
+
+  async function initialize(item) {
+    try {
+      const resolved = await resolveCollectorTarget(item.target);
+      if (closed || item.closed) return;
+      item.provider = resolved.provider;
+      item.identity = resolved.identity;
+      const query = canonicalCollectorQuery(item.resource, item.identity, resolved.targetIdentity, item.demand);
+      if (!query) throw new Error("invalid collector query");
+      const subscription = engine.subscribe(query, item.demand, (snapshot) => {
+        item.nextDueAt = snapshot.nextDueAt;
+        item.onSnapshot(snapshot);
+      });
+      if (!subscription.ok) throw new Error("collector subscription unavailable");
+      item.id = subscription.value.id;
+      if (subscription.value.snapshot) item.onSnapshot(subscription.value.snapshot);
+      if (demandEnabled(item.demand)) await startPoll(item);
+    } catch (error) {
+      try { onDiagnostic({ stage: "initialize", reason: redact(shortErr(error)) }); } catch { /* diagnostics are isolated */ }
+      item.onHold?.("disconnected");
+      schedule(item, 1_000, () => startInitialize(item));
+    }
+  }
+
+  function startInitialize(item) {
+    if (item.initializePromise || closed || item.closed) return item.initializePromise;
+    item.initializePromise = initialize(item).finally(() => { item.initializePromise = null; });
+    return item.initializePromise;
+  }
+
+  return {
+    subscribe({ target, resource, demand, onSnapshot, onHold }) {
+      const normalizedDemand = normalizeCollectorDemand(demand);
+      if (!normalizedDemand) throw new Error("invalid collector demand");
+      const item = { target, resource, demand: normalizedDemand, onSnapshot, onHold, id: null, identity: null,
+        provider: null, polling: false, pollPromise: null, controller: null,
+        initializePromise: null, closed: false, timer: null, queuedRefresh: null };
+      items.add(item);
+      void startInitialize(item);
+      return {
+        updateDemand(next) {
+          const normalized = normalizeCollectorDemand(next);
+          if (!normalized) return { ok: false, reason: "invalid" };
+          const wasEnabled = demandEnabled(item.demand);
+          item.demand = normalized;
+          if (!demandEnabled(normalized) && item.timer !== null) {
+            clearTimeout_(item.timer);
+            item.timer = null;
+          }
+          const updated = item.id ? engine.updateDemand(item.id, normalized) : { ok: true };
+          if (!wasEnabled && demandEnabled(normalized)) void startPoll(item);
+          return updated;
+        },
+        refresh(force = false) { void startPoll(item, { manual: true, force: force === true }); },
+        inspect() {
+          if (!item.id) return { source: "local collector", status: "initializing", resource: item.resource };
+          const inspected = engine.inspect(item.id);
+          const record = inspected.ok ? inspected.value : null;
+          return {
+            source: "local collector",
+            status: inspected.ok ? record?.hold?.reason ?? (record?.snapshot ? "healthy" : "waiting") : "unavailable",
+            resource: item.resource,
+            generation: record?.generation ?? 0,
+            lastSuccessAt: record?.snapshot?.lastSuccessAt ?? null,
+            lastChangedAt: record?.snapshot?.lastChangedAt ?? null,
+          };
+        },
+        close() {
+          item.closed = true;
+          item.controller?.abort();
+          if (item.timer !== null) clearTimeout_(item.timer);
+          if (item.id) engine.unsubscribe(item.id);
+          items.delete(item);
+        },
+      };
+    },
+    async close() {
+      closed = true;
+      for (const item of items) {
+        item.closed = true;
+        item.controller?.abort();
+        if (item.timer !== null) clearTimeout_(item.timer);
+      }
+      for (const context of providerContexts.values()) context.coordinator.close();
+      for (const entry of targetInitializations.values()) entry.controller.abort();
+      await Promise.allSettled([...items].flatMap((item) =>
+        [item.initializePromise, item.pollPromise].filter(Boolean)));
+      for (const item of items) if (item.id) engine.unsubscribe(item.id);
+      items.clear();
+      engine.close();
+      for (const context of providerContexts.values()) {
+        if (context.scope) releaseLease(context.scope, context.leaseId);
+      }
+      providerContexts.clear();
+    },
+  };
+}
+
+async function runCollectorForeground(configPath, {
+  pathOptions = {},
+  platform = process.platform,
+  stderr = process.stderr,
+  runtime = null,
+} = {}) {
+  const loaded = loadCollectorConfig(configPath);
+  if (!loaded.ok) throw new Error(`collector config ${loaded.reason}`);
+  const activeRuntime = runtime ?? createCollectorAcquisitionRuntime({
+    config: loaded.value,
+    pathOptions,
+    onDiagnostic(event) {
+      stderr.write(`gh-glance: collector ${safe(event.stage)}: ${redact(event.reason)}\n`);
+    },
+  });
+  const service = await createCollectorService({ config: loaded.value, pathOptions, platform, runtime: activeRuntime });
+  stderr.write(`gh-glance: collector listening at ${service.socketPath}\n`);
+  await new Promise((resolve) => {
+    const stop = () => resolve();
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+  });
+  await service.close();
+}
+
+async function runCollectorStdioBridge({
+  pathOptions = {},
+  platform = process.platform,
+  input = process.stdin,
+  output = process.stdout,
+  stderr = process.stderr,
+  createConnection_ = createConnection,
+} = {}) {
+  if (platform === "win32") throw new Error("collector mode is unsupported on Windows");
+  const socket = createConnection_(collectorSocketPath(pathOptions));
+  await new Promise((resolve, reject) => {
+    const cleanup = () => { socket.off("connect", connected); socket.off("error", failed); };
+    const connected = () => { cleanup(); resolve(); };
+    const failed = (error) => { cleanup(); reject(error); };
+    socket.once("connect", connected);
+    socket.once("error", failed);
+  });
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      socket.off("drain", onSocketDrain);
+      socket.off("data", onSocketData);
+      socket.off("error", fail);
+      socket.off("close", onSocketClose);
+      output.off?.("drain", onOutputDrain);
+      input.off("data", onInputData);
+      input.off("end", onInputEnd);
+      input.off("error", fail);
+    };
+    const finish = (error = null) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) {
+        stderr.write(`gh-glance: collector bridge ${redact(shortErr(error))}\n`);
+        socket.destroy();
+        reject(error);
+      } else resolve();
+    };
+    function fail(error) { finish(error); }
+    const outbound = createCollectorFrameDecoder({
+      onFrame(frame) {
+        if (!socket.write(encodeCollectorFrame(frame))) input.pause();
+      },
+      onError: fail,
+    });
+    const inbound = createCollectorFrameDecoder({
+      onFrame(frame) {
+        if (!output.write(encodeCollectorFrame(frame))) socket.pause();
+      },
+      onError: fail,
+    });
+    const onSocketDrain = () => input.resume();
+    const onOutputDrain = () => socket.resume();
+    const onInputData = (chunk) => outbound.push(chunk);
+    const onInputEnd = () => {
+      if (outbound.end() && !settled) socket.end();
+    };
+    const onSocketData = (chunk) => inbound.push(chunk);
+    const onSocketClose = () => {
+      if (inbound.end()) finish();
+    };
+    socket.on("drain", onSocketDrain);
+    output.on?.("drain", onOutputDrain);
+    input.on("data", onInputData);
+    input.once("end", onInputEnd);
+    input.once("error", fail);
+    socket.on("data", onSocketData);
+    socket.once("error", fail);
+    socket.once("close", onSocketClose);
+  });
+}
+
+function createLocalCollectorClient({ pathOptions = {}, onReady = () => {},
+  createConnection_ = createConnection, setTimeout: setTimeout_ = setTimeout,
+  clearTimeout: clearTimeout_ = clearTimeout } = {}) {
+  const subscriptions = new Map();
+  let socket = null;
+  let serverEpoch = null;
+  let welcomed = false;
+  let ready = false;
+  let closed = false;
+  let reconnectTimer = null;
+  const assembler = createCollectorSnapshotAssembler({
+    setTimeout: setTimeout_,
+    clearTimeout: clearTimeout_,
+    resourceForId: (id) => subscriptions.get(id)?.resource ?? null,
+    onSnapshot(snapshot, frame) {
+      const item = subscriptions.get(frame.id);
+      if (!item || frame.serverEpoch !== serverEpoch || snapshot.generation <= item.generation) return;
+      item.generation = snapshot.generation;
+      item.controlGeneration = Math.max(item.controlGeneration, snapshot.generation);
+      if (!ready) {
+        ready = true;
+        onReady(true);
+      }
+      item.onSnapshot(snapshot);
+    },
+  });
+  const write = (message) => {
+    if (welcomed && socket?.writable) socket.write(encodeCollectorFrame(message));
+  };
+  const resubscribe = () => {
+    for (const item of subscriptions.values()) {
+      item.generation = -1;
+      item.controlGeneration = -1;
+      write({ type: "subscribe", id: item.id, host: item.host, repo: item.repo,
+        resource: item.resource, demand: item.demand });
+    }
+  };
+  const connect = () => {
+    if (closed) return;
+    const candidate = createConnection_(collectorSocketPath(pathOptions));
+    socket = candidate;
+    welcomed = false;
+    const decoder = createCollectorFrameDecoder({
+      onFrame(frame) {
+        if (frame.type === "welcome" && frame.protocolVersion === COLLECTOR_PROTOCOL_VERSION &&
+            validGovernorId(frame.serverEpoch)) {
+          if (serverEpoch !== frame.serverEpoch) assembler.reset();
+          serverEpoch = frame.serverEpoch;
+          welcomed = true;
+          ready = false;
+          resubscribe();
+          return;
+        }
+        if (!welcomed || frame.serverEpoch !== serverEpoch) return;
+        const item = subscriptions.get(frame.id);
+        if (!item) { candidate.destroy(); return; }
+        if (frame.type === "snapshot" || frame.type.startsWith?.("snapshot-")) {
+          if (!assembler.accept(frame).ok) candidate.destroy();
+        }
+        else if (frame.type === "hold") {
+          if (!exactKeys(frame, ["type", "id", "serverEpoch", "generation", "hold"]) ||
+              !Number.isSafeInteger(frame.generation) || frame.generation < item.controlGeneration ||
+              !COLLECTOR_HOLD_REASONS.has(frame.hold)) return;
+          item.controlGeneration = frame.generation;
+          item.onHold?.(frame.hold);
+        }
+        else if (frame.type === "diagnostic") {
+          const diagnostic = normalizeCollectorDiagnostic(frame.diagnostic, item?.resource ?? null);
+          if (!exactKeys(frame, ["type", "id", "serverEpoch", "generation", "diagnostic"]) ||
+              !Number.isSafeInteger(frame.generation) || frame.generation < item.controlGeneration ||
+              diagnostic?.generation !== frame.generation) return;
+          item.controlGeneration = frame.generation;
+          item.onDiagnostic?.(diagnostic);
+        }
+        else if (frame.type === "error") {
+          if (!exactKeys(frame, ["type", "id", "serverEpoch", "generation", "code"]) ||
+              !Number.isSafeInteger(frame.generation) || frame.generation < item.controlGeneration ||
+              typeof frame.code !== "string") return;
+          item.controlGeneration = frame.generation;
+          item.onError?.(safe(frame.code));
+        }
+      },
+      onError: () => candidate.destroy(),
+    });
+    candidate.on("connect", () => candidate.write(encodeCollectorFrame({
+      type: "hello", protocolVersion: COLLECTOR_PROTOCOL_VERSION,
+    })));
+    candidate.on("data", (chunk) => decoder.push(chunk));
+    candidate.on("error", () => {});
+    candidate.on("close", () => {
+      decoder.end();
+      assembler.reset();
+      if (socket === candidate) socket = null;
+      welcomed = false;
+      ready = false;
+      onReady(false);
+      if (!closed && reconnectTimer === null) {
+        reconnectTimer = setTimeout_(() => { reconnectTimer = null; connect(); }, 1_000);
+        reconnectTimer?.unref?.();
+      }
+    });
+  };
+  connect();
+  return {
+    subscribe({ id = randomUUID(), host, repo, resource, demand, onSnapshot, onHold, onError, onDiagnostic }) {
+      const subscription = normalizeCollectorSubscription({ id, host, repo, resource, demand });
+      if (!subscription || typeof onSnapshot !== "function") {
+        return { ok: false, reason: "invalid" };
+      }
+      const item = { ...subscription,
+        onSnapshot, onHold, onError, onDiagnostic, generation: -1, controlGeneration: -1 };
+      subscriptions.set(id, item);
+      if (welcomed) write({ type: "subscribe", id: item.id, host: item.host, repo: item.repo,
+        resource: item.resource, demand: item.demand });
+      return { ok: true, value: {
+        id,
+        updateDemand(next) {
+          const normalized = normalizeCollectorDemand(next);
+          if (!normalized) return { ok: false, reason: "invalid" };
+          if (item.demand.active === normalized.active && item.demand.background === normalized.background &&
+              item.demand.floorMs === normalized.floorMs && item.demand.pages === normalized.pages) {
+            return { ok: true, changed: false };
+          }
+          item.demand = normalized;
+          write({ type: "demand", id, demand: normalized });
+          return { ok: true, changed: true };
+        },
+        refresh(force = false) { write({ type: "refresh", id, force: force === true }); },
+        inspect() { write({ type: "inspect", id }); },
+        close() { write({ type: "unsubscribe", id }); subscriptions.delete(id); assembler.cancel(id); },
+      } };
+    },
+    close() {
+      closed = true;
+      if (reconnectTimer !== null) clearTimeout_(reconnectTimer);
+      socket?.destroy();
+      assembler.reset();
+      subscriptions.clear();
+    },
+  };
+}
+
+function collectorDisplayDecision({ connected, hasSnapshot, hold = null }) {
+  if (!connected || hold === "disconnected") return { disconnected: true };
+  if (hold === "shared-wait") return { mode: "waiting", waitCause: "shared-lane" };
+  if (["observer", "primary", "secondary", "coordination"].includes(hold)) {
+    return { mode: "paused", detailKind: hold };
+  }
+  if (hold === "cache-only") return { mode: "waiting", detailKind: "cache" };
+  return hasSnapshot ? { sharedData: true } : { mode: "waiting", detailKind: "collector" };
 }
 
 // ---------- Diagnostics (--doctor) ----------
@@ -6289,22 +8005,33 @@ function normalizeAcquisitionDiagnosticMetadata(raw) {
   return { producerEpoch: raw.producerEpoch, metrics, uncertainReceipts, queries, subscriptions };
 }
 
-function unavailableAcquisitionDiagnostic(reason) {
-  return { source: "standalone", status: reason, epoch: null, activeQueries: 0,
+function unavailableAcquisitionDiagnostic(reason, source = "standalone") {
+  return { source, status: reason, epoch: null, activeQueries: 0,
     activeSubscribers: 0, metrics: emptyAcquisitionMetrics(), queries: [] };
 }
 
-function doctorAcquisitionDiagnostic({ nowMs = Date.now() } = {}) {
+function doctorAcquisitionDiagnostic({ nowMs = Date.now(), source = "standalone" } = {}) {
   try {
     const raw = JSON.parse(readFileSync(join(identityRegistryRoot(), "acquisition.json"), "utf8"));
     const normalized = normalizeAcquisitionDiagnosticMetadata(raw);
     return normalized
-      ? acquisitionDiagnostics(normalized, { nowMs })
-      : unavailableAcquisitionDiagnostic("corrupt");
+      ? acquisitionDiagnostics(normalized, { nowMs, source })
+      : unavailableAcquisitionDiagnostic("corrupt", source);
   } catch (error) {
     return unavailableAcquisitionDiagnostic(error?.code === "ENOENT"
       ? "missing"
-      : error instanceof SyntaxError ? "corrupt" : "unreadable");
+      : error instanceof SyntaxError ? "corrupt" : "unreadable", source);
+  }
+}
+
+function collectorSocketDiagnostic(pathOptions = {}) {
+  try {
+    const stat = statSync(collectorSocketPath(pathOptions));
+    if (!stat.isSocket()) return "unsafe endpoint";
+    if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) return "unsafe permissions";
+    return "available";
+  } catch (error) {
+    return error?.code === "ENOENT" ? "not running" : "unreadable";
   }
 }
 
@@ -6399,7 +8126,9 @@ async function runDoctor({ probeEndpoints = false } = {}) {
   const governor = probeEndpoints
     ? governorHealth(governorResult, Date.now())
     : { status: "not inspected (--probe not requested)", leases: 0, resources: {} };
-  const acquisitionDiagnostic = doctorAcquisitionDiagnostic();
+  const acquisitionDiagnostic = doctorAcquisitionDiagnostic({
+    source: runtime.connect === "local" ? "local collector" : "standalone",
+  });
 
   const lines = [
     "gh-glance doctor",
@@ -6473,6 +8202,12 @@ async function runDoctor({ probeEndpoints = false } = {}) {
       field("next due", query.nextDueAt ? new Date(query.nextDueAt).toISOString() : "unknown"),
       field("consumers", query.coalescedConsumers),
     ])),
+    ...(runtime.connect === "local" ? [
+      "",
+      ...section("Local collector"),
+      field("socket", collectorSocketDiagnostic()),
+      field("fallback", "disabled"),
+    ] : []),
     "",
     ...section("Environment"),
     ...doctorEnvNames().map((name) => field(name, envValue(name))),
@@ -6595,6 +8330,10 @@ function parseArgs(argv) {
     // visibly aged.
     background: null,
     verbose: false,
+    serve: false,
+    config: null,
+    connect: null,
+    collectorStdio: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -6616,6 +8355,13 @@ function parseArgs(argv) {
     else if (arg === "--verbose") opts.verbose = true;
     else if (arg === "--doctor") opts.doctor = true;
     else if (arg === "--probe") opts.probe = true;
+    else if (arg === "--serve") opts.serve = true;
+    else if (arg === "--collector-stdio") opts.collectorStdio = true;
+    else if (arg === "--config" || arg.startsWith("--config=")) {
+      opts.config = takeValue("--config");
+    } else if (arg === "--connect" || arg.startsWith("--connect=")) {
+      opts.connect = takeValue("--connect");
+    }
     else if (arg === "--repo" || arg === "-R" || arg.startsWith("--repo=")) {
       opts.repo = takeValue("--repo");
     } else if (arg === "--refresh" || arg.startsWith("--refresh=")) {
@@ -6661,6 +8407,17 @@ function validateArgs(opts, tabKeys) {
     throw new Error(`--background must be one of ${BACKGROUND_MODES.join(", ")}, got: ${opts.background}`);
   }
   if (opts.probe && !opts.doctor) throw new Error("--probe requires --doctor");
+  if (opts.connect !== null && opts.doctor && opts.probe) {
+    throw new Error("--connect local --doctor --probe is unsupported; collector clients make no GitHub API calls");
+  }
+  if (opts.serve && opts.config === null) throw new Error("--serve requires --config");
+  if (!opts.serve && opts.config !== null) throw new Error("--config requires --serve");
+  if (opts.connect !== null && opts.connect !== "local") throw new Error("--connect must be local");
+  const modes = Number(opts.serve) + Number(opts.collectorStdio) + Number(opts.connect !== null);
+  if (modes > 1) throw new Error("collector modes cannot be combined");
+  if ((opts.serve || opts.collectorStdio) &&
+      (opts.repo !== null || opts.refresh !== null || opts.tab !== null || opts.background !== null ||
+        opts.doctor || opts.probe || opts.verbose)) throw new Error("collector mode cannot be combined with dashboard options");
 
   return {
     help: opts.help,
@@ -6673,6 +8430,10 @@ function validateArgs(opts, tabKeys) {
     tabKey: opts.tab,
     background: opts.background,
     verbose: opts.verbose,
+    serve: opts.serve,
+    config: opts.config,
+    connect: opts.connect,
+    collectorStdio: opts.collectorStdio,
   };
 }
 
@@ -6747,6 +8508,10 @@ Usage:
   gh-glance --verbose 2>log     Log every gh call to a file (see below)
   gh-glance --doctor            Print a diagnostic report and exit
   gh-glance --doctor --probe    Run bounded, admitted GitHub capability probes
+  gh-glance --serve --config PATH
+                                Run the foreground local collector
+  gh-glance --connect local     Use the current user's local collector
+  gh-glance --collector-stdio  Bridge stdio to the running local collector
   gh-glance --help              Show this help
   gh-glance --version           Show the version
 
@@ -6778,6 +8543,11 @@ Options:
                            Safe to redirect to a file and share -- tokens are
                            never printed, proxy credentials are stripped, and
                            no response bodies are included.
+  --serve                  Run the optional collector in the foreground. Requires
+                           one private, versioned --config file.
+  --config <path>          Collector provider and exact repository allowlist.
+  --connect local          Subscribe the dashboard to the fixed private socket.
+  --collector-stdio        Non-TTY protocol bridge to that same running socket.
 
 Run it from inside a locally cloned GitHub repository; the repo is inferred
 from the git remote, the same way \`gh\` does it. Requires the \`gh\` CLI
@@ -6861,6 +8631,7 @@ if (IS_MAIN) {
   runtime.host = opts.host;
   runtime.repoExplicit = opts.repo !== null;
   runtime.verbose = opts.verbose;
+  runtime.connect = opts.connect;
   if (opts.refreshMs !== null) runtime.refreshMs = opts.refreshMs;
   if (opts.tabKey !== null) runtime.initialTabIndex = TAB_KEYS.indexOf(opts.tabKey);
   if (opts.background !== null) runtime.background = opts.background;
@@ -6876,6 +8647,10 @@ if (IS_MAIN) {
     process.exit(0);
   }
 
+  if (opts.serve) runtime.headlessMode = { type: "serve", config: opts.config };
+  else if (opts.collectorStdio) runtime.headlessMode = { type: "stdio" };
+  else {
+
   // A reporting command, like --help and --version: gather, print, exit. It sits
   // here on purpose -- ahead of the non-TTY refusal, because the whole point is
   // `gh-glance --doctor > report.txt`, and ahead of preflight(), because a
@@ -6884,6 +8659,19 @@ if (IS_MAIN) {
   if (opts.doctor) {
     console.log(await runDoctor({ probeEndpoints: opts.probe }));
     process.exit(0);
+  }
+
+  // A local collector subscription needs an exact offline target before Ink
+  // mounts. Resolve git remotes locally and fail with the actionable flag;
+  // otherwise a cold invocation paints a dashboard that can only say
+  // Disconnected and never has a subscription it can recover.
+  if (opts.connect === "local") {
+    runtimeRemoteUrls = await gitRemoteUrls();
+    const problem = localCollectorPreflight(runtimeRemoteUrls);
+    if (problem) {
+      console.error(problem);
+      process.exit(3);
+    }
   }
 
   // Verbose output must never reach stdout -- that is ink's frame stream, and
@@ -6909,13 +8697,15 @@ if (IS_MAIN) {
     process.exit(1);
   }
 
-  const problem = await preflight();
+  const problem = opts.connect === "local" ? null : await preflight();
   if (problem) {
     console.error(problem);
     process.exit(3);
   }
-  runtimeRemoteUrls = await gitRemoteUrls();
-  runtimeIdentityCoordinator = createIdentityCoordinator({ host: () => effectiveRuntimeHost() });
+  if (opts.connect !== "local") runtimeRemoteUrls = await gitRemoteUrls();
+  runtimeIdentityCoordinator = opts.connect === "local"
+    ? null
+    : createIdentityCoordinator({ host: () => effectiveRuntimeHost() });
   // Resolve warm identity/cache locally; cold proof belongs to the mounted UI
   // so quit/signal handling remains available while GitHub is slow.
   //
@@ -6925,14 +8715,21 @@ if (IS_MAIN) {
   // first frame for the full subprocess timeout with nothing on screen at all.
   // Past the bound the same refresh is picked up by the mounted UI, and
   // ensureScope corrects the cache target and hydrates from it.
-  await Promise.race([
-    runtimeIdentityCoordinator.refresh({ allowBootstrap: false }),
-    new Promise((resolve) => { setTimeout(resolve, WARM_IDENTITY_WAIT_MS).unref(); }),
-  ]);
+  if (runtimeIdentityCoordinator) {
+    await Promise.race([
+      runtimeIdentityCoordinator.refresh({ allowBootstrap: false }),
+      new Promise((resolve) => { setTimeout(resolve, WARM_IDENTITY_WAIT_MS).unref(); }),
+    ]);
+  }
+  }
 }
 
-const ReactModule = await import("react");
-const { render, measureElement, Box, Text, useStdout, useInput, useStdin, useApp } = await import("ink");
+const headlessEntry = IS_MAIN && runtime.headlessMode;
+const ReactModule = headlessEntry
+  ? { default: { Component: class {}, createElement: () => null, memo: (component) => component } }
+  : await import("react");
+const InkModule = headlessEntry ? {} : await import("ink");
+const { render, measureElement, Box, Text, useStdout, useInput, useStdin, useApp } = InkModule;
 
 const React = ReactModule.default;
 const { useState, useEffect, useMemo, useRef, useCallback } = ReactModule;
@@ -9427,6 +11224,15 @@ function createAcquisitionEngine({
     return { ok: true, value: true, snapshot: loaded.value };
   }
 
+  function deliverQuerySnapshot(queryKey, snapshot) {
+    for (const [id, item] of local) {
+      if (item.queryKey !== queryKey || item.detached || item.generation === snapshot.generation) continue;
+      item.generation = snapshot.generation;
+      try { item.callback?.(snapshot); } catch { /* subscriber callback is isolated */ }
+      releaseDetachedLocal(id, item);
+    }
+  }
+
   function inspect(id = null) {
     const loaded = load();
     if (!loaded.ok) return loaded;
@@ -9681,7 +11487,7 @@ function createAcquisitionEngine({
     }
     if (result.ok) {
       remapLocalQueries(result.value.remapped);
-      deliver(id, { generation: result.value.snapshot.generation, snapshot: result.value.snapshot });
+      deliverQuerySnapshot(result.value.queryKey, result.value.snapshot);
     }
     releaseDetachedLocal(id, item);
     return result;
@@ -10058,6 +11864,10 @@ function pollPolicyInterval({
   if (tab === "actions" && inProgressCI === true) return Math.max(floorMs, POLL_ACTIVE_CI_MS);
   if (unchangedCount >= POLL_QUIET_AFTER) return Math.max(floorMs, pick(POLL_QUIET_MS, tab, 0));
   return floorMs;
+}
+
+function hasActionsInProgress(rows) {
+  return Array.isArray(rows) && rows.some((row) => row.status !== "completed");
 }
 
 // Only a validated observation moves this counter. An error, a blind Security
@@ -10552,6 +12362,26 @@ function uncertainReservationReceipts(scope, reservationId, nowMs) {
   });
 }
 
+function abortableDelay(ms, signal, {
+  setTimeout: setTimeout_ = setTimeout,
+  clearTimeout: clearTimeout_ = clearTimeout,
+} = {}) {
+  if (!(ms > 0)) return Promise.resolve(!signal?.aborted);
+  if (signal?.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let timer = null;
+    const finish = (elapsed) => {
+      if (timer !== null) clearTimeout_(timer);
+      signal?.removeEventListener?.("abort", aborted);
+      resolve(elapsed);
+    };
+    const aborted = () => finish(false);
+    signal?.addEventListener?.("abort", aborted, { once: true });
+    timer = setTimeout_(() => finish(true), ms);
+    timer?.unref?.();
+  });
+}
+
 async function runAdmittedOperation({
   scope,
   leaseId,
@@ -10563,7 +12393,7 @@ async function runAdmittedOperation({
   // One clock for the whole admission, so the wait below is measured against
   // the same time the governor scheduled the slot on.
   now = Date.now,
-  wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  wait = (ms, waitSignal) => abortableDelay(ms, waitSignal),
 }) {
   let admitted = admitGovernorOperation(scope, leaseId, operation, priority, now());
   const scheduled = admitted.ok &&
@@ -10578,7 +12408,7 @@ async function runAdmittedOperation({
     // as a refusal -- that race alone made this path intermittent.
     const delay = scheduled.notBefore - now();
     if (delay <= waitMs) {
-      if (delay > 0) await wait(delay);
+      if (delay > 0) await wait(delay, signal);
       if (!signal?.aborted) {
         admitted = startReservation(scope, scheduled.reservationId, now());
       }
@@ -10609,7 +12439,10 @@ async function runAdmittedOperation({
       outcome,
       ...(measured || outcome === "measured-success" ? { actualCost: costs } : {}),
     }, now());
-    if (scope.accessKey && scope.accessKey !== runtimeIdentityCoordinator?.current()?.accessKey) return { ok: false, error: new Error("Credential changed"), reservationId };
+    const identityCoordinator = scope.identityCoordinator ?? runtimeIdentityCoordinator;
+    if (scope.accessKey && scope.accessKey !== identityCoordinator?.current()?.accessKey) {
+      return { ok: false, error: new Error("Credential changed"), reservationId };
+    }
     return { ok: true, value, reservationId,
       uncertainReceipts: measured ? [] : pendingReceipts };
   } catch (error) {
@@ -12381,15 +14214,16 @@ function App({ onCreateRemote = () => {} } = {}) {
 
     function adoptAcquisitionSnapshot(key, snapshot) {
       if (!snapshot || cancelled) return;
+      const snapshotMeta = snapshot.meta ?? { at: snapshot.lastChangedAt, truncated: false };
       lastOkRef.current[key] = snapshot.lastSuccessAt;
       for (const entity of snapshot.entities ?? []) {
         entityRef.current.set(entity.key, { etag: entity.etag, body: entity.body });
       }
       const sameRows = JSON.stringify(dataRef.current[key]) === JSON.stringify(snapshot.rows);
       if (!sameRows) setData((current) => ({ ...current, [key]: snapshot.rows }));
-      setMeta((current) => current[key]?.at === snapshot.meta.at &&
-        current[key]?.truncated === snapshot.meta.truncated
-        ? current : { ...current, [key]: snapshot.meta });
+      setMeta((current) => current[key]?.at === snapshotMeta.at &&
+        current[key]?.truncated === snapshotMeta.truncated
+        ? current : { ...current, [key]: snapshotMeta });
       if (key === "security") {
         const accessKey = identity()?.accessKey;
         if (accessKey) {
@@ -12400,8 +14234,8 @@ function App({ onCreateRemote = () => {} } = {}) {
             });
           }
         }
-        setSecurityNotes(snapshot.securityNotes);
-        setSecurityBlind(snapshot.securityBlind);
+        setSecurityNotes(snapshot.securityNotes ?? []);
+        setSecurityBlind(snapshot.securityBlind === true);
       }
       if (snapshot.pageInfo && Number.isFinite(snapshot.pageInfo.loadedPages)) {
         pageStateRef.current[key] = {
@@ -12409,6 +14243,70 @@ function App({ onCreateRemote = () => {} } = {}) {
           hasNextPage: snapshot.pageInfo.hasNextPage === true,
         };
       }
+    }
+
+    if (runtime.connect === "local") {
+      const repository = effectiveRuntimeRepository({ remoteUrls: runtimeRemoteUrls });
+      const host = effectiveRuntimeHost({ remoteUrls: runtimeRemoteUrls });
+      const handles = new Map();
+      const receivedSnapshots = new Set();
+      let collectorReady = false;
+      setGovernorDecisions(Object.fromEntries(TAB_KEYS.map((key) => [key, { disconnected: true }])));
+      if (!repository || !host) {
+        fetchTabRef.current = null;
+        return () => { cancelled = true; controller.abort(); };
+      }
+      const client = createLocalCollectorClient({
+        onReady(ready) {
+          if (cancelled) return;
+          collectorReady = ready;
+          if (!ready) receivedSnapshots.clear();
+          setGovernorDecisions(Object.fromEntries(TAB_KEYS.map((key) => [key,
+            collectorDisplayDecision({ connected: ready, hasSnapshot: receivedSnapshots.has(key) })])));
+        },
+      });
+      for (const key of TAB_KEYS) {
+          const demand = {
+            active: TABS[activeIndexRef.current].key === key,
+            background: runtime.background !== "off",
+            floorMs: runtime.refreshMs,
+            pages: pageStateRef.current[key]?.pages ?? 1,
+          };
+          const subscribed = client.subscribe({ host, repo: repository, resource: key, demand,
+            onSnapshot: (snapshot) => {
+              receivedSnapshots.add(key);
+              adoptAcquisitionSnapshot(key, snapshot);
+              setWaiting((current) => current[key] ? { ...current, [key]: false } : current);
+              setGovernorDecisions((current) => ({ ...current, [key]:
+                collectorDisplayDecision({ connected: collectorReady, hasSnapshot: true }) }));
+            },
+            onHold: (hold) => setGovernorDecisions((current) => ({ ...current, [key]:
+              collectorDisplayDecision({ connected: collectorReady,
+                hasSnapshot: receivedSnapshots.has(key), hold }) })),
+          });
+          if (subscribed.ok) handles.set(key, subscribed.value);
+      }
+      fetchTabRef.current = (key, request = {}) => {
+        const handle = handles.get(key);
+        if (!handle) return;
+        if (request.kind === "tab-switch") {
+          for (const [candidate, candidateHandle] of handles) {
+            candidateHandle.updateDemand({ active: candidate === key, background: runtime.background !== "off",
+              floorMs: runtime.refreshMs, pages: pageStateRef.current[candidate]?.pages ?? 1 });
+          }
+        } else {
+          handle.updateDemand({ active: true, background: runtime.background !== "off",
+            floorMs: runtime.refreshMs, pages: pageStateRef.current[key]?.pages ?? 1 });
+        }
+        handle.refresh(request.force === true);
+      };
+      return () => {
+        cancelled = true;
+        fetchTabRef.current = null;
+        for (const handle of handles.values()) handle.close();
+        client.close();
+        controller.abort();
+      };
     }
 
     function ensureAcquisitionSubscription(key, currentIdentity, { synchronizeDemand = true } = {}) {
@@ -12574,7 +14472,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     // caller that has just parsed newer rows passes them, because dataRef only
     // catches up on the next render.
     function actionsInProgress(rows = dataRef.current.actions) {
-      return Array.isArray(rows) && rows.some((row) => row.status !== "completed");
+      return hasActionsInProgress(rows);
     }
 
     function pollIntervalFor(key, activeKey, { actionRows } = {}) {
@@ -13360,10 +15258,13 @@ function App({ onCreateRemote = () => {} } = {}) {
     TABS.map((t) => [t.key, data[t.key] == null && !errors[t.key] && loading[t.key]]),
   );
   const anyFirstLoad = Object.values(firstLoad).some(Boolean);
+  const statusDisconnected = runtime.connect === "local"
+    ? activeGovernorDecision?.disconnected === true
+    : data[tab.key] !== null && !runtimeIdentityCoordinator?.current();
   let semanticStatus = refreshStatus({
     widthMode: resizeRef.current.active,
     remoteSetup,
-    visibleLoading: Boolean(loading[tab.key]),
+    visibleLoading: Boolean(loading[tab.key]) && !statusDisconnected,
     visibleInFlight: Boolean(activeRequestStatus),
     automaticStatusVisible: Boolean(activeRequestStatus?.automaticStatusVisible),
     governorDecision: activeGovernorDecision,
@@ -13371,7 +15272,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     securityIncomplete:
       tab.key === "security" && securityBlind,
     sharedData: activeGovernorDecision?.sharedData === true,
-    disconnected: data[tab.key] !== null && !runtimeIdentityCoordinator?.current(),
+    disconnected: statusDisconnected,
     screenReader,
   });
   const showSpinner = !remoteSetup && ANIMATE && (semanticStatus.animate || hasRunningVisible);
@@ -13902,7 +15803,21 @@ function installCrashHandlers(unmountApp) {
   process.on("unhandledRejection", fail("unhandled promise rejection"));
 }
 
-if (IS_MAIN) {
+if (IS_MAIN && runtime.headlessMode) {
+  try {
+    if (runtime.headlessMode.type === "serve") {
+      await runCollectorForeground(runtime.headlessMode.config);
+    } else {
+      await runCollectorStdioBridge();
+    }
+    process.exit(0);
+  } catch (error) {
+    console.error(`gh-glance: ${redact(shortErr(error))}`);
+    process.exit(1);
+  }
+}
+
+if (IS_MAIN && !runtime.headlessMode) {
   let app;
   const unmountApp = () => {
     try {
@@ -14209,6 +16124,30 @@ export {
   publishStagedEntities,
   fetchAlertSource,
   fetchSecurity,
+  COLLECTOR_PROTOCOL_VERSION,
+  COLLECTOR_FRAME_MAX_BYTES,
+  COLLECTOR_CHUNK_FRAME_MAX_BYTES,
+  COLLECTOR_ASSEMBLY_MAX_BYTES,
+  COLLECTOR_ASSEMBLY_TIMEOUT_MS,
+  collectorSocketPath,
+  localCollectorPreflight,
+  normalizeCollectorConfig,
+  loadCollectorConfig,
+  encodeCollectorFrame,
+  createCollectorFrameDecoder,
+  validateCollectorClientMessage,
+  encodeCollectorSnapshotFrames,
+  createCollectorSnapshotAssembler,
+  createCollectorSnapshotEncodingCache,
+  createCollectorSender,
+  projectCollectorSnapshot,
+  createCollectorService,
+  createCollectorAcquisitionRuntime,
+  collectorPublicationFromResult,
+  runCollectorForeground,
+  runCollectorStdioBridge,
+  createLocalCollectorClient,
+  collectorDisplayDecision,
   formatAge,
   formatDuration,
   usableSize,
@@ -14254,6 +16193,7 @@ export {
   ACQUISITION_MAX_SUBSCRIPTIONS,
   acquisitionStorePath,
   acquisitionQueryKey,
+  acquisitionQueryForTab,
   acquisitionHold,
   acquisitionDiagnostics,
   acquisitionRequestMetrics,
@@ -14292,6 +16232,7 @@ export {
   rateLimitBlockProbeRecovered,
   admitGovernorOperation,
   runAdmittedOperation,
+  abortableDelay,
   GOVERNOR_ADMISSION_WAIT_MS,
   pollResultTransition,
   forcedBackoffKeys,

@@ -543,6 +543,42 @@ test("a separately admitted operation waits out a lane gap instead of being refu
   assert.ok(waited.every((ms) => ms > 0 && ms <= GOVERNOR_ADMISSION_WAIT_MS), `waited ${waited}`);
 });
 
+test("an aborted deferred admission is cancelled before start and cannot run late", async (t) => {
+  const now = Date.now();
+  const box = sandbox(t, { now, authIdentity: "admission-abort" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId, now));
+  publishInitial(box.scope, leaseId, now);
+  const first = await runAdmittedOperation({
+    scope: box.scope,
+    leaseId,
+    operation: "tab:actions-runs",
+    waitMs: GOVERNOR_PHASE_WINDOW_MS + 3_600_000,
+    now: box.now,
+    wait: async (ms) => box.setNow(box.now() + ms + 1),
+    run: async () => "runs",
+  });
+  assert.equal(first.ok, true);
+
+  const controller = new AbortController();
+  let calls = 0;
+  const deferred = await runAdmittedOperation({
+    scope: box.scope,
+    leaseId,
+    operation: "catalog:actions-workflows",
+    priority: "background",
+    waitMs: GOVERNOR_ADMISSION_WAIT_MS,
+    signal: controller.signal,
+    now: box.now,
+    wait: async () => { controller.abort(); return false; },
+    run: async () => { calls += 1; },
+  });
+  assert.equal(deferred.skipped, true);
+  assert.equal(calls, 0);
+  assert.equal(Object.values(inspectGovernor(box.scope, box.now()).value.reservations)
+    .filter((reservation) => reservation.status === "scheduled" || reservation.status === "started").length, 0);
+});
+
 test("OBS-01: nested reservation settlement distinguishes proven 304 from unknown failure", async (t) => {
   const execute = async (authIdentity, run) => {
     const now = Date.now();

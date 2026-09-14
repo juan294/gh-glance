@@ -132,6 +132,24 @@ raw credentials or reuses saved rate-limit headers as authority. Source success
 and content-change timestamps remain separate, so a conditional 304 updates
 freshness without pretending the display changed.
 
+The optional local collector uses one fixed Unix-domain socket inside the same
+private config root. The directory is `0700` and the socket, lock, configuration,
+and state files are `0600` on POSIX. Startup rejects symlinked or differently
+owned roots, refuses a live owner, and removes stale artifacts only after dead
+owner plus inode evidence. Shutdown removes only the lock and socket identities
+created by that service instance. Collector hosting and the stdio bridge are not
+supported on Windows; no TCP fallback exists.
+
+The collector trust boundary is one OS user, not multiple tenants. Its strict
+configuration maps each exact host/repository target to one named `gh` provider.
+Clients never send credentials or arbitrary GitHub operations. Wire frames are
+newline-delimited JSON capped at 1 MiB; large snapshots use digest-checked,
+ordered chunks capped at 512 KiB and assemble to at most 8 MiB. Per-client and
+aggregate outbound queues are bounded, and a stalled client is disconnected.
+Wire snapshots project sanitized display rows, pagination, semantic holds, and
+source timestamps only. They exclude tokens, access/quota digests, local paths,
+validators, raw bodies, reservations, and provider details.
+
 One nonce-fenced producer owns each due query generation. Its 45-second claim
 is heartbeated every ten seconds, and expiration alone cannot transfer
 ownership: takeover also requires PID-confirmed death or explicit cancellation.

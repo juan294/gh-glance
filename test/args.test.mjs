@@ -7,6 +7,9 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -35,12 +38,50 @@ test("no arguments keeps every default", () => {
   assert.equal(opts.tabKey, null);
   assert.equal(opts.verbose, false);
   assert.equal(opts.probe, false);
+  assert.equal(opts.serve, false);
+  assert.equal(opts.config, null);
+  assert.equal(opts.connect, null);
+  assert.equal(opts.collectorStdio, false);
+});
+
+test("collector modes are explicit, exclusive, and strictly valued", () => {
+  assert.deepEqual(parse(["--serve", "--config", "/tmp/collector.json"]), {
+    ...parse([]), serve: true, config: "/tmp/collector.json",
+  });
+  assert.equal(parse(["--connect", "local", "--repo", "acme/widget"]).connect, "local");
+  assert.equal(parse(["--collector-stdio"]).collectorStdio, true);
+  assert.throws(() => parse(["--serve"]), /--serve requires --config/);
+  assert.throws(() => parse(["--config", "/tmp/x"]), /--config requires --serve/);
+  assert.throws(() => parse(["--connect", "tcp:public"]), /--connect must be local/);
+  assert.throws(() => parse(["--serve", "--config", "/tmp/x", "--connect", "local"]), /cannot be combined/);
+  assert.throws(() => parse(["--collector-stdio", "--repo", "acme/widget"]), /cannot be combined/);
+});
+
+test("--connect local without an offline repository target fails before the dashboard", (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "gh-glance-local-preflight-"));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  assert.throws(
+    () => execFileSync(process.execPath, [ENTRY, "--connect", "local"], {
+      cwd,
+      env: { ...process.env, GH_REPO: "" },
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }),
+    (error) => {
+      assert.equal(error.status, 3);
+      assert.match(error.stderr, /pass --repo owner\/name/i);
+      assert.doesNotMatch(error.stderr, /stdout is not a terminal/i);
+      return true;
+    },
+  );
 });
 
 test("--probe is an explicit doctor-only opt in", () => {
   assert.equal(parse(["--doctor"]).probe, false);
   assert.equal(parse(["--doctor", "--probe"]).probe, true);
   assert.throws(() => parse(["--probe"]), /--probe requires --doctor/);
+  assert.throws(() => parse(["--connect", "local", "--doctor", "--probe"]),
+    /collector clients make no GitHub API calls/);
 });
 
 test("unknown arguments are still rejected", () => {
