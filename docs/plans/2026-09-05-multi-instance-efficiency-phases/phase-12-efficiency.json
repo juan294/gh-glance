@@ -1,0 +1,996 @@
+{
+  "schema": 1,
+  "kind": "deterministic-efficiency-measurement",
+  "runtime": "v24.19.0",
+  "platform": "darwin/arm64",
+  "workload": {
+    "manifestSchema": 1,
+    "id": "sustained-hour",
+    "simulatedDurationMs": 3600000,
+    "tickMs": 60000
+  },
+  "topologies": [
+    {
+      "id": "single-pane",
+      "panes": 1,
+      "simulatedDurationMs": 3600000,
+      "attributableStreams": 1,
+      "maximumProducersPerGeneration": 1,
+      "maximumConcurrentProducerRequests": 1,
+      "duplicateProducerPerGeneration": 0,
+      "coalescedConsumers": 1,
+      "accountSwitchIsolated": true,
+      "progressAfterReset": true,
+      "secondaryHoldObserved": true,
+      "minimumCoreRemaining": 4871,
+      "minimumGraphqlRemaining": 4971,
+      "pinnedGraphqlProbe": {
+        "before": 0,
+        "after": 0,
+        "actualUsed": 15
+      },
+      "repositoryProgress": {
+        "acme/widget": {
+          "dueGenerations": 44,
+          "requests": 60,
+          "successes": 59,
+          "postHoldSuccesses": 34,
+          "postResetSuccesses": 30
+        }
+      }
+    },
+    {
+      "id": "two-duplicates",
+      "panes": 2,
+      "simulatedDurationMs": 3600000,
+      "attributableStreams": 1,
+      "maximumProducersPerGeneration": 1,
+      "maximumConcurrentProducerRequests": 1,
+      "duplicateProducerPerGeneration": 0,
+      "coalescedConsumers": 2,
+      "accountSwitchIsolated": true,
+      "progressAfterReset": true,
+      "secondaryHoldObserved": true,
+      "minimumCoreRemaining": 4871,
+      "minimumGraphqlRemaining": 4971,
+      "pinnedGraphqlProbe": {
+        "before": 0,
+        "after": 0,
+        "actualUsed": 15
+      },
+      "repositoryProgress": {
+        "acme/widget": {
+          "dueGenerations": 45,
+          "requests": 61,
+          "successes": 60,
+          "postHoldSuccesses": 35,
+          "postResetSuccesses": 30
+        }
+      }
+    },
+    {
+      "id": "seven-duplicates",
+      "panes": 7,
+      "simulatedDurationMs": 3600000,
+      "attributableStreams": 1,
+      "maximumProducersPerGeneration": 1,
+      "maximumConcurrentProducerRequests": 1,
+      "duplicateProducerPerGeneration": 0,
+      "coalescedConsumers": 7,
+      "accountSwitchIsolated": true,
+      "progressAfterReset": true,
+      "secondaryHoldObserved": true,
+      "minimumCoreRemaining": 4871,
+      "minimumGraphqlRemaining": 4971,
+      "pinnedGraphqlProbe": {
+        "before": 0,
+        "after": 0,
+        "actualUsed": 15
+      },
+      "repositoryProgress": {
+        "acme/widget": {
+          "dueGenerations": 45,
+          "requests": 61,
+          "successes": 60,
+          "postHoldSuccesses": 35,
+          "postResetSuccesses": 30
+        }
+      }
+    },
+    {
+      "id": "ten-duplicates",
+      "panes": 10,
+      "simulatedDurationMs": 3600000,
+      "attributableStreams": 1,
+      "maximumProducersPerGeneration": 1,
+      "maximumConcurrentProducerRequests": 1,
+      "duplicateProducerPerGeneration": 0,
+      "coalescedConsumers": 10,
+      "accountSwitchIsolated": true,
+      "progressAfterReset": true,
+      "secondaryHoldObserved": true,
+      "minimumCoreRemaining": 4871,
+      "minimumGraphqlRemaining": 4971,
+      "pinnedGraphqlProbe": {
+        "before": 0,
+        "after": 0,
+        "actualUsed": 15
+      },
+      "repositoryProgress": {
+        "acme/widget": {
+          "dueGenerations": 45,
+          "requests": 61,
+          "successes": 60,
+          "postHoldSuccesses": 35,
+          "postResetSuccesses": 30
+        }
+      }
+    },
+    {
+      "id": "ten-distinct",
+      "panes": 10,
+      "simulatedDurationMs": 3600000,
+      "attributableStreams": 10,
+      "maximumProducersPerGeneration": 1,
+      "maximumConcurrentProducerRequests": 1,
+      "duplicateProducerPerGeneration": 0,
+      "coalescedConsumers": 1,
+      "accountSwitchIsolated": true,
+      "progressAfterReset": true,
+      "secondaryHoldObserved": true,
+      "minimumCoreRemaining": 4862,
+      "minimumGraphqlRemaining": 4970,
+      "pinnedGraphqlProbe": {
+        "before": 0,
+        "after": 0,
+        "actualUsed": 15
+      },
+      "repositoryProgress": {
+        "acme/project-0": {
+          "dueGenerations": 45,
+          "requests": 61,
+          "successes": 60,
+          "postHoldSuccesses": 35,
+          "postResetSuccesses": 30
+        },
+        "acme/project-1": {
+          "dueGenerations": 44,
+          "requests": 59,
+          "successes": 59,
+          "postHoldSuccesses": 34,
+          "postResetSuccesses": 30
+        },
+        "acme/project-2": {
+          "dueGenerations": 44,
+          "requests": 59,
+          "successes": 59,
+          "postHoldSuccesses": 34,
+          "postResetSuccesses": 30
+        },
+        "acme/project-3": {
+          "dueGenerations": 44,
+          "requests": 59,
+          "successes": 59,
+          "postHoldSuccesses": 34,
+          "postResetSuccesses": 30
+        },
+        "acme/project-4": {
+          "dueGenerations": 44,
+          "requests": 59,
+          "successes": 59,
+          "postHoldSuccesses": 34,
+          "postResetSuccesses": 30
+        },
+        "acme/project-5": {
+          "dueGenerations": 44,
+          "requests": 59,
+          "successes": 59,
+          "postHoldSuccesses": 34,
+          "postResetSuccesses": 30
+        },
+        "acme/project-6": {
+          "dueGenerations": 44,
+          "requests": 59,
+          "successes": 59,
+          "postHoldSuccesses": 34,
+          "postResetSuccesses": 30
+        },
+        "acme/project-7": {
+          "dueGenerations": 44,
+          "requests": 59,
+          "successes": 59,
+          "postHoldSuccesses": 34,
+          "postResetSuccesses": 30
+        },
+        "acme/project-8": {
+          "dueGenerations": 44,
+          "requests": 59,
+          "successes": 59,
+          "postHoldSuccesses": 34,
+          "postResetSuccesses": 30
+        },
+        "acme/project-9": {
+          "dueGenerations": 44,
+          "requests": 59,
+          "successes": 59,
+          "postHoldSuccesses": 34,
+          "postResetSuccesses": 30
+        }
+      }
+    },
+    {
+      "id": "two-machines",
+      "panes": 7,
+      "clientsByRoot": [
+        3,
+        4
+      ],
+      "simulatedDurationMs": 3600000,
+      "attributableStreams": 1,
+      "maximumProducersPerGeneration": 1,
+      "maximumConcurrentProducerRequests": 1,
+      "duplicateProducerPerGeneration": 0,
+      "coalescedConsumers": 7,
+      "accountSwitchIsolated": true,
+      "progressAfterReset": true,
+      "secondaryHoldObserved": true,
+      "minimumCoreRemaining": 4871,
+      "minimumGraphqlRemaining": 4971,
+      "pinnedGraphqlProbe": {
+        "before": 0,
+        "after": 0,
+        "actualUsed": 15
+      },
+      "repositoryProgress": {
+        "acme/widget": {
+          "dueGenerations": 45,
+          "requests": 61,
+          "successes": 60,
+          "postHoldSuccesses": 35,
+          "postResetSuccesses": 30
+        }
+      },
+      "clientGithubRequests": 0,
+      "clientRoots": 2,
+      "collectorStreams": 1,
+      "collectorDeliveries": 7,
+      "collectorGenerations": 1,
+      "clientProcessStarts": 7,
+      "sshOnly": true,
+      "transport": "service+stdio+fake-ssh"
+    }
+  ],
+  "metrics": {
+    "httpRequests": 1619,
+    "dataHttpRequests": 896,
+    "rest200": 36,
+    "rest304": 854,
+    "coreUnits": 385,
+    "graphqlUnits": 350,
+    "observerCalls": 723,
+    "observerCost": 699,
+    "failedRequests": 18,
+    "provenCoreUnits": 36,
+    "provenGraphqlUnits": 0,
+    "uncertainCoreUnits": 7,
+    "uncertainGraphqlUnits": 0,
+    "coalescedConsumers": 10,
+    "maximumConcurrentProducerRequests": 1,
+    "costEvidence": {
+      "oracleCharged": true,
+      "acquisitionPersisted": true,
+      "oracleFields": [
+        "coreUnits",
+        "graphqlUnits",
+        "observerCalls",
+        "observerCost"
+      ],
+      "acquisitionFields": [
+        "provenCoreUnits",
+        "provenGraphqlUnits",
+        "uncertainCoreUnits",
+        "uncertainGraphqlUnits"
+      ]
+    },
+    "perOperation": {
+      "actions.runs": {
+        "httpRequests": 896,
+        "status200": 36,
+        "status304": 854,
+        "coreUnits": 36,
+        "graphqlUnits": 0
+      },
+      "core.observer": {
+        "httpRequests": 355,
+        "status200": 349,
+        "status304": 0,
+        "coreUnits": 349,
+        "graphqlUnits": 0
+      },
+      "graphql.observer": {
+        "httpRequests": 356,
+        "status200": 350,
+        "status304": 0,
+        "coreUnits": 0,
+        "graphqlUnits": 350
+      },
+      "quota.probe": {
+        "httpRequests": 12,
+        "status200": 12,
+        "status304": 0,
+        "coreUnits": 0,
+        "graphqlUnits": 0
+      }
+    }
+  },
+  "freshness": {
+    "sourceToDisplayMs": {
+      "samples": 12,
+      "p50": 3110,
+      "p95": 4720
+    }
+  },
+  "queueDelayMs": {
+    "kind": "shared-follower-delivery-after-producer-start",
+    "samples": 2969,
+    "p50": 100,
+    "p95": 464
+  },
+  "correctness": {
+    "duplicateProducerPerGeneration": 0,
+    "remoteClientGithubRequests": 0,
+    "producerLossRecovered": true,
+    "accountSwitchIsolated": true,
+    "progressAfterReset": true,
+    "secondaryHoldObserved": true,
+    "producerLossRetainedUncertainty": true,
+    "staleCompletionFenced": true,
+    "accessPartitionIsolated": true,
+    "securityCapabilityTruth": true,
+    "restartRetention": true,
+    "reconnectAgeNonRegressing": true,
+    "reserveBoundaryApproached": true,
+    "reserveCrossingRefused": true,
+    "reserveBoundary": {
+      "coreRemaining": 1000,
+      "requestedCoreUnits": 1,
+      "status": "paused",
+      "reason": "reserve",
+      "refused": true
+    },
+    "minimumCoreRemaining": 4862,
+    "minimumGraphqlRemaining": 4970,
+    "pinnedGraphqlProbeStable": true,
+    "e2e4Combinations": {
+      "standalone": true,
+      "localCollector": true,
+      "sshClients": true,
+      "webhookInvalidation": true,
+      "githubAppProvider": true
+    }
+  },
+  "resources": {
+    "subprocessCount": 7,
+    "wallTimeMs": 16250,
+    "sampledCpuSeconds": 16.348091,
+    "peakSampledRssKiB": 141456,
+    "note": "Accelerated runtime plus the observed SSH client bridge cohort; CPU/RSS cover the parent measurement process only and are not compared with the Phase 1 PTY sample."
+  },
+  "baselineComparison": {
+    "status": "incompatible",
+    "baselineCommit": "b819f42e87922671a35bb72052bd0ede445b74be",
+    "baselineRuntime": "v24.19.0",
+    "baselinePlatform": "darwin/arm64",
+    "currentWorkload": "sustained-hour",
+    "reasons": [
+      "workload",
+      "measurement-method"
+    ],
+    "improvementPercent": null,
+    "note": "The Phase 1 sample is an eight-second legacy Actions-only PTY capture; this is an accelerated sustained-hour production-policy run. No numeric improvement is claimed."
+  },
+  "compatibleStartup": {
+    "measurement": {
+      "schema": 1,
+      "kind": "observed-current-production-baseline",
+      "capturedAt": "2026-09-15T08:54:41.536Z",
+      "commit": "14f355e4579efe5bc9a3659763f674941d170c5a",
+      "runtime": "v24.19.0",
+      "platform": "darwin/arm64",
+      "workload": "Actions-active panes; --refresh 40; background defaults; identical/distinct repositories; generous 1000000-unit ten-minute budgets; 100ms fixture delay; fixed 8-second observation window; current legacy fixture transport",
+      "measurementNotes": [
+        "Counts are fixture invocations, not claims about all HTTP requests hidden inside real gh porcelain commands.",
+        "Charged units are observations from the existing legacy server ledger, which does not debit auth status; the new independent oracle accounts for auth HTTP explicitly.",
+        "Only active Actions data becomes due within this fixed window; this is a startup duplicate-demand baseline, not a sustained all-tab workload."
+      ],
+      "unavailable": {
+        "sourceToDisplayLatency": "No content changes injected; request latency is measured, not source-to-display.",
+        "coalescedConsumers": "No production metric exposed at baseline.",
+        "queueWait": "Not sampled by existing capture harness."
+      },
+      "resourceMeasurement": "100ms samples of owned descendants (dashboard, shell, fixture); CPU is a sampled lower bound, RSS is aggregate sample peak; excludes measurement parent and sampler.",
+      "samples": [
+        {
+          "panes": 1,
+          "resources": {
+            "sampleIntervalMs": 100,
+            "samples": 80,
+            "sampledCpuSeconds": 0.56,
+            "peakSampledRssKiB": 175568
+          },
+          "elapsedMs": 8162,
+          "subprocessCount": 6,
+          "recordedFixtureStarts": 4,
+          "observers": 1,
+          "actionsRunRequests": 1,
+          "coreChargedUnits": 2,
+          "graphqlChargedUnits": 1,
+          "requestLatencyMs": {
+            "p50": 103,
+            "p95": 104
+          },
+          "maxConcurrency": 1
+        },
+        {
+          "panes": 2,
+          "resources": {
+            "sampleIntervalMs": 100,
+            "samples": 80,
+            "sampledCpuSeconds": 0.9400000000000002,
+            "peakSampledRssKiB": 304640
+          },
+          "elapsedMs": 8167,
+          "subprocessCount": 8,
+          "recordedFixtureStarts": 5,
+          "observers": 1,
+          "actionsRunRequests": 1,
+          "coreChargedUnits": 2,
+          "graphqlChargedUnits": 1,
+          "requestLatencyMs": {
+            "p50": 102,
+            "p95": 103
+          },
+          "maxConcurrency": 2
+        },
+        {
+          "panes": 7,
+          "resources": {
+            "sampleIntervalMs": 100,
+            "samples": 81,
+            "sampledCpuSeconds": 3.5999999999999983,
+            "peakSampledRssKiB": 938848
+          },
+          "elapsedMs": 8231,
+          "subprocessCount": 19,
+          "recordedFixtureStarts": 11,
+          "observers": 1,
+          "actionsRunRequests": 2,
+          "coreChargedUnits": 2,
+          "graphqlChargedUnits": 1,
+          "requestLatencyMs": {
+            "p50": 103,
+            "p95": 104
+          },
+          "maxConcurrency": 7
+        },
+        {
+          "panes": 10,
+          "resources": {
+            "sampleIntervalMs": 100,
+            "samples": 82,
+            "sampledCpuSeconds": 4.9099999999999975,
+            "peakSampledRssKiB": 1282400
+          },
+          "elapsedMs": 8315,
+          "subprocessCount": 24,
+          "recordedFixtureStarts": 13,
+          "observers": 1,
+          "actionsRunRequests": 1,
+          "coreChargedUnits": 2,
+          "graphqlChargedUnits": 1,
+          "requestLatencyMs": {
+            "p50": 103,
+            "p95": 104
+          },
+          "maxConcurrency": 10
+        },
+        {
+          "panes": 10,
+          "distinct": true,
+          "resources": {
+            "sampleIntervalMs": 100,
+            "samples": 82,
+            "sampledCpuSeconds": 5.589999999999999,
+            "peakSampledRssKiB": 1299024
+          },
+          "elapsedMs": 8319,
+          "subprocessCount": 33,
+          "recordedFixtureStarts": 22,
+          "observers": 1,
+          "actionsRunRequests": 10,
+          "coreChargedUnits": 11,
+          "graphqlChargedUnits": 1,
+          "requestLatencyMs": {
+            "p50": 103,
+            "p95": 104
+          },
+          "maxConcurrency": 10
+        }
+      ]
+    },
+    "comparison": {
+      "status": "compatible",
+      "reasons": [],
+      "improvementPercent": 50,
+      "headline": {
+        "metric": "actionsRunRequests",
+        "status": "comparable",
+        "baseline": 30,
+        "current": 15,
+        "delta": -15,
+        "improvementPercent": 50
+      },
+      "samples": [
+        {
+          "key": "1:duplicate",
+          "status": "comparable",
+          "metrics": {
+            "actionsRunRequests": {
+              "status": "comparable",
+              "baseline": 1,
+              "current": 1,
+              "delta": 0,
+              "improvementPercent": 0
+            },
+            "recordedFixtureStarts": {
+              "status": "comparable",
+              "baseline": 5,
+              "current": 4,
+              "delta": -1,
+              "improvementPercent": 20
+            },
+            "observers": {
+              "status": "comparable",
+              "baseline": 2,
+              "current": 1,
+              "delta": -1,
+              "improvementPercent": 50
+            },
+            "coreChargedUnits": {
+              "status": "comparable",
+              "baseline": 3,
+              "current": 2,
+              "delta": -1,
+              "improvementPercent": 33.33
+            },
+            "graphqlChargedUnits": {
+              "status": "comparable",
+              "baseline": 0,
+              "current": 1,
+              "delta": 1,
+              "improvementPercent": null
+            },
+            "subprocessCount": {
+              "status": "comparable",
+              "baseline": 5,
+              "current": 6,
+              "delta": 1,
+              "improvementPercent": -20
+            },
+            "elapsedMs": {
+              "status": "comparable",
+              "baseline": 8121,
+              "current": 8162,
+              "delta": 41,
+              "improvementPercent": -0.5
+            },
+            "sampledCpuSeconds": {
+              "status": "comparable",
+              "baseline": 0.48,
+              "current": 0.56,
+              "delta": 0.08000000000000007,
+              "improvementPercent": -16.67
+            },
+            "peakSampledRssKiB": {
+              "status": "comparable",
+              "baseline": 223952,
+              "current": 175568,
+              "delta": -48384,
+              "improvementPercent": 21.6
+            },
+            "requestLatencyP50Ms": {
+              "status": "comparable",
+              "baseline": 102,
+              "current": 103,
+              "delta": 1,
+              "improvementPercent": -0.98
+            },
+            "requestLatencyP95Ms": {
+              "status": "comparable",
+              "baseline": 103,
+              "current": 104,
+              "delta": 1,
+              "improvementPercent": -0.97
+            },
+            "maxConcurrency": {
+              "status": "comparable",
+              "baseline": 2,
+              "current": 1,
+              "delta": -1,
+              "improvementPercent": 50
+            }
+          }
+        },
+        {
+          "key": "2:duplicate",
+          "status": "comparable",
+          "metrics": {
+            "actionsRunRequests": {
+              "status": "comparable",
+              "baseline": 2,
+              "current": 1,
+              "delta": -1,
+              "improvementPercent": 50
+            },
+            "recordedFixtureStarts": {
+              "status": "comparable",
+              "baseline": 8,
+              "current": 5,
+              "delta": -3,
+              "improvementPercent": 37.5
+            },
+            "observers": {
+              "status": "comparable",
+              "baseline": 2,
+              "current": 1,
+              "delta": -1,
+              "improvementPercent": 50
+            },
+            "coreChargedUnits": {
+              "status": "comparable",
+              "baseline": 5,
+              "current": 2,
+              "delta": -3,
+              "improvementPercent": 60
+            },
+            "graphqlChargedUnits": {
+              "status": "comparable",
+              "baseline": 0,
+              "current": 1,
+              "delta": 1,
+              "improvementPercent": null
+            },
+            "subprocessCount": {
+              "status": "comparable",
+              "baseline": 8,
+              "current": 8,
+              "delta": 0,
+              "improvementPercent": 0
+            },
+            "elapsedMs": {
+              "status": "comparable",
+              "baseline": 8115,
+              "current": 8167,
+              "delta": 52,
+              "improvementPercent": -0.64
+            },
+            "sampledCpuSeconds": {
+              "status": "comparable",
+              "baseline": 0.8500000000000002,
+              "current": 0.9400000000000002,
+              "delta": 0.08999999999999997,
+              "improvementPercent": -10.59
+            },
+            "peakSampledRssKiB": {
+              "status": "comparable",
+              "baseline": 349808,
+              "current": 304640,
+              "delta": -45168,
+              "improvementPercent": 12.91
+            },
+            "requestLatencyP50Ms": {
+              "status": "comparable",
+              "baseline": 102,
+              "current": 102,
+              "delta": 0,
+              "improvementPercent": 0
+            },
+            "requestLatencyP95Ms": {
+              "status": "comparable",
+              "baseline": 104,
+              "current": 103,
+              "delta": -1,
+              "improvementPercent": 0.96
+            },
+            "maxConcurrency": {
+              "status": "comparable",
+              "baseline": 3,
+              "current": 2,
+              "delta": -1,
+              "improvementPercent": 33.33
+            }
+          }
+        },
+        {
+          "key": "7:duplicate",
+          "status": "comparable",
+          "metrics": {
+            "actionsRunRequests": {
+              "status": "comparable",
+              "baseline": 7,
+              "current": 2,
+              "delta": -5,
+              "improvementPercent": 71.43
+            },
+            "recordedFixtureStarts": {
+              "status": "comparable",
+              "baseline": 23,
+              "current": 11,
+              "delta": -12,
+              "improvementPercent": 52.17
+            },
+            "observers": {
+              "status": "comparable",
+              "baseline": 2,
+              "current": 1,
+              "delta": -1,
+              "improvementPercent": 50
+            },
+            "coreChargedUnits": {
+              "status": "comparable",
+              "baseline": 15,
+              "current": 2,
+              "delta": -13,
+              "improvementPercent": 86.67
+            },
+            "graphqlChargedUnits": {
+              "status": "comparable",
+              "baseline": 0,
+              "current": 1,
+              "delta": 1,
+              "improvementPercent": null
+            },
+            "subprocessCount": {
+              "status": "comparable",
+              "baseline": 23,
+              "current": 19,
+              "delta": -4,
+              "improvementPercent": 17.39
+            },
+            "elapsedMs": {
+              "status": "comparable",
+              "baseline": 8118,
+              "current": 8231,
+              "delta": 113,
+              "improvementPercent": -1.39
+            },
+            "sampledCpuSeconds": {
+              "status": "comparable",
+              "baseline": 3.239999999999999,
+              "current": 3.5999999999999983,
+              "delta": 0.35999999999999943,
+              "improvementPercent": -11.11
+            },
+            "peakSampledRssKiB": {
+              "status": "comparable",
+              "baseline": 1581760,
+              "current": 938848,
+              "delta": -642912,
+              "improvementPercent": 40.65
+            },
+            "requestLatencyP50Ms": {
+              "status": "comparable",
+              "baseline": 103,
+              "current": 103,
+              "delta": 0,
+              "improvementPercent": 0
+            },
+            "requestLatencyP95Ms": {
+              "status": "comparable",
+              "baseline": 109,
+              "current": 104,
+              "delta": -5,
+              "improvementPercent": 4.59
+            },
+            "maxConcurrency": {
+              "status": "comparable",
+              "baseline": 14,
+              "current": 7,
+              "delta": -7,
+              "improvementPercent": 50
+            }
+          }
+        },
+        {
+          "key": "10:duplicate",
+          "status": "comparable",
+          "metrics": {
+            "actionsRunRequests": {
+              "status": "comparable",
+              "baseline": 10,
+              "current": 1,
+              "delta": -9,
+              "improvementPercent": 90
+            },
+            "recordedFixtureStarts": {
+              "status": "comparable",
+              "baseline": 32,
+              "current": 13,
+              "delta": -19,
+              "improvementPercent": 59.38
+            },
+            "observers": {
+              "status": "comparable",
+              "baseline": 2,
+              "current": 1,
+              "delta": -1,
+              "improvementPercent": 50
+            },
+            "coreChargedUnits": {
+              "status": "comparable",
+              "baseline": 21,
+              "current": 2,
+              "delta": -19,
+              "improvementPercent": 90.48
+            },
+            "graphqlChargedUnits": {
+              "status": "comparable",
+              "baseline": 0,
+              "current": 1,
+              "delta": 1,
+              "improvementPercent": null
+            },
+            "subprocessCount": {
+              "status": "comparable",
+              "baseline": 32,
+              "current": 24,
+              "delta": -8,
+              "improvementPercent": 25
+            },
+            "elapsedMs": {
+              "status": "comparable",
+              "baseline": 8145,
+              "current": 8315,
+              "delta": 170,
+              "improvementPercent": -2.09
+            },
+            "sampledCpuSeconds": {
+              "status": "comparable",
+              "baseline": 4.860000000000001,
+              "current": 4.9099999999999975,
+              "delta": 0.04999999999999627,
+              "improvementPercent": -1.03
+            },
+            "peakSampledRssKiB": {
+              "status": "comparable",
+              "baseline": 2015056,
+              "current": 1282400,
+              "delta": -732656,
+              "improvementPercent": 36.36
+            },
+            "requestLatencyP50Ms": {
+              "status": "comparable",
+              "baseline": 103,
+              "current": 103,
+              "delta": 0,
+              "improvementPercent": 0
+            },
+            "requestLatencyP95Ms": {
+              "status": "comparable",
+              "baseline": 104,
+              "current": 104,
+              "delta": 0,
+              "improvementPercent": 0
+            },
+            "maxConcurrency": {
+              "status": "comparable",
+              "baseline": 16,
+              "current": 10,
+              "delta": -6,
+              "improvementPercent": 37.5
+            }
+          }
+        },
+        {
+          "key": "10:distinct",
+          "status": "comparable",
+          "metrics": {
+            "actionsRunRequests": {
+              "status": "comparable",
+              "baseline": 10,
+              "current": 10,
+              "delta": 0,
+              "improvementPercent": 0
+            },
+            "recordedFixtureStarts": {
+              "status": "comparable",
+              "baseline": 32,
+              "current": 22,
+              "delta": -10,
+              "improvementPercent": 31.25
+            },
+            "observers": {
+              "status": "comparable",
+              "baseline": 2,
+              "current": 1,
+              "delta": -1,
+              "improvementPercent": 50
+            },
+            "coreChargedUnits": {
+              "status": "comparable",
+              "baseline": 21,
+              "current": 11,
+              "delta": -10,
+              "improvementPercent": 47.62
+            },
+            "graphqlChargedUnits": {
+              "status": "comparable",
+              "baseline": 0,
+              "current": 1,
+              "delta": 1,
+              "improvementPercent": null
+            },
+            "subprocessCount": {
+              "status": "comparable",
+              "baseline": 32,
+              "current": 33,
+              "delta": 1,
+              "improvementPercent": -3.13
+            },
+            "elapsedMs": {
+              "status": "comparable",
+              "baseline": 8152,
+              "current": 8319,
+              "delta": 167,
+              "improvementPercent": -2.05
+            },
+            "sampledCpuSeconds": {
+              "status": "comparable",
+              "baseline": 4.910000000000003,
+              "current": 5.589999999999999,
+              "delta": 0.6799999999999962,
+              "improvementPercent": -13.85
+            },
+            "peakSampledRssKiB": {
+              "status": "comparable",
+              "baseline": 1322400,
+              "current": 1299024,
+              "delta": -23376,
+              "improvementPercent": 1.77
+            },
+            "requestLatencyP50Ms": {
+              "status": "comparable",
+              "baseline": 103,
+              "current": 103,
+              "delta": 0,
+              "improvementPercent": 0
+            },
+            "requestLatencyP95Ms": {
+              "status": "comparable",
+              "baseline": 105,
+              "current": 104,
+              "delta": -1,
+              "improvementPercent": 0.95
+            },
+            "maxConcurrency": {
+              "status": "comparable",
+              "baseline": 10,
+              "current": 10,
+              "delta": 0,
+              "improvementPercent": 0
+            }
+          }
+        }
+      ],
+      "unavailable": {
+        "sourceToDisplayLatency": "The compatible Phase 1 workload injected no source changes.",
+        "coalescedConsumers": "The Phase 1 capture exposed no coalescing metric.",
+        "queueWait": "The Phase 1 capture exposed no queue-wait metric."
+      }
+    }
+  },
+  "releaseGate": {
+    "passed": true,
+    "reason": "positive-request-improvement"
+  }
+}

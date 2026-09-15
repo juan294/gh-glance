@@ -124,9 +124,10 @@ current.
 npm install -g gh-glance
 ```
 
-That is the whole install. `gh-glance` ships as a single `index.mjs` with no
-build step, so there is nothing to compile and nothing to configure -- the
-package is the source you can read in this repository.
+That is the whole install for the default standalone dashboard. `gh-glance`
+ships as a single `index.mjs` with no build step, so there is nothing to
+compile. The optional collector, SSH, webhook, and GitHub App modes use the
+explicit configuration described below.
 
 The installed package is a CLI, not a JavaScript library. The `gh-glance`
 executable is supported; package-root and deep imports are intentionally
@@ -141,9 +142,9 @@ page](https://www.npmjs.com/package/gh-glance) shows the exact source.
 
 ### First run
 
-`gh-glance` uses the credentials and active account already selected by your
-local `gh` CLI. It does not request, inspect, or store the token itself. Check
-that account before starting the dashboard:
+The default standalone dashboard uses the credentials and active account
+already selected by your local `gh` CLI. It does not persist or display the
+token. Check that account before starting the dashboard:
 
 ```bash
 gh auth status
@@ -549,7 +550,7 @@ Environment variables work too, and the flags take precedence:
 |---|---|
 | `GH_REPO=[host/]owner/name` | Watch a specific repository instead of the current directory's. A qualified value supplies the host; an unqualified value means `github.com`. An explicit `--repo` wins. |
 | `GH_HOST=<host>` | When no explicit `--repo` overrides it, send every call and the account governor to a GitHub Enterprise or EMU host instead of `github.com`. |
-| `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN` | Used by `gh`. gh-glance never logs or stores these values, but hashes each set value locally as part of the account-scoped cache and governor namespaces so panes with different credentials cannot share rows or admission. The raw values are not written to disk. |
+| `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN` | Used by the default `gh` provider with `gh`'s host-specific precedence. gh-glance never logs or stores the raw values. One-way credential digests keep private rows access-partitioned; credentials GitHub verifies as the same principal share its quota ledger. App-provider children remove these variables before setting their memory-only installation token. |
 | `GH_CONFIG_DIR` | Selects `gh`'s account configuration and contributes its normalized identity to the cache and governor namespaces. Separate values can isolate simultaneous panes on different accounts; see [No account pinning](#limitations). |
 | `GH_GLANCE_REFRESH=<seconds>` | Minimum active-tab poll interval, 2-3600. Sets the floor for every pane in a shell; `--refresh` takes precedence. See [Rate limit](#rate-limit). |
 | `GH_GLANCE_ICONS=unicode` | Unicode status glyphs and single-cell text substitutes for Nerd Font row icons |
@@ -593,13 +594,15 @@ $XDG_CONFIG_HOME/gh-glance/dashboard-cache.json
 ~/.config/gh-glance/dashboard-cache.json
 ```
 
-The cache is scoped to the repository, host, and effective `gh` account
-namespace. In inferred mode, the host and current working directory also form
-the identity, so rows from one checkout or credential context cannot appear in
-another. The namespace uses `GH_CONFIG_DIR`/`hosts.yml` identity plus one-way
-digests of supported token environment variables; raw credentials are never
-stored. It retains at most five recent targets and 60 rows per tab; a shortened
-cached tab keeps its `+` marker rather than presenting the saved count as exact.
+The cache is scoped to the repository, host, provider, and effective access
+partition. In inferred standalone mode, the host and current working directory
+also form the identity, so rows from one checkout or credential context cannot
+appear in another. Human-provider access includes one-way digests of the
+selected credential and its authorization generation; App-provider access also
+binds the configured repository and permission restrictions. Raw credentials
+are never stored. It retains at most 32 recent targets and 60 rows per tab; a
+shortened cached tab keeps its `+` marker rather than presenting the saved count
+as exact.
 
 Only successfully parsed, non-blind observations replace saved rows. A failed
 request can add a live error or `?` marker, but it cannot turn known Security
@@ -809,11 +812,12 @@ clean probe can account for it. Missing, stale, corrupt, locked, or unwritable
 coordination denies the call instead of returning to five-second polling.
 
 Core observations come from real response headers, so the core reserve has a
-closed feedback loop. GraphQL is currently weaker: `gh issue` and `gh pr` do
-not expose response headers in their normal output, and the free `rate_limit`
-endpoint can remain unchanged while real GraphQL use rises. gh-glance therefore
-paces its declared local GraphQL work and fails closed on a missing or stale
-probe, but it cannot yet prove the account-wide GraphQL reserve.
+closed feedback loop. GraphQL uses explicit bounded queries whose envelopes
+report actual cost and counter evidence. One shared, separately accounted
+GraphQL observer establishes spendable capacity; the free `rate_limit` endpoint
+is diagnostic only and can never authorize or refund work. Missing or stale
+authoritative evidence fails closed rather than falling back to an inferred
+counter.
 
 One pane owns the free `rate_limit` probe for a control window and publishes it
 for the others. Manual and diagnostic work is considered before tab-switch,
@@ -839,16 +843,43 @@ age remains explicit through the `stale` label, and the rate-limit banner still
 describes the current failed request; cached data never turns a failure into a
 false success.
 
-The enforceable boundary is local admission from fresh, conservatively debited
-evidence. Another program can spend after the probe, and panes on another
-machine or in a different local account scope cannot share this file. GitHub
-does not offer an atomic global quota reservation. The token-wide counter still
-lets gh-glance measure external use and reduce future capacity, but the hard
-reserve is not a claim that unrelated consumers can never cross it.
+The enforceable boundary is admission from fresh, conservatively debited
+evidence. Another program can spend after the probe, and standalone panes in a
+different local account scope cannot share the same coordination file. Optional
+SSH clients can instead share the collector machine's one acquisition and quota
+scope while making zero client-side GitHub requests. GitHub does not offer an
+atomic global quota reservation. The account-wide counter still lets gh-glance
+measure external use and reduce future capacity, but the hard reserve is not a
+claim that unrelated consumers can never cross it.
 
 `GH_GLANCE_REFRESH=30` sets a wider floor for every pane in a shell; `--refresh`
 still wins per pane. A single pane on a healthy budget normally stays at its
 floor and shows Watching between checks.
+
+### Efficiency verification
+
+The repository includes an offline sustained-workload gate for the coordination
+contracts described above:
+
+```sh
+npm run test:efficiency
+npm run measure:efficiency
+```
+
+The deterministic test advances an injected clock through one simulated hour
+while using the production acquisition and governor machinery. It covers one,
+two, seven, and ten panes, duplicate and distinct repositories, and a 3+4 remote
+client split, with running and quiet CI, conditional responses, external spend,
+primary reset, secondary hold, producer loss, and an account switch. The fake
+SSH route invokes the real bridge and collector; no real GitHub account, App,
+webhook, or second computer is used.
+
+The measurement command reports operation-level HTTP outcomes, proven and
+uncertain quota, observer work, coalescing, queue delay, source-to-display
+percentiles, subprocesses, wall time, CPU, and RSS. A percentage is shown only
+when the candidate and baseline used a compatible workload, machine, platform,
+and runtime. Missing or incompatible baseline values stay labelled as such;
+fixture performance is not presented as live GitHub performance.
 
 ## Limitations
 

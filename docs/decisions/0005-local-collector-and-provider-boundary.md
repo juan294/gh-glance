@@ -96,3 +96,18 @@ personal-login provider. Optional Security permissions are enforced per source,
 so a missing capability cannot become a false empty result. Installation
 deletion, suspension, and repository removal webhook events must match the
 configured installation before they advance the authority fence.
+
+Phase 12 validates the complete optional topology without changing its trust
+boundary. Standalone, local collector, fake-SSH client, webhook invalidation,
+and GitHub App provider combinations use offline fixtures; a remote client must
+perform no local credential lookup and no client-side GitHub request. Delivery
+and token events can request work or change authority, but only an API-validated
+collector publication can advance source freshness.
+
+The installed artifact remains one CLI rather than a library or bundle of
+mode-specific files. Package acceptance installs the actual tarball, requires
+`exports: {}`, exercises the standalone, foreground collector, stdio bridge,
+local-client, and SSH-facing contracts, and compares the manifest to an exact
+allowlist of `index.mjs`, `package.json`, `README.md`, `CHANGELOG.md`, and
+`LICENSE`. Tests, fixtures, private keys, webhook secrets, collector
+configuration, queues, caches, and coordination state are never package inputs.

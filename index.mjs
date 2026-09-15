@@ -752,16 +752,18 @@ async function runGh(args, { signal, operation, input = null, execute = null } =
   const local = ["version", "local-git"].includes(operation);
   let control = null;
   const identityCoordinator = bound?.identityCoordinator ?? runtimeIdentityCoordinator;
+  const requestNow = typeof bound?.now === "function" ? bound.now : Date.now;
   const permit = identityCoordinator && !local
-    ? await acquireIdentityHttpPermit(identityCoordinator, { signal }) : null;
-  const startedAt = Date.now();
+    ? await acquireIdentityHttpPermit(identityCoordinator, { signal, now: requestNow,
+        ...(typeof bound?.httpWait === "function" ? { wait: bound.httpWait } : {}) }) : null;
+  const startedAt = requestNow();
   let requestError = null;
   let requestStdout = null;
   let requestStarted = false;
   try {
     assertBoundCredential(bound);
     if (identityCoordinator && operation === "budget-core-observer") {
-      control = startIdentityControl(identityCoordinator);
+      control = startIdentityControl(identityCoordinator, requestNow());
       if (!control.ok) throw new Error(identityCoordinationMessage(control.reason));
     }
     // Admission can precede this per-call transport slot by many seconds.
@@ -773,7 +775,7 @@ async function runGh(args, { signal, operation, input = null, execute = null } =
       throw new Error(`Operation paused after an unbounded cost (retry after ${new Date(pausedUntil).toISOString()})`);
     }
     if (bound && !local && !CONTROL_OPERATIONS.includes(operation)) {
-      const ready = inspectAdmittedHttpStart(bound, operation);
+      const ready = inspectAdmittedHttpStart(bound, operation, requestNow);
       if (!ready.ok) throw new Error(`API budget paused (${ready.reason})`);
     }
     assertBoundCredential(bound);
@@ -804,12 +806,13 @@ async function runGh(args, { signal, operation, input = null, execute = null } =
     throw err;
   } finally {
     if (permit) {
-      const release = () => releaseIdentityHttpPermit(identityCoordinator, permit, requestError);
+      const release = () => releaseIdentityHttpPermit(identityCoordinator, permit, requestError, requestNow());
       const released = await retryIdentityCompletion(release, { timeoutMs: IDENTITY_RELEASE_WAIT_MS, shouldRetry: () => !identityCoordinator.isClosed() });
       if (!released.ok) identityCoordinator.deferCompletion(`permit:${permit.nonce}`, release);
     }
     if (control?.ok) {
-      const settle = () => settleIdentityControl(identityCoordinator, control.value, requestStdout ?? requestError?.stdout);
+      const settle = () => settleIdentityControl(identityCoordinator, control.value,
+        requestStdout ?? requestError?.stdout, requestNow());
       const settled = await retryIdentityCompletion(settle, { timeoutMs: IDENTITY_RELEASE_WAIT_MS, shouldRetry: () => !identityCoordinator.isClosed() });
       if (!settled.ok) identityCoordinator.deferCompletion(`control:${control.value.id}`, settle);
     }
@@ -3278,7 +3281,11 @@ function settleIdentityControl(coordinator, control, stdout, now = Date.now()) {
   }, { now });
 }
 
-async function acquireIdentityHttpPermit(coordinator, { signal, now = Date.now } = {}) {
+async function acquireIdentityHttpPermit(coordinator, {
+  signal,
+  now = Date.now,
+  wait = (delay) => new Promise((resolve) => setTimeout(resolve, delay)),
+} = {}) {
   const flushed = await coordinator.flushCompletions?.();
   if (flushed && !flushed.ok) throw new Error(identityCoordinationMessage(flushed.reason));
   const identity = coordinator.current();
@@ -3326,7 +3333,7 @@ async function acquireIdentityHttpPermit(coordinator, { signal, now = Date.now }
       const retryAt = result.retryAt ?? now() + 50;
       if ((result.reason !== "transport-busy" && !retryableCoordination(result.reason)) ||
           now() >= deadline || retryAt >= deadline) throw new Error(identityCoordinationMessage(result.reason));
-      await new Promise((resolve) => setTimeout(resolve, Math.max(1, Math.min(50, retryAt - now()))));
+      await wait(Math.max(1, Math.min(50, retryAt - now())));
     }
   } finally {
     if (!acquired) {
@@ -3436,7 +3443,7 @@ function clearTransportThrottle(transport) {
   }
 }
 
-function releaseIdentityHttpPermit(coordinator, permit, error = null) {
+function releaseIdentityHttpPermit(coordinator, permit, error = null, now = Date.now()) {
   return withIdentityRegistry(coordinator.root, (state) => {
     const transport = state.hosts[permit.host];
     if (transport?.permit?.nonce === permit.nonce) transport.permit = null;
@@ -3455,7 +3462,7 @@ function releaseIdentityHttpPermit(coordinator, permit, error = null) {
           retryAfter: verdict.retryAfter,
           status: verdict.status,
           secondary: verdict.secondary,
-          at: Date.now(),
+          at: now,
         });
       }
     } else if (transport && !error) {
@@ -8269,16 +8276,23 @@ function createCollectorAcquisitionRuntime({
   resolveTargetIdentity = null,
   produce = null,
   now = Date.now,
+  createId = governorId,
+  pid = process.pid,
+  kill = process.kill.bind(process),
   setTimeout: setTimeout_ = setTimeout,
   clearTimeout: clearTimeout_ = clearTimeout,
+  setInterval: setInterval_ = setInterval,
+  clearInterval: clearInterval_ = clearInterval,
   onDiagnostic = () => {},
   createGitHubAppProvider: createGitHubAppProvider_ = createGitHubAppProvider,
   githubAppOptions = {},
   readInstallationCore = readInstallationCoreBudget,
+  readBudgets = null,
   executeGh = null,
 } = {}) {
   if (!config || !Array.isArray(config.targets)) throw new Error("invalid collector runtime config");
-  const engine = createAcquisitionEngine({ pathOptions, now });
+  const engine = createAcquisitionEngine({ pathOptions, now, createId, pid, kill,
+    setInterval: setInterval_, clearInterval: clearInterval_ });
   const providerContexts = new Map();
   const targetInitializations = new Map();
   const accessRefreshTargets = new Set();
@@ -8291,6 +8305,22 @@ function createCollectorAcquisitionRuntime({
   const providerAbort = new AbortController();
   let closed = false;
 
+  function withInjectedBudgetReader(context) {
+    if (!readBudgets || !context?.scope || context.readBudgets ||
+        (context.definition?.type ?? context.scope.providerType) !== "gh") return context;
+    return { ...context, readBudgets };
+  }
+
+  function refreshProviderBudget(context, signal) {
+    const budgetReader = context.readBudgets ?? readBudgets;
+    return refreshSharedBudget(context.scope, context.leaseId, signal,
+      { ...(budgetReader ? { readBudgets: budgetReader } : {}),
+        onObserverPublished: context.onObserverPublished, now,
+        wait: (delay) => abortableDelay(delay, signal, {
+          setTimeout: setTimeout_, clearTimeout: clearTimeout_,
+        }) });
+  }
+
   async function defaultResolve(target, signal = providerAbort.signal) {
     let context = providerContexts.get(target.provider);
     if (!context) {
@@ -8299,7 +8329,8 @@ function createCollectorAcquisitionRuntime({
         ? createGitHubAppProvider_({ name: target.provider, provider: definition, pathOptions, now,
           ...githubAppOptions })
         : createIdentityCoordinator({ host: target.host, pathOptions, now });
-      context = { coordinator, definition, identity: null, scope: null, leaseId: governorId(),
+      context = { coordinator, definition, identity: null, scope: null,
+        leaseId: createId("collector-provider-lease", target.provider),
         credentialEnvironment: null, capabilities: null, readBudgets: null,
         coreValidatorAccessKey: coordinator.coreValidatorAccessKey?.() ?? null };
       if (definition.type === "github-app") {
@@ -8337,7 +8368,7 @@ function createCollectorAcquisitionRuntime({
       identity = resolved.value;
       context.credentialEnvironment = null;
       context.capabilities = null;
-      context.readBudgets = null;
+      context.readBudgets = readBudgets;
     }
     if (identity.host !== target.host) throw new Error("collector provider unavailable");
     context.identity = identity;
@@ -8361,9 +8392,7 @@ function createCollectorAcquisitionRuntime({
     const at = now();
     const lease = maintainControlLease(context.scope, context.leaseId, demand.floorMs, resource, at);
     if (!lease.ok) throw new Error("collector governor unavailable");
-    const refreshed = await refreshSharedBudget(context.scope, context.leaseId, signal,
-      context.readBudgets ? { readBudgets: context.readBudgets,
-        onObserverPublished: context.onObserverPublished } : {});
+    const refreshed = await refreshProviderBudget(context, signal);
     if (!refreshed.ok) {
       const error = new Error(refreshed.reason === "provider-capability"
         ? `collector provider capability unavailable (${refreshed.capability})`
@@ -8381,6 +8410,10 @@ function createCollectorAcquisitionRuntime({
       wait: (delay, waitSignal) => abortableDelay(delay, waitSignal, {
         setTimeout: setTimeout_, clearTimeout: clearTimeout_,
       }),
+      admit: (admitScope, admitLeaseId, operation, priority, at) =>
+        admitGovernorOperation(admitScope, admitLeaseId, operation, priority, at,
+          createId("collector-intent", admitLeaseId, operation, priority, at)),
+      deferredRetryAt: collectorObserverRetryAt(context.scope, resource, now()),
     });
     const reservationId = admitted.reservationId;
     const governor = inspectGovernor(context.scope, now());
@@ -8452,9 +8485,7 @@ function createCollectorAcquisitionRuntime({
     const context = provider?.scope ? provider : await defaultResolve(target, signal);
     const lease = maintainControlLease(context.scope, context.leaseId, REFRESH_MS, "issues", now());
     if (!lease.ok) throw new Error("collector identity governor unavailable");
-    const refreshed = await refreshSharedBudget(context.scope, context.leaseId, signal,
-      context.readBudgets ? { readBudgets: context.readBudgets,
-        onObserverPublished: context.onObserverPublished } : {});
+    const refreshed = await refreshProviderBudget(context, signal);
     if (!refreshed.ok) {
       const error = new Error(refreshed.reason === "provider-capability"
         ? `collector provider capability unavailable (${refreshed.capability})`
@@ -8507,9 +8538,9 @@ function createCollectorAcquisitionRuntime({
       // spend through the conflicting provider.
       const persisted = loadCollectorCanonicalOwnership(pathOptions, target);
       if (!persisted.ok) throw new Error(`collector canonical ${persisted.reason}`);
-      const provider = resolveProvider
+      const provider = withInjectedBudgetReader(resolveProvider
         ? await resolveProvider(target.provider, target, { signal: controller.signal })
-          : await defaultResolve(target, controller.signal);
+          : await defaultResolve(target, controller.signal));
       const identity = provider?.identity ?? provider;
       const requireAccessRefresh = accessRefreshTargets.has(key);
       const discovered = !requireAccessRefresh && persisted.value ? persisted.value : (resolveTargetIdentity
@@ -8591,7 +8622,7 @@ function createCollectorAcquisitionRuntime({
     if (item.timer !== null) clearTimeout_(item.timer);
     item.timer = setTimeout_(() => {
       item.timer = null;
-      void operation();
+      return operation();
     }, Math.max(1, Math.min(delay, item.demand.floorMs)));
     item.timer?.unref?.();
   }
@@ -8609,9 +8640,9 @@ function createCollectorAcquisitionRuntime({
     let retryIn = item.demand.floorMs;
     let claim = null;
     try {
-      const refreshedProvider = refreshProvider
+      const refreshedProvider = withInjectedBudgetReader(refreshProvider
         ? await refreshProvider(item.target.provider, item.target)
-        : !resolveProvider ? await defaultResolve(item.target, providerAbort.signal) : item.provider;
+        : !resolveProvider ? await defaultResolve(item.target, providerAbort.signal) : item.provider);
       const refreshedIdentity = refreshedProvider?.identity ?? refreshedProvider;
       if (refreshedIdentity?.accessKey !== item.identity?.accessKey ||
           refreshedIdentity?.generation !== item.identity?.generation) {
@@ -8712,7 +8743,7 @@ function createCollectorAcquisitionRuntime({
         item.onHold?.(hold);
         try { onDiagnostic({ stage: "acquire", reason: redact(shortErr(error)) }); } catch { /* diagnostics are isolated */ }
         retryIn = error?.notStarted && Number.isFinite(error.retryAt)
-          ? Math.max(1, error.retryAt - now()) : Math.min(1_000, item.demand.floorMs);
+          ? Math.max(50, error.retryAt - now()) : Math.min(1_000, item.demand.floorMs);
       } finally {
         item.controller = null;
       }
@@ -8807,7 +8838,7 @@ function createCollectorAcquisitionRuntime({
           if (!wasEnabled && demandEnabled(normalized)) void startPoll(item);
           return updated;
         },
-        refresh(force = false) { void startPoll(item, { manual: true, force: force === true }); },
+        refresh(force = false) { return startPoll(item, { manual: true, force: force === true }); },
         inspect() {
           if (!item.id) return { source: "local collector", status: "initializing", resource: item.resource };
           const inspected = engine.inspect(item.id);
@@ -8820,6 +8851,12 @@ function createCollectorAcquisitionRuntime({
             lastSuccessAt: record?.snapshot?.lastSuccessAt ?? null,
             lastChangedAt: record?.snapshot?.lastChangedAt ?? null,
           };
+        },
+        async whenCurrentPollSettled() {
+          const initializing = item.initializePromise;
+          if (initializing) await initializing;
+          const polling = item.pollPromise;
+          if (polling) await polling;
         },
         close() {
           item.closed = true;
@@ -12951,6 +12988,7 @@ function createAcquisitionEngine({
   transport = null,
   storage = null,
   now = Date.now,
+  createId = governorId,
   pid = process.pid,
   kill = process.kill.bind(process),
   setInterval: setInterval_ = setInterval,
@@ -13084,8 +13122,8 @@ function createAcquisitionEngine({
         typeof resumeFreshSnapshot !== "boolean") {
       return { ok: false, reason: "invalid" };
     }
-    const id = governorId();
-    const nonce = governorId();
+    const id = createId("acquisition-subscription", preliminaryKey, local.size);
+    const nonce = createId("acquisition-subscription-nonce", preliminaryKey, local.size);
     const result = transact((state) => {
       reapAcquisitionSubscriptions(state, now(), kill);
       const repositoryId = state.aliases[acquisitionAliasKey(queryInput.host, queryInput.repository)] ??
@@ -13447,7 +13485,7 @@ function createAcquisitionEngine({
             snapshot: record.snapshot, sharingCount: acquisitionSharingCount(state, item.queryKey) } };
         }
       }
-      const nonce = governorId();
+      const nonce = createId("acquisition-claim", item.queryKey, record.generation + 1);
       record.claim = {
         pid,
         nonce,
@@ -14169,6 +14207,7 @@ async function awaitCollectorReservation({
   admit = admitGovernorOperation,
   start = startReservation,
   cancel = cancelIntent,
+  deferredRetryAt = null,
 }) {
   const attempt = await resolveGovernorAdmission({
     scope, leaseId, operation, priority, signal, waitMs, now, wait,
@@ -14181,8 +14220,22 @@ async function awaitCollectorReservation({
   const error = new Error(aborted ? "collector admission aborted" : "collector admission deferred");
   if (aborted) error.name = "AbortError";
   error.notStarted = true;
-  error.retryAt = admitted.value?.notBefore ?? admitted.retryAt ?? scheduled?.notBefore ?? now() + 1_000;
+  error.retryAt = admitted.value?.notBefore ?? admitted.retryAt ?? scheduled?.notBefore ??
+    (Number.isFinite(deferredRetryAt) ? deferredRetryAt : now() + 1_000);
   throw error;
+}
+
+function collectorObserverRetryAt(scope, resource, at) {
+  const declared = tabRequestCost(resource);
+  const snapshot = inspectGovernor(scope, at);
+  if (!snapshot.ok || !declared) return null;
+  const deadlines = RATE_RESOURCES.flatMap((budgetResource) => {
+    if (!(declared[budgetResource] > 0)) return [];
+    const observer = snapshot.value.observers[budgetResource];
+    return observer?.outcome !== "healthy" && Number.isFinite(observer?.nextAt) && observer.nextAt > at
+      ? [observer.nextAt] : [];
+  });
+  return deadlines.length > 0 ? Math.max(...deadlines) : null;
 }
 
 async function resolveGovernorAdmission({

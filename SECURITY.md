@@ -6,7 +6,10 @@ Only the current release line receives security patches.
 
 | Version | Supported           |
 | ------- | ------------------- |
-| 0.11.x  | Yes                 |
+| 0.14.x  | Yes                 |
+| 0.13.x  | No                  |
+| 0.12.x  | No                  |
+| 0.11.x  | No                  |
 | 0.10.x  | No                  |
 | 0.9.x   | No                  |
 | 0.8.x   | No                  |
@@ -206,6 +209,13 @@ authority comes from conditional `/installation/repositories?per_page=1`, never
 `/user`. Authentication, permission, suspension, expiry, and unsupported-source
 failures retain last-known-good rows and never fall back to a personal token.
 
+The published npm artifact is also a security boundary. Its manifest contains
+only `index.mjs`, `package.json`, `README.md`, `CHANGELOG.md`, and `LICENSE`;
+tests, fixture credentials, private keys, collector configuration, webhook
+secrets, queues, caches, and coordination state are excluded. Package and deep
+imports remain closed through `exports: {}` so internal test seams do not become
+an unsupported programmatic API.
+
 Remote collector clients reuse that protocol only through the user's existing
 SSH configuration. The process argv is fixed to `ssh -T -o BatchMode=yes -o
 ClearAllForwardings=yes -o ForwardAgent=no -- <validated-alias> 'gh-glance
@@ -324,20 +334,26 @@ artifacts users are invited to attach to a bug report, and `gh` error messages
 quote the URL they failed on -- which is a real path for a credential to reach
 them.
 
-GitHub authentication is delegated to the existing `gh auth login` session,
-including on GitHub Enterprise and EMU hosts. Every GitHub API call currently
-goes through the `gh` CLI. Effective credential selection follows `gh`'s
-host-specific environment precedence. When no applicable environment token is
-selected, a dedicated non-logging `gh auth token --hostname <host>` call obtains
-the local credential, hashes it immediately, and discards the raw output.
-Resolution is cached until relevant configuration changes. No token is placed
-in command arguments, returned to the UI, logged, or written to disk; keychain
-databases are never read directly. Failure authentication diagnosis uses the
-cached verified identity or reports that identity is unavailable, without a
-network-backed `gh auth status` call. Optional account and repository strings
-are sanitized before rendering, and doctor output remains protected by the
-presence-only and redaction rules above. Login, authorization refresh, and
-account switching remain explicit user-owned `gh` commands.
+Default standalone and `gh` collector providers delegate authentication to the
+existing `gh auth login` session, including on GitHub Enterprise and EMU hosts.
+Their repository data calls go through the `gh` CLI. Effective credential
+selection follows `gh`'s host-specific environment precedence. When no
+applicable environment token is selected, a dedicated non-logging `gh auth
+token --hostname <host>` call obtains the local credential, hashes it
+immediately, and discards the raw output. Resolution is cached until relevant
+configuration changes.
+
+An explicitly configured GitHub App provider is the one authentication
+exception: the collector reads its private key locally and uses bounded native
+HTTPS to mint an installation token, then supplies that memory-only token to
+governed `gh api` data calls. No token or private key is placed in command
+arguments, returned to the UI, logged, or written to disk; keychain databases
+are never read directly. Failure authentication diagnosis uses cached verified
+identity or reports that identity is unavailable, without a network-backed `gh
+auth status` call. Optional account and repository strings are sanitized before
+rendering, and doctor output remains protected by the presence-only and
+redaction rules above. Human login, authorization refresh, and account switching
+remain explicit user-owned `gh` commands.
 
 Repository creation is also user-owned. When a local repository has no remote,
 gh-glance invokes plain `gh repo create` only after the user presses `Enter`;

@@ -8,6 +8,7 @@ import { EventEmitter, once } from "node:events";
 import { test } from "node:test";
 
 import {
+  ACQUISITION_CLAIM_TTL_MS,
   abortableDelay,
   awaitCollectorReservation,
   acquisitionQueryForTab,
@@ -86,6 +87,19 @@ test("COL-01: a deferred collector admission releases its exact intent before re
     (error) => error.notStarted === true && error.retryAt === 4_000,
   );
   assert.deepEqual(cancelled, [intentId]);
+});
+
+test("COL-01: a paused collector admission retries at its persisted observer deadline", async () => {
+  await assert.rejects(
+    awaitCollectorReservation({
+      scope: {}, leaseId: "22222222-2222-4222-8222-222222222222",
+      operation: "tab:actions", priority: "active", now: () => 1_000,
+      waitMs: 0,
+      admit: () => ({ ok: false, reason: "observer" }),
+      deferredRetryAt: 61_000,
+    }),
+    (error) => error.notStarted === true && error.retryAt === 61_000,
+  );
 });
 
 test("COL-05: stdio bridge finalizes once and removes listeners after failure", async () => {
@@ -305,6 +319,57 @@ const IDENTITY = {
   generation: 1, observedAt: 1,
 };
 
+test("COL-01: collector runtime forwards deterministic acquisition heartbeat and liveness controls", async (t) => {
+  const root = mkdtempSync("/tmp/ggc-runtime-clock-");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const pathOptions = { env: { XDG_CONFIG_HOME: root }, platform: "linux" };
+  const enginePid = 424_242;
+  const livenessChecks = [];
+  const interval = { unref() {} };
+  let intervalRun = null;
+  let intervalCleared = null;
+  let now = 100_000;
+  const runtime = createCollectorAcquisitionRuntime({
+    config: normalizeCollectorConfig(CONFIG),
+    pathOptions,
+    now: () => now,
+    pid: enginePid,
+    kill(pid, signal) { livenessChecks.push([pid, signal]); },
+    setInterval(run) { intervalRun = run; return interval; },
+    clearInterval(value) { intervalCleared = value; },
+    setTimeout(run, delay) { return { run, delay, unref() {} }; },
+    clearTimeout() {},
+    resolveProvider: async () => IDENTITY,
+    resolveTargetIdentity: async () => ({ id: "R_1", nameWithOwner: "acme/widget" }),
+    async produce({ markStarted }) {
+      assert.equal((await markStarted()).ok, true);
+      return { ...publication(), lastSuccessAt: now, lastChangedAt: now, nextDueAt: now + 5_000 };
+    },
+  });
+  t.after(() => runtime.close());
+  await within(new Promise((resolve, reject) => runtime.subscribe({
+    target: normalizeCollectorConfig(CONFIG).targets[0], resource: "actions",
+    demand: { active: true, background: true, floorMs: 5_000, pages: 1 },
+    onSnapshot: resolve, onHold: (hold) => hold === "disconnected" && reject(new Error(hold)),
+  })));
+
+  const before = loadAcquisitionStore(acquisitionStorePath(pathOptions));
+  assert.equal(before.ok, true);
+  assert.deepEqual(Object.values(before.value.subscriptions).map((subscription) => subscription.pid), [enginePid]);
+  assert.equal(typeof intervalRun, "function");
+
+  now += ACQUISITION_CLAIM_TTL_MS + 1;
+  intervalRun();
+  const after = loadAcquisitionStore(acquisitionStorePath(pathOptions));
+  assert.equal(Object.keys(after.value.subscriptions).length, 1,
+    "the injected live owner must survive and receive a deterministic heartbeat");
+  assert.equal(Object.values(after.value.subscriptions)[0].expiresAt, now + ACQUISITION_CLAIM_TTL_MS);
+  assert.deepEqual(livenessChecks, [[enginePid, 0]]);
+
+  await runtime.close();
+  assert.equal(intervalCleared, interval);
+});
+
 test("COL-01/06: headless runtime coalesces twelve subscribers through the shared acquisition store", async (t) => {
   const root = mkdtempSync("/tmp/ggc-runtime-");
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -338,6 +403,48 @@ test("COL-01/06: headless runtime coalesces twelve subscribers through the share
   assert.equal(providerResolutions, 1);
   assert.equal(targetResolutions, 1);
   assert.equal(new Set(snapshots.map((snapshot) => snapshot.lastSuccessAt)).size, 1);
+});
+
+test("collector runtime settlement seam waits for an in-flight publication", async (t) => {
+  const root = mkdtempSync("/tmp/ggc-runtime-settled-");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let resolveStarted;
+  const started = new Promise((resolve) => { resolveStarted = resolve; });
+  let delivered = false;
+  const runtime = createCollectorAcquisitionRuntime({
+    config: normalizeCollectorConfig(CONFIG),
+    pathOptions: { env: { XDG_CONFIG_HOME: root }, platform: "linux" },
+    resolveProvider: async () => IDENTITY,
+    resolveTargetIdentity: async () => ({ id: "R_1", nameWithOwner: "acme/widget" }),
+    async produce({ markStarted }) {
+      assert.equal((await markStarted()).ok, true);
+      resolveStarted();
+      await gate;
+      return publication();
+    },
+  });
+  t.after(() => runtime.close());
+  const handle = runtime.subscribe({
+    target: normalizeCollectorConfig(CONFIG).targets[0], resource: "actions",
+    demand: { active: true, background: true, floorMs: 5_000, pages: 1 },
+    onSnapshot() { delivered = true; }, onHold() {},
+  });
+  try {
+    const settled = handle.whenCurrentPollSettled();
+    let finished = false;
+    settled.then(() => { finished = true; });
+    await within(started);
+    assert.equal(finished, false);
+    assert.equal(delivered, false);
+    release();
+    await within(settled);
+    assert.equal(finished, true);
+    assert.equal(delivered, true);
+  } finally {
+    release();
+  }
 });
 
 test("COL-01/03/06: twelve real sockets share one real-runtime acquisition stream", async (t) => {
@@ -582,6 +689,38 @@ test("COL-01: provider failure schedules recovery instead of wedging the subscri
   scheduled.shift().callback();
   await received;
   assert.equal(attempts, 2);
+});
+
+test("COL-01: a past deferred-admission deadline cannot create a one-millisecond retry loop", async (t) => {
+  const root = mkdtempSync("/tmp/ggc-deferred-floor-");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scheduled = [];
+  let resolveScheduled;
+  const firstScheduled = new Promise((resolve) => { resolveScheduled = resolve; });
+  const now = 1_000;
+  const runtime = createCollectorAcquisitionRuntime({
+    config: normalizeCollectorConfig(CONFIG),
+    pathOptions: { env: { XDG_CONFIG_HOME: root }, platform: "linux" },
+    now: () => now,
+    setTimeout(callback, delay) {
+      scheduled.push({ callback, delay });
+      resolveScheduled();
+      return { unref() {} };
+    },
+    clearTimeout() {},
+    resolveProvider: async () => IDENTITY,
+    async produce() {
+      const error = new Error("collector admission deferred");
+      error.notStarted = true;
+      error.retryAt = now;
+      throw error;
+    },
+  });
+  t.after(() => runtime.close());
+  runtime.subscribe({ target: normalizeCollectorConfig(CONFIG).targets[0], resource: "actions",
+    demand: { active: true, background: true, floorMs: 5_000, pages: 1 }, onSnapshot() {}, onHold() {} });
+  await within(firstScheduled);
+  assert.equal(scheduled[0].delay, 50);
 });
 
 test("COL-01: background-off starts no inactive work, promotion polls, and demotion cancels cadence", async (t) => {

@@ -70,10 +70,9 @@ test("the installed package supports only the gh-glance executable", async () =>
     const tarball = join(root, manifest.filename);
     const paths = manifest.files.map(({ path }) => path);
 
-    for (const required of ["index.mjs", "README.md", "CHANGELOG.md", "LICENSE", "package.json"]) {
-      assert.ok(paths.includes(required), `${required} must be published`);
-    }
-    assert.ok(paths.every((path) => !path.startsWith("test/")), "tests must stay out of the package");
+    assert.deepEqual(paths.toSorted(), [
+      "CHANGELOG.md", "LICENSE", "README.md", "index.mjs", "package.json",
+    ], "the package must contain only the executable and public documentation");
 
     const installRoot = join(root, "installed");
     await run(
@@ -95,6 +94,13 @@ test("the installed package supports only the gh-glance executable", async () =>
       await readFile(join(installRoot, "node_modules/gh-glance/package.json"), "utf8"),
     );
     assert.deepEqual(installedPackage.exports, {});
+    assert.deepEqual(installedPackage.bin, { "gh-glance": "./index.mjs" });
+    for (const script of [installedPackage.scripts.test, installedPackage.scripts["test:coverage"]]) {
+      assert.ok(script.includes("--test-skip-pattern='E2E-'"),
+        "ordinary test gates must exclude the dedicated E2E efficiency cases");
+    }
+    assert.equal(installedPackage.scripts["test:efficiency"],
+      "node --test test/efficiency.test.mjs");
 
     const expectedVersion = installedPackage.version;
     const bin = join(installRoot, "node_modules/.bin/gh-glance");
@@ -108,6 +114,22 @@ test("the installed package supports only the gh-glance executable", async () =>
     assert.match(help, /--connect local/);
     assert.match(help, /--connect ssh:<alias>/);
     assert.match(help, /--collector-stdio/);
+
+    await assert.rejects(
+      run(bin, [], { cwd: installRoot }),
+      (error) => {
+        assert.equal(error.code, 1);
+        assert.match(error.stderr, /stdout is not a terminal/);
+        return true;
+      },
+    );
+    await assert.rejects(
+      run(bin, ["--definitely-not-a-flag"], { cwd: installRoot }),
+      (error) => {
+        assert.equal(error.code, 2);
+        return true;
+      },
+    );
 
     // Exercise the installed artifact's three Phase 8 entry routes. This is
     // intentionally more than a manifest/help check: the foreground process

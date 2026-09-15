@@ -15,6 +15,44 @@
     { "id": "partial-graphql", "panes": 1, "response": { "status": 200, "errors": [{ "type": "FORBIDDEN" }] }, "activationPhase": 3, "targets": { "publishPartialData": false, "ingestBudgetEvidence": true } },
     { "id": "credential-switch", "panes": 2, "credentials": ["fixture-full", "fixture-restricted"], "activationPhase": 2, "targets": { "privatePayloadIsolation": true, "sharedPrincipalQuota": true } },
     { "id": "explicit-pagination", "panes": 1, "rows": 150, "pageSize": 50, "activationPhase": 5, "targets": { "explicitPages": 3, "maximumRows": 150 } },
-    { "id": "sustained-hour", "panes": 10, "repositoryPattern": "acme/project-{pane}", "durationMs": 3600000, "clock": "injected", "activationPhase": 12, "targets": { "preserveReserveFraction": 0.2, "progressAfterReset": true } }
+    {
+      "id": "sustained-hour",
+      "panes": 10,
+      "repositoryPattern": "acme/project-{pane}",
+      "durationMs": 3600000,
+      "clock": "injected",
+      "tickMs": 60000,
+      "activationPhase": 12,
+      "topologies": [
+        { "id": "single-pane", "panes": 1, "repositories": ["acme/widget"] },
+        { "id": "two-duplicates", "panes": 2, "repositories": ["acme/widget"] },
+        { "id": "seven-duplicates", "panes": 7, "repositories": ["acme/widget"] },
+        { "id": "ten-duplicates", "panes": 10, "repositories": ["acme/widget"] },
+        { "id": "ten-distinct", "panes": 10, "repositoryPattern": "acme/project-{pane}" },
+        { "id": "two-machines", "panes": 7, "clientsByRoot": [3, 4], "repositories": ["acme/widget"], "transport": "collector" }
+      ],
+      "publishedProbes": { "graphql": { "mode": "pinned" } },
+      "responseCounters": "independent",
+      "timeline": [
+        { "type": "change", "atMs": 300000, "repository": "acme/project-0", "resource": "actions", "version": 2, "state": "running" },
+        { "type": "change", "atMs": 600000, "repository": "acme/project-0", "resource": "actions", "version": 3, "state": "quiet" },
+        { "type": "externalSpend", "atMs": 1200000, "resource": "core", "amount": 100 },
+        { "type": "secondaryHold", "atMs": 1500000, "durationMs": 5000 },
+        { "type": "recovery", "atMs": 1505000, "from": "secondaryHold" },
+        { "type": "primaryReset", "atMs": 1800000 },
+        { "type": "producerLoss", "atMs": 2100000, "repository": "acme/project-0", "resource": "actions" },
+        { "type": "recovery", "atMs": 2160000, "from": "producerLoss" },
+        { "type": "forceRefresh", "atMs": 2400000, "repository": "acme/project-0", "resource": "actions" },
+        { "type": "accountSwitch", "atMs": 2700000, "credential": "fixture-restricted" },
+        { "type": "recovery", "atMs": 3000000, "from": "accountSwitch" }
+      ],
+      "targets": {
+        "preserveReserveFraction": 0.2,
+        "progressAfterReset": true,
+        "sourceToDisplayMs": 7000,
+        "followerDeliveryMs": 2000,
+        "requestsPerDueQuery": 1
+      }
+    }
   ]
 }

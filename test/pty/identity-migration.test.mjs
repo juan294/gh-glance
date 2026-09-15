@@ -135,12 +135,12 @@ test("ID-05: corrupt legacy protocol fails closed without replacing its evidence
 
 function exerciseAllTabs() {
   const frame = '"$GH_GLANCE_CAPTURE_OUT"';
-  const waitForRow = (pattern) => waitForAwk(frame, `index($0, "${pattern}") { ok=1 }`, 200) + "sleep .4; ";
+  const waitForRow = (pattern) => waitForAwk(frame, `index($0, "${pattern}") { ok=1 }`, 600) + "sleep .4; ";
   const barrier = (name) =>
     `: > "$GH_GLANCE_BARRIER/${name}-$GH_GLANCE_FIXTURE_PANE"; i=0; ` +
     `while [ ! -f "$GH_GLANCE_BARRIER/${name}-0" ] || ` +
     `[ ! -f "$GH_GLANCE_BARRIER/${name}-1" ]; do ` +
-    "i=$((i + 1)); [ $i -ge 200 ] && break; sleep .1; done; ";
+    "i=$((i + 1)); [ $i -ge 600 ] && break; sleep .1; done; ";
   return waitForRow("ci: pin actions") + barrier("actions") + "printf 2; " +
     waitForRow("SIGTERM erases") + barrier("issues") + "printf 3; " +
     waitForRow("release: v0.2.0") + barrier("pulls") + "printf 4; " +
@@ -149,10 +149,17 @@ function exerciseAllTabs() {
 
 test("ID-08: two real panes serialize all four tabs and control requests through the shared permit", async (t) => {
   const box = fixture(t);
+  const state = box.read();
+  // Keep the first Actions generation open long enough for both independently
+  // instrumented dashboard processes to join it. The assertion below is about
+  // shared ownership, not an accidental race against the fixture's 100ms
+  // default response time.
+  state.delayByCommand = { actions: 2_000 };
+  writeFileSync(box.statePath, JSON.stringify(state), { mode: 0o600 });
   const barrier = join(box.root, "id08-barrier");
   mkdirSync(barrier);
   const results = await Promise.all(Array.from({ length: 2 }, (_, pane) => captureAsync({
-    cols: 80, rows: 24, signal: "none", settle: 60, stdin: exerciseAllTabs(),
+    cols: 80, rows: 24, signal: "none", settle: 180, stdin: exerciseAllTabs(),
     args: "--repo acme/widget --refresh 300 --background off", configHome: box.root,
     env: {
       GH_GLANCE_BARRIER: barrier,

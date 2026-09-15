@@ -209,3 +209,21 @@ memory-only token, so a late response cannot cross a repository or permission
 change. The bounded 60/120/240/480-second retry ladder cannot be replenished by
 token rotation. Private keys, JWTs, and tokens are excluded from the registry
 and quota ledgers.
+
+## Amendment: sustained acceptance evidence (phase 12)
+
+Release acceptance exercises these identity and accounting decisions for one
+simulated hour through the production acquisition engine and governor with an
+injected clock and transport. The independent request oracle, not production
+cost declarations, owns server counters and scripted 200/304, GraphQL, external
+spend, reset, secondary-hold, producer-loss, and account-switch evidence. The
+accelerated workload is paired with real process, lock, IPC, bridge, and PTY
+tests so injected time cannot stand in for ownership or lifecycle behavior.
+
+Correctness is a fixed gate: one producer per due canonical query, independent
+fair progress for distinct repositories, no client-side GitHub work in remote
+mode, no stale-generation publication across an access change, and no admitted
+data crossing the known reserve. CPU, RSS, and latency percentages are evidence,
+not universal thresholds. They may be compared only when baseline and candidate
+share the same workload, machine, platform, and runtime; otherwise the report
+names the incompatibility and makes no improvement claim.

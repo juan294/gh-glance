@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Equivalent panes now share one acquisition.** A private, bounded
+  authorization-partitioned store elects one producer for each due canonical
+  query and lets local followers adopt its validated generation. Conditional
+  validators, last-known-good rows, pagination state, source timestamps, and
+  capability evidence survive compatible restarts without treating cache reads
+  as fresh GitHub observations.
+- **An optional foreground collector can serve local or SSH-carried clients.**
+  `--serve --config`, `--connect local`, `--collector-stdio`, and `--connect
+  ssh:<alias>` reuse the same governor and acquisition engine through bounded
+  Unix-socket/newline-JSON transport. Clients choose only allowlisted targets,
+  start no local GitHub request, and never fall back to standalone polling after
+  disconnect.
+- **Collectors can opt in to durable webhook invalidation.** A loopback-only,
+  default-off listener verifies the exact raw body with HMAC SHA-256, persists a
+  compact bounded delivery queue before acknowledging it, coalesces duplicate
+  work, and requests an ordinary governed refresh. Webhook content is never row
+  data or freshness evidence, and missed events remain bounded by quiet
+  reconciliation polling.
+- **Collectors can opt in to GitHub App installation authentication.** A
+  validated provider signs short-lived JWTs locally, mints repository- and
+  permission-restricted installation tokens through one bounded native HTTPS
+  adapter, and supplies the memory-only token only to its governed `gh api`
+  children. Installation and human quota identities remain separate; token
+  renewal preserves access identity, while repository or permission changes
+  advance an authorization fence.
+- **Acquisition diagnostics now report measured work and freshness.** Local
+  doctor output distinguishes HTTP attempts, REST 200/304, proven and uncertain
+  core/GraphQL units, observer calls, cache hits, joined followers, queue wait,
+  active subscriptions, source success/change, and semantic holds without
+  exposing internal identity or credential material.
+- **A deterministic sustained-efficiency gate and measurement report cover the
+  complete topology.** The offline workload advances an injected clock through
+  one simulated hour across duplicate/distinct panes and a 3+4 client split,
+  then reports sharing, reserve, freshness, queue, process, CPU, and RSS
+  evidence. Candidate/baseline percentages are emitted only for compatible
+  workload, machine, platform, and runtime evidence.
+
+### Changed
+
+- **Remote receipt and conditional reuse no longer invent freshness.** Source
+  success and content change remain separate across 304s, process restarts,
+  collector epochs, SSH reconnects, clock skew, and retained cache reads. A
+  disconnect preserves visible rows with an honest source-age lower bound.
+- **The dashboard cache now retains 32 recent authorization-scoped targets, up
+  to 60 rows per tab.** Shared-acquisition storage is separately bounded to 32
+  MiB, 512 entities, 32 live targets, and 128 subscriptions, with active targets
+  pinned ahead of inactive least-recently-used generations.
+- **GraphQL capacity is authoritative and operation-specific.** Issues, pull
+  requests, pages, and the shared observer use explicit bounded envelopes and
+  reconcile their returned costs. The free `rate_limit` endpoint remains
+  diagnostic and cannot admit work or refund a reservation.
+
+### Security
+
+- **Collector, SSH, webhook, and App boundaries fail closed.** Socket and state
+  ownership are nonce/inode fenced; protocol frames and queues are bounded;
+  webhook secrets and App private keys must be private regular files; SSH uses a
+  fixed forwarding-disabled argument vector; App children scrub competing token
+  variables; stale generations cannot cross provider or authorization changes;
+  and a missing optional Security permission is visible rather than rendered as
+  a clean result.
+- **The installed npm artifact is checked as an exact five-file CLI.** It
+  contains only `index.mjs`, `package.json`, `README.md`, `CHANGELOG.md`, and
+  `LICENSE`, keeps `exports: {}`, and exercises installed version, help,
+  non-TTY, unknown-argument, collector, bridge, and client contracts. Tests,
+  fixtures, credentials, keys, webhook secrets, and configuration/state files
+  remain outside the tarball.
+
 ## [0.14.1] - 2026-09-08
 
 ### Fixed

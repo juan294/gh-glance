@@ -128,7 +128,12 @@ test("footer layout keeps semantic status and essential actions from 80 to 24 co
 });
 
 test("four ample panes explain a shared lane without moving the hint group", async (t) => {
-  const box = sharedFixture(t);
+  const box = sharedFixture(t, {
+    // A smaller but still ample window makes one three-call Security grant
+    // reserve a long enough lane for a separately started observer process to
+    // render its provenance deterministically.
+    core: { limit: 500, used: 0, remaining: 500, resetMs: Date.now() + 3_600_000 },
+  });
   const releasePath = join(box.root, "release-sharing-holders");
   const holders = Array.from({ length: 3 }, (_, index) => captureAsync({
     cols: 80,
@@ -151,16 +156,22 @@ test("four ample panes explain a shared lane without moving the hint group", asy
   try {
     const deadline = Date.now() + 10_000;
     let leaseCount = 0;
-    while (Date.now() < deadline && leaseCount < 3) {
+    let holderLaneReady = false;
+    while (Date.now() < deadline && !holderLaneReady) {
       try {
         const state = JSON.parse(readFileSync(governorPath(box.root), "utf8"));
-        leaseCount = Object.keys(state.leases).length;
+        const leaseIds = Object.keys(state.leases);
+        leaseCount = leaseIds.length;
+        holderLaneReady = leaseCount === 3 && [state.budgets.core, state.budgets.graphql]
+          .some((budget) => leaseIds.includes(budget.roundRobinCursor) &&
+            budget.laneNextAt > Date.now() + 5_000);
       } catch {
         // The first atomic governor publication is transiently absent.
       }
-      if (leaseCount < 3) await new Promise((resolve) => setTimeout(resolve, 40));
+      if (!holderLaneReady) await new Promise((resolve) => setTimeout(resolve, 40));
     }
     assert.equal(leaseCount, 3, "holder panes did not publish three live leases");
+    assert.equal(holderLaneReady, true, "holder panes did not establish a shared pacing lane");
     observer = await captureAsync({
       cols: 80,
       rows: 20,
