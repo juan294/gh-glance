@@ -186,3 +186,26 @@ representation advances both. Persisted quota headers are not replayed.
 Storage is capped at 32 MiB total, 1 MiB per entity, 512 entities, 32 live
 targets, and 128 subscriptions. Active targets are pinned and inactive
 least-recently-used generations are evicted first.
+
+## Amendment: GitHub App installation identities (phase 11)
+
+An explicitly configured collector provider may establish an installation
+principal by minting a repository-restricted installation token at the exact
+configured App installation endpoint. Its quota key binds host, principal kind
+`installation`, and installation ID. Its access key additionally binds provider
+name, the sorted repository and permission restrictions, and authorization
+generation. Equivalent token renewal does not split either identity; changed
+authority fences retained data without changing the installation's quota
+ledger. Installation core authority comes from conditional
+`/installation/repositories?per_page=1` observations under the installation
+token. `/user` remains exclusive to human identity proof.
+
+JWT signing and mint attempts have their own persisted rolling allowance and
+redacted control metrics. Token-mint response headers do not establish data
+quota authority. Started attempts survive collector restart, concurrent callers
+share one refresh, and a durable PID/nonce lease fences abandoned owners. The
+authorization generation and mint revision are persisted independently of the
+memory-only token, so a late response cannot cross a repository or permission
+change. The bounded 60/120/240/480-second retry ladder cannot be replenished by
+token rotation. Private keys, JWTs, and tokens are excluded from the registry
+and quota ledgers.

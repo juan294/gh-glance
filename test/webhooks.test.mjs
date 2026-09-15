@@ -487,12 +487,25 @@ test("HOOK-01/06: event mapping is allowlisted, resource-specific, and access re
   const removal = mapWebhookInvalidations({ event: "installation_repositories",
     payload: EVENTS.installation_repositories, config });
   assert.equal(removal.ok, true);
-  assert.equal(removal.invalidations.length, 4);
-  assert.ok(removal.invalidations.every((item) => item.accessRemoved));
-  const partialCoverage = normalizeCollectorConfig({ ...CONFIG, webhook: { ...CONFIG.webhook,
-    targets: [{ ...CONFIG.webhook.targets[0], resources: ["issues"] }] } });
+  assert.equal(removal.unsupported, true);
+  assert.deepEqual(removal.invalidations, [], "installation events cannot fence a personal gh provider");
+  const appTarget = { ...TARGET, provider: "app" };
+  const appProvider = { type: "github-app", host: "github.com", clientId: "Iv1.fixture",
+    installationId: 123, privateKeyFile: "/private/app.pem", repositoryIds: [101],
+    permissions: { metadata: "read", actions: "read", issues: "read", pull_requests: "read" } };
+  const appConfig = normalizeCollectorConfig({ ...CONFIG, providers: { app: appProvider }, targets: [appTarget],
+    webhook: { ...CONFIG.webhook, targets: [{ ...appTarget,
+      resources: ["actions", "issues", "prs", "security"] }] } });
+  const appRemovalPayload = { ...EVENTS.installation_repositories, installation: { id: 123 } };
+  const appRemoval = mapWebhookInvalidations({ event: "installation_repositories",
+    payload: appRemovalPayload, config: appConfig });
+  assert.equal(appRemoval.ok, true);
+  assert.equal(appRemoval.invalidations.length, 4);
+  assert.ok(appRemoval.invalidations.every((item) => item.accessRemoved && item.provider === "app"));
+  const partialCoverage = { ...appConfig, webhook: { ...appConfig.webhook,
+    targets: [{ ...appConfig.webhook.targets[0], resources: ["issues"] }] } };
   assert.deepEqual(mapWebhookInvalidations({ event: "installation_repositories",
-    payload: EVENTS.installation_repositories, config: partialCoverage }).invalidations.map((item) => item.resource),
+    payload: appRemovalPayload, config: partialCoverage }).invalidations.map((item) => item.resource),
   ["actions", "issues", "prs", "security"], "access removal must fence uncovered subscriptions too");
 });
 
@@ -819,11 +832,11 @@ test("HOOK-04/05/07: signed HTTP reaches governed collector display and holds st
   const gatedStarted = new Promise((resolve) => { signalGatedStart = resolve; });
   await sendIssue("25252525-2525-4252-8252-252525252525");
   await within(gatedStarted, 3_000);
-  const accessBody = Buffer.from(JSON.stringify(EVENTS.installation_repositories));
+  const accessBody = Buffer.from(JSON.stringify({ action: "deleted", repository: EVENTS.issues.repository }));
   assert.equal(await postLoopback({ port, body: accessBody, headers: {
     "content-type": "application/json", "content-length": String(accessBody.length),
     "x-github-delivery": "26262626-2626-4262-8262-262626262626",
-    "x-github-event": "installation_repositories", "x-hub-signature-256": signature(accessBody),
+    "x-github-event": "repository", "x-hub-signature-256": signature(accessBody),
   } }), 202);
   await new Promise((resolve) => setTimeout(resolve, 1_100));
   releaseGated();

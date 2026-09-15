@@ -368,6 +368,61 @@ that resolve to one repository cannot cross provider ownership. Disconnecting
 keeps last-known-good rows and their source age, then reconnects to a new server
 epoch without silently falling back to standalone polling.
 
+#### Optional GitHub App provider
+
+The default `gh` provider above is unchanged. A collector can instead opt in to
+one GitHub App installation. gh-glance does not create or register the App,
+install it, grant permissions, or generate its private key. Put the existing
+PEM key in an absolute, current-user-owned mode-0600 file and name every allowed
+repository ID and read permission explicitly:
+
+```json
+{
+  "version": 1,
+  "providers": {
+    "automation": {
+      "type": "github-app",
+      "host": "github.com",
+      "clientId": "Iv1.example",
+      "installationId": 123456,
+      "privateKeyFile": "/absolute/private/path/github-app.pem",
+      "repositoryIds": [123456789],
+      "permissions": {
+        "metadata": "read",
+        "actions": "read",
+        "issues": "read",
+        "pull_requests": "read",
+        "vulnerability_alerts": "read",
+        "security_events": "read",
+        "secret_scanning_alerts": "read"
+      }
+    }
+  },
+  "targets": [
+    { "host": "github.com", "repo": "owner/repository", "provider": "automation" }
+  ]
+}
+```
+
+`metadata`, `actions`, `issues`, and `pull_requests` are required for the four
+collector tabs. The three Security permissions are independent and optional:
+
+| Security surface | Configuration permission |
+|---|---|
+| Dependabot alerts | `vulnerability_alerts: read` |
+| Code scanning alerts | `security_events: read` |
+| Secret scanning alerts | `secret_scanning_alerts: read` |
+
+An omitted Security permission produces an explicit unavailable capability for
+that source without disabling the other tabs or permitted Security sources.
+The collector signs a short-lived JWT locally, requests only the configured
+repositories and permissions, and keeps the installation token in memory. Data
+still travels through `gh api`; the selected token is supplied only in that
+child's environment. Token refresh, failure, or expiry never falls back to the
+server user's personal `gh` credential. Configuration changes require a
+collector restart. Installation deletion, suspension, and repository removal
+webhooks fence old data when webhook ingress is also enabled.
+
 #### Optional webhook invalidation
 
 Webhook ingress is disabled unless the collector configuration contains an

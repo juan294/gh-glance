@@ -195,7 +195,7 @@ Planning review is complete. Independent controller and whole-plan reviews ident
 - [x] Phase 8
 - [x] Phase 9
 - [x] Phase 10
-- [ ] Phase 11
+- [x] Phase 11
 - [ ] Phase 12
 
 No unresolved design questions. User setup values (SSH alias, repository allowlist, App installation ID and private-key path, webhook secret and reverse-proxy endpoint) are runtime configuration inputs, not placeholders in the implementation design. No live setup is required to complete its local automated acceptance.

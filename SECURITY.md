@@ -170,7 +170,7 @@ inode match rather than file age. Negative or materially future queue timestamps
 fail closed.
 
 The collector trust boundary is one OS user, not multiple tenants. Its strict
-configuration maps each exact host/repository target to one named `gh` provider.
+configuration maps each exact host/repository target to one named provider.
 Clients never send credentials or arbitrary GitHub operations. Wire frames are
 newline-delimited JSON capped at 1 MiB; large snapshots use digest-checked,
 ordered chunks capped at 512 KiB and assemble to at most 8 MiB. Per-client and
@@ -178,6 +178,33 @@ aggregate outbound queues are bounded, and a stalled client is disconnected.
 Wire snapshots project sanitized display rows, pagination, semantic holds, and
 source timestamps only. They exclude tokens, access/quota digests, local paths,
 validators, raw bodies, reservations, and provider details.
+
+Collector providers default to the current OS user's host-specific `gh` login.
+The optional `github-app` provider accepts only a validated host, client ID,
+installation ID, absolute private-key path, repository-ID allowlist, and an
+explicit read-only permission set. The private key must be a regular,
+current-user-owned mode-0600 file. It is read only on the collector machine and
+is never sent over the collector protocol. RS256 JWTs live only for signing and
+the installation token remains memory-only. App authentication is the sole
+native HTTPS GitHub request: it uses the fixed installation-token endpoint,
+normal TLS verification, no redirects, a ten-second deadline, and a 1 MiB
+response bound. GitHub.com uses `api.github.com`; Enterprise Server uses its
+validated host and `/api/v3` prefix.
+
+Installation data continues through the governed `gh api` path. Each child
+environment removes all competing GH/GITHUB token variables before setting the
+one host-appropriate installation token; tokens and JWTs never enter argv,
+state, diagnostics, wire frames, or errors. Installation and human principals
+have separate quota identities. Equivalent token renewal keeps the same quota
+and access partition, while repository/permission authority changes fence old
+snapshots. Mint attempts use a separate persisted rolling allowance and are
+not treated as free or merged with data-budget headers. A durable PID/nonce
+lease serializes mint ownership across collector processes; abandoned owners
+enter bounded backoff, and a persisted authorization revision rejects any mint
+that completes after installation authority changes. Installation core
+authority comes from conditional `/installation/repositories?per_page=1`, never
+`/user`. Authentication, permission, suspension, expiry, and unsupported-source
+failures retain last-known-good rows and never fall back to a personal token.
 
 Remote collector clients reuse that protocol only through the user's existing
 SSH configuration. The process argv is fixed to `ssh -T -o BatchMode=yes -o

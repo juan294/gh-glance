@@ -134,6 +134,15 @@ SSH transport changes also run `test/ssh-transport.test.mjs` and
 fixed argument vector and launches the real stdio bridge against private local
 IPC; the tests require no SSH server, network, key, or real GitHub account.
 
+GitHub App provider changes must run `test/app-auth.test.mjs`. Keep its fixtures
+offline: generate RSA keys in the test process and inject the token transport.
+The APP scenarios must cover JWT claims, exact host/path and requested scope,
+single-flight renewal using returned expiry, persisted retry limits, scrubbed
+child environments, stable installation quota identity, access-generation
+fences, stale-row/no-fallback behavior, independent Security permissions, and
+the installation-specific 200/304 core observer. Never add a live App,
+installation, private key, token, or network dependency to the suite.
+
 Two things to know before editing it:
 
 - `script(1)` is mutually incompatible between macOS (BSD) and Linux (GNU) --

@@ -58,6 +58,6 @@ None required for implementation acceptance. User registration/installation and 
 
 ## Completion
 
-- [ ] Optional provider, signing/mint, renewal and permission isolation implemented.
-- [ ] APP scenarios and parent local gates passed.
-- [ ] Independent compliance/quality review complete; integrated locally; stop.
+- [x] Optional provider, signing/mint, renewal and permission isolation implemented.
+- [x] APP scenarios and parent local gates passed.
+- [x] Independent compliance/quality review complete; integrated locally; stop.

@@ -79,3 +79,20 @@ their ordinary behavior. Access-change events retire old bindings and require
 repository-access validation before new publication. The listener does not
 register hooks, expose a public client API, or introduce another dashboard
 transport.
+
+An optional `github-app` provider is now also inside this boundary. Provider
+configuration contains a validated host/client/installation tuple, an absolute
+private-key file, explicit repository IDs, and read-only permissions. The
+collector alone signs and mints; clients still select only allowlisted targets
+and cannot request authentication, choose a provider, or supply credentials.
+Repository API work remains on `gh api` with a scrubbed per-child token
+environment. The fixed native HTTPS installation-token request is an
+authentication adapter, not a second data transport. It follows no redirects,
+uses normal TLS verification, and has bounded time and response size.
+
+App tokens remain in memory and never cross the socket or SSH protocol.
+Authentication or permission failure retains stale rows and cannot activate the
+personal-login provider. Optional Security permissions are enforced per source,
+so a missing capability cannot become a false empty result. Installation
+deletion, suspension, and repository removal webhook events must match the
+configured installation before they advance the authority fence.

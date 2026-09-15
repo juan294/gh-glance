@@ -24,7 +24,7 @@ process.env.NODE_ENV ??= "production";
 
 import { execFile, spawn } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, createPrivateKey, randomUUID, sign as cryptoSign, timingSafeEqual } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
   constants as fsConstants,
@@ -45,6 +45,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { createServer as createHttpServer } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { createConnection, createServer } from "node:net";
 import { fileURLToPath } from "node:url";
@@ -742,7 +743,7 @@ function operationPausedUntil(operation, now = Date.now()) {
   return until;
 }
 
-async function runGh(args, { signal, operation, input = null } = {}) {
+async function runGh(args, { signal, operation, input = null, execute = null } = {}) {
   if (operationCost(operation) === null) {
     throw new Error(`undeclared gh operation: ${operation ?? "missing"}`);
   }
@@ -776,11 +777,12 @@ async function runGh(args, { signal, operation, input = null } = {}) {
       if (!ready.ok) throw new Error(`API budget paused (${ready.reason})`);
     }
     assertBoundCredential(bound);
-    const pending = execFileAsync("gh", args, {
+    const executeChild = execute ?? bound?.executeGh ?? execFileAsync;
+    const pending = executeChild("gh", args, {
       timeout: GH_TIMEOUT_MS,
       killSignal: "SIGKILL",
       maxBuffer: GH_MAX_BUFFER,
-      env: { ...process.env, ...GH_ENV_OVERRIDES },
+      env: { ...(bound?.credentialEnvironment ?? process.env), ...GH_ENV_OVERRIDES },
       signal,
     });
     requestStarted = true;
@@ -852,6 +854,15 @@ function pickRateLimit(headers) {
   return { resource, limit, used, remaining, resetMs: reset * 1000 };
 }
 
+function invalidateBoundGitHubApp(error, parsed) {
+  const bound = requestIdentityStorage.getStore();
+  if (parsed?.status !== 401 || bound?.providerType !== "github-app" ||
+      error?.appCredentialInvalidated) return false;
+  bound.identityCoordinator?.invalidate?.("unauthorized");
+  error.appCredentialInvalidated = true;
+  return true;
+}
+
 function responseHeaderObservation(rateLimit, cost, receivedAt = Date.now()) {
   return rateLimit ? {
     ...rateLimit,
@@ -900,6 +911,7 @@ async function ghApi(args, { operation, signal, etag = null, run = runGh } = {})
     }
     if (parsed.status !== null) {
       error.apiResponse = parsed;
+      invalidateBoundGitHubApp(error, parsed);
       const rateLimit = pickRateLimit(parsed.headers);
       const observation = responseHeaderObservation(rateLimit, 0);
       if (observation) error.budgetObservations = [observation];
@@ -1691,6 +1703,7 @@ async function fetchGraphqlPage(kind, { signal, after = null, run = runGh, opera
     stdout = typeof error?.stdout === "string" ? error.stdout : "";
   }
   const parsed = parseGhApiResponse(stdout);
+  if (failure) invalidateBoundGitHubApp(failure, parsed);
   const envelope = parseGraphqlEnvelope(parsed.body);
   // Prefer the envelope's meter: it carries this query's actual `cost`, which
   // the headers do not. Headers remain the fallback when the body is unusable.
@@ -2769,7 +2782,8 @@ function normalizeIdentityRegistry(raw) {
   const time = (value) => Number.isFinite(value) && value >= 0;
   for (const [key, identity] of Object.entries(raw.identities)) {
     if (!digest(key) || !exactKeys(identity, ["host", "kind", "id", "login", "quotaKey", "accessKey", "generation", "observedAt"]) ||
-        !normalizeHost(identity.host) || identity.kind !== "user" || !Number.isSafeInteger(identity.id) || identity.id <= 0 ||
+        !normalizeHost(identity.host) || !["user", "installation"].includes(identity.kind) ||
+        !Number.isSafeInteger(identity.id) || identity.id <= 0 ||
         typeof identity.login !== "string" || identity.login !== safe(identity.login) || !digest(identity.quotaKey) || !digest(identity.accessKey) ||
         !Number.isSafeInteger(identity.generation) || identity.generation < 1 || !time(identity.observedAt)) return null;
   }
@@ -5170,6 +5184,9 @@ async function refreshSharedBudget(scope, leaseId, signal, options = {}) {
   for (const resource of BUDGET_REFRESH_ORDER) {
     outcomes.push([resource, await refreshResourceBudget(scope, leaseId, signal, resource, options)]);
   }
+  const providerCapability = outcomes.find(([, result]) =>
+    !result.ok && result.reason === "provider-capability");
+  if (providerCapability) return providerCapability[1];
   const published = outcomes.filter(([, result]) => result.ok);
   if (published.length === 0) return outcomes[0][1];
   const inspect = options.inspect ?? inspectGovernor;
@@ -5194,6 +5211,7 @@ async function refreshResourceBudget(scope, leaseId, signal, resource, {
   renew = renewProbeClaim,
   publish = publishProbe,
   fail = failProbeClaim,
+  onObserverPublished = null,
 } = {}) {
   let claim = claimProbe(scope, leaseId, now(), resource);
   if (!claim.ok) return claim;
@@ -5286,8 +5304,30 @@ async function refreshResourceBudget(scope, leaseId, signal, resource, {
         return extended.ok;
       },
     }));
-  } catch {
+  } catch (error) {
+    if (typeof error?.providerCapability === "string") {
+      const failureDeadline = Math.min(
+        renewed.value.leaseUntil ?? Number.POSITIVE_INFINITY,
+        now() + GOVERNOR_PROBE_TRANSITION_MS,
+      );
+      await retryGovernorMutation(
+        () => fail(scope, leaseId, nonce, now(), resource),
+        { now, wait, deadline: failureDeadline, signal },
+      );
+      return { ok: false, reason: "provider-capability", capability: error.providerCapability };
+    }
     budgets = null;
+  }
+  if (typeof budgets?.providerCapability === "string") {
+    const failureDeadline = Math.min(
+      renewed.value.leaseUntil ?? Number.POSITIVE_INFINITY,
+      now() + GOVERNOR_PROBE_TRANSITION_MS,
+    );
+    await retryGovernorMutation(
+      () => fail(scope, leaseId, nonce, now(), resource),
+      { now, wait, deadline: failureDeadline, signal },
+    );
+    return { ok: false, reason: "provider-capability", capability: budgets.providerCapability };
   }
   if (!budgets) {
     const failureDeadline = Math.min(
@@ -5313,6 +5353,10 @@ async function refreshResourceBudget(scope, leaseId, signal, resource, {
       () => fail(scope, leaseId, nonce, now(), resource),
       { now, wait, deadline: transitionDeadline, signal },
     );
+  }
+  if (published.ok) {
+    try { await onObserverPublished?.(resource, budgets[resource]); }
+    catch { /* validator ownership persistence fails closed and retries later */ }
   }
   return published;
 }
@@ -6051,17 +6095,60 @@ function admitCollectorCanonicalOwnership(pathOptions, target, repositoryIdentit
   });
 }
 
+const GITHUB_APP_PERMISSION_KEYS = Object.freeze([
+  "metadata", "actions", "issues", "pull_requests",
+  "vulnerability_alerts", "security_events", "secret_scanning_alerts",
+]);
+const GITHUB_APP_REQUIRED_PERMISSIONS = Object.freeze([
+  "metadata", "actions", "issues", "pull_requests",
+]);
+const GITHUB_APP_RENEWAL_SKEW_MS = 5 * 60_000;
+const GITHUB_APP_RETRY_DELAYS_MS = Object.freeze([60_000, 120_000, 240_000, 480_000]);
+const GITHUB_APP_RESPONSE_MAX_BYTES = 1024 * 1024;
+const GITHUB_APP_REQUEST_TIMEOUT_MS = 10_000;
+const GITHUB_APP_IN_FLIGHT_MAX_MS = GITHUB_APP_REQUEST_TIMEOUT_MS + 5_000;
+
+function normalizeGitHubAppPermissions(raw) {
+  if (!isRecord(raw) || Object.keys(raw).length > GITHUB_APP_PERMISSION_KEYS.length ||
+      Object.entries(raw).some(([key, value]) => !GITHUB_APP_PERMISSION_KEYS.includes(key) || value !== "read") ||
+      GITHUB_APP_REQUIRED_PERMISSIONS.some((key) => raw[key] !== "read")) return null;
+  return { ...raw };
+}
+
+function normalizeGitHubAppProvider(raw) {
+  if (!exactKeys(raw, ["type", "host", "clientId", "installationId", "privateKeyFile", "repositoryIds", "permissions"]) ||
+      raw.type !== "github-app" || typeof raw.clientId !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(raw.clientId) ||
+      !Number.isSafeInteger(raw.installationId) || raw.installationId < 1 ||
+      typeof raw.privateKeyFile !== "string" || raw.privateKeyFile.length < 1 ||
+      raw.privateKeyFile.length > 4_096 || !isAbsolute(raw.privateKeyFile) ||
+      !Array.isArray(raw.repositoryIds) || raw.repositoryIds.length < 1 || raw.repositoryIds.length > 500 ||
+      raw.repositoryIds.some((id) => !Number.isSafeInteger(id) || id < 1) ||
+      new Set(raw.repositoryIds).size !== raw.repositoryIds.length) return null;
+  const host = normalizeHost(raw.host);
+  const permissions = normalizeGitHubAppPermissions(raw.permissions);
+  if (!host || !permissions) return null;
+  return { type: "github-app", host, clientId: raw.clientId, installationId: raw.installationId,
+    privateKeyFile: raw.privateKeyFile, repositoryIds: [...raw.repositoryIds], permissions };
+}
+
 function normalizeCollectorConfig(raw, { aliases = {} } = {}) {
   if ((!exactKeys(raw, ["version", "providers", "targets"]) &&
        !exactKeys(raw, ["version", "providers", "targets", "webhook"])) || raw.version !== 1 ||
       !isRecord(raw.providers) || !Array.isArray(raw.targets) || raw.targets.length > 32) return null;
   const providers = {};
   for (const [name, provider] of Object.entries(raw.providers)) {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) ||
-        !exactKeys(provider, ["type", "host"]) || provider.type !== "gh") return null;
-    const host = normalizeHost(provider.host);
-    if (!host) return null;
-    providers[name] = { type: "gh", host };
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) return null;
+    if (provider?.type === "gh") {
+      if (!exactKeys(provider, ["type", "host"])) return null;
+      const host = normalizeHost(provider.host);
+      if (!host) return null;
+      providers[name] = { type: "gh", host };
+    } else {
+      const app = normalizeGitHubAppProvider(provider);
+      if (!app) return null;
+      providers[name] = app;
+    }
   }
   if (Object.keys(providers).length === 0) return null;
   const targets = [];
@@ -6113,6 +6200,543 @@ function normalizeWebhookConfig(raw, collectorTargets) {
   return { enabled: true, address: raw.address, port: raw.port, secretFile: raw.secretFile, targets };
 }
 
+function readPrivateFile(path, { maxBytes = 65_536, message }) {
+  let fd = null;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const identity = fstatSync(fd);
+    if (!identity.isFile() || identity.size < 1 || identity.size > maxBytes ||
+        typeof process.getuid === "function" && identity.uid !== process.getuid() ||
+        process.platform !== "win32" && (identity.mode & 0o077) !== 0) {
+      throw new Error(message);
+    }
+    return readFileSync(fd);
+  } catch {
+    throw new Error(message);
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+function readGitHubAppPrivateKey(path) {
+  return readPrivateFile(path, { message: "GitHub App private key is unavailable" });
+}
+
+function signGitHubAppJwt(provider, { now = Date.now, readPrivateKey = readGitHubAppPrivateKey } = {}) {
+  const normalized = normalizeGitHubAppProvider(provider);
+  if (!normalized) throw new Error("GitHub App configuration is invalid");
+  let keyBytes = null;
+  try {
+    keyBytes = readPrivateKey(normalized.privateKeyFile);
+    const key = createPrivateKey(keyBytes);
+    if (key.asymmetricKeyType !== "rsa") {
+      throw new Error("invalid key type");
+    }
+    const seconds = Math.floor(now() / 1000);
+    const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
+    const payload = Buffer.from(JSON.stringify({ iat: seconds - 60, exp: seconds + 540,
+      iss: normalized.clientId })).toString("base64url");
+    const input = `${header}.${payload}`;
+    return `${input}.${cryptoSign("RSA-SHA256", Buffer.from(input), key).toString("base64url")}`;
+  } catch (error) {
+    if (error?.message === "GitHub App private key is unavailable") throw error;
+    // eslint-disable-next-line preserve-caught-error -- crypto/key-reader causes can disclose key paths or parser detail
+    throw new Error("GitHub App private key is invalid");
+  } finally {
+    if (Buffer.isBuffer(keyBytes)) keyBytes.fill(0);
+  }
+}
+
+function githubAppChildEnvironment(host, token, env = process.env) {
+  const result = { ...env };
+  for (const name of ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]) {
+    delete result[name];
+  }
+  const [selected] = credentialEnvironmentNames(host);
+  result[selected] = token;
+  return result;
+}
+
+function githubAppAccessIdentity(name, provider, generation = 1) {
+  const normalized = normalizeGitHubAppProvider(provider);
+  if (!normalized || !validCollectorId(name) || !Number.isSafeInteger(generation) || generation < 1) {
+    throw new Error("GitHub App configuration is invalid");
+  }
+  const quotaKey = privateIdentityDigest("installation-quota-v1", normalized.host,
+    "installation", normalized.installationId);
+  const credentialKey = privateIdentityDigest("installation-credential-v1", normalized.host,
+    normalized.clientId, normalized.installationId);
+  const repositoryIds = [...normalized.repositoryIds].sort((left, right) => left - right);
+  const permissions = Object.entries(normalized.permissions).sort(([left], [right]) => left.localeCompare(right));
+  return {
+    host: normalized.host,
+    kind: "installation",
+    id: normalized.installationId,
+    login: `installation-${normalized.installationId}`,
+    quotaKey,
+    credentialKey,
+    accessKey: privateIdentityDigest("installation-access-v1", name, normalized.host,
+      normalized.installationId, repositoryIds, permissions, generation),
+    generation,
+    observedAt: Date.now(),
+  };
+}
+
+function githubAppResourceCapabilities(provider) {
+  const permissions = normalizeGitHubAppProvider(provider)?.permissions ?? {};
+  return {
+    actions: permissions.actions === "read",
+    issues: permissions.issues === "read",
+    prs: permissions.pull_requests === "read",
+    security: {
+      dependabot: permissions.vulnerability_alerts === "read",
+      codeScanning: permissions.security_events === "read",
+      secretScanning: permissions.secret_scanning_alerts === "read",
+    },
+  };
+}
+
+function githubAppSecurityPolicy(provider, at = Date.now()) {
+  const normalized = normalizeGitHubAppProvider(provider);
+  if (!normalized) throw new Error("GitHub App configuration is invalid");
+  const permission = { dependabot: "vulnerability_alerts", codeScanning: "security_events",
+    secretScanning: "secret_scanning_alerts" };
+  const sources = ALERT_SOURCES.filter((source) => normalized.permissions[permission[source.key]] === "read");
+  const allowed = new Set(sources.map((source) => source.key));
+  const denied = ALERT_SOURCES.filter((source) => !allowed.has(source.key));
+  const capabilities = Object.fromEntries(denied.map((source) => [
+    source.key,
+    { verdict: "unavailable", step: 0, until: at + BACKOFF_STEPS_MS[0],
+      note: `${source.name}: permission not granted` },
+  ]));
+  return { sources, capabilities, blind: false,
+    notes: denied.map((source) => `${source.name}: permission not granted`) };
+}
+
+function applyGitHubAppSecurityPolicy(result, policy) {
+  if (!isRecord(result) || !isRecord(policy) || typeof result.parse !== "function") return result;
+  const parse = result.parse;
+  return {
+    ...result,
+    capabilities: { ...(result.capabilities ?? {}), ...(policy.capabilities ?? {}) },
+    parse() {
+      const parsed = parse();
+      if (!isRecord(parsed) || parsed.unusable) return parsed;
+      return { ...parsed, notes: [...(parsed.notes ?? []), ...(policy.notes ?? [])],
+        blind: parsed.blind === true || policy.blind === true };
+    },
+  };
+}
+
+function githubAppTokenEndpoint(host, installationId) {
+  return host === "github.com"
+    ? { host: "api.github.com", path: `/app/installations/${installationId}/access_tokens` }
+    : { host, path: `/api/v3/app/installations/${installationId}/access_tokens` };
+}
+
+function requestGitHubAppToken({ host, path, headers, body, signal }, {
+  request: requestImpl = httpsRequest, setTimeout: setTimeout_ = setTimeout, clearTimeout: clearTimeout_ = clearTimeout,
+} = {}) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let bytes = 0;
+    const chunks = [];
+    let request = null;
+    let deadline = null;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      if (deadline !== null) clearTimeout_(deadline);
+      if (error) reject(new Error("GitHub App token request failed"));
+      else resolve(value);
+    };
+    try {
+      request = requestImpl({ protocol: "https:", hostname: host, port: 443, path, method: "POST",
+        headers, rejectUnauthorized: true, signal }, (response) => {
+        if (response.statusCode >= 300 && response.statusCode < 400) {
+          response.resume();
+          finish(new Error("redirect"));
+          return;
+        }
+        response.on("data", (chunk) => {
+          bytes += chunk.length;
+          if (bytes > GITHUB_APP_RESPONSE_MAX_BYTES) {
+            request.destroy();
+            finish(new Error("large response"));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        response.once("end", () => finish(null, { status: response.statusCode,
+          headers: { ...response.headers }, body: Buffer.concat(chunks, bytes).toString("utf8") }));
+        response.once("error", (error) => finish(error));
+      });
+      deadline = setTimeout_(() => { request.destroy(); finish(new Error("timeout")); },
+        GITHUB_APP_REQUEST_TIMEOUT_MS);
+      deadline.unref?.();
+      request.once("error", (error) => finish(error));
+      request.end(body);
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
+
+function normalizeGitHubAppTokenResponse(response, provider, nowMs) {
+  if (!isRecord(response) || response.status !== 201 || typeof response.body !== "string" ||
+      Buffer.byteLength(response.body) > GITHUB_APP_RESPONSE_MAX_BYTES) return null;
+  let body;
+  try { body = JSON.parse(response.body); } catch { return null; }
+  if (!isRecord(body) || typeof body.token !== "string" || !body.token || /\s/.test(body.token) ||
+      body.token.length > 4_096 || typeof body.expires_at !== "string") return null;
+  const expiresAt = Date.parse(body.expires_at);
+  if (!Number.isFinite(expiresAt) || expiresAt <= nowMs) return null;
+  if (!Array.isArray(body.repositories) || body.repositories.length !== provider.repositoryIds.length ||
+      body.repositories.some((repository) => !isRecord(repository) || !Number.isSafeInteger(repository.id)) ||
+      new Set(body.repositories.map((repository) => repository.id)).size !== body.repositories.length) return null;
+  const returnedIds = new Set(body.repositories.map((repository) => repository.id));
+  if (provider.repositoryIds.some((id) => !returnedIds.has(id))) return null;
+  const returnedPermissions = normalizeGitHubAppPermissions(body.permissions);
+  if (!returnedPermissions || JSON.stringify(Object.entries(returnedPermissions).sort()) !==
+      JSON.stringify(Object.entries(provider.permissions).sort())) return null;
+  return { token: body.token, expiresAt };
+}
+
+function persistGitHubAppIdentity(root, identity, now = Date.now()) {
+  return withIdentityRegistry(root, (state) => {
+    const scope = { ...createQuotaScope(identity, { root, now: () => now }), rootLocked: true };
+    const initialized = withGovernorLock(scope, () => {
+      const loaded = readIdentityQuotaState(state, scope, now);
+      if (!loaded.ok) return loaded;
+      return loaded.missing ? writeGovernorState(scope.path, loaded.value) : { ok: true };
+    });
+    if (!initialized.ok) return initialized;
+    state.identities[identity.credentialKey] = { host: identity.host, kind: identity.kind,
+      id: identity.id, login: identity.login, quotaKey: identity.quotaKey,
+      accessKey: identity.accessKey, generation: identity.generation, observedAt: now };
+    return { ok: true, value: identity };
+  }, { now });
+}
+
+const GITHUB_APP_ATTEMPT_WINDOW_MS = 60 * 60_000;
+
+function githubAppAuthStatePath(root, identity) {
+  return join(root, `app-auth-${identity.credentialKey}.json`);
+}
+
+function emptyGitHubAppAuthState() {
+  return { version: 1, generation: 1, revision: 1, attempts: [], retryAt: 0,
+    inFlight: null, coreAccessKey: null };
+}
+
+function normalizeGitHubAppAuthState(raw, nowMs) {
+  if (!exactKeys(raw, ["version", "generation", "revision", "attempts", "retryAt", "inFlight", "coreAccessKey"]) ||
+      raw.version !== 1 || !Number.isSafeInteger(raw.generation) || raw.generation < 1 ||
+      !Number.isSafeInteger(raw.revision) || raw.revision < 1 ||
+      !Array.isArray(raw.attempts) || raw.attempts.length > 5 ||
+      raw.attempts.some((at) => !Number.isFinite(at) || at < 0 || at > nowMs) ||
+      !Number.isFinite(raw.retryAt) || raw.retryAt < 0 ||
+      raw.coreAccessKey !== null && !/^[0-9a-f]{64}$/.test(raw.coreAccessKey)) return null;
+  if (raw.inFlight !== null && (!exactKeys(raw.inFlight, ["pid", "nonce", "startedAt", "revision"]) ||
+      !Number.isSafeInteger(raw.inFlight.pid) || raw.inFlight.pid < 1 || !validGovernorId(raw.inFlight.nonce) ||
+      !Number.isFinite(raw.inFlight.startedAt) || raw.inFlight.startedAt < 0 || raw.inFlight.startedAt > nowMs ||
+      !Number.isSafeInteger(raw.inFlight.revision) || raw.inFlight.revision < 1)) return null;
+  return raw;
+}
+
+function mutateGitHubAppAuthState(root, identity, nowMs, operation, { kill = process.kill.bind(process) } = {}) {
+  const path = githubAppAuthStatePath(root, identity);
+  const scope = { path, hash: identity.credentialKey, host: identity.host, kill };
+  return withGovernorLock(scope, () => {
+    let state = emptyGitHubAppAuthState();
+    try {
+      const raw = normalizeGitHubAppAuthState(JSON.parse(readFileSync(path, "utf8")), nowMs);
+      if (!raw) return { ok: false, reason: "corrupt" };
+      state = raw;
+    } catch (error) {
+      if (error?.code !== "ENOENT") return { ok: false, reason: "unwritable" };
+    }
+    state.attempts = state.attempts.filter((at) => at + GITHUB_APP_ATTEMPT_WINDOW_MS > nowMs);
+    const result = operation(state);
+    if (result.write === false || !result.ok && result.write !== true) return result;
+    const written = writeGovernorState(path, state);
+    return written.ok ? result : written;
+  });
+}
+
+function inspectGitHubAppAuthState(root, identity, nowMs, options) {
+  return mutateGitHubAppAuthState(root, identity, nowMs,
+    (state) => ({ ok: true, value: { generation: state.generation, revision: state.revision,
+      coreAccessKey: state.coreAccessKey }, write: false }), options);
+}
+
+function bindGitHubAppCoreValidator(root, identity, accessKey, nowMs, options) {
+  return mutateGitHubAppAuthState(root, identity, nowMs, (state) => {
+    if (!/^[0-9a-f]{64}$/.test(accessKey)) return { ok: false, reason: "stale", write: false };
+    state.coreAccessKey = accessKey;
+    return { ok: true, value: { accessKey } };
+  }, options);
+}
+
+function claimGitHubAppMint(root, identity, nowMs, {
+  pid = process.pid, kill = process.kill.bind(process), nonce = randomUUID(),
+} = {}) {
+  return mutateGitHubAppAuthState(root, identity, nowMs, (state) => {
+    if (state.inFlight) {
+      const staleAt = state.inFlight.startedAt + GITHUB_APP_IN_FLIGHT_MAX_MS;
+      if (!pidIsDead(state.inFlight.pid, kill) && staleAt > nowMs) {
+        return { ok: false, reason: "in-flight", retryAt: staleAt, write: false };
+      }
+      state.inFlight = null;
+      state.retryAt = Math.max(state.retryAt, nowMs + GITHUB_APP_RETRY_DELAYS_MS[0]);
+      return { ok: false, reason: "backoff", retryAt: state.retryAt, write: true };
+    }
+    const capacityRetryAt = state.attempts.length >= 5
+      ? state.attempts[0] + GITHUB_APP_ATTEMPT_WINDOW_MS : 0;
+    const blockedUntil = Math.max(state.retryAt, capacityRetryAt);
+    if (blockedUntil > nowMs) return { ok: false, reason: "backoff", retryAt: blockedUntil, write: false };
+    state.attempts.push(nowMs);
+    state.inFlight = { pid, nonce, startedAt: nowMs, revision: state.revision };
+    return { ok: true, value: { attempt: state.attempts.length, pid, nonce, generation: state.generation,
+      revision: state.revision } };
+  }, { kill });
+}
+
+function settleGitHubAppMint(root, identity, claim, nowMs, success, retryAfterMs = 0, {
+  kill = process.kill.bind(process),
+} = {}) {
+  return mutateGitHubAppAuthState(root, identity, nowMs, (state) => {
+    if (!claim || state.revision !== claim.revision || state.inFlight?.nonce !== claim.nonce ||
+        state.inFlight.pid !== claim.pid) return { ok: false, reason: "stale", write: false,
+      generation: state.generation, revision: state.revision };
+    state.inFlight = null;
+    if (success) {
+      state.attempts = [];
+      state.retryAt = 0;
+    } else {
+      const retryIndex = Math.max(0, Math.min(state.attempts.length - 1,
+        GITHUB_APP_RETRY_DELAYS_MS.length - 1));
+      const ladderRetryAt = state.attempts.length >= 5
+        ? state.attempts[0] + GITHUB_APP_ATTEMPT_WINDOW_MS
+        : nowMs + GITHUB_APP_RETRY_DELAYS_MS[retryIndex];
+      state.retryAt = Math.max(ladderRetryAt,
+        Number.isFinite(retryAfterMs) ? nowMs + Math.max(0, Math.min(retryAfterMs, 24 * 60 * 60_000)) : 0);
+    }
+    return { ok: true, value: { retryAt: state.retryAt, generation: state.generation,
+      revision: state.revision } };
+  }, { kill });
+}
+
+function invalidateGitHubAppAuthority(root, identity, nowMs, options) {
+  return mutateGitHubAppAuthState(root, identity, nowMs, (state) => {
+    state.generation += 1;
+    state.revision += 1;
+    state.inFlight = null;
+    state.coreAccessKey = null;
+    return { ok: true, value: { generation: state.generation, revision: state.revision } };
+  }, options);
+}
+
+function githubAppResponseRetryAfter(response, nowMs) {
+  const headers = isRecord(response?.headers) ? response.headers : {};
+  const seconds = Number(headers["retry-after"]);
+  let delay = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : 0;
+  const resetSeconds = Number(headers["x-ratelimit-reset"]);
+  if (Number(headers["x-ratelimit-remaining"]) === 0 && Number.isFinite(resetSeconds)) {
+    delay = Math.max(delay, resetSeconds * 1000 - nowMs);
+  }
+  return Math.max(0, delay);
+}
+
+function createGitHubAppProvider({ name, provider, pathOptions = {}, now = Date.now,
+  readPrivateKey = readGitHubAppPrivateKey, requestToken = requestGitHubAppToken,
+  pid = process.pid, kill = process.kill.bind(process), nonce = randomUUID } = {}) {
+  const normalized = normalizeGitHubAppProvider(provider);
+  if (!normalized || !validCollectorId(name)) throw new Error("GitHub App configuration is invalid");
+  const root = identityRegistryRoot(pathOptions);
+  const stableIdentity = githubAppAccessIdentity(name, normalized, 1);
+  const initialAuth = inspectGitHubAppAuthState(root, stableIdentity, now(), { kill });
+  if (!initialAuth.ok) throw new Error("GitHub App token unavailable");
+  let generation = initialAuth.value.generation;
+  let revision = initialAuth.value.revision;
+  let coreAccessKey = initialAuth.value.coreAccessKey;
+  let credential = null;
+  let currentIdentity = null;
+  let pending = null;
+  let closed = false;
+  let failures = 0;
+  let retryAt = 0;
+  let attempts = 0;
+  let lastError = null;
+  let unauthorizedRefreshPending = false;
+  let authorityInvalidated = false;
+  const retryDelays = [];
+  const capabilities = githubAppResourceCapabilities(normalized);
+  let projection = null;
+  let mintAbort = null;
+  const current = () => closed || !credential || credential.expiresAt <= now() ? null : currentIdentity;
+  const inspect = () => ({ generation, attempts, retryAt, retryDelays: [...retryDelays],
+    lastError, expiresAt: credential?.expiresAt ?? null });
+  const project = () => {
+    if (!projection && credential && currentIdentity) {
+      projection = { identity: currentIdentity,
+        environment: githubAppChildEnvironment(normalized.host, credential.token), capabilities };
+    }
+    return projection;
+  };
+  const resolve = ({ signal, force = false } = {}) => {
+    if (closed) return Promise.reject(new Error("GitHub App token unavailable"));
+    if (!force && credential && credential.expiresAt - now() > GITHUB_APP_RENEWAL_SKEW_MS) {
+      return Promise.resolve(project());
+    }
+    if (pending) return pending;
+    if (now() < retryAt) {
+      if (credential && credential.expiresAt > now()) return Promise.resolve(project());
+      const error = new Error("GitHub App token unavailable");
+      error.retryAt = retryAt;
+      return Promise.reject(error);
+    }
+    pending = (async () => {
+      let mintClaim = null;
+      try {
+        const claimed = claimGitHubAppMint(root, stableIdentity, now(), { pid, kill, nonce: nonce() });
+        if (!claimed.ok) {
+          retryAt = claimed.retryAt ?? now() + GITHUB_APP_RETRY_DELAYS_MS[0];
+          const error = new Error("GitHub App token unavailable");
+          error.retryAt = retryAt;
+          error.mintNotStarted = true;
+          throw error;
+        }
+        mintClaim = claimed.value;
+        generation = Math.max(generation, mintClaim.generation);
+        revision = Math.max(revision, mintClaim.revision);
+        const jwt = signGitHubAppJwt(normalized, { now, readPrivateKey });
+        attempts += 1;
+        const body = JSON.stringify({ repository_ids: normalized.repositoryIds,
+          permissions: normalized.permissions });
+        const endpoint = githubAppTokenEndpoint(normalized.host, normalized.installationId);
+        mintAbort = new AbortController();
+        const requestSignal = signal ? AbortSignal.any([signal, mintAbort.signal]) : mintAbort.signal;
+        const response = await requestToken({ host: endpoint.host,
+          path: endpoint.path,
+          headers: { accept: "application/vnd.github+json", authorization: `Bearer ${jwt}`,
+            "content-type": "application/json", "content-length": Buffer.byteLength(body),
+            "user-agent": "gh-glance" }, body, signal: requestSignal });
+        if (authorityInvalidated || revision !== mintClaim.revision) {
+          throw new Error("authority changed during token mint");
+        }
+        const next = normalizeGitHubAppTokenResponse(response, normalized, now());
+        if (!next) {
+          const error = new Error("invalid token response");
+          error.retryAfterMs = githubAppResponseRetryAfter(response, now());
+          throw error;
+        }
+        const identity = githubAppAccessIdentity(name, normalized, generation);
+        identity.observedAt = now();
+        const settled = settleGitHubAppMint(root, stableIdentity, mintClaim, now(), true, { kill });
+        if (!settled.ok) {
+          generation = Math.max(generation, settled.generation ?? generation);
+          revision = Math.max(revision, settled.revision ?? revision);
+          const error = new Error("auth accounting unavailable");
+          error.mintSettled = true;
+          throw error;
+        }
+        credential = next;
+        currentIdentity = identity;
+        projection = null;
+        failures = 0;
+        retryAt = 0;
+        lastError = null;
+        authorityInvalidated = false;
+        return project();
+      } catch (caught) {
+        const settled = caught?.mintNotStarted || caught?.mintSettled
+          ? { ok: true, value: { retryAt } }
+          : settleGitHubAppMint(root, stableIdentity, mintClaim, now(), false, caught?.retryAfterMs, { kill });
+        const delay = GITHUB_APP_RETRY_DELAYS_MS[Math.min(failures, GITHUB_APP_RETRY_DELAYS_MS.length - 1)];
+        if (!caught?.mintNotStarted && !caught?.mintSettled && failures < GITHUB_APP_RETRY_DELAYS_MS.length) {
+          retryDelays.push(delay);
+          if (retryDelays.length > GITHUB_APP_RETRY_DELAYS_MS.length) retryDelays.shift();
+        }
+        if (!caught?.mintNotStarted && !caught?.mintSettled) failures += 1;
+        retryAt = settled.ok ? settled.value.retryAt : now() + delay;
+        lastError = "GitHub App token unavailable";
+        if (credential && credential.expiresAt > now() && !caught?.mintSettled) return project();
+        credential = null;
+        currentIdentity = null;
+        projection = null;
+        const error = new Error("GitHub App token unavailable");
+        error.retryAt = retryAt;
+        throw error;
+      } finally {
+        mintAbort = null;
+      }
+    })().finally(() => { pending = null; });
+    return pending;
+  };
+  const invalidate = (reason = "unauthorized") => {
+    credential = null;
+    currentIdentity = null;
+    projection = null;
+    if (reason === "authority-changed") {
+      mintAbort?.abort();
+      if (!authorityInvalidated) {
+        const invalidated = invalidateGitHubAppAuthority(root, stableIdentity, now(), { kill });
+        if (invalidated.ok) {
+          generation = invalidated.value.generation;
+          revision = invalidated.value.revision;
+          coreAccessKey = null;
+        } else {
+          generation += 1;
+          revision += 1;
+          lastError = "GitHub App token unavailable";
+        }
+      }
+      authorityInvalidated = true;
+      unauthorizedRefreshPending = false;
+      retryAt = 0;
+    } else if (unauthorizedRefreshPending) {
+      retryAt = now() + GITHUB_APP_RETRY_DELAYS_MS[0];
+      mutateGitHubAppAuthState(root, stableIdentity, now(), (state) => {
+        state.retryAt = Math.max(state.retryAt, retryAt);
+        return { ok: true };
+      }, { kill });
+    } else {
+      unauthorizedRefreshPending = true;
+      retryAt = 0;
+    }
+  };
+  return { root, current, resolve, refresh: resolve, invalidate, inspect,
+    coreValidatorAccessKey: () => coreAccessKey,
+    markCoreValidated(accessKey) {
+      const bound = bindGitHubAppCoreValidator(root, stableIdentity, accessKey, now(), { kill });
+      if (bound.ok) coreAccessKey = accessKey;
+      return bound;
+    },
+    markAuthorized() { unauthorizedRefreshPending = false; },
+    flushCompletions: () => Promise.resolve({ ok: true }), deferCompletion() {}, isClosed: () => closed,
+    close() { closed = true; mintAbort?.abort(); credential = null; currentIdentity = null; projection = null; } };
+}
+
+async function readInstallationCoreBudget(signal, host, etag = null, { run = ghApi, now = Date.now } = {}) {
+  const unsupported = () => ({ unsupported: true,
+    capability: "installation-core-observer-unsupported" });
+  try {
+    const response = await run(["installation/repositories?per_page=1", ...apiHostArgs(host)], {
+      signal, operation: "budget-core-observer", etag,
+    });
+    if (![200, 304].includes(response.status) || response.rateLimit?.resource !== "core") return unsupported();
+    return { budget: response.rateLimit, etag: response.etag ?? etag, receivedAt: now(),
+      cost: response.status === 304 ? 0 : 1 };
+  } catch (error) {
+    const status = error?.apiResponse?.status;
+    const rateLimit = pickRateLimit(error?.apiResponse?.headers);
+    if (![403, 429].includes(status) || rateLimit?.resource !== "core") return unsupported();
+    return { budget: rateLimit, etag: error.apiResponse.headers.etag ?? etag,
+      receivedAt: now(), blocked: true, cost: 1 };
+  }
+}
+
 function validWebhookDeliveryId(value) {
   return typeof value === "string" &&
     /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
@@ -6150,8 +6774,7 @@ const WEBHOOK_ACCESS_EVENTS = new Set(["installation", "installation_repositorie
 function webhookPayloadRepositories(event, payload) {
   if (event === "installation") return [];
   if (event === "installation_repositories") {
-    return [...(Array.isArray(payload.repositories_added) ? payload.repositories_added : []),
-      ...(Array.isArray(payload.repositories_removed) ? payload.repositories_removed : [])]
+    return (Array.isArray(payload.repositories_removed) ? payload.repositories_removed : [])
       .map((repository) => repository?.full_name);
   }
   return [payload.repository?.full_name];
@@ -6163,6 +6786,12 @@ function mapWebhookInvalidations({ event, payload, config, enterpriseHost = null
   }
   let resource = WEBHOOK_EVENT_RESOURCES[event] ?? null;
   if (event === "issue_comment") resource = isRecord(payload.issue?.pull_request) ? "prs" : "issues";
+  if (event === "installation" && !["deleted", "suspend"].includes(payload.action)) {
+    return { ok: true, unsupported: true, invalidations: [] };
+  }
+  if (event === "installation_repositories" && payload.action !== "removed") {
+    return { ok: true, unsupported: true, invalidations: [] };
+  }
   const accessRemoved = WEBHOOK_ACCESS_EVENTS.has(event);
   if (!resource && !accessRemoved) return { ok: true, unsupported: true, invalidations: [] };
   const selectedHost = enterpriseHost === null || enterpriseHost === undefined || enterpriseHost === ""
@@ -6173,14 +6802,26 @@ function mapWebhookInvalidations({ event, payload, config, enterpriseHost = null
     try { return parseRepoTarget(name).slug !== String(name); } catch { return true; }
   }))) return { ok: false, reason: "target" };
   const names = new Set(repositoryNames.map((name) => name.toLowerCase()));
-  let targets = config.webhook.targets.filter((target) =>
+  const mappedTargets = accessRemoved
+    ? config.targets.map((target) => ({ ...target, resources: TAB_KEYS }))
+    : config.webhook.targets;
+  let targets = mappedTargets.filter((target) =>
     (!selectedHost || target.host === selectedHost) && (event === "installation" || names.has(target.repo)));
+  if (["installation", "installation_repositories"].includes(event)) {
+    targets = targets.filter((target) => {
+      const provider = config.providers[target.provider];
+      return provider?.type === "github-app" && Number.isSafeInteger(payload.installation?.id) &&
+        provider.installationId === payload.installation.id;
+    });
+  }
   if (!selectedHost && event !== "installation") {
     const hostsByRepo = new Map();
     for (const target of targets) hostsByRepo.set(target.repo, (hostsByRepo.get(target.repo) ?? new Set()).add(target.host));
     if ([...hostsByRepo.values()].some((hosts) => hosts.size !== 1)) return { ok: false, reason: "target" };
   }
-  if (targets.length === 0) return { ok: false, reason: "target" };
+  if (targets.length === 0) return ["installation", "installation_repositories"].includes(event)
+    ? { ok: true, unsupported: true, invalidations: [] }
+    : { ok: false, reason: "target" };
   const invalidations = targets.flatMap((target) => {
     const resources = accessRemoved ? TAB_KEYS : target.resources.includes(resource) ? [resource] : [];
     return resources.map((covered) => ({ host: target.host, repo: target.repo, provider: target.provider,
@@ -6461,21 +7102,7 @@ function createWebhookQueue({ pathOptions = {}, now = Date.now, maxDeliveries = 
 }
 
 function readWebhookSecret(path) {
-  let fd = null;
-  try {
-    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
-    const identity = fstatSync(fd);
-    if (!identity.isFile() || identity.size < 1 || identity.size > 65_536 ||
-        typeof process.getuid === "function" && identity.uid !== process.getuid() ||
-        process.platform !== "win32" && (identity.mode & 0o077) !== 0) {
-      throw new Error("webhook secret unavailable");
-    }
-    return readFileSync(fd);
-  } catch {
-    throw new Error("webhook secret unavailable");
-  } finally {
-    if (fd !== null) closeSync(fd);
-  }
+  return readPrivateFile(path, { message: "webhook secret unavailable" });
 }
 
 function webhookHeader(request, name) {
@@ -7645,6 +8272,10 @@ function createCollectorAcquisitionRuntime({
   setTimeout: setTimeout_ = setTimeout,
   clearTimeout: clearTimeout_ = clearTimeout,
   onDiagnostic = () => {},
+  createGitHubAppProvider: createGitHubAppProvider_ = createGitHubAppProvider,
+  githubAppOptions = {},
+  readInstallationCore = readInstallationCoreBudget,
+  executeGh = null,
 } = {}) {
   if (!config || !Array.isArray(config.targets)) throw new Error("invalid collector runtime config");
   const engine = createAcquisitionEngine({ pathOptions, now });
@@ -7657,37 +8288,89 @@ function createCollectorAcquisitionRuntime({
   const webhookCoveredQueries = new Set([...webhookTargets.values()].flatMap((target) =>
     target.resources.map((resource) => webhookCoverageKey({ ...target, resource }))));
   const items = new Set();
+  const providerAbort = new AbortController();
   let closed = false;
 
-  async function defaultResolve(target) {
+  async function defaultResolve(target, signal = providerAbort.signal) {
     let context = providerContexts.get(target.provider);
     if (!context) {
-      const coordinator = createIdentityCoordinator({ host: target.host, pathOptions, now });
-      context = { coordinator, identity: null, scope: null, leaseId: governorId() };
+      const definition = config.providers[target.provider];
+      const coordinator = definition.type === "github-app"
+        ? createGitHubAppProvider_({ name: target.provider, provider: definition, pathOptions, now,
+          ...githubAppOptions })
+        : createIdentityCoordinator({ host: target.host, pathOptions, now });
+      context = { coordinator, definition, identity: null, scope: null, leaseId: governorId(),
+        credentialEnvironment: null, capabilities: null, readBudgets: null,
+        coreValidatorAccessKey: coordinator.coreValidatorAccessKey?.() ?? null };
+      if (definition.type === "github-app") {
+        context.onObserverPublished = (resource) => {
+          if (resource !== "core") return;
+          const bound = context.coordinator.markCoreValidated?.(context.identity.accessKey);
+          if (bound?.ok) context.coreValidatorAccessKey = context.identity.accessKey;
+        };
+        context.readBudgets = async (signal, host, options) => {
+          const budgets = await readSharedBudgetSources(signal, host, {
+            ...options,
+            coreEtag: context.coreValidatorAccessKey === context.identity?.accessKey
+              ? options.coreEtag : null,
+          readCore: (coreSignal, coreHost, etag) =>
+            readInstallationCore(coreSignal, coreHost, etag, { now }),
+          });
+          return budgets;
+        };
+      }
       providerContexts.set(target.provider, context);
     }
-    const resolved = await context.coordinator.refresh();
-    if (!resolved.ok || resolved.value.host !== target.host) throw new Error("collector provider unavailable");
-    context.identity = resolved.value;
+    let identity;
+    if (context.definition.type === "github-app") {
+      const resolved = await context.coordinator.resolve({ signal });
+      identity = resolved.identity;
+      context.credentialEnvironment = resolved.environment;
+      context.capabilities = resolved.capabilities;
+      if (context.identity?.accessKey !== identity.accessKey) {
+        const persisted = persistGitHubAppIdentity(context.coordinator.root, identity, now());
+        if (!persisted.ok) throw new Error("collector provider unavailable");
+      }
+    } else {
+      const resolved = await context.coordinator.refresh();
+      if (!resolved.ok) throw new Error("collector provider unavailable");
+      identity = resolved.value;
+      context.credentialEnvironment = null;
+      context.capabilities = null;
+      context.readBudgets = null;
+    }
+    if (identity.host !== target.host) throw new Error("collector provider unavailable");
+    context.identity = identity;
     context.scope = {
-      ...createQuotaScope(resolved.value, {
+      ...createQuotaScope(identity, {
         root: context.coordinator.root,
         now,
         identityProvider: context.coordinator.current,
       }),
       identityCoordinator: context.coordinator,
       repository: target.repo,
+      providerType: context.definition.type,
+      ...(executeGh ? { executeGh } : {}),
+      ...(context.credentialEnvironment ? { credentialEnvironment: context.credentialEnvironment } : {}),
     };
     return context;
   }
 
   async function defaultProduce({ target, resource, demand, snapshot, claim, markStarted, provider, signal, force }) {
-    const context = provider?.scope ? provider : await defaultResolve(target);
+    const context = provider?.scope ? provider : await defaultResolve(target, signal);
     const at = now();
     const lease = maintainControlLease(context.scope, context.leaseId, demand.floorMs, resource, at);
     if (!lease.ok) throw new Error("collector governor unavailable");
-    const refreshed = await refreshSharedBudget(context.scope, context.leaseId, signal);
-    if (!refreshed.ok) throw new Error("collector budget unavailable");
+    const refreshed = await refreshSharedBudget(context.scope, context.leaseId, signal,
+      context.readBudgets ? { readBudgets: context.readBudgets,
+        onObserverPublished: context.onObserverPublished } : {});
+    if (!refreshed.ok) {
+      const error = new Error(refreshed.reason === "provider-capability"
+        ? `collector provider capability unavailable (${refreshed.capability})`
+        : "collector budget unavailable");
+      if (refreshed.reason === "provider-capability") error.providerCapability = refreshed.capability;
+      throw error;
+    }
     const admitted = await awaitCollectorReservation({
       scope: context.scope,
       leaseId: context.leaseId,
@@ -7714,14 +8397,18 @@ function createCollectorAcquisitionRuntime({
     const descriptor = tabForKey(resource);
     try {
       const entities = new Map((force ? [] : snapshot?.entities ?? []).map((entity) => [entity.key, entity]));
-      const result = await requestIdentityStorage.run(context.scope, () => descriptor.fetch({
+      const securityPolicy = resource === "security" && context.definition?.type === "github-app"
+        ? githubAppSecurityPolicy(context.definition, now()) : null;
+      let result = await requestIdentityStorage.run(context.scope, () => descriptor.fetch({
         signal,
         entities,
         previousRaw: force ? null : snapshot?.raw ?? null,
         force,
         pages: demand.pages,
         governor: { scope: context.scope, leaseId: context.leaseId },
+        ...(securityPolicy ? { sources: securityPolicy.sources } : {}),
       }));
+      if (securityPolicy) result = applyGitHubAppSecurityPolicy(result, securityPolicy);
       settleReservationWithBudgetObservations(
         { ...context.scope, identityProvider: null },
         context.leaseId,
@@ -7762,11 +8449,19 @@ function createCollectorAcquisitionRuntime({
   }
 
   async function defaultTargetIdentity(target, provider, signal) {
-    const context = provider?.scope ? provider : await defaultResolve(target);
+    const context = provider?.scope ? provider : await defaultResolve(target, signal);
     const lease = maintainControlLease(context.scope, context.leaseId, REFRESH_MS, "issues", now());
     if (!lease.ok) throw new Error("collector identity governor unavailable");
-    const refreshed = await refreshSharedBudget(context.scope, context.leaseId, signal);
-    if (!refreshed.ok) throw new Error("collector identity budget unavailable");
+    const refreshed = await refreshSharedBudget(context.scope, context.leaseId, signal,
+      context.readBudgets ? { readBudgets: context.readBudgets,
+        onObserverPublished: context.onObserverPublished } : {});
+    if (!refreshed.ok) {
+      const error = new Error(refreshed.reason === "provider-capability"
+        ? `collector provider capability unavailable (${refreshed.capability})`
+        : "collector identity budget unavailable");
+      if (refreshed.reason === "provider-capability") error.providerCapability = refreshed.capability;
+      throw error;
+    }
     const result = await runAdmittedOperation({
       scope: context.scope,
       leaseId: context.leaseId,
@@ -7814,7 +8509,7 @@ function createCollectorAcquisitionRuntime({
       if (!persisted.ok) throw new Error(`collector canonical ${persisted.reason}`);
       const provider = resolveProvider
         ? await resolveProvider(target.provider, target, { signal: controller.signal })
-        : await defaultResolve(target);
+          : await defaultResolve(target, controller.signal);
       const identity = provider?.identity ?? provider;
       const requireAccessRefresh = accessRefreshTargets.has(key);
       const discovered = !requireAccessRefresh && persisted.value ? persisted.value : (resolveTargetIdentity
@@ -7916,7 +8611,7 @@ function createCollectorAcquisitionRuntime({
     try {
       const refreshedProvider = refreshProvider
         ? await refreshProvider(item.target.provider, item.target)
-        : !resolveProvider ? await defaultResolve(item.target) : item.provider;
+        : !resolveProvider ? await defaultResolve(item.target, providerAbort.signal) : item.provider;
       const refreshedIdentity = refreshedProvider?.identity ?? refreshedProvider;
       if (refreshedIdentity?.accessKey !== item.identity?.accessKey ||
           refreshedIdentity?.generation !== item.identity?.generation) {
@@ -7951,7 +8646,7 @@ function createCollectorAcquisitionRuntime({
       const producer = produce ?? defaultProduce;
       item.controller = new AbortController();
       try {
-        const produced = await producer({
+        const produceBound = () => producer({
           target: item.target,
           resource: item.resource,
           demand: ownership.value.demand,
@@ -7962,6 +8657,23 @@ function createCollectorAcquisitionRuntime({
           force,
           markStarted: (receipt) => engine.refresh(subscriptionId, { started: { ...claim, ...(receipt ? { receipt } : {}) } }),
         });
+        const produced = item.provider?.scope
+          ? await requestIdentityStorage.run(item.provider.scope, produceBound)
+          : await produceBound();
+        if (item.provider?.definition?.type === "github-app" &&
+            item.provider.coordinator.current()?.accessKey !== claim.accessKey) {
+          engine.refresh(subscriptionId, { claim, failure: {
+            hold: "disconnected",
+            requestMetrics: produced.requestMetrics ?? {},
+            uncertainReceipts: produced.uncertainReceipts ?? [],
+          } });
+          engine.unsubscribe(subscriptionId);
+          item.id = null;
+          targetInitializations.delete(targetInitializationKey(item.target));
+          item.onHold?.("disconnected");
+          retryIn = 1;
+          return;
+        }
         if (bindingRevision !== item.bindingRevision) {
           engine.refresh(subscriptionId, { cancel: claim });
           retryIn = 1;
@@ -7980,8 +8692,15 @@ function createCollectorAcquisitionRuntime({
         item.pollPhase = "publishing";
         const published = await engine.refresh(subscriptionId, { claim, publish: produced });
         if (!published.ok) { item.onHold?.("disconnected"); retryIn = 1_000; }
-        else retryIn = Math.max(1, published.value.snapshot.nextDueAt - now());
+        else {
+          item.provider?.coordinator?.markAuthorized?.();
+          retryIn = Math.max(1, published.value.snapshot.nextDueAt - now());
+        }
       } catch (error) {
+        if (item.provider?.definition?.type === "github-app" && error?.apiResponse?.status === 401 &&
+            !error.appCredentialInvalidated) {
+          item.provider.coordinator.invalidate("unauthorized");
+        }
         const hold = error?.notStarted ? "shared-wait" : acquisitionFailureHold(error);
         if (claim && error?.notStarted) engine.refresh(subscriptionId, { cancel: claim });
         else if (claim) engine.refresh(subscriptionId, { claim, failure: {
@@ -8118,9 +8837,13 @@ function createCollectorAcquisitionRuntime({
       const configuredWebhookTarget = webhookTargets.get(targetInitializationKey(normalized));
       const configuredCollectorTarget = collectorTarget(config, normalized.host, normalized.repo);
       if (!configuredCollectorTarget || configuredCollectorTarget.provider !== normalized.provider ||
-          !configuredWebhookTarget || !normalized.accessRemoved &&
-            !configuredWebhookTarget.resources.includes(normalized.resource)) {
+          !normalized.accessRemoved && (!configuredWebhookTarget ||
+            !configuredWebhookTarget.resources.includes(normalized.resource))) {
         throw new Error("invalid collector invalidation");
+      }
+      if (normalized.accessRemoved) {
+        const providerContext = providerContexts.get(normalized.provider);
+        providerContext?.coordinator.invalidate?.("authority-changed");
       }
       const matching = [...items].filter((item) => !item.closed &&
         (normalized.accessRemoved || demandEnabled(item.demand)) &&
@@ -8183,13 +8906,13 @@ function createCollectorAcquisitionRuntime({
     },
     async close() {
       closed = true;
+      providerAbort.abort();
       for (const item of items) {
         item.closed = true;
         rejectInvalidations(item, new Error("collector runtime closed"));
         item.controller?.abort();
         if (item.timer !== null) clearTimeout_(item.timer);
       }
-      for (const context of providerContexts.values()) context.coordinator.close();
       for (const entry of targetInitializations.values()) entry.controller.abort();
       await Promise.allSettled([...items].flatMap((item) =>
         [item.initializePromise, item.pollPromise].filter(Boolean)));
@@ -8198,6 +8921,9 @@ function createCollectorAcquisitionRuntime({
       engine.close();
       for (const context of providerContexts.values()) {
         if (context.scope) releaseLease(context.scope, context.leaseId);
+        context.coordinator.close();
+        context.credentialEnvironment = null;
+        if (context.scope) delete context.scope.credentialEnvironment;
       }
       providerContexts.clear();
     },
@@ -8836,6 +9562,9 @@ async function readSharedBudgetSources(signal, host = effectiveRuntimeHost(), {
     // charged one.
     if (resources.includes("graphql") && typeof renewClaim === "function" && !await renewClaim()) return null;
     const core = await readCore(signal, host, coreEtag);
+    if (core?.unsupported === true && typeof core.capability === "string") {
+      return { providerCapability: core.capability };
+    }
     if (core) result.core = core;
   }
   return Object.keys(result).length > 0 ? result : null;
@@ -11551,6 +12280,7 @@ function acquisitionDiagnostics(state, { source = "standalone", nowMs = Date.now
 }
 
 function acquisitionFailureHold(error) {
+  if (typeof error?.providerCapability === "string") return "observer";
   if (SECONDARY_LIMIT_PATTERN.test(errText(error))) return "secondary";
   if (isRateLimited(error) || /API budget paused/i.test(errText(error))) return "primary";
   const attemptedHttp = Number.isSafeInteger(error?.requestMetrics?.httpRequests) &&
@@ -17112,6 +17842,7 @@ if (IS_MAIN && !runtime.headlessMode) {
 // Exported for unit tests. The dashboard itself is still one file; these are
 // the pure functions worth pinning, and nothing here is part of the public API.
 export {
+  runGh,
   retryIdentityCompletion,
   createSettlementContext,
   startIdentityControl,
@@ -17275,6 +18006,16 @@ export {
   COLLECTOR_ASSEMBLY_MAX_BYTES,
   COLLECTOR_ASSEMBLY_TIMEOUT_MS,
   collectorSocketPath,
+  normalizeGitHubAppProvider,
+  signGitHubAppJwt,
+  githubAppChildEnvironment,
+  githubAppAccessIdentity,
+  githubAppResourceCapabilities,
+  githubAppSecurityPolicy,
+  applyGitHubAppSecurityPolicy,
+  createGitHubAppProvider,
+  requestGitHubAppToken,
+  readInstallationCoreBudget,
   normalizeCollectorConfig,
   loadCollectorConfig,
   verifyWebhookSignature,
