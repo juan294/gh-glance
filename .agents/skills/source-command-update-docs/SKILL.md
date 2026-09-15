@@ -104,7 +104,7 @@ For each document in the approved plan:
    sweep misses. In cc-rpi: `scripts/verify-counts.sh` (counts agree
    everywhere stated), `scripts/verify-version.sh` (version strings match
    CHANGELOG), `scripts/verify-skills.sh` (skill frontmatter and size), and
-   `scripts/check-tree-drift.sh` (`templates/` vs `.Codex/`). Fix every
+   `scripts/check-tree-drift.sh` (`templates/` vs `.claude/`). Fix every
    location they report.
 5. Preserve existing document structure, voice, and formatting.
 6. For inline docs (JSDoc, docstrings, doc comments):
@@ -126,7 +126,8 @@ and include it in the final report.
 1. Run verification commands sequentially (chain with `&&` or `;`, never parallel Bash calls):
 
    ```bash
-   $LINT_CMD; npx markdownlint '**/*.md' --ignore node_modules --ignore .Codex 2>&1
+   $LINT_CMD; npx markdownlint '**/*.md' --ignore node_modules \
+     --ignore .claude 2>&1
    ```
 
 2. Present the full diff of all changed files.

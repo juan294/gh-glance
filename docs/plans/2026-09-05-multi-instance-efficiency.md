@@ -183,7 +183,13 @@ Record requests, charged units, observers, coalesced consumers, queue wait, sour
 
 ## Completion tracking
 
-Planning review is complete. Independent controller and whole-plan reviews identified and resolved bootstrap allowance, phase prerequisite, installation observer, provider/socket routing, chunked-frame, reconnect freshness, Width-mode key precedence, and webhook deadline issues. Plan links, phase dependencies, code-reference ranges, Markdown fences and unresolved-marker checks were verified locally. This review validates the specification; implementation/runtime acceptance remains unchecked below.
+Planning review is complete. Independent controller and whole-plan reviews
+identified and resolved bootstrap allowance, phase prerequisite, installation
+observer, provider/socket routing, chunked-frame, reconnect freshness,
+Width-mode key precedence, and webhook deadline issues. Plan links, phase
+dependencies, code-reference ranges, Markdown fences and unresolved-marker
+checks were verified locally. Implementation and runtime acceptance are
+complete; Phase 12 contains the final validation record.
 
 - [x] Phase 1
 - [x] Phase 2
