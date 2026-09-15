@@ -106,6 +106,7 @@ test("the installed package supports only the gh-glance executable", async () =>
     const help = (await run(bin, ["--help"], { cwd: installRoot })).stdout;
     assert.match(help, /--serve --config (?:PATH|<path>)/);
     assert.match(help, /--connect local/);
+    assert.match(help, /--connect ssh:<alias>/);
     assert.match(help, /--collector-stdio/);
 
     // Exercise the installed artifact's three Phase 8 entry routes. This is
@@ -143,6 +144,10 @@ test("the installed package supports only the gh-glance executable", async () =>
         cwd: installRoot, env,
       });
       assert.match(doctor.stdout, /local collector/i);
+      const sshDoctor = await run(bin,
+        ["--connect", "ssh:studio", "--repo", "acme/widget", "--doctor"],
+        { cwd: installRoot, env });
+      assert.match(sshDoctor.stdout, /SSH collector[\s\S]*studio/);
       await assert.rejects(
         run(bin, ["--connect", "local", "--repo", "acme/widget"], { cwd: installRoot, env }),
         (error) => {

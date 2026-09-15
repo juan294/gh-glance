@@ -9,6 +9,7 @@ import { test } from "node:test";
 
 import {
   abortableDelay,
+  awaitCollectorReservation,
   acquisitionQueryForTab,
   acquisitionStorePath,
   collectorPublicationFromResult,
@@ -69,6 +70,23 @@ async function within(promise, timeoutMs = 5_000) {
     clearTimeout(timer);
   }
 }
+
+test("COL-01: a deferred collector admission releases its exact intent before retry", async () => {
+  const intentId = "11111111-1111-4111-8111-111111111111";
+  const cancelled = [];
+  await assert.rejects(
+    awaitCollectorReservation({
+      scope: {}, leaseId: "22222222-2222-4222-8222-222222222222",
+      operation: "tab:actions", priority: "active", now: () => 1_000,
+      waitMs: 2_000,
+      admit: () => ({ ok: true, value: { status: "waiting",
+        reservationId: `reservation:${intentId}`, notBefore: 4_000 } }),
+      cancel(_scope, id) { cancelled.push(id); return { ok: true }; },
+    }),
+    (error) => error.notStarted === true && error.retryAt === 4_000,
+  );
+  assert.deepEqual(cancelled, [intentId]);
+});
 
 test("COL-05: stdio bridge finalizes once and removes listeners after failure", async () => {
   class FakeSocket extends EventEmitter {

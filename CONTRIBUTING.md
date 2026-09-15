@@ -129,6 +129,10 @@ acquisition with standalone processes. `test/pty/collector.test.mjs` must prove
 headless serve/bridge behavior and a real local dashboard, including an empty
 client-side `gh` call log. `test/package-boundary.test.mjs` keeps the installed
 package to one executable while checking every collector mode remains present.
+SSH transport changes also run `test/ssh-transport.test.mjs` and
+`test/pty/remote-collector.test.mjs`. Their executable fake `ssh` validates the
+fixed argument vector and launches the real stdio bridge against private local
+IPC; the tests require no SSH server, network, key, or real GitHub account.
 
 Two things to know before editing it:
 

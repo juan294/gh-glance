@@ -326,6 +326,7 @@ pane definition. Flags are there when you want them:
 | `--doctor --probe` | Add bounded, admitted GitHub capability probes to the local diagnostic report. |
 | `--serve --config <path>` | Run the optional local collector in the foreground from a private, versioned JSON allowlist. |
 | `--connect local` | Subscribe the dashboard to the current OS user's collector. No GitHub request runs in the client process. |
+| `--connect ssh:<alias>` | Subscribe through the named SSH config alias. The client starts only the fixed remote collector bridge and never falls back to local GitHub acquisition. |
 | `--collector-stdio` | Bridge bounded newline JSON on stdin/stdout to an already running local collector. |
 
 An unrecognised flag exits 2 rather than being ignored, so a typo fails loudly.
@@ -365,6 +366,43 @@ providers, API paths, queries, commands, or filesystem paths. Renamed aliases
 that resolve to one repository cannot cross provider ownership. Disconnecting
 keeps last-known-good rows and their source age, then reconnects to a new server
 epoch without silently falling back to standalone polling.
+
+### Optional SSH collector client
+
+An SSH client connects to a collector already running under your account on a
+computer you control. Configure the host, user, port, key, jump host, and host
+trust in `~/.ssh/config`; the CLI accepts only a simple alias:
+
+```sh
+# On the collector computer
+gh-glance --serve --config ~/.config/gh-glance/collector.json
+
+# On a client computer, after normal ssh host-key/key setup
+gh-glance --connect ssh:my-collector --repo owner/repository
+```
+
+The client runs exactly `ssh -T -o BatchMode=yes -o ClearAllForwardings=yes -o
+ForwardAgent=no -- <alias> 'gh-glance --collector-stdio'`. It does not disable host-key checking,
+install software or keys, start the collector, create forwarding, or send the
+repository through a shell command. `gh-glance` must already be on the remote
+login's `PATH`, and the collector must already be running there.
+
+Local `GH_*`, `GITHUB_*`, `GH_CONFIG_DIR`, and `XDG_CONFIG_HOME` values are not
+given to the SSH child. Repository rows arrive through the same bounded protocol
+as a local client. A disconnect keeps them visible as `Disconnected` and retries
+after a bounded 1, 2, 4, 8, 16, then 30-second ladder with jitter. A new server
+epoch resubscribes once; old epoch/generation frames cannot overwrite it.
+
+Remote snapshots carry the source observation time and collector wall time.
+The client persists the resulting conservative age under a private digest of
+the SSH alias plus target. Reconnect, receipt time, a backward local clock, and
+a cold offline restart cannot make the same observation look younger. A newer
+successful source observation can reset the age. Pressing `Enter` still opens a
+validated HTTPS target URL on the client computer and makes no GitHub API call.
+
+`gh-glance --connect ssh:my-collector --repo owner/repository --doctor` is a
+local-only report of the selected source and disabled fallback. Live endpoint
+probes are intentionally rejected for collector clients.
 
 Environment variables work too, and the flags take precedence:
 

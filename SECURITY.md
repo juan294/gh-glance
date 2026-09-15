@@ -150,6 +150,29 @@ Wire snapshots project sanitized display rows, pagination, semantic holds, and
 source timestamps only. They exclude tokens, access/quota digests, local paths,
 validators, raw bodies, reservations, and provider details.
 
+Remote collector clients reuse that protocol only through the user's existing
+SSH configuration. The process argv is fixed to `ssh -T -o BatchMode=yes -o
+ClearAllForwardings=yes -o ForwardAgent=no -- <validated-alias> 'gh-glance
+--collector-stdio'`; aliases cannot begin with `-` or contain shell syntax.
+Repository names and received row text never enter the remote command. Host-key
+checking is not disabled, forwarding and agent forwarding are explicitly disabled, and no key,
+software, collector service, or remote configuration is installed or started.
+
+The SSH child receives a deliberate environment allowlist needed by SSH itself.
+Local GitHub token variables, `GH_CONFIG_DIR`, `XDG_CONFIG_HOME`, arbitrary
+environment values, credential hashes, and local state paths are excluded.
+Remote stderr is byte-bounded, redacted, sanitized, and reduced to one concise
+diagnostic. Disconnects do not activate the local GitHub data path. The client
+kills only the SSH process it created; the shared collector and other clients
+continue.
+
+Each SSH snapshot includes collector wall time alongside the already separate
+source-success and source-change timestamps. The client keeps a monotonic lower
+bound for source age and persists it with the client checkpoint and server epoch
+under a private collector-alias/target namespace. Receipt, reconnect, cache load,
+or backward wall-clock movement cannot claim newer evidence. Browser opening is
+local and accepts only HTTPS URLs on the validated target host.
+
 One nonce-fenced producer owns each due query generation. Its 45-second claim
 is heartbeated every ten seconds, and expiration alone cannot transfer
 ownership: takeover also requires PID-confirmed death or explicit cancellation.

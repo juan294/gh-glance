@@ -13,7 +13,7 @@ import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 
@@ -258,6 +258,18 @@ test("COL-02/05: local collector doctor reports source and never probes GitHub",
   assert.match(out, /^fallback\s+disabled$/m);
   const calls = readFileSync(log, "utf8").trim().split("\n").filter(Boolean);
   assert.ok(calls.every((line) => !line.includes('"api"') && !line.includes('"auth"')));
+});
+
+test("SSH-03/07: SSH collector doctor is local-only and reports no fallback", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-ssh-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const log = join(root, "gh-calls.log");
+  const out = await doctor({ probe: false, args: ["--connect", "ssh:studio", "--repo", "acme/widget"],
+    env: { XDG_CONFIG_HOME: root, GH_GLANCE_FIXTURE_LOG: log } });
+  assert.match(out, /source\s+SSH collector/);
+  assert.match(out, /SSH collector[\s\S]*alias\s+studio[\s\S]*fallback\s+disabled/);
+  const calls = existsSync(log) ? readFileSync(log, "utf8") : "";
+  assert.doesNotMatch(calls, /\bapi\b|graphql|actions\/runs/);
 });
 
 test("OBS-03: doctor reports corrupt acquisition metadata instead of healthy zeros", async (t) => {

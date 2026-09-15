@@ -1,4 +1,4 @@
-# 5. Keep optional collection local, explicit, and provider-fenced
+# 5. Keep optional collection explicit, provider-fenced, and SSH-carried remotely
 
 Date: 2026-09-05
 Status: Accepted
@@ -15,9 +15,10 @@ infrastructure, a GitHub App, or remote access part of default startup.
 Keep standalone mode as the default. An explicit `--serve --config <path>` runs
 the existing acquisition and governor machinery as a foreground collector.
 `--connect local` makes a normal terminal dashboard a data-only client, and
-`--collector-stdio` is a narrow bridge to an already running collector. Service
-installation, daemonization, SSH, webhooks, and GitHub App providers are outside
-this decision.
+`--collector-stdio` is a narrow bridge to an already running collector.
+`--connect ssh:<alias>` may carry that same bridge through an existing SSH
+configuration. Service installation, daemonization, webhooks, and GitHub App
+providers remain outside this decision.
 
 Use one fixed Unix-domain socket in the current OS user's private gh-glance
 config root. Support macOS and Linux. Reject collector and bridge modes on
@@ -40,6 +41,20 @@ digests, local paths, provider details, validators, raw response bodies, and
 quota state. The server owns identity, admission, request accounting, and shared
 acquisition. A local client never falls back to GitHub polling when disconnected.
 
+The SSH command and its argument vector are fixed. Only a restricted SSH config
+alias is variable; repository and row data never reach a remote shell string.
+Batch mode is mandatory, forwarding and agent forwarding are disabled, and host-key policy remains the
+user's SSH policy. The child environment is allowlisted and excludes local
+GitHub credentials and config roots. A client owns and cancels only its SSH
+child, not the collector.
+
+Remote receipt does not create source freshness. Snapshot transport carries
+collector wall time, and the client persists a monotonic source-age lower bound
+with the original source timestamps, server epoch, and client checkpoint under
+a collector/target namespace. Reconnect and clock skew cannot make an old
+observation younger. A disconnect preserves rows, reports the connection hold,
+and follows a capped reconnect ladder without local acquisition fallback.
+
 ## Consequences
 
 One OS user is the trust boundary. A collector is not a multi-tenant service.
@@ -47,4 +62,5 @@ Configuration or provider changes require restart and a new epoch. Existing
 standalone processes using the same config root can join collector acquisitions
 without starting another query generation. A service with no subscribers makes
 no data poll, while bounded last-known-good snapshots remain available for a
-later subscriber.
+later subscriber. Cross-computer operation depends on user-managed SSH and an
+already running collector; it adds no TCP listener or hosted service.

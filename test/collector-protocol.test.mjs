@@ -98,6 +98,8 @@ test("COL-08: large snapshots assemble only after bounded digest validation", ()
     securityNotes: [], securityBlind: false, capabilities: {},
   };
   const frames = encodeCollectorSnapshotFrames("sub-1", "epoch-1", snapshot);
+  assert.ok(frames.every((frame) => frame.type === "snapshot-part" || frame.type === "snapshot-end" ||
+    Number.isFinite(frame.serverNow)), "the complete snapshot carries collector wall time");
   assert.equal(frames[0].type, "snapshot-begin");
   assert.equal(frames.at(-1).type, "snapshot-end");
   assert.ok(frames.every((frame) => Buffer.byteLength(encodeCollectorFrame(frame)) <= COLLECTOR_FRAME_MAX_BYTES));
@@ -328,7 +330,7 @@ test("COL-08: reconnect adopts a new epoch while generations stay monotonic insi
     digest: "a".repeat(64), parts: 1 })));
   sockets[0].destroy();
   assert.deepEqual(connections, [true, false]);
-  assert.deepEqual(timers.map((timer) => timer.delay).sort((a, b) => a - b), [1000, 10000]);
+  assert.deepEqual(timers.map((timer) => timer.delay).sort((a, b) => a - b), [1000, 10000, 10000]);
   timers.splice(timers.findIndex((timer) => timer.delay === 1000), 1)[0].callback();
   sockets[1].emit("connect");
   sockets[1].emit("data", Buffer.from(encodeCollectorFrame({ type: "welcome", protocolVersion: 1,

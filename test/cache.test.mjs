@@ -20,6 +20,8 @@ import {
   nextSecurityRaw,
   saveDashboardCache,
   serializeDashboardCache,
+  collectorCachedSourceAge,
+  sshCollectorCacheIdentity,
 } from "../index.mjs";
 
 function withTemporaryRoot(run) {
@@ -101,6 +103,24 @@ test("dashboard cache path shares the private gh-glance config directory", () =>
       dashboardCachePath({ env: { XDG_CONFIG_HOME: root }, platform: process.platform, home: root }),
       join(root, "gh-glance", "dashboard-cache.json"),
     );
+  });
+});
+
+test("SSH-06: remote source evidence round-trips under collector identity", () => {
+  withTemporaryRoot((root) => {
+    const target = dashboardCacheTarget({ repo: "acme/widget", host: "github.com",
+      account: sshCollectorCacheIdentity("studio") });
+    const source = { kind: "ssh", collector: sshCollectorCacheIdentity("studio"),
+      serverEpoch: "11111111-1111-4111-8111-111111111111",
+      lastSuccessAt: NOW - 5_000, lastChangedAt: NOW - 10_000,
+      ageMs: 5_000, clientCheckpointAt: NOW };
+    const cache = cacheFor(target, { actions: { ...actionsTab(), lastOk: source.lastSuccessAt, source } });
+    const path = cachePath(root);
+    assert.equal(saveDashboardCache(path, cache).ok, true);
+    const loaded = loadDashboardCache(path, target).entry.tabs.actions;
+    assert.deepEqual(loaded.source, source);
+    assert.equal(collectorCachedSourceAge(loaded, NOW + 2_000), 7_000);
+    assert.equal(collectorCachedSourceAge(loaded, NOW - 2_000), 5_000);
   });
 });
 
