@@ -65,6 +65,8 @@ None for local protocol correctness. OS service installation is outside this pha
 
 ## Completion
 
-- [ ] Foreground collector, private IPC and bounded protocol implemented.
-- [ ] COL scenarios and parent local gates passed.
-- [ ] Independent compliance/quality review complete; integrated locally; stop.
+- [x] Foreground collector, private IPC and bounded protocol implemented.
+- [x] COL scenarios and parent local gates passed: 507 unit/integration tests and 134 serial PTY tests, with Node 22/24 mode smoke.
+- [x] Independent compliance/quality review complete; integrated locally; stop.
+
+Targeted and full Phase 8 gates cover the implementation.

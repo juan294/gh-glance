@@ -13,15 +13,17 @@ import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 
 import {
   BUDGET_SNAPSHOT_TTL_MS,
   GOVERNOR_LEASE_TTL_MS,
+  acquisitionStorePath,
   claimProbe,
   classify,
+  createAcquisitionEngine,
   createIdentityCoordinator,
   createQuotaScope,
   inspectGovernor,
@@ -29,6 +31,9 @@ import {
   redact,
   registerLease,
   requestManualProbe,
+  setRuntimeAcquisitionHold,
+  crashDiagnostic,
+  verboseLogLine,
 } from "../index.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -71,6 +76,22 @@ test("redact leaves ordinary diagnostic text intact", () => {
   assert.equal(redact("gh version 2.97.0 (2026-07-01)"), "gh version 2.97.0 (2026-07-01)");
 });
 
+test("OBS-06: verbose and crash formatters redact credentials and never add response bodies", () => {
+  const token = "ghp_ABCDEFGHIJKLMNOPQRST";
+  const verbose = verboseLogLine(
+    ["api", `https://octocat:${token}@github.com/acme/widget`],
+    100,
+    `FAILED ${token}`,
+    125,
+  );
+  const crash = crashDiagnostic("crashed", new Error(`request ${token} failed`));
+  for (const output of [verbose, crash]) {
+    assert.doesNotMatch(output, new RegExp(token));
+    assert.match(output, /<redacted/);
+    assert.doesNotMatch(output, /RAW_RESPONSE_BODY_MUST_NOT_RENDER/);
+  }
+});
+
 test("classify agrees with the dashboard's own predicates", () => {
   assert.equal(classify(null), "ok");
   assert.equal(classify({ stderr: "HTTP 403: API rate limit exceeded" }), "rate-limited");
@@ -91,10 +112,13 @@ test("rate limiting outranks the auth marker", () => {
 
 // The report itself. --doctor exits before ink is imported, so a plain child
 // process is enough -- no pty needed.
-async function doctor({ env = {}, args = [] } = {}) {
+async function doctor({ env = {}, args = [], probe = true } = {}) {
   const root = env.XDG_CONFIG_HOME ?? mkdtempSync(join(tmpdir(), "gh-glance-doctor-case-"));
   try {
-    const { stdout } = await execFileAsync(process.execPath, [ENTRY, "--doctor", ...args], {
+    const { stdout } = await execFileAsync(
+      process.execPath,
+      [ENTRY, "--doctor", ...(probe ? ["--probe"] : []), ...args],
+      {
       cwd: REPO,
       env: {
         ...(process.env.NODE_V8_COVERAGE ? { NODE_V8_COVERAGE: process.env.NODE_V8_COVERAGE } : {}),
@@ -106,7 +130,8 @@ async function doctor({ env = {}, args = [] } = {}) {
         XDG_CONFIG_HOME: root,
       },
       maxBuffer: 8 * 1024 * 1024,
-    });
+      },
+    );
     return stdout;
   } finally {
     if (!env.XDG_CONFIG_HOME) rmSync(root, { recursive: true, force: true });
@@ -145,16 +170,172 @@ function probeBlock(report, name) {
   return report.slice(start, end === -1 ? undefined : end);
 }
 
-test("--doctor exits 0 through a pipe and prints a complete report", async () => {
+test("OBS-02: plain --doctor is local-only and invokes no GitHub API command", async (t) => {
   // execFile gives the child a pipe for stdout, which is precisely the
   // condition the dashboard refuses to start under (exit 1). A reporting
   // command must return before that guard.
-  const out = await doctor();
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-local-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const acquisition = createAcquisitionEngine({ pathOptions: { env: { XDG_CONFIG_HOME: root } } });
+  t.after(() => acquisition.close());
+  const subscribed = acquisition.subscribe({
+    host: "github.com",
+    repositoryId: "R_DOCTOR",
+    repository: "acme/widget",
+    accessKey: "a".repeat(64),
+    targetKey: "doctor-target",
+    resource: "actions",
+    queryVersion: 2,
+    filters: {},
+    pageSize: 60,
+    cursorGeneration: "first",
+  }, { active: true, floorMs: 5_000 });
+  const otherAccess = acquisition.subscribe({
+    host: "github.com",
+    repositoryId: "R_DOCTOR",
+    repository: "acme/widget",
+    accessKey: "b".repeat(64),
+    targetKey: "doctor-target",
+    resource: "actions",
+    queryVersion: 2,
+    filters: {},
+    pageSize: 60,
+    cursorGeneration: "first",
+  }, { active: true, floorMs: 5_000 });
+  const now = Date.now();
+  await acquisition.refresh(subscribed.value.id, { acquire: async () => ({
+    rows: [{ databaseId: 1, displayTitle: "RAW_RESPONSE_BODY_MUST_NOT_RENDER" }],
+    pageInfo: null,
+    raw: "ghp_ABCDEFGHIJKLMNOPQRST raw response body",
+    entities: [],
+    lastSuccessAt: now,
+    lastChangedAt: now,
+    nextDueAt: now + 5_000,
+    hold: null,
+    capabilities: {},
+    meta: { at: now, truncated: false },
+    securityNotes: [],
+    securityBlind: false,
+  }) });
+  assert.equal(otherAccess.ok, true);
+  assert.equal(setRuntimeAcquisitionHold(
+    acquisition,
+    new Map([["actions", subscribed.value]]),
+    "actions",
+    "observer",
+    "a".repeat(64),
+  ).ok, true);
+  const log = join(root, "gh.log");
+  const out = await doctor({ probe: false, env: { XDG_CONFIG_HOME: root, GH_GLANCE_FIXTURE_LOG: log } });
   assert.match(out, /gh-glance doctor/);
-  assert.match(out, /Authenticated hosts/);
+  assert.match(out, /Authenticated hosts\n-+\nnot probed \(--probe not requested\)/);
   assert.match(out, /Repository target/);
   assert.match(out, /Environment/);
+  assert.match(out, /Acquisition metrics/);
+  assert.match(out, /^active queries\s+2$/m);
+  assert.match(out, /^HTTP attempts\s+0$/m);
+  assert.match(out, /^failed requests\s+0$/m);
+  assert.match(out, /^queue wait \(measured\) {1,}0ms$/m);
+  assert.match(out, /^query\s+actions: observer$/m);
+  assert.equal(out.match(/^query\s+actions: observer$/gm)?.length, 1);
+  assert.equal(out.match(/^query\s+actions: open$/gm)?.length, 1);
+  assert.doesNotMatch(out, /RAW_RESPONSE_BODY_MUST_NOT_RENDER|ghp_ABCDEFGHIJKLMNOPQRST/);
   assert.match(out, /Endpoint probes/);
+  assert.match(out, /disabled \(use --doctor --probe\)/);
+  const calls = readFileSync(log, "utf8").trim().split("\n").filter(Boolean);
+  assert.ok(calls.every((line) => !line.includes('"api"') && !line.includes('"auth"')), calls.join("\n"));
+});
+
+test("COL-02/05: local collector doctor reports source and never probes GitHub", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-collector-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const log = join(root, "gh.log");
+  const out = await doctor({ probe: false, args: ["--connect", "local"],
+    env: { XDG_CONFIG_HOME: root, GH_GLANCE_FIXTURE_LOG: log } });
+  assert.match(out, /^source\s+local collector$/m);
+  assert.match(out, /Local collector\n---------------/);
+  assert.match(out, /^socket\s+not running$/m);
+  assert.match(out, /^fallback\s+disabled$/m);
+  const calls = readFileSync(log, "utf8").trim().split("\n").filter(Boolean);
+  assert.ok(calls.every((line) => !line.includes('"api"') && !line.includes('"auth"')));
+});
+
+test("SSH-03/07: SSH collector doctor is local-only and reports no fallback", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-ssh-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const log = join(root, "gh-calls.log");
+  const out = await doctor({ probe: false, args: ["--connect", "ssh:studio", "--repo", "acme/widget"],
+    env: { XDG_CONFIG_HOME: root, GH_GLANCE_FIXTURE_LOG: log } });
+  assert.match(out, /source\s+SSH collector/);
+  assert.match(out, /SSH collector[\s\S]*alias\s+studio[\s\S]*fallback\s+disabled/);
+  const calls = existsSync(log) ? readFileSync(log, "utf8") : "";
+  assert.doesNotMatch(calls, /\bapi\b|graphql|actions\/runs/);
+});
+
+test("OBS-03: doctor reports corrupt acquisition metadata instead of healthy zeros", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-corrupt-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const path = acquisitionStorePath({ env: { XDG_CONFIG_HOME: root } });
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, "{not-json\n");
+  const out = await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } });
+  assert.match(out, /^status\s+corrupt$/m);
+  assert.doesNotMatch(out, /^status\s+healthy$/m);
+});
+
+test("OBS-03: doctor rejects malformed or unreconciled uncertainty metadata", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-receipts-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const engine = createAcquisitionEngine({ pathOptions: { env: { XDG_CONFIG_HOME: root } } });
+  t.after(() => engine.close());
+  const subscribed = engine.subscribe({
+    host: "github.com",
+    repositoryId: "R_RECEIPT",
+    repository: "acme/widget",
+    accessKey: "a".repeat(64),
+    targetKey: "doctor-receipt",
+    resource: "actions",
+    queryVersion: 2,
+    filters: {},
+    pageSize: 60,
+    cursorGeneration: "first",
+  }, { active: true, floorMs: 5_000 });
+  const claim = await engine.refresh(subscribed.value.id, { force: true });
+  await engine.refresh(subscribed.value.id, { started: {
+    ...claim.value,
+    receipt: {
+      reservationId: "reservation:doctor",
+      accessKey: "a".repeat(64),
+      epochs: { core: "core:doctor" },
+    },
+  } });
+  const path = acquisitionStorePath({ env: { XDG_CONFIG_HOME: root } });
+  const persisted = JSON.parse(readFileSync(path, "utf8"));
+  const receiptId = Object.keys(persisted.uncertainReceipts)[0];
+
+  const malformed = structuredClone(persisted);
+  malformed.uncertainReceipts[receiptId].units = 0;
+  writeFileSync(path, JSON.stringify(malformed));
+  assert.match(await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } }), /^status\s+corrupt$/m);
+
+  const mismatched = structuredClone(persisted);
+  mismatched.metrics.uncertainCoreUnits += 1;
+  writeFileSync(path, JSON.stringify(mismatched));
+  assert.match(await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } }), /^status\s+corrupt$/m);
+
+  const numericClaimId = structuredClone(persisted);
+  const receipt = numericClaimId.uncertainReceipts[receiptId];
+  delete numericClaimId.uncertainReceipts[receiptId];
+  receipt.id = "0";
+  numericClaimId.uncertainReceipts["0"] = receipt;
+  const queryRecord = Object.values(numericClaimId.queries)[0];
+  queryRecord.claim.receiptIds = [0];
+  writeFileSync(path, JSON.stringify(numericClaimId));
+  assert.match(await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } }), /^status\s+corrupt$/m);
+});
+
+test("OBS-02: --doctor --probe keeps the bounded admitted endpoint report", async () => {
+  const out = await doctor();
   assert.match(out, /^ {2}Repository access$/m);
   // One block per diagnostic request, including the bounded Security priority lanes.
   assert.equal(out.match(/^ {2}classified {2}/gm)?.length, 11, out);

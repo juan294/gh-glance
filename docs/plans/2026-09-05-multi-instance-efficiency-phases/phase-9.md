@@ -14,7 +14,7 @@ Public syntax is `gh-glance --connect ssh:<alias> --repo [host/]owner/name`; ali
 ```text
 transport = spawn('ssh', [
   '-T', '-o', 'BatchMode=yes', '-o', 'ClearAllForwardings=yes',
-  '--', validatedAlias, 'gh-glance --collector-stdio'
+  '-o', 'ForwardAgent=no', '--', validatedAlias, 'gh-glance --collector-stdio'
 ])
 handshake protocol 1 over stdio
 subscribe using local-resolved explicit host/repo identity
@@ -27,7 +27,7 @@ on reconnect:
   handshake new epoch, resubscribe once, request current snapshot
 ```
 
-The fixed remote command is the only remote shell string. Do not disable host-key checking or install keys. Batch mode avoids interactive SSH prompts inside the dashboard. Redact/bound stderr, show a concise connection remedy, and preserve terminal lifecycle. Cancellation kills only the owned SSH child, never a shared collector. No automatic remote installation, upgrade or collector startup.
+The fixed remote command is the only remote shell string. Do not disable host-key checking or install keys. Batch mode avoids interactive SSH prompts inside the dashboard; forwarding and agent forwarding are disabled. Redact/bound stderr, show a concise connection remedy, and preserve terminal lifecycle. Cancellation kills only the owned SSH child, never a shared collector. No automatic remote installation, upgrade or collector startup.
 
 Server GitHub credentials/provider and repository allowlist govern access. Clients never forward local tokens, keys, `GH_*` values, config directories or credential hashes. Requested host/repository must match collector policy. The UI reports the configured collector/source, so remote account choice is not silently assumed to match the client machine's `gh` login. Failure diagnosis uses collector evidence and local SSH connection status.
 
@@ -53,6 +53,6 @@ No real network is required for implementation acceptance. A documented activati
 
 ## Completion
 
-- [ ] SSH transport, reconnect, age handling and client-local opening implemented.
-- [ ] SSH scenarios and parent local gates passed.
-- [ ] Independent compliance/quality review complete; integrated locally; stop.
+- [x] SSH transport, reconnect, age handling and client-local opening implemented.
+- [x] SSH scenarios and parent local gates passed.
+- [x] Independent compliance/quality review complete; integrated locally; stop.

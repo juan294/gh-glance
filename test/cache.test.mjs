@@ -20,6 +20,8 @@ import {
   nextSecurityRaw,
   saveDashboardCache,
   serializeDashboardCache,
+  collectorCachedSourceAge,
+  sshCollectorCacheIdentity,
 } from "../index.mjs";
 
 function withTemporaryRoot(run) {
@@ -104,6 +106,24 @@ test("dashboard cache path shares the private gh-glance config directory", () =>
   });
 });
 
+test("SSH-06: remote source evidence round-trips under collector identity", () => {
+  withTemporaryRoot((root) => {
+    const target = dashboardCacheTarget({ repo: "acme/widget", host: "github.com",
+      account: sshCollectorCacheIdentity("studio") });
+    const source = { kind: "ssh", collector: sshCollectorCacheIdentity("studio"),
+      serverEpoch: "11111111-1111-4111-8111-111111111111",
+      lastSuccessAt: NOW - 5_000, lastChangedAt: NOW - 10_000,
+      ageMs: 5_000, clientCheckpointAt: NOW };
+    const cache = cacheFor(target, { actions: { ...actionsTab(), lastOk: source.lastSuccessAt, source } });
+    const path = cachePath(root);
+    assert.equal(saveDashboardCache(path, cache).ok, true);
+    const loaded = loadDashboardCache(path, target).entry.tabs.actions;
+    assert.deepEqual(loaded.source, source);
+    assert.equal(collectorCachedSourceAge(loaded, NOW + 2_000), 7_000);
+    assert.equal(collectorCachedSourceAge(loaded, NOW - 2_000), 5_000);
+  });
+});
+
 test("missing, corrupt, and future dashboard caches return no entry without throwing", () => {
   withTemporaryRoot((root) => {
     const path = cachePath(root);
@@ -169,7 +189,7 @@ test("valid dashboard data round-trips by target and tab", () => {
 test("dashboard cache bounds recent targets and rows", () => {
   withTemporaryRoot((root) => {
     const path = cachePath(root);
-    const targets = Array.from({ length: 6 }, (_, index) =>
+    const targets = Array.from({ length: 33 }, (_, index) =>
       dashboardCacheTarget({ repo: `acme/repo-${index}`, host: "github.com", cwd: root }),
     );
     const cache = Object.fromEntries(
@@ -194,7 +214,7 @@ test("dashboard cache bounds recent targets and rows", () => {
 
     assert.equal(saveDashboardCache(path, cache).ok, true);
     const document = JSON.parse(readFileSync(path, "utf8"));
-    assert.equal(Object.keys(document.targets).length, 5);
+    assert.equal(Object.keys(document.targets).length, 32);
     assert.equal(Object.hasOwn(document.targets, targets[0]), false);
     assert.equal(document.targets[targets.at(-1)].tabs.actions.data.length, 60);
     assert.equal(document.targets[targets.at(-1)].tabs.actions.meta.truncated, true);

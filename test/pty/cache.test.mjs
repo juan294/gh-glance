@@ -66,6 +66,12 @@ try {
     }
   }
   writeFileSync(cachePath, `${JSON.stringify(document, null, 2)}\n`, "utf8");
+  // This case exercises migration from the display cache specifically. A
+  // Phase 6 acquisition snapshot carries its own paired freshness clocks and
+  // would correctly supersede the artificially aged display-cache entry.
+  const acquisitionPath = join(configHome, "gh-glance", "coordination-v2", "acquisition.json");
+  rmSync(acquisitionPath, { force: true });
+  rmSync(`${acquisitionPath}.snapshots`, { recursive: true, force: true });
 
   recovered = capture({
     cols: 80,

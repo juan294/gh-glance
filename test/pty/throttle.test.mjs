@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   GOVERNOR_PHASE_WINDOW_MS,
+  loadAcquisitionStore,
   resourceDecision,
   resourceReserve,
   tabRequestCost,
@@ -52,6 +53,9 @@ function fixture(t, overrides = {}) {
       const name = readdirSync(directory).find((entry) => /^quota-[a-f0-9]{64}\.json$/.test(entry));
       return JSON.parse(readFileSync(join(directory, name), "utf8"));
     },
+    readAcquisition: () => loadAcquisitionStore(
+      join(root, "gh-glance", "coordination-v2", "acquisition.json"),
+    ).value,
   };
 }
 
@@ -235,7 +239,7 @@ test("a held core resource leaves both GraphQL tabs usable", async (t) => {
   assert.ok(graphqlStarts(state, "pulls.page").length >= 1, "pull requests did not progress");
 });
 
-test("a real reset gets one fresh probe then one phased active request per pane", async (t) => {
+test("a real reset gets one fresh probe then one shared active acquisition", async (t) => {
   const box = fixture(t, {
     anchorAtFirstProbe: true,
     createdAt: null,
@@ -258,8 +262,13 @@ test("a real reset gets one fresh probe then one phased active request per pane"
     args: "--refresh 40",
     stdin:
       "i=0; while [ ! -f \"$GH_GLANCE_FIXTURE_READY\" ] && [ \"$i\" -lt 1200 ]; do " +
-      "sleep .1; i=$((i + 1)); done; printf q",
-    env: { GH_GLANCE_FIXTURE_READY: readyPath },
+      "sleep .1; i=$((i + 1)); done; " +
+      "i=0; while ! grep -q 'ci: pin actions' \"$GH_GLANCE_CAPTURE_OUT\" 2>/dev/null " +
+      "&& [ \"$i\" -lt 100 ]; do sleep .1; i=$((i + 1)); done; printf q",
+    env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+      GH_GLANCE_FIXTURE_READY: readyPath,
+    },
   });
   // The reset publication is core's own observation -- it is what reopens the
   // core lane. Independent claims land it *before* the GraphQL observer that
@@ -291,13 +300,14 @@ test("a real reset gets one fresh probe then one phased active request per pane"
     ? ACTIONS_CORE_COST / resetDecision.callsPerMs
     : null;
   const progressDeadline = Number.isFinite(laneInterval)
-    ? publishedCore.observedAt + GOVERNOR_PHASE_WINDOW_MS + 2 * laneInterval + 40_000
+    ? publishedCore.observedAt + GOVERNOR_PHASE_WINDOW_MS + laneInterval + 40_000
     : Date.now();
   const progress = Number.isFinite(laneInterval)
     ? await observeUntil(
-      box.read,
-      (state) => new Set(actionsRuns(state).map((event) => event.pane)).size >= 3 &&
-        dataStarts(state).length >= 3 * ACTIONS_CORE_COST,
+      () => ({ state: box.read(), acquisition: box.readAcquisition() }),
+      ({ state, acquisition }) => actionsRuns(state).length >= 1 &&
+        dataStarts(state).length >= ACTIONS_CORE_COST && state.dataActive === 0 &&
+        Object.values(acquisition.queries).some((record) => record.snapshot?.rows?.length > 0),
       progressDeadline,
     )
     : null;
@@ -313,7 +323,7 @@ test("a real reset gets one fresh probe then one phased active request per pane"
       reservation.notBefore >= publishedCore.observedAt)
     .sort((left, right) => left.notBefore - right.notBefore);
   writeFileSync(readyPath, "ready\n", { mode: 0o600 });
-  await captures;
+  const results = await captures;
 
   const state = box.read();
   const probes = starts(state, "api").filter((event) => event.graphqlOperation === "graphql.observer");
@@ -326,32 +336,27 @@ test("a real reset gets one fresh probe then one phased active request per pane"
   assert.ok(publication?.matched, "the reset budget publication was not observed");
   assert.ok(resetProbe?.matched, "the core reset did not make the GraphQL observer due");
   assert.equal(resetDecision?.mode, "open", "reset publication did not reopen the core lane");
-  assert.equal(progress?.matched, true, `three panes missed the reset horizon ${progressDeadline}`);
+  assert.equal(progress?.matched, true, `the shared acquisition missed the reset horizon ${progressDeadline}`);
   assert.ok(probes.length >= 2, `expected reset probe, got ${probes.length}`);
-  assert.equal(runs.length, 3, `expected one active request per pane, got ${runs.length}`);
-  assert.equal(new Set(runs.map((event) => event.pane)).size, 3);
+  assert.equal(runs.length, 1, `expected one shared active request, got ${runs.length}`);
   assert.equal(dataStarts(state).length, runs.length * ACTIONS_CORE_COST,
     "background work joined the reset phase");
+  for (const result of results) {
+    assert.match(result.raw, /ci: pin actions/,
+      "a reset follower never rendered the shared Actions rows");
+  }
   assert.ok(publishedCore.observedAt <= runs[0].at, "data raced the reset publication");
   assert.equal(state.maxDataConcurrency, 1, "governed Actions batches overlapped");
-  assert.equal(plannedReservations.length, 3, "reset reservations were not retained before teardown");
-  for (let index = 1; index < plannedReservations.length; index += 1) {
-    assert.ok(
-      plannedReservations[index].notBefore - plannedReservations[index - 1].notBefore >=
-        laneInterval - schedulingTolerance,
-      `reset slots escaped the ${laneInterval}ms lane: ${JSON.stringify(plannedReservations)}`,
-    );
-  }
-  for (let index = 0; index < runs.length; index += 1) {
-    assert.ok(runs[index].at >= plannedReservations[index].notBefore - schedulingTolerance,
-      `reset request started before its due slot: ${JSON.stringify({
-        run: runs[index],
-        reservation: plannedReservations[index],
-      })}`);
-  }
+  assert.equal(plannedReservations.length, 1, "the shared reset reservation was not retained before teardown");
+  assert.equal(plannedReservations[0].status, "completed", "the shared reset request settled more than once");
+  assert.ok(runs[0].at >= plannedReservations[0].notBefore - schedulingTolerance,
+    `reset request started before its due slot: ${JSON.stringify({
+      run: runs[0],
+      reservation: plannedReservations[0],
+    })}`);
 });
 
-test("twelve panes share probe ownership and start bounded phased work", async (t) => {
+test("twelve panes share probe and acquisition ownership within the policy horizon", async (t) => {
   const box = fixture(t, { delayMs: 40 });
   const readyPath = join(box.root, "healthy-ready");
   const setup = box.read();
@@ -368,17 +373,23 @@ test("twelve panes share probe ownership and start bounded phased work", async (
     },
     resource: "core",
     nowMs: setup.createdAt,
-    cost: 2,
+    cost: ACTIONS_CORE_COST,
     chargedCost: 0,
   });
   const laneInterval = ACTIONS_CORE_COST / decision.callsPerMs;
   const captures = capturePanes(12, box, "pane", {
     signal: "none",
     settle: 35,
+    args: "--refresh 300",
     stdin:
       "i=0; while [ ! -f \"$GH_GLANCE_FIXTURE_READY\" ] && [ \"$i\" -lt 500 ]; do " +
-      "sleep .1; i=$((i + 1)); done; printf q",
-    env: { GH_GLANCE_FIXTURE_READY: readyPath },
+      "sleep .1; i=$((i + 1)); done; " +
+      "i=0; while ! grep -q 'ci: pin actions' \"$GH_GLANCE_CAPTURE_OUT\" 2>/dev/null " +
+      "&& [ \"$i\" -lt 100 ]; do sleep .1; i=$((i + 1)); done; printf q",
+    env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+      GH_GLANCE_FIXTURE_READY: readyPath,
+    },
   });
 
   const publicationResult = await observeUntil(
@@ -405,15 +416,17 @@ test("twelve panes share probe ownership and start bounded phased work", async (
     processStartMarginMs;
   const progress = publication && registeredGovernor
     ? await observeUntil(
-      box.read,
-      (state) => new Set(actionsRuns(state).map((event) => event.pane)).size >= 2,
+      () => ({ state: box.read(), acquisition: box.readAcquisition() }),
+      ({ state, acquisition }) => actionsRuns(state).length >= 1 &&
+        Object.values(acquisition.queries).some((record) =>
+          record.query.resource === "actions" && record.snapshot?.rows?.length > 0),
       progressHorizonAt,
     )
     : null;
   const preReleaseState = box.read();
   const fixtureLockArtifacts = readFixtureLockArtifacts(box.root);
   writeFileSync(readyPath, "ready\n", { mode: 0o600 });
-  await captures;
+  const results = await captures;
 
   const state = box.read();
   const governor = box.readGovernor();
@@ -423,9 +436,7 @@ test("twelve panes share probe ownership and start bounded phased work", async (
     publicationAt,
     progressHorizonAt,
     laneInterval,
-    progressObserved: Boolean(progress?.matched && new Set(
-      actionsRuns(progress.value).map((event) => event.pane),
-    ).size >= 2),
+    progressObserved: Boolean(progress?.matched && actionsRuns(progress.value.state).length >= 1),
     preReleaseActive: preReleaseState.active,
     preReleaseEvents: preReleaseState.events,
     fixtureLockArtifacts,
@@ -445,16 +456,22 @@ test("twelve panes share probe ownership and start bounded phased work", async (
   assert.ok(publication, "the shared budget publication was not observed");
   assert.ok(registeredAts.length >= 2, "fewer than two live leases registered after publication");
   assert.ok(probes.length >= 1 && probes.length <= 2, `shared probes: ${probes.length}`);
-  assert.ok(runs.length >= 2, "fewer than two panes progressed within the policy horizon");
-  assert.ok(new Set(runs.map((event) => event.pane)).size > 1, "round-robin made no progress");
+  assert.equal(runs.length, 1, `duplicate panes started ${runs.length} Actions acquisitions`);
+  for (const result of results) {
+    assert.match(result.raw, /ci: pin actions/,
+      "a pane did not render the shared Actions generation");
+  }
+  const acquisition = box.readAcquisition();
+  const actionsQueries = Object.values(acquisition.queries)
+    .filter((record) => record.query.resource === "actions");
+  assert.equal(actionsQueries.length, 1, "duplicate panes retained multiple Actions queries");
+  assert.equal(actionsQueries[0].generation, 1, "the shared startup produced more than one generation");
+  const completedActions = Object.values(governor.reservations).filter((reservation) =>
+    reservation.costs.core === ACTIONS_CORE_COST && reservation.costs.graphql === 0 &&
+    reservation.status === "completed");
+  assert.equal(completedActions.length, 1, "the shared Actions generation did not settle exactly once");
   assert.equal(state.maxDataConcurrency, 1,
     `governed Actions batches overlapped: ${state.maxDataConcurrency}`);
-  for (let index = 1; index < runs.length; index += 1) {
-    assert.ok(
-      runs[index].at - runs[index - 1].at >= laneInterval - 250,
-      `data starts escaped lane pacing: ${JSON.stringify(runs.map(({ at, pane }) => ({ at, pane })))}`,
-    );
-  }
 });
 
 test("twelve held panes share one block probe instead of retrying per pane", async (t) => {

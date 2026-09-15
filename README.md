@@ -25,10 +25,10 @@ without switching to the browser.
 ╭─ Actions · owner/repo ──────────────────────────────────────────────────╮
 │     TITLE                  │WORKFLOW  │BRANCH        │TIME   │UPDATED   │
 │ ─────────────────────────────────────────────────────────────────────── │
-│ >+  ci: pin actions to com… #443 CI    develop        1m20s   28d ago   │
-│  x  fix: restore the prima… #442 Code… develop        1m28s   28d ago   │
-│  +  chore: bump dependenci… #441 CI    dependa…int-10 30s     28d ago   │
-│  -  docs: update the readme #440 CI    develop        15s     29d ago   │
+│ >+  ci: pin actions to com… #443 CI    develop        1m20s   44d ago   │
+│  x  fix: restore the prima… #442 Code… develop        1m28s   44d ago   │
+│  +  chore: bump dependenci… #441 CI    dependa…int-10 30s     44d ago   │
+│  -  docs: update the readme #440 CI    develop        15s     45d ago   │
 │                                                                         │
 │                                                                         │
 ╰──────────────────────────────────────────────────────────────── 4 of 4 ─╯
@@ -124,9 +124,10 @@ current.
 npm install -g gh-glance
 ```
 
-That is the whole install. `gh-glance` ships as a single `index.mjs` with no
-build step, so there is nothing to compile and nothing to configure -- the
-package is the source you can read in this repository.
+That is the whole install for the default standalone dashboard. `gh-glance`
+ships as a single `index.mjs` with no build step, so there is nothing to
+compile. The optional collector, SSH, webhook, and GitHub App modes use the
+explicit configuration described below.
 
 The installed package is a CLI, not a JavaScript library. The `gh-glance`
 executable is supported; package-root and deep imports are intentionally
@@ -141,9 +142,9 @@ page](https://www.npmjs.com/package/gh-glance) shows the exact source.
 
 ### First run
 
-`gh-glance` uses the credentials and active account already selected by your
-local `gh` CLI. It does not request, inspect, or store the token itself. Check
-that account before starting the dashboard:
+The default standalone dashboard uses the credentials and active account
+already selected by your local `gh` CLI. It does not persist or display the
+token. Check that account before starting the dashboard:
 
 ```bash
 gh auth status
@@ -323,8 +324,225 @@ pane definition. Flags are there when you want them:
 | `--background <mode>` | `all` (default) or `off`. `off` never requests data for a tab you are not looking at. Its count keeps the last known value and ages visibly, and switching to the tab fetches it. |
 | `--verbose` | Log one line per dashboard `gh` call to stderr, with timing and outcome. Credential lookup and the account-identity proof are deliberately excluded, so that they cannot log anything derived from a token. stderr must be redirected: `gh-glance --verbose 2>gh-glance.log`. |
 | `--doctor` | Print a diagnostic report and exit. See [Diagnostics](#diagnostics). |
+| `--doctor --probe` | Add bounded, admitted GitHub capability probes to the local diagnostic report. |
+| `--serve --config <path>` | Run the optional local collector in the foreground from a private, versioned JSON allowlist. |
+| `--connect local` | Subscribe the dashboard to the current OS user's collector. No GitHub request runs in the client process. |
+| `--connect ssh:<alias>` | Subscribe through the named SSH config alias. The client starts only the fixed remote collector bridge and never falls back to local GitHub acquisition. |
+| `--collector-stdio` | Bridge bounded newline JSON on stdin/stdout to an already running local collector. |
 
 An unrecognised flag exits 2 rather than being ignored, so a typo fails loudly.
+
+### Optional local collector
+
+The collector is opt-in and stays in the foreground. It is supported on macOS
+and Linux. Windows continues to support the standalone dashboard, but rejects
+collector hosting and bridge modes. The endpoint is always
+`collector-v1.sock` inside gh-glance's private config directory; there is no TCP
+dashboard/client transport or custom socket flag. The optional loopback webhook
+ingress described below is the only HTTP listener.
+
+Create a mode-0600 configuration file:
+
+```json
+{
+  "version": 1,
+  "providers": {
+    "personal": { "type": "gh", "host": "github.com" }
+  },
+  "targets": [
+    { "host": "github.com", "repo": "owner/repository", "provider": "personal" }
+  ]
+}
+```
+
+Then run the service and dashboard in separate terminals:
+
+```sh
+gh-glance --serve --config ~/.config/gh-glance/collector.json
+gh-glance --connect local --repo owner/repository
+```
+
+Providers use the server OS user's existing host-specific `gh` login. Clients
+select only an allowlisted `(host, repo)` pair and cannot submit credentials,
+providers, API paths, queries, commands, or filesystem paths. Renamed aliases
+that resolve to one repository cannot cross provider ownership. Disconnecting
+keeps last-known-good rows and their source age, then reconnects to a new server
+epoch without silently falling back to standalone polling.
+
+#### Optional GitHub App provider
+
+The default `gh` provider above is unchanged. A collector can instead opt in to
+one GitHub App installation. gh-glance does not create or register the App,
+install it, grant permissions, or generate its private key. Put the existing
+PEM key in an absolute, current-user-owned mode-0600 file and name every allowed
+repository ID and read permission explicitly:
+
+```json
+{
+  "version": 1,
+  "providers": {
+    "automation": {
+      "type": "github-app",
+      "host": "github.com",
+      "clientId": "Iv1.example",
+      "installationId": 123456,
+      "privateKeyFile": "/absolute/private/path/github-app.pem",
+      "repositoryIds": [123456789],
+      "permissions": {
+        "metadata": "read",
+        "actions": "read",
+        "issues": "read",
+        "pull_requests": "read",
+        "vulnerability_alerts": "read",
+        "security_events": "read",
+        "secret_scanning_alerts": "read"
+      }
+    }
+  },
+  "targets": [
+    { "host": "github.com", "repo": "owner/repository", "provider": "automation" }
+  ]
+}
+```
+
+`metadata`, `actions`, `issues`, and `pull_requests` are required for the four
+collector tabs. The three Security permissions are independent and optional:
+
+| Security surface | Configuration permission |
+|---|---|
+| Dependabot alerts | `vulnerability_alerts: read` |
+| Code scanning alerts | `security_events: read` |
+| Secret scanning alerts | `secret_scanning_alerts: read` |
+
+An omitted Security permission produces an explicit unavailable capability for
+that source without disabling the other tabs or permitted Security sources.
+The collector signs a short-lived JWT locally, requests only the configured
+repositories and permissions, and keeps the installation token in memory. Data
+still travels through `gh api`; the selected token is supplied only in that
+child's environment. Token refresh, failure, or expiry never falls back to the
+server user's personal `gh` credential. Configuration changes require a
+collector restart. Installation deletion, suspension, and repository removal
+webhooks fence old data when webhook ingress is also enabled.
+
+#### Optional webhook invalidation
+
+Webhook ingress is disabled unless the collector configuration contains an
+enabled `webhook` object. It listens only on the configured loopback address and
+fixed `/webhooks/github` route. Exposing that route requires a user-managed
+HTTPS reverse proxy; gh-glance does not create a public listener, register a
+GitHub webhook, or manage proxy/TLS infrastructure.
+
+Create a separate mode-0600 secret file with no trailing newline, then add the
+exact repositories and resource families covered by the GitHub webhook:
+
+```json
+{
+  "version": 1,
+  "providers": {
+    "personal": { "type": "gh", "host": "github.com" }
+  },
+  "targets": [
+    { "host": "github.com", "repo": "owner/repository", "provider": "personal" }
+  ],
+  "webhook": {
+    "enabled": true,
+    "address": "127.0.0.1",
+    "port": 8787,
+    "secretFile": "/absolute/private/path/webhook-secret",
+    "targets": [
+      {
+        "host": "github.com",
+        "repo": "owner/repository",
+        "provider": "personal",
+        "resources": ["actions", "issues", "prs", "security"]
+      }
+    ]
+  }
+}
+```
+
+Configure GitHub to send JSON payloads and select only the events needed for
+the covered resources: `workflow_run`/`workflow_job` for Actions, `issues` and
+issue comments for Issues, pull requests/reviews/review comments/review threads
+and PR issue comments for PRs, and the supported Dependabot, repository
+vulnerability, code-scanning, and secret-scanning alert events for Security.
+Installation and repository-access events fence permissions. Event availability
+depends on the target GitHub host. The collector verifies the SHA-256 signature
+over the exact request bytes before parsing, persists only delivery IDs and
+compact invalidations, and returns 202 only after durable acceptance. The
+listener buffers at most 25 MiB per request and 50 MiB across concurrent
+requests; aggregate pressure returns 503 so GitHub or the proxy can retry. A
+local signed-delivery check can use the same payload bytes and secret to POST
+`Content-Type: application/json`, `X-GitHub-Event`, `X-GitHub-Delivery`, and
+`X-Hub-Signature-256: sha256=<hex digest>` to
+`http://127.0.0.1:8787/webhooks/github`.
+
+For example, with the collector running and the paths adjusted locally:
+
+```sh
+printf '%s' '{"action":"opened","repository":{"full_name":"owner/repository"},"issue":{"number":1}}' > /tmp/gh-glance-hook.json
+signature=$(node --input-type=module - /absolute/private/path/webhook-secret /tmp/gh-glance-hook.json <<'NODE'
+import { createHmac } from "node:crypto";
+import { readFileSync } from "node:fs";
+const [, , secretPath, bodyPath] = process.argv;
+process.stdout.write(createHmac("sha256", readFileSync(secretPath)).update(readFileSync(bodyPath)).digest("hex"));
+NODE
+)
+curl -i --data-binary @/tmp/gh-glance-hook.json \
+  -H 'Content-Type: application/json' \
+  -H 'X-GitHub-Event: issues' \
+  -H 'X-GitHub-Delivery: 11111111-1111-4111-8111-111111111111' \
+  -H "X-Hub-Signature-256: sha256=$signature" \
+  http://127.0.0.1:8787/webhooks/github
+```
+
+The expected response is 202. Repeating the same delivery ID is acknowledged
+without scheduling duplicate work.
+
+Webhook events only request an ordinary governed GitHub refresh. They never
+become rows or freshness evidence, and they do not bypass quota or secondary
+cooldowns. After two validated unchanged observations, covered quiet resources
+reconcile at least every
+`max(--refresh, 300 seconds)`; Actions with running work keep their fast cadence,
+and manual refresh remains available. Missing deliveries therefore delay an
+update until reconciliation instead of disabling polling.
+
+### Optional SSH collector client
+
+An SSH client connects to a collector already running under your account on a
+computer you control. Configure the host, user, port, key, jump host, and host
+trust in `~/.ssh/config`; the CLI accepts only a simple alias:
+
+```sh
+# On the collector computer
+gh-glance --serve --config ~/.config/gh-glance/collector.json
+
+# On a client computer, after normal ssh host-key/key setup
+gh-glance --connect ssh:my-collector --repo owner/repository
+```
+
+The client runs exactly `ssh -T -o BatchMode=yes -o ClearAllForwardings=yes -o
+ForwardAgent=no -- <alias> 'gh-glance --collector-stdio'`. It does not disable host-key checking,
+install software or keys, start the collector, create forwarding, or send the
+repository through a shell command. `gh-glance` must already be on the remote
+login's `PATH`, and the collector must already be running there.
+
+Local `GH_*`, `GITHUB_*`, `GH_CONFIG_DIR`, and `XDG_CONFIG_HOME` values are not
+given to the SSH child. Repository rows arrive through the same bounded protocol
+as a local client. A disconnect keeps them visible as `Disconnected` and retries
+after a bounded 1, 2, 4, 8, 16, then 30-second ladder with jitter. A new server
+epoch resubscribes once; old epoch/generation frames cannot overwrite it.
+
+Remote snapshots carry the source observation time and collector wall time.
+The client persists the resulting conservative age under a private digest of
+the SSH alias plus target. Reconnect, receipt time, a backward local clock, and
+a cold offline restart cannot make the same observation look younger. A newer
+successful source observation can reset the age. Pressing `Enter` still opens a
+validated HTTPS target URL on the client computer and makes no GitHub API call.
+
+`gh-glance --connect ssh:my-collector --repo owner/repository --doctor` is a
+local-only report of the selected source and disabled fallback. Live endpoint
+probes are intentionally rejected for collector clients.
 
 Environment variables work too, and the flags take precedence:
 
@@ -332,7 +550,7 @@ Environment variables work too, and the flags take precedence:
 |---|---|
 | `GH_REPO=[host/]owner/name` | Watch a specific repository instead of the current directory's. A qualified value supplies the host; an unqualified value means `github.com`. An explicit `--repo` wins. |
 | `GH_HOST=<host>` | When no explicit `--repo` overrides it, send every call and the account governor to a GitHub Enterprise or EMU host instead of `github.com`. |
-| `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN` | Used by `gh`. gh-glance never logs or stores these values, but hashes each set value locally as part of the account-scoped cache and governor namespaces so panes with different credentials cannot share rows or admission. The raw values are not written to disk. |
+| `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN` | Used by the default `gh` provider with `gh`'s host-specific precedence. gh-glance never logs or stores the raw values. One-way credential digests keep private rows access-partitioned; credentials GitHub verifies as the same principal share its quota ledger. App-provider children remove these variables before setting their memory-only installation token. |
 | `GH_CONFIG_DIR` | Selects `gh`'s account configuration and contributes its normalized identity to the cache and governor namespaces. Separate values can isolate simultaneous panes on different accounts; see [No account pinning](#limitations). |
 | `GH_GLANCE_REFRESH=<seconds>` | Minimum active-tab poll interval, 2-3600. Sets the floor for every pane in a shell; `--refresh` takes precedence. See [Rate limit](#rate-limit). |
 | `GH_GLANCE_ICONS=unicode` | Unicode status glyphs and single-cell text substitutes for Nerd Font row icons |
@@ -376,13 +594,15 @@ $XDG_CONFIG_HOME/gh-glance/dashboard-cache.json
 ~/.config/gh-glance/dashboard-cache.json
 ```
 
-The cache is scoped to the repository, host, and effective `gh` account
-namespace. In inferred mode, the host and current working directory also form
-the identity, so rows from one checkout or credential context cannot appear in
-another. The namespace uses `GH_CONFIG_DIR`/`hosts.yml` identity plus one-way
-digests of supported token environment variables; raw credentials are never
-stored. It retains at most five recent targets and 60 rows per tab; a shortened
-cached tab keeps its `+` marker rather than presenting the saved count as exact.
+The cache is scoped to the repository, host, provider, and effective access
+partition. In inferred standalone mode, the host and current working directory
+also form the identity, so rows from one checkout or credential context cannot
+appear in another. Human-provider access includes one-way digests of the
+selected credential and its authorization generation; App-provider access also
+binds the configured repository and permission restrictions. Raw credentials
+are never stored. It retains at most 32 recent targets and 60 rows per tab; a
+shortened cached tab keeps its `+` marker rather than presenting the saved count
+as exact.
 
 Only successfully parsed, non-blind observations replace saved rows. A failed
 request can add a live error or `?` marker, but it cannot turn known Security
@@ -486,30 +706,38 @@ It will not claim a feature is "not enabled" because of a lapse.
 gh-glance --doctor > report.txt
 ```
 
-Collects, in one plain-text block: the `gh-glance`, Node and `gh` versions;
-which hosts `gh` is authenticated for; how the repository target resolved and
-from where; your remaining REST and GraphQL budget plus the configuration's
-unpaced cost projection; shared governor health; the relevant environment
-variables; a read-only `Repository access` probe; and each bounded dashboard
-probe, including the Security priority lanes, with the exact argv it sent, its
-outcome, and how any error was classified (`unavailable`, `rate-limited`,
-`auth-problem` or `other`).
+By default, doctor reads only local evidence. It reports the executable and
+configuration context, repository target, and shared-acquisition metrics and
+freshness without making a GitHub API request or resolving a credential. The
+acquisition section keeps the last successful observation, last payload change,
+next due time, current hold, active query/subscriber count, request outcomes,
+known charges, conservative outstanding charges, cache hits, joined followers,
+measured queue time, observer calls, and producer epoch separate. A joined
+follower is counted only when it waits on an existing producer generation; a
+cached subscription is a cache hit, not a coalesced request. Active queries are
+queries with a live subscriber. Retained queries remain listed as `cache-only`
+without inflating that count. Holds distinguish observer failure, primary and
+secondary limits, disconnected acquisition, shared producer waits, and local
+coordination.
 
-Doctor first makes one free `rate_limit` request to the effective host. It then
-uses an ephemeral governor lease and admits every quota-consuming endpoint at
-its exact declared cost. A probe whose safe slot is later, whose resource is
-held, or whose budget is unavailable is reported as `SKIPPED`; diagnostics do
-not bypass the reserve. The `API governor` section reports `healthy`, `waiting
-for probe`, `stale`, `blocked`, or `unavailable`, plus the number of live leases
-and each resource's remaining calls, hard reserve, and reset. It does not print
-the scope hash, account identity, state path, lock owner, or reservation IDs.
+Use `gh-glance --doctor --probe` when live capability evidence is needed. Probe
+mode uses an ephemeral governor lease and admits every quota-consuming endpoint
+at its exact declared cost. It includes the repository and bounded dashboard
+probes, including Security priority lanes, with the exact argv, outcome, and
+classification (`unavailable`, `rate-limited`, `auth-problem` or `other`). A
+probe whose safe slot is later, whose resource is held, or whose budget is
+unavailable is reported as `SKIPPED`; diagnostics do not bypass the reserve.
+The `API governor` section then reports its measured health and resource state.
+Neither mode prints scope hashes, account identity keys, state paths, lock
+owners, reservation IDs, response bodies, or credentials.
 
 The `Repository access` probe shows whether the target resolves for the active
 `gh` credentials. A failed GitHub resolution response cannot distinguish a
 nonexistent, renamed, or stale target from a private repository hidden from
 that identity.
 
-Add `--verbose` to get a log of every `gh` call it makes alongside the report.
+Add `--verbose` to probe mode to get a log of every `gh` call it makes alongside
+the report. Plain doctor has no GitHub API calls to log.
 
 It exits 0 and prints a report even when `gh` is missing or you are outside a
 git repository -- those are conditions worth reporting rather than failing on --
@@ -548,30 +776,24 @@ payload never counts as one: a tab that cannot be read is not a quiet tab. One
 inactive tab is considered per wake, in rotation, so three of them falling due
 together do not start together.
 
-The resources are independent. Actions and Security spend REST `core` calls;
-Issues and Pull Requests are sorted with `--search`, which routes them through
-GraphQL. The following table is the conservative demand before shared pacing,
-not a promise that the governor will start every listed request. At the default
-floor:
+The resources are independent. Actions and Security use REST `core`; Issues
+and Pull Requests use explicit GraphQL documents. The governor's declared costs
+are conservative admission bounds. They are not presented as fixed hourly
+charges because pagination, conditional REST 304 responses, quiet cadence,
+workflow-name fallback, capability backoff, and shared followers all change
+the actual result.
 
-| Visible tab | REST / hour | GraphQL / hour |
-|---|---|---|
-| Actions | ~192 quiet, up to ~792 | ~120 |
-| Issues or Pull Requests | ~102 | ~300 quiet, up to ~1,500 |
-| Security | ~390 quiet, up to ~4,350 | ~120 |
+Plain `--doctor` reports reconciled local acquisition totals: HTTP attempts,
+failed outcomes, REST 200/304 outcomes, proven actual core and GraphQL units,
+conservative outstanding units, and measured follower queue delay. Probe mode
+adds live governor evidence. These measured
+figures stay separate from the policy-derived `projected demand` range.
 
-The lower figure in each range is every tab at its quiet cadence; the upper is
-the active tab at its floor with Actions busy. `--doctor` prints the same range
-for the configuration you actually run, labelled `projected demand` to keep it
-distinct from the charges the governor section reports.
-
-Security is the most expensive. A repository whose newest alert pages are not
-full uses the three base endpoint calls and lands near 2,280 REST requests per
-hour. A full page activates bounded critical/high lanes for Dependabot and code
-scanning, raising the safe projection to about 4,440. Actions is not cheap
-either: one `gh run list` issues two REST requests. `gh-glance --doctor` reports
-this projection beside the server's actual REST and GraphQL budgets. Enterprise
-ceilings can differ from 5,000.
+Security can require the most REST work: each source starts with one newest
+page, and full pages can activate bounded critical/high lanes for Dependabot
+and code scanning. Actions normally requests its runs endpoint and admits a
+separate conditional workflow-catalog request only when displayed runs lack a
+known workflow name. Enterprise ceilings can differ from GitHub.com's.
 
 For each resource, gh-glance calculates 20% of the reported limit for other work:
 
@@ -590,11 +812,12 @@ clean probe can account for it. Missing, stale, corrupt, locked, or unwritable
 coordination denies the call instead of returning to five-second polling.
 
 Core observations come from real response headers, so the core reserve has a
-closed feedback loop. GraphQL is currently weaker: `gh issue` and `gh pr` do
-not expose response headers in their normal output, and the free `rate_limit`
-endpoint can remain unchanged while real GraphQL use rises. gh-glance therefore
-paces its declared local GraphQL work and fails closed on a missing or stale
-probe, but it cannot yet prove the account-wide GraphQL reserve.
+closed feedback loop. GraphQL uses explicit bounded queries whose envelopes
+report actual cost and counter evidence. One shared, separately accounted
+GraphQL observer establishes spendable capacity; the free `rate_limit` endpoint
+is diagnostic only and can never authorize or refund work. Missing or stale
+authoritative evidence fails closed rather than falling back to an inferred
+counter.
 
 One pane owns the free `rate_limit` probe for a control window and publishes it
 for the others. Manual and diagnostic work is considered before tab-switch,
@@ -620,16 +843,43 @@ age remains explicit through the `stale` label, and the rate-limit banner still
 describes the current failed request; cached data never turns a failure into a
 false success.
 
-The enforceable boundary is local admission from fresh, conservatively debited
-evidence. Another program can spend after the probe, and panes on another
-machine or in a different local account scope cannot share this file. GitHub
-does not offer an atomic global quota reservation. The token-wide counter still
-lets gh-glance measure external use and reduce future capacity, but the hard
-reserve is not a claim that unrelated consumers can never cross it.
+The enforceable boundary is admission from fresh, conservatively debited
+evidence. Another program can spend after the probe, and standalone panes in a
+different local account scope cannot share the same coordination file. Optional
+SSH clients can instead share the collector machine's one acquisition and quota
+scope while making zero client-side GitHub requests. GitHub does not offer an
+atomic global quota reservation. The account-wide counter still lets gh-glance
+measure external use and reduce future capacity, but the hard reserve is not a
+claim that unrelated consumers can never cross it.
 
 `GH_GLANCE_REFRESH=30` sets a wider floor for every pane in a shell; `--refresh`
 still wins per pane. A single pane on a healthy budget normally stays at its
 floor and shows Watching between checks.
+
+### Efficiency verification
+
+The repository includes an offline sustained-workload gate for the coordination
+contracts described above:
+
+```sh
+npm run test:efficiency
+npm run measure:efficiency
+```
+
+The deterministic test advances an injected clock through one simulated hour
+while using the production acquisition and governor machinery. It covers one,
+two, seven, and ten panes, duplicate and distinct repositories, and a 3+4 remote
+client split, with running and quiet CI, conditional responses, external spend,
+primary reset, secondary hold, producer loss, and an account switch. The fake
+SSH route invokes the real bridge and collector; no real GitHub account, App,
+webhook, or second computer is used.
+
+The measurement command reports operation-level HTTP outcomes, proven and
+uncertain quota, observer work, coalescing, queue delay, source-to-display
+percentiles, subprocesses, wall time, CPU, and RSS. A percentage is shown only
+when the candidate and baseline used a compatible workload, machine, platform,
+and runtime. Missing or incompatible baseline values stay labelled as such;
+fixture performance is not presented as live GitHub performance.
 
 ## Limitations
 
@@ -720,23 +970,23 @@ GH_GLANCE_ICONS=ascii gh-glance
 | `No GitHub remote found` | Press `Enter` to start `gh repo create`, then choose **Push an existing local repository**. Or press `q` and run `gh-glance --repo owner/name` to watch an existing repository without attaching this folder. |
 | `GitHub login or authorization required` | Run `gh auth status`. With no account, run `gh auth login`; with an expired authorization, run `gh auth refresh`; then press `R`, which also clears the endpoint backoff the failures accrued. |
 | `Repository not found or inaccessible to the active gh account` | The active identity cannot resolve the target. Check `gh auth status`, `git remote -v` or the explicit `--repo`, and use `gh auth switch` only if the wrong account is active. |
-| `GraphQL: Could not resolve to a Repository...` in older gh-glance versions | The response has the same ambiguity: a missing or renamed target, or a private repository not visible to the active account. Run `gh-glance --doctor`. |
-| Actions says `not available for this repository` while Repository access is `ok` | The repository resolved, but that endpoint is unavailable; inspect the corresponding doctor block. |
+| `GraphQL: Could not resolve to a Repository...` in older gh-glance versions | The response has the same ambiguity: a missing or renamed target, or a private repository not visible to the active account. Run `gh-glance --doctor --probe`. |
+| Actions says `not available for this repository` while Repository access is `ok` | The repository resolved, but that endpoint is unavailable; inspect the corresponding `--doctor --probe` block. |
 | Row icons are blank boxes | Your terminal font is not a Nerd Font. Use `GH_GLANCE_ICONS=unicode`. |
 | Security tab shows a "not enabled" note | Code scanning and secret scanning need GitHub Advanced Security. Dependabot alerts work independently. The note now appears only when the feature genuinely is unavailable: auth, SSO and network failures show the real error instead. |
 | `none of the git remotes ... point to a known GitHub host` | `gh` is not authenticated for that host. Run `gh auth login --hostname <host>`. |
 | Security tab empty on an enterprise host in an older gh-glance version | Older versions could route alert endpoints separately. Current gh-glance routes every API call and the governor to one effective host; use `--repo host/owner/name`, `GH_HOST`, or a qualified `GH_REPO`, then confirm the resolved host with `--doctor`. |
-| Tabs start failing after working for a while | The enterprise SAML session lapsed. Re-authorize in the browser; the dashboard recovers within about 30 seconds. Run `gh-glance --doctor` to confirm. |
+| Tabs start failing after working for a while | The enterprise SAML session lapsed. Re-authorize in the browser; the dashboard recovers within about 30 seconds. Run `gh-glance --doctor --probe` to confirm. |
 | A tab's count is red | That tab's last fetch failed. The error itself is shown when you switch to it, translated into what to do about it where `gh-glance` recognises the failure. |
-| Security tab shows `?` instead of a number | The alert endpoints could not be read at all -- an expired SAML session, a token without `security_events`, or an org OAuth restriction. `?` means "unknown", not "zero"; run `gh-glance --doctor` to see which probe failed and how it was classified. |
+| Security tab shows `?` instead of a number | The alert endpoints could not be read at all -- an expired SAML session, a token without `security_events`, or an org OAuth restriction. `?` means "unknown", not "zero"; run `gh-glance --doctor --probe` to see which probe failed and how it was classified. |
 | `Watching` with `next 2m` | The active tab has a shared budget probe or safe grant scheduled. The interval names this grant only; it is not a recurring polling interval. Pressing `r` raises safe priority but cannot bypass the lane or reserve. |
-| `Watching` with `sharing 4` | Four local panes share this account governor, and another pane owns the lane immediately ahead of this grant. This is pacing, not quota scarcity. |
+| `Shared` | This pane is using a generation acquired for matching local subscribers. This is coalescing, not quota scarcity. |
 | `Paused` with a reset time | The active tab's REST or GraphQL resource is at its reserve, exhausted, or under a shared rate-limit block. Wait for the stated reset/probe. Other tabs can continue when they use the healthy resource. |
 | `Paused` without a reset time | Budget or coordinator evidence is unknown, corrupt, locked, or unwritable. No data call is started. Run `gh-glance --doctor`; also check the config directory permissions and whether another live process owns its private lock. |
 | A failing tab seems to have stopped retrying | Recognized endpoint failures back off rather than re-spawning `gh` at the floor. Press `r` to request a higher-priority retry, or `R` to also clear the endpoint backoff; either way the retry waits for a safe grant, so the tab remains Watching or Paused. |
 | `unknown argument: -v` | `-v` used to mean `--version` and no longer does, because this CLI also has `--verbose`. Use `--version` or `--verbose` explicitly. |
-| Cached rows plus `Paused` and `stale 2m` | The rows came from the separate last-known-good dashboard cache, while the live request is blocked or unsafe. Stale age is not extended by a pause. The error and footer describe current coordination; cached data never means the live check succeeded. |
-| Repeated GitHub rate-limit messages | A classified rate-limit response is published as one shared resource block. Local panes make no data retry before that block's probe/reset deadline. Use `--doctor` to inspect the resource and reset; repeated manual refresh cannot override it. |
+| Cached rows plus `Paused`, `Stale`, or `Disconnected` | The rows are last-known-good data while the live source is blocked, overdue, or unavailable. A cache read never advances source success. The footer never calls stale or disconnected rows `Watching`. |
+| Repeated GitHub rate-limit messages | A classified rate-limit response is published as one shared resource block. Local panes make no data retry before that block's probe/reset deadline. Use `--doctor --probe` to inspect the live resource and reset; repeated manual refresh cannot override it. |
 | It exits immediately when piped | Intentional. It is a full-screen dashboard, not a reporting command. |
 | `Restart required: close older gh-glance panes` | A pane from an older release still holds a live lease in the previous coordination format, which this version cannot join. Quit those panes; this one resumes on its own. Nothing is killed for you, and no state needs deleting. |
 | `Upgrade waiting for legacy quota reset` | The older panes are gone, but left spend that cannot be proven settled. It waits for the affected rate-limit window to reset rather than assume the quota is free. This one has a deadline and clears itself. |

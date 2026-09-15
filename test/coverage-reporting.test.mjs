@@ -67,6 +67,7 @@ test('coverage workflow is exact-SHA, scheduled, manual, and fail-closed', () =>
   assert.match(workflow, /push:\s*\n\s+branches: \[develop\]/);
   assert.match(workflow, /schedule:\s*\n\s+- cron:/);
   assert.match(workflow, /workflow_dispatch:/);
+  assert.match(workflow, /timeout-minutes: 35/);
   assert.match(workflow, /npm run test:coverage/);
   assert.match(workflow, /COVERAGE_SECRET: \$\{\{ secrets\.COVERAGE_SECRET \}\}/);
   assert.match(workflow, /SOURCE_COMMIT_SHA: \$\{\{ github\.sha \}\}/);
@@ -86,6 +87,11 @@ test('coverage workflow reports PTY runtime visibility without a threshold gate'
   assert.match(workflow, /RUNTIME_COVERAGE_SUMMARY=runtime-coverage\.md/);
   assert.match(workflow, /GITHUB_STEP_SUMMARY/);
   assert.doesNotMatch(workflow, /test-coverage-(?:lines|branches|functions)=/);
+});
+
+test('instrumented unit coverage is serialized so latency contracts measure the product path', () => {
+  const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+  assert.match(pkg.scripts['test:coverage'], /--test-concurrency=1/);
 });
 
 test('reporter fails before networking when required provenance is absent', () => {

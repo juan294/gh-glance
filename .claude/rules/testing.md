@@ -27,4 +27,6 @@ the probe would have.
 Run checks sequentially, never as parallel Bash calls
 (hook enforced). Chain: `npm run lint ; npm test`
 There is no typecheck step -- do not invent one. Add `npm run test:pty`
-when touching rendering or the terminal lifecycle.
+when touching rendering or the terminal lifecycle. Add
+`npm run test:efficiency` when changing acquisition, scheduling, collector,
+or efficiency behavior; `npm test` excludes that sustained acceptance suite.

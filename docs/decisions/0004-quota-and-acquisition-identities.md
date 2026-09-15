@@ -153,3 +153,77 @@ a run's page is derived from the repository and its databaseId. Every URL is
 admitted before use -- https only, and only the host this pane is talking to --
 because a row is remote data, and an unadmitted `url` would let a crafted row
 point the user's browser anywhere or hand a `file:` URL to the platform opener.
+
+## Amendment: shared acquisition ownership (phase 6)
+
+The access identity now also partitions a private, file-backed acquisition
+store. Query identity includes host, admitted repository identity, resource,
+projection version, filters, page size, and cursor generation. Equivalent
+explicit and inferred repository names converge on the same conservative slug
+identity until admitted GitHub evidence provides a stable database ID; an
+unresolved alias is never guessed across targets.
+
+Each due query generation has one producer claim, identified by PID, nonce and
+generation. Claims live for 45 seconds and are heartbeated every ten seconds.
+Expiry is necessary but not sufficient for takeover: the local PID must also be
+confirmed dead. An inaccessible or suspended process retains ownership, while
+an explicit cancellation releases it. Publication checks nonce, generation and
+access partition, so an old completion cannot overwrite newer evidence.
+
+Claiming, governor admission, transport, settlement, and publication are
+separate operations. The acquisition lock is never held across GitHub I/O, and
+only the producer obtains and settles the quota reservation. Followers inspect
+generation metadata at most once per second, adopt validated snapshots, and do
+not fall back to their own request when coordination is busy or unwritable.
+
+The coordination file contains lightweight claim, subscription, generation and
+bounded-digest metadata. Sanitized parsed rows and each validator with the
+bounded validated body it governs live in private per-query artifacts. The
+artifact is complete before an atomic coordination-file replacement publishes
+its reference; followers inspect only metadata until the generation changes.
+A 304 advances `lastSuccessAt` while preserving `lastChangedAt`; a changed
+representation advances both. Persisted quota headers are not replayed.
+Storage is capped at 32 MiB total, 1 MiB per entity, 512 entities, 32 live
+targets, and 128 subscriptions. Active targets are pinned and inactive
+least-recently-used generations are evicted first.
+
+## Amendment: GitHub App installation identities (phase 11)
+
+An explicitly configured collector provider may establish an installation
+principal by minting a repository-restricted installation token at the exact
+configured App installation endpoint. Its quota key binds host, principal kind
+`installation`, and installation ID. Its access key additionally binds provider
+name, the sorted repository and permission restrictions, and authorization
+generation. Equivalent token renewal does not split either identity; changed
+authority fences retained data without changing the installation's quota
+ledger. Installation core authority comes from conditional
+`/installation/repositories?per_page=1` observations under the installation
+token. `/user` remains exclusive to human identity proof.
+
+JWT signing and mint attempts have their own persisted rolling allowance and
+redacted control metrics. Token-mint response headers do not establish data
+quota authority. Started attempts survive collector restart, concurrent callers
+share one refresh, and a durable PID/nonce lease fences abandoned owners. The
+authorization generation and mint revision are persisted independently of the
+memory-only token, so a late response cannot cross a repository or permission
+change. The bounded 60/120/240/480-second retry ladder cannot be replenished by
+token rotation. Private keys, JWTs, and tokens are excluded from the registry
+and quota ledgers.
+
+## Amendment: sustained acceptance evidence (phase 12)
+
+Release acceptance exercises these identity and accounting decisions for one
+simulated hour through the production acquisition engine and governor with an
+injected clock and transport. The independent request oracle, not production
+cost declarations, owns server counters and scripted 200/304, GraphQL, external
+spend, reset, secondary-hold, producer-loss, and account-switch evidence. The
+accelerated workload is paired with real process, lock, IPC, bridge, and PTY
+tests so injected time cannot stand in for ownership or lifecycle behavior.
+
+Correctness is a fixed gate: one producer per due canonical query, independent
+fair progress for distinct repositories, no client-side GitHub work in remote
+mode, no stale-generation publication across an access change, and no admitted
+data crossing the known reserve. CPU, RSS, and latency percentages are evidence,
+not universal thresholds. They may be compared only when baseline and candidate
+share the same workload, machine, platform, and runtime; otherwise the report
+names the incompatibility and makes no improvement claim.

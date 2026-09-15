@@ -3,7 +3,9 @@
 ## One-liner
 
 A live-refreshing GitHub dashboard for the terminal -- Actions, Issues, Pull
-Requests, and Security alerts in one narrow pane. Shells out to the `gh` CLI.
+Requests, and Security alerts in one narrow pane. The default standalone mode
+shells out to the `gh` CLI; optional collector, SSH, webhook, and GitHub App
+providers remain explicit opt-in modes.
 
 ## Stack
 
@@ -29,8 +31,10 @@ Use /clear between tasks, /compact when context is heavy.
 ```bash
 npm run lint            # ESLint
 npm start               # node index.mjs
-npm test                # node:test unit suite
+npm test                # node:test unit suite; excludes the dedicated E2E efficiency gate
 npm run test:pty        # end-to-end under a pseudo-terminal (slower; gates `main` only)
+npm run test:efficiency # deterministic simulated-hour acceptance
+npm run measure:efficiency # JSON and Markdown efficiency evidence
 node --check index.mjs  # syntax check (no build step to catch this otherwise)
 node index.mjs --version
 node index.mjs --help
@@ -84,8 +88,9 @@ Run verification sequentially with `;` or `&&`, never as parallel Bash calls.
 ## Deployment
 
 Published to npm as [`gh-glance`](https://www.npmjs.com/package/gh-glance).
-There is no server: `main` is the released state of the source, and the npm
-package is the artifact.
+There is no hosted gh-glance service: `main` is the released state of the
+source, and the npm package is the artifact. The optional collector is a
+user-operated local process and is not deployed by this repository.
 
 `.github/workflows/release.yml` publishes automatically when a GitHub release
 is published. It authenticates with **OIDC trusted publishing, not a token** --

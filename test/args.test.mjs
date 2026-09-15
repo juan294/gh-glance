@@ -7,6 +7,9 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -34,6 +37,75 @@ test("no arguments keeps every default", () => {
   assert.equal(opts.refreshMs, null);
   assert.equal(opts.tabKey, null);
   assert.equal(opts.verbose, false);
+  assert.equal(opts.probe, false);
+  assert.equal(opts.serve, false);
+  assert.equal(opts.config, null);
+  assert.equal(opts.connect, null);
+  assert.equal(opts.collectorStdio, false);
+});
+
+test("collector modes are explicit, exclusive, and strictly valued", () => {
+  assert.deepEqual(parse(["--serve", "--config", "/tmp/collector.json"]), {
+    ...parse([]), serve: true, config: "/tmp/collector.json",
+  });
+  assert.equal(parse(["--connect", "local", "--repo", "acme/widget"]).connect, "local");
+  assert.equal(parse(["--connect", "ssh:studio", "--repo", "acme/widget"]).connect, "ssh:studio");
+  assert.equal(parse(["--collector-stdio"]).collectorStdio, true);
+  assert.throws(() => parse(["--serve"]), /--serve requires --config/);
+  assert.throws(() => parse(["--config", "/tmp/x"]), /--config requires --serve/);
+  assert.throws(() => parse(["--connect", "tcp:public"]), /--connect must be local or ssh/);
+  for (const value of ["ssh:", "ssh:-host", "ssh:user@host", "ssh:host;touch", "ssh:host name"]) {
+    assert.throws(() => parse(["--connect", value]), /SSH alias/);
+  }
+  assert.throws(() => parse(["--serve", "--config", "/tmp/x", "--connect", "local"]), /cannot be combined/);
+  assert.throws(() => parse(["--collector-stdio", "--repo", "acme/widget"]), /cannot be combined/);
+});
+
+test("--connect local without an offline repository target fails before the dashboard", (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "gh-glance-local-preflight-"));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  assert.throws(
+    () => execFileSync(process.execPath, [ENTRY, "--connect", "local"], {
+      cwd,
+      env: { ...process.env, GH_REPO: "" },
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }),
+    (error) => {
+      assert.equal(error.status, 3);
+      assert.match(error.stderr, /pass --repo owner\/name/i);
+      assert.doesNotMatch(error.stderr, /stdout is not a terminal/i);
+      return true;
+    },
+  );
+});
+
+test("--connect ssh without an offline repository target fails before ssh or the dashboard", (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "gh-glance-ssh-preflight-"));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  assert.throws(
+    () => execFileSync(process.execPath, [ENTRY, "--connect", "ssh:studio"], {
+      cwd,
+      env: { ...process.env, GH_REPO: "", PATH: "/usr/bin:/bin" },
+      encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+    }),
+    (error) => {
+      assert.equal(error.status, 3);
+      assert.match(error.stderr, /pass --repo owner\/name/i);
+      assert.doesNotMatch(error.stderr, /stdout is not a terminal/i);
+      return true;
+    },
+  );
+});
+
+test("--probe is an explicit doctor-only opt in", () => {
+  assert.equal(parse(["--doctor"]).probe, false);
+  assert.equal(parse(["--doctor", "--probe"]).probe, true);
+  assert.throws(() => parse(["--probe"]), /--probe requires --doctor/);
+  assert.throws(() => parse(["--connect", "local", "--doctor", "--probe"]),
+    /collector clients make no GitHub API calls/);
+  assert.throws(() => parse(["--connect", "ssh:studio", "--doctor", "--probe"]),
+    /collector clients make no GitHub API calls/);
 });
 
 test("unknown arguments are still rejected", () => {
@@ -255,6 +327,7 @@ test("--help describes refresh as a shared-governor floor", () => {
   assert.match(help, /^[ \t]*R[ \t]+Resynchronize the current tab, ignoring cached validators and backoff$/m);
   assert.match(help, /--background <mode>\s+all or off \(default all\)/);
   assert.match(help, /never requests data\n\s+for a tab you are not looking at/);
+  assert.match(help, /--doctor --probe\s+Run bounded, admitted GitHub capability probes/);
   assert.match(help, /a quiet tab slows to 30s \(60s for Security\),\n\s+and running Actions are checked every 5s/);
   assert.match(help, /GH_GLANCE_ICONS=unicode\s+Unicode status glyphs and text row substitutes/);
   assert.match(help, /GH_GLANCE_ICONS=ascii\s+ASCII-only status and row icons/);

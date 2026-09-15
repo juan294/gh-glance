@@ -50,6 +50,6 @@ None required for local implementation acceptance. Creating real webhook subscri
 
 ## Completion
 
-- [ ] Optional ingress, durable invalidation and reconciliation policy implemented.
-- [ ] HOOK scenarios and parent local gates passed.
-- [ ] Independent compliance/quality review complete; integrated locally; stop.
+- [x] Optional ingress, durable invalidation and reconciliation policy implemented.
+- [x] HOOK scenarios and parent local gates passed.
+- [x] Independent compliance/quality review complete; integrated locally; stop.

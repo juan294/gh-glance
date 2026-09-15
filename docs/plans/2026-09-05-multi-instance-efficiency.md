@@ -3,7 +3,7 @@
 Date: 2026-09-05  
 Source: `develop` at `b819f42e87922671a35bb72052bd0ede445b74be` (0.11.2)  
 Research: [multi-instance API efficiency and architecture](../research/2026-09-05-multi-instance-api-efficiency-and-architecture.md)  
-Status: Implementation underway; phases 1-3 completed and locally verified.
+Status: All 12 phases completed and locally verified; remote activation and release remain separate.
 
 ## Outcome and scope
 
@@ -183,19 +183,25 @@ Record requests, charged units, observers, coalesced consumers, queue wait, sour
 
 ## Completion tracking
 
-Planning review is complete. Independent controller and whole-plan reviews identified and resolved bootstrap allowance, phase prerequisite, installation observer, provider/socket routing, chunked-frame, reconnect freshness, Width-mode key precedence, and webhook deadline issues. Plan links, phase dependencies, code-reference ranges, Markdown fences and unresolved-marker checks were verified locally. This review validates the specification; implementation/runtime acceptance remains unchecked below.
+Planning review is complete. Independent controller and whole-plan reviews
+identified and resolved bootstrap allowance, phase prerequisite, installation
+observer, provider/socket routing, chunked-frame, reconnect freshness,
+Width-mode key precedence, and webhook deadline issues. Plan links, phase
+dependencies, code-reference ranges, Markdown fences and unresolved-marker
+checks were verified locally. Implementation and runtime acceptance are
+complete; Phase 12 contains the final validation record.
 
 - [x] Phase 1
 - [x] Phase 2
 - [x] Phase 3
-- [ ] Phase 4
-- [ ] Phase 5
-- [ ] Phase 6
-- [ ] Phase 7
-- [ ] Phase 8
-- [ ] Phase 9
-- [ ] Phase 10
-- [ ] Phase 11
-- [ ] Phase 12
+- [x] Phase 4
+- [x] Phase 5
+- [x] Phase 6
+- [x] Phase 7
+- [x] Phase 8
+- [x] Phase 9
+- [x] Phase 10
+- [x] Phase 11
+- [x] Phase 12
 
 No unresolved design questions. User setup values (SSH alias, repository allowlist, App installation ID and private-key path, webhook secret and reverse-proxy endpoint) are runtime configuration inputs, not placeholders in the implementation design. No live setup is required to complete its local automated acceptance.

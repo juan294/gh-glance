@@ -477,6 +477,10 @@ test("structured tab errors select actionable one-line remedies", () => {
 
   const raw = "dial tcp: lookup api.github.com: no such host";
   assert.equal(formatTabError(toTabError({ stderr: raw })), raw);
+  assert.equal(
+    formatTabError(toTabError({ stderr: "API budget paused (budget-reset)" })),
+    "GitHub checks are paused until the shared API budget allows them",
+  );
   assert.equal(formatTabError({ kind: "text", text: "browser launch failed" }), "browser launch failed");
   assert.equal(formatTabError(null), null);
 
@@ -1627,6 +1631,18 @@ test("refresh status pins active-tab precedence, copy, motion, and details", () 
   assert.equal(status({ activeError: { verdict: "other" }, securityIncomplete: true }).kind, "failed");
   assert.equal(status({ securityIncomplete: false, securityNotes: ["Dependabot is not enabled"] }).kind, "watching");
   assert.equal(status({ securityIncomplete: true }).kind, "limited");
+  assert.deepEqual(status({ sharedData: true }), {
+    kind: "shared", glyphKind: "watching", label: "Shared",
+    tone: "inert", animate: false, detailKind: "sharing",
+  });
+  assert.deepEqual(status({ stale: true }), {
+    kind: "stale", glyphKind: "limited", label: "Stale",
+    tone: "attention", animate: false, detailKind: "stale",
+  });
+  assert.deepEqual(status({ disconnected: true, stale: true }), {
+    kind: "disconnected", glyphKind: "failed", label: "Disconnected",
+    tone: "attention", animate: false, detailKind: "stale",
+  });
   assert.equal(status({
     governorDecision: { mode: "paused" },
     activeError: { verdict: "other" },

@@ -37,10 +37,12 @@ There's no build step -- it's plain ESM JavaScript, run directly by Node.
 ### Tests
 
 ```bash
-npm test          # node:test, no framework, no config
+npm test          # node:test; excludes E2E-* cases owned by test:efficiency
 npm run lint      # eslint, fails on warnings
 node --check index.mjs
 npm run test:pty  # end-to-end, drives the real binary under a pty (slower)
+npm run test:efficiency  # deterministic simulated-hour acceptance
+npm run measure:efficiency  # JSON and Markdown efficiency evidence
 npm run test:coverage:runtime  # informational PTY child-process function coverage
 ```
 
@@ -75,6 +77,24 @@ summarizes observed `index.mjs` functions. It is an informational scheduled or
 manual signal, not a threshold or release gate, and is skipped by the coverage
 workflow on ordinary `develop` pushes because CI already runs the PTY suite.
 
+`npm run test:efficiency` advances an injected clock through the versioned
+60-minute workload while exercising the production acquisition and governor
+machinery. It checks duplicate and distinct repository topologies, the 3+4
+collector-client split, conditional responses, external spend, reset, secondary
+hold, producer loss, and account switching. Keep the independent oracle in
+charge of server truth; do not copy production cost or reserve rules into the
+fixture merely to make its assertions agree. The ordinary unit and coverage
+commands skip `E2E-*` cases so this dedicated command remains their authoritative
+gate rather than running the sustained workload implicitly a second time.
+
+`npm run measure:efficiency` emits the same candidate's JSON and Markdown
+evidence. A baseline comparison is valid only when workload, machine, platform,
+and runtime match. Record unmeasurable or incompatible values explicitly instead
+of converting them to a percentage. Deterministic accelerated-time assertions
+do not replace the real process, file-lock, IPC, fake-SSH, and canonical PTY
+checks. Run Node 22 and 24 smoke and package tests locally, and verify both the
+macOS and Linux Unix-socket paths before calling a candidate fully validated.
+
 One default keeps it worth having: **assert structure, not incidental dashboard
 copy.** Line counts, widths, escape-sequence balance and ordering, and exit codes
 survive a wording change. The narrow exception is a semantic data-flow test
@@ -99,6 +119,17 @@ so it cannot hide a lost update in the mechanism it is validating. PTY files
 run serially; their individual cases still create the required concurrent
 panes.
 
+Acquisition diagnostics are measured, not projected. Tests that change a
+fetcher must reconcile HTTP attempts, REST 200/304 outcomes, actual core and
+GraphQL units, outstanding estimates, observer calls, cache hits, joined
+followers, failed outcomes, and measured follower queue time against an
+explicit oracle. A cache reader is not a joined follower, and retained cache
+records do not count as active queries. Failed or malformed data must leave the
+last-good snapshot untouched and retain any cost that lacks proof. Keep `lastSuccessAt`,
+`lastChangedAt`, `nextDueAt`, and the current hold independent. Plain
+`--doctor` must stay local-only; live endpoint checks belong behind the explicit
+`--doctor --probe` admission path.
+
 Direct SGR mouse tests must enter width mode before sending reports, then send
 each logical report through the foreground pty as its own timed write, plus one
 intentionally split report that exercises the pending token boundary. Assert
@@ -108,6 +139,31 @@ the primary buffer -- a crash diagnostic or an interactive child handoff --
 that transcript is not dashboard frame geometry; assert its after-restore tail
 separately. For an interactive child, synchronize input with an explicit
 fixture-ready marker instead of guessing when the child owns the terminal.
+
+Collector changes must keep `test/collector-protocol.test.mjs` independent from
+the socket lifecycle tests in `test/collector.test.mjs`. Protocol tests cover
+exact message schemas, byte limits, chunk order/digest, epoch/generation fences,
+and slow-client queue bounds. Lifecycle tests cover private ownership, stale
+recovery, allowlisted subscriptions, canonical provider fencing, and shared
+acquisition with standalone processes. `test/pty/collector.test.mjs` must prove
+headless serve/bridge behavior and a real local dashboard, including an empty
+client-side `gh` call log. `test/package-boundary.test.mjs` keeps the installed
+package to one executable and an exact documentation allowlist while checking
+the standalone, collector, bridge, local-client, and SSH-facing CLI contracts
+remain present.
+SSH transport changes also run `test/ssh-transport.test.mjs` and
+`test/pty/remote-collector.test.mjs`. Their executable fake `ssh` validates the
+fixed argument vector and launches the real stdio bridge against private local
+IPC; the tests require no SSH server, network, key, or real GitHub account.
+
+GitHub App provider changes must run `test/app-auth.test.mjs`. Keep its fixtures
+offline: generate RSA keys in the test process and inject the token transport.
+The APP scenarios must cover JWT claims, exact host/path and requested scope,
+single-flight renewal using returned expiry, persisted retry limits, scrubbed
+child environments, stable installation quota identity, access-generation
+fences, stale-row/no-fallback behavior, independent Security permissions, and
+the installation-specific 200/304 core observer. Never add a live App,
+installation, private key, token, or network dependency to the suite.
 
 Two things to know before editing it:
 
@@ -129,11 +185,11 @@ Worth knowing about the app's shape before changing it:
   registry vector is still `{core:1, graphql:0}` because its first 200 can cost
   one unit. It records that counter immediately and persists the validator so
   later observations can return a free 304.
-- GraphQL admission is currently open-loop. `gh issue` and `gh pr` do not expose
-  response headers through their normal output, and `gh api rate_limit` can lag
-  the real GraphQL counter. Keep the probe freshness failure closed, but do not
-  describe that probe as authoritative or claim that it proves the GraphQL
-  reserve. ADR 0003 records the required follow-up boundary.
+- GraphQL data uses explicit bounded `gh api graphql` envelopes, and one claimed
+  observer establishes spendable capacity from `rateLimit` counter evidence.
+  The free `gh api rate_limit` endpoint is diagnostic only and must never admit
+  work or refund a reservation. Missing or stale authoritative evidence remains
+  fail-closed. ADR 0003 records the authority boundary.
 - Budget control, data work, and lease heartbeats use independent one-shot
   schedulers. A slow request must not suppress a probe or lease renewal, and a
   control wake must not create an unconditional data poll.

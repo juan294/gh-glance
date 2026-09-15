@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { loadAcquisitionStore } from "../../index.mjs";
 import { capture, captureAsync, waitForAwk } from "./capture.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -23,6 +24,9 @@ function fixture(t) {
   const legacyPath = join(directory, `rate-governor-v1-${"a".repeat(64)}.json`);
   return { root, directory, statePath, legacyPath, now,
     read: () => JSON.parse(readFileSync(statePath, "utf8")),
+    readAcquisition: () => loadAcquisitionStore(
+      join(directory, "coordination-v2", "acquisition.json"),
+    ).value,
     seed: (state) => writeFileSync(legacyPath, `${JSON.stringify(state)}\n`, { mode: 0o600 }),
   };
 }
@@ -130,38 +134,78 @@ test("ID-05: corrupt legacy protocol fails closed without replacing its evidence
 });
 
 function exerciseAllTabs() {
-  const calls = '"$GH_GLANCE_CAPTURE_OUT.calls"';
-  const waitForCall = (pattern) => waitForAwk(calls, `index($0, "${pattern}") { ok=1 }`, 200) + "sleep .4; ";
-  return waitForCall("/actions/workflows?") + "printf 2; " +
-    waitForCall("graphql issues.page") + "printf 3; " +
-    waitForCall("graphql pulls.page") + "printf 4; " +
-    waitForCall("secret-scanning/alerts") + "printf q";
+  const frame = '"$GH_GLANCE_CAPTURE_OUT"';
+  const waitForRow = (pattern) => waitForAwk(frame, `index($0, "${pattern}") { ok=1 }`, 600) + "sleep .4; ";
+  const barrier = (name) =>
+    `: > "$GH_GLANCE_BARRIER/${name}-$GH_GLANCE_FIXTURE_PANE"; i=0; ` +
+    `while [ ! -f "$GH_GLANCE_BARRIER/${name}-0" ] || ` +
+    `[ ! -f "$GH_GLANCE_BARRIER/${name}-1" ]; do ` +
+    "i=$((i + 1)); [ $i -ge 600 ] && break; sleep .1; done; ";
+  return waitForRow("ci: pin actions") + barrier("actions") + "printf 2; " +
+    waitForRow("SIGTERM erases") + barrier("issues") + "printf 3; " +
+    waitForRow("release: v0.2.0") + barrier("pulls") + "printf 4; " +
+    waitForRow("no alerts") + barrier("security") + "printf q";
 }
 
 test("ID-08: two real panes serialize all four tabs and control requests through the shared permit", async (t) => {
   const box = fixture(t);
+  const state = box.read();
+  // Keep the first Actions generation open long enough for both independently
+  // instrumented dashboard processes to join it. The assertion below is about
+  // shared ownership, not an accidental race against the fixture's 100ms
+  // default response time.
+  state.delayByCommand = { actions: 2_000 };
+  writeFileSync(box.statePath, JSON.stringify(state), { mode: 0o600 });
+  const barrier = join(box.root, "id08-barrier");
+  mkdirSync(barrier);
   const results = await Promise.all(Array.from({ length: 2 }, (_, pane) => captureAsync({
-    cols: 80, rows: 24, signal: "none", settle: 45, stdin: exerciseAllTabs(),
-    args: "--repo acme/widget --refresh 40", configHome: box.root,
-    env: { GH_GLANCE_FIXTURE_STATE: box.statePath, GH_GLANCE_FIXTURE_PANE: String(pane) },
+    cols: 80, rows: 24, signal: "none", settle: 180, stdin: exerciseAllTabs(),
+    args: "--repo acme/widget --refresh 300 --background off", configHome: box.root,
+    env: {
+      GH_GLANCE_BARRIER: barrier,
+      GH_GLANCE_FIXTURE_STATE: box.statePath,
+      GH_GLANCE_FIXTURE_PANE: String(pane),
+    },
   })));
   for (const result of results) {
     assertRestored(result);
-    for (const operation of ["/actions/runs?", "graphql issues.page", "graphql pulls.page", "dependabot/alerts", "code-scanning/alerts", "secret-scanning/alerts"]) {
-      assert.ok(result.fixtureCalls.some((call) => call.includes(operation)), `pane never acquired ${operation}`);
+    for (const row of ["ci: pin actions", "SIGTERM erases", "release: v0.2.0", "no alerts"]) {
+      assert.match(result.raw, new RegExp(row), `follower never rendered ${row}`);
     }
     assert.equal(result.fixtureCalls.filter((call) => call.startsWith("auth status")).length, 0);
   }
   const events = box.read().events;
   const starts = events.filter(isHttpStart);
   const ends = new Map(events.filter((event) => event.type === "end").map((event) => [event.sequence, event]));
-  // Two panes x (identity, GraphQL observer, Actions runs, one Issues page, one
-  // Pull requests page, three alert endpoints). It was 15 when Actions made two
-  // calls and each list walked to its row cap; the property under test is that
-  // every call was serialized, not how many there were.
-  assert.ok(starts.length >= 12, `fixture never exercised all tab and control demand: ${starts.length}`);
+  const operationStarts = (predicate) => starts.filter(predicate);
+  const actionRuns = operationStarts((event) =>
+    event.argv.some((argument) => argument.includes("/actions/runs?")));
+  assert.equal(actionRuns.length, 1, "duplicate panes did not share the Actions generation");
+  const securityCounts = ["dependabot/alerts", "code-scanning/alerts", "secret-scanning/alerts"]
+    .map((operation) => operationStarts((event) =>
+      event.argv.some((argument) => argument.includes(operation))).length);
+  assert.deepEqual(securityCounts, [1, 1, 1],
+    "a shared Security generation did not transport exactly one complete source set");
+  const issuesCount = operationStarts((event) => event.graphqlOperation === "issues.page").length;
+  const pullsCount = operationStarts((event) => event.graphqlOperation === "pulls.page").length;
+  assert.equal(issuesCount, 1, "duplicate panes did not share the Issues generation");
+  assert.equal(pullsCount, 1, "duplicate panes did not share the PR generation");
   assert.ok(starts.some((event) => event.argv.includes("user")), "identity/core observer was not exercised");
   assert.ok(starts.some((event) => event.graphqlOperation === "graphql.observer"), "GraphQL control probe was not exercised");
+  const queries = Object.values(box.readAcquisition().queries);
+  const actionsQueries = queries.filter((record) => record.query.resource === "actions");
+  assert.equal(actionsQueries.length, 1, "duplicate panes retained multiple Actions queries");
+  assert.equal(actionsQueries[0].generation, 1, "duplicate panes published multiple Actions generations");
+  for (const [resource, generation] of [
+    ["issues", issuesCount],
+    ["prs", pullsCount],
+    ["security", 1],
+  ]) {
+    const matching = queries.filter((record) => record.query.resource === resource);
+    assert.equal(matching.length, 1, `duplicate panes retained multiple ${resource} queries`);
+    assert.equal(matching[0].generation, generation,
+      `${resource} transports did not match its admitted shared generations`);
+  }
   // These timestamps are independent server process entry/exit, not permit
   // grant timestamps. Unit seam tests pin the exact 250ms grant interval.
   // Here every operation must finish before the next HTTP operation starts.

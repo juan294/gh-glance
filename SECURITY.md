@@ -6,7 +6,11 @@ Only the current release line receives security patches.
 
 | Version | Supported           |
 | ------- | ------------------- |
-| 0.11.x  | Yes                 |
+| 0.15.x  | Yes                 |
+| 0.14.x  | No                  |
+| 0.13.x  | No                  |
+| 0.12.x  | No                  |
+| 0.11.x  | No                  |
 | 0.10.x  | No                  |
 | 0.9.x   | No                  |
 | 0.8.x   | No                  |
@@ -105,7 +109,7 @@ Successfully parsed rows can be persisted in an authorization-and-target-scoped
 `dashboard-cache.json` beside the width-preference file. The cache contains
 sanitized repository data such as titles, authors, branches, and Security
 findings, but it never contains a GitHub token or other credential. It retains
-at most five repository targets and 60 rows per tab. The account namespace is
+at most 32 repository targets and 60 rows per tab. The account namespace is
 derived from the effective host, a one-way SHA-256 digest of the selected
 credential, and its authorization generation. Two credentials for the same
 verified account share quota coordination but cannot hydrate each other's
@@ -118,6 +122,137 @@ at once. Missing, corrupt, future-version, locked, or unwritable state is
 advisory: it is ignored rather than weakening authentication or preventing
 startup. A failed or blind Security observation never replaces a
 last-known-good alert set with an empty one.
+
+Live panes also coordinate through a private `coordination-v2/acquisition.json`
+store. A versioned query key binds host, admitted repository identity, access
+partition, resource, projection, page size, filters, and cursor generation.
+That lightweight file contains claims, subscriptions, generations, bounded
+content digests, and references to private per-query snapshot artifacts. Each
+artifact contains only sanitized rows and validated ETag/body pairs. A producer
+writes the artifact before atomically publishing its metadata reference, so a
+reader sees the complete old or new generation rather than a partial pair.
+Unreferenced artifacts are removed after publication. Neither layer persists
+raw credentials or reuses saved rate-limit headers as authority. Source success
+and content-change timestamps remain separate, so a conditional 304 updates
+freshness without pretending the display changed.
+
+The optional local collector uses one fixed Unix-domain socket inside the same
+private config root. The directory is `0700` and the socket, lock, configuration,
+and state files are `0600` on POSIX. Startup rejects symlinked or differently
+owned roots, refuses a live owner, and removes stale artifacts only after dead
+owner plus inode evidence. Shutdown removes only the lock and socket identities
+created by that service instance. Collector hosting and the stdio bridge are not
+supported on Windows; no TCP fallback exists.
+
+The collector's optional webhook listener is disabled by default and accepts
+only the fixed `/webhooks/github` route on literal loopback addresses. Public
+exposure, TLS termination, reverse-proxy configuration, and webhook
+registration remain user-owned. The secret path must be absolute and name a
+regular, current-user-owned mode-0600 file. The listener authenticates the
+exact raw body with HMAC SHA-256 and constant-time comparison before JSON
+parsing, target mapping, or queue mutation. It requires JSON content type and
+bounded delivery/event headers, limits reads to 25 MiB and ten seconds, and
+caps concurrent requests at 32. Buffered request bodies also share a 50 MiB
+aggregate allowance; excess concurrent bodies receive 503 without displacing
+accepted durable work. The ten-second limit is one absolute body deadline from
+handler entry; continued byte activity cannot extend it.
+
+Accepted delivery IDs are retained for at most 24 hours and capped at 10,000;
+pending invalidations are compact repository/resource keys capped at 512. Raw
+event bodies, signatures, and secrets are not persisted, logged, included in
+metrics, or sent over the collector protocol. A 202 response means that the
+compact invalidation was durably accepted, not that GitHub data is fresh. Queue
+capacity or storage failure returns an error so the sender can retry. Workers
+coalesce one key for one second, use the normal governor and secondary-limit
+admission path, and remove durable work only after a newer API-validated
+generation is published. Access-change events retire the old binding and
+revalidate repository access for every target subscription, including uncovered
+and background-off resources, before its in-flight result can publish. Queue
+replacement fsyncs the new file and its parent directory before 202. Its lock
+records PID and nonce ownership; recovery requires dead-owner evidence and an
+inode match rather than file age. Negative or materially future queue timestamps
+fail closed.
+
+The collector trust boundary is one OS user, not multiple tenants. Its strict
+configuration maps each exact host/repository target to one named provider.
+Clients never send credentials or arbitrary GitHub operations. Wire frames are
+newline-delimited JSON capped at 1 MiB; large snapshots use digest-checked,
+ordered chunks capped at 512 KiB and assemble to at most 8 MiB. Per-client and
+aggregate outbound queues are bounded, and a stalled client is disconnected.
+Wire snapshots project sanitized display rows, pagination, semantic holds, and
+source timestamps only. They exclude tokens, access/quota digests, local paths,
+validators, raw bodies, reservations, and provider details.
+
+Collector providers default to the current OS user's host-specific `gh` login.
+The optional `github-app` provider accepts only a validated host, client ID,
+installation ID, absolute private-key path, repository-ID allowlist, and an
+explicit read-only permission set. The private key must be a regular,
+current-user-owned mode-0600 file. It is read only on the collector machine and
+is never sent over the collector protocol. RS256 JWTs live only for signing and
+the installation token remains memory-only. App authentication is the sole
+native HTTPS GitHub request: it uses the fixed installation-token endpoint,
+normal TLS verification, no redirects, a ten-second deadline, and a 1 MiB
+response bound. GitHub.com uses `api.github.com`; Enterprise Server uses its
+validated host and `/api/v3` prefix.
+
+Installation data continues through the governed `gh api` path. Each child
+environment removes all competing GH/GITHUB token variables before setting the
+one host-appropriate installation token; tokens and JWTs never enter argv,
+state, diagnostics, wire frames, or errors. Installation and human principals
+have separate quota identities. Equivalent token renewal keeps the same quota
+and access partition, while repository/permission authority changes fence old
+snapshots. Mint attempts use a separate persisted rolling allowance and are
+not treated as free or merged with data-budget headers. A durable PID/nonce
+lease serializes mint ownership across collector processes; abandoned owners
+enter bounded backoff, and a persisted authorization revision rejects any mint
+that completes after installation authority changes. Installation core
+authority comes from conditional `/installation/repositories?per_page=1`, never
+`/user`. Authentication, permission, suspension, expiry, and unsupported-source
+failures retain last-known-good rows and never fall back to a personal token.
+
+The published npm artifact is also a security boundary. Its manifest contains
+only `index.mjs`, `package.json`, `README.md`, `CHANGELOG.md`, and `LICENSE`;
+tests, fixture credentials, private keys, collector configuration, webhook
+secrets, queues, caches, and coordination state are excluded. Package and deep
+imports remain closed through `exports: {}` so internal test seams do not become
+an unsupported programmatic API.
+
+Remote collector clients reuse that protocol only through the user's existing
+SSH configuration. The process argv is fixed to `ssh -T -o BatchMode=yes -o
+ClearAllForwardings=yes -o ForwardAgent=no -- <validated-alias> 'gh-glance
+--collector-stdio'`; aliases cannot begin with `-` or contain shell syntax.
+Repository names and received row text never enter the remote command. Host-key
+checking is not disabled, forwarding and agent forwarding are explicitly disabled, and no key,
+software, collector service, or remote configuration is installed or started.
+
+The SSH child receives a deliberate environment allowlist needed by SSH itself.
+Local GitHub token variables, `GH_CONFIG_DIR`, `XDG_CONFIG_HOME`, arbitrary
+environment values, credential hashes, and local state paths are excluded.
+Remote stderr is byte-bounded, redacted, sanitized, and reduced to one concise
+diagnostic. Disconnects do not activate the local GitHub data path. The client
+kills only the SSH process it created; the shared collector and other clients
+continue.
+
+Each SSH snapshot includes collector wall time alongside the already separate
+source-success and source-change timestamps. The client keeps a monotonic lower
+bound for source age and persists it with the client checkpoint and server epoch
+under a private collector-alias/target namespace. Receipt, reconnect, cache load,
+or backward wall-clock movement cannot claim newer evidence. Browser opening is
+local and accepts only HTTPS URLs on the validated target host.
+
+One nonce-fenced producer owns each due query generation. Its 45-second claim
+is heartbeated every ten seconds, and expiration alone cannot transfer
+ownership: takeover also requires PID-confirmed death or explicit cancellation.
+An indeterminate or suspended owner therefore pauses duplicate acquisition.
+No store lock is held during governor admission or network I/O. Busy, corrupt,
+unwritable, malformed, oversized, or capacity-exhausted state fails closed and
+never falls back to independent pane polling.
+
+Shared acquisition is bounded to 32 MiB total, 1 MiB per entity, 512 entities,
+32 live targets, and 128 active subscriptions. Live targets are pinned;
+inactive least-recently-used generations are evicted first. Payloads and
+capability observations remain access-partitioned. The existing display cache
+can migrate validated rows, but it cannot invent validators that were absent.
 
 API admission uses a separate `coordination-v2/quota-<scope hash>.json` file in
 the same private directory. Its SHA-256 scope binds the effective host to the
@@ -180,8 +315,11 @@ which is what keeps a three-part typo a rejected typo rather than a request to
 somewhere else -- and it is **never** interpolated into a request path. It is
 passed to `gh` as a `--hostname` argument instead.
 
-`--doctor` prints a report intended to be attached to a bug report, and it never
-prints credentials. Environment values are printed only for a short curated list
+Plain `--doctor` prints a report intended to be attached to a bug report. It
+reads local evidence and starts no GitHub API request or credential resolution.
+The explicit `--doctor --probe` form performs bounded capability requests only
+after shared-governor admission. Neither mode prints credentials. Environment
+values are printed only for a short curated list
 -- the variables that are themselves the thing being diagnosed, such as
 `GH_HOST`, `GH_REPO` and `NO_COLOR`. Every other variable it finds, including any
 `GH_*`/`GITHUB_*` name it was never told about, is reported as present or absent
@@ -197,20 +335,26 @@ artifacts users are invited to attach to a bug report, and `gh` error messages
 quote the URL they failed on -- which is a real path for a credential to reach
 them.
 
-GitHub authentication is delegated to the existing `gh auth login` session,
-including on GitHub Enterprise and EMU hosts. Every GitHub API call currently
-goes through the `gh` CLI. Effective credential selection follows `gh`'s
-host-specific environment precedence. When no applicable environment token is
-selected, a dedicated non-logging `gh auth token --hostname <host>` call obtains
-the local credential, hashes it immediately, and discards the raw output.
-Resolution is cached until relevant configuration changes. No token is placed
-in command arguments, returned to the UI, logged, or written to disk; keychain
-databases are never read directly. Failure authentication diagnosis uses the
-cached verified identity or reports that identity is unavailable, without a
-network-backed `gh auth status` call. Optional account and repository strings
-are sanitized before rendering, and doctor output remains protected by the
-presence-only and redaction rules above. Login, authorization refresh, and
-account switching remain explicit user-owned `gh` commands.
+Default standalone and `gh` collector providers delegate authentication to the
+existing `gh auth login` session, including on GitHub Enterprise and EMU hosts.
+Their repository data calls go through the `gh` CLI. Effective credential
+selection follows `gh`'s host-specific environment precedence. When no
+applicable environment token is selected, a dedicated non-logging `gh auth
+token --hostname <host>` call obtains the local credential, hashes it
+immediately, and discards the raw output. Resolution is cached until relevant
+configuration changes.
+
+An explicitly configured GitHub App provider is the one authentication
+exception: the collector reads its private key locally and uses bounded native
+HTTPS to mint an installation token, then supplies that memory-only token to
+governed `gh api` data calls. No token or private key is placed in command
+arguments, returned to the UI, logged, or written to disk; keychain databases
+are never read directly. Failure authentication diagnosis uses cached verified
+identity or reports that identity is unavailable, without a network-backed `gh
+auth status` call. Optional account and repository strings are sanitized before
+rendering, and doctor output remains protected by the presence-only and
+redaction rules above. Human login, authorization refresh, and account switching
+remain explicit user-owned `gh` commands.
 
 Repository creation is also user-owned. When a local repository has no remote,
 gh-glance invokes plain `gh repo create` only after the user presses `Enter`;

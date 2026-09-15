@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 10 ] || [ "$1" != "-T" ] || [ "$2" != "-o" ] || \
+   [ "$3" != "BatchMode=yes" ] || [ "$4" != "-o" ] || \
+   [ "$5" != "ClearAllForwardings=yes" ] || [ "$6" != "-o" ] || \
+   [ "$7" != "ForwardAgent=no" ] || \
+   [ "$8" != "--" ] || [ "${10}" != "gh-glance --collector-stdio" ]; then
+  echo "fake ssh: unsafe argv" >&2
+  exit 64
+fi
+
+# A real remote login supplies the remote account's environment. The local fake
+# uses its isolated HOME as that remote config root so it cannot see the test
+# runner's own gh-glance socket or cache.
+export XDG_CONFIG_HOME="$HOME"
+exec gh-glance --collector-stdio

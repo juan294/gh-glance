@@ -24,11 +24,16 @@ process.env.NODE_ENV ??= "production";
 
 import { execFile, spawn } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, createPrivateKey, randomUUID, sign as cryptoSign, timingSafeEqual } from "node:crypto";
+import { EventEmitter } from "node:events";
 import {
+  constants as fsConstants,
   chmodSync,
   closeSync,
+  fstatSync,
+  fsyncSync,
   mkdirSync,
+  lstatSync,
   openSync,
   readFileSync,
   readdirSync,
@@ -39,7 +44,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import { createServer as createHttpServer } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { basename, dirname, isAbsolute, join } from "node:path";
+import { createConnection, createServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -214,6 +222,7 @@ const runtime = {
   refreshMs: REFRESH_MS,
   background: "all",
   verbose: false,
+  connect: null,
   initialTabIndex: 0,
 };
 let runtimeRemoteUrls = [];
@@ -556,6 +565,9 @@ function unavailableRemedy(accounts, targetHost) {
 function formatTabError(error, failureContext = null) {
   if (error == null) return null;
   if (error.kind === "text") return error.text;
+  if (/^API budget paused(?:\s|\()/i.test(error.raw ?? "")) {
+    return "GitHub checks are paused until the shared API budget allows them";
+  }
   if (error.verdict === "other") return error.raw;
   if (error.verdict === "unavailable" && failureContext?.repo?.ok) {
     return "not available for this repository";
@@ -635,12 +647,15 @@ function redact(text) {
 // here. The README tells users to run `--verbose 2>gh-glance.log` and attach the
 // result to a bug report, so this is one of the three artifacts that leave the
 // machine, and it was the only one with no redaction boundary.
+function verboseLogLine(args, startedAt, outcome, nowMs = Date.now()) {
+  return redact(
+    `${new Date(nowMs).toISOString()} gh ${args.join(" ")} -- ${outcome} in ${nowMs - startedAt}ms\n`,
+  );
+}
+
 function logGh(args, startedAt, outcome) {
   if (!runtime.verbose) return;
-  const ms = Date.now() - startedAt;
-  process.stderr.write(
-    `${new Date().toISOString()} gh ${args.join(" ")} -- ${redact(outcome)} in ${ms}ms\n`,
-  );
+  process.stderr.write(verboseLogLine(args, startedAt, outcome));
 }
 
 // The poll loop's AbortController, published here so the crash handlers can
@@ -688,7 +703,8 @@ function inspectAdmittedHttpStart(scope, operation, now = Date.now) {
 // that the account can change in between. One definition so the three checks
 // cannot drift, and so a request costs one identity snapshot instead of three.
 function assertBoundCredential(bound) {
-  if (bound?.accessKey && bound.accessKey !== runtimeIdentityCoordinator?.current()?.accessKey) {
+  const coordinator = bound?.identityCoordinator ?? runtimeIdentityCoordinator;
+  if (bound?.accessKey && bound.accessKey !== coordinator?.current()?.accessKey) {
     throw new Error("Credential changed before request start");
   }
 }
@@ -727,7 +743,7 @@ function operationPausedUntil(operation, now = Date.now()) {
   return until;
 }
 
-async function runGh(args, { signal, operation, input = null } = {}) {
+async function runGh(args, { signal, operation, input = null, execute = null } = {}) {
   if (operationCost(operation) === null) {
     throw new Error(`undeclared gh operation: ${operation ?? "missing"}`);
   }
@@ -735,15 +751,19 @@ async function runGh(args, { signal, operation, input = null } = {}) {
   assertBoundCredential(bound);
   const local = ["version", "local-git"].includes(operation);
   let control = null;
-  const permit = runtimeIdentityCoordinator && !local
-    ? await acquireIdentityHttpPermit(runtimeIdentityCoordinator, { signal }) : null;
-  const startedAt = Date.now();
+  const identityCoordinator = bound?.identityCoordinator ?? runtimeIdentityCoordinator;
+  const requestNow = typeof bound?.now === "function" ? bound.now : Date.now;
+  const permit = identityCoordinator && !local
+    ? await acquireIdentityHttpPermit(identityCoordinator, { signal, now: requestNow,
+        ...(typeof bound?.httpWait === "function" ? { wait: bound.httpWait } : {}) }) : null;
+  const startedAt = requestNow();
   let requestError = null;
   let requestStdout = null;
+  let requestStarted = false;
   try {
     assertBoundCredential(bound);
-    if (runtimeIdentityCoordinator && operation === "budget-core-observer") {
-      control = startIdentityControl(runtimeIdentityCoordinator);
+    if (identityCoordinator && operation === "budget-core-observer") {
+      control = startIdentityControl(identityCoordinator, requestNow());
       if (!control.ok) throw new Error(identityCoordinationMessage(control.reason));
     }
     // Admission can precede this per-call transport slot by many seconds.
@@ -755,17 +775,19 @@ async function runGh(args, { signal, operation, input = null } = {}) {
       throw new Error(`Operation paused after an unbounded cost (retry after ${new Date(pausedUntil).toISOString()})`);
     }
     if (bound && !local && !CONTROL_OPERATIONS.includes(operation)) {
-      const ready = inspectAdmittedHttpStart(bound, operation);
+      const ready = inspectAdmittedHttpStart(bound, operation, requestNow);
       if (!ready.ok) throw new Error(`API budget paused (${ready.reason})`);
     }
     assertBoundCredential(bound);
-    const pending = execFileAsync("gh", args, {
+    const executeChild = execute ?? bound?.executeGh ?? execFileAsync;
+    const pending = executeChild("gh", args, {
       timeout: GH_TIMEOUT_MS,
       killSignal: "SIGKILL",
       maxBuffer: GH_MAX_BUFFER,
-      env: { ...process.env, ...GH_ENV_OVERRIDES },
+      env: { ...(bound?.credentialEnvironment ?? process.env), ...GH_ENV_OVERRIDES },
       signal,
     });
+    requestStarted = true;
     if (typeof input === "string") {
       // A child killed by the timeout or the abort signal closes stdin under
       // us; that EPIPE is the kill's consequence, not the failure worth
@@ -779,18 +801,20 @@ async function runGh(args, { signal, operation, input = null } = {}) {
     return stdout;
   } catch (err) {
     requestError = err;
+    if (requestStarted && isRecord(err)) err.httpStarted = true;
     logGh(args, startedAt, `FAILED ${shortErr(err)}`);
     throw err;
   } finally {
     if (permit) {
-      const release = () => releaseIdentityHttpPermit(runtimeIdentityCoordinator, permit, requestError);
-      const released = await retryIdentityCompletion(release, { timeoutMs: IDENTITY_RELEASE_WAIT_MS, shouldRetry: () => !runtimeIdentityCoordinator.isClosed() });
-      if (!released.ok) runtimeIdentityCoordinator.deferCompletion(`permit:${permit.nonce}`, release);
+      const release = () => releaseIdentityHttpPermit(identityCoordinator, permit, requestError, requestNow());
+      const released = await retryIdentityCompletion(release, { timeoutMs: IDENTITY_RELEASE_WAIT_MS, shouldRetry: () => !identityCoordinator.isClosed() });
+      if (!released.ok) identityCoordinator.deferCompletion(`permit:${permit.nonce}`, release);
     }
     if (control?.ok) {
-      const settle = () => settleIdentityControl(runtimeIdentityCoordinator, control.value, requestStdout ?? requestError?.stdout);
-      const settled = await retryIdentityCompletion(settle, { timeoutMs: IDENTITY_RELEASE_WAIT_MS, shouldRetry: () => !runtimeIdentityCoordinator.isClosed() });
-      if (!settled.ok) runtimeIdentityCoordinator.deferCompletion(`control:${control.value.id}`, settle);
+      const settle = () => settleIdentityControl(identityCoordinator, control.value,
+        requestStdout ?? requestError?.stdout, requestNow());
+      const settled = await retryIdentityCompletion(settle, { timeoutMs: IDENTITY_RELEASE_WAIT_MS, shouldRetry: () => !identityCoordinator.isClosed() });
+      if (!settled.ok) identityCoordinator.deferCompletion(`control:${control.value.id}`, settle);
     }
   }
 }
@@ -833,6 +857,15 @@ function pickRateLimit(headers) {
   return { resource, limit, used, remaining, resetMs: reset * 1000 };
 }
 
+function invalidateBoundGitHubApp(error, parsed) {
+  const bound = requestIdentityStorage.getStore();
+  if (parsed?.status !== 401 || bound?.providerType !== "github-app" ||
+      error?.appCredentialInvalidated) return false;
+  bound.identityCoordinator?.invalidate?.("unauthorized");
+  error.appCredentialInvalidated = true;
+  return true;
+}
+
 function responseHeaderObservation(rateLimit, cost, receivedAt = Date.now()) {
   return rateLimit ? {
     ...rateLimit,
@@ -871,8 +904,17 @@ async function ghApi(args, { operation, signal, etag = null, run = runGh } = {})
         body: "",
       };
     }
+    if (error?.httpStarted || parsed.status !== null) {
+      error.requestMetrics = {
+        httpRequests: 1,
+        rest200: parsed.status === 200 ? 1 : 0,
+        rest304: parsed.status === 304 ? 1 : 0,
+        failedRequests: 1,
+      };
+    }
     if (parsed.status !== null) {
       error.apiResponse = parsed;
+      invalidateBoundGitHubApp(error, parsed);
       const rateLimit = pickRateLimit(parsed.headers);
       const observation = responseHeaderObservation(rateLimit, 0);
       if (observation) error.budgetObservations = [observation];
@@ -1117,8 +1159,9 @@ function resolveEffectiveRepository({ runtimeRepo = null, ghRepo = null, remoteU
 }
 
 function effectiveRuntimeRepository(options = {}) {
+  const bound = requestIdentityStorage.getStore();
   return resolveEffectiveRepository({
-    runtimeRepo: runtime.repo,
+    runtimeRepo: bound?.repository ?? runtime.repo,
     ghRepo: process.env.GH_REPO,
     remoteUrls: runtimeRemoteUrls,
     ...options,
@@ -1126,10 +1169,11 @@ function effectiveRuntimeRepository(options = {}) {
 }
 
 function effectiveRuntimeHost(options = {}) {
+  const bound = requestIdentityStorage.getStore();
   return resolveEffectiveHost({
-    runtimeHost: runtime.host,
-    runtimeRepo: runtime.repo,
-    repoExplicit: runtime.repoExplicit,
+    runtimeHost: bound?.host ?? runtime.host,
+    runtimeRepo: bound?.repository ?? runtime.repo,
+    repoExplicit: bound?.repository ? true : runtime.repoExplicit,
     ghHost: process.env.GH_HOST,
     ghRepo: process.env.GH_REPO,
     remoteUrls: runtimeRemoteUrls,
@@ -1155,7 +1199,8 @@ function apiHostArgs(host = effectiveRuntimeHost()) {
 // a request path -- and note it is the bare slug that goes in, never the host,
 // which travels as an argument rather than as path text.
 function apiPath(path) {
-  return runtime.repo ? path.replace("{owner}/{repo}", runtime.repo) : path;
+  const repository = effectiveRuntimeRepository();
+  return repository ? path.replace("{owner}/{repo}", repository) : path;
 }
 
 // ---------- Data fetchers ----------
@@ -1433,6 +1478,7 @@ async function fetchConditionalEntity({
       body: recovery.recover ? null : cached.body,
       staged: null,
       observations: observation ? [observation] : [],
+      requestMetrics: restResponseRequestMetrics(response),
       recovered: recovery.recover,
     };
   }
@@ -1446,6 +1492,7 @@ async function fetchConditionalEntity({
           : null]
       : null,
     observations: observation ? [observation] : [],
+    requestMetrics: restResponseRequestMetrics(response),
   };
 }
 
@@ -1453,11 +1500,13 @@ function conditionalBatchResult(responses, previousRaw, joinedRaw = null) {
   const list = Array.isArray(responses) ? responses : [];
   let allNotModified = list.length > 0;
   let restSpent = 0;
+  let restNotModified = 0;
   let stagedEntities = null;
   const observations = [];
   for (const response of list) {
     if (response?.status !== 304 || typeof response.body !== "string") allNotModified = false;
     if (response?.status === 200) restSpent += 1;
+    if (response?.status === 304) restNotModified += 1;
     if (Array.isArray(response?.observations)) observations.push(...response.observations);
     if (!response?.staged) continue;
     stagedEntities ??= new Map();
@@ -1469,8 +1518,43 @@ function conditionalBatchResult(responses, previousRaw, joinedRaw = null) {
       : joinedRaw ?? list.map((response) => response?.body ?? "").join("\0"),
     allNotModified,
     restSpent,
+    restNotModified,
+    httpRequests: list.length,
     stagedEntities,
     observations,
+  };
+}
+
+function mergeAcquisitionRequestMetrics(...values) {
+  const merged = {};
+  for (const value of values) {
+    const normalized = normalizeAcquisitionMetrics(value ?? {}, { partial: true });
+    if (normalized === null) continue;
+    for (const [key, amount] of Object.entries(normalized)) merged[key] = (merged[key] ?? 0) + amount;
+  }
+  return merged;
+}
+
+function restResponseRequestMetrics(response) {
+  if (!Number.isSafeInteger(response?.status)) return {};
+  return {
+    httpRequests: 1,
+    rest200: response.status === 200 ? 1 : 0,
+    rest304: response.status === 304 ? 1 : 0,
+    coreUnits: response.status === 200 ? 1 : 0,
+    failedRequests: response.status === 200 || response.status === 304 ? 0 : 1,
+  };
+}
+
+function graphqlPageRequestMetrics(page) {
+  const attempted = page?.status !== null || page?.failure?.httpStarted || page?.ok === true;
+  if (!attempted) return {};
+  return {
+    httpRequests: 1,
+    failedRequests: page.ok ? 0 : 1,
+    ...(Array.isArray(page.observations) && page.observations.length > 0
+      ? { graphqlUnits: page.observedCost }
+      : {}),
   };
 }
 
@@ -1514,6 +1598,12 @@ async function fetchActions(signal, {
       raw: null,
       limit: ACTIONS_RUN_LIMIT,
       restSpent: 0,
+      rest200: runsResponse.requestMetrics?.rest200 ?? 0,
+      restNotModified: runsResponse.requestMetrics?.rest304 ?? (runsResponse.status === 304 ? 1 : 0),
+      httpRequests: runsResponse.requestMetrics?.httpRequests ?? 1,
+      failedRequests: runsResponse.requestMetrics?.failedRequests ?? 0,
+      coreUnitsTotal: runsResponse.requestMetrics?.coreUnits ?? 0,
+      requestMetrics: runsResponse.requestMetrics ?? restResponseRequestMetrics(runsResponse),
       graphqlSpent: GRAPHQL_PER_FETCH.actions,
       stagedEntities: null,
       observations: runsResponse.observations,
@@ -1522,6 +1612,8 @@ async function fetchActions(signal, {
     };
   }
   const responses = [runsResponse];
+  let requestMetrics = runsResponse.requestMetrics ?? restResponseRequestMetrics(runsResponse);
+  const uncertainReceipts = [];
   const runs = parseActionsRuns(runsResponse.body);
   const startedAt = Date.now();
   let nextCatalog = catalog;
@@ -1545,9 +1637,16 @@ async function fetchActions(signal, {
         request,
       }),
     });
+    uncertainReceipts.push(...(admitted.uncertainReceipts ?? []));
     if (admitted.ok && admitted.value) {
       responses.push(admitted.value);
+      requestMetrics = mergeAcquisitionRequestMetrics(
+        requestMetrics,
+        admitted.value.requestMetrics ?? restResponseRequestMetrics(admitted.value),
+      );
       nextCatalog = parseWorkflowCatalog(admitted.value.body, startedAt, catalog);
+    } else {
+      requestMetrics = mergeAcquisitionRequestMetrics(requestMetrics, admitted.error?.requestMetrics);
     }
     // A refusal leaves the catalog exactly as it was. Closing the TTL on a
     // scheduling outcome would hide missing names for fifteen minutes over a
@@ -1565,6 +1664,13 @@ async function fetchActions(signal, {
     // The tab settles for its own request. The catalog settled against the
     // reservation it opened for itself.
     restSpent: runsResponse.status === 200 ? 1 : 0,
+    rest200: requestMetrics.rest200 ?? batch.restSpent,
+    restNotModified: requestMetrics.rest304 ?? batch.restNotModified,
+    httpRequests: requestMetrics.httpRequests ?? 0,
+    failedRequests: requestMetrics.failedRequests ?? 0,
+    coreUnitsTotal: requestMetrics.coreUnits ?? 0,
+    requestMetrics,
+    uncertainReceipts,
     graphqlSpent: GRAPHQL_PER_FETCH.actions,
     stagedEntities: batch.stagedEntities,
     observations: batch.observations,
@@ -1600,6 +1706,7 @@ async function fetchGraphqlPage(kind, { signal, after = null, run = runGh, opera
     stdout = typeof error?.stdout === "string" ? error.stdout : "";
   }
   const parsed = parseGhApiResponse(stdout);
+  if (failure) invalidateBoundGitHubApp(failure, parsed);
   const envelope = parseGraphqlEnvelope(parsed.body);
   // Prefer the envelope's meter: it carries this query's actual `cost`, which
   // the headers do not. Headers remain the fallback when the body is unusable.
@@ -1760,9 +1867,12 @@ async function fetchGraphqlList(kind, mapRow, {
   if (!first.ok) {
     const error = first.failure ?? new Error(`GraphQL ${kind} page unavailable (${first.reason})`);
     error.budgetObservations = first.observations;
+    error.requestMetrics = graphqlPageRequestMetrics(first);
     throw error;
   }
   const observations = [...first.observations];
+  const uncertainReceipts = [];
+  const repositoryIdentity = normalizeRepositoryIdentity(first.data?.repository);
   // Only the first page. Pages past it opened their own reservation inside
   // runAdmittedOperation and settle against it, so adding them here charges the
   // same work twice -- and a settlement above its reservation is rejected as
@@ -1770,6 +1880,7 @@ async function fetchGraphqlList(kind, mapRow, {
   // budget observation the fetch gathered.
   const envelopeSpent = first.observedCost;
   let spent = first.observedCost;
+  let requestMetrics = graphqlPageRequestMetrics(first);
   let overrun = first.overrun;
   let current = graphqlConnection(first, connection);
   const totalCount = current?.totalCount ?? null;
@@ -1798,18 +1909,21 @@ async function fetchGraphqlList(kind, mapRow, {
       waitMs: GOVERNOR_ADMISSION_WAIT_MS,
       run: (admittedSignal) => fetchPage(kind, { signal: admittedSignal, after: cursor, operation: `page:${kind}` }),
     });
+    uncertainReceipts.push(...(admitted.uncertainReceipts ?? []));
     // A later page that is denied, fails, or returns errors leaves the rows
     // already gathered exactly as they are. Losing page one because page two
     // was refused would turn a budget decision into data loss.
     //
-    // Note that runAdmittedOperation settles these at their *declared* cost, not
-    // their observed one -- conservative, so never an under-charge. A later
-    // page's real meter reaches the ledger through the observations forwarded to
-    // the tab settlement rather than through its own reservation.
-    // Evidence first, and unconditionally: a page that failed as data still
-    // observed the meter, and dropping that is the one thing this phase says
-    // it will not do.
+    // runAdmittedOperation settles each later page from that page's evidence.
+    // Keep its observations as well so the shared budget observer can reconcile
+    // the same request without treating a data failure as missing meter data.
     if (admitted.value?.observations) observations.push(...admitted.value.observations);
+    requestMetrics = mergeAcquisitionRequestMetrics(
+      requestMetrics,
+      admitted.ok
+        ? graphqlPageRequestMetrics(admitted.value)
+        : admitted.error?.requestMetrics,
+    );
     if (admitted.value?.overrun) overrun = true;
     if (!admitted.ok || !admitted.value?.ok) { truncatedWalk = true; break; }
     spent += admitted.value.observedCost;
@@ -1846,8 +1960,13 @@ async function fetchGraphqlList(kind, mapRow, {
     graphqlSpent: envelopeSpent,
     // What the whole walk cost, for reporting. Never the settlement figure.
     graphqlSpentTotal: spent,
+    httpRequests: requestMetrics.httpRequests ?? 0,
+    failedRequests: requestMetrics.failedRequests ?? 0,
+    requestMetrics,
+    uncertainReceipts,
     observations,
     incomplete,
+    repositoryIdentity,
     totalCount,
     hasNextPage: merged.hasNextPage,
     generation: merged.generation,
@@ -2666,7 +2785,8 @@ function normalizeIdentityRegistry(raw) {
   const time = (value) => Number.isFinite(value) && value >= 0;
   for (const [key, identity] of Object.entries(raw.identities)) {
     if (!digest(key) || !exactKeys(identity, ["host", "kind", "id", "login", "quotaKey", "accessKey", "generation", "observedAt"]) ||
-        !normalizeHost(identity.host) || identity.kind !== "user" || !Number.isSafeInteger(identity.id) || identity.id <= 0 ||
+        !normalizeHost(identity.host) || !["user", "installation"].includes(identity.kind) ||
+        !Number.isSafeInteger(identity.id) || identity.id <= 0 ||
         typeof identity.login !== "string" || identity.login !== safe(identity.login) || !digest(identity.quotaKey) || !digest(identity.accessKey) ||
         !Number.isSafeInteger(identity.generation) || identity.generation < 1 || !time(identity.observedAt)) return null;
   }
@@ -3161,7 +3281,11 @@ function settleIdentityControl(coordinator, control, stdout, now = Date.now()) {
   }, { now });
 }
 
-async function acquireIdentityHttpPermit(coordinator, { signal, now = Date.now } = {}) {
+async function acquireIdentityHttpPermit(coordinator, {
+  signal,
+  now = Date.now,
+  wait = (delay) => new Promise((resolve) => setTimeout(resolve, delay)),
+} = {}) {
   const flushed = await coordinator.flushCompletions?.();
   if (flushed && !flushed.ok) throw new Error(identityCoordinationMessage(flushed.reason));
   const identity = coordinator.current();
@@ -3209,7 +3333,7 @@ async function acquireIdentityHttpPermit(coordinator, { signal, now = Date.now }
       const retryAt = result.retryAt ?? now() + 50;
       if ((result.reason !== "transport-busy" && !retryableCoordination(result.reason)) ||
           now() >= deadline || retryAt >= deadline) throw new Error(identityCoordinationMessage(result.reason));
-      await new Promise((resolve) => setTimeout(resolve, Math.max(1, Math.min(50, retryAt - now()))));
+      await wait(Math.max(1, Math.min(50, retryAt - now())));
     }
   } finally {
     if (!acquired) {
@@ -3319,7 +3443,7 @@ function clearTransportThrottle(transport) {
   }
 }
 
-function releaseIdentityHttpPermit(coordinator, permit, error = null) {
+function releaseIdentityHttpPermit(coordinator, permit, error = null, now = Date.now()) {
   return withIdentityRegistry(coordinator.root, (state) => {
     const transport = state.hosts[permit.host];
     if (transport?.permit?.nonce === permit.nonce) transport.permit = null;
@@ -3338,7 +3462,7 @@ function releaseIdentityHttpPermit(coordinator, permit, error = null) {
           retryAfter: verdict.retryAfter,
           status: verdict.status,
           secondary: verdict.secondary,
-          at: Date.now(),
+          at: now,
         });
       }
     } else if (transport && !error) {
@@ -4839,8 +4963,11 @@ function completeReservation(scope, reservationId, completion, nowMs) {
     if (!reservation || reservation.status !== "started" || !GOVERNOR_OUTCOMES.has(completion?.outcome)) {
       return { ok: false, reason: "stale" };
     }
+    const suppliedActual = completion.actualCost === undefined
+      ? null : exactResourceCosts(completion.actualCost);
+    if (completion.actualCost !== undefined && !suppliedActual) return { ok: false, reason: "corrupt" };
     const measured = completion.outcome === "measured-success"
-      ? exactResourceCosts(completion.actualCost)
+      ? suppliedActual
       : reservation.costs;
     if (!measured || RATE_RESOURCES.some((resource) => measured[resource] > reservation.costs[resource])) {
       return { ok: false, reason: "corrupt" };
@@ -5064,6 +5191,9 @@ async function refreshSharedBudget(scope, leaseId, signal, options = {}) {
   for (const resource of BUDGET_REFRESH_ORDER) {
     outcomes.push([resource, await refreshResourceBudget(scope, leaseId, signal, resource, options)]);
   }
+  const providerCapability = outcomes.find(([, result]) =>
+    !result.ok && result.reason === "provider-capability");
+  if (providerCapability) return providerCapability[1];
   const published = outcomes.filter(([, result]) => result.ok);
   if (published.length === 0) return outcomes[0][1];
   const inspect = options.inspect ?? inspectGovernor;
@@ -5081,12 +5211,14 @@ async function refreshSharedBudget(scope, leaseId, signal, options = {}) {
 
 async function refreshResourceBudget(scope, leaseId, signal, resource, {
   readBudgets = readSharedBudgetSources,
+  onObserverCall = null,
   now = () => scopeNow(scope),
   wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   inspect = inspectGovernor,
   renew = renewProbeClaim,
   publish = publishProbe,
   fail = failProbeClaim,
+  onObserverPublished = null,
 } = {}) {
   let claim = claimProbe(scope, leaseId, now(), resource);
   if (!claim.ok) return claim;
@@ -5160,6 +5292,7 @@ async function refreshResourceBudget(scope, leaseId, signal, resource, {
   }
   let budgets;
   try {
+    try { onObserverCall?.(resource); } catch { /* diagnostics cannot block a budget observer */ }
     budgets = await requestIdentityStorage.run(scope, () => readBudgets(signal, scope.host, {
       resources: [resource],
       coreEtag,
@@ -5178,8 +5311,30 @@ async function refreshResourceBudget(scope, leaseId, signal, resource, {
         return extended.ok;
       },
     }));
-  } catch {
+  } catch (error) {
+    if (typeof error?.providerCapability === "string") {
+      const failureDeadline = Math.min(
+        renewed.value.leaseUntil ?? Number.POSITIVE_INFINITY,
+        now() + GOVERNOR_PROBE_TRANSITION_MS,
+      );
+      await retryGovernorMutation(
+        () => fail(scope, leaseId, nonce, now(), resource),
+        { now, wait, deadline: failureDeadline, signal },
+      );
+      return { ok: false, reason: "provider-capability", capability: error.providerCapability };
+    }
     budgets = null;
+  }
+  if (typeof budgets?.providerCapability === "string") {
+    const failureDeadline = Math.min(
+      renewed.value.leaseUntil ?? Number.POSITIVE_INFINITY,
+      now() + GOVERNOR_PROBE_TRANSITION_MS,
+    );
+    await retryGovernorMutation(
+      () => fail(scope, leaseId, nonce, now(), resource),
+      { now, wait, deadline: failureDeadline, signal },
+    );
+    return { ok: false, reason: "provider-capability", capability: budgets.providerCapability };
   }
   if (!budgets) {
     const failureDeadline = Math.min(
@@ -5205,6 +5360,10 @@ async function refreshResourceBudget(scope, leaseId, signal, resource, {
       () => fail(scope, leaseId, nonce, now(), resource),
       { now, wait, deadline: transitionDeadline, signal },
     );
+  }
+  if (published.ok) {
+    try { await onObserverPublished?.(resource, budgets[resource]); }
+    catch { /* validator ownership persistence fails closed and retries later */ }
   }
   return published;
 }
@@ -5307,7 +5466,7 @@ async function fetchAlertSource(source, signal, now, {
   force = false,
   request = fetchConditionalEntity,
 } = {}) {
-  if (backoffActive(source.key, now)) {
+  if (!force && backoffActive(source.key, now)) {
     const { note, verdict } = alertBackoff.get(backoffStorageKey(source.key));
     // The verdict is replayed alongside the note. Replaying only the note left
     // the tab unable to tell "Dependabot is switched off here" from "we cannot
@@ -5317,13 +5476,21 @@ async function fetchAlertSource(source, signal, now, {
     return {
       raw: `backoff:${note}`,
       completedCalls: 0,
+      httpRequests: 0,
+      rest200: 0,
+      rest304: 0,
       verdict,
       allNotModified: false,
       stagedEntities: new Map(),
+      requestMetrics: {},
       parse: () => ({ alerts: [], note, verdict, truncated: false }),
     };
   }
   let completedCalls = 0;
+  let httpRequests = 0;
+  let rest200 = 0;
+  let rest304 = 0;
+  let requestMetrics = {};
   const observations = [];
   try {
     const requests = alertRequestArgs(source);
@@ -5332,8 +5499,9 @@ async function fetchAlertSource(source, signal, now, {
     const responses = [];
     for (const [index, args] of requests.entries()) {
       if (index > 0 && !shouldFetchAlertPriorityLanes(groups[0]?.length ?? 0)) break;
-      let response = null;
+      let response;
       try {
+        httpRequests += 1;
         response = await request({
           tab: "security",
           args,
@@ -5342,16 +5510,31 @@ async function fetchAlertSource(source, signal, now, {
           force,
           entities,
         });
-        if (response.status === 200) completedCalls += 1;
-        observations.push(...(response.observations ?? []));
-        responses.push(response);
-        payloads.push(response.body ?? "");
-        groups.push(parseJsonOutput(response.body ?? "").filter((alert) => alert.state === "open"));
       } catch (error) {
-        if (response === null) completedCalls += 1;
+        completedCalls += 1;
         observations.push(...(error.budgetObservations ?? []));
+        const failedMetrics = mergeAcquisitionRequestMetrics(
+          error.requestMetrics ?? { httpRequests: 1, failedRequests: 1 },
+        );
+        if (!Object.hasOwn(failedMetrics, "coreUnits")) {
+          failedMetrics.uncertainCoreUnits = failedMetrics.httpRequests ?? 1;
+        }
+        requestMetrics = mergeAcquisitionRequestMetrics(requestMetrics, failedMetrics);
         throw error;
       }
+      if (response.status === 200) {
+        completedCalls += 1;
+        rest200 += 1;
+      }
+      if (response.status === 304) rest304 += 1;
+      observations.push(...(response.observations ?? []));
+      requestMetrics = mergeAcquisitionRequestMetrics(
+        requestMetrics,
+        response.requestMetrics ?? restResponseRequestMetrics(response),
+      );
+      responses.push(response);
+      payloads.push(response.body ?? "");
+      groups.push(parseJsonOutput(response.body ?? "").filter((alert) => alert.state === "open"));
     }
     const raw = payloads.join("\0");
     clearBackoff(source.key);
@@ -5359,6 +5542,9 @@ async function fetchAlertSource(source, signal, now, {
     return {
       raw,
       completedCalls,
+      httpRequests,
+      rest200,
+      rest304,
       verdict: "ok",
       allNotModified: batch.allNotModified,
       // Every other fetchAlertSource path returns a Map. An all-304 batch has
@@ -5366,6 +5552,7 @@ async function fetchAlertSource(source, signal, now, {
       // here before fetchSecurity merges the independently fetched sources.
       stagedEntities: batch.stagedEntities ?? new Map(),
       observations,
+      requestMetrics,
       parse: () => {
         const rows = mergeAlertRows(groups);
         return {
@@ -5386,10 +5573,14 @@ async function fetchAlertSource(source, signal, now, {
       return {
         raw: "unusable-output",
         completedCalls,
+        httpRequests,
+        rest200,
+        rest304,
         verdict,
         allNotModified: false,
         stagedEntities: new Map(),
         observations,
+        requestMetrics,
         parse: () => ({
           alerts: [],
           note: null,
@@ -5410,10 +5601,14 @@ async function fetchAlertSource(source, signal, now, {
       // A failed call still bills: the request reached GitHub and was counted
       // whether it returned data, `[]`, or a 403.
       completedCalls,
+      httpRequests,
+      rest200,
+      rest304,
       verdict,
       allNotModified: false,
       stagedEntities: new Map(),
       observations,
+      requestMetrics,
       parse: () => ({ alerts: [], note, verdict, truncated: false }),
     };
   }
@@ -5435,6 +5630,8 @@ async function fetchSecurity(signal, {
   entities = new Map(),
   force = false,
   previousRaw = null,
+  sources = ALERT_SOURCES,
+  request = fetchConditionalEntity,
 } = {}) {
   // Monotonic, not wall-clock. These deadlines measure *elapsed* time, and
   // Date.now() can jump: a laptop resume or an NTP correction stepping the clock
@@ -5444,10 +5641,23 @@ async function fetchSecurity(signal, {
   // for the mirror-image reason: a sleep gap is the thing it reports, and
   // performance.now() does not advance across suspend.
   const now = performance.now();
-  const parts = await Promise.all(ALERT_SOURCES.map((source) =>
-    fetchAlertSource(source, signal, now, { entities, force })));
+  const parts = await Promise.all(sources.map(async (source) => ({
+    ...await fetchAlertSource(source, signal, now, { entities, force, request }),
+    sourceKey: source.key,
+  })));
+  const capabilities = Object.fromEntries(parts.flatMap((part) => {
+    if (part.verdict !== "unavailable") return [];
+    const state = alertBackoff.get(backoffStorageKey(part.sourceKey));
+    return state ? [[part.sourceKey, {
+      verdict: "unavailable",
+      note: state.note,
+      step: state.step,
+      until: Date.now() + Math.max(0, state.until - now),
+    }]] : [];
+  }));
   const allNotModified = parts.length > 0 && parts.every((part) => part.allNotModified);
   const stagedEntities = new Map(parts.flatMap((part) => [...part.stagedEntities]));
+  const requestMetrics = mergeAcquisitionRequestMetrics(...parts.map((part) => part.requestMetrics));
   return {
     // Joined with a NUL so a change in any one of the three shows up as a
     // change in the combined payload, without risk of two different splits
@@ -5458,11 +5668,18 @@ async function fetchSecurity(signal, {
     // ALERT_SOURCES.length: a source held off by backoff spawned nothing and
     // must not be billed for it.
     restSpent: parts.reduce((total, part) => total + part.completedCalls, 0),
+    restNotModified: parts.reduce((total, part) => total + part.rest304, 0),
+    httpRequests: parts.reduce((total, part) => total + part.httpRequests, 0),
+    rest200: parts.reduce((total, part) => total + part.rest200, 0),
+    failedRequests: parts.reduce((total, part) =>
+      total + Math.max(0, part.httpRequests - part.rest200 - part.rest304), 0),
+    requestMetrics,
     graphqlSpent: 0,
     measuredSuccess: parts.every((part) => part.verdict === "ok"),
     rateLimited: parts.some((part) => part.verdict === "rate-limited"),
     stagedEntities,
     observations: parts.flatMap((part) => part.observations ?? []),
+    capabilities,
     parse: () => {
       if (parts.some((part) => part.verdict === "unusable-output")) return { unusable: true };
       const parsed = parts.map((p) => p.parse());
@@ -5642,6 +5859,3424 @@ async function preflight() {
     );
   }
   return null;
+}
+
+function collectorClientPreflight(remoteUrls = [], source = "collector") {
+  if (effectiveRuntimeRepository({ remoteUrls })) return null;
+  return (
+    `gh-glance: ${source} repository could not be resolved.\n` +
+    "Run it from a checkout with one usable GitHub remote, or pass --repo owner/name."
+  );
+}
+
+// ---------- Optional local collector ----------
+
+const COLLECTOR_PROTOCOL_VERSION = 1;
+const COLLECTOR_FRAME_MAX_BYTES = 1024 * 1024;
+const COLLECTOR_CHUNK_FRAME_MAX_BYTES = 512 * 1024;
+const COLLECTOR_ASSEMBLY_MAX_BYTES = 8 * 1024 * 1024;
+const COLLECTOR_ASSEMBLY_TIMEOUT_MS = 10_000;
+const COLLECTOR_MAX_CLIENT_SUBSCRIPTIONS = 64;
+const COLLECTOR_MAX_CLIENT_QUEUE_FRAMES = 64;
+const COLLECTOR_MAX_CLIENT_QUEUE_BYTES = 4 * 1024 * 1024;
+const COLLECTOR_MAX_AGGREGATE_QUEUE_BYTES = 64 * 1024 * 1024;
+const COLLECTOR_DRAIN_TIMEOUT_MS = 10_000;
+const WEBHOOK_BODY_MAX_BYTES = 25 * 1024 * 1024;
+const WEBHOOK_AGGREGATE_BODY_MAX_BYTES = WEBHOOK_BODY_MAX_BYTES * 2;
+const WEBHOOK_READ_TIMEOUT_MS = 10_000;
+const WEBHOOK_MAX_CONNECTIONS = 32;
+const WEBHOOK_DELIVERY_TTL_MS = 24 * 60 * 60 * 1_000;
+const WEBHOOK_MAX_DELIVERIES = 10_000;
+const WEBHOOK_MAX_INVALIDATIONS = 512;
+const WEBHOOK_COALESCE_MS = 1_000;
+const WEBHOOK_RECONCILE_MS = 300_000;
+const WEBHOOK_DORMANT_RETRY_MS = WEBHOOK_RECONCILE_MS;
+const WEBHOOK_QUEUE_MAX_BYTES = 2 * 1024 * 1024;
+const WEBHOOK_ROUTE = "/webhooks/github";
+const SSH_RECONNECT_STEPS_MS = Object.freeze([1_000, 2_000, 4_000, 8_000, 16_000, 30_000]);
+const SSH_STDERR_MAX_BYTES = 4_096;
+const SSH_ALIAS_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/;
+const COLLECTOR_HOLD_REASONS = new Set([
+  "observer", "primary", "secondary", "disconnected", "coordination", "shared-wait", "cache-only",
+]);
+const COLLECTOR_ROW_KEYS = Object.freeze({
+  actions: ["databaseId", "displayTitle", "workflowName", "number", "headBranch", "status", "conclusion",
+    "startedAt", "updatedAt", "url"],
+  issues: ["number", "title", "author", "label", "updatedAt", "url"],
+  prs: ["number", "title", "author", "headRefName", "isDraft", "reviewDecision", "updatedAt", "url"],
+  security: ["id", "kind", "severity", "title", "detail", "createdAt"],
+});
+const COLLECTOR_DIAGNOSTIC_STATUSES = new Set([
+  "initializing", "healthy", "waiting", "unavailable", ...COLLECTOR_HOLD_REASONS,
+]);
+
+function validateSshAlias(value) {
+  if (typeof value !== "string" || !SSH_ALIAS_PATTERN.test(value)) {
+    throw new Error("SSH alias must use only letters, digits, dot, underscore, or hyphen and cannot start with hyphen");
+  }
+  return value;
+}
+
+function sshAliasFromConnect(value) {
+  if (typeof value !== "string" || !value.startsWith("ssh:")) return null;
+  return validateSshAlias(value.slice(4));
+}
+
+function collectorSshArgv(alias) {
+  return ["-T", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes", "-o", "ForwardAgent=no", "--",
+    validateSshAlias(alias), "gh-glance --collector-stdio"];
+}
+
+function collectorSshEnvironment(env = process.env) {
+  const exact = new Set(["PATH", "HOME", "USER", "LOGNAME", "SHELL", "SSH_AUTH_SOCK", "LANG", "TERM", "TMPDIR"]);
+  return Object.fromEntries(Object.entries(env).filter(([name, value]) =>
+    value !== undefined && (exact.has(name) || /^LC_[A-Z0-9_]+$/.test(name))));
+}
+
+function sshReconnectDelay(attempt, { random = Math.random } = {}) {
+  const index = Math.min(Math.max(0, Number.isSafeInteger(attempt) ? attempt : 0), SSH_RECONNECT_STEPS_MS.length - 1);
+  const base = SSH_RECONNECT_STEPS_MS[index];
+  const jitter = Math.floor(Math.max(0, Math.min(1, Number(random()) || 0)) * Math.min(1_000, base * 0.2));
+  return base + jitter;
+}
+
+function createCollectorSourceAgeTracker({ now = Date.now, monotonicNow = () => performance.now(), checkpoint = null } = {}) {
+  let sourceAt = Number.isFinite(checkpoint?.lastSuccessAt) ? checkpoint.lastSuccessAt : null;
+  let lowerBound = Number.isFinite(checkpoint?.ageMs) ? Math.max(0, checkpoint.ageMs) : 0;
+  if (Number.isFinite(checkpoint?.clientCheckpointAt)) {
+    lowerBound += Math.max(0, now() - checkpoint.clientCheckpointAt);
+  }
+  let measuredAt = monotonicNow();
+  const current = () => lowerBound + Math.max(0, monotonicNow() - measuredAt);
+  return {
+    observe({ lastSuccessAt, serverNow }) {
+      if (!Number.isFinite(lastSuccessAt) || !Number.isFinite(serverNow)) return current();
+      const candidate = Math.max(0, serverNow - lastSuccessAt);
+      const elapsed = current();
+      if (sourceAt === null || lastSuccessAt > sourceAt) lowerBound = candidate;
+      else lowerBound = Math.max(elapsed, candidate);
+      sourceAt = sourceAt === null ? lastSuccessAt : Math.max(sourceAt, lastSuccessAt);
+      measuredAt = monotonicNow();
+      return lowerBound;
+    },
+    current,
+    checkpoint() {
+      return { lastSuccessAt: sourceAt, ageMs: current(), clientCheckpointAt: now() };
+    },
+  };
+}
+
+function createSshCollectorTransport({
+  alias,
+  env = process.env,
+  spawn_ = spawn,
+  onDiagnostic = () => {},
+  setTimeout: setTimeout_ = setTimeout,
+  clearTimeout: clearTimeout_ = clearTimeout,
+} = {}) {
+  const child = spawn_("ssh", collectorSshArgv(alias), {
+    env: collectorSshEnvironment(env),
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const transport = new EventEmitter();
+  let closed = false;
+  let destroyed = false;
+  let stderr = Buffer.alloc(0);
+  let killTimer = null;
+  const finish = (fallbackDiagnostic = "") => {
+    if (closed) return;
+    closed = true;
+    if (killTimer !== null) clearTimeout_(killTimer);
+    if (stderr.length > 0 || fallbackDiagnostic) {
+      const message = safe(redact(stderr.length > 0 ? stderr.toString("utf8") : fallbackDiagnostic));
+      if (message) onDiagnostic(message);
+    }
+    transport.emit("close");
+  };
+  child.once("spawn", () => transport.emit("connect"));
+  child.stdout.on("data", (chunk) => transport.emit("data", chunk));
+  child.stderr.on("data", (chunk) => {
+    if (stderr.length >= SSH_STDERR_MAX_BYTES) return;
+    const next = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    stderr = Buffer.concat([stderr, next.subarray(0, SSH_STDERR_MAX_BYTES - stderr.length)]);
+  });
+  child.stdin.on("error", (error) => {
+    if (closed) return;
+    if (transport.listenerCount("error") > 0) transport.emit("error", error);
+    transport.destroy();
+  });
+  child.once("error", (error) => {
+    if (transport.listenerCount("error") > 0) transport.emit("error", error);
+    finish(`SSH connection failed: ${shortErr(error)}`);
+  });
+  child.once("close", (code) => finish(code === 0 ? "" : `SSH connection closed (exit ${code ?? "unknown"})`));
+  transport.write = (value) => !closed && child.stdin.writable && child.stdin.write(value);
+  Object.defineProperty(transport, "writable", { get: () => !closed && child.stdin.writable });
+  Object.defineProperty(transport, "destroyed", { get: () => closed });
+  transport.destroy = () => {
+    if (destroyed || closed) return;
+    destroyed = true;
+    child.stdin.destroy();
+    child.kill("SIGTERM");
+    killTimer = setTimeout_(() => { if (!closed) child.kill("SIGKILL"); }, 1_000);
+    killTimer?.unref?.();
+  };
+  return transport;
+}
+
+function collectorSocketPath(pathOptions = {}) {
+  return join(dirname(widthPreferencesPath(pathOptions)), "collector-v1.sock");
+}
+
+function collectorOwnershipPath(pathOptions = {}) {
+  return join(dirname(widthPreferencesPath(pathOptions)), "collector-ownership-v1.json");
+}
+
+function loadCollectorCanonicalOwnership(pathOptions, target) {
+  const path = collectorOwnershipPath(pathOptions);
+  try {
+    const loaded = JSON.parse(readFileSync(path, "utf8"));
+    if (!isRecord(loaded) || loaded.version !== 1 || !isRecord(loaded.owners) ||
+        !isRecord(loaded.aliases ?? {}) || Object.keys(loaded).some((key) => !["version", "owners", "aliases"].includes(key))) {
+      return { ok: false, reason: "corrupt" };
+    }
+    const textual = `${target.host}/${target.repo.toLowerCase()}`;
+    if (loaded.owners[textual] && loaded.owners[textual] !== target.provider) {
+      return { ok: false, reason: "provider-conflict" };
+    }
+    const identity = loaded.aliases?.[textual];
+    return identity === undefined
+      ? { ok: true, value: null }
+      : normalizeRepositoryIdentity(identity)
+        ? { ok: true, value: normalizeRepositoryIdentity(identity) }
+        : { ok: false, reason: "corrupt" };
+  } catch (error) {
+    return error?.code === "ENOENT" ? { ok: true, value: null } : { ok: false, reason: "unreadable" };
+  }
+}
+
+function admitCollectorCanonicalOwnership(pathOptions, target, repositoryIdentity) {
+  const identity = normalizeRepositoryIdentity(repositoryIdentity);
+  if (!identity) return { ok: false, reason: "identity" };
+  const path = collectorOwnershipPath(pathOptions);
+  ensurePrivateCollectorRoot(dirname(path), pathOptions.platform);
+  return withPersistenceLock(path, () => {
+    let state = { version: 1, owners: {}, aliases: {} };
+    try {
+      const loaded = JSON.parse(readFileSync(path, "utf8"));
+      if (!isRecord(loaded) || loaded.version !== 1 || !isRecord(loaded.owners) ||
+          !isRecord(loaded.aliases ?? {}) || Object.keys(loaded).some((key) => !["version", "owners", "aliases"].includes(key)) ||
+          Object.entries(loaded.owners).some(([key, value]) => key.length > 512 || !validCollectorId(value))) {
+        return { ok: false, reason: "corrupt" };
+      }
+      state = { ...loaded, aliases: loaded.aliases ?? {} };
+    } catch (error) {
+      if (error?.code !== "ENOENT") return { ok: false, reason: "unreadable" };
+    }
+    const textual = `${target.host}/${target.repo.toLowerCase()}`;
+    const canonical = `${target.host}/${identity.nameWithOwner.toLowerCase()}`;
+    const keys = [textual, canonical, `${target.host}/id:${identity.id}`];
+    if (keys.some((key) => state.owners[key] && state.owners[key] !== target.provider)) {
+      return { ok: false, reason: "provider-conflict" };
+    }
+    let changed = false;
+    for (const key of keys) {
+      if (state.owners[key] !== target.provider) { state.owners[key] = target.provider; changed = true; }
+    }
+    for (const alias of [textual, canonical]) {
+      if (JSON.stringify(state.aliases[alias]) !== JSON.stringify(identity)) {
+        state.aliases[alias] = identity;
+        changed = true;
+      }
+    }
+    if (!changed) return { ok: true, value: identity };
+    const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temp, `${JSON.stringify(state)}\n`, { mode: 0o600, flag: "wx" });
+      renameSync(temp, path);
+      return { ok: true, value: identity };
+    } catch (error) {
+      try { unlinkSync(temp); } catch { /* exact operation-owned temp */ }
+      return { ok: false, reason: "unwritable", error };
+    }
+  });
+}
+
+const GITHUB_APP_PERMISSION_KEYS = Object.freeze([
+  "metadata", "actions", "issues", "pull_requests",
+  "vulnerability_alerts", "security_events", "secret_scanning_alerts",
+]);
+const GITHUB_APP_REQUIRED_PERMISSIONS = Object.freeze([
+  "metadata", "actions", "issues", "pull_requests",
+]);
+const GITHUB_APP_RENEWAL_SKEW_MS = 5 * 60_000;
+const GITHUB_APP_RETRY_DELAYS_MS = Object.freeze([60_000, 120_000, 240_000, 480_000]);
+const GITHUB_APP_RESPONSE_MAX_BYTES = 1024 * 1024;
+const GITHUB_APP_REQUEST_TIMEOUT_MS = 10_000;
+const GITHUB_APP_IN_FLIGHT_MAX_MS = GITHUB_APP_REQUEST_TIMEOUT_MS + 5_000;
+
+function normalizeGitHubAppPermissions(raw) {
+  if (!isRecord(raw) || Object.keys(raw).length > GITHUB_APP_PERMISSION_KEYS.length ||
+      Object.entries(raw).some(([key, value]) => !GITHUB_APP_PERMISSION_KEYS.includes(key) || value !== "read") ||
+      GITHUB_APP_REQUIRED_PERMISSIONS.some((key) => raw[key] !== "read")) return null;
+  return { ...raw };
+}
+
+function normalizeGitHubAppProvider(raw) {
+  if (!exactKeys(raw, ["type", "host", "clientId", "installationId", "privateKeyFile", "repositoryIds", "permissions"]) ||
+      raw.type !== "github-app" || typeof raw.clientId !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(raw.clientId) ||
+      !Number.isSafeInteger(raw.installationId) || raw.installationId < 1 ||
+      typeof raw.privateKeyFile !== "string" || raw.privateKeyFile.length < 1 ||
+      raw.privateKeyFile.length > 4_096 || !isAbsolute(raw.privateKeyFile) ||
+      !Array.isArray(raw.repositoryIds) || raw.repositoryIds.length < 1 || raw.repositoryIds.length > 500 ||
+      raw.repositoryIds.some((id) => !Number.isSafeInteger(id) || id < 1) ||
+      new Set(raw.repositoryIds).size !== raw.repositoryIds.length) return null;
+  const host = normalizeHost(raw.host);
+  const permissions = normalizeGitHubAppPermissions(raw.permissions);
+  if (!host || !permissions) return null;
+  return { type: "github-app", host, clientId: raw.clientId, installationId: raw.installationId,
+    privateKeyFile: raw.privateKeyFile, repositoryIds: [...raw.repositoryIds], permissions };
+}
+
+function normalizeCollectorConfig(raw, { aliases = {} } = {}) {
+  if ((!exactKeys(raw, ["version", "providers", "targets"]) &&
+       !exactKeys(raw, ["version", "providers", "targets", "webhook"])) || raw.version !== 1 ||
+      !isRecord(raw.providers) || !Array.isArray(raw.targets) || raw.targets.length > 32) return null;
+  const providers = {};
+  for (const [name, provider] of Object.entries(raw.providers)) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) return null;
+    if (provider?.type === "gh") {
+      if (!exactKeys(provider, ["type", "host"])) return null;
+      const host = normalizeHost(provider.host);
+      if (!host) return null;
+      providers[name] = { type: "gh", host };
+    } else {
+      const app = normalizeGitHubAppProvider(provider);
+      if (!app) return null;
+      providers[name] = app;
+    }
+  }
+  if (Object.keys(providers).length === 0) return null;
+  const targets = [];
+  const ownership = new Map();
+  for (const target of raw.targets) {
+    if (!exactKeys(target, ["host", "repo", "provider"]) || !providers[target.provider]) return null;
+    const host = normalizeHost(target.host);
+    let repo;
+    try { repo = parseRepoTarget(target.repo).slug; } catch { return null; }
+    if (!host || providers[target.provider].host !== host) return null;
+    const textual = `${host}/${repo.toLowerCase()}`;
+    const canonical = aliases[textual] ?? textual;
+    const owner = ownership.get(canonical);
+    if (owner && owner !== target.provider) return null;
+    if (owner) return null;
+    ownership.set(canonical, target.provider);
+    targets.push({ host, repo, provider: target.provider, canonical });
+  }
+  if (targets.length === 0) return null;
+  const webhook = raw.webhook === undefined ? null : normalizeWebhookConfig(raw.webhook, targets);
+  if (raw.webhook !== undefined && webhook === null) return null;
+  return { version: 1, providers, targets, ...(webhook ? { webhook } : {}) };
+}
+
+function normalizeWebhookConfig(raw, collectorTargets) {
+  if (exactKeys(raw, ["enabled"]) && raw.enabled === false) return { enabled: false };
+  if (!exactKeys(raw, ["enabled", "address", "port", "secretFile", "targets"]) || raw.enabled !== true ||
+      !["127.0.0.1", "::1"].includes(raw.address) || !Number.isSafeInteger(raw.port) ||
+      raw.port < 1 || raw.port > 65_535 || typeof raw.secretFile !== "string" ||
+      raw.secretFile.length === 0 || raw.secretFile.length > 4_096 || !isAbsolute(raw.secretFile) ||
+      !Array.isArray(raw.targets) || raw.targets.length === 0 || raw.targets.length > 32) return null;
+  const targets = [];
+  const seen = new Set();
+  for (const candidate of raw.targets) {
+    if (!exactKeys(candidate, ["host", "repo", "provider", "resources"]) ||
+        !Array.isArray(candidate.resources) || candidate.resources.length === 0 ||
+        candidate.resources.length > TAB_KEYS.length || candidate.resources.some((resource) => !TAB_KEYS.includes(resource)) ||
+        new Set(candidate.resources).size !== candidate.resources.length) return null;
+    const host = normalizeHost(candidate.host);
+    let repo;
+    try { repo = parseRepoTarget(candidate.repo).slug.toLowerCase(); } catch { return null; }
+    const matched = collectorTargets.find((target) => target.host === host &&
+      target.repo.toLowerCase() === repo && target.provider === candidate.provider);
+    const key = `${host}\0${repo}\0${candidate.provider}`;
+    if (!matched || seen.has(key)) return null;
+    seen.add(key);
+    targets.push({ host, repo, provider: candidate.provider, resources: [...candidate.resources] });
+  }
+  return { enabled: true, address: raw.address, port: raw.port, secretFile: raw.secretFile, targets };
+}
+
+function readPrivateFile(path, { maxBytes = 65_536, message }) {
+  let fd = null;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const identity = fstatSync(fd);
+    if (!identity.isFile() || identity.size < 1 || identity.size > maxBytes ||
+        typeof process.getuid === "function" && identity.uid !== process.getuid() ||
+        process.platform !== "win32" && (identity.mode & 0o077) !== 0) {
+      throw new Error(message);
+    }
+    return readFileSync(fd);
+  } catch {
+    throw new Error(message);
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+function readGitHubAppPrivateKey(path) {
+  return readPrivateFile(path, { message: "GitHub App private key is unavailable" });
+}
+
+function signGitHubAppJwt(provider, { now = Date.now, readPrivateKey = readGitHubAppPrivateKey } = {}) {
+  const normalized = normalizeGitHubAppProvider(provider);
+  if (!normalized) throw new Error("GitHub App configuration is invalid");
+  let keyBytes = null;
+  try {
+    keyBytes = readPrivateKey(normalized.privateKeyFile);
+    const key = createPrivateKey(keyBytes);
+    if (key.asymmetricKeyType !== "rsa") {
+      throw new Error("invalid key type");
+    }
+    const seconds = Math.floor(now() / 1000);
+    const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
+    const payload = Buffer.from(JSON.stringify({ iat: seconds - 60, exp: seconds + 540,
+      iss: normalized.clientId })).toString("base64url");
+    const input = `${header}.${payload}`;
+    return `${input}.${cryptoSign("RSA-SHA256", Buffer.from(input), key).toString("base64url")}`;
+  } catch (error) {
+    if (error?.message === "GitHub App private key is unavailable") throw error;
+    // eslint-disable-next-line preserve-caught-error -- crypto/key-reader causes can disclose key paths or parser detail
+    throw new Error("GitHub App private key is invalid");
+  } finally {
+    if (Buffer.isBuffer(keyBytes)) keyBytes.fill(0);
+  }
+}
+
+function githubAppChildEnvironment(host, token, env = process.env) {
+  const result = { ...env };
+  for (const name of ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]) {
+    delete result[name];
+  }
+  const [selected] = credentialEnvironmentNames(host);
+  result[selected] = token;
+  return result;
+}
+
+function githubAppAccessIdentity(name, provider, generation = 1) {
+  const normalized = normalizeGitHubAppProvider(provider);
+  if (!normalized || !validCollectorId(name) || !Number.isSafeInteger(generation) || generation < 1) {
+    throw new Error("GitHub App configuration is invalid");
+  }
+  const quotaKey = privateIdentityDigest("installation-quota-v1", normalized.host,
+    "installation", normalized.installationId);
+  const credentialKey = privateIdentityDigest("installation-credential-v1", normalized.host,
+    normalized.clientId, normalized.installationId);
+  const repositoryIds = [...normalized.repositoryIds].sort((left, right) => left - right);
+  const permissions = Object.entries(normalized.permissions).sort(([left], [right]) => left.localeCompare(right));
+  return {
+    host: normalized.host,
+    kind: "installation",
+    id: normalized.installationId,
+    login: `installation-${normalized.installationId}`,
+    quotaKey,
+    credentialKey,
+    accessKey: privateIdentityDigest("installation-access-v1", name, normalized.host,
+      normalized.installationId, repositoryIds, permissions, generation),
+    generation,
+    observedAt: Date.now(),
+  };
+}
+
+function githubAppResourceCapabilities(provider) {
+  const permissions = normalizeGitHubAppProvider(provider)?.permissions ?? {};
+  return {
+    actions: permissions.actions === "read",
+    issues: permissions.issues === "read",
+    prs: permissions.pull_requests === "read",
+    security: {
+      dependabot: permissions.vulnerability_alerts === "read",
+      codeScanning: permissions.security_events === "read",
+      secretScanning: permissions.secret_scanning_alerts === "read",
+    },
+  };
+}
+
+function githubAppSecurityPolicy(provider, at = Date.now()) {
+  const normalized = normalizeGitHubAppProvider(provider);
+  if (!normalized) throw new Error("GitHub App configuration is invalid");
+  const permission = { dependabot: "vulnerability_alerts", codeScanning: "security_events",
+    secretScanning: "secret_scanning_alerts" };
+  const sources = ALERT_SOURCES.filter((source) => normalized.permissions[permission[source.key]] === "read");
+  const allowed = new Set(sources.map((source) => source.key));
+  const denied = ALERT_SOURCES.filter((source) => !allowed.has(source.key));
+  const capabilities = Object.fromEntries(denied.map((source) => [
+    source.key,
+    { verdict: "unavailable", step: 0, until: at + BACKOFF_STEPS_MS[0],
+      note: `${source.name}: permission not granted` },
+  ]));
+  return { sources, capabilities, blind: false,
+    notes: denied.map((source) => `${source.name}: permission not granted`) };
+}
+
+function applyGitHubAppSecurityPolicy(result, policy) {
+  if (!isRecord(result) || !isRecord(policy) || typeof result.parse !== "function") return result;
+  const parse = result.parse;
+  return {
+    ...result,
+    capabilities: { ...(result.capabilities ?? {}), ...(policy.capabilities ?? {}) },
+    parse() {
+      const parsed = parse();
+      if (!isRecord(parsed) || parsed.unusable) return parsed;
+      return { ...parsed, notes: [...(parsed.notes ?? []), ...(policy.notes ?? [])],
+        blind: parsed.blind === true || policy.blind === true };
+    },
+  };
+}
+
+function githubAppTokenEndpoint(host, installationId) {
+  return host === "github.com"
+    ? { host: "api.github.com", path: `/app/installations/${installationId}/access_tokens` }
+    : { host, path: `/api/v3/app/installations/${installationId}/access_tokens` };
+}
+
+function requestGitHubAppToken({ host, path, headers, body, signal }, {
+  request: requestImpl = httpsRequest, setTimeout: setTimeout_ = setTimeout, clearTimeout: clearTimeout_ = clearTimeout,
+} = {}) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let bytes = 0;
+    const chunks = [];
+    let request = null;
+    let deadline = null;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      if (deadline !== null) clearTimeout_(deadline);
+      if (error) reject(new Error("GitHub App token request failed"));
+      else resolve(value);
+    };
+    try {
+      request = requestImpl({ protocol: "https:", hostname: host, port: 443, path, method: "POST",
+        headers, rejectUnauthorized: true, signal }, (response) => {
+        if (response.statusCode >= 300 && response.statusCode < 400) {
+          response.resume();
+          finish(new Error("redirect"));
+          return;
+        }
+        response.on("data", (chunk) => {
+          bytes += chunk.length;
+          if (bytes > GITHUB_APP_RESPONSE_MAX_BYTES) {
+            request.destroy();
+            finish(new Error("large response"));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        response.once("end", () => finish(null, { status: response.statusCode,
+          headers: { ...response.headers }, body: Buffer.concat(chunks, bytes).toString("utf8") }));
+        response.once("error", (error) => finish(error));
+      });
+      deadline = setTimeout_(() => { request.destroy(); finish(new Error("timeout")); },
+        GITHUB_APP_REQUEST_TIMEOUT_MS);
+      deadline.unref?.();
+      request.once("error", (error) => finish(error));
+      request.end(body);
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
+
+function normalizeGitHubAppTokenResponse(response, provider, nowMs) {
+  if (!isRecord(response) || response.status !== 201 || typeof response.body !== "string" ||
+      Buffer.byteLength(response.body) > GITHUB_APP_RESPONSE_MAX_BYTES) return null;
+  let body;
+  try { body = JSON.parse(response.body); } catch { return null; }
+  if (!isRecord(body) || typeof body.token !== "string" || !body.token || /\s/.test(body.token) ||
+      body.token.length > 4_096 || typeof body.expires_at !== "string") return null;
+  const expiresAt = Date.parse(body.expires_at);
+  if (!Number.isFinite(expiresAt) || expiresAt <= nowMs) return null;
+  if (!Array.isArray(body.repositories) || body.repositories.length !== provider.repositoryIds.length ||
+      body.repositories.some((repository) => !isRecord(repository) || !Number.isSafeInteger(repository.id)) ||
+      new Set(body.repositories.map((repository) => repository.id)).size !== body.repositories.length) return null;
+  const returnedIds = new Set(body.repositories.map((repository) => repository.id));
+  if (provider.repositoryIds.some((id) => !returnedIds.has(id))) return null;
+  const returnedPermissions = normalizeGitHubAppPermissions(body.permissions);
+  if (!returnedPermissions || JSON.stringify(Object.entries(returnedPermissions).sort()) !==
+      JSON.stringify(Object.entries(provider.permissions).sort())) return null;
+  return { token: body.token, expiresAt };
+}
+
+function persistGitHubAppIdentity(root, identity, now = Date.now()) {
+  return withIdentityRegistry(root, (state) => {
+    const scope = { ...createQuotaScope(identity, { root, now: () => now }), rootLocked: true };
+    const initialized = withGovernorLock(scope, () => {
+      const loaded = readIdentityQuotaState(state, scope, now);
+      if (!loaded.ok) return loaded;
+      return loaded.missing ? writeGovernorState(scope.path, loaded.value) : { ok: true };
+    });
+    if (!initialized.ok) return initialized;
+    state.identities[identity.credentialKey] = { host: identity.host, kind: identity.kind,
+      id: identity.id, login: identity.login, quotaKey: identity.quotaKey,
+      accessKey: identity.accessKey, generation: identity.generation, observedAt: now };
+    return { ok: true, value: identity };
+  }, { now });
+}
+
+const GITHUB_APP_ATTEMPT_WINDOW_MS = 60 * 60_000;
+
+function githubAppAuthStatePath(root, identity) {
+  return join(root, `app-auth-${identity.credentialKey}.json`);
+}
+
+function emptyGitHubAppAuthState() {
+  return { version: 1, generation: 1, revision: 1, attempts: [], retryAt: 0,
+    inFlight: null, coreAccessKey: null };
+}
+
+function normalizeGitHubAppAuthState(raw, nowMs) {
+  if (!exactKeys(raw, ["version", "generation", "revision", "attempts", "retryAt", "inFlight", "coreAccessKey"]) ||
+      raw.version !== 1 || !Number.isSafeInteger(raw.generation) || raw.generation < 1 ||
+      !Number.isSafeInteger(raw.revision) || raw.revision < 1 ||
+      !Array.isArray(raw.attempts) || raw.attempts.length > 5 ||
+      raw.attempts.some((at) => !Number.isFinite(at) || at < 0 || at > nowMs) ||
+      !Number.isFinite(raw.retryAt) || raw.retryAt < 0 ||
+      raw.coreAccessKey !== null && !/^[0-9a-f]{64}$/.test(raw.coreAccessKey)) return null;
+  if (raw.inFlight !== null && (!exactKeys(raw.inFlight, ["pid", "nonce", "startedAt", "revision"]) ||
+      !Number.isSafeInteger(raw.inFlight.pid) || raw.inFlight.pid < 1 || !validGovernorId(raw.inFlight.nonce) ||
+      !Number.isFinite(raw.inFlight.startedAt) || raw.inFlight.startedAt < 0 || raw.inFlight.startedAt > nowMs ||
+      !Number.isSafeInteger(raw.inFlight.revision) || raw.inFlight.revision < 1)) return null;
+  return raw;
+}
+
+function mutateGitHubAppAuthState(root, identity, nowMs, operation, { kill = process.kill.bind(process) } = {}) {
+  const path = githubAppAuthStatePath(root, identity);
+  const scope = { path, hash: identity.credentialKey, host: identity.host, kill };
+  return withGovernorLock(scope, () => {
+    let state = emptyGitHubAppAuthState();
+    try {
+      const raw = normalizeGitHubAppAuthState(JSON.parse(readFileSync(path, "utf8")), nowMs);
+      if (!raw) return { ok: false, reason: "corrupt" };
+      state = raw;
+    } catch (error) {
+      if (error?.code !== "ENOENT") return { ok: false, reason: "unwritable" };
+    }
+    state.attempts = state.attempts.filter((at) => at + GITHUB_APP_ATTEMPT_WINDOW_MS > nowMs);
+    const result = operation(state);
+    if (result.write === false || !result.ok && result.write !== true) return result;
+    const written = writeGovernorState(path, state);
+    return written.ok ? result : written;
+  });
+}
+
+function inspectGitHubAppAuthState(root, identity, nowMs, options) {
+  return mutateGitHubAppAuthState(root, identity, nowMs,
+    (state) => ({ ok: true, value: { generation: state.generation, revision: state.revision,
+      coreAccessKey: state.coreAccessKey }, write: false }), options);
+}
+
+function bindGitHubAppCoreValidator(root, identity, accessKey, nowMs, options) {
+  return mutateGitHubAppAuthState(root, identity, nowMs, (state) => {
+    if (!/^[0-9a-f]{64}$/.test(accessKey)) return { ok: false, reason: "stale", write: false };
+    state.coreAccessKey = accessKey;
+    return { ok: true, value: { accessKey } };
+  }, options);
+}
+
+function claimGitHubAppMint(root, identity, nowMs, {
+  pid = process.pid, kill = process.kill.bind(process), nonce = randomUUID(),
+} = {}) {
+  return mutateGitHubAppAuthState(root, identity, nowMs, (state) => {
+    if (state.inFlight) {
+      const staleAt = state.inFlight.startedAt + GITHUB_APP_IN_FLIGHT_MAX_MS;
+      if (!pidIsDead(state.inFlight.pid, kill) && staleAt > nowMs) {
+        return { ok: false, reason: "in-flight", retryAt: staleAt, write: false };
+      }
+      state.inFlight = null;
+      state.retryAt = Math.max(state.retryAt, nowMs + GITHUB_APP_RETRY_DELAYS_MS[0]);
+      return { ok: false, reason: "backoff", retryAt: state.retryAt, write: true };
+    }
+    const capacityRetryAt = state.attempts.length >= 5
+      ? state.attempts[0] + GITHUB_APP_ATTEMPT_WINDOW_MS : 0;
+    const blockedUntil = Math.max(state.retryAt, capacityRetryAt);
+    if (blockedUntil > nowMs) return { ok: false, reason: "backoff", retryAt: blockedUntil, write: false };
+    state.attempts.push(nowMs);
+    state.inFlight = { pid, nonce, startedAt: nowMs, revision: state.revision };
+    return { ok: true, value: { attempt: state.attempts.length, pid, nonce, generation: state.generation,
+      revision: state.revision } };
+  }, { kill });
+}
+
+function settleGitHubAppMint(root, identity, claim, nowMs, success, retryAfterMs = 0, {
+  kill = process.kill.bind(process),
+} = {}) {
+  return mutateGitHubAppAuthState(root, identity, nowMs, (state) => {
+    if (!claim || state.revision !== claim.revision || state.inFlight?.nonce !== claim.nonce ||
+        state.inFlight.pid !== claim.pid) return { ok: false, reason: "stale", write: false,
+      generation: state.generation, revision: state.revision };
+    state.inFlight = null;
+    if (success) {
+      state.attempts = [];
+      state.retryAt = 0;
+    } else {
+      const retryIndex = Math.max(0, Math.min(state.attempts.length - 1,
+        GITHUB_APP_RETRY_DELAYS_MS.length - 1));
+      const ladderRetryAt = state.attempts.length >= 5
+        ? state.attempts[0] + GITHUB_APP_ATTEMPT_WINDOW_MS
+        : nowMs + GITHUB_APP_RETRY_DELAYS_MS[retryIndex];
+      state.retryAt = Math.max(ladderRetryAt,
+        Number.isFinite(retryAfterMs) ? nowMs + Math.max(0, Math.min(retryAfterMs, 24 * 60 * 60_000)) : 0);
+    }
+    return { ok: true, value: { retryAt: state.retryAt, generation: state.generation,
+      revision: state.revision } };
+  }, { kill });
+}
+
+function invalidateGitHubAppAuthority(root, identity, nowMs, options) {
+  return mutateGitHubAppAuthState(root, identity, nowMs, (state) => {
+    state.generation += 1;
+    state.revision += 1;
+    state.inFlight = null;
+    state.coreAccessKey = null;
+    return { ok: true, value: { generation: state.generation, revision: state.revision } };
+  }, options);
+}
+
+function githubAppResponseRetryAfter(response, nowMs) {
+  const headers = isRecord(response?.headers) ? response.headers : {};
+  const seconds = Number(headers["retry-after"]);
+  let delay = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : 0;
+  const resetSeconds = Number(headers["x-ratelimit-reset"]);
+  if (Number(headers["x-ratelimit-remaining"]) === 0 && Number.isFinite(resetSeconds)) {
+    delay = Math.max(delay, resetSeconds * 1000 - nowMs);
+  }
+  return Math.max(0, delay);
+}
+
+function createGitHubAppProvider({ name, provider, pathOptions = {}, now = Date.now,
+  readPrivateKey = readGitHubAppPrivateKey, requestToken = requestGitHubAppToken,
+  pid = process.pid, kill = process.kill.bind(process), nonce = randomUUID } = {}) {
+  const normalized = normalizeGitHubAppProvider(provider);
+  if (!normalized || !validCollectorId(name)) throw new Error("GitHub App configuration is invalid");
+  const root = identityRegistryRoot(pathOptions);
+  const stableIdentity = githubAppAccessIdentity(name, normalized, 1);
+  const initialAuth = inspectGitHubAppAuthState(root, stableIdentity, now(), { kill });
+  if (!initialAuth.ok) throw new Error("GitHub App token unavailable");
+  let generation = initialAuth.value.generation;
+  let revision = initialAuth.value.revision;
+  let coreAccessKey = initialAuth.value.coreAccessKey;
+  let credential = null;
+  let currentIdentity = null;
+  let pending = null;
+  let closed = false;
+  let failures = 0;
+  let retryAt = 0;
+  let attempts = 0;
+  let lastError = null;
+  let unauthorizedRefreshPending = false;
+  let authorityInvalidated = false;
+  const retryDelays = [];
+  const capabilities = githubAppResourceCapabilities(normalized);
+  let projection = null;
+  let mintAbort = null;
+  const current = () => closed || !credential || credential.expiresAt <= now() ? null : currentIdentity;
+  const inspect = () => ({ generation, attempts, retryAt, retryDelays: [...retryDelays],
+    lastError, expiresAt: credential?.expiresAt ?? null });
+  const project = () => {
+    if (!projection && credential && currentIdentity) {
+      projection = { identity: currentIdentity,
+        environment: githubAppChildEnvironment(normalized.host, credential.token), capabilities };
+    }
+    return projection;
+  };
+  const resolve = ({ signal, force = false } = {}) => {
+    if (closed) return Promise.reject(new Error("GitHub App token unavailable"));
+    if (!force && credential && credential.expiresAt - now() > GITHUB_APP_RENEWAL_SKEW_MS) {
+      return Promise.resolve(project());
+    }
+    if (pending) return pending;
+    if (now() < retryAt) {
+      if (credential && credential.expiresAt > now()) return Promise.resolve(project());
+      const error = new Error("GitHub App token unavailable");
+      error.retryAt = retryAt;
+      return Promise.reject(error);
+    }
+    pending = (async () => {
+      let mintClaim = null;
+      try {
+        const claimed = claimGitHubAppMint(root, stableIdentity, now(), { pid, kill, nonce: nonce() });
+        if (!claimed.ok) {
+          retryAt = claimed.retryAt ?? now() + GITHUB_APP_RETRY_DELAYS_MS[0];
+          const error = new Error("GitHub App token unavailable");
+          error.retryAt = retryAt;
+          error.mintNotStarted = true;
+          throw error;
+        }
+        mintClaim = claimed.value;
+        generation = Math.max(generation, mintClaim.generation);
+        revision = Math.max(revision, mintClaim.revision);
+        const jwt = signGitHubAppJwt(normalized, { now, readPrivateKey });
+        attempts += 1;
+        const body = JSON.stringify({ repository_ids: normalized.repositoryIds,
+          permissions: normalized.permissions });
+        const endpoint = githubAppTokenEndpoint(normalized.host, normalized.installationId);
+        mintAbort = new AbortController();
+        const requestSignal = signal ? AbortSignal.any([signal, mintAbort.signal]) : mintAbort.signal;
+        const response = await requestToken({ host: endpoint.host,
+          path: endpoint.path,
+          headers: { accept: "application/vnd.github+json", authorization: `Bearer ${jwt}`,
+            "content-type": "application/json", "content-length": Buffer.byteLength(body),
+            "user-agent": "gh-glance" }, body, signal: requestSignal });
+        if (authorityInvalidated || revision !== mintClaim.revision) {
+          throw new Error("authority changed during token mint");
+        }
+        const next = normalizeGitHubAppTokenResponse(response, normalized, now());
+        if (!next) {
+          const error = new Error("invalid token response");
+          error.retryAfterMs = githubAppResponseRetryAfter(response, now());
+          throw error;
+        }
+        const identity = githubAppAccessIdentity(name, normalized, generation);
+        identity.observedAt = now();
+        const settled = settleGitHubAppMint(root, stableIdentity, mintClaim, now(), true, { kill });
+        if (!settled.ok) {
+          generation = Math.max(generation, settled.generation ?? generation);
+          revision = Math.max(revision, settled.revision ?? revision);
+          const error = new Error("auth accounting unavailable");
+          error.mintSettled = true;
+          throw error;
+        }
+        credential = next;
+        currentIdentity = identity;
+        projection = null;
+        failures = 0;
+        retryAt = 0;
+        lastError = null;
+        authorityInvalidated = false;
+        return project();
+      } catch (caught) {
+        const settled = caught?.mintNotStarted || caught?.mintSettled
+          ? { ok: true, value: { retryAt } }
+          : settleGitHubAppMint(root, stableIdentity, mintClaim, now(), false, caught?.retryAfterMs, { kill });
+        const delay = GITHUB_APP_RETRY_DELAYS_MS[Math.min(failures, GITHUB_APP_RETRY_DELAYS_MS.length - 1)];
+        if (!caught?.mintNotStarted && !caught?.mintSettled && failures < GITHUB_APP_RETRY_DELAYS_MS.length) {
+          retryDelays.push(delay);
+          if (retryDelays.length > GITHUB_APP_RETRY_DELAYS_MS.length) retryDelays.shift();
+        }
+        if (!caught?.mintNotStarted && !caught?.mintSettled) failures += 1;
+        retryAt = settled.ok ? settled.value.retryAt : now() + delay;
+        lastError = "GitHub App token unavailable";
+        if (credential && credential.expiresAt > now() && !caught?.mintSettled) return project();
+        credential = null;
+        currentIdentity = null;
+        projection = null;
+        const error = new Error("GitHub App token unavailable");
+        error.retryAt = retryAt;
+        throw error;
+      } finally {
+        mintAbort = null;
+      }
+    })().finally(() => { pending = null; });
+    return pending;
+  };
+  const invalidate = (reason = "unauthorized") => {
+    credential = null;
+    currentIdentity = null;
+    projection = null;
+    if (reason === "authority-changed") {
+      mintAbort?.abort();
+      if (!authorityInvalidated) {
+        const invalidated = invalidateGitHubAppAuthority(root, stableIdentity, now(), { kill });
+        if (invalidated.ok) {
+          generation = invalidated.value.generation;
+          revision = invalidated.value.revision;
+          coreAccessKey = null;
+        } else {
+          generation += 1;
+          revision += 1;
+          lastError = "GitHub App token unavailable";
+        }
+      }
+      authorityInvalidated = true;
+      unauthorizedRefreshPending = false;
+      retryAt = 0;
+    } else if (unauthorizedRefreshPending) {
+      retryAt = now() + GITHUB_APP_RETRY_DELAYS_MS[0];
+      mutateGitHubAppAuthState(root, stableIdentity, now(), (state) => {
+        state.retryAt = Math.max(state.retryAt, retryAt);
+        return { ok: true };
+      }, { kill });
+    } else {
+      unauthorizedRefreshPending = true;
+      retryAt = 0;
+    }
+  };
+  return { root, current, resolve, refresh: resolve, invalidate, inspect,
+    coreValidatorAccessKey: () => coreAccessKey,
+    markCoreValidated(accessKey) {
+      const bound = bindGitHubAppCoreValidator(root, stableIdentity, accessKey, now(), { kill });
+      if (bound.ok) coreAccessKey = accessKey;
+      return bound;
+    },
+    markAuthorized() { unauthorizedRefreshPending = false; },
+    flushCompletions: () => Promise.resolve({ ok: true }), deferCompletion() {}, isClosed: () => closed,
+    close() { closed = true; mintAbort?.abort(); credential = null; currentIdentity = null; projection = null; } };
+}
+
+async function readInstallationCoreBudget(signal, host, etag = null, { run = ghApi, now = Date.now } = {}) {
+  const unsupported = () => ({ unsupported: true,
+    capability: "installation-core-observer-unsupported" });
+  try {
+    const response = await run(["installation/repositories?per_page=1", ...apiHostArgs(host)], {
+      signal, operation: "budget-core-observer", etag,
+    });
+    if (![200, 304].includes(response.status) || response.rateLimit?.resource !== "core") return unsupported();
+    return { budget: response.rateLimit, etag: response.etag ?? etag, receivedAt: now(),
+      cost: response.status === 304 ? 0 : 1 };
+  } catch (error) {
+    const status = error?.apiResponse?.status;
+    const rateLimit = pickRateLimit(error?.apiResponse?.headers);
+    if (![403, 429].includes(status) || rateLimit?.resource !== "core") return unsupported();
+    return { budget: rateLimit, etag: error.apiResponse.headers.etag ?? etag,
+      receivedAt: now(), blocked: true, cost: 1 };
+  }
+}
+
+function validWebhookDeliveryId(value) {
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function validWebhookEventName(value) {
+  return typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value);
+}
+
+function verifyWebhookSignature(rawBody, signature, secret) {
+  if ((!Buffer.isBuffer(rawBody) && !(rawBody instanceof Uint8Array)) ||
+      typeof signature !== "string" || !/^sha256=[0-9a-f]{64}$/i.test(signature) ||
+      (!Buffer.isBuffer(secret) && !(secret instanceof Uint8Array))) return false;
+  const supplied = Buffer.from(signature.slice(7), "hex");
+  const expected = createHmac("sha256", secret).update(rawBody).digest();
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+}
+
+const WEBHOOK_EVENT_RESOURCES = Object.freeze({
+  workflow_run: "actions",
+  workflow_job: "actions",
+  issues: "issues",
+  pull_request: "prs",
+  pull_request_review: "prs",
+  pull_request_review_comment: "prs",
+  pull_request_review_thread: "prs",
+  dependabot_alert: "security",
+  repository_vulnerability_alert: "security",
+  code_scanning_alert: "security",
+  secret_scanning_alert: "security",
+  secret_scanning_alert_location: "security",
+});
+const WEBHOOK_ACCESS_EVENTS = new Set(["installation", "installation_repositories", "repository"]);
+
+function webhookPayloadRepositories(event, payload) {
+  if (event === "installation") return [];
+  if (event === "installation_repositories") {
+    return (Array.isArray(payload.repositories_removed) ? payload.repositories_removed : [])
+      .map((repository) => repository?.full_name);
+  }
+  return [payload.repository?.full_name];
+}
+
+function mapWebhookInvalidations({ event, payload, config, enterpriseHost = null } = {}) {
+  if (!validWebhookEventName(event) || !isRecord(payload) || config?.webhook?.enabled !== true) {
+    return { ok: false, reason: "invalid" };
+  }
+  let resource = WEBHOOK_EVENT_RESOURCES[event] ?? null;
+  if (event === "issue_comment") resource = isRecord(payload.issue?.pull_request) ? "prs" : "issues";
+  if (event === "installation" && !["deleted", "suspend"].includes(payload.action)) {
+    return { ok: true, unsupported: true, invalidations: [] };
+  }
+  if (event === "installation_repositories" && payload.action !== "removed") {
+    return { ok: true, unsupported: true, invalidations: [] };
+  }
+  const accessRemoved = WEBHOOK_ACCESS_EVENTS.has(event);
+  if (!resource && !accessRemoved) return { ok: true, unsupported: true, invalidations: [] };
+  const selectedHost = enterpriseHost === null || enterpriseHost === undefined || enterpriseHost === ""
+    ? null : normalizeHost(enterpriseHost);
+  if (enterpriseHost && !selectedHost) return { ok: false, reason: "target" };
+  const repositoryNames = webhookPayloadRepositories(event, payload);
+  if (event !== "installation" && (repositoryNames.length === 0 || repositoryNames.some((name) => {
+    try { return parseRepoTarget(name).slug !== String(name); } catch { return true; }
+  }))) return { ok: false, reason: "target" };
+  const names = new Set(repositoryNames.map((name) => name.toLowerCase()));
+  const mappedTargets = accessRemoved
+    ? config.targets.map((target) => ({ ...target, resources: TAB_KEYS }))
+    : config.webhook.targets;
+  let targets = mappedTargets.filter((target) =>
+    (!selectedHost || target.host === selectedHost) && (event === "installation" || names.has(target.repo)));
+  if (["installation", "installation_repositories"].includes(event)) {
+    targets = targets.filter((target) => {
+      const provider = config.providers[target.provider];
+      return provider?.type === "github-app" && Number.isSafeInteger(payload.installation?.id) &&
+        provider.installationId === payload.installation.id;
+    });
+  }
+  if (!selectedHost && event !== "installation") {
+    const hostsByRepo = new Map();
+    for (const target of targets) hostsByRepo.set(target.repo, (hostsByRepo.get(target.repo) ?? new Set()).add(target.host));
+    if ([...hostsByRepo.values()].some((hosts) => hosts.size !== 1)) return { ok: false, reason: "target" };
+  }
+  if (targets.length === 0) return ["installation", "installation_repositories"].includes(event)
+    ? { ok: true, unsupported: true, invalidations: [] }
+    : { ok: false, reason: "target" };
+  const invalidations = targets.flatMap((target) => {
+    const resources = accessRemoved ? TAB_KEYS : target.resources.includes(resource) ? [resource] : [];
+    return resources.map((covered) => ({ host: target.host, repo: target.repo, provider: target.provider,
+      resource: covered, accessRemoved }));
+  });
+  if (invalidations.length === 0) return { ok: true, unsupported: true, invalidations: [] };
+  const unique = new Map(invalidations.map((item) => [webhookInvalidationKey(item), item]));
+  return { ok: true, invalidations: [...unique.values()] };
+}
+
+function webhookInvalidationKey(item) {
+  return createHash("sha256").update(`${item.host}\0${item.repo}\0${item.provider}\0${item.resource}`).digest("hex");
+}
+
+function webhookCoverageKey(item) {
+  return `${item.provider}\0${item.host}\0${item.repo.toLowerCase()}\0${item.resource}`;
+}
+
+function webhookQueuePath(options = {}) {
+  return join(identityRegistryRoot(options), "webhook-queue-v1.json");
+}
+
+function emptyWebhookQueueState() {
+  return { version: 1, deliveries: {}, invalidations: {} };
+}
+
+function normalizeWebhookInvalidationInput(raw) {
+  if (!exactKeys(raw, ["host", "repo", "provider", "resource", "accessRemoved"]) ||
+      !normalizeHost(raw.host) || typeof raw.repo !== "string" || !REPO_PATTERN.test(raw.repo) ||
+      !validCollectorId(raw.provider) || !TAB_KEYS.includes(raw.resource) || typeof raw.accessRemoved !== "boolean") {
+    return null;
+  }
+  return { ...raw, host: normalizeHost(raw.host), repo: raw.repo.toLowerCase() };
+}
+
+function normalizeWebhookInvalidation(raw, expectedKey = null, nowMs = Number.POSITIVE_INFINITY) {
+  if (!exactKeys(raw, ["host", "repo", "provider", "resource", "accessRemoved", "acceptedAt", "dueAt", "revision"]) ||
+      !Number.isFinite(raw.acceptedAt) || raw.acceptedAt < 0 || raw.acceptedAt > nowMs + WEBHOOK_COALESCE_MS ||
+      !Number.isFinite(raw.dueAt) || raw.dueAt < raw.acceptedAt ||
+      raw.dueAt > nowMs + WEBHOOK_DELIVERY_TTL_MS ||
+      !validGovernorId(raw.revision)) return null;
+  const input = normalizeWebhookInvalidationInput({ host: raw.host, repo: raw.repo, provider: raw.provider,
+    resource: raw.resource, accessRemoved: raw.accessRemoved });
+  if (!input) return null;
+  const value = { ...input, acceptedAt: raw.acceptedAt, dueAt: raw.dueAt, revision: raw.revision };
+  return expectedKey === null || webhookInvalidationKey(value) === expectedKey ? value : null;
+}
+
+function normalizeWebhookQueueState(raw, { maxDeliveries = WEBHOOK_MAX_DELIVERIES,
+  maxInvalidations = WEBHOOK_MAX_INVALIDATIONS, nowMs = Date.now() } = {}) {
+  if (!exactKeys(raw, ["version", "deliveries", "invalidations"]) || raw.version !== 1 ||
+      !isRecord(raw.deliveries) || !isRecord(raw.invalidations) ||
+      Object.keys(raw.deliveries).length > maxDeliveries ||
+      Object.keys(raw.invalidations).length > maxInvalidations) return null;
+  const deliveries = {};
+  for (const [id, acceptedAt] of Object.entries(raw.deliveries)) {
+    if (!validWebhookDeliveryId(id) || !Number.isFinite(acceptedAt) || acceptedAt < 0 ||
+        acceptedAt > nowMs + WEBHOOK_COALESCE_MS) return null;
+    deliveries[id.toLowerCase()] = acceptedAt;
+  }
+  const invalidations = {};
+  for (const [key, rawInvalidation] of Object.entries(raw.invalidations)) {
+    if (!/^[0-9a-f]{64}$/.test(key)) return null;
+    const invalidation = normalizeWebhookInvalidation(rawInvalidation, key, nowMs);
+    if (!invalidation) return null;
+    invalidations[key] = invalidation;
+  }
+  return { version: 1, deliveries, invalidations };
+}
+
+function loadWebhookQueueState(path, limits = {}, nowMs = Date.now()) {
+  let fd = null;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > WEBHOOK_QUEUE_MAX_BYTES ||
+        typeof process.getuid === "function" && stat.uid !== process.getuid() ||
+        process.platform !== "win32" && (stat.mode & 0o077) !== 0) return { ok: false, reason: "unsafe" };
+    const value = normalizeWebhookQueueState(JSON.parse(readFileSync(fd, "utf8")), { ...limits, nowMs });
+    return value ? { ok: true, value } : { ok: false, reason: "corrupt" };
+  } catch (error) {
+    return error?.code === "ENOENT" ? { ok: true, value: emptyWebhookQueueState() }
+      : { ok: false, reason: error instanceof SyntaxError ? "corrupt" : "unreadable", error };
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+function writeWebhookQueueState(path, state) {
+  const serialized = `${JSON.stringify(state)}\n`;
+  if (Buffer.byteLength(serialized) > WEBHOOK_QUEUE_MAX_BYTES) return { ok: false, reason: "capacity" };
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  let tempFd = null;
+  let directoryFd = null;
+  try {
+    tempFd = openSync(temp, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    writeFileSync(tempFd, serialized, { encoding: "utf8" });
+    fsyncSync(tempFd);
+    closeSync(tempFd);
+    tempFd = null;
+    renameSync(temp, path);
+    directoryFd = openSync(dirname(path), fsConstants.O_RDONLY);
+    fsyncSync(directoryFd);
+    return { ok: true };
+  } catch (error) {
+    try { unlinkSync(temp); } catch { /* exact operation-owned temp */ }
+    return { ok: false, reason: "unwritable", error };
+  } finally {
+    if (tempFd !== null) try { closeSync(tempFd); } catch { /* already closed */ }
+    if (directoryFd !== null) try { closeSync(directoryFd); } catch { /* already closed */ }
+  }
+}
+
+function withWebhookQueueLock(path, operation, { pid = process.pid, kill = process.kill.bind(process),
+  waitMs = PERSISTENCE_LOCK_WAIT_MS } = {}) {
+  const lockPath = `${path}.lock`;
+  const deadline = Date.now() + waitMs;
+  const nonce = randomUUID();
+  let fd = null;
+  let identity = null;
+  while (fd === null) {
+    try {
+      fd = openSync(lockPath, "wx", 0o600);
+      identity = fstatSync(fd);
+      writeFileSync(fd, JSON.stringify({ pid, nonce }), { encoding: "utf8" });
+    } catch (error) {
+      if (fd !== null) { try { closeSync(fd); } catch { /* failed acquisition */ } fd = null; }
+      if (identity) unlinkMatchingInode(lockPath, identity);
+      identity = null;
+      if (error?.code !== "EEXIST") return { ok: false, reason: "unwritable" };
+      const owner = readCollectorLock(lockPath, { requireNonce: true });
+      if (owner && pidIsDead(owner.owner.pid, kill) && unlinkMatchingInode(lockPath, owner.identity)) continue;
+      if (Date.now() >= deadline) return { ok: false, reason: "busy" };
+      Atomics.wait(persistenceWaitCell, 0, 0, Math.min(10, waitMs));
+    }
+  }
+  try {
+    return operation();
+  } finally {
+    try { closeSync(fd); } finally { unlinkMatchingInode(lockPath, identity); }
+  }
+}
+
+function createWebhookQueue({ pathOptions = {}, now = Date.now, maxDeliveries = WEBHOOK_MAX_DELIVERIES,
+  maxInvalidations = WEBHOOK_MAX_INVALIDATIONS, pid = process.pid,
+  kill = process.kill.bind(process) } = {}) {
+  const path = webhookQueuePath(pathOptions);
+  ensurePrivateCollectorRoot(dirname(path), pathOptions.platform);
+  const limits = { maxDeliveries, maxInvalidations };
+  const inFlight = new Map();
+  const schedulingMetadata = (state, releasedKey = null) => {
+    const entries = Object.entries(state.invalidations);
+    const eligible = entries.filter(([key, item]) => {
+      const current = inFlight.get(key);
+      return key === releasedKey || !current || item.accessRemoved && !current.accessRemoved;
+    });
+    return {
+      pending: entries.length,
+      nextDueAt: eligible.length === 0 ? null : Math.min(...eligible.map(([, item]) => item.dueAt)),
+    };
+  };
+  const transact = (operation, lockOptions = {}) => withWebhookQueueLock(path, () => {
+    const loaded = loadWebhookQueueState(path, limits, now());
+    if (!loaded.ok) return loaded;
+    const result = operation(loaded.value);
+    if (result?.ok === false) return result;
+    if (result?.changed === false) return { ok: true, value: result.value };
+    const written = writeWebhookQueueState(path, loaded.value);
+    return written.ok ? { ok: true, value: result?.value } : written;
+  }, { pid, kill, ...lockOptions });
+  const pruneDeliveries = (state, at) => {
+    let changed = false;
+    for (const [knownId, acceptedAt] of Object.entries(state.deliveries)) {
+      if (acceptedAt > at - WEBHOOK_DELIVERY_TTL_MS) continue;
+      delete state.deliveries[knownId];
+      changed = true;
+    }
+    return changed;
+  };
+  const inspect = ({ waitMs = PERSISTENCE_LOCK_WAIT_MS } = {}) => transact((state) => ({
+    changed: pruneDeliveries(state, now()),
+    value: {
+      ...schedulingMetadata(state),
+      deliveries: Object.keys(state.deliveries).length,
+      invalidations: Object.values(state.invalidations).map((item) => ({ ...item })),
+    },
+  }), { waitMs });
+  const accept = ({ deliveryId, invalidations }) => {
+    if (!validWebhookDeliveryId(deliveryId) || !Array.isArray(invalidations)) {
+      return { ok: false, reason: "invalid" };
+    }
+    const normalizedInvalidations = invalidations.map(normalizeWebhookInvalidationInput);
+    if (normalizedInvalidations.some((item) => !item)) return { ok: false, reason: "invalid" };
+    const id = deliveryId.toLowerCase();
+    const result = transact((state) => {
+      const at = now();
+      const changed = pruneDeliveries(state, at);
+      if (Object.hasOwn(state.deliveries, id)) {
+        const metadata = schedulingMetadata(state);
+        return { changed, value: { duplicate: true, queued: metadata.pending, nextDueAt: metadata.nextDueAt } };
+      }
+      if (Object.keys(state.deliveries).length >= maxDeliveries) return { ok: false, reason: "capacity" };
+      const incoming = new Map(normalizedInvalidations.map((item) => [webhookInvalidationKey(item), item]));
+      const novel = [...incoming.keys()].filter((key) => !state.invalidations[key]);
+      if (Object.keys(state.invalidations).length + novel.length > maxInvalidations) {
+        return { ok: false, reason: "capacity" };
+      }
+      state.deliveries[id] = at;
+      for (const [key, item] of incoming) {
+        const current = state.invalidations[key];
+        state.invalidations[key] = {
+          host: item.host,
+          repo: item.repo.toLowerCase(),
+          provider: item.provider,
+          resource: item.resource,
+          accessRemoved: item.accessRemoved || current?.accessRemoved === true,
+          acceptedAt: Math.min(at, current?.acceptedAt ?? at),
+          dueAt: Math.min(at + WEBHOOK_COALESCE_MS, current?.dueAt ?? Number.POSITIVE_INFINITY),
+          revision: randomUUID(),
+        };
+      }
+      const metadata = schedulingMetadata(state);
+      return { value: { duplicate: false, queued: metadata.pending, nextDueAt: metadata.nextDueAt } };
+    });
+    return result.ok ? { ok: true, ...result.value } : result;
+  };
+  const drain = async (dispatch) => {
+    if (typeof dispatch !== "function") return { ok: false, reason: "invalid" };
+    const loaded = inspect({ waitMs: 0 });
+    if (!loaded.ok) return loaded;
+    const due = loaded.value.invalidations.filter((item) => item.dueAt <= now());
+    const started = [];
+    let lastMetadata = { pending: loaded.value.pending, nextDueAt: loaded.value.nextDueAt };
+    for (const item of due) {
+      const key = webhookInvalidationKey(item);
+      const current = inFlight.get(key);
+      if (current && (!item.accessRemoved || current.accessRemoved)) continue;
+      const task = (async () => {
+        try {
+          await dispatch({ host: item.host, repo: item.repo, provider: item.provider,
+            resource: item.resource, accessRemoved: item.accessRemoved });
+          const completed = transact((state) => {
+            if (state.invalidations[key]?.revision !== item.revision) {
+              return { changed: false, value: { processed: 0, ...schedulingMetadata(state, key) } };
+            }
+            delete state.invalidations[key];
+            return { value: { processed: 1, ...schedulingMetadata(state, key) } };
+          });
+          if (completed.ok) lastMetadata = completed.value;
+          return completed.ok ? { ok: true, ...completed.value } : completed;
+        } catch (error) {
+          const deferred = transact((state) => {
+            if (state.invalidations[key]?.revision !== item.revision) {
+              return { changed: false, value: { processed: 0, ...schedulingMetadata(state, key) } };
+            }
+            const retryAfterMs = Number.isFinite(error?.retryAfterMs) && error.retryAfterMs > 0
+              ? error.retryAfterMs : WEBHOOK_COALESCE_MS;
+            state.invalidations[key].dueAt = now() + retryAfterMs;
+            return { value: { processed: 0, ...schedulingMetadata(state, key) } };
+          });
+          if (deferred.ok) lastMetadata = deferred.value;
+          return deferred.ok ? { ok: true, ...deferred.value } : deferred;
+        }
+      })().finally(() => { if (inFlight.get(key)?.promise === task) inFlight.delete(key); });
+      inFlight.set(key, { promise: task, accessRemoved: item.accessRemoved });
+      started.push(task);
+    }
+    const results = await Promise.all(started);
+    const failed = results.find((result) => !result.ok);
+    if (failed) return failed;
+    const scheduled = results.map((result) => result.nextDueAt).filter(Number.isFinite);
+    return { ok: true,
+      processed: results.reduce((total, result) => total + result.processed, 0),
+      pending: lastMetadata.pending,
+      nextDueAt: scheduled.length === 0 ? lastMetadata.nextDueAt : Math.min(...scheduled) };
+  };
+  return { accept, inspect, drain, path };
+}
+
+function readWebhookSecret(path) {
+  return readPrivateFile(path, { message: "webhook secret unavailable" });
+}
+
+function webhookHeader(request, name) {
+  const value = request.headers?.[name];
+  return typeof value === "string" ? value : null;
+}
+
+function createWebhookWorker(queue, dispatch, {
+  now = Date.now,
+  setTimeout: setTimeout_ = setTimeout,
+  clearTimeout: clearTimeout_ = clearTimeout,
+} = {}) {
+  let closed = false;
+  let timer = null;
+  let timerDueAt = null;
+  const active = new Set();
+
+  const scheduleAt = (dueAt) => {
+    if (closed || !Number.isFinite(dueAt) || timer !== null && timerDueAt <= dueAt) return;
+    if (timer !== null) clearTimeout_(timer);
+    timerDueAt = dueAt;
+    timer = setTimeout_(() => {
+      timer = null;
+      timerDueAt = null;
+      void run();
+    }, Math.max(1, dueAt - now()));
+    timer?.unref?.();
+  };
+
+  const schedulePending = () => {
+    if (closed || timer !== null) return;
+    const inspected = queue.inspect({ waitMs: 0 });
+    scheduleAt(inspected.ok ? inspected.value.nextDueAt : now() + WEBHOOK_COALESCE_MS);
+  };
+
+  const run = () => {
+    if (closed) return null;
+    const task = queue.drain(dispatch).then((result) => {
+      if (!closed) scheduleAt(result.ok ? result.nextDueAt : now() + WEBHOOK_COALESCE_MS);
+      return result;
+    }).finally(() => { active.delete(task); });
+    active.add(task);
+    return task;
+  };
+
+  const wake = (dueAt = null) => {
+    if (closed) return;
+    if (Number.isFinite(dueAt)) scheduleAt(dueAt);
+    else schedulePending();
+  };
+  schedulePending();
+  return {
+    wake,
+    stop() {
+      closed = true;
+      if (timer !== null) clearTimeout_(timer);
+      timer = null;
+      timerDueAt = null;
+    },
+    async settle() { await Promise.allSettled([...active]); },
+  };
+}
+
+async function createWebhookIngress({
+  config,
+  pathOptions = {},
+  dispatch,
+  createServer: createServer_ = createHttpServer,
+  readSecret: readSecret_ = readWebhookSecret,
+  now = Date.now,
+  setTimeout: setTimeout_ = setTimeout,
+  clearTimeout: clearTimeout_ = clearTimeout,
+  requestTimeoutMs = WEBHOOK_READ_TIMEOUT_MS,
+  bodyMaxBytes = WEBHOOK_BODY_MAX_BYTES,
+  aggregateBodyMaxBytes = WEBHOOK_AGGREGATE_BODY_MAX_BYTES,
+} = {}) {
+  if (config?.webhook?.enabled !== true || typeof dispatch !== "function" ||
+      !Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0 ||
+      !Number.isSafeInteger(bodyMaxBytes) || bodyMaxBytes <= 0 ||
+      !Number.isSafeInteger(aggregateBodyMaxBytes) || aggregateBodyMaxBytes <= 0) {
+    throw new Error("invalid webhook ingress");
+  }
+  const secret = readSecret_(config.webhook.secretFile);
+  const requests = new Set();
+  let aggregateBufferedBytes = 0;
+  let queue = null;
+  let worker = null;
+  let server = null;
+  let serverError = null;
+  let stopping = null;
+  let closePromise = null;
+  try {
+    queue = createWebhookQueue({ pathOptions, now });
+    server = createServer_((request, response) => {
+      if (requests.size >= WEBHOOK_MAX_CONNECTIONS) {
+        response.statusCode = 503;
+        response.end();
+        return;
+      }
+      requests.add(request);
+      let done = false;
+      let bytes = 0;
+      let bodyBuffer = Buffer.alloc(0);
+      let capacity = 0;
+      let deadline = null;
+      const releaseBody = () => {
+        aggregateBufferedBytes -= capacity;
+        capacity = 0;
+        bodyBuffer = Buffer.alloc(0);
+      };
+      const finish = (status) => {
+        if (done) return;
+        done = true;
+        if (deadline !== null) clearTimeout_(deadline);
+        requests.delete(request);
+        releaseBody();
+        response.statusCode = status;
+        response.setHeader?.("cache-control", "no-store");
+        response.end();
+      };
+      const ensureBodyCapacity = (required, { exact = false } = {}) => {
+        if (required <= capacity) return true;
+        const nextCapacity = exact ? required
+          : Math.min(bodyMaxBytes, Math.max(required, Math.max(1_024, capacity * 2)));
+        if (aggregateBufferedBytes + nextCapacity > aggregateBodyMaxBytes) return false;
+        let next;
+        try { next = Buffer.allocUnsafe(nextCapacity); }
+        catch { return false; }
+        aggregateBufferedBytes += nextCapacity;
+        bodyBuffer.copy(next, 0, 0, bytes);
+        aggregateBufferedBytes -= capacity;
+        bodyBuffer = next;
+        capacity = nextCapacity;
+        return true;
+      };
+      deadline = setTimeout_(() => {
+        finish(408);
+        request.destroy?.();
+      }, requestTimeoutMs);
+      deadline?.unref?.();
+      if (request.method !== "POST" || request.url !== WEBHOOK_ROUTE) {
+        finish(request.method === "POST" ? 404 : 405);
+        return;
+      }
+      if (webhookHeader(request, "content-type") !== "application/json") {
+        finish(415);
+        return;
+      }
+      const contentLength = webhookHeader(request, "content-length");
+      const declaredBytes = contentLength === null || !/^\d+$/.test(contentLength) ? null : Number(contentLength);
+      if (contentLength !== null && (declaredBytes === null || declaredBytes > bodyMaxBytes)) {
+        finish(413);
+        request.destroy?.();
+        return;
+      }
+      if (declaredBytes > 0 && !ensureBodyCapacity(declaredBytes, { exact: true })) {
+        finish(503);
+        request.destroy?.();
+        return;
+      }
+      request.on("data", (chunk) => {
+        if (done) return;
+        const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        const required = bytes + value.length;
+        if (required > bodyMaxBytes) {
+          finish(413);
+          request.destroy?.();
+          return;
+        }
+        if (!ensureBodyCapacity(required)) {
+          finish(503);
+          request.destroy?.();
+          return;
+        }
+        value.copy(bodyBuffer, bytes);
+        bytes = required;
+      });
+      request.on("aborted", () => finish(400));
+      request.on("error", () => finish(400));
+      request.on("end", () => {
+        if (done) return;
+        const rawBody = bodyBuffer.subarray(0, bytes);
+        if (!verifyWebhookSignature(rawBody, webhookHeader(request, "x-hub-signature-256"), secret)) {
+          finish(401);
+          return;
+        }
+        const deliveryId = webhookHeader(request, "x-github-delivery");
+        const event = webhookHeader(request, "x-github-event");
+        if (!validWebhookDeliveryId(deliveryId) || !validWebhookEventName(event)) { finish(400); return; }
+        let payload;
+        try { payload = JSON.parse(rawBody.toString("utf8")); }
+        catch { finish(400); return; }
+        const mapped = mapWebhookInvalidations({
+          event,
+          payload,
+          config,
+          enterpriseHost: webhookHeader(request, "x-github-enterprise-host"),
+        });
+        if (!mapped.ok) { finish(400); return; }
+        const accepted = queue.accept({ deliveryId, invalidations: mapped.invalidations });
+        if (!accepted.ok) { finish(accepted.reason === "capacity" ? 503 : 500); return; }
+        worker?.wake(accepted.nextDueAt);
+        finish(202);
+      });
+    });
+    server.maxConnections = WEBHOOK_MAX_CONNECTIONS;
+    await new Promise((resolve, reject) => {
+      const failed = (error) => reject(error);
+      server.once("error", failed);
+      server.listen(config.webhook.port, config.webhook.address, () => {
+        server.off("error", failed);
+        resolve();
+      });
+    });
+    worker = createWebhookWorker(queue, dispatch, { now, setTimeout: setTimeout_, clearTimeout: clearTimeout_ });
+    server.on("error", (error) => { serverError ??= error; });
+    const stop = () => {
+      if (stopping) return stopping;
+      stopping = new Promise((resolve, reject) => {
+        server.close((error) => error || serverError ? reject(error ?? serverError) : resolve());
+        server.closeAllConnections?.();
+      }).finally(() => worker.stop());
+      return stopping;
+    };
+    return {
+      queue,
+      stop,
+      close() {
+        closePromise ??= (async () => {
+          let error = null;
+          try { await stop(); } catch (caught) { error = caught; }
+          try { await worker.settle(); } catch (caught) { error ??= caught; }
+          secret.fill(0);
+          if (error) throw error;
+        })();
+        return closePromise;
+      },
+    };
+  } catch (error) {
+    worker?.stop();
+    for (const request of requests) request.destroy?.();
+    server?.closeAllConnections?.();
+    try {
+      await new Promise((resolve) => {
+        if (!server) { resolve(); return; }
+        server.close(() => resolve());
+      });
+    }
+    catch { /* never started */ }
+    try { await worker?.settle(); } catch { /* preserve the setup error */ }
+    secret.fill(0);
+    throw error;
+  }
+}
+
+function webhookReconciliationInterval({ covered, resource, floorMs, rows, unchangedCount = 0 } = {}) {
+  if (!covered || !TAB_KEYS.includes(resource) || !Number.isFinite(floorMs) ||
+      unchangedCount < POLL_QUIET_AFTER) return null;
+  if (resource === "actions" && hasActionsInProgress(rows)) return null;
+  return Math.max(floorMs, WEBHOOK_RECONCILE_MS);
+}
+
+function loadCollectorConfig(path, options = {}) {
+  if (typeof path !== "string" || path.length === 0) return { ok: false, reason: "invalid" };
+  let fd = null;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return { ok: false, reason: "invalid" };
+    if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+      return { ok: false, reason: "ownership" };
+    }
+    if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
+      return { ok: false, reason: "permissions" };
+    }
+    if (stat.size > COLLECTOR_FRAME_MAX_BYTES) return { ok: false, reason: "size" };
+    const value = normalizeCollectorConfig(JSON.parse(readFileSync(fd, "utf8")), options);
+    return value ? { ok: true, value } : { ok: false, reason: "invalid" };
+  } catch (error) {
+    return { ok: false, reason: error instanceof SyntaxError ? "invalid" : "unreadable", error };
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+function encodeCollectorFrame(frame) {
+  const line = `${JSON.stringify(frame)}\n`;
+  if (Buffer.byteLength(line) > COLLECTOR_FRAME_MAX_BYTES) throw new Error("collector frame too large");
+  return line;
+}
+
+function createCollectorFrameDecoder({ onFrame, onError = () => {} } = {}) {
+  if (typeof onFrame !== "function") throw new TypeError("onFrame must be a function");
+  let parts = [];
+  let pendingBytes = 0;
+  let failed = false;
+  const reject = (reason) => {
+    if (failed) return;
+    failed = true;
+    parts = [];
+    pendingBytes = 0;
+    onError(new Error(reason));
+  };
+  const acceptLine = (part, newlineBytes) => {
+    const total = pendingBytes + newlineBytes;
+    if (total + 1 > COLLECTOR_FRAME_MAX_BYTES) { reject("collector frame too large"); return false; }
+    if (newlineBytes > 0) parts.push(part);
+    const line = parts.length === 0 ? "" : parts.length === 1
+      ? parts[0].toString("utf8")
+      : Buffer.concat(parts, total).toString("utf8");
+    parts = [];
+    pendingBytes = 0;
+    try {
+      const value = JSON.parse(line);
+      if (!isRecord(value)) throw new Error("frame must be an object");
+      onFrame(value);
+      return true;
+    } catch {
+      reject("invalid collector JSON");
+      return false;
+    }
+  };
+  return {
+    push(chunk) {
+      if (failed || !Buffer.isBuffer(chunk) && !(chunk instanceof Uint8Array)) return false;
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      let offset = 0;
+      let newline;
+      while ((newline = buffer.indexOf(0x0a, offset)) >= 0) {
+        const segment = buffer.subarray(offset, newline);
+        if (!acceptLine(segment, segment.length)) return false;
+        offset = newline + 1;
+      }
+      if (offset < buffer.length) {
+        const remainder = buffer.subarray(offset);
+        pendingBytes += remainder.length;
+        if (pendingBytes >= COLLECTOR_FRAME_MAX_BYTES) { reject("collector frame too large"); return false; }
+        parts.push(remainder);
+      }
+      return true;
+    },
+    end() {
+      if (!failed && pendingBytes > 0) reject("incomplete collector frame");
+      return !failed;
+    },
+  };
+}
+
+function normalizeCollectorDemand(raw) {
+  if (!exactKeys(raw, ["active", "background", "floorMs", "pages"]) || typeof raw.active !== "boolean" ||
+      typeof raw.background !== "boolean" ||
+      !Number.isSafeInteger(raw.floorMs) || raw.floorMs < MIN_REFRESH_SECONDS * 1000 ||
+      raw.floorMs > MAX_REFRESH_SECONDS * 1000 || !Number.isSafeInteger(raw.pages) ||
+      raw.pages < 1 || raw.pages > 3) return null;
+  return { active: raw.active, background: raw.background, floorMs: raw.floorMs, pages: raw.pages };
+}
+
+function normalizeCollectorSubscription(raw) {
+  if (!isRecord(raw) || !validCollectorId(raw.id) || !TAB_KEYS.includes(raw.resource)) return null;
+  const host = normalizeHost(raw.host);
+  const demand = normalizeCollectorDemand(raw.demand);
+  let repo = null;
+  try { repo = parseRepoTarget(raw.repo).slug; } catch { /* rejected below */ }
+  return host && repo && demand ? { id: raw.id, host, repo, resource: raw.resource, demand } : null;
+}
+
+function validCollectorId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
+}
+
+function validateCollectorClientMessage(raw) {
+  if (!isRecord(raw) || typeof raw.type !== "string") return null;
+  if (raw.type === "hello") {
+    return exactKeys(raw, ["type", "protocolVersion"]) && raw.protocolVersion === 1 ? { ...raw } : null;
+  }
+  if (["unsubscribe", "inspect"].includes(raw.type)) {
+    return exactKeys(raw, ["type", "id"]) && validCollectorId(raw.id) ? { ...raw } : null;
+  }
+  if (raw.type === "refresh") {
+    return exactKeys(raw, ["type", "id", "force"]) && validCollectorId(raw.id) &&
+      typeof raw.force === "boolean" ? { ...raw } : null;
+  }
+  if (raw.type === "demand") {
+    const demand = normalizeCollectorDemand(raw.demand);
+    return exactKeys(raw, ["type", "id", "demand"]) && validCollectorId(raw.id) && demand
+      ? { type: raw.type, id: raw.id, demand } : null;
+  }
+  if (raw.type === "subscribe") {
+    const subscription = normalizeCollectorSubscription(raw);
+    return exactKeys(raw, ["type", "id", "host", "repo", "resource", "demand"]) && subscription
+      ? { type: raw.type, ...subscription } : null;
+  }
+  return null;
+}
+
+function normalizeCollectorSnapshot(raw, expectedResource = null) {
+  const keys = ["resource", "generation", "rows", "pageInfo", "lastSuccessAt", "lastChangedAt", "nextDueAt",
+    "hold", "meta", "securityNotes", "securityBlind", "capabilities"];
+  if (!exactKeys(raw, keys) || !TAB_KEYS.includes(raw.resource) ||
+      expectedResource !== null && raw.resource !== expectedResource ||
+      !Number.isSafeInteger(raw.generation) || raw.generation < 0 ||
+      !Array.isArray(raw.rows) || raw.rows.length > ACQUISITION_MAX_ENTITIES ||
+      !Number.isFinite(raw.lastSuccessAt) || !Number.isFinite(raw.lastChangedAt) ||
+      raw.lastChangedAt > raw.lastSuccessAt || !Number.isFinite(raw.nextDueAt) ||
+      raw.hold !== null && !ACQUISITION_HOLD_REASONS.has(raw.hold) ||
+      !exactKeys(raw.meta, ["at", "truncated"]) || !Number.isFinite(raw.meta.at) ||
+      typeof raw.meta.truncated !== "boolean" || !Array.isArray(raw.securityNotes) || raw.securityNotes.length > 256 ||
+      raw.securityNotes.some((note) => typeof note !== "string") || typeof raw.securityBlind !== "boolean") return null;
+  if (raw.rows.some((row) => !exactKeys(row, COLLECTOR_ROW_KEYS[raw.resource]))) return null;
+  const rows = raw.rows.map((row) => normalizeCachedItem(raw.resource, row));
+  const capabilities = normalizeAcquisitionCapabilities(raw.capabilities);
+  const pageInfo = normalizeAcquisitionPageInfo(raw.pageInfo);
+  if (rows.some((row) => row === null) || capabilities === null ||
+      raw.resource !== "security" && Object.keys(capabilities).length > 0 ||
+      raw.pageInfo !== null && pageInfo === null) return null;
+  return {
+    resource: raw.resource,
+    generation: raw.generation,
+    rows,
+    pageInfo,
+    lastSuccessAt: raw.lastSuccessAt,
+    lastChangedAt: raw.lastChangedAt,
+    nextDueAt: raw.nextDueAt,
+    hold: raw.hold,
+    meta: { at: raw.meta.at, truncated: raw.meta.truncated },
+    securityNotes: raw.securityNotes.map(safe),
+    securityBlind: raw.securityBlind,
+    capabilities,
+  };
+}
+
+function projectCollectorSnapshot(snapshot, resource = snapshot?.resource) {
+  if (!isRecord(snapshot) || !TAB_KEYS.includes(resource)) return null;
+  return normalizeCollectorSnapshot({
+    resource,
+    generation: snapshot.generation,
+    rows: snapshot.rows,
+    pageInfo: snapshot.pageInfo ?? null,
+    lastSuccessAt: snapshot.lastSuccessAt,
+    lastChangedAt: snapshot.lastChangedAt,
+    nextDueAt: snapshot.nextDueAt,
+    hold: snapshot.hold ?? null,
+    meta: snapshot.meta ?? { at: snapshot.lastChangedAt, truncated: false },
+    securityNotes: snapshot.securityNotes ?? [],
+    securityBlind: snapshot.securityBlind ?? false,
+    capabilities: snapshot.capabilities ?? {},
+  });
+}
+
+function prepareCollectorSnapshot(input, resource = input?.resource) {
+  const snapshot = projectCollectorSnapshot(input, resource);
+  if (!snapshot) throw new Error("invalid collector snapshot");
+  const json = JSON.stringify(snapshot);
+  const payload = Buffer.from(json);
+  if (payload.length > COLLECTOR_ASSEMBLY_MAX_BYTES) throw new Error("collector snapshot too large");
+  return { snapshot, json, payload };
+}
+
+function createCollectorSnapshotEncodingCache() {
+  const entries = new WeakMap();
+  let preparations = 0;
+  let references = 0;
+  return {
+    acquire(input, resource = input?.resource) {
+      if (!isRecord(input)) throw new Error("invalid collector snapshot");
+      let byResource = entries.get(input);
+      if (!byResource) { byResource = new Map(); entries.set(input, byResource); }
+      let entry = byResource.get(resource);
+      if (!entry) {
+        entry = { prepared: prepareCollectorSnapshot(input, resource), refs: 0 };
+        byResource.set(resource, entry);
+        preparations += 1;
+      }
+      entry.refs += 1;
+      references += 1;
+      let released = false;
+      return {
+        value: entry.prepared,
+        release() {
+          if (released) return;
+          released = true;
+          entry.refs -= 1;
+          references -= 1;
+          if (entry.refs === 0) queueMicrotask(() => {
+            if (entry.refs === 0 && byResource.get(resource) === entry) byResource.delete(resource);
+          });
+        },
+      };
+    },
+    inspect() { return { preparations, references }; },
+  };
+}
+
+function *collectorSnapshotLineIterator(id, serverEpoch, prepared, serverNow = Date.now()) {
+  if (!validCollectorId(id) || !validGovernorId(serverEpoch) && !validCollectorId(serverEpoch)) {
+    throw new Error("invalid collector snapshot");
+  }
+  const { snapshot, json, payload } = prepared;
+  const small = `{"type":"snapshot","id":${JSON.stringify(id)},"serverEpoch":${JSON.stringify(serverEpoch)},` +
+    `"generation":${snapshot.generation},"serverNow":${serverNow},"snapshot":${json}}\n`;
+  if (Buffer.byteLength(small) <= COLLECTOR_FRAME_MAX_BYTES) { yield small; return; }
+  const snapshotId = randomUUID();
+  const digest = createHash("sha256").update(payload).digest("hex");
+  const rawChunkBytes = 360 * 1024;
+  const partCount = Math.ceil(payload.length / rawChunkBytes);
+  yield encodeCollectorFrame({ type: "snapshot-begin", id, serverEpoch, resource: snapshot.resource,
+    generation: snapshot.generation, serverNow, snapshotId, totalBytes: payload.length, digest, parts: partCount });
+  for (let index = 0, offset = 0; offset < payload.length; index += 1, offset += rawChunkBytes) {
+    const line = encodeCollectorFrame({ type: "snapshot-part", id, serverEpoch, resource: snapshot.resource,
+      generation: snapshot.generation, snapshotId, index,
+      data: payload.subarray(offset, offset + rawChunkBytes).toString("base64") });
+    if (Buffer.byteLength(line) > COLLECTOR_CHUNK_FRAME_MAX_BYTES) throw new Error("collector chunk frame too large");
+    yield line;
+  }
+  yield encodeCollectorFrame({ type: "snapshot-end", id, serverEpoch, resource: snapshot.resource,
+    generation: snapshot.generation, snapshotId });
+}
+
+function *collectorSnapshotFrameIterator(id, serverEpoch, input, resource = input?.resource, serverNow = Date.now()) {
+  const prepared = prepareCollectorSnapshot(input, resource);
+  const { snapshot, payload } = prepared;
+  if (!validCollectorId(id) || !validGovernorId(serverEpoch) && !validCollectorId(serverEpoch) ||
+      !snapshot) throw new Error("invalid collector snapshot");
+  const small = { type: "snapshot", id, serverEpoch, generation: snapshot.generation, serverNow, snapshot };
+  try { encodeCollectorFrame(small); yield small; return; } catch (error) {
+    if (!/frame too large/.test(error.message)) throw error;
+  }
+  const snapshotId = randomUUID();
+  const digest = createHash("sha256").update(payload).digest("hex");
+  const rawChunkBytes = 360 * 1024;
+  const partCount = Math.ceil(payload.length / rawChunkBytes);
+  yield { type: "snapshot-begin", id, serverEpoch, resource: snapshot.resource, generation: snapshot.generation,
+    serverNow, snapshotId, totalBytes: payload.length, digest, parts: partCount };
+  for (let index = 0, offset = 0; offset < payload.length; index += 1, offset += rawChunkBytes) {
+    const data = payload.subarray(offset, offset + rawChunkBytes).toString("base64");
+    const frame = { type: "snapshot-part", id, serverEpoch, resource: snapshot.resource, generation: snapshot.generation,
+      snapshotId, index, data };
+    if (Buffer.byteLength(encodeCollectorFrame(frame)) > COLLECTOR_CHUNK_FRAME_MAX_BYTES) {
+      throw new Error("collector chunk frame too large");
+    }
+    yield frame;
+  }
+  yield { type: "snapshot-end", id, serverEpoch, resource: snapshot.resource,
+    generation: snapshot.generation, snapshotId };
+}
+
+function encodeCollectorSnapshotFrames(id, serverEpoch, snapshot) {
+  return [...collectorSnapshotFrameIterator(id, serverEpoch, snapshot)];
+}
+
+function createCollectorSnapshotAssembler({ onSnapshot, now = Date.now, setTimeout: setTimeout_ = setTimeout,
+  clearTimeout: clearTimeout_ = clearTimeout, resourceForId = () => null } = {}) {
+  if (typeof onSnapshot !== "function") throw new TypeError("onSnapshot must be a function");
+  const pending = new Map();
+  const fail = (id, reason) => {
+    const state = pending.get(id);
+    if (state?.timer !== undefined) clearTimeout_(state.timer);
+    pending.delete(id);
+    return { ok: false, reason };
+  };
+  return {
+    accept(frame) {
+      if (!isRecord(frame) || !validCollectorId(frame.id) ||
+          !validGovernorId(frame.serverEpoch) && !validCollectorId(frame.serverEpoch) ||
+          !Number.isSafeInteger(frame.generation) || frame.generation < 0) return { ok: false, reason: "invalid" };
+      if (frame.type === "snapshot") {
+        if (!exactKeys(frame, ["type", "id", "serverEpoch", "generation", "snapshot"]) &&
+            !exactKeys(frame, ["type", "id", "serverEpoch", "generation", "serverNow", "snapshot"]) ||
+            Object.hasOwn(frame, "serverNow") && !Number.isFinite(frame.serverNow)) {
+          return { ok: false, reason: "invalid" };
+        }
+        const snapshot = normalizeCollectorSnapshot(frame.snapshot, resourceForId(frame.id));
+        if (!snapshot || snapshot.generation !== frame.generation) return { ok: false, reason: "invalid" };
+        onSnapshot(snapshot, frame);
+        return { ok: true, complete: true };
+      }
+      if (frame.type === "snapshot-begin") {
+        if ((!exactKeys(frame, ["type", "id", "serverEpoch", "resource", "generation", "snapshotId", "totalBytes", "digest", "parts"]) &&
+             !exactKeys(frame, ["type", "id", "serverEpoch", "resource", "generation", "serverNow", "snapshotId", "totalBytes", "digest", "parts"])) ||
+            Object.hasOwn(frame, "serverNow") && !Number.isFinite(frame.serverNow) ||
+            pending.has(frame.id) || pending.size >= COLLECTOR_MAX_CLIENT_SUBSCRIPTIONS ||
+            !TAB_KEYS.includes(frame.resource) || resourceForId(frame.id) !== null && resourceForId(frame.id) !== frame.resource ||
+            !validCollectorId(frame.snapshotId) ||
+            !Number.isSafeInteger(frame.totalBytes) || frame.totalBytes < 1 ||
+            frame.totalBytes > COLLECTOR_ASSEMBLY_MAX_BYTES || !Number.isSafeInteger(frame.parts) ||
+            frame.parts < 1 || frame.parts > 32 || !/^[0-9a-f]{64}$/.test(frame.digest)) return fail(frame.id, "invalid");
+        const state = { ...frame, next: 0, bytes: 0, chunks: [], startedAt: now(), timer: null };
+        state.timer = setTimeout_(() => fail(frame.id, "timeout"), COLLECTOR_ASSEMBLY_TIMEOUT_MS);
+        state.timer?.unref?.();
+        pending.set(frame.id, state);
+        return { ok: true };
+      }
+      const state = pending.get(frame.id);
+      if (!state || frame.snapshotId !== state.snapshotId || frame.serverEpoch !== state.serverEpoch ||
+          frame.generation !== state.generation || frame.resource !== state.resource ||
+          now() - state.startedAt > COLLECTOR_ASSEMBLY_TIMEOUT_MS) {
+        return fail(frame.id, "stale");
+      }
+      if (frame.type === "snapshot-part") {
+        if (!exactKeys(frame, ["type", "id", "serverEpoch", "resource", "generation", "snapshotId", "index", "data"]) ||
+            frame.index !== state.next || frame.index >= state.parts || typeof frame.data !== "string" ||
+            frame.data.length === 0 || frame.data.length % 4 !== 0 ||
+            !/^[A-Za-z0-9+/]+={0,2}$/.test(frame.data) ||
+            Buffer.byteLength(encodeCollectorFrame(frame)) > COLLECTOR_CHUNK_FRAME_MAX_BYTES) return fail(frame.id, "order");
+        const chunk = Buffer.from(frame.data, "base64");
+        state.chunks.push(chunk);
+        state.next += 1;
+        state.bytes += chunk.length;
+        if (state.bytes > state.totalBytes) {
+          return fail(frame.id, "size");
+        }
+        return { ok: true };
+      }
+      if (frame.type !== "snapshot-end" ||
+          !exactKeys(frame, ["type", "id", "serverEpoch", "resource", "generation", "snapshotId"]) ||
+          state.next !== state.parts) return fail(frame.id, "incomplete");
+      const payload = Buffer.concat(state.chunks);
+      fail(frame.id, "complete");
+      if (payload.length !== state.totalBytes ||
+          createHash("sha256").update(payload).digest("hex") !== state.digest) return { ok: false, reason: "digest" };
+      try {
+        const snapshot = normalizeCollectorSnapshot(JSON.parse(payload.toString("utf8")), state.resource);
+        if (!snapshot || snapshot.generation !== state.generation) return { ok: false, reason: "schema" };
+        onSnapshot(snapshot, state);
+        return { ok: true, complete: true };
+      } catch {
+        return { ok: false, reason: "schema" };
+      }
+    },
+    cancel(id) { fail(id, "cancelled"); },
+    reset() { for (const id of [...pending.keys()]) fail(id, "reset"); },
+    inspect() { return { pending: pending.size }; },
+  };
+}
+
+function createCollectorSender(socket, aggregate = { bytes: 0 }, {
+  setTimeout: setTimeout_ = setTimeout,
+  clearTimeout: clearTimeout_ = clearTimeout,
+  drainTimeoutMs = COLLECTOR_DRAIN_TIMEOUT_MS,
+  snapshotCache = createCollectorSnapshotEncodingCache(),
+} = {}) {
+  const queue = [];
+  const pendingSnapshots = new Map();
+  const snapshotOrder = [];
+  let queuedFrames = 0;
+  let queuedBytes = 0;
+  let active = false;
+  let closed = false;
+  let currentTask = null;
+  let currentSnapshotTask = null;
+
+  const release = (frames, bytes) => {
+    queuedFrames = Math.max(0, queuedFrames - frames);
+    queuedBytes = Math.max(0, queuedBytes - bytes);
+    aggregate.bytes = Math.max(0, aggregate.bytes - bytes);
+  };
+  const releaseTask = (task) => {
+    if (!task || task.released) return;
+    task.released = true;
+    release(task.frameCount, task.bytes);
+    task.release?.();
+  };
+  const reserveTask = (task, replaced = null) => {
+    const priorFrames = replaced?.frameCount ?? 0;
+    const priorBytes = replaced?.bytes ?? 0;
+    if (queuedFrames - priorFrames + task.frameCount > COLLECTOR_MAX_CLIENT_QUEUE_FRAMES ||
+        queuedBytes - priorBytes + task.bytes > COLLECTOR_MAX_CLIENT_QUEUE_BYTES ||
+        aggregate.bytes - priorBytes + task.bytes > COLLECTOR_MAX_AGGREGATE_QUEUE_BYTES) return false;
+    if (replaced) releaseTask(replaced);
+    queuedFrames += task.frameCount;
+    queuedBytes += task.bytes;
+    aggregate.bytes += task.bytes;
+    return true;
+  };
+  const fail = () => {
+    if (closed) return;
+    closed = true;
+    releaseTask(currentTask);
+    releaseTask(currentSnapshotTask);
+    for (const task of queue.splice(0)) releaseTask(task);
+    for (const task of pendingSnapshots.values()) releaseTask(task);
+    pendingSnapshots.clear();
+    snapshotOrder.length = 0;
+    if (!socket.destroyed) socket.destroy();
+  };
+  const waitForDrain = () => new Promise((resolve, reject) => {
+    let timer = null;
+    const cleanup = () => {
+      socket.off?.("drain", drained);
+      socket.off?.("error", failed);
+      socket.off?.("close", closedSocket);
+      if (timer !== null) clearTimeout_(timer);
+    };
+    const drained = () => { cleanup(); resolve(); };
+    const failed = (error) => { cleanup(); reject(error); };
+    const closedSocket = () => { cleanup(); reject(new Error("collector socket closed")); };
+    socket.once("drain", drained);
+    socket.once("error", failed);
+    socket.once("close", closedSocket);
+    timer = setTimeout_(() => failed(new Error("collector drain timeout")), drainTimeoutMs);
+    timer?.unref?.();
+  });
+  const writeLine = async (line, reserved = false) => {
+    const bytes = Buffer.byteLength(line);
+    if (!reserved) {
+      if (aggregate.bytes + bytes > COLLECTOR_MAX_AGGREGATE_QUEUE_BYTES) throw new Error("collector aggregate stalled");
+      aggregate.bytes += bytes;
+    }
+    try {
+      if (!socket.write(line)) await waitForDrain();
+    } finally {
+      if (!reserved) aggregate.bytes -= bytes;
+    }
+  };
+  const pump = async () => {
+    if (active || closed) return;
+    active = true;
+    try {
+      while (!closed && (queue.length > 0 || snapshotOrder.length > 0)) {
+        const task = queue.length > 0 ? queue.shift() : pendingSnapshots.get(snapshotOrder.shift());
+        if (!task) continue;
+        currentTask = task;
+        if (task.kind === "snapshot") {
+          pendingSnapshots.delete(task.id);
+          currentSnapshotTask = task;
+        }
+        if (task.kind === "lines") {
+          for (const line of task.lines) await writeLine(line, true);
+        } else {
+          for (const line of task.lines()) {
+            const encoded = { frameCount: 1, bytes: Buffer.byteLength(line), released: false };
+            if (!reserveTask(encoded)) throw new Error("collector client stalled");
+            currentTask = encoded;
+            try {
+              await writeLine(line, true);
+            } finally {
+              releaseTask(encoded);
+              currentTask = task;
+            }
+          }
+        }
+        releaseTask(task);
+        currentTask = null;
+        currentSnapshotTask = null;
+      }
+    } catch {
+      fail();
+    } finally {
+      active = false;
+    }
+  };
+  return {
+    send(frames) {
+      if (closed) return false;
+      const lines = (Array.isArray(frames) ? frames : [frames]).map(encodeCollectorFrame);
+      const bytes = lines.reduce((total, line) => total + Buffer.byteLength(line), 0);
+      if (queuedFrames + lines.length > COLLECTOR_MAX_CLIENT_QUEUE_FRAMES ||
+          queuedBytes + bytes > COLLECTOR_MAX_CLIENT_QUEUE_BYTES ||
+          aggregate.bytes + bytes > COLLECTOR_MAX_AGGREGATE_QUEUE_BYTES) {
+        fail();
+        return false;
+      }
+      const task = { kind: "lines", lines, bytes, frameCount: lines.length, released: false };
+      if (!reserveTask(task)) { fail(); return false; }
+      queue.push(task);
+      void pump();
+      return true;
+    },
+    sendSnapshot(id, serverEpoch, snapshot, resource = snapshot?.resource) {
+      if (closed) return false;
+      const encoding = snapshotCache.acquire(snapshot, resource);
+      const task = { kind: "snapshot", id, generation: encoding.value.snapshot.generation,
+        bytes: 0, frameCount: 0, released: false,
+        release: encoding.release,
+        lines: () => collectorSnapshotLineIterator(id, serverEpoch, encoding.value, Date.now()) };
+      if (pendingSnapshots.has(id)) {
+        const previous = pendingSnapshots.get(id);
+        if (previous.generation > task.generation) { releaseTask(task); return true; }
+        releaseTask(previous);
+        pendingSnapshots.set(id, task);
+      } else {
+        if (pendingSnapshots.size >= COLLECTOR_MAX_CLIENT_SUBSCRIPTIONS) {
+          releaseTask(task); fail(); return false;
+        }
+        pendingSnapshots.set(id, task);
+        snapshotOrder.push(id);
+      }
+      void pump();
+      return true;
+    },
+    close: fail,
+    inspect() { return { active, queuedFrames, queuedBytes, pendingSnapshots: pendingSnapshots.size, closed }; },
+  };
+}
+
+function collectorTarget(config, host, repo) {
+  return config.targets.find((target) => target.host === host && target.repo.toLowerCase() === repo.toLowerCase()) ?? null;
+}
+
+function normalizeCollectorDiagnostic(raw, expectedResource = null) {
+  if (!exactKeys(raw, ["source", "status", "resource", "generation", "lastSuccessAt", "lastChangedAt"]) ||
+      raw.source !== "local collector" || !TAB_KEYS.includes(raw.resource) ||
+      expectedResource !== null && raw.resource !== expectedResource ||
+      !COLLECTOR_DIAGNOSTIC_STATUSES.has(raw.status) ||
+      !Number.isSafeInteger(raw.generation) || raw.generation < 0 ||
+      raw.lastSuccessAt !== null && !Number.isFinite(raw.lastSuccessAt) ||
+      raw.lastChangedAt !== null && !Number.isFinite(raw.lastChangedAt)) return null;
+  return { source: raw.source, status: safe(raw.status), resource: raw.resource,
+    generation: raw.generation, lastSuccessAt: raw.lastSuccessAt, lastChangedAt: raw.lastChangedAt };
+}
+
+function ensurePrivateCollectorRoot(root, platform = process.platform) {
+  try {
+    const current = lstatSync(root);
+    if (!current.isDirectory() || current.isSymbolicLink() ||
+        typeof process.getuid === "function" && current.uid !== process.getuid()) {
+      throw new Error("collector config root is not privately owned");
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+  }
+  if (platform !== "win32") chmodSync(root, 0o700);
+}
+
+async function removeUnownedStaleSocket(socketPath) {
+  let identity;
+  try {
+    identity = lstatSync(socketPath);
+    if (!identity.isSocket() || identity.isSymbolicLink()) throw new Error("collector endpoint is unsafe");
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  const live = await new Promise((resolve) => {
+    const probe = createConnection(socketPath);
+    const finish = (value) => { probe.destroy(); resolve(value); };
+    probe.once("connect", () => finish(true));
+    probe.once("error", () => finish(false));
+    probe.setTimeout(250, () => finish(true));
+  });
+  if (live) throw new Error("collector endpoint already active");
+  if (!unlinkMatchingInode(socketPath, identity)) throw new Error("collector endpoint ownership changed");
+}
+
+function unlinkMatchingInode(path, identity) {
+  if (!identity) return false;
+  try {
+    const current = lstatSync(path);
+    if (current.dev !== identity.dev || current.ino !== identity.ino) return false;
+    unlinkSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readCollectorLock(lockPath, { requireNonce = false } = {}) {
+  let fd = null;
+  try {
+    fd = openSync(lockPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const identity = fstatSync(fd);
+    const owner = JSON.parse(readFileSync(fd, "utf8"));
+    if (!identity.isFile() || typeof process.getuid === "function" && identity.uid !== process.getuid() ||
+        process.platform !== "win32" && (identity.mode & 0o077) !== 0 ||
+        requireNonce && (!Number.isSafeInteger(owner?.pid) || !validGovernorId(owner?.nonce))) return null;
+    return { owner, identity };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+function removeOwnedCollectorLock(lockPath, nonce) {
+  const loaded = readCollectorLock(lockPath);
+  if (loaded?.owner?.nonce !== nonce) return false;
+  return unlinkMatchingInode(lockPath, loaded.identity);
+}
+
+async function createCollectorService({ config, pathOptions = {}, runtime, platform = process.platform,
+  pid = process.pid, kill = process.kill.bind(process), createServer: createServer_ = createServer,
+  createWebhookServer = createHttpServer, chmod: chmod_ = chmodSync } = {}) {
+  if (!config || !runtime || typeof runtime.subscribe !== "function") throw new Error("invalid collector service");
+  if (platform === "win32") throw new Error("collector mode is unsupported on Windows");
+  const socketPath = collectorSocketPath(pathOptions);
+  const root = dirname(socketPath);
+  ensurePrivateCollectorRoot(root, platform);
+  const lockPath = `${socketPath}.lock`;
+  const nonce = randomUUID();
+  const serverEpoch = randomUUID();
+  let lockFd;
+  try {
+    lockFd = openSync(lockPath, "wx", 0o600);
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    const loadedLock = readCollectorLock(lockPath);
+    const owner = loadedLock?.owner;
+    if (!Number.isSafeInteger(owner?.pid) || !pidIsDead(owner.pid, kill)) {
+      throw new Error("collector already running", { cause: error });
+    }
+    const staleLock = loadedLock.identity;
+    if (!staleLock.isFile() || staleLock.isSymbolicLink()) {
+      throw new Error("collector lock is unsafe", { cause: error });
+    }
+    await removeUnownedStaleSocket(socketPath);
+    const currentLock = lstatSync(lockPath);
+    if (currentLock.dev !== staleLock.dev || currentLock.ino !== staleLock.ino) {
+      throw new Error("collector lock ownership changed", { cause: error });
+    }
+    unlinkSync(lockPath);
+    lockFd = openSync(lockPath, "wx", 0o600);
+  }
+  const createdLockIdentity = fstatSync(lockFd);
+  try {
+    writeFileSync(lockFd, JSON.stringify({ pid, nonce, serverEpoch }), { mode: 0o600 });
+  } catch (error) {
+    try { closeSync(lockFd); } catch { /* already closed */ }
+    unlinkMatchingInode(lockPath, createdLockIdentity);
+    throw error;
+  }
+  closeSync(lockFd);
+  try {
+    await removeUnownedStaleSocket(socketPath);
+  } catch (error) {
+    removeOwnedCollectorLock(lockPath, nonce);
+    throw error;
+  }
+  const aggregate = { bytes: 0 };
+  const snapshotCache = createCollectorSnapshotEncodingCache();
+  const clients = new Set();
+  const server = createServer_((socket) => {
+    clients.add(socket);
+    const subscriptions = new Map();
+    const generations = new Map();
+    let welcomed = false;
+    const sender = createCollectorSender(socket, aggregate, { snapshotCache });
+    const send = (frames) => sender.send(frames);
+    const error = (id, code) => {
+      const normalizedId = validCollectorId(id) ? id : "protocol";
+      return send({ type: "error", id: normalizedId, serverEpoch,
+        generation: generations.get(normalizedId) ?? 0, code: safe(code) });
+    };
+    const decoder = createCollectorFrameDecoder({
+      onError: () => { error("protocol", "invalid-frame"); socket.end(); },
+      onFrame(raw) {
+        const message = validateCollectorClientMessage(raw);
+        if (!message) { error(raw?.id, "invalid-message"); return; }
+        if (!welcomed) {
+          if (message.type !== "hello") { error(message.id, "handshake-required"); return; }
+          welcomed = true;
+          send({ type: "welcome", protocolVersion: COLLECTOR_PROTOCOL_VERSION, serverEpoch,
+            capabilities: { chunks: true, maxSubscriptions: COLLECTOR_MAX_CLIENT_SUBSCRIPTIONS } });
+          return;
+        }
+        if (message.type === "hello") { error("protocol", "already-welcomed"); return; }
+        if (message.type === "subscribe") {
+          if (subscriptions.has(message.id) || subscriptions.size >= COLLECTOR_MAX_CLIENT_SUBSCRIPTIONS) {
+            error(message.id, "subscription-limit"); return;
+          }
+          const target = collectorTarget(config, message.host, message.repo);
+          if (!target) { error(message.id, "target-not-allowed"); return; }
+          generations.set(message.id, 0);
+          let handle;
+          try {
+            handle = runtime.subscribe({ target, resource: message.resource, demand: message.demand,
+              onSnapshot(snapshot) {
+                generations.set(message.id, Math.max(generations.get(message.id) ?? 0, snapshot.generation ?? 0));
+                try { sender.sendSnapshot(message.id, serverEpoch, snapshot, message.resource); }
+                catch (snapshotError) { error(message.id, /too large/.test(snapshotError.message) ? "bounded-result" : "invalid-snapshot"); }
+              },
+              onHold(hold) {
+                if (!COLLECTOR_HOLD_REASONS.has(hold)) { error(message.id, "invalid-hold"); return; }
+                send({ type: "hold", id: message.id, serverEpoch,
+                  generation: generations.get(message.id) ?? 0, hold });
+              },
+            });
+          } catch {
+            generations.delete(message.id);
+            error(message.id, "subscription-unavailable");
+            return;
+          }
+          if (!handle || typeof handle !== "object") { error(message.id, "subscription-unavailable"); return; }
+          subscriptions.set(message.id, handle);
+          return;
+        }
+        const handle = subscriptions.get(message.id);
+        if (!handle) { error(message.id, "unknown-subscription"); return; }
+        if (message.type === "unsubscribe") {
+          handle.close?.();
+          subscriptions.delete(message.id);
+          generations.delete(message.id);
+        } else if (message.type === "demand") handle.updateDemand?.(message.demand);
+        else if (message.type === "refresh") handle.refresh?.(message.force);
+        else if (message.type === "inspect") {
+          const diagnostic = normalizeCollectorDiagnostic(handle.inspect?.(), message.resource);
+          if (diagnostic) send({ type: "diagnostic", id: message.id, serverEpoch,
+            generation: diagnostic.generation, diagnostic });
+          else error(message.id, "invalid-diagnostic");
+        }
+      },
+    });
+    socket.on("data", (chunk) => decoder.push(chunk));
+    socket.on("end", () => decoder.end());
+    socket.on("error", () => sender.close());
+    socket.on("close", () => {
+      sender.close();
+      clients.delete(socket);
+      for (const handle of subscriptions.values()) handle.close?.();
+      subscriptions.clear();
+      generations.clear();
+    });
+  });
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, () => { server.off("error", reject); resolve(); });
+    });
+  } catch (error) {
+    try { await new Promise((resolve) => server.close(() => resolve())); } catch { /* never started */ }
+    removeOwnedCollectorLock(lockPath, nonce);
+    await runtime.close?.();
+    throw error;
+  }
+  let boundSocketIdentity = null;
+  let socketIdentity;
+  let webhookIngress = null;
+  try {
+    boundSocketIdentity = lstatSync(socketPath);
+    if (!boundSocketIdentity.isSocket() || boundSocketIdentity.isSymbolicLink()) {
+      throw new Error("collector endpoint ownership changed");
+    }
+    chmod_(socketPath, 0o600);
+    socketIdentity = lstatSync(socketPath);
+    if (!socketIdentity.isSocket() || socketIdentity.dev !== boundSocketIdentity.dev ||
+        socketIdentity.ino !== boundSocketIdentity.ino) throw new Error("collector endpoint ownership changed");
+    if (config.webhook?.enabled === true) {
+      if (typeof runtime.invalidate !== "function") throw new Error("collector webhook invalidation unavailable");
+      webhookIngress = await createWebhookIngress({
+        config,
+        pathOptions,
+        createServer: createWebhookServer,
+        dispatch: (invalidation) => runtime.invalidate(invalidation),
+      });
+    }
+  } catch (error) {
+    try { await webhookIngress?.close(); } catch { /* preserve the startup error */ }
+    try { await new Promise((resolve) => server.close(resolve)); } catch { /* preserve the startup error */ }
+    try { await runtime.close?.(); } catch { /* preserve the startup error */ }
+    removeOwnedCollectorLock(lockPath, nonce);
+    if (boundSocketIdentity) unlinkMatchingInode(socketPath, boundSocketIdentity);
+    throw error;
+  }
+  let closePromise = null;
+  return {
+    socketPath,
+    serverEpoch,
+    close() {
+      closePromise ??= (async () => {
+        let closeError = null;
+        try {
+          await webhookIngress?.stop();
+        } catch (error) {
+          closeError = error;
+        }
+        for (const client of clients) client.destroy();
+        const replacementPath = `${socketPath}.replacement-${nonce}`;
+        let parkedReplacement = false;
+        try {
+          const current = lstatSync(socketPath);
+          if (current.dev !== socketIdentity.dev || current.ino !== socketIdentity.ino) {
+            renameSync(socketPath, replacementPath);
+            parkedReplacement = true;
+          }
+        } catch { /* the owned endpoint may already be absent */ }
+        try {
+          await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+        } catch (error) {
+          closeError ??= error;
+        }
+        try {
+          await runtime.close?.();
+        } catch (error) {
+          closeError ??= error;
+        }
+        try {
+          await webhookIngress?.close();
+        } catch (error) {
+          closeError ??= error;
+        } finally {
+          removeOwnedCollectorLock(lockPath, nonce);
+          unlinkMatchingInode(socketPath, socketIdentity);
+          if (parkedReplacement) {
+            try { renameSync(replacementPath, socketPath); }
+            catch { /* retain replacement under its recovery name rather than overwrite a new owner */ }
+          }
+        }
+        if (closeError) throw closeError;
+      })();
+      return closePromise;
+    },
+  };
+}
+
+function collectorPublicationFromResult(resource, result, previous, demand, completedAt, state = {}) {
+  const transition = pollResultTransition({
+    key: resource,
+    previousRaw: previous?.raw ?? null,
+    raw: result.raw,
+    parse: result.parse,
+    limit: result.limit,
+    completedAt,
+  });
+  if (!["changed", "unchanged"].includes(transition.kind)) {
+    const error = new Error("collector received unusable data");
+    error.requestMetrics = acquisitionRequestMetrics(result);
+    error.uncertainReceipts = result.uncertainReceipts ?? [];
+    throw error;
+  }
+  const rows = transition.kind === "changed" ? transition.data : previous?.rows;
+  const meta = transition.kind === "changed" ? transition.meta : previous?.meta;
+  if (!Array.isArray(rows) || !meta) throw new Error("collector has no valid snapshot");
+  const entitiesByKey = new Map((previous?.entities ?? []).map((entity) => [entity.key, entity]));
+  publishStagedEntities(entitiesByKey, result.stagedEntities, transition.kind);
+  const entities = [...entitiesByKey.entries()].map(([key, entity]) => ({ key, etag: entity.etag, body: entity.body }));
+  const lastChangedAt = transition.kind === "changed" ? completedAt : previous.lastChangedAt;
+  state.unchangedCount = advanceUnchangedCount(state.unchangedCount ?? 0, transition.kind);
+  return {
+    rows,
+    pageInfo: {
+      loadedPages: result.loadedPages ?? previous?.pageInfo?.loadedPages ?? demand.pages,
+      hasNextPage: result.hasNextPage === true,
+    },
+    raw: transition.kind === "changed" ? transition.nextRaw : previous.raw,
+    entities,
+    lastSuccessAt: completedAt,
+    lastChangedAt,
+    nextDueAt: completedAt + pollPolicyInterval({
+      tab: resource,
+      floorMs: demand.floorMs,
+      demand: demand.active ? "active" : "inactive",
+      unchangedCount: state.unchangedCount,
+      inProgressCI: resource === "actions" && hasActionsInProgress(rows),
+      background: demand.background ? "all" : "off",
+    }),
+    hold: null,
+    capabilities: result.capabilities ?? previous?.capabilities ?? {},
+    requestMetrics: acquisitionRequestMetrics(result),
+    uncertainReceipts: result.uncertainReceipts ?? [],
+    repositoryIdentity: result.repositoryIdentity,
+    meta,
+    securityNotes: resource === "security"
+      ? transition.notes ?? previous?.securityNotes ?? [] : [],
+    securityBlind: resource === "security"
+      ? transition.blind ?? previous?.securityBlind ?? false : false,
+  };
+}
+
+function createCollectorAcquisitionRuntime({
+  config,
+  pathOptions = {},
+  resolveProvider = null,
+  refreshProvider = null,
+  resolveTargetIdentity = null,
+  produce = null,
+  now = Date.now,
+  createId = governorId,
+  pid = process.pid,
+  kill = process.kill.bind(process),
+  setTimeout: setTimeout_ = setTimeout,
+  clearTimeout: clearTimeout_ = clearTimeout,
+  setInterval: setInterval_ = setInterval,
+  clearInterval: clearInterval_ = clearInterval,
+  onDiagnostic = () => {},
+  createGitHubAppProvider: createGitHubAppProvider_ = createGitHubAppProvider,
+  githubAppOptions = {},
+  readInstallationCore = readInstallationCoreBudget,
+  readBudgets = null,
+  executeGh = null,
+} = {}) {
+  if (!config || !Array.isArray(config.targets)) throw new Error("invalid collector runtime config");
+  const engine = createAcquisitionEngine({ pathOptions, now, createId, pid, kill,
+    setInterval: setInterval_, clearInterval: clearInterval_ });
+  const providerContexts = new Map();
+  const targetInitializations = new Map();
+  const accessRefreshTargets = new Set();
+  const canonicalOwners = new Map(config.targets.map((target) => [target.canonical, target.provider]));
+  const webhookTargets = new Map((config.webhook?.enabled === true ? config.webhook.targets : [])
+    .map((target) => [targetInitializationKey(target), target]));
+  const webhookCoveredQueries = new Set([...webhookTargets.values()].flatMap((target) =>
+    target.resources.map((resource) => webhookCoverageKey({ ...target, resource }))));
+  const items = new Set();
+  const providerAbort = new AbortController();
+  let closed = false;
+
+  function withInjectedBudgetReader(context) {
+    if (!readBudgets || !context?.scope || context.readBudgets ||
+        (context.definition?.type ?? context.scope.providerType) !== "gh") return context;
+    return { ...context, readBudgets };
+  }
+
+  function refreshProviderBudget(context, signal) {
+    const budgetReader = context.readBudgets ?? readBudgets;
+    return refreshSharedBudget(context.scope, context.leaseId, signal,
+      { ...(budgetReader ? { readBudgets: budgetReader } : {}),
+        onObserverPublished: context.onObserverPublished, now,
+        wait: (delay) => abortableDelay(delay, signal, {
+          setTimeout: setTimeout_, clearTimeout: clearTimeout_,
+        }) });
+  }
+
+  async function defaultResolve(target, signal = providerAbort.signal) {
+    let context = providerContexts.get(target.provider);
+    if (!context) {
+      const definition = config.providers[target.provider];
+      const coordinator = definition.type === "github-app"
+        ? createGitHubAppProvider_({ name: target.provider, provider: definition, pathOptions, now,
+          ...githubAppOptions })
+        : createIdentityCoordinator({ host: target.host, pathOptions, now });
+      context = { coordinator, definition, identity: null, scope: null,
+        leaseId: createId("collector-provider-lease", target.provider),
+        credentialEnvironment: null, capabilities: null, readBudgets: null,
+        coreValidatorAccessKey: coordinator.coreValidatorAccessKey?.() ?? null };
+      if (definition.type === "github-app") {
+        context.onObserverPublished = (resource) => {
+          if (resource !== "core") return;
+          const bound = context.coordinator.markCoreValidated?.(context.identity.accessKey);
+          if (bound?.ok) context.coreValidatorAccessKey = context.identity.accessKey;
+        };
+        context.readBudgets = async (signal, host, options) => {
+          const budgets = await readSharedBudgetSources(signal, host, {
+            ...options,
+            coreEtag: context.coreValidatorAccessKey === context.identity?.accessKey
+              ? options.coreEtag : null,
+          readCore: (coreSignal, coreHost, etag) =>
+            readInstallationCore(coreSignal, coreHost, etag, { now }),
+          });
+          return budgets;
+        };
+      }
+      providerContexts.set(target.provider, context);
+    }
+    let identity;
+    if (context.definition.type === "github-app") {
+      const resolved = await context.coordinator.resolve({ signal });
+      identity = resolved.identity;
+      context.credentialEnvironment = resolved.environment;
+      context.capabilities = resolved.capabilities;
+      if (context.identity?.accessKey !== identity.accessKey) {
+        const persisted = persistGitHubAppIdentity(context.coordinator.root, identity, now());
+        if (!persisted.ok) throw new Error("collector provider unavailable");
+      }
+    } else {
+      const resolved = await context.coordinator.refresh();
+      if (!resolved.ok) throw new Error("collector provider unavailable");
+      identity = resolved.value;
+      context.credentialEnvironment = null;
+      context.capabilities = null;
+      context.readBudgets = readBudgets;
+    }
+    if (identity.host !== target.host) throw new Error("collector provider unavailable");
+    context.identity = identity;
+    context.scope = {
+      ...createQuotaScope(identity, {
+        root: context.coordinator.root,
+        now,
+        identityProvider: context.coordinator.current,
+      }),
+      identityCoordinator: context.coordinator,
+      repository: target.repo,
+      providerType: context.definition.type,
+      ...(executeGh ? { executeGh } : {}),
+      ...(context.credentialEnvironment ? { credentialEnvironment: context.credentialEnvironment } : {}),
+    };
+    return context;
+  }
+
+  async function defaultProduce({ target, resource, demand, snapshot, claim, markStarted, provider, signal, force }) {
+    const context = provider?.scope ? provider : await defaultResolve(target, signal);
+    const at = now();
+    const lease = maintainControlLease(context.scope, context.leaseId, demand.floorMs, resource, at);
+    if (!lease.ok) throw new Error("collector governor unavailable");
+    const refreshed = await refreshProviderBudget(context, signal);
+    if (!refreshed.ok) {
+      const error = new Error(refreshed.reason === "provider-capability"
+        ? `collector provider capability unavailable (${refreshed.capability})`
+        : "collector budget unavailable");
+      if (refreshed.reason === "provider-capability") error.providerCapability = refreshed.capability;
+      throw error;
+    }
+    const admitted = await awaitCollectorReservation({
+      scope: context.scope,
+      leaseId: context.leaseId,
+      operation: `tab:${resource}`,
+      priority: demand.active ? "active" : "background",
+      signal,
+      now,
+      wait: (delay, waitSignal) => abortableDelay(delay, waitSignal, {
+        setTimeout: setTimeout_, clearTimeout: clearTimeout_,
+      }),
+      admit: (admitScope, admitLeaseId, operation, priority, at) =>
+        admitGovernorOperation(admitScope, admitLeaseId, operation, priority, at,
+          createId("collector-intent", admitLeaseId, operation, priority, at)),
+      deferredRetryAt: collectorObserverRetryAt(context.scope, resource, now()),
+    });
+    const reservationId = admitted.reservationId;
+    const governor = inspectGovernor(context.scope, now());
+    const started = await markStarted({
+      reservationId,
+      accessKey: context.identity.accessKey,
+      epochs: governor.ok ? governor.value.epochs : {},
+    });
+    if (!started.ok) {
+      completeReservation({ ...context.scope, identityProvider: null }, reservationId,
+        { outcome: "rejected" }, now());
+      throw new Error("collector acquisition start failed");
+    }
+    const descriptor = tabForKey(resource);
+    try {
+      const entities = new Map((force ? [] : snapshot?.entities ?? []).map((entity) => [entity.key, entity]));
+      const securityPolicy = resource === "security" && context.definition?.type === "github-app"
+        ? githubAppSecurityPolicy(context.definition, now()) : null;
+      let result = await requestIdentityStorage.run(context.scope, () => descriptor.fetch({
+        signal,
+        entities,
+        previousRaw: force ? null : snapshot?.raw ?? null,
+        force,
+        pages: demand.pages,
+        governor: { scope: context.scope, leaseId: context.leaseId },
+        ...(securityPolicy ? { sources: securityPolicy.sources } : {}),
+      }));
+      if (securityPolicy) result = applyGitHubAppSecurityPolicy(result, securityPolicy);
+      settleReservationWithBudgetObservations(
+        { ...context.scope, identityProvider: null },
+        context.leaseId,
+        reservationId,
+        result?.measuredSuccess === false
+          ? { outcome: "rejected", observations: result.observations ?? [] }
+          : {
+              outcome: "measured-success",
+              actualCosts: {
+                core: result.restSpent ?? REST_PER_FETCH[resource] ?? 0,
+                graphql: result.graphqlSpent ?? GRAPHQL_PER_FETCH[resource] ?? 0,
+              },
+              observations: result.observations ?? [],
+            },
+        now(),
+      );
+      const completedAt = now();
+      const publication = collectorPublicationFromResult(
+        resource, result, snapshot, demand, completedAt, claim.state,
+      );
+      const covered = webhookCoveredQueries.has(webhookCoverageKey({ ...target, resource }));
+      const reconciliation = webhookReconciliationInterval({
+        covered,
+        resource,
+        floorMs: demand.floorMs,
+        rows: publication.rows,
+        unchangedCount: claim.state.unchangedCount,
+      });
+      if (reconciliation !== null) publication.nextDueAt = completedAt + reconciliation;
+      return publication;
+    } catch (error) {
+      settleReservationWithBudgetObservations(
+        { ...context.scope, identityProvider: null }, context.leaseId, reservationId,
+        { outcome: governorOutcomeForError(error), observations: error.budgetObservations ?? [] }, now(),
+      );
+      throw error;
+    }
+  }
+
+  async function defaultTargetIdentity(target, provider, signal) {
+    const context = provider?.scope ? provider : await defaultResolve(target, signal);
+    const lease = maintainControlLease(context.scope, context.leaseId, REFRESH_MS, "issues", now());
+    if (!lease.ok) throw new Error("collector identity governor unavailable");
+    const refreshed = await refreshProviderBudget(context, signal);
+    if (!refreshed.ok) {
+      const error = new Error(refreshed.reason === "provider-capability"
+        ? `collector provider capability unavailable (${refreshed.capability})`
+        : "collector identity budget unavailable");
+      if (refreshed.reason === "provider-capability") error.providerCapability = refreshed.capability;
+      throw error;
+    }
+    const result = await runAdmittedOperation({
+      scope: context.scope,
+      leaseId: context.leaseId,
+      operation: "failure-context:repository",
+      priority: "active",
+      signal,
+      waitMs: GOVERNOR_ADMISSION_WAIT_MS,
+      now,
+      run: (admittedSignal) => fetchGraphqlPage("repository", {
+        signal: admittedSignal,
+        operation: "failure-context:repository",
+      }),
+    });
+    const identity = normalizeRepositoryIdentity(result.value?.data?.repository);
+    if (!result.ok || !identity) throw result.error ?? new Error("collector target identity unavailable");
+    return identity;
+  }
+
+  function canonicalCollectorQuery(resource, identity, targetIdentity, demand) {
+    const query = acquisitionQueryForTab(resource, identity, targetIdentity.nameWithOwner, demand.pages);
+    if (!query) return null;
+    return {
+      ...query,
+      repositoryId: targetIdentity.id,
+      targetKey: privateIdentityDigest("acquisition-target-v1", identity.host, targetIdentity.id),
+    };
+  }
+
+  function targetInitializationKey(target) {
+    return `${target.provider}\0${target.host}\0${target.repo.toLowerCase()}`;
+  }
+
+  function resolveCollectorTarget(target) {
+    const key = targetInitializationKey(target);
+    const current = targetInitializations.get(key);
+    if (current) return current.promise;
+    const controller = new AbortController();
+    const entry = { controller, promise: null };
+    entry.promise = (async () => {
+      // A textual target is already enough to reject a provider conflict.
+      // Consult the durable fence before resolving credentials or making any
+      // provider/identity request, so a rejected namespace cannot observe or
+      // spend through the conflicting provider.
+      const persisted = loadCollectorCanonicalOwnership(pathOptions, target);
+      if (!persisted.ok) throw new Error(`collector canonical ${persisted.reason}`);
+      const provider = withInjectedBudgetReader(resolveProvider
+        ? await resolveProvider(target.provider, target, { signal: controller.signal })
+          : await defaultResolve(target, controller.signal));
+      const identity = provider?.identity ?? provider;
+      const requireAccessRefresh = accessRefreshTargets.has(key);
+      const discovered = !requireAccessRefresh && persisted.value ? persisted.value : (resolveTargetIdentity
+        ? await resolveTargetIdentity({ target, provider, signal: controller.signal })
+        : resolveProvider
+          ? { id: `slug:${target.repo.toLowerCase()}`, nameWithOwner: target.repo }
+          : await defaultTargetIdentity(target, provider, controller.signal));
+      const admitted = admitCollectorCanonicalOwnership(pathOptions, target, discovered);
+      if (!admitted.ok || !admitCanonical(target, admitted.value)) {
+        throw new Error("collector canonical provider conflict");
+      }
+      if (requireAccessRefresh) accessRefreshTargets.delete(key);
+      return { provider, identity, targetIdentity: admitted.value };
+    })().finally(() => {
+      // This map is a single-flight latch, not an identity cache. A later
+      // subscription must validate the provider's current access generation
+      // before it can bind to an acquisition partition.
+      if (targetInitializations.get(key) === entry) targetInitializations.delete(key);
+    });
+    targetInitializations.set(key, entry);
+    return entry.promise;
+  }
+
+  function admitCanonical(target, repositoryIdentity) {
+    const identity = normalizeRepositoryIdentity(repositoryIdentity);
+    if (!identity) return true;
+    const keys = [
+      `${target.host}/${identity.nameWithOwner}`,
+      `${target.host}/id:${identity.id}`,
+    ];
+    if (keys.some((key) => canonicalOwners.has(key) && canonicalOwners.get(key) !== target.provider)) return false;
+    for (const key of keys) canonicalOwners.set(key, target.provider);
+    return true;
+  }
+
+  function demandEnabled(demand) {
+    return demand.active || demand.background;
+  }
+
+  function rejectInvalidations(item, error) {
+    for (const waiter of item.invalidations) waiter.reject(error);
+    item.invalidations.clear();
+  }
+
+  function deliverCollectorSnapshot(item, snapshot, bindingRevision, { publication = false } = {}) {
+    if (bindingRevision !== item.bindingRevision) return false;
+    item.nextDueAt = snapshot.nextDueAt;
+    item.onSnapshot(snapshot);
+    if (!publication || !Number.isSafeInteger(snapshot.generation)) return true;
+    for (const waiter of item.invalidations) {
+      if (bindingRevision !== waiter.bindingRevision || waiter.requiredGeneration === null ||
+          snapshot.generation < waiter.requiredGeneration) continue;
+      item.invalidations.delete(waiter);
+      waiter.resolve(snapshot);
+    }
+    if (item.invalidations.size > 0 && !closed && !item.closed && demandEnabled(item.demand)) {
+      queueMicrotask(() => startPoll(item, { manual: true }));
+    }
+    return true;
+  }
+
+  function startPoll(item, { manual = false, force = false } = {}) {
+    if (item.pollPromise) {
+      if (manual) item.queuedRefresh = { force: force || item.queuedRefresh?.force === true };
+      return item.pollPromise;
+    }
+    if (closed || item.closed || !demandEnabled(item.demand)) return null;
+    item.pollPromise = poll(item, { manual, force }).finally(() => {
+      item.pollPromise = null;
+      const queued = item.queuedRefresh;
+      item.queuedRefresh = null;
+      if (queued && !closed && !item.closed) queueMicrotask(() => startPoll(item, { manual: true, force: queued.force }));
+    });
+    return item.pollPromise;
+  }
+
+  function schedule(item, delay, operation = () => startPoll(item)) {
+    if (closed || item.closed || !demandEnabled(item.demand)) return;
+    if (item.timer !== null) clearTimeout_(item.timer);
+    item.timer = setTimeout_(() => {
+      item.timer = null;
+      return operation();
+    }, Math.max(1, Math.min(delay, item.demand.floorMs)));
+    item.timer?.unref?.();
+  }
+
+  async function poll(item, { manual = false, force = false } = {}) {
+    if (closed || item.closed || !item.id || item.polling) return;
+    if (item.timer !== null) {
+      clearTimeout_(item.timer);
+      item.timer = null;
+    }
+    item.polling = true;
+    item.pollPhase = "preclaim";
+    const bindingRevision = item.bindingRevision;
+    const subscriptionId = item.id;
+    let retryIn = item.demand.floorMs;
+    let claim = null;
+    try {
+      const refreshedProvider = withInjectedBudgetReader(refreshProvider
+        ? await refreshProvider(item.target.provider, item.target)
+        : !resolveProvider ? await defaultResolve(item.target, providerAbort.signal) : item.provider);
+      const refreshedIdentity = refreshedProvider?.identity ?? refreshedProvider;
+      if (refreshedIdentity?.accessKey !== item.identity?.accessKey ||
+          refreshedIdentity?.generation !== item.identity?.generation) {
+        engine.unsubscribe(subscriptionId);
+        item.id = null;
+        targetInitializations.delete(targetInitializationKey(item.target));
+        item.onHold?.("shared-wait");
+        retryIn = 1;
+        return;
+      }
+      item.provider = refreshedProvider;
+      const ownership = await engine.refresh(subscriptionId, { force: manual });
+      if (!ownership.ok) { item.onHold?.("disconnected"); retryIn = 1_000; return; }
+      if (ownership.value.role !== "producer") {
+        if (ownership.value.snapshot) {
+          deliverCollectorSnapshot(item, ownership.value.snapshot, bindingRevision);
+        }
+        if (ownership.value.reason !== "fresh") {
+          item.onHold?.("shared-wait");
+          retryIn = ACQUISITION_INSPECT_MS;
+        } else if (Number.isFinite(ownership.value.snapshot?.nextDueAt)) {
+          retryIn = Math.max(1, ownership.value.snapshot.nextDueAt - now());
+        }
+        return;
+      }
+      claim = {
+        nonce: ownership.value.nonce,
+        generation: ownership.value.generation,
+        accessKey: item.identity.accessKey,
+      };
+      item.pollPhase = "claimed";
+      const producer = produce ?? defaultProduce;
+      item.controller = new AbortController();
+      try {
+        const produceBound = () => producer({
+          target: item.target,
+          resource: item.resource,
+          demand: ownership.value.demand,
+          snapshot: ownership.value.snapshot,
+          claim: { ...claim, state: item },
+          provider: item.provider,
+          signal: item.controller.signal,
+          force,
+          markStarted: (receipt) => engine.refresh(subscriptionId, { started: { ...claim, ...(receipt ? { receipt } : {}) } }),
+        });
+        const produced = item.provider?.scope
+          ? await requestIdentityStorage.run(item.provider.scope, produceBound)
+          : await produceBound();
+        if (item.provider?.definition?.type === "github-app" &&
+            item.provider.coordinator.current()?.accessKey !== claim.accessKey) {
+          engine.refresh(subscriptionId, { claim, failure: {
+            hold: "disconnected",
+            requestMetrics: produced.requestMetrics ?? {},
+            uncertainReceipts: produced.uncertainReceipts ?? [],
+          } });
+          engine.unsubscribe(subscriptionId);
+          item.id = null;
+          targetInitializations.delete(targetInitializationKey(item.target));
+          item.onHold?.("disconnected");
+          retryIn = 1;
+          return;
+        }
+        if (bindingRevision !== item.bindingRevision) {
+          engine.refresh(subscriptionId, { cancel: claim });
+          retryIn = 1;
+          return;
+        }
+        if (!admitCanonical(item.target, produced.repositoryIdentity)) {
+          engine.refresh(subscriptionId, { claim, failure: {
+            hold: "disconnected",
+            requestMetrics: produced.requestMetrics ?? {},
+            uncertainReceipts: produced.uncertainReceipts ?? [],
+          } });
+          item.onHold?.("disconnected");
+          retryIn = item.demand.floorMs;
+          return;
+        }
+        item.pollPhase = "publishing";
+        const published = await engine.refresh(subscriptionId, { claim, publish: produced });
+        if (!published.ok) { item.onHold?.("disconnected"); retryIn = 1_000; }
+        else {
+          item.provider?.coordinator?.markAuthorized?.();
+          retryIn = Math.max(1, published.value.snapshot.nextDueAt - now());
+        }
+      } catch (error) {
+        if (item.provider?.definition?.type === "github-app" && error?.apiResponse?.status === 401 &&
+            !error.appCredentialInvalidated) {
+          item.provider.coordinator.invalidate("unauthorized");
+        }
+        const hold = error?.notStarted ? "shared-wait" : acquisitionFailureHold(error);
+        if (claim && error?.notStarted) engine.refresh(subscriptionId, { cancel: claim });
+        else if (claim) engine.refresh(subscriptionId, { claim, failure: {
+          hold,
+          requestMetrics: error?.requestMetrics ?? {},
+          uncertainReceipts: error?.uncertainReceipts ?? [],
+        } });
+        else engine.setHold(subscriptionId, hold, { resource: item.resource, accessKey: item.identity.accessKey });
+        item.onHold?.(hold);
+        try { onDiagnostic({ stage: "acquire", reason: redact(shortErr(error)) }); } catch { /* diagnostics are isolated */ }
+        retryIn = error?.notStarted && Number.isFinite(error.retryAt)
+          ? Math.max(50, error.retryAt - now()) : Math.min(1_000, item.demand.floorMs);
+      } finally {
+        item.controller = null;
+      }
+    } catch (error) {
+      // Provider/access refresh runs before a producer claim exists. Keep that
+      // failure inside this subscription's exact access partition and retry it
+      // on the bounded collector cadence; letting it escape startPoll created
+      // an unhandled rejection and permanently stopped the stream.
+      const hold = acquisitionFailureHold(error);
+      if (item.id && item.identity?.accessKey) {
+        engine.setHold(item.id, hold, { resource: item.resource, accessKey: item.identity.accessKey });
+      }
+      item.onHold?.(hold);
+      try { onDiagnostic({ stage: "provider-refresh", reason: redact(shortErr(error)) }); } catch { /* isolated */ }
+      retryIn = Math.min(1_000, item.demand.floorMs);
+    } finally {
+      item.polling = false;
+      item.pollPhase = null;
+      schedule(item, retryIn, item.id ? () => startPoll(item) : () => startInitialize(item));
+    }
+  }
+
+  async function initialize(item) {
+    try {
+      const resolved = await resolveCollectorTarget(item.target);
+      if (closed || item.closed) return;
+      item.provider = resolved.provider;
+      item.identity = resolved.identity;
+      const query = canonicalCollectorQuery(item.resource, item.identity, resolved.targetIdentity, item.demand);
+      if (!query) throw new Error("invalid collector query");
+      const bindingRevision = item.bindingRevision;
+      const subscription = engine.subscribe(query, item.demand, (snapshot) => {
+        deliverCollectorSnapshot(item, snapshot, bindingRevision, { publication: true });
+      }, { resumeFreshSnapshot: true });
+      if (!subscription.ok) throw new Error("collector subscription unavailable");
+      item.id = subscription.value.id;
+      const generation = subscription.value.snapshot?.generation ?? 0;
+      const accessReset = [...item.invalidations].some((waiter) =>
+        waiter.bindingRevision === bindingRevision && waiter.accessRemoved);
+      for (const waiter of item.invalidations) {
+        if (waiter.bindingRevision !== bindingRevision) continue;
+        if (waiter.accessOnly) {
+          item.invalidations.delete(waiter);
+          waiter.resolve(null);
+        } else if (waiter.requiredGeneration === null) {
+          waiter.requiredGeneration = generation + 1;
+        }
+      }
+      if (subscription.value.snapshot && !accessReset) {
+        deliverCollectorSnapshot(item, subscription.value.snapshot, bindingRevision);
+      }
+      if (demandEnabled(item.demand)) {
+        await startPoll(item, { manual: item.invalidations.size > 0 });
+      }
+    } catch (error) {
+      try { onDiagnostic({ stage: "initialize", reason: redact(shortErr(error)) }); } catch { /* diagnostics are isolated */ }
+      item.onHold?.("disconnected");
+      schedule(item, 1_000, () => startInitialize(item));
+    }
+  }
+
+  function startInitialize(item) {
+    if (item.initializePromise || closed || item.closed) return item.initializePromise;
+    item.initializePromise = initialize(item).finally(() => { item.initializePromise = null; });
+    return item.initializePromise;
+  }
+
+  return {
+    subscribe({ target, resource, demand, onSnapshot, onHold }) {
+      const normalizedDemand = normalizeCollectorDemand(demand);
+      if (!normalizedDemand) throw new Error("invalid collector demand");
+      const item = { target, resource, demand: normalizedDemand, onSnapshot, onHold, id: null, identity: null,
+        provider: null, polling: false, pollPhase: null, pollPromise: null, controller: null,
+        initializePromise: null, closed: false, timer: null, queuedRefresh: null,
+        bindingRevision: 0, invalidations: new Set() };
+      items.add(item);
+      void startInitialize(item);
+      return {
+        updateDemand(next) {
+          const normalized = normalizeCollectorDemand(next);
+          if (!normalized) return { ok: false, reason: "invalid" };
+          const wasEnabled = demandEnabled(item.demand);
+          item.demand = normalized;
+          if (!demandEnabled(normalized) && item.timer !== null) {
+            clearTimeout_(item.timer);
+            item.timer = null;
+          }
+          if (wasEnabled && !demandEnabled(normalized) && item.invalidations.size > 0) {
+            rejectInvalidations(item, new Error("collector subscription inactive"));
+          }
+          const updated = item.id ? engine.updateDemand(item.id, normalized) : { ok: true };
+          if (!wasEnabled && demandEnabled(normalized)) void startPoll(item);
+          return updated;
+        },
+        refresh(force = false) { return startPoll(item, { manual: true, force: force === true }); },
+        inspect() {
+          if (!item.id) return { source: "local collector", status: "initializing", resource: item.resource };
+          const inspected = engine.inspect(item.id);
+          const record = inspected.ok ? inspected.value : null;
+          return {
+            source: "local collector",
+            status: inspected.ok ? record?.hold?.reason ?? (record?.snapshot ? "healthy" : "waiting") : "unavailable",
+            resource: item.resource,
+            generation: record?.generation ?? 0,
+            lastSuccessAt: record?.snapshot?.lastSuccessAt ?? null,
+            lastChangedAt: record?.snapshot?.lastChangedAt ?? null,
+          };
+        },
+        async whenCurrentPollSettled() {
+          const initializing = item.initializePromise;
+          if (initializing) await initializing;
+          const polling = item.pollPromise;
+          if (polling) await polling;
+        },
+        close() {
+          item.closed = true;
+          rejectInvalidations(item, new Error("collector subscription closed"));
+          item.controller?.abort();
+          if (item.timer !== null) clearTimeout_(item.timer);
+          if (item.id) engine.unsubscribe(item.id);
+          items.delete(item);
+        },
+      };
+    },
+    async invalidate(invalidation) {
+      const normalized = normalizeWebhookInvalidationInput(invalidation);
+      if (!normalized) throw new Error("invalid collector invalidation");
+      const configuredWebhookTarget = webhookTargets.get(targetInitializationKey(normalized));
+      const configuredCollectorTarget = collectorTarget(config, normalized.host, normalized.repo);
+      if (!configuredCollectorTarget || configuredCollectorTarget.provider !== normalized.provider ||
+          !normalized.accessRemoved && (!configuredWebhookTarget ||
+            !configuredWebhookTarget.resources.includes(normalized.resource))) {
+        throw new Error("invalid collector invalidation");
+      }
+      if (normalized.accessRemoved) {
+        const providerContext = providerContexts.get(normalized.provider);
+        providerContext?.coordinator.invalidate?.("authority-changed");
+      }
+      const matching = [...items].filter((item) => !item.closed &&
+        (normalized.accessRemoved || demandEnabled(item.demand)) &&
+        item.target.host === normalized.host && item.target.repo.toLowerCase() === normalized.repo &&
+        item.target.provider === normalized.provider && item.resource === normalized.resource);
+      if (matching.length === 0) {
+        const error = new Error("collector invalidation has no subscriber");
+        error.retryAfterMs = WEBHOOK_DORMANT_RETRY_MS;
+        throw error;
+      }
+      await Promise.all(matching.map((item) => new Promise((resolve, reject) => {
+        let requiredGeneration = null;
+        if (item.id) {
+          const inspected = engine.inspect(item.id);
+          if (!inspected.ok) { reject(new Error("collector invalidation unavailable")); return; }
+          const generation = inspected.value?.generation ?? 0;
+          requiredGeneration = Math.max(generation + (item.pollPhase === "preclaim" ? 2 : 1),
+            (inspected.value?.claim?.generation ?? generation) + 1);
+        }
+        if (normalized.accessRemoved) {
+          item.bindingRevision += 1;
+          for (const waiter of item.invalidations) {
+            waiter.bindingRevision = item.bindingRevision;
+            waiter.requiredGeneration = null;
+          }
+          item.controller?.abort();
+          const key = targetInitializationKey(item.target);
+          accessRefreshTargets.add(key);
+          targetInitializations.get(key)?.controller.abort();
+          targetInitializations.delete(key);
+          requiredGeneration = null;
+        }
+        item.invalidations.add({
+          requiredGeneration,
+          bindingRevision: item.bindingRevision,
+          accessRemoved: normalized.accessRemoved,
+          accessOnly: normalized.accessRemoved && !demandEnabled(item.demand),
+          resolve,
+          reject,
+        });
+        if (item.timer !== null) { clearTimeout_(item.timer); item.timer = null; }
+        if (normalized.accessRemoved) {
+          const retire = async () => {
+            await Promise.allSettled([item.pollPromise, item.initializePromise].filter(Boolean));
+            if (closed || item.closed) return;
+            if (item.id) engine.unsubscribe(item.id);
+            item.id = null;
+            item.identity = null;
+            item.provider = null;
+            targetInitializations.delete(targetInitializationKey(item.target));
+            await startInitialize(item);
+          };
+          void retire().catch(() => { /* durable invalidation remains pending */ });
+        } else if (item.id) {
+          void startPoll(item, { manual: true });
+        } else {
+          void startInitialize(item);
+        }
+      })));
+    },
+    async close() {
+      closed = true;
+      providerAbort.abort();
+      for (const item of items) {
+        item.closed = true;
+        rejectInvalidations(item, new Error("collector runtime closed"));
+        item.controller?.abort();
+        if (item.timer !== null) clearTimeout_(item.timer);
+      }
+      for (const entry of targetInitializations.values()) entry.controller.abort();
+      await Promise.allSettled([...items].flatMap((item) =>
+        [item.initializePromise, item.pollPromise].filter(Boolean)));
+      for (const item of items) if (item.id) engine.unsubscribe(item.id);
+      items.clear();
+      engine.close();
+      for (const context of providerContexts.values()) {
+        if (context.scope) releaseLease(context.scope, context.leaseId);
+        context.coordinator.close();
+        context.credentialEnvironment = null;
+        if (context.scope) delete context.scope.credentialEnvironment;
+      }
+      providerContexts.clear();
+    },
+  };
+}
+
+async function runCollectorForeground(configPath, {
+  pathOptions = {},
+  platform = process.platform,
+  stderr = process.stderr,
+  runtime = null,
+} = {}) {
+  const loaded = loadCollectorConfig(configPath);
+  if (!loaded.ok) throw new Error(`collector config ${loaded.reason}`);
+  const activeRuntime = runtime ?? createCollectorAcquisitionRuntime({
+    config: loaded.value,
+    pathOptions,
+    onDiagnostic(event) {
+      stderr.write(`gh-glance: collector ${safe(event.stage)}: ${redact(event.reason)}\n`);
+    },
+  });
+  const service = await createCollectorService({ config: loaded.value, pathOptions, platform, runtime: activeRuntime });
+  stderr.write(`gh-glance: collector listening at ${service.socketPath}\n`);
+  const stop = () => resolveStop?.();
+  let resolveStop;
+  try {
+    await new Promise((resolve) => {
+      resolveStop = resolve;
+      process.once("SIGINT", stop);
+      process.once("SIGTERM", stop);
+    });
+  } finally {
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+  }
+  await service.close();
+}
+
+async function runCollectorStdioBridge({
+  pathOptions = {},
+  platform = process.platform,
+  input = process.stdin,
+  output = process.stdout,
+  stderr = process.stderr,
+  createConnection_ = createConnection,
+} = {}) {
+  if (platform === "win32") throw new Error("collector mode is unsupported on Windows");
+  const socket = createConnection_(collectorSocketPath(pathOptions));
+  await new Promise((resolve, reject) => {
+    const cleanup = () => { socket.off("connect", connected); socket.off("error", failed); };
+    const connected = () => { cleanup(); resolve(); };
+    const failed = (error) => { cleanup(); reject(error); };
+    socket.once("connect", connected);
+    socket.once("error", failed);
+  });
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      socket.off("drain", onSocketDrain);
+      socket.off("data", onSocketData);
+      socket.off("error", fail);
+      socket.off("close", onSocketClose);
+      output.off?.("drain", onOutputDrain);
+      input.off("data", onInputData);
+      input.off("end", onInputEnd);
+      input.off("error", fail);
+    };
+    const finish = (error = null) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) {
+        stderr.write(`gh-glance: collector bridge ${redact(shortErr(error))}\n`);
+        socket.destroy();
+        reject(error);
+      } else resolve();
+    };
+    function fail(error) { finish(error); }
+    const outbound = createCollectorFrameDecoder({
+      onFrame(frame) {
+        if (!socket.write(encodeCollectorFrame(frame))) input.pause();
+      },
+      onError: fail,
+    });
+    const inbound = createCollectorFrameDecoder({
+      onFrame(frame) {
+        if (!output.write(encodeCollectorFrame(frame))) socket.pause();
+      },
+      onError: fail,
+    });
+    const onSocketDrain = () => input.resume();
+    const onOutputDrain = () => socket.resume();
+    const onInputData = (chunk) => outbound.push(chunk);
+    const onInputEnd = () => {
+      if (outbound.end() && !settled) socket.end();
+    };
+    const onSocketData = (chunk) => inbound.push(chunk);
+    const onSocketClose = () => {
+      if (inbound.end()) finish();
+    };
+    socket.on("drain", onSocketDrain);
+    output.on?.("drain", onOutputDrain);
+    input.on("data", onInputData);
+    input.once("end", onInputEnd);
+    input.once("error", fail);
+    socket.on("data", onSocketData);
+    socket.once("error", fail);
+    socket.once("close", onSocketClose);
+  });
+}
+
+function createCollectorProtocolClient({ createTransport, onReady = () => {},
+  reconnectDelay = () => 1_000, now = Date.now, monotonicNow = () => performance.now(),
+  handshakeTimeoutMs = 10_000, requireServerNow = false,
+  setTimeout: setTimeout_ = setTimeout, clearTimeout: clearTimeout_ = clearTimeout } = {}) {
+  if (typeof createTransport !== "function") throw new TypeError("createTransport must be a function");
+  const subscriptions = new Map();
+  let socket = null;
+  let serverEpoch = null;
+  let welcomed = false;
+  let ready = false;
+  let closed = false;
+  let reconnectTimer = null;
+  let reconnectAttempt = 0;
+  const assembler = createCollectorSnapshotAssembler({
+    setTimeout: setTimeout_,
+    clearTimeout: clearTimeout_,
+    resourceForId: (id) => subscriptions.get(id)?.resource ?? null,
+    onSnapshot(snapshot, frame) {
+      const item = subscriptions.get(frame.id);
+      if (!item || frame.serverEpoch !== serverEpoch || snapshot.generation <= item.generation) return;
+      item.generation = snapshot.generation;
+      item.controlGeneration = Math.max(item.controlGeneration, snapshot.generation);
+      const sourceAgeMs = item.sourceAge.observe({
+        lastSuccessAt: snapshot.lastSuccessAt,
+        serverNow: Number.isFinite(frame.serverNow) ? frame.serverNow : now(),
+      });
+      if (!ready) {
+        ready = true;
+        reconnectAttempt = 0;
+        onReady(true);
+      }
+      item.onSnapshot(snapshot, {
+        sourceAgeMs,
+        clientCheckpointAt: now(),
+        serverEpoch: frame.serverEpoch,
+      });
+    },
+  });
+  const write = (message) => {
+    if (welcomed && socket?.writable) socket.write(encodeCollectorFrame(message));
+  };
+  const resubscribe = (resetGenerations) => {
+    for (const item of subscriptions.values()) {
+      if (resetGenerations) {
+        item.generation = -1;
+        item.controlGeneration = -1;
+      }
+      write({ type: "subscribe", id: item.id, host: item.host, repo: item.repo,
+        resource: item.resource, demand: item.demand });
+    }
+  };
+  const connect = () => {
+    if (closed) return;
+    const candidate = createTransport();
+    socket = candidate;
+    welcomed = false;
+    let handshakeTimer = null;
+    const decoder = createCollectorFrameDecoder({
+      onFrame(frame) {
+        if (frame.type === "welcome") {
+          if (frame.protocolVersion !== COLLECTOR_PROTOCOL_VERSION || !validGovernorId(frame.serverEpoch)) {
+            candidate.destroy();
+            return;
+          }
+          if (handshakeTimer !== null) { clearTimeout_(handshakeTimer); handshakeTimer = null; }
+          const epochChanged = serverEpoch !== frame.serverEpoch;
+          if (epochChanged) assembler.reset();
+          serverEpoch = frame.serverEpoch;
+          welcomed = true;
+          ready = false;
+          resubscribe(epochChanged);
+          return;
+        }
+        if (!welcomed || frame.serverEpoch !== serverEpoch) return;
+        const item = subscriptions.get(frame.id);
+        if (!item) { candidate.destroy(); return; }
+        if (frame.type === "snapshot" || frame.type.startsWith?.("snapshot-")) {
+          if (requireServerNow && ["snapshot", "snapshot-begin"].includes(frame.type) &&
+              !Number.isFinite(frame.serverNow)) { candidate.destroy(); return; }
+          if (!assembler.accept(frame).ok) candidate.destroy();
+        }
+        else if (frame.type === "hold") {
+          if (!exactKeys(frame, ["type", "id", "serverEpoch", "generation", "hold"]) ||
+              !Number.isSafeInteger(frame.generation) || frame.generation < item.controlGeneration ||
+              !COLLECTOR_HOLD_REASONS.has(frame.hold)) return;
+          item.controlGeneration = frame.generation;
+          item.onHold?.(frame.hold);
+        }
+        else if (frame.type === "diagnostic") {
+          const diagnostic = normalizeCollectorDiagnostic(frame.diagnostic, item?.resource ?? null);
+          if (!exactKeys(frame, ["type", "id", "serverEpoch", "generation", "diagnostic"]) ||
+              !Number.isSafeInteger(frame.generation) || frame.generation < item.controlGeneration ||
+              diagnostic?.generation !== frame.generation) return;
+          item.controlGeneration = frame.generation;
+          item.onDiagnostic?.(diagnostic);
+        }
+        else if (frame.type === "error") {
+          if (!exactKeys(frame, ["type", "id", "serverEpoch", "generation", "code"]) ||
+              !Number.isSafeInteger(frame.generation) || frame.generation < item.controlGeneration ||
+              typeof frame.code !== "string") return;
+          item.controlGeneration = frame.generation;
+          item.onError?.(safe(frame.code));
+        }
+      },
+      onError: () => candidate.destroy(),
+    });
+    candidate.on("connect", () => {
+      candidate.write(encodeCollectorFrame({ type: "hello", protocolVersion: COLLECTOR_PROTOCOL_VERSION }));
+      handshakeTimer = setTimeout_(() => candidate.destroy(), handshakeTimeoutMs);
+      handshakeTimer?.unref?.();
+    });
+    candidate.on("data", (chunk) => decoder.push(chunk));
+    candidate.on("error", () => {});
+    candidate.on("close", () => {
+      if (handshakeTimer !== null) { clearTimeout_(handshakeTimer); handshakeTimer = null; }
+      decoder.end();
+      assembler.reset();
+      if (socket === candidate) socket = null;
+      welcomed = false;
+      const wasReady = ready;
+      ready = false;
+      if (wasReady) onReady(false);
+      if (!closed && reconnectTimer === null) {
+        const delay = reconnectDelay(reconnectAttempt);
+        reconnectAttempt += 1;
+        reconnectTimer = setTimeout_(() => { reconnectTimer = null; connect(); }, delay);
+        reconnectTimer?.unref?.();
+      }
+    });
+  };
+  connect();
+  return {
+    subscribe({ id = randomUUID(), host, repo, resource, demand, onSnapshot, onHold, onError, onDiagnostic,
+      sourceCheckpoint = null }) {
+      const subscription = normalizeCollectorSubscription({ id, host, repo, resource, demand });
+      if (!subscription || typeof onSnapshot !== "function") {
+        return { ok: false, reason: "invalid" };
+      }
+      const item = { ...subscription,
+        onSnapshot, onHold, onError, onDiagnostic, generation: -1, controlGeneration: -1,
+        sourceAge: createCollectorSourceAgeTracker({ now, monotonicNow, checkpoint: sourceCheckpoint }) };
+      subscriptions.set(id, item);
+      if (welcomed) write({ type: "subscribe", id: item.id, host: item.host, repo: item.repo,
+        resource: item.resource, demand: item.demand });
+      return { ok: true, value: {
+        id,
+        updateDemand(next) {
+          const normalized = normalizeCollectorDemand(next);
+          if (!normalized) return { ok: false, reason: "invalid" };
+          if (item.demand.active === normalized.active && item.demand.background === normalized.background &&
+              item.demand.floorMs === normalized.floorMs && item.demand.pages === normalized.pages) {
+            return { ok: true, changed: false };
+          }
+          item.demand = normalized;
+          write({ type: "demand", id, demand: normalized });
+          return { ok: true, changed: true };
+        },
+        refresh(force = false) { write({ type: "refresh", id, force: force === true }); },
+        inspect() { write({ type: "inspect", id }); },
+        close() { write({ type: "unsubscribe", id }); subscriptions.delete(id); assembler.cancel(id); },
+      } };
+    },
+    close() {
+      closed = true;
+      if (reconnectTimer !== null) clearTimeout_(reconnectTimer);
+      socket?.destroy();
+      assembler.reset();
+      subscriptions.clear();
+    },
+  };
+}
+
+function createLocalCollectorClient({ pathOptions = {}, createConnection_ = createConnection, ...options } = {}) {
+  return createCollectorProtocolClient({
+    ...options,
+    createTransport: () => createConnection_(collectorSocketPath(pathOptions)),
+  });
+}
+
+function createSshCollectorClient({ alias, createTransport = null, random = Math.random,
+  onTransportDiagnostic = () => {}, env = process.env, spawn_ = spawn, ...options } = {}) {
+  const validated = validateSshAlias(alias);
+  return createCollectorProtocolClient({
+    ...options,
+    requireServerNow: true,
+    reconnectDelay: (attempt) => sshReconnectDelay(attempt, { random }),
+    createTransport: createTransport ?? (() => createSshCollectorTransport({
+      alias: validated,
+      env,
+      spawn_,
+      onDiagnostic: onTransportDiagnostic,
+      setTimeout: options.setTimeout,
+      clearTimeout: options.clearTimeout,
+    })),
+  });
+}
+
+function collectorDisplayDecision({ connected, hasSnapshot, hold = null }) {
+  if (!connected || hold === "disconnected") return { disconnected: true };
+  if (hold === "shared-wait") return { mode: "waiting", waitCause: "shared-lane" };
+  if (["observer", "primary", "secondary", "coordination"].includes(hold)) {
+    return { mode: "paused", detailKind: hold };
+  }
+  if (hold === "cache-only") return { mode: "waiting", detailKind: "cache" };
+  return hasSnapshot ? { sharedData: true } : { mode: "waiting", detailKind: "collector" };
 }
 
 // ---------- Diagnostics (--doctor) ----------
@@ -5964,6 +9599,9 @@ async function readSharedBudgetSources(signal, host = effectiveRuntimeHost(), {
     // charged one.
     if (resources.includes("graphql") && typeof renewClaim === "function" && !await renewClaim()) return null;
     const core = await readCore(signal, host, coreEtag);
+    if (core?.unsupported === true && typeof core.capability === "string") {
+      return { providerCapability: core.capability };
+    }
     if (core) result.core = core;
   }
   return Object.keys(result).length > 0 ? result : null;
@@ -6063,12 +9701,115 @@ function skippedDoctorProbe(name, args, admitted) {
   };
 }
 
-async function runDoctor() {
+const ACQUISITION_METRIC_KEYS = [
+  "httpRequests", "rest200", "rest304", "coreUnits", "graphqlUnits",
+  "uncertainCoreUnits", "uncertainGraphqlUnits", "failedRequests", "observerCalls", "cacheHits",
+  "joinedFollowers", "queueWaitMs",
+];
+const ACQUISITION_HOLD_REASONS = new Set([
+  "observer", "primary", "secondary", "disconnected", "coordination",
+]);
+const ACQUISITION_STORE_VERSION = 1;
+const ACQUISITION_MAX_UNCERTAIN_RECEIPTS = 1024;
+
+function normalizeAcquisitionDiagnosticMetadata(raw) {
+  if (!isRecord(raw) || raw.version !== ACQUISITION_STORE_VERSION ||
+      typeof raw.producerEpoch !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(raw.producerEpoch) ||
+      !isRecord(raw.subscriptions) || !isRecord(raw.queries)) return null;
+  const metrics = normalizeAcquisitionMetrics(raw.metrics);
+  if (!metrics) return null;
+  const receipts = raw.uncertainReceipts ?? {};
+  if (!isRecord(receipts) || Object.keys(receipts).length > ACQUISITION_MAX_UNCERTAIN_RECEIPTS) return null;
+  const uncertainReceipts = {};
+  const outstanding = { core: 0, graphql: 0 };
+  for (const [id, receipt] of Object.entries(receipts)) {
+    const normalized = normalizeAcquisitionReceipt(receipt, id);
+    if (!normalized) return null;
+    uncertainReceipts[id] = normalized;
+    outstanding[normalized.resource] += normalized.units;
+  }
+  if (metrics.uncertainCoreUnits !== outstanding.core ||
+      metrics.uncertainGraphqlUnits !== outstanding.graphql) return null;
+  const queries = {};
+  for (const [queryKey, value] of Object.entries(raw.queries)) {
+    if (!isRecord(value) || !isRecord(value.query) || value.query.queryKey !== queryKey ||
+        !TAB_KEYS.includes(value.query.resource)) return null;
+    const hold = normalizeAcquisitionHold(value.hold);
+    if (value.hold !== undefined && value.hold !== null && !hold) return null;
+    const snapshot = value.snapshot;
+    if (snapshot !== null && (!isRecord(snapshot) ||
+        !Number.isFinite(snapshot.lastSuccessAt) || !Number.isFinite(snapshot.lastChangedAt) ||
+        !Number.isFinite(snapshot.nextDueAt))) return null;
+    const claim = value.claim;
+    if (claim !== null && (!isRecord(claim) || !Number.isSafeInteger(claim.generation) ||
+        (claim.receiptIds !== undefined && (!Array.isArray(claim.receiptIds) ||
+          claim.receiptIds.some((id) => typeof id !== "string" || !uncertainReceipts[id]))))) return null;
+    queries[queryKey] = {
+      query: { queryKey, resource: value.query.resource },
+      snapshot: snapshot === null ? null : {
+        lastSuccessAt: snapshot.lastSuccessAt,
+        lastChangedAt: snapshot.lastChangedAt,
+        nextDueAt: snapshot.nextDueAt,
+      },
+      claim: claim === null ? null : { generation: claim.generation },
+      hold,
+    };
+  }
+  const subscriptions = {};
+  for (const [id, value] of Object.entries(raw.subscriptions)) {
+    if (!isRecord(value) || !queries[value.queryKey] || !Number.isFinite(value.expiresAt)) return null;
+    const waitingGeneration = value.waitingGeneration ?? null;
+    const waitingSinceAt = value.waitingSinceAt ?? null;
+    if (waitingGeneration !== null && (!Number.isSafeInteger(waitingGeneration) ||
+        !Number.isFinite(waitingSinceAt))) return null;
+    if (waitingGeneration === null && waitingSinceAt !== null) return null;
+    subscriptions[id] = {
+      queryKey: value.queryKey,
+      expiresAt: value.expiresAt,
+      waitingGeneration,
+      waitingSinceAt,
+    };
+  }
+  return { producerEpoch: raw.producerEpoch, metrics, uncertainReceipts, queries, subscriptions };
+}
+
+function unavailableAcquisitionDiagnostic(reason, source = "standalone") {
+  return { source, status: reason, epoch: null, activeQueries: 0,
+    activeSubscribers: 0, metrics: emptyAcquisitionMetrics(), queries: [] };
+}
+
+function doctorAcquisitionDiagnostic({ nowMs = Date.now(), source = "standalone" } = {}) {
+  try {
+    const raw = JSON.parse(readFileSync(join(identityRegistryRoot(), "acquisition.json"), "utf8"));
+    const normalized = normalizeAcquisitionDiagnosticMetadata(raw);
+    return normalized
+      ? acquisitionDiagnostics(normalized, { nowMs, source })
+      : unavailableAcquisitionDiagnostic("corrupt", source);
+  } catch (error) {
+    return unavailableAcquisitionDiagnostic(error?.code === "ENOENT"
+      ? "missing"
+      : error instanceof SyntaxError ? "corrupt" : "unreadable", source);
+  }
+}
+
+function collectorSocketDiagnostic(pathOptions = {}) {
+  try {
+    const stat = statSync(collectorSocketPath(pathOptions));
+    if (!stat.isSocket()) return "unsafe endpoint";
+    if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) return "unsafe permissions";
+    return "available";
+  } catch (error) {
+    return error?.code === "ENOENT" ? "not running" : "unreadable";
+  }
+}
+
+async function runDoctor({ probeEndpoints = false } = {}) {
   // A live backoff would make an alert probe silently skip and report nothing,
   // which is the opposite of what a diagnostic run is for.
   alertBackoff.clear();
 
-  const probes = doctorProbePlan();
+  const probes = probeEndpoints ? doctorProbePlan() : [];
 
   // Free checks run first. The display rate_limit read is report data only;
   // admission re-reads its GraphQL source after owning the shared claim.
@@ -6078,22 +9819,28 @@ async function runDoctor() {
     gitRemoteUrls(),
   ]);
   const effectiveHost = effectiveRuntimeHost({ remoteUrls });
-  runtimeIdentityCoordinator = createIdentityCoordinator({ host: effectiveHost });
-  const verified = await runtimeIdentityCoordinator.refresh();
-  const verifiedIdentity = runtimeIdentityCoordinator.current();
-  const authStatus = verifiedIdentity
-    ? `${verifiedIdentity.host}: ${verifiedIdentity.login} (verified)`
-    : runtimeHasNoRepositoryTarget(remoteUrls) ? NO_REPOSITORY_TARGET_REPORT : identityCoordinationMessage(verified.reason);
-  const resources = verifiedIdentity ? await readRateLimitResources(undefined, effectiveHost).catch(() => null) : null;
+  runtimeIdentityCoordinator = probeEndpoints ? createIdentityCoordinator({ host: effectiveHost }) : null;
+  const verified = probeEndpoints
+    ? await runtimeIdentityCoordinator.refresh()
+    : { ok: false, reason: "probe-disabled" };
+  const verifiedIdentity = runtimeIdentityCoordinator?.current() ?? null;
+  const authStatus = !probeEndpoints
+    ? "not probed (--probe not requested)"
+    : verifiedIdentity
+      ? `${verifiedIdentity.host}: ${verifiedIdentity.login} (verified)`
+      : runtimeHasNoRepositoryTarget(remoteUrls) ? NO_REPOSITORY_TARGET_REPORT : identityCoordinationMessage(verified.reason);
+  const resources = probeEndpoints && verifiedIdentity
+    ? await readRateLimitResources(undefined, effectiveHost).catch(() => null)
+    : null;
   const budget = resources
     ? await rateBudget(resources)
     : { core: "unavailable", graphql: "unavailable" };
-  const scopeResult = verifiedIdentity
+  const scopeResult = probeEndpoints && verifiedIdentity
     ? { ok: true, value: createQuotaScope(verifiedIdentity, { root: runtimeIdentityCoordinator.root, identityProvider: runtimeIdentityCoordinator.current }) }
     : verified;
   let governorResult = scopeResult;
   let results = [];
-  if (scopeResult.ok) {
+  if (probeEndpoints && scopeResult.ok) {
     const scope = scopeResult.value;
     const leaseId = governorId();
     const nowMs = Date.now();
@@ -6145,7 +9892,13 @@ async function runDoctor() {
       governorResult = inspectGovernor(cleanup, Date.now());
     }
   }
-  const governor = governorHealth(governorResult, Date.now());
+  const governor = probeEndpoints
+    ? governorHealth(governorResult, Date.now())
+    : { status: "not inspected (--probe not requested)", leases: 0, resources: {} };
+  const diagnosticSource = runtime.connect === "local"
+    ? "local collector"
+    : runtime.connect?.startsWith("ssh:") ? "SSH collector" : "standalone";
+  const acquisitionDiagnostic = doctorAcquisitionDiagnostic({ source: diagnosticSource });
 
   const lines = [
     "gh-glance doctor",
@@ -6198,11 +9951,48 @@ async function runDoctor() {
       );
     }),
     "",
+    ...section("Acquisition metrics"),
+    field("source", acquisitionDiagnostic?.source ?? "standalone"),
+    field("status", acquisitionDiagnostic?.status ?? "unavailable"),
+    field("epoch", acquisitionDiagnostic?.epoch ?? "unavailable"),
+    field("active queries", acquisitionDiagnostic?.activeQueries ?? 0),
+    field("subscribers", acquisitionDiagnostic?.activeSubscribers ?? 0),
+    field("HTTP attempts", acquisitionDiagnostic?.metrics.httpRequests ?? 0),
+    field("failed requests", acquisitionDiagnostic?.metrics.failedRequests ?? 0),
+    field("REST actual 200/304", `${acquisitionDiagnostic?.metrics.rest200 ?? 0}/${acquisitionDiagnostic?.metrics.rest304 ?? 0}`),
+    field("proven actual units", `${acquisitionDiagnostic?.metrics.coreUnits ?? 0} core + ${acquisitionDiagnostic?.metrics.graphqlUnits ?? 0} GraphQL`),
+    field("conservative outstanding", `${acquisitionDiagnostic?.metrics.uncertainCoreUnits ?? 0} core + ${acquisitionDiagnostic?.metrics.uncertainGraphqlUnits ?? 0} GraphQL`),
+    field("observer calls", acquisitionDiagnostic?.metrics.observerCalls ?? 0),
+    field("cache/followers", `${acquisitionDiagnostic?.metrics.cacheHits ?? 0}/${acquisitionDiagnostic?.metrics.joinedFollowers ?? 0}`),
+    field("queue wait (measured)", `${acquisitionDiagnostic?.metrics.queueWaitMs ?? 0}ms`),
+    ...((acquisitionDiagnostic?.queries ?? []).flatMap((query) => [
+      field("query", `${query.resource}: ${query.hold ?? "open"}`),
+      field("last success", query.lastSuccessAt ? new Date(query.lastSuccessAt).toISOString() : "never"),
+      field("last change", query.lastChangedAt ? new Date(query.lastChangedAt).toISOString() : "never"),
+      field("next due", query.nextDueAt ? new Date(query.nextDueAt).toISOString() : "unknown"),
+      field("consumers", query.coalescedConsumers),
+    ])),
+    ...(runtime.connect === "local" ? [
+      "",
+      ...section("Local collector"),
+      field("socket", collectorSocketDiagnostic()),
+      field("fallback", "disabled"),
+    ] : []),
+    ...(runtime.connect?.startsWith("ssh:") ? [
+      "",
+      ...section("SSH collector"),
+      field("alias", sshAliasFromConnect(runtime.connect)),
+      field("command", "ssh (fixed collector bridge command)"),
+      field("fallback", "disabled"),
+    ] : []),
+    "",
     ...section("Environment"),
     ...doctorEnvNames().map((name) => field(name, envValue(name))),
     "",
     ...section("Endpoint probes"),
   ];
+
+  if (!probeEndpoints) lines.push("  disabled (use --doctor --probe)", "");
 
   const probeLine = (label, value) => lines.push(`  ${field(label, value, PROBE_LABEL_WIDTH)}`);
   for (const result of results) {
@@ -6303,6 +10093,7 @@ function parseArgs(argv) {
     help: false,
     showVersion: false,
     doctor: false,
+    probe: false,
     repo: null,
     refresh: null,
     // Which surface supplied `refresh`, so validateArgs can name it in the
@@ -6316,6 +10107,10 @@ function parseArgs(argv) {
     // visibly aged.
     background: null,
     verbose: false,
+    serve: false,
+    config: null,
+    connect: null,
+    collectorStdio: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -6336,6 +10131,14 @@ function parseArgs(argv) {
     else if (arg === "--version") opts.showVersion = true;
     else if (arg === "--verbose") opts.verbose = true;
     else if (arg === "--doctor") opts.doctor = true;
+    else if (arg === "--probe") opts.probe = true;
+    else if (arg === "--serve") opts.serve = true;
+    else if (arg === "--collector-stdio") opts.collectorStdio = true;
+    else if (arg === "--config" || arg.startsWith("--config=")) {
+      opts.config = takeValue("--config");
+    } else if (arg === "--connect" || arg.startsWith("--connect=")) {
+      opts.connect = takeValue("--connect");
+    }
     else if (arg === "--repo" || arg === "-R" || arg.startsWith("--repo=")) {
       opts.repo = takeValue("--repo");
     } else if (arg === "--refresh" || arg.startsWith("--refresh=")) {
@@ -6380,17 +10183,37 @@ function validateArgs(opts, tabKeys) {
   if (opts.background !== null && !BACKGROUND_MODES.includes(opts.background)) {
     throw new Error(`--background must be one of ${BACKGROUND_MODES.join(", ")}, got: ${opts.background}`);
   }
+  if (opts.probe && !opts.doctor) throw new Error("--probe requires --doctor");
+  if (opts.connect !== null && opts.doctor && opts.probe) {
+    throw new Error("--connect --doctor --probe is unsupported; collector clients make no GitHub API calls");
+  }
+  if (opts.serve && opts.config === null) throw new Error("--serve requires --config");
+  if (!opts.serve && opts.config !== null) throw new Error("--config requires --serve");
+  if (opts.connect !== null && opts.connect !== "local") {
+    if (!opts.connect.startsWith("ssh:")) throw new Error("--connect must be local or ssh:<alias>");
+    sshAliasFromConnect(opts.connect);
+  }
+  const modes = Number(opts.serve) + Number(opts.collectorStdio) + Number(opts.connect !== null);
+  if (modes > 1) throw new Error("collector modes cannot be combined");
+  if ((opts.serve || opts.collectorStdio) &&
+      (opts.repo !== null || opts.refresh !== null || opts.tab !== null || opts.background !== null ||
+        opts.doctor || opts.probe || opts.verbose)) throw new Error("collector mode cannot be combined with dashboard options");
 
   return {
     help: opts.help,
     showVersion: opts.showVersion,
     doctor: opts.doctor,
+    probe: opts.probe,
     repo: slug,
     host,
     refreshMs,
     tabKey: opts.tab,
     background: opts.background,
     verbose: opts.verbose,
+    serve: opts.serve,
+    config: opts.config,
+    connect: opts.connect,
+    collectorStdio: opts.collectorStdio,
   };
 }
 
@@ -6464,6 +10287,12 @@ Usage:
   gh-glance --background off    Poll only the tab you are looking at
   gh-glance --verbose 2>log     Log every gh call to a file (see below)
   gh-glance --doctor            Print a diagnostic report and exit
+  gh-glance --doctor --probe    Run bounded, admitted GitHub capability probes
+  gh-glance --serve --config PATH
+                                Run the foreground local collector
+  gh-glance --connect local     Use the current user's local collector
+  gh-glance --connect ssh:ALIAS Use a collector through an SSH config alias
+  gh-glance --collector-stdio  Bridge stdio to the running local collector
   gh-glance --help              Show this help
   gh-glance --version           Show the version
 
@@ -6488,12 +10317,22 @@ Options:
                            must be redirected -- writing it to the terminal
                            would draw over the dashboard, so this refuses to
                            start otherwise.
-  --doctor                 Gather versions, authenticated hosts, the resolved
-                           repo target, API governor health and one safely
-                           admitted probe per endpoint, then exit.
+  --doctor                 Inspect local versions, configuration, acquisition
+                           freshness and metrics without GitHub API requests.
+  --probe                  With --doctor, run one bounded, safely admitted
+                           capability probe per endpoint.
                            Safe to redirect to a file and share -- tokens are
                            never printed, proxy credentials are stripped, and
                            no response bodies are included.
+  --serve                  Run the optional collector in the foreground. Requires
+                           one private, versioned --config file.
+  --config <path>          Collector provider and exact repository allowlist.
+  --connect local          Subscribe the dashboard to the fixed private socket.
+  --connect ssh:<alias>    Run the fixed collector bridge through the named SSH
+                           config alias. Batch mode, forwarding refusal and
+                           agent-forwarding refusal are always enabled; GitHub
+                           credentials are never sent.
+  --collector-stdio        Non-TTY protocol bridge to that same running socket.
 
 Run it from inside a locally cloned GitHub repository; the repo is inferred
 from the git remote, the same way \`gh\` does it. Requires the \`gh\` CLI
@@ -6577,6 +10416,7 @@ if (IS_MAIN) {
   runtime.host = opts.host;
   runtime.repoExplicit = opts.repo !== null;
   runtime.verbose = opts.verbose;
+  runtime.connect = opts.connect;
   if (opts.refreshMs !== null) runtime.refreshMs = opts.refreshMs;
   if (opts.tabKey !== null) runtime.initialTabIndex = TAB_KEYS.indexOf(opts.tabKey);
   if (opts.background !== null) runtime.background = opts.background;
@@ -6592,14 +10432,32 @@ if (IS_MAIN) {
     process.exit(0);
   }
 
+  if (opts.serve) runtime.headlessMode = { type: "serve", config: opts.config };
+  else if (opts.collectorStdio) runtime.headlessMode = { type: "stdio" };
+  else {
+
   // A reporting command, like --help and --version: gather, print, exit. It sits
   // here on purpose -- ahead of the non-TTY refusal, because the whole point is
   // `gh-glance --doctor > report.txt`, and ahead of preflight(), because a
   // missing gh and a cwd outside a repository are exactly the conditions worth
   // reporting rather than exiting 3 over.
   if (opts.doctor) {
-    console.log(await runDoctor());
+    console.log(await runDoctor({ probeEndpoints: opts.probe }));
     process.exit(0);
+  }
+
+  // A local collector subscription needs an exact offline target before Ink
+  // mounts. Resolve git remotes locally and fail with the actionable flag;
+  // otherwise a cold invocation paints a dashboard that can only say
+  // Disconnected and never has a subscription it can recover.
+  if (opts.connect !== null) {
+    runtimeRemoteUrls = await gitRemoteUrls();
+    const source = opts.connect === "local" ? "local collector" : "SSH collector";
+    const problem = collectorClientPreflight(runtimeRemoteUrls, source);
+    if (problem) {
+      console.error(problem);
+      process.exit(3);
+    }
   }
 
   // Verbose output must never reach stdout -- that is ink's frame stream, and
@@ -6625,13 +10483,15 @@ if (IS_MAIN) {
     process.exit(1);
   }
 
-  const problem = await preflight();
+  const problem = opts.connect !== null ? null : await preflight();
   if (problem) {
     console.error(problem);
     process.exit(3);
   }
-  runtimeRemoteUrls = await gitRemoteUrls();
-  runtimeIdentityCoordinator = createIdentityCoordinator({ host: () => effectiveRuntimeHost() });
+  if (opts.connect === null) runtimeRemoteUrls = await gitRemoteUrls();
+  runtimeIdentityCoordinator = opts.connect !== null
+    ? null
+    : createIdentityCoordinator({ host: () => effectiveRuntimeHost() });
   // Resolve warm identity/cache locally; cold proof belongs to the mounted UI
   // so quit/signal handling remains available while GitHub is slow.
   //
@@ -6641,14 +10501,21 @@ if (IS_MAIN) {
   // first frame for the full subprocess timeout with nothing on screen at all.
   // Past the bound the same refresh is picked up by the mounted UI, and
   // ensureScope corrects the cache target and hydrates from it.
-  await Promise.race([
-    runtimeIdentityCoordinator.refresh({ allowBootstrap: false }),
-    new Promise((resolve) => { setTimeout(resolve, WARM_IDENTITY_WAIT_MS).unref(); }),
-  ]);
+  if (runtimeIdentityCoordinator) {
+    await Promise.race([
+      runtimeIdentityCoordinator.refresh({ allowBootstrap: false }),
+      new Promise((resolve) => { setTimeout(resolve, WARM_IDENTITY_WAIT_MS).unref(); }),
+    ]);
+  }
+  }
 }
 
-const ReactModule = await import("react");
-const { render, measureElement, Box, Text, useStdout, useInput, useStdin, useApp } = await import("ink");
+const headlessEntry = IS_MAIN && runtime.headlessMode;
+const ReactModule = headlessEntry
+  ? { default: { Component: class {}, createElement: () => null, memo: (component) => component } }
+  : await import("react");
+const InkModule = headlessEntry ? {} : await import("ink");
+const { render, measureElement, Box, Text, useStdout, useInput, useStdin, useApp } = InkModule;
 
 const React = ReactModule.default;
 const { useState, useEffect, useMemo, useRef, useCallback } = ReactModule;
@@ -7892,7 +11759,7 @@ const createWidthPreferenceWriter = createCoalescedWriter;
 
 // 3: cached rows carry their page URL, without which they cannot be opened.
 const DASHBOARD_CACHE_VERSION = 3;
-const MAX_DASHBOARD_CACHE_TARGETS = 5;
+const MAX_DASHBOARD_CACHE_TARGETS = 32;
 const MAX_DASHBOARD_CACHE_ROWS_PER_TAB = 60;
 let dashboardCacheTempSequence = 0;
 
@@ -7960,6 +11827,27 @@ function dashboardCacheTarget({
   return target
     ? JSON.stringify({ kind: "repo", host: String(host ?? ""), repo: String(target), account })
     : JSON.stringify({ kind: "cwd", host: String(host ?? ""), cwd: String(cwd), account });
+}
+
+function sshCollectorCacheIdentity(alias) {
+  return privateIdentityDigest("ssh-collector-cache-v1", validateSshAlias(alias));
+}
+
+function normalizeCollectorCacheEvidence(raw) {
+  if (!isRecord(raw) || raw.kind !== "ssh" || typeof raw.collector !== "string" ||
+      raw.collector.length !== 64 || !/^[0-9a-f]+$/.test(raw.collector) ||
+      !validGovernorId(raw.serverEpoch) || !Number.isFinite(raw.lastSuccessAt) ||
+      !Number.isFinite(raw.lastChangedAt) || raw.lastChangedAt > raw.lastSuccessAt ||
+      !Number.isFinite(raw.ageMs) || raw.ageMs < 0 ||
+      !Number.isFinite(raw.clientCheckpointAt)) return null;
+  return { kind: "ssh", collector: raw.collector, serverEpoch: raw.serverEpoch,
+    lastSuccessAt: raw.lastSuccessAt, lastChangedAt: raw.lastChangedAt,
+    ageMs: raw.ageMs, clientCheckpointAt: raw.clientCheckpointAt };
+}
+
+function collectorCachedSourceAge(tab, nowMs = Date.now()) {
+  const source = normalizeCollectorCacheEvidence(tab?.source);
+  return source ? source.ageMs + Math.max(0, nowMs - source.clientCheckpointAt) : null;
 }
 
 function cacheTimestamp(value) {
@@ -8049,7 +11937,8 @@ function normalizeDashboardCacheEntry(entry) {
       at: tab.meta.at,
       truncated: tab.meta.truncated || normalizedData.length > MAX_DASHBOARD_CACHE_ROWS_PER_TAB,
     };
-    tabs[tabKey] = { data, meta, lastOk };
+    const source = normalizeCollectorCacheEvidence(tab.source);
+    tabs[tabKey] = { data, meta, lastOk, ...(source ? { source } : {}) };
   }
   if (Object.keys(tabs).length === 0) return null;
   const latestTab = Math.max(...Object.values(tabs).map((tab) => tab.lastOk));
@@ -8180,6 +12069,1590 @@ function shouldCheckpointFreshness({ persistedAt, completedAt }) {
   return !Number.isFinite(persistedAt) || completedAt - persistedAt >= CACHE_FRESHNESS_CHECKPOINT_MS;
 }
 
+// ---------- Shared acquisition store ----------
+
+// This store is data coordination, not quota authority. It may be discarded as
+// a unit with its validators, but an inability to claim it must never fall back
+// to an independent request: that would defeat its only security property.
+const ACQUISITION_CLAIM_TTL_MS = 45_000;
+const ACQUISITION_HEARTBEAT_MS = 10_000;
+const ACQUISITION_INSPECT_MS = 1_000;
+const ACQUISITION_MAX_BYTES = 32 * 1024 * 1024;
+const ACQUISITION_MAX_ENTITY_BYTES = 1024 * 1024;
+const ACQUISITION_MAX_ENTITIES = 512;
+const ACQUISITION_MAX_LIVE_TARGETS = 32;
+const ACQUISITION_MAX_SUBSCRIPTIONS = 128;
+let acquisitionTempSequence = 0;
+
+function acquisitionStorePath(options = {}) {
+  return join(identityRegistryRoot(options), "acquisition.json");
+}
+
+function emptyAcquisitionStore() {
+  return {
+    version: ACQUISITION_STORE_VERSION,
+    producerEpoch: governorId(),
+    metrics: emptyAcquisitionMetrics(),
+    uncertainReceipts: {},
+    subscriptions: {},
+    queries: {},
+    aliases: {},
+  };
+}
+
+function emptyAcquisitionMetrics() {
+  return Object.fromEntries(ACQUISITION_METRIC_KEYS.map((key) => [key, 0]));
+}
+
+function normalizeAcquisitionMetrics(raw, { partial = false } = {}) {
+  if (raw === undefined && !partial) return emptyAcquisitionMetrics();
+  if (!isRecord(raw) || Object.keys(raw).some((key) => !ACQUISITION_METRIC_KEYS.includes(key))) return null;
+  const metrics = partial ? {} : emptyAcquisitionMetrics();
+  for (const key of ACQUISITION_METRIC_KEYS) {
+    if (!Object.hasOwn(raw, key)) continue;
+    if (!Number.isSafeInteger(raw[key]) || raw[key] < 0) return null;
+    metrics[key] = raw[key];
+  }
+  return metrics;
+}
+
+function acquisitionMetricState(state) {
+  state.metrics ??= emptyAcquisitionMetrics();
+  return state.metrics;
+}
+
+function removeAcquisitionReceipt(state, id) {
+  const receipt = state.uncertainReceipts?.[id];
+  if (!receipt) return false;
+  const metrics = acquisitionMetricState(state);
+  const key = receipt.resource === "core" ? "uncertainCoreUnits" : "uncertainGraphqlUnits";
+  metrics[key] = Math.max(0, metrics[key] - receipt.units);
+  delete state.uncertainReceipts[id];
+  for (const record of Object.values(state.queries ?? {})) {
+    if (record.claim?.receiptIds?.includes(id)) {
+      record.claim.receiptIds = record.claim.receiptIds.filter((receiptId) => receiptId !== id);
+    }
+  }
+  return true;
+}
+
+function addAcquisitionReceipt(state, receipt) {
+  state.uncertainReceipts ??= {};
+  if (state.uncertainReceipts[receipt.id]) return true;
+  if (Object.keys(state.uncertainReceipts).length >= ACQUISITION_MAX_UNCERTAIN_RECEIPTS) return false;
+  state.uncertainReceipts[receipt.id] = receipt;
+  const metrics = acquisitionMetricState(state);
+  const key = receipt.resource === "core" ? "uncertainCoreUnits" : "uncertainGraphqlUnits";
+  metrics[key] += receipt.units;
+  return true;
+}
+
+function normalizeAcquisitionReceipt(raw, expectedId = raw?.id) {
+  if (!isRecord(raw) || raw.id !== expectedId || typeof raw.id !== "string" || raw.id.length > 240 ||
+      typeof raw.reservationId !== "string" || raw.reservationId.length < 1 ||
+      raw.reservationId.length > 200 || typeof raw.accessKey !== "string" ||
+      raw.accessKey.length < 1 || raw.accessKey.length > 128 || !RATE_RESOURCES.includes(raw.resource) ||
+      typeof raw.epoch !== "string" || raw.epoch.length < 1 || raw.epoch.length > 128 ||
+      !Number.isSafeInteger(raw.units) || raw.units < 1 || !Number.isFinite(raw.startedAt)) return null;
+  return { ...raw };
+}
+
+function addAcquisitionMetrics(state, delta) {
+  const normalized = normalizeAcquisitionMetrics(delta, { partial: true });
+  if (normalized === null) return false;
+  const metrics = acquisitionMetricState(state);
+  for (const [key, value] of Object.entries(normalized)) metrics[key] += value;
+  return true;
+}
+
+function addAcquisitionRequestMetrics(state, delta) {
+  const observed = Object.fromEntries(Object.entries(delta ?? {}).filter(([key]) =>
+    key !== "uncertainCoreUnits" && key !== "uncertainGraphqlUnits"));
+  return addAcquisitionMetrics(state, observed);
+}
+
+function releaseAcquisitionUncertainty(state, record) {
+  if (!record?.claim?.started) return;
+  const receiptIds = record.claim.receiptIds ?? [];
+  if (Object.hasOwn(record.claim, "receiptIds")) {
+    for (const id of receiptIds) removeAcquisitionReceipt(state, id);
+    return;
+  }
+  const costs = tabRequestCost(record.query.resource);
+  const metrics = acquisitionMetricState(state);
+  metrics.uncertainCoreUnits = Math.max(0, metrics.uncertainCoreUnits - costs.core);
+  metrics.uncertainGraphqlUnits = Math.max(0, metrics.uncertainGraphqlUnits - costs.graphql);
+}
+
+function releaseKnownAcquisitionUncertainty(state, record, requestMetrics) {
+  if (!record?.claim?.started) return;
+  const receiptIds = record.claim.receiptIds ?? [];
+  if (Object.hasOwn(record.claim, "receiptIds")) {
+    for (const resource of RATE_RESOURCES) {
+      const metricKey = resource === "core" ? "coreUnits" : "graphqlUnits";
+      const uncertainKey = resource === "core" ? "uncertainCoreUnits" : "uncertainGraphqlUnits";
+      const resourceReceipts = receiptIds
+        .map((id) => state.uncertainReceipts?.[id])
+        .filter((receipt) => receipt?.resource === resource);
+      if (Object.hasOwn(requestMetrics, uncertainKey)) {
+        let remaining = requestMetrics[uncertainKey];
+        for (const receipt of resourceReceipts) {
+          const retained = Math.min(receipt.units, remaining);
+          const released = receipt.units - retained;
+          remaining -= retained;
+          if (retained === 0) removeAcquisitionReceipt(state, receipt.id);
+          else if (released > 0) {
+            receipt.units = retained;
+            acquisitionMetricState(state)[uncertainKey] -= released;
+          }
+        }
+        continue;
+      }
+      if (Object.hasOwn(requestMetrics, metricKey)) {
+        for (const receipt of resourceReceipts) removeAcquisitionReceipt(state, receipt.id);
+      }
+    }
+    return;
+  }
+  const declared = tabRequestCost(record.query.resource);
+  const metrics = acquisitionMetricState(state);
+  if (Object.hasOwn(requestMetrics, "uncertainCoreUnits")) {
+    metrics.uncertainCoreUnits = Math.min(declared.core, requestMetrics.uncertainCoreUnits);
+  } else if (Object.hasOwn(requestMetrics, "coreUnits")) {
+    metrics.uncertainCoreUnits = Math.max(0, metrics.uncertainCoreUnits - declared.core);
+  }
+  if (Object.hasOwn(requestMetrics, "uncertainGraphqlUnits")) {
+    metrics.uncertainGraphqlUnits = Math.min(declared.graphql, requestMetrics.uncertainGraphqlUnits);
+  } else if (Object.hasOwn(requestMetrics, "graphqlUnits")) {
+    metrics.uncertainGraphqlUnits = Math.max(0, metrics.uncertainGraphqlUnits - declared.graphql);
+  }
+}
+
+function settleAcquisitionWaiters(state, queryKey, generation, at) {
+  let queueWaitMs = 0;
+  for (const subscription of Object.values(state.subscriptions)) {
+    if (subscription.queryKey !== queryKey || subscription.waitingGeneration !== generation ||
+        !Number.isFinite(subscription.waitingSinceAt)) continue;
+    queueWaitMs += Math.max(0, Math.floor(at - subscription.waitingSinceAt));
+    subscription.waitingGeneration = null;
+    subscription.waitingSinceAt = null;
+  }
+  acquisitionMetricState(state).queueWaitMs += queueWaitMs;
+}
+
+function settleInvalidAcquisitionPublication(state, record, claim, requestMetrics, receipts, at) {
+  const normalized = requestMetrics ?? {};
+  addAcquisitionRequestMetrics(state, {
+    ...normalized,
+    failedRequests: Math.max(1, normalized.failedRequests ?? 0),
+  });
+  releaseKnownAcquisitionUncertainty(state, record, normalized);
+  for (const receipt of receipts ?? []) addAcquisitionReceipt(state, receipt);
+  settleAcquisitionWaiters(state, record.query.queryKey, claim.generation, at);
+  record.claim = null;
+  record.hold = { reason: "primary", at };
+  record.lastUsedAt = at;
+}
+
+function normalizeAcquisitionHold(raw) {
+  if (raw === null || raw === undefined) return null;
+  if (!isRecord(raw) || !ACQUISITION_HOLD_REASONS.has(raw.reason) || !Number.isFinite(raw.at)) return null;
+  return { reason: raw.reason, at: raw.at };
+}
+
+function acquisitionHold(record, subscriptions = []) {
+  if (subscriptions.length === 0 && record?.snapshot) return "cache-only";
+  const persisted = normalizeAcquisitionHold(record?.hold)?.reason ?? null;
+  if (persisted) return persisted;
+  const waiting = subscriptions.some((subscription) =>
+    subscription.waitingGeneration === record?.claim?.generation &&
+    Number.isFinite(subscription.waitingSinceAt));
+  if (record?.claim && waiting) return "shared-wait";
+  if (record?.claim) return "coordination";
+  return null;
+}
+
+function acquisitionDiagnostics(state, { source = "standalone", nowMs = Date.now() } = {}) {
+  const normalizedSource = ["standalone", "local collector", "SSH collector"].includes(source)
+    ? source : "standalone";
+  const subscriptions = Object.values(state?.subscriptions ?? {}).filter((subscription) =>
+    Number.isFinite(subscription?.expiresAt) && subscription.expiresAt > nowMs);
+  const subscriptionsByQuery = new Map();
+  for (const subscription of subscriptions) {
+    const grouped = subscriptionsByQuery.get(subscription.queryKey) ?? [];
+    grouped.push(subscription);
+    subscriptionsByQuery.set(subscription.queryKey, grouped);
+  }
+  const activeQueryKeys = new Set(subscriptions.map((subscription) => subscription.queryKey));
+  const queries = Object.values(state?.queries ?? {}).map((record) => {
+    const snapshot = record.snapshot;
+    const consumers = subscriptionsByQuery.get(record.query.queryKey) ?? [];
+    return {
+      resource: record.query.resource,
+      lastSuccessAt: snapshot?.lastSuccessAt ?? null,
+      lastChangedAt: snapshot?.lastChangedAt ?? null,
+      nextDueAt: snapshot?.nextDueAt ?? null,
+      hold: acquisitionHold(record, consumers),
+      observedRequests: state?.metrics?.httpRequests ?? 0,
+      provenPrimaryCost: {
+        core: state?.metrics?.coreUnits ?? 0,
+        graphql: state?.metrics?.graphqlUnits ?? 0,
+      },
+      uncertainCost: {
+        core: state?.metrics?.uncertainCoreUnits ?? 0,
+        graphql: state?.metrics?.uncertainGraphqlUnits ?? 0,
+      },
+      coalescedConsumers: consumers.length,
+    };
+  });
+  return {
+    source: normalizedSource,
+    status: "healthy",
+    epoch: validGovernorId(state?.producerEpoch) ? state.producerEpoch : null,
+    activeQueries: activeQueryKeys.size,
+    activeSubscribers: subscriptions.length,
+    metrics: normalizeAcquisitionMetrics(state?.metrics) ?? emptyAcquisitionMetrics(),
+    queries,
+  };
+}
+
+function acquisitionFailureHold(error) {
+  if (typeof error?.providerCapability === "string") return "observer";
+  if (SECONDARY_LIMIT_PATTERN.test(errText(error))) return "secondary";
+  if (isRateLimited(error) || /API budget paused/i.test(errText(error))) return "primary";
+  const attemptedHttp = Number.isSafeInteger(error?.requestMetrics?.httpRequests) &&
+    error.requestMetrics.httpRequests > 0;
+  if ((!error?.apiResponse && !attemptedHttp) || isAuthProblem(error)) return "disconnected";
+  return "primary";
+}
+
+function acquisitionRequestMetrics(result) {
+  if (result?.requestMetrics) return mergeAcquisitionRequestMetrics(result.requestMetrics);
+  const httpRequests = result?.httpRequests ?? 0;
+  const rest200 = result?.rest200 ?? result?.restSpent ?? 0;
+  const rest304 = result?.restNotModified ?? 0;
+  return {
+    httpRequests,
+    rest200,
+    rest304,
+    coreUnits: result?.coreUnitsTotal ?? result?.restSpent ?? 0,
+    graphqlUnits: result?.graphqlSpentTotal ?? result?.graphqlSpent ?? 0,
+    failedRequests: result?.failedRequests ?? 0,
+  };
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalJson(value[key])]));
+}
+
+function acquisitionQueryKey(input) {
+  const host = normalizeHost(input?.host);
+  const repositoryId = typeof input?.repositoryId === "string" && input.repositoryId.length > 0
+    ? input.repositoryId : null;
+  const accessKey = typeof input?.accessKey === "string" && input.accessKey.length > 0
+    ? privateIdentityDigest("acquisition-access-v1", input.accessKey) : null;
+  const resource = TAB_KEYS.includes(input?.resource) ? input.resource : null;
+  const queryVersion = Number.isSafeInteger(input?.queryVersion) && input.queryVersion > 0
+    ? input.queryVersion : null;
+  const pageSize = Number.isSafeInteger(input?.pageSize) && input.pageSize > 0 ? input.pageSize : null;
+  const cursorGeneration = typeof input?.cursorGeneration === "string" && input.cursorGeneration.length > 0
+    ? input.cursorGeneration : null;
+  if (!host || !repositoryId || !accessKey || !resource || !queryVersion || !pageSize || !cursorGeneration ||
+      !isRecord(input?.filters ?? {})) return null;
+  return privateIdentityDigest(
+    "query-v1",
+    host,
+    repositoryId,
+    accessKey,
+    resource,
+    String(queryVersion),
+    JSON.stringify(canonicalJson(input.filters ?? {})),
+    String(pageSize),
+    cursorGeneration,
+  );
+}
+
+function acquisitionQueryForTab(key, identity, repository, pages = 1) {
+  if (!TAB_KEYS.includes(key) || !identity?.host || !identity?.accessKey || !repository) return null;
+  const normalizedRepository = repository.toLowerCase();
+  return {
+    host: identity.host,
+    // The admitted owner/name is the conservative identity until GitHub returns
+    // a database ID. Explicit --repo, GH_REPO and an unambiguous remote converge
+    // here; unresolved aliases intentionally remain separate.
+    repositoryId: `slug:${normalizedRepository}`,
+    repository: normalizedRepository,
+    accessKey: identity.accessKey,
+    targetKey: privateIdentityDigest("acquisition-target-v1", identity.host, normalizedRepository),
+    resource: key,
+    queryVersion: key === "actions" ? ACTIONS_QUERY_VERSION : GRAPHQL_QUERY_VERSION,
+    filters: {},
+    pageSize: key === "actions" ? ACTIONS_RUN_LIMIT : key === "security" ? ALERT_PER_PAGE : GRAPHQL_PAGE_SIZE,
+    cursorGeneration: "first",
+    pages,
+  };
+}
+
+function acquisitionAliasKey(host, repository) {
+  return `${normalizeHost(host)}\0${String(repository).toLowerCase()}`;
+}
+
+function normalizeRepositoryIdentity(raw) {
+  if (!isRecord(raw) || typeof raw.id !== "string" || raw.id.length === 0 ||
+      typeof raw.nameWithOwner !== "string" || !REPO_PATTERN.test(raw.nameWithOwner)) return null;
+  return { id: raw.id, nameWithOwner: raw.nameWithOwner.toLowerCase() };
+}
+
+function admitAcquisitionRepositoryIdentity(state, evidence) {
+  const identity = normalizeRepositoryIdentity(evidence?.identity);
+  const host = normalizeHost(evidence?.host);
+  const repository = typeof evidence?.repository === "string" ? evidence.repository.toLowerCase() : null;
+  const source = state.queries[evidence?.queryKey];
+  if (!identity || !host || !repository || !source || source.query.host !== host) {
+    return { ok: false, reason: "invalid" };
+  }
+  const targetKey = privateIdentityDigest("acquisition-target-v1", host, identity.id);
+  const canonicalQuery = {
+    ...source.query,
+    repositoryId: identity.id,
+    repository: identity.nameWithOwner,
+    targetKey,
+  };
+  canonicalQuery.queryKey = acquisitionQueryKey(canonicalQuery);
+  const related = Object.entries(state.queries).filter(([key, record]) => {
+    if (key === canonicalQuery.queryKey || key === evidence.queryKey) return true;
+    const knownId = state.aliases[acquisitionAliasKey(host, record.query.repository)];
+    if (record.query.host !== host ||
+        record.query.repositoryId !== identity.id && record.query.repository !== identity.nameWithOwner &&
+          knownId !== identity.id) return false;
+    return acquisitionQueryKey({
+      ...record.query,
+      repositoryId: identity.id,
+      repository: identity.nameWithOwner,
+      targetKey,
+    }) === canonicalQuery.queryKey;
+  });
+  const generation = Math.max(...related.map(([, record]) => record.generation));
+  const claimed = related.map(([, record]) => record.claim)
+    .find((claim) => claim?.nonce === evidence.claimNonce);
+  if (!claimed) return { ok: false, reason: "stale" };
+  const snapshotRecord = related.map(([, record]) => record)
+    .filter((record) => record.snapshot)
+    .sort((left, right) => right.snapshot.lastSuccessAt - left.snapshot.lastSuccessAt ||
+      right.generation - left.generation)[0] ?? null;
+  const snapshot = snapshotRecord?.snapshot
+    ? { ...snapshotRecord.snapshot, queryKey: canonicalQuery.queryKey, generation }
+    : null;
+  const merged = {
+    query: canonicalQuery,
+    generation,
+    claim: { ...claimed, generation: generation + 1 },
+    snapshot,
+    hold: related.map(([, record]) => record.hold).find(Boolean) ?? null,
+    lastUsedAt: Math.max(...related.map(([, record]) => record.lastUsedAt)),
+  };
+  const remapped = {};
+  const relatedByKey = new Map(related);
+  for (const [oldKey, record] of related) {
+    state.aliases[acquisitionAliasKey(host, record.query.repository)] = identity.id;
+    if (oldKey !== canonicalQuery.queryKey) remapped[oldKey] = canonicalQuery.queryKey;
+    delete state.queries[oldKey];
+  }
+  for (const subscription of Object.values(state.subscriptions)) {
+    const oldRecord = relatedByKey.get(subscription.queryKey);
+    if (!oldRecord) continue;
+    const unsatisfied = subscription.requestedGeneration > oldRecord.generation;
+    subscription.queryKey = canonicalQuery.queryKey;
+    subscription.requestedGeneration = unsatisfied ? merged.claim.generation : generation;
+    if (subscription.waitingGeneration !== null) {
+      subscription.waitingGeneration = merged.claim.generation;
+    }
+  }
+  state.aliases[acquisitionAliasKey(host, repository)] = identity.id;
+  state.aliases[acquisitionAliasKey(host, identity.nameWithOwner)] = identity.id;
+  state.queries[canonicalQuery.queryKey] = merged;
+  return { ok: true, remapped, generation: merged.claim.generation };
+}
+
+function normalizeAcquisitionDemand(raw) {
+  if (!isRecord(raw)) return null;
+  const active = raw.active === true;
+  const floorMs = Number.isFinite(raw.floorMs) && raw.floorMs >= MIN_REFRESH_SECONDS * 1000
+    ? raw.floorMs : null;
+  const pages = raw.pages === undefined ? 1 : raw.pages;
+  if (floorMs === null || !Number.isSafeInteger(pages) || pages < 1 || pages > 3) return null;
+  return { active, floorMs, pages };
+}
+
+function normalizeAcquisitionQuery(raw) {
+  if (!isRecord(raw)) return null;
+  const queryKey = acquisitionQueryKey(raw);
+  if (!queryKey || raw.queryKey !== queryKey || typeof raw.repository !== "string" ||
+      typeof raw.targetKey !== "string" || raw.targetKey.length === 0) return null;
+  return {
+    queryKey,
+    host: normalizeHost(raw.host),
+    repositoryId: raw.repositoryId,
+    repository: safe(raw.repository),
+    accessKey: raw.accessKey,
+    targetKey: raw.targetKey,
+    resource: raw.resource,
+    queryVersion: raw.queryVersion,
+    filters: canonicalJson(raw.filters ?? {}),
+    pageSize: raw.pageSize,
+    cursorGeneration: raw.cursorGeneration,
+  };
+}
+
+function sanitizeAcquisitionJson(value, depth = 0) {
+  if (depth > 8) return null;
+  if (value === null || typeof value === "boolean" || Number.isFinite(value)) return value;
+  if (typeof value === "string") return safe(value);
+  if (Array.isArray(value)) {
+    if (value.length > ACQUISITION_MAX_ENTITIES) return null;
+    const items = value.map((item) => sanitizeAcquisitionJson(item, depth + 1));
+    return items.some((item, index) => item === null && value[index] !== null) ? null : items;
+  }
+  if (!isRecord(value) || Object.keys(value).length > 64) return null;
+  const result = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key.length > 100 || ["__proto__", "constructor", "prototype"].includes(key)) return null;
+    const sanitized = sanitizeAcquisitionJson(item, depth + 1);
+    if (sanitized === null && item !== null) return null;
+    result[key] = sanitized;
+  }
+  return result;
+}
+
+function normalizeAcquisitionEntity(raw, resource) {
+  if (!isRecord(raw) || typeof raw.key !== "string" || raw.key.length === 0 ||
+      typeof raw.etag !== "string" || raw.etag.length === 0 || typeof raw.body !== "string") return null;
+  if (!raw.key.startsWith(`${resource}\0`) || raw.key.length > 2_048 || raw.etag.length > 1_024 ||
+      Buffer.byteLength(raw.body) > ACQUISITION_MAX_ENTITY_BYTES) return null;
+  let parsed;
+  try { parsed = JSON.parse(raw.body); } catch { return null; }
+  const sanitized = sanitizeAcquisitionJson(parsed);
+  if (sanitized === null) return null;
+  const body = JSON.stringify(sanitized);
+  if (Buffer.byteLength(body) > ACQUISITION_MAX_ENTITY_BYTES) return null;
+  return { key: raw.key, etag: safe(raw.etag), body };
+}
+
+function normalizeAcquisitionPageInfo(raw) {
+  if (raw === null) return null;
+  if (!isRecord(raw) || Object.keys(raw).some((key) => !["loadedPages", "hasNextPage"].includes(key)) ||
+      !Number.isSafeInteger(raw.loadedPages) || raw.loadedPages < 1 || raw.loadedPages > 3 ||
+      typeof raw.hasNextPage !== "boolean") return null;
+  return { loadedPages: raw.loadedPages, hasNextPage: raw.hasNextPage };
+}
+
+function normalizeAcquisitionCapabilities(raw) {
+  if (!isRecord(raw) || Object.keys(raw).length > ALERT_SOURCES.length) return null;
+  const result = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!ALERT_SOURCES.some((source) => source.key === key) || !isRecord(value) ||
+        value.verdict !== "unavailable" || !Number.isFinite(value.until) ||
+        !Number.isSafeInteger(value.step) || value.step < 0 || value.step >= BACKOFF_STEPS_MS.length ||
+        typeof value.note !== "string") return null;
+    result[key] = { verdict: value.verdict, until: value.until, step: value.step, note: safe(value.note) };
+  }
+  return result;
+}
+
+function normalizeAcquisitionSnapshot(raw, query, generation, producerEpoch) {
+  if (!isRecord(raw) || !Array.isArray(raw.rows) || !Array.isArray(raw.entities) ||
+      !Number.isFinite(raw.lastSuccessAt) || !Number.isFinite(raw.lastChangedAt) ||
+      !Number.isFinite(raw.nextDueAt) || raw.lastChangedAt > raw.lastSuccessAt ||
+      raw.raw !== undefined && typeof raw.raw !== "string" || !isRecord(raw.capabilities ?? {}) ||
+      !isRecord(raw.meta) || !Number.isFinite(raw.meta.at) || typeof raw.meta.truncated !== "boolean" ||
+      !Array.isArray(raw.securityNotes) || typeof raw.securityBlind !== "boolean") return null;
+  const rows = raw.rows.map((row) => normalizeCachedItem(query.resource, row));
+  const entities = raw.entities.map((entity) => normalizeAcquisitionEntity(entity, query.resource));
+  if (rows.some((row) => row === null) || entities.some((entity) => entity === null)) return null;
+  const pageInfo = normalizeAcquisitionPageInfo(raw.pageInfo);
+  if (raw.pageInfo !== null && pageInfo === null) return null;
+  if (raw.hold !== null) return null;
+  const capabilities = normalizeAcquisitionCapabilities(raw.capabilities ?? {});
+  if (capabilities === null || query.resource !== "security" && Object.keys(capabilities).length > 0) return null;
+  const content = JSON.stringify(rows);
+  const contentDigest = createHash("sha256").update(content).digest("hex");
+  if (raw.raw === undefined && raw.contentDigest !== contentDigest) return null;
+  return {
+    schema: 1,
+    producerEpoch,
+    queryKey: query.queryKey,
+    generation,
+    rows,
+    pageInfo,
+    raw: content,
+    contentDigest,
+    entities,
+    lastSuccessAt: raw.lastSuccessAt,
+    lastChangedAt: raw.lastChangedAt,
+    nextDueAt: raw.nextDueAt,
+    hold: null,
+    capabilities,
+    meta: { at: raw.meta.at, truncated: raw.meta.truncated },
+    securityNotes: raw.securityNotes.filter((note) => typeof note === "string").map(safe),
+    securityBlind: raw.securityBlind,
+  };
+}
+
+function acquisitionSnapshotRoot(path) {
+  return `${path}.snapshots`;
+}
+
+function normalizeAcquisitionSnapshotRef(raw, queryKey, generation) {
+  if (!isRecord(raw) || raw.generation !== generation ||
+      typeof raw.artifact !== "string" ||
+      raw.artifact !== `${queryKey}.${generation}.${raw.digest}.json` ||
+      typeof raw.digest !== "string" || !/^[a-f0-9]{64}$/.test(raw.digest) ||
+      !Number.isSafeInteger(raw.bytes) || raw.bytes < 1 || raw.bytes > ACQUISITION_MAX_BYTES ||
+      !Number.isSafeInteger(raw.entityCount) || raw.entityCount < 0 ||
+      raw.entityCount > ACQUISITION_MAX_ENTITIES ||
+      typeof raw.contentDigest !== "string" || !/^[a-f0-9]{64}$/.test(raw.contentDigest) ||
+      !Number.isFinite(raw.lastSuccessAt) || !Number.isFinite(raw.lastChangedAt) ||
+      !Number.isFinite(raw.nextDueAt)) return null;
+  return { ...raw };
+}
+
+function acquisitionSnapshotPayload(snapshot) {
+  const payload = { ...snapshot };
+  delete payload.raw;
+  return payload;
+}
+
+function prepareAcquisitionSnapshot(queryKey, snapshot) {
+  const payload = JSON.stringify(acquisitionSnapshotPayload(snapshot));
+  const bytes = Buffer.byteLength(payload);
+  const digest = createHash("sha256").update(payload).digest("hex");
+  return {
+    payload,
+    descriptor: {
+      artifact: `${queryKey}.${snapshot.generation}.${digest}.json`,
+      generation: snapshot.generation,
+      digest,
+      bytes,
+      entityCount: snapshot.entities.length,
+      contentDigest: snapshot.contentDigest,
+      lastSuccessAt: snapshot.lastSuccessAt,
+      lastChangedAt: snapshot.lastChangedAt,
+      nextDueAt: snapshot.nextDueAt,
+    },
+  };
+}
+
+function normalizeAcquisitionStore(raw) {
+  if (!isRecord(raw) || raw.version !== ACQUISITION_STORE_VERSION || !validGovernorId(raw.producerEpoch) ||
+      !isRecord(raw.subscriptions) || !isRecord(raw.queries) || !isRecord(raw.aliases)) return null;
+  const state = {
+    version: ACQUISITION_STORE_VERSION,
+    producerEpoch: raw.producerEpoch,
+    metrics: normalizeAcquisitionMetrics(raw.metrics),
+    uncertainReceipts: {},
+    subscriptions: {},
+    queries: {},
+    aliases: {},
+  };
+  if (state.metrics === null) return null;
+  const receipts = raw.uncertainReceipts ?? {};
+  if (!isRecord(receipts) || Object.keys(receipts).length > ACQUISITION_MAX_UNCERTAIN_RECEIPTS) return null;
+  for (const [id, receipt] of Object.entries(receipts)) {
+    const normalized = normalizeAcquisitionReceipt(receipt, id);
+    if (!normalized) return null;
+    state.uncertainReceipts[id] = normalized;
+  }
+  if (raw.uncertainReceipts !== undefined) {
+    const outstanding = Object.values(state.uncertainReceipts).reduce((total, receipt) => {
+      total[receipt.resource] += receipt.units;
+      return total;
+    }, { core: 0, graphql: 0 });
+    if (state.metrics.uncertainCoreUnits !== outstanding.core ||
+        state.metrics.uncertainGraphqlUnits !== outstanding.graphql) return null;
+  }
+  for (const [key, value] of Object.entries(raw.aliases)) {
+    if (typeof key !== "string" || typeof value !== "string") return null;
+    state.aliases[key] = value;
+  }
+  for (const [key, value] of Object.entries(raw.queries)) {
+    if (!isRecord(value)) return null;
+    const query = normalizeAcquisitionQuery(value.query);
+    if (!query || key !== query.queryKey || !Number.isSafeInteger(value.generation) || value.generation < 0 ||
+        !Number.isFinite(value.lastUsedAt)) return null;
+    let claim = null;
+    if (value.claim !== null) {
+      const candidate = value.claim;
+      if (!isRecord(candidate) || !Number.isSafeInteger(candidate.pid) || candidate.pid <= 0 ||
+          !validGovernorId(candidate.nonce) || !Number.isSafeInteger(candidate.generation) ||
+          candidate.generation !== value.generation + 1 || !Number.isFinite(candidate.claimedAt) ||
+          !Number.isFinite(candidate.leaseUntil) || candidate.leaseUntil < candidate.claimedAt ||
+          typeof candidate.started !== "boolean") return null;
+      const hasReceiptIds = Object.hasOwn(candidate, "receiptIds");
+      const receiptIds = candidate.receiptIds ?? [];
+      if (!Array.isArray(receiptIds) || receiptIds.some((id) => typeof id !== "string" ||
+          !state.uncertainReceipts[id])) return null;
+      claim = { ...candidate, ...(hasReceiptIds ? { receiptIds } : {}) };
+    }
+    const snapshot = value.snapshot === null ? null
+      : value.snapshot?.artifact
+        ? normalizeAcquisitionSnapshotRef(value.snapshot, query.queryKey, value.generation)
+        : normalizeAcquisitionSnapshot(value.snapshot, query, value.generation, raw.producerEpoch);
+    if (value.snapshot !== null && !snapshot) return null;
+    const hold = normalizeAcquisitionHold(value.hold);
+    if (value.hold !== undefined && value.hold !== null && hold === null) return null;
+    state.queries[key] = { query, generation: value.generation, claim, snapshot, hold, lastUsedAt: value.lastUsedAt };
+  }
+  for (const [id, value] of Object.entries(raw.subscriptions)) {
+    const demand = normalizeAcquisitionDemand(value?.demand);
+    const record = state.queries[value?.queryKey];
+    const requestedGeneration = value?.requestedGeneration === undefined
+      ? record?.generation
+      : value.requestedGeneration;
+    if (!validGovernorId(id) || !isRecord(value) || !Number.isSafeInteger(value.pid) || value.pid <= 0 ||
+        !validGovernorId(value.nonce) || !record || !demand ||
+        !Number.isSafeInteger(requestedGeneration) || requestedGeneration < 0 ||
+        requestedGeneration > record.generation + 1 ||
+        !Number.isFinite(value.expiresAt) || !Number.isFinite(value.lastSeenAt)) return null;
+    const waitingGeneration = value.waitingGeneration ?? null;
+    const waitingSinceAt = value.waitingSinceAt ?? null;
+    if (waitingGeneration !== null && (!Number.isSafeInteger(waitingGeneration) ||
+        waitingGeneration < 1 || waitingGeneration > record.generation + 1 ||
+        !Number.isFinite(waitingSinceAt))) return null;
+    if (waitingGeneration === null && waitingSinceAt !== null) return null;
+    state.subscriptions[id] = {
+      ...value,
+      demand,
+      requestedGeneration,
+      waitingGeneration,
+      waitingSinceAt,
+    };
+  }
+  if (Object.keys(state.subscriptions).length > ACQUISITION_MAX_SUBSCRIPTIONS ||
+      Object.keys(state.queries).length > ACQUISITION_MAX_ENTITIES) return null;
+  return state;
+}
+
+function loadAcquisitionMetadata(path) {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    const value = normalizeAcquisitionStore(parsed);
+    return value ? { ok: true, value } : { ok: false, reason: "corrupt" };
+  } catch (error) {
+    return error?.code === "ENOENT"
+      ? { ok: true, value: emptyAcquisitionStore(), missing: true }
+      : { ok: false, reason: "corrupt", error };
+  }
+}
+
+function readAcquisitionSnapshot(path, record) {
+  if (!record?.snapshot) return { ok: true, value: null };
+  if (Array.isArray(record.snapshot.rows)) return { ok: true, value: record.snapshot };
+  try {
+    const raw = readFileSync(join(acquisitionSnapshotRoot(path), record.snapshot.artifact), "utf8");
+    if (Buffer.byteLength(raw) !== record.snapshot.bytes ||
+        createHash("sha256").update(raw).digest("hex") !== record.snapshot.digest) {
+      return { ok: false, reason: "corrupt" };
+    }
+    const parsed = JSON.parse(raw);
+    const snapshot = normalizeAcquisitionSnapshot(
+      parsed, record.query, record.generation, parsed.producerEpoch,
+    );
+    return snapshot ? { ok: true, value: snapshot } : { ok: false, reason: "corrupt" };
+  } catch (error) {
+    return { ok: false, reason: "corrupt", error };
+  }
+}
+
+function hydrateAcquisitionStore(path, state) {
+  for (const record of Object.values(state.queries)) {
+    const loaded = readAcquisitionSnapshot(path, record);
+    if (!loaded.ok) return loaded;
+    record.snapshot = loaded.value;
+  }
+  return { ok: true, value: state };
+}
+
+function loadAcquisitionStore(path) {
+  const loaded = loadAcquisitionMetadata(path);
+  return loaded.ok ? hydrateAcquisitionStore(path, loaded.value) : loaded;
+}
+
+function writeAcquisitionArtifact(root, artifact, payload) {
+  let tempPath = null;
+  try {
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    if (process.platform !== "win32") chmodSync(root, 0o700);
+    acquisitionTempSequence += 1;
+    const path = join(root, artifact);
+    tempPath = `${path}.${process.pid}.${Date.now()}.${acquisitionTempSequence}.tmp`;
+    writeFileSync(tempPath, payload, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    renameSync(tempPath, path);
+    return { ok: true };
+  } catch (error) {
+    if (tempPath !== null) {
+      try { unlinkSync(tempPath); } catch { /* exact operation-owned path */ }
+    }
+    return { ok: false, reason: "unwritable", error };
+  }
+}
+
+function writeAcquisitionStore(path, state) {
+  const persisted = { ...state, queries: {} };
+  const staged = [];
+  let snapshotBytes = 0;
+  for (const [queryKey, record] of Object.entries(state.queries)) {
+    let snapshot = record.snapshot;
+    if (snapshot && Array.isArray(snapshot.rows)) {
+      const prepared = prepareAcquisitionSnapshot(queryKey, snapshot);
+      if (prepared.descriptor.bytes > ACQUISITION_MAX_BYTES) return { ok: false, reason: "capacity" };
+      staged.push(prepared);
+      snapshot = prepared.descriptor;
+    }
+    snapshotBytes += snapshot?.bytes ?? 0;
+    persisted.queries[queryKey] = { ...record, snapshot };
+  }
+  const payload = `${JSON.stringify(persisted)}\n`;
+  if (Buffer.byteLength(payload) + snapshotBytes > ACQUISITION_MAX_BYTES) {
+    return { ok: false, reason: "capacity" };
+  }
+  const parent = dirname(path);
+  let tempPath = null;
+  try {
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    if (process.platform !== "win32") chmodSync(parent, 0o700);
+    const snapshotRoot = acquisitionSnapshotRoot(path);
+    for (const prepared of staged) {
+      const written = writeAcquisitionArtifact(snapshotRoot, prepared.descriptor.artifact, prepared.payload);
+      if (!written.ok) return written;
+    }
+    acquisitionTempSequence += 1;
+    tempPath = `${path}.${process.pid}.${Date.now()}.${acquisitionTempSequence}.tmp`;
+    writeFileSync(tempPath, payload, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    renameSync(tempPath, path);
+    const retained = new Set(Object.values(persisted.queries)
+      .map((record) => record.snapshot?.artifact).filter(Boolean));
+    try {
+      for (const artifact of readdirSync(snapshotRoot)) {
+        if (!retained.has(artifact)) {
+          try { unlinkSync(join(snapshotRoot, artifact)); } catch { /* exact private artifact */ }
+        }
+      }
+    } catch { /* no snapshot directory yet */ }
+    return { ok: true, persisted };
+  } catch (error) {
+    if (tempPath !== null) {
+      try { unlinkSync(tempPath); } catch { /* exact operation-owned path */ }
+    }
+    return { ok: false, reason: "unwritable", error };
+  }
+}
+
+function acquisitionLockOwner(path) {
+  const owner = lockOwner(path);
+  return owner && validGovernorId(owner.nonce) ? owner : null;
+}
+
+function withAcquisitionStore(path, operation, {
+  now = Date.now(),
+  pid = process.pid,
+  kill = process.kill.bind(process),
+} = {}) {
+  const lockPath = `${path}.lock`;
+  const nonce = governorId();
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      writeFileSync(lockPath, JSON.stringify({ pid, nonce }), { encoding: "utf8", mode: 0o600, flag: "wx" });
+      break;
+    } catch (error) {
+      if (error?.code !== "EEXIST") return { ok: false, reason: "unwritable", error };
+      const owner = acquisitionLockOwner(lockPath);
+      // Another process can observe the lock file between its exclusive create
+      // and completed JSON write. Treat an unreadable owner as contention; it
+      // cannot authorize stealing and must not turn a healthy race into a
+      // corrupt-store verdict.
+      if (!owner || !pidIsDead(owner.pid, kill)) return { ok: false, reason: "busy" };
+      const abandoned = `${lockPath}.dead-${owner.nonce}`;
+      try { renameSync(lockPath, abandoned); } catch { continue; }
+      try { unlinkSync(abandoned); } catch { /* exact quarantined path */ }
+    }
+  }
+  if (acquisitionLockOwner(lockPath)?.nonce !== nonce) return { ok: false, reason: "busy" };
+  try {
+    const loaded = loadAcquisitionMetadata(path, { now });
+    if (!loaded.ok) return loaded;
+    const result = operation(loaded.value);
+    if (result?.ok === false) return result;
+    if (result?.changed === false) {
+      return { ok: true, value: result?.value, state: loaded.value, written: false };
+    }
+    const written = writeAcquisitionStore(path, loaded.value);
+    return written.ok ? { ok: true, value: result?.value, state: written.persisted, written: true } : written;
+  } finally {
+    if (acquisitionLockOwner(lockPath)?.nonce === nonce) {
+      try { unlinkSync(lockPath); } catch { /* exact owned lock */ }
+    }
+  }
+}
+
+function acquisitionOwnerStatus(pid, kill) {
+  try {
+    kill(pid, 0);
+    return "live";
+  } catch (error) {
+    if (error?.code === "ESRCH") return "dead";
+    return "unknown";
+  }
+}
+
+function reapAcquisitionSubscriptions(state, at, kill) {
+  let removed = 0;
+  for (const [id, subscription] of Object.entries(state.subscriptions)) {
+    if (subscription.expiresAt > at || acquisitionOwnerStatus(subscription.pid, kill) !== "dead") continue;
+    delete state.subscriptions[id];
+    removed += 1;
+  }
+  return removed;
+}
+
+function aggregateAcquisitionDemand(state, queryKey) {
+  const demand = Object.values(state.subscriptions)
+    .filter((subscription) => subscription.queryKey === queryKey)
+    .map((subscription) => subscription.demand);
+  if (demand.length === 0) return null;
+  return {
+    active: demand.some((value) => value.active),
+    floorMs: Math.min(...demand.map((value) => value.floorMs)),
+    pages: Math.max(...demand.map((value) => value.pages)),
+  };
+}
+
+function acquisitionSharingCount(state, queryKey) {
+  return Object.values(state.subscriptions)
+    .filter((subscription) => subscription.queryKey === queryKey).length;
+}
+
+function trimAcquisitionStore(state, protectedQueryKey = null) {
+  const pinned = new Set(Object.values(state.subscriptions).map((subscription) =>
+    state.queries[subscription.queryKey]?.query.targetKey).filter(Boolean));
+  const targets = new Map();
+  const entries = Object.entries(state.queries).map(([key, query]) => {
+    const prepared = query.snapshot && Array.isArray(query.snapshot.rows)
+      ? prepareAcquisitionSnapshot(key, query.snapshot) : null;
+    const snapshotBytes = prepared?.descriptor.bytes ?? query.snapshot?.bytes ?? 0;
+    const entityCount = prepared?.descriptor.entityCount ?? query.snapshot?.entityCount ?? 0;
+    const metadataRecord = { ...query, snapshot: prepared?.descriptor ?? query.snapshot };
+    const metadataBytes = Buffer.byteLength(JSON.stringify([key, metadataRecord]));
+    targets.set(query.query.targetKey, (targets.get(query.query.targetKey) ?? 0) + 1);
+    return { key, query, snapshotBytes, entityCount, metadataBytes };
+  });
+  let queryCount = entries.length;
+  let entityCount = entries.reduce((total, entry) => total + entry.entityCount, 0);
+  let byteCount = Buffer.byteLength(JSON.stringify({
+    version: state.version,
+    producerEpoch: state.producerEpoch,
+    subscriptions: state.subscriptions,
+    queries: {},
+    aliases: state.aliases,
+  })) + entries.reduce((total, entry) => total + entry.metadataBytes + entry.snapshotBytes, 0);
+  const over = () => queryCount > ACQUISITION_MAX_ENTITIES ||
+    targets.size > ACQUISITION_MAX_LIVE_TARGETS ||
+    entityCount > ACQUISITION_MAX_ENTITIES || byteCount > ACQUISITION_MAX_BYTES;
+  const evictable = entries.filter(({ key, query }) =>
+    !pinned.has(query.query.targetKey) && key !== protectedQueryKey)
+    .sort((left, right) => left.query.lastUsedAt - right.query.lastUsedAt);
+  for (const entry of evictable) {
+    if (!over()) break;
+    const { key, query, snapshotBytes, entityCount: removedEntities, metadataBytes } = entry;
+    delete state.queries[key];
+    queryCount -= 1;
+    entityCount -= removedEntities;
+    byteCount -= metadataBytes + snapshotBytes;
+    const remainingForTarget = targets.get(query.query.targetKey) - 1;
+    if (remainingForTarget === 0) targets.delete(query.query.targetKey);
+    else targets.set(query.query.targetKey, remainingForTarget);
+  }
+  return !over();
+}
+
+async function runStartedAcquisitionTransport(markStarted, transport) {
+  const started = await markStarted();
+  if (!started.ok) return started;
+  return { ok: true, value: await transport() };
+}
+
+function createAcquisitionEngine({
+  pathOptions = {},
+  transport = null,
+  storage = null,
+  now = Date.now,
+  createId = governorId,
+  pid = process.pid,
+  kill = process.kill.bind(process),
+  setInterval: setInterval_ = setInterval,
+  clearInterval: clearInterval_ = clearInterval,
+} = {}) {
+  const path = acquisitionStorePath(pathOptions);
+  const local = new Map();
+  let closed = false;
+  let closing = false;
+  let timer = null;
+
+  const transact = (operation, options = {}) => {
+    if (closed) return { ok: false, reason: "closed" };
+    return storage?.transact
+      ? storage.transact(operation, { now: now(), pid, kill, path, ...options })
+      : withAcquisitionStore(path, operation, { now: now(), pid, kill, ...options });
+  };
+  const load = () => storage?.load
+    ? storage.load({ now: now(), path })
+    : loadAcquisitionMetadata(path);
+
+  function loadRecordSnapshot(record) {
+    return storage ? { ok: true, value: record?.snapshot ?? null } : readAcquisitionSnapshot(path, record);
+  }
+
+  function releaseDetachedLocal(id, item) {
+    if (item.detached && item.claimNonce === null && !item.cleanupPending) local.delete(id);
+  }
+
+  function remapLocalQueries(remapped = {}) {
+    for (const item of local.values()) item.queryKey = remapped[item.queryKey] ?? item.queryKey;
+  }
+
+  function deliver(id, record) {
+    const item = local.get(id);
+    if (!item || item.detached || !record?.snapshot || item.generation === record.generation) {
+      return { ok: true, value: false };
+    }
+    const loaded = loadRecordSnapshot(record);
+    if (!loaded.ok) return loaded;
+    item.generation = record.generation;
+    try { item.callback?.(loaded.value); } catch { /* subscriber callback is isolated */ }
+    return { ok: true, value: true, snapshot: loaded.value };
+  }
+
+  function deliverQuerySnapshot(queryKey, snapshot) {
+    for (const [id, item] of local) {
+      if (item.queryKey !== queryKey || item.detached || item.generation === snapshot.generation) continue;
+      item.generation = snapshot.generation;
+      try { item.callback?.(snapshot); } catch { /* subscriber callback is isolated */ }
+      releaseDetachedLocal(id, item);
+    }
+  }
+
+  function inspect(id = null) {
+    const loaded = load();
+    if (!loaded.ok) return loaded;
+    const ids = id === null ? [...local.keys()] : [id];
+    for (const subscriberId of ids) {
+      const item = local.get(subscriberId);
+      const shared = loaded.value.subscriptions[subscriberId];
+      if (item && shared?.nonce === item.nonce) item.queryKey = shared.queryKey;
+      if (item) {
+        const delivered = deliver(subscriberId, loaded.value.queries[item.queryKey]);
+        if (!delivered.ok) return delivered;
+      }
+    }
+    if (id === null) return loaded;
+    const item = local.get(id);
+    if (!item) return { ok: false, reason: "stale" };
+    const record = loaded.value.queries[item.queryKey] ?? null;
+    if (!record?.snapshot) return { ok: true, value: record };
+    const snapshot = loadRecordSnapshot(record);
+    return snapshot.ok ? { ok: true, value: { ...record, snapshot: snapshot.value } } : snapshot;
+  }
+
+  function heartbeat() {
+    if (closed || local.size === 0) return;
+    const at = now();
+    const heartbeatResult = transact((state) => {
+      let changed = reapAcquisitionSubscriptions(state, at, kill) > 0;
+      for (const [id, item] of local) {
+        const subscription = state.subscriptions[id];
+        if (subscription?.nonce === item.nonce) {
+          if (subscription.lastSeenAt !== at || subscription.expiresAt !== at + ACQUISITION_CLAIM_TTL_MS) {
+            subscription.lastSeenAt = at;
+            subscription.expiresAt = at + ACQUISITION_CLAIM_TTL_MS;
+            changed = true;
+          }
+        }
+        const query = state.queries[item.queryKey];
+        if (query?.claim?.pid === pid && query.claim.nonce === item.claimNonce &&
+            query.claim.leaseUntil !== at + ACQUISITION_CLAIM_TTL_MS) {
+          query.claim.leaseUntil = at + ACQUISITION_CLAIM_TTL_MS;
+          changed = true;
+        }
+      }
+      return { changed, value: true };
+    });
+    if (heartbeatResult.ok) {
+      for (const [id, item] of local) deliver(id, heartbeatResult.state.queries[item.queryKey]);
+    }
+    for (const [id, item] of local) {
+      retryPending(id, item);
+    }
+    for (const [id, item] of [...local]) {
+      if (item.cleanupPending) unsubscribe(id);
+    }
+    finishClose();
+  }
+
+  function ensureTimer() {
+    if (timer !== null) return;
+    let heartbeatAt = now() + ACQUISITION_HEARTBEAT_MS;
+    timer = setInterval_(() => {
+      if (now() >= heartbeatAt) {
+        heartbeatAt = now() + ACQUISITION_HEARTBEAT_MS;
+        heartbeat();
+      } else {
+        inspect();
+      }
+    }, ACQUISITION_INSPECT_MS);
+    timer?.unref?.();
+  }
+
+  function subscribe(queryInput, demandInput, callback = null, { resumeFreshSnapshot = false } = {}) {
+    if (closing) return { ok: false, reason: "closed" };
+    const demand = normalizeAcquisitionDemand(demandInput);
+    const preliminaryKey = acquisitionQueryKey(queryInput);
+    if (!preliminaryKey || !demand || callback !== null && typeof callback !== "function" ||
+        typeof resumeFreshSnapshot !== "boolean") {
+      return { ok: false, reason: "invalid" };
+    }
+    const id = createId("acquisition-subscription", preliminaryKey, local.size);
+    const nonce = createId("acquisition-subscription-nonce", preliminaryKey, local.size);
+    const result = transact((state) => {
+      reapAcquisitionSubscriptions(state, now(), kill);
+      const repositoryId = state.aliases[acquisitionAliasKey(queryInput.host, queryInput.repository)] ??
+        queryInput.repositoryId;
+      const queryKey = acquisitionQueryKey({ ...queryInput, repositoryId });
+      const query = queryKey ? normalizeAcquisitionQuery({ ...queryInput, repositoryId, queryKey }) : null;
+      if (!query) return { ok: false, reason: "invalid" };
+      if (Object.keys(state.subscriptions).length >= ACQUISITION_MAX_SUBSCRIPTIONS) {
+        return { ok: false, reason: "capacity" };
+      }
+      const liveTargets = new Set(Object.values(state.subscriptions).map((subscription) =>
+        state.queries[subscription.queryKey]?.query.targetKey).filter(Boolean));
+      if (!liveTargets.has(query.targetKey) && liveTargets.size >= ACQUISITION_MAX_LIVE_TARGETS) {
+        return { ok: false, reason: "capacity" };
+      }
+      const existingQuery = state.queries[queryKey];
+      state.queries[queryKey] ??= {
+        query,
+        generation: 0,
+        claim: null,
+        snapshot: null,
+        hold: null,
+        lastUsedAt: now(),
+      };
+      if (!trimAcquisitionStore(state, queryKey)) {
+        if (!existingQuery) delete state.queries[queryKey];
+        return { ok: false, reason: "capacity" };
+      }
+      const queryRecord = state.queries[queryKey];
+      const requestedGeneration = queryRecord.claim?.generation ??
+        (resumeFreshSnapshot && queryRecord.snapshot?.nextDueAt > now()
+          ? queryRecord.generation : queryRecord.generation + 1);
+      state.subscriptions[id] = {
+        pid,
+        nonce,
+        queryKey,
+        demand,
+        requestedGeneration,
+        waitingGeneration: null,
+        waitingSinceAt: null,
+        lastSeenAt: now(),
+        expiresAt: now() + ACQUISITION_CLAIM_TTL_MS,
+      };
+      state.queries[queryKey].lastUsedAt = now();
+      if (existingQuery?.snapshot) acquisitionMetricState(state).cacheHits += 1;
+      return { value: { id, queryKey, snapshot: state.queries[queryKey].snapshot } };
+    });
+    if (!result.ok) return result;
+    const record = result.state.queries[result.value.queryKey];
+    const loadedSnapshot = loadRecordSnapshot(record);
+    if (!loadedSnapshot.ok) return loadedSnapshot;
+    result.value.snapshot = loadedSnapshot.value;
+    local.set(id, { nonce, queryKey: result.value.queryKey, callback, generation: record?.generation ?? 0,
+      claimNonce: null, pending: null });
+    ensureTimer();
+    return result;
+  }
+
+  function updateDemand(id, demandInput) {
+    const demand = normalizeAcquisitionDemand(demandInput);
+    const item = local.get(id);
+    if (!item || item.detached || closing || !demand) return { ok: false, reason: "invalid" };
+    const result = transact((state) => {
+      const reaped = reapAcquisitionSubscriptions(state, now(), kill);
+      const subscription = state.subscriptions[id];
+      if (!subscription || subscription.nonce !== item.nonce) return { ok: false, reason: "stale" };
+      const unchanged = subscription.demand.active === demand.active &&
+        subscription.demand.floorMs === demand.floorMs && subscription.demand.pages === demand.pages;
+      if (!unchanged) subscription.demand = demand;
+      return { changed: reaped > 0 || !unchanged, value: { queryKey: subscription.queryKey,
+        demand: aggregateAcquisitionDemand(state, subscription.queryKey) } };
+    });
+    if (result.ok) item.queryKey = result.value.queryKey;
+    return result;
+  }
+
+  function publish(id, claim, produced) {
+    const item = local.get(id);
+    if (!item || !isRecord(claim)) return { ok: false, reason: "invalid" };
+    const committed = transact((state) => {
+      let record = state.queries[item.queryKey];
+      if (!record || record.claim?.nonce !== claim.nonce ||
+          record.claim.generation !== claim.generation || record.query.accessKey !== claim.accessKey) {
+        return { value: { ok: false, reason: "stale", definitive: true } };
+      }
+      let remapped = {};
+      let effectiveClaim = claim;
+      if (produced?.repositoryIdentity !== undefined) {
+        const admitted = admitAcquisitionRepositoryIdentity(state, {
+          host: record.query.host,
+          repository: record.query.repository,
+          identity: produced.repositoryIdentity,
+          queryKey: item.queryKey,
+          claimNonce: claim.nonce,
+        });
+        if (!admitted.ok) {
+          return admitted.reason === "stale"
+            ? { value: { ok: false, reason: "stale", definitive: true } }
+            : admitted;
+        }
+        remapped = admitted.remapped;
+        record = state.queries[remapped[item.queryKey] ?? item.queryKey];
+        effectiveClaim = { ...claim, generation: admitted.generation };
+      }
+      const requestMetrics = produced?.requestMetrics === undefined
+        ? {}
+        : normalizeAcquisitionMetrics(produced.requestMetrics, { partial: true });
+      const receiptInputs = produced?.uncertainReceipts ?? [];
+      const receipts = Array.isArray(receiptInputs)
+        ? receiptInputs.map((receipt) => normalizeAcquisitionReceipt(receipt)) : null;
+      const receiptsValid = receipts && !receipts.includes(null) &&
+        receipts.every((receipt) => receipt.accessKey === record.query.accessKey);
+      const loadedPrevious = loadRecordSnapshot(record);
+      if (!loadedPrevious.ok) return loadedPrevious;
+      if (loadedPrevious.value) record.snapshot = loadedPrevious.value;
+      let snapshot = normalizeAcquisitionSnapshot(
+        produced,
+        record.query,
+        effectiveClaim.generation,
+        state.producerEpoch,
+      );
+      if (snapshot && record.snapshot?.contentDigest === snapshot.contentDigest) {
+        snapshot = { ...snapshot, lastChangedAt: loadedPrevious.value.lastChangedAt };
+      }
+      if (!snapshot) {
+        settleInvalidAcquisitionPublication(state, record, effectiveClaim, requestMetrics, receiptsValid ? receipts : [], now());
+        return { value: { ok: false, reason: "invalid" } };
+      }
+      const previous = record.snapshot;
+      const previousClaim = record.claim;
+      if (requestMetrics === null || !receiptsValid) {
+        settleInvalidAcquisitionPublication(state, record, effectiveClaim, requestMetrics ?? {}, [], now());
+        return { value: { ok: false, reason: "invalid" } };
+      }
+      const receiptIds = new Set(Object.keys(state.uncertainReceipts ?? {}));
+      const novelReceipts = receipts.filter((receipt) => !receiptIds.has(receipt.id));
+      if (receiptIds.size + novelReceipts.length > ACQUISITION_MAX_UNCERTAIN_RECEIPTS) {
+        return { value: { ok: false, reason: "capacity", retryClaim: effectiveClaim, remapped } };
+      }
+      record.generation = effectiveClaim.generation;
+      record.snapshot = snapshot;
+      record.claim = null;
+      record.hold = null;
+      record.lastUsedAt = now();
+      if (!trimAcquisitionStore(state, record.query.queryKey)) {
+        record.snapshot = previous;
+        record.generation -= 1;
+        record.claim = previousClaim;
+        return { value: { ok: false, reason: "capacity", retryClaim: effectiveClaim, remapped } };
+      }
+      if (Object.hasOwn(requestMetrics, "uncertainCoreUnits") ||
+          Object.hasOwn(requestMetrics, "uncertainGraphqlUnits")) {
+        releaseKnownAcquisitionUncertainty(state, { ...record, claim: previousClaim }, requestMetrics);
+      } else {
+        releaseAcquisitionUncertainty(state, { ...record, claim: previousClaim });
+      }
+      addAcquisitionRequestMetrics(state, requestMetrics);
+      for (const receipt of receipts) addAcquisitionReceipt(state, receipt);
+      settleAcquisitionWaiters(state, record.query.queryKey, effectiveClaim.generation, now());
+      return { value: { ok: true, value: { role: "producer", snapshot,
+        queryKey: record.query.queryKey, remapped } } };
+    });
+    const rawResult = committed.ok ? committed.value : committed;
+    const { definitive: _definitive, retryClaim, remapped: committedRemap, ...result } = rawResult;
+    const ownsLocalClaim = claim.nonce === item.claimNonce;
+    if (committed.ok && committedRemap) {
+      remapLocalQueries(committedRemap);
+    }
+    if (ownsLocalClaim && committed.ok && (result.ok || result.reason === "invalid" || _definitive === true)) {
+      item.claimNonce = null;
+      item.pending = null;
+    } else if (ownsLocalClaim) {
+      item.pending = { kind: "publish", claim: retryClaim ?? claim, produced };
+    }
+    if (result.ok) {
+      remapLocalQueries(result.value.remapped);
+      deliverQuerySnapshot(result.value.queryKey, result.value.snapshot);
+    }
+    releaseDetachedLocal(id, item);
+    return result;
+  }
+
+  function cancel(id, claim) {
+    const item = local.get(id);
+    if (!item || !isRecord(claim)) return { ok: false, reason: "invalid" };
+    const result = transact((state) => {
+      const record = state.queries[item.queryKey];
+      if (!record || record.claim?.nonce !== claim.nonce || record.claim.generation !== claim.generation) {
+        return { value: { ok: false, reason: "stale", definitive: true } };
+      }
+      record.claim = null;
+      return { value: { ok: true, value: true, definitive: true } };
+    });
+    const rawResult = result.ok ? result.value : result;
+    const { definitive: _definitive, ...value } = rawResult;
+    if (result.ok && _definitive === true) {
+      item.claimNonce = null;
+      item.pending = null;
+    } else {
+      item.pending = { kind: "cancel", claim };
+    }
+    releaseDetachedLocal(id, item);
+    return value;
+  }
+
+  function settleFailure(id, claim, failure) {
+    const item = local.get(id);
+    const requestMetrics = normalizeAcquisitionMetrics(failure?.requestMetrics ?? {}, { partial: true });
+    const receipts = Array.isArray(failure?.uncertainReceipts ?? [])
+      ? (failure?.uncertainReceipts ?? []).map((receipt) => normalizeAcquisitionReceipt(receipt)) : null;
+    const hold = failure?.hold ?? "primary";
+    if (!item || !isRecord(claim) || requestMetrics === null || !receipts || receipts.includes(null) ||
+        !ACQUISITION_HOLD_REASONS.has(hold)) {
+      return { ok: false, reason: "invalid" };
+    }
+    const result = transact((state) => {
+      const record = state.queries[item.queryKey];
+      if (!record || record.claim?.nonce !== claim.nonce || record.claim.generation !== claim.generation) {
+        return { value: { ok: false, reason: "stale", definitive: true } };
+      }
+      if (receipts.some((receipt) => receipt.accessKey !== record.query.accessKey) ||
+          Object.keys(state.uncertainReceipts ?? {}).length +
+            receipts.filter((receipt) => !state.uncertainReceipts?.[receipt.id]).length >
+              ACQUISITION_MAX_UNCERTAIN_RECEIPTS) return { ok: false, reason: "capacity" };
+      addAcquisitionRequestMetrics(state, requestMetrics);
+      releaseKnownAcquisitionUncertainty(state, record, requestMetrics);
+      for (const receipt of receipts) addAcquisitionReceipt(state, receipt);
+      settleAcquisitionWaiters(state, record.query.queryKey, claim.generation, now());
+      record.claim = null;
+      record.hold = { reason: hold, at: now() };
+      record.lastUsedAt = now();
+      return { value: { ok: true, value: true, definitive: true } };
+    });
+    const rawResult = result.ok ? result.value : result;
+    const { definitive: _definitive, ...value } = rawResult;
+    if (result.ok && _definitive === true) {
+      item.claimNonce = null;
+      item.pending = null;
+    } else {
+      item.pending = { kind: "failure", claim, failure };
+    }
+    releaseDetachedLocal(id, item);
+    return value;
+  }
+
+  function setHold(id, reason, expected = null) {
+    const item = local.get(id);
+    if (!item || reason !== null && !ACQUISITION_HOLD_REASONS.has(reason) ||
+        expected !== null && (!isRecord(expected) || !TAB_KEYS.includes(expected.resource) ||
+          typeof expected.accessKey !== "string" || expected.accessKey.length === 0)) {
+      return { ok: false, reason: "invalid" };
+    }
+    return transact((state) => {
+      const record = state.queries[item.queryKey];
+      if (!record) return { ok: false, reason: "stale" };
+      if (expected && (record.query.resource !== expected.resource ||
+          record.query.accessKey !== expected.accessKey)) return { ok: false, reason: "stale-access" };
+      if ((record.hold?.reason ?? null) === reason) return { changed: false, value: true };
+      const next = reason === null ? null : { reason, at: now() };
+      record.hold = next;
+      return { value: true };
+    });
+  }
+
+  function markStarted(id, claim) {
+    const item = local.get(id);
+    if (!item || !isRecord(claim)) return { ok: false, reason: "invalid" };
+    return transact((state) => {
+      const record = state.queries[item.queryKey];
+      if (!record || record.claim?.nonce !== claim.nonce || record.claim.generation !== claim.generation) {
+        return { ok: false, reason: "stale" };
+      }
+      if (record.claim.started) return { changed: false, value: true };
+      const costs = tabRequestCost(record.query.resource);
+      const supplied = claim.receipt;
+      if (supplied !== undefined && (!isRecord(supplied) || supplied.accessKey !== record.query.accessKey ||
+          typeof supplied.reservationId !== "string" || supplied.reservationId.length < 1 ||
+          !isRecord(supplied.epochs))) return { ok: false, reason: "invalid" };
+      const reservationId = supplied?.reservationId ?? `claim:${record.claim.nonce}`;
+      const receiptIds = [];
+      for (const resource of RATE_RESOURCES) {
+        if (costs[resource] <= 0) continue;
+        const epoch = typeof supplied?.epochs?.[resource] === "string" && supplied.epochs[resource].length > 0
+          ? supplied.epochs[resource] : "unknown";
+        const receipt = {
+          id: `${reservationId}:${resource}`,
+          reservationId,
+          accessKey: record.query.accessKey,
+          resource,
+          epoch,
+          units: costs[resource],
+          startedAt: now(),
+        };
+        if (!addAcquisitionReceipt(state, receipt)) return { ok: false, reason: "capacity" };
+        receiptIds.push(receipt.id);
+      }
+      record.claim.started = true;
+      record.claim.receiptIds = receiptIds;
+      return { value: true };
+    });
+  }
+
+  function retryPending(id, item = local.get(id)) {
+    const pending = item?.pending;
+    if (!pending) return { ok: true, value: false };
+    if (pending.kind === "publish") return publish(id, pending.claim, pending.produced);
+    if (pending.kind === "failure") return settleFailure(id, pending.claim, pending.failure);
+    return cancel(id, pending.claim);
+  }
+
+  async function refresh(id, { force = false, acquire = null, claim = null, publish: publication,
+    cancel: cancellation = null, failure = null, started = null } = {}) {
+    const item = local.get(id);
+    if (!item || acquire !== null && typeof acquire !== "function") return { ok: false, reason: "invalid" };
+    // A retired scope cannot start new work, but its already-started producer
+    // must still be able to publish for remaining consumers or cancel its
+    // durable claim. The callback was detached synchronously by unsubscribe,
+    // so neither terminal action can repopulate the retired UI.
+    if (publication !== undefined) return publish(id, claim, publication);
+    if (failure !== null) return settleFailure(id, claim, failure);
+    if (cancellation !== null) return cancel(id, cancellation);
+    if (started !== null) return markStarted(id, started);
+    if (item.detached || closing) return { ok: false, reason: closing ? "closed" : "invalid" };
+    if (item.pending) {
+      const pending = item.pending;
+      const retried = retryPending(id, item);
+      if (!retried.ok || pending.kind === "publish") return retried;
+    }
+    const claimed = transact((state) => {
+      const reaped = reapAcquisitionSubscriptions(state, now(), kill);
+      const subscription = state.subscriptions[id];
+      const record = state.queries[item.queryKey];
+      if (!subscription || subscription.nonce !== item.nonce || !record) return { ok: false, reason: "stale" };
+      const requestedGeneration = force
+        ? Math.max(subscription.requestedGeneration,
+          record.claim?.generation ?? record.generation + 1)
+        : subscription.requestedGeneration;
+      const demandChanged = requestedGeneration !== subscription.requestedGeneration;
+      if (demandChanged) {
+        subscription.requestedGeneration = requestedGeneration;
+      }
+      if (requestedGeneration <= record.generation && record.snapshot?.nextDueAt > now()) {
+        return { changed: reaped > 0 || demandChanged,
+          value: { role: "follower", reason: "fresh", snapshot: record.snapshot,
+            sharingCount: acquisitionSharingCount(state, item.queryKey) } };
+      }
+      if (record.claim) {
+        const expired = record.claim.leaseUntil <= now();
+        const owner = acquisitionOwnerStatus(record.claim.pid, kill);
+        if (!expired || owner !== "dead") {
+          const joined = subscription.waitingGeneration !== record.claim.generation;
+          if (joined) {
+            subscription.waitingGeneration = record.claim.generation;
+            subscription.waitingSinceAt = now();
+            acquisitionMetricState(state).joinedFollowers += 1;
+          }
+          return { changed: reaped > 0 || demandChanged || joined,
+            value: { role: "follower", reason: expired ? `owner-${owner}` : "claimed",
+            snapshot: record.snapshot, sharingCount: acquisitionSharingCount(state, item.queryKey) } };
+        }
+      }
+      const nonce = createId("acquisition-claim", item.queryKey, record.generation + 1);
+      record.claim = {
+        pid,
+        nonce,
+        generation: record.generation + 1,
+        claimedAt: now(),
+        leaseUntil: now() + ACQUISITION_CLAIM_TTL_MS,
+        started: false,
+      };
+      record.hold = null;
+      subscription.waitingGeneration = null;
+      subscription.waitingSinceAt = null;
+      record.lastUsedAt = now();
+      return { value: { role: "producer", nonce, generation: record.claim.generation,
+        query: record.query, snapshot: record.snapshot, demand: aggregateAcquisitionDemand(state, item.queryKey),
+        sharingCount: acquisitionSharingCount(state, item.queryKey) } };
+    });
+    if (claimed.ok && claimed.value?.snapshot) {
+      const record = claimed.state.queries[item.queryKey];
+      const loadedSnapshot = loadRecordSnapshot(record);
+      if (!loadedSnapshot.ok) return loadedSnapshot;
+      claimed.value.snapshot = loadedSnapshot.value;
+    }
+    if (!claimed.ok || claimed.value.role !== "producer") {
+      if (claimed.value?.snapshot) deliver(id, { generation: claimed.value.snapshot.generation, snapshot: claimed.value.snapshot });
+      return claimed;
+    }
+    item.claimNonce = claimed.value.nonce;
+    const acquire_ = acquire ?? transport;
+    if (acquire_ === null) return claimed;
+    let produced;
+    try {
+      const startedTransport = await runStartedAcquisitionTransport(
+        () => markStarted(id, claimed.value),
+        () => acquire_({
+          query: claimed.value.query,
+          snapshot: claimed.value.snapshot,
+          demand: claimed.value.demand,
+          claim: { nonce: claimed.value.nonce, generation: claimed.value.generation },
+        }),
+      );
+      if (!startedTransport.ok) {
+        cancel(id, { nonce: claimed.value.nonce, generation: claimed.value.generation });
+        return startedTransport;
+      }
+      produced = startedTransport.value;
+    } catch (error) {
+      settleFailure(id, {
+        nonce: claimed.value.nonce,
+        generation: claimed.value.generation,
+      }, {
+        hold: acquisitionFailureHold(error),
+        requestMetrics: error?.requestMetrics ?? {},
+      });
+      throw error;
+    }
+    return publish(id, {
+      nonce: claimed.value.nonce,
+      generation: claimed.value.generation,
+      accessKey: claimed.value.query.accessKey,
+    }, produced);
+  }
+
+  function unsubscribe(id) {
+    const item = local.get(id);
+    if (!item) return { ok: false, reason: "stale" };
+    item.callback = null;
+    item.detached = true;
+    const result = transact((state) => {
+      const subscription = state.subscriptions[id];
+      let changed = false;
+      if (subscription?.nonce === item.nonce) {
+        delete state.subscriptions[id];
+        changed = true;
+      }
+      const record = state.queries[item.queryKey];
+      const ownsClaim = record?.claim?.pid === pid && record.claim.nonce === item.claimNonce;
+      const retainedClaim = ownsClaim && aggregateAcquisitionDemand(state, item.queryKey) !== null;
+      if (ownsClaim && !retainedClaim) {
+        record.claim = null;
+        changed = true;
+      }
+      return { changed, value: { id, retainedClaim } };
+    });
+    if (result.ok) {
+      item.cleanupPending = false;
+      if (!result.value.retainedClaim) item.claimNonce = null;
+    } else {
+      item.cleanupPending = true;
+      ensureTimer();
+    }
+    releaseDetachedLocal(id, item);
+    finishClose();
+    return result;
+  }
+
+  function finishClose() {
+    if (!closing || local.size > 0 || closed) return;
+    closed = true;
+    if (timer !== null) clearInterval_(timer);
+    timer = null;
+  }
+
+  function close() {
+    if (closed || closing) return;
+    closing = true;
+    for (const id of [...local.keys()]) unsubscribe(id);
+    finishClose();
+  }
+
+  function diagnostics(options = {}) {
+    const loaded = load();
+    return loaded.ok
+      ? { ok: true, value: acquisitionDiagnostics(loaded.value, { nowMs: now(), ...options }) }
+      : loaded;
+  }
+
+  function recordMetrics(delta) {
+    const metrics = normalizeAcquisitionMetrics(delta, { partial: true });
+    if (metrics === null) return { ok: false, reason: "invalid" };
+    return transact((state) => {
+      addAcquisitionMetrics(state, metrics);
+      return { value: { ...state.metrics } };
+    });
+  }
+
+  function reconcileUncertainty(accessKey, evidence) {
+    if (typeof accessKey !== "string" || accessKey.length === 0 || !isRecord(evidence)) {
+      return { ok: false, reason: "invalid" };
+    }
+    return transact((state) => {
+      let changed = false;
+      for (const [id, receipt] of Object.entries(state.uncertainReceipts ?? {})) {
+        const observed = evidence[receipt.resource];
+        if (receipt.accessKey !== accessKey || !isRecord(observed) ||
+            typeof observed.epoch !== "string" || !Number.isFinite(observed.observedAt)) continue;
+        const reset = receipt.epoch !== "unknown" && observed.epoch !== receipt.epoch;
+        if (!reset && observed.observedAt < receipt.startedAt) continue;
+        changed = removeAcquisitionReceipt(state, id) || changed;
+      }
+      return { changed, value: { ...state.metrics } };
+    });
+  }
+
+  return {
+    subscribe,
+    updateDemand,
+    refresh,
+    unsubscribe,
+    inspect,
+    diagnostics,
+    recordMetrics,
+    reconcileUncertainty,
+    setHold,
+    close,
+    path,
+  };
+}
+
+function setRuntimeAcquisitionHold(engine, subscriptions, resource, reason, accessKey) {
+  const subscription = subscriptions?.get(resource);
+  if (!subscription?.id) return { ok: false, reason: "stale" };
+  if (typeof accessKey !== "string" || accessKey.length === 0) {
+    return { ok: false, reason: "stale-access" };
+  }
+  return engine.setHold(subscription.id, reason, { resource, accessKey });
+}
+
 // The one place the cadence table is decided. It used to be spread across a
 // fixed active floor, a fixed four-floor background slot, and a Security-only
 // unchanged rule -- three policies that could disagree, and did: Security
@@ -8204,6 +13677,10 @@ function pollPolicyInterval({
   if (tab === "actions" && inProgressCI === true) return Math.max(floorMs, POLL_ACTIVE_CI_MS);
   if (unchangedCount >= POLL_QUIET_AFTER) return Math.max(floorMs, pick(POLL_QUIET_MS, tab, 0));
   return floorMs;
+}
+
+function hasActionsInProgress(rows) {
+  return Array.isArray(rows) && rows.some((row) => row.status !== "completed");
 }
 
 // Only a validated observation moves this counter. An error, a blind Security
@@ -8503,6 +13980,13 @@ function pendingFailureIsTerminal(reason) {
   return reason === "stale";
 }
 
+function cancelCoordinatedPending(item, { cancelGovernor, cancelAcquisition: cancelShared } = {}) {
+  if (!item) return false;
+  cancelGovernor?.(item.intentId);
+  cancelShared?.(item.acquisition);
+  return true;
+}
+
 function runtimeIntentGate(liveScheduling, { force = false, protocolReady = false } = {}) {
   return liveScheduling || protocolReady
     ? { registerIntent: true, requestProbe: false }
@@ -8654,6 +14138,148 @@ function rateLimitBlockProbeRecovered(pending, state, nowMs) {
 // startReservation revalidates the budget when the wait is over.
 const GOVERNOR_ADMISSION_WAIT_MS = 2_000;
 
+function measuredNestedOperationCost(operation, value) {
+  const declared = operationCost(operation);
+  if (!declared) return null;
+  const metrics = value?.requestMetrics ?? (
+    operation.startsWith("page:") ? graphqlPageRequestMetrics(value) : restResponseRequestMetrics(value)
+  );
+  const actual = { core: 0, graphql: 0 };
+  if (declared.core > 0) {
+    if (!Object.hasOwn(metrics, "coreUnits")) return null;
+    actual.core = metrics.coreUnits;
+  }
+  if (declared.graphql > 0) {
+    if (!Object.hasOwn(metrics, "graphqlUnits")) return null;
+    actual.graphql = metrics.graphqlUnits;
+  }
+  return actual;
+}
+
+function uncertainReservationReceipts(scope, reservationId, nowMs) {
+  const snapshot = inspectGovernor(scope, nowMs);
+  const reservation = snapshot.ok ? snapshot.value.reservations?.[reservationId] : null;
+  const accessKey = scope.accessKey ?? scope.hash;
+  if (!reservation || typeof accessKey !== "string") return [];
+  return RATE_RESOURCES.flatMap((resource) => {
+    if (reservation.costs[resource] <= 0) return [];
+    return [{
+      id: `${reservationId}:${resource}`,
+      reservationId,
+      accessKey,
+      resource,
+      epoch: reservation.epochs[resource],
+      units: reservation.costs[resource],
+      startedAt: reservation.startedAt,
+    }];
+  });
+}
+
+function abortableDelay(ms, signal, {
+  setTimeout: setTimeout_ = setTimeout,
+  clearTimeout: clearTimeout_ = clearTimeout,
+} = {}) {
+  if (!(ms > 0)) return Promise.resolve(!signal?.aborted);
+  if (signal?.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let timer = null;
+    const finish = (elapsed) => {
+      if (timer !== null) clearTimeout_(timer);
+      signal?.removeEventListener?.("abort", aborted);
+      resolve(elapsed);
+    };
+    const aborted = () => finish(false);
+    signal?.addEventListener?.("abort", aborted, { once: true });
+    timer = setTimeout_(() => finish(true), ms);
+    timer?.unref?.();
+  });
+}
+
+async function awaitCollectorReservation({
+  scope,
+  leaseId,
+  operation,
+  priority,
+  signal,
+  waitMs = GOVERNOR_ADMISSION_WAIT_MS,
+  now = Date.now,
+  wait = (ms, waitSignal) => abortableDelay(ms, waitSignal),
+  admit = admitGovernorOperation,
+  start = startReservation,
+  cancel = cancelIntent,
+  deferredRetryAt = null,
+}) {
+  const attempt = await resolveGovernorAdmission({
+    scope, leaseId, operation, priority, signal, waitMs, now, wait,
+    admit, start, cancel, requireElapsed: true,
+  });
+  if (attempt.started) return attempt.admitted.value;
+
+  const { admitted, scheduled } = attempt;
+  const aborted = signal?.aborted === true;
+  const error = new Error(aborted ? "collector admission aborted" : "collector admission deferred");
+  if (aborted) error.name = "AbortError";
+  error.notStarted = true;
+  error.retryAt = admitted.value?.notBefore ?? admitted.retryAt ?? scheduled?.notBefore ??
+    (Number.isFinite(deferredRetryAt) ? deferredRetryAt : now() + 1_000);
+  throw error;
+}
+
+function collectorObserverRetryAt(scope, resource, at) {
+  const declared = tabRequestCost(resource);
+  const snapshot = inspectGovernor(scope, at);
+  if (!snapshot.ok || !declared) return null;
+  const deadlines = RATE_RESOURCES.flatMap((budgetResource) => {
+    if (!(declared[budgetResource] > 0)) return [];
+    const observer = snapshot.value.observers[budgetResource];
+    return observer?.outcome !== "healthy" && Number.isFinite(observer?.nextAt) && observer.nextAt > at
+      ? [observer.nextAt] : [];
+  });
+  return deadlines.length > 0 ? Math.max(...deadlines) : null;
+}
+
+async function resolveGovernorAdmission({
+  scope,
+  leaseId,
+  operation,
+  priority,
+  signal,
+  waitMs,
+  now,
+  wait,
+  admit = admitGovernorOperation,
+  start = startReservation,
+  cancel = cancelIntent,
+  requireElapsed = false,
+}) {
+  let admitted = admit(scope, leaseId, operation, priority, now());
+  const scheduled = admitted.ok &&
+    ["scheduled", "waiting"].includes(admitted.value?.status) &&
+    typeof admitted.value.reservationId === "string" &&
+    Number.isFinite(admitted.value.notBefore)
+      ? admitted.value
+      : null;
+  if (waitMs > 0 && scheduled) {
+    const delay = scheduled.notBefore - now();
+    if (delay <= waitMs) {
+      const elapsed = delay <= 0 || await wait(delay, signal);
+      if ((!requireElapsed || elapsed) && !signal?.aborted) {
+        admitted = start(scope, scheduled.reservationId, now());
+      }
+    }
+  }
+  const started = admitted.ok && admitted.value?.status === "started";
+  if (!started) {
+    const intentId = admitted.value?.intentId ?? (
+      typeof admitted.value?.reservationId === "string"
+        ? admitted.value.reservationId.slice("reservation:".length)
+        : scheduled?.reservationId?.slice("reservation:".length)
+    );
+    if (validGovernorId(intentId)) cancel(scope, intentId, now());
+  }
+  return { admitted, scheduled, started };
+}
+
 async function runAdmittedOperation({
   scope,
   leaseId,
@@ -8665,35 +14291,13 @@ async function runAdmittedOperation({
   // One clock for the whole admission, so the wait below is measured against
   // the same time the governor scheduled the slot on.
   now = Date.now,
-  wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  wait = (ms, waitSignal) => abortableDelay(ms, waitSignal),
 }) {
-  let admitted = admitGovernorOperation(scope, leaseId, operation, priority, now());
-  const scheduled = admitted.ok &&
-    ["scheduled", "waiting"].includes(admitted.value?.status) &&
-    typeof admitted.value.reservationId === "string" &&
-    Number.isFinite(admitted.value.notBefore)
-      ? admitted.value
-      : null;
-  if (waitMs > 0 && scheduled) {
-    // The named slot can already have arrived while the intent was being
-    // persisted, so a delay that is gone is retried at once rather than treated
-    // as a refusal -- that race alone made this path intermittent.
-    const delay = scheduled.notBefore - now();
-    if (delay <= waitMs) {
-      if (delay > 0) await wait(delay);
-      if (!signal?.aborted) {
-        admitted = startReservation(scope, scheduled.reservationId, now());
-      }
-    }
-  }
-  if (!admitted.ok || admitted.value.status !== "started") {
-    // The reservation is named by its intent, so a slot this call decided not
-    // to take is released rather than left scheduled against the budget.
-    const abandoned = admitted.value?.intentId ??
-      (typeof admitted.value?.reservationId === "string"
-        ? admitted.value.reservationId.slice(12)
-        : scheduled?.reservationId?.slice(12));
-    if (validGovernorId(abandoned)) cancelIntent(scope, abandoned, now());
+  const attempt = await resolveGovernorAdmission({
+    scope, leaseId, operation, priority, signal, waitMs, now, wait,
+  });
+  const { admitted } = attempt;
+  if (!attempt.started) {
     const detail = admitted.value?.resetMs
       ? ` until ${new Date(admitted.value.resetMs).toISOString()}`
       : admitted.value?.notBefore ? ` until ${new Date(admitted.value.notBefore).toISOString()}` : "";
@@ -8701,18 +14305,30 @@ async function runAdmittedOperation({
   }
   const reservationId = admitted.value.reservationId;
   const settlementScope = { ...scope, identityProvider: null };
+  const pendingReceipts = uncertainReservationReceipts(scope, reservationId, now());
   try {
     const value = await requestIdentityStorage.run(scope, () => run(signal));
-    const costs = operationCost(operation);
+    const measured = measuredNestedOperationCost(operation, value);
+    const costs = measured ?? operationCost(operation);
+    const outcome = value?.ok === false ? governorOutcomeForError(value.failure) : "measured-success";
     completeReservation(settlementScope, reservationId, {
-      outcome: "measured-success",
-      actualCost: costs,
+      outcome,
+      ...(measured || outcome === "measured-success" ? { actualCost: costs } : {}),
     }, now());
-    if (scope.accessKey && scope.accessKey !== runtimeIdentityCoordinator?.current()?.accessKey) return { ok: false, error: new Error("Credential changed"), reservationId };
-    return { ok: true, value, reservationId };
+    const identityCoordinator = scope.identityCoordinator ?? runtimeIdentityCoordinator;
+    if (scope.accessKey && scope.accessKey !== identityCoordinator?.current()?.accessKey) {
+      return { ok: false, error: new Error("Credential changed"), reservationId };
+    }
+    return { ok: true, value, reservationId,
+      uncertainReceipts: measured ? [] : pendingReceipts };
   } catch (error) {
-    completeReservation(settlementScope, reservationId, { outcome: governorOutcomeForError(error) }, now());
-    return { ok: false, error, reservationId };
+    const actualCost = measuredNestedOperationCost(operation, { requestMetrics: error?.requestMetrics });
+    const uncertainReceipts = actualCost ? [] : pendingReceipts;
+    completeReservation(settlementScope, reservationId, {
+      outcome: governorOutcomeForError(error),
+      ...(actualCost ? { actualCost } : {}),
+    }, now());
+    return { ok: false, error, reservationId, uncertainReceipts };
   }
 }
 
@@ -8925,6 +14541,9 @@ function refreshStatus({
   governorDecision = null,
   activeError = null,
   securityIncomplete = false,
+  sharedData = false,
+  stale = false,
+  disconnected = false,
   screenReader = false,
 } = {}) {
   const status = (kind, glyphKind, label, tone, animate = false, detailKind = null) => ({
@@ -8953,6 +14572,11 @@ function refreshStatus({
   if (mode === "paused" || activeError?.verdict === "rate-limited") {
     return status("paused", "paused", "Paused", "attention", false, detailKind);
   }
+  if (disconnected) {
+    return status("disconnected", "failed", "Disconnected", "attention", false, stale ? "stale" : null);
+  }
+  if (stale) return status("stale", "limited", "Stale", "attention", false, "stale");
+  if (sharedData) return status("shared", "watching", "Shared", "inert", false, "sharing");
   if (["waiting", "pending", "probe"].includes(mode)) {
     const sharing = sharedLaneProvenance(governorDecision).waitCause === "shared-lane";
     const watchingDetail = sharing
@@ -9123,6 +14747,7 @@ function sameVisibleGovernorDecision(left, right) {
     "detailKind",
     "waitCause",
     "sharingCount",
+    "sharedData",
     "coordinationError",
     "reservationId",
   ]) {
@@ -9358,16 +14983,21 @@ function App({ onCreateRemote = () => {} } = {}) {
     };
   }, [widthPreferenceWriter]);
   const [cachePath] = useState(() => dashboardCachePath());
+  const [sshCacheIdentity] = useState(() => runtime.connect?.startsWith("ssh:")
+    ? sshCollectorCacheIdentity(sshAliasFromConnect(runtime.connect))
+    : null);
   const [cacheTarget] = useState(() =>
     dashboardCacheTarget({
       repo: runtime.repo,
       ghRepo: process.env.GH_REPO,
       host: runtimeIdentityCoordinator?.current()?.host ?? effectiveRuntimeHost(),
       cwd: process.cwd(),
-      account: runtimeIdentityCoordinator?.current()?.accessKey ?? "unverified",
+      account: sshCacheIdentity ?? runtimeIdentityCoordinator?.current()?.accessKey ?? "unverified",
     }),
   );
   const [loadedCache] = useState(() => loadDashboardCache(cachePath, cacheTarget));
+  const [acquisitionEngine] = useState(() => createAcquisitionEngine());
+  useEffect(() => () => acquisitionEngine.close(), [acquisitionEngine]);
   const dashboardCacheRef = useRef(loadedCache.cache);
   const dashboardCachePersistedRef = useRef(loadedCache.cache);
   const dashboardCacheTargetRef = useRef(cacheTarget);
@@ -9518,11 +15148,18 @@ function App({ onCreateRemote = () => {} } = {}) {
   const lastOkRef = useRef(
     Object.fromEntries(
       TABS.flatMap((candidate) => {
-        const lastOk = cachedEntry?.tabs[candidate.key]?.lastOk;
+        const cachedTab = cachedEntry?.tabs[candidate.key];
+        const cachedAge = collectorCachedSourceAge(cachedTab);
+        const lastOk = cachedAge === null ? cachedTab?.lastOk : Date.now() - cachedAge;
         return lastOk == null ? [] : [[candidate.key, lastOk]];
       }),
     ),
   );
+  const collectorSourceAgeRef = useRef(Object.fromEntries(TABS.flatMap((candidate) => {
+    const cachedTab = cachedEntry?.tabs[candidate.key];
+    const ageMs = collectorCachedSourceAge(cachedTab);
+    return ageMs === null ? [] : [[candidate.key, { ageMs, measuredAt: performance.now() }]];
+  })));
   const fetchTabRef = useRef(null);
   const contextCoordinatorRef = useRef(null);
   const governorRef = useRef(null);
@@ -9957,13 +15594,14 @@ function App({ onCreateRemote = () => {} } = {}) {
         ...currentEntry,
         tabs: {
           ...currentEntry.tabs,
-          [key]: { data: tabData, meta: tabMeta, lastOk },
+          [key]: { data: tabData, meta: tabMeta, lastOk,
+            ...(security.source ? { source: security.source } : {}) },
         },
         securityNotes:
           key === "security" ? (security.notes ?? []) : currentEntry.securityNotes,
         securityBlind:
           key === "security" ? Boolean(security.blind) : currentEntry.securityBlind,
-        updatedAt: lastOk,
+        updatedAt: security.source?.clientCheckpointAt ?? lastOk,
       };
       const nextCache = mergeDashboardCacheEntry(currentCache, target, nextEntry);
       dashboardCacheRef.current = nextCache;
@@ -10016,7 +15654,23 @@ function App({ onCreateRemote = () => {} } = {}) {
       return null;
     }
 
-    function pauseCoordination(key, reason) {
+    function pauseCoordination(key, reason, diagnosticHold = null) {
+      const hold = diagnosticHold ?? (
+        /secondary|abuse/.test(reason ?? "")
+          ? "secondary"
+          : /budget-reset|rate-limit|reset/.test(reason ?? "")
+            ? "primary"
+            : /identity|unknown-scope|credential/.test(reason ?? "")
+              ? "disconnected"
+              : "coordination"
+      );
+      setRuntimeAcquisitionHold(
+        acquisitionEngine,
+        acquisitionSubscriptions,
+        key,
+        hold,
+        identity()?.accessKey ?? null,
+      );
       setTabGovernorDecision(key, {
         mode: "paused",
         reason: reason ?? "unavailable",
@@ -10042,7 +15696,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         return;
       }
       if (!refreshed?.ok) {
-        pauseCoordination(key, refreshed?.reason);
+        pauseCoordination(key, refreshed?.reason, "observer");
         return;
       }
       if (!snapshot?.ok) {
@@ -10085,6 +15739,15 @@ function App({ onCreateRemote = () => {} } = {}) {
         if (decision.mode === "open") continue;
         const resetHold = ["budget-reset", "reset", "rate-limit"].includes(decision.reason) ||
           budget?.blockUntil > nowMs;
+        setRuntimeAcquisitionHold(
+          acquisitionEngine,
+          acquisitionSubscriptions,
+          key,
+          /secondary|abuse/.test(budget?.blockReason ?? decision.reason ?? "")
+            ? "secondary"
+            : resetHold || decision.mode === "paused" ? "primary" : "coordination",
+          identity()?.accessKey ?? null,
+        );
         setTabGovernorDecision(key, {
           mode: resetHold || decision.mode === "paused" ? "paused" : "waiting",
           reason: decision.reason,
@@ -10093,7 +15756,34 @@ function App({ onCreateRemote = () => {} } = {}) {
         });
         return;
       }
+      setRuntimeAcquisitionHold(
+        acquisitionEngine,
+        acquisitionSubscriptions,
+        key,
+        null,
+        identity()?.accessKey ?? null,
+      );
       setTabGovernorDecision(key, null);
+    }
+
+    async function refreshRuntimeBudget(currentScope) {
+      let observerCalls = 0;
+      const refreshed = await refreshSharedBudget(currentScope, leaseId, controller.signal, {
+        onObserverCall: () => { observerCalls += 1; },
+      });
+      if (observerCalls > 0) acquisitionEngine.recordMetrics({ observerCalls });
+      return refreshed;
+    }
+
+    function reconcileRuntimeUncertainty(currentScope, snapshot) {
+      if (!snapshot?.ok) return;
+      const evidence = Object.fromEntries(RATE_RESOURCES.flatMap((resource) => {
+        const observer = snapshot.value.observers?.[resource];
+        const epoch = snapshot.value.epochs?.[resource];
+        return observer?.outcome === "healthy" && typeof epoch === "string" && Number.isFinite(observer.at)
+          ? [[resource, { epoch, observedAt: observer.at }]] : [];
+      }));
+      acquisitionEngine.reconcileUncertainty(currentScope.accessKey, evidence);
     }
 
     function commit(key, run, {
@@ -10102,6 +15792,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       scope,
       reservationId,
       admittedAt,
+      acquisition = null,
       onSettled,
       automaticStatusVisible = false,
     } = {}) {
@@ -10139,7 +15830,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         }));
       }
       return requestIdentityStorage.run(scope, run)
-        .then((result) => {
+        .then(async (result) => {
           settleReservationWithBudgetObservations(settlementScope, leaseId, reservationId, result?.measuredSuccess === false
             ? { outcome: "rejected", observations: result?.observations ?? [] }
             : {
@@ -10150,7 +15841,13 @@ function App({ onCreateRemote = () => {} } = {}) {
                 },
                 observations: result?.observations ?? [],
               }, Date.now());
-          if (!currentAccess()) return;
+          if (!currentAccess()) {
+            failAcquisition(acquisition, {
+              requestMetrics: acquisitionRequestMetrics(result),
+              hold: "disconnected",
+            });
+            return;
+          }
           if (result?.rateLimited) {
             const blockAt = Date.now();
             const budget = inspectGovernor(scope, blockAt).value?.budgets?.core;
@@ -10162,6 +15859,12 @@ function App({ onCreateRemote = () => {} } = {}) {
           }
           if (cancelled) return;
           const { raw, parse, limit, stagedEntities } = result;
+          if (acquisition) {
+            acquisition.capabilities = result.capabilities ?? {};
+            acquisition.repositoryIdentity = result.repositoryIdentity;
+            acquisition.requestMetrics = acquisitionRequestMetrics(result);
+            acquisition.uncertainReceipts = result.uncertainReceipts ?? [];
+          }
           // Identical payload: skip the parse *and* the state update. Returning
           // the same state object makes React bail out of the re-render, so an
           // idle repo stops redrawing the pane entirely.
@@ -10196,7 +15899,11 @@ function App({ onCreateRemote = () => {} } = {}) {
           unchangedPolls[key] = advanceUnchangedCount(unchangedPolls[key], transition.kind);
           // Recomputed now that the outcome is known: the schedule chose this
           // tab's deadline before the observation that decides its cadence.
-          rescheduleTab(key, admittedAt, {
+          // Shared snapshots publish a deadline from completion. Anchor the
+          // local wake to that same observation so waking just before the
+          // shared deadline cannot consume a fresh follower result and add a
+          // second full cadence interval.
+          rescheduleTab(key, completedAt, {
             actionRows: key === "actions" && transition.kind === "changed" ? transition.data : undefined,
           });
           if (result?.catalog) workflowCatalogRef.current = result.catalog;
@@ -10209,6 +15916,8 @@ function App({ onCreateRemote = () => {} } = {}) {
           publishStagedEntities(entityRef.current, stagedEntities, transition.kind);
           if (transition.kind === "unchanged") {
             lastOkRef.current[key] = completedAt;
+            const publication = await finishAcquisition(key, acquisition, transition, completedAt);
+            if (!publication.ok) pauseCoordination(key, publication.reason);
             // Clear on the first success or a single failure latches the ladder.
             clearBackoff(`tab:${key}`);
             setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
@@ -10238,6 +15947,11 @@ function App({ onCreateRemote = () => {} } = {}) {
           // so the next admitted tick parses its response instead of taking the
           // identical-output fast path.
           if (transition.kind === "unusable") {
+            failAcquisition(acquisition, {
+              requestMetrics: acquisition?.requestMetrics ?? {},
+              uncertainReceipts: acquisition?.uncertainReceipts ?? [],
+              hold: "primary",
+            });
             rawRef.current[key] = transition.nextRaw;
             setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
             return;
@@ -10248,6 +15962,11 @@ function App({ onCreateRemote = () => {} } = {}) {
           // freshness. Do not retain its raw value either, so the next source
           // retry is parsed instead of taking the identical-payload fast path.
           if (transition.kind === "blind") {
+            failAcquisition(acquisition, {
+              requestMetrics: acquisition?.requestMetrics ?? {},
+              uncertainReceipts: acquisition?.uncertainReceipts ?? [],
+              hold: "primary",
+            });
             rawRef.current[key] = transition.nextRaw;
             setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
             setSecurityNotes(transition.notes);
@@ -10266,12 +15985,18 @@ function App({ onCreateRemote = () => {} } = {}) {
           if (key === "security") {
             setSecurityBlind((b) => (b === transition.blind ? b : transition.blind));
           }
+          const publication = await finishAcquisition(key, acquisition, transition, completedAt);
+          if (!publication.ok) pauseCoordination(key, publication.reason);
           cacheSuccessfulTab(key, tabData, tabMeta, completedAt, {
             notes: transition.notes,
             blind: transition.blind,
           });
         })
         .catch((err) => {
+          failAcquisition(acquisition, {
+            requestMetrics: err?.requestMetrics ?? {},
+            hold: acquisitionFailureHold(err),
+          });
           settleReservationWithBudgetObservations(settlementScope, leaseId, reservationId, {
             outcome: governorOutcomeForError(err),
             observations: err?.budgetObservations ?? [],
@@ -10372,13 +16097,306 @@ function App({ onCreateRemote = () => {} } = {}) {
     // to fall out of step with what is on screen.
     const unchangedPolls = Object.fromEntries(TAB_KEYS.map((key) => [key, 0]));
     let pendingBlockPublications = new Map();
+    const acquisitionSubscriptions = new Map();
+
+    function adoptAcquisitionSnapshot(key, snapshot, receipt = null) {
+      if (!snapshot || cancelled) return;
+      const snapshotMeta = snapshot.meta ?? { at: snapshot.lastChangedAt, truncated: false };
+      const receiptAge = Number.isFinite(receipt?.sourceAgeMs) ? Math.max(0, receipt.sourceAgeMs) : null;
+      if (receiptAge === null) {
+        lastOkRef.current[key] = snapshot.lastSuccessAt;
+        delete collectorSourceAgeRef.current[key];
+      } else {
+        lastOkRef.current[key] = Date.now() - receiptAge;
+        collectorSourceAgeRef.current[key] = { ageMs: receiptAge, measuredAt: performance.now() };
+      }
+      for (const entity of snapshot.entities ?? []) {
+        entityRef.current.set(entity.key, { etag: entity.etag, body: entity.body });
+      }
+      const sameRows = JSON.stringify(dataRef.current[key]) === JSON.stringify(snapshot.rows);
+      if (!sameRows) setData((current) => ({ ...current, [key]: snapshot.rows }));
+      setMeta((current) => current[key]?.at === snapshotMeta.at &&
+        current[key]?.truncated === snapshotMeta.truncated
+        ? current : { ...current, [key]: snapshotMeta });
+      if (key === "security") {
+        const accessKey = identity()?.accessKey;
+        if (accessKey) {
+          for (const [sourceKey, capability] of Object.entries(snapshot.capabilities ?? {})) {
+            alertBackoff.set(`${accessKey}\0${sourceKey}`, {
+              ...capability,
+              until: performance.now() + Math.max(0, capability.until - Date.now()),
+            });
+          }
+        }
+        setSecurityNotes(snapshot.securityNotes ?? []);
+        setSecurityBlind(snapshot.securityBlind === true);
+      }
+      if (snapshot.pageInfo && Number.isFinite(snapshot.pageInfo.loadedPages)) {
+        pageStateRef.current[key] = {
+          pages: snapshot.pageInfo.loadedPages,
+          hasNextPage: snapshot.pageInfo.hasNextPage === true,
+        };
+      }
+      if (runtime.connect?.startsWith("ssh:") && receiptAge !== null && validGovernorId(receipt.serverEpoch)) {
+        cacheSuccessfulTab(key, snapshot.rows, snapshotMeta, snapshot.lastSuccessAt, {
+          notes: snapshot.securityNotes,
+          blind: snapshot.securityBlind,
+          source: {
+            kind: "ssh",
+            collector: sshCacheIdentity,
+            serverEpoch: receipt.serverEpoch,
+            lastSuccessAt: snapshot.lastSuccessAt,
+            lastChangedAt: snapshot.lastChangedAt,
+            ageMs: receiptAge,
+            clientCheckpointAt: receipt.clientCheckpointAt,
+          },
+        });
+      }
+    }
+
+    if (runtime.connect !== null) {
+      const repository = effectiveRuntimeRepository({ remoteUrls: runtimeRemoteUrls });
+      const host = effectiveRuntimeHost({ remoteUrls: runtimeRemoteUrls });
+      const handles = new Map();
+      const receivedSnapshots = new Set();
+      let collectorReady = false;
+      setGovernorDecisions(Object.fromEntries(TAB_KEYS.map((key) => [key, { disconnected: true }])));
+      if (!repository || !host) {
+        fetchTabRef.current = null;
+        return () => { cancelled = true; controller.abort(); };
+      }
+      const clientOptions = {
+        onReady(ready) {
+          if (cancelled) return;
+          collectorReady = ready;
+          if (!ready) receivedSnapshots.clear();
+          setGovernorDecisions(Object.fromEntries(TAB_KEYS.map((key) => [key,
+            collectorDisplayDecision({ connected: ready, hasSnapshot: receivedSnapshots.has(key) })])));
+        },
+      };
+      const client = runtime.connect === "local"
+        ? createLocalCollectorClient(clientOptions)
+        : createSshCollectorClient({
+            ...clientOptions,
+            alias: sshAliasFromConnect(runtime.connect),
+            onTransportDiagnostic() {
+              if (cancelled) return;
+              const failure = toTabError(new Error(
+                "SSH collector unavailable. Check the SSH alias, host trust, and remote gh-glance.",
+              ));
+              setErrors(Object.fromEntries(TAB_KEYS.map((key) => [key, failure])));
+            },
+          });
+      for (const key of TAB_KEYS) {
+          const demand = {
+            active: TABS[activeIndexRef.current].key === key,
+            background: runtime.background !== "off",
+            floorMs: runtime.refreshMs,
+            pages: pageStateRef.current[key]?.pages ?? 1,
+          };
+          const subscribed = client.subscribe({ host, repo: repository, resource: key, demand,
+            sourceCheckpoint: cachedEntry?.tabs[key]?.source ?? null,
+            onSnapshot: (snapshot, receipt) => {
+              receivedSnapshots.add(key);
+              adoptAcquisitionSnapshot(key, snapshot, receipt);
+              setErrors((current) => current[key] === null ? current : { ...current, [key]: null });
+              setWaiting((current) => current[key] ? { ...current, [key]: false } : current);
+              setGovernorDecisions((current) => ({ ...current, [key]:
+                collectorDisplayDecision({ connected: collectorReady, hasSnapshot: true }) }));
+            },
+            onHold: (hold) => setGovernorDecisions((current) => ({ ...current, [key]:
+              collectorDisplayDecision({ connected: collectorReady,
+                hasSnapshot: receivedSnapshots.has(key), hold }) })),
+          });
+          if (subscribed.ok) handles.set(key, subscribed.value);
+      }
+      fetchTabRef.current = (key, request = {}) => {
+        const handle = handles.get(key);
+        if (!handle) return;
+        if (request.kind === "tab-switch") {
+          for (const [candidate, candidateHandle] of handles) {
+            candidateHandle.updateDemand({ active: candidate === key, background: runtime.background !== "off",
+              floorMs: runtime.refreshMs, pages: pageStateRef.current[candidate]?.pages ?? 1 });
+          }
+        } else {
+          handle.updateDemand({ active: true, background: runtime.background !== "off",
+            floorMs: runtime.refreshMs, pages: pageStateRef.current[key]?.pages ?? 1 });
+        }
+        handle.refresh(request.force === true);
+      };
+      return () => {
+        cancelled = true;
+        fetchTabRef.current = null;
+        for (const handle of handles.values()) handle.close();
+        client.close();
+        controller.abort();
+      };
+    }
+
+    function ensureAcquisitionSubscription(key, currentIdentity, { synchronizeDemand = true } = {}) {
+      const repository = effectiveRuntimeRepository({ remoteUrls });
+      const pages = pageStateRef.current[key]?.pages ?? 1;
+      const query = acquisitionQueryForTab(key, currentIdentity, repository, pages);
+      if (!query) return null;
+      const queryKey = acquisitionQueryKey(query);
+      let subscription = acquisitionSubscriptions.get(key);
+      if (subscription && (subscription.requestedKey ?? subscription.queryKey) !== queryKey) {
+        acquisitionEngine.unsubscribe(subscription.id);
+        acquisitionSubscriptions.delete(key);
+        subscription = null;
+      }
+      const demand = {
+        active: TABS[activeIndexRef.current].key === key,
+        floorMs: runtime.refreshMs,
+        pages,
+      };
+      if (!subscription) {
+        const registered = acquisitionEngine.subscribe(query, demand, (snapshot) =>
+          adoptAcquisitionSnapshot(key, snapshot));
+        if (!registered.ok) return registered;
+        subscription = { ...registered.value, requestedKey: queryKey };
+        acquisitionSubscriptions.set(key, subscription);
+        if (subscription.snapshot) adoptAcquisitionSnapshot(key, subscription.snapshot);
+      } else if (synchronizeDemand) {
+        const updated = acquisitionEngine.updateDemand(subscription.id, demand);
+        if (!updated.ok) return updated;
+      }
+      if (!synchronizeDemand) return { ok: true, value: subscription };
+      for (const [candidateKey, candidate] of acquisitionSubscriptions) {
+        if (candidateKey === key) continue;
+        acquisitionEngine.updateDemand(candidate.id, {
+          active: TABS[activeIndexRef.current].key === candidateKey,
+          floorMs: runtime.refreshMs,
+          pages: pageStateRef.current[candidateKey]?.pages ?? 1,
+        });
+      }
+      return { ok: true, value: subscription };
+    }
+
+    function acquisitionPublication(key, acquisition, transition, completedAt) {
+      const rows = transition.kind === "changed" ? transition.data : dataRef.current[key];
+      const meta = transition.kind === "changed" ? transition.meta : metaRef.current[key];
+      if (!Array.isArray(rows) || !meta) return null;
+      const prefix = `${key}\0`;
+      const entities = [...entityRef.current.entries()]
+        .filter(([entityKey_]) => entityKey_.startsWith(prefix))
+        .map(([entityKey_, entity]) => ({ key: entityKey_, etag: entity.etag, body: entity.body }));
+      return {
+        rows,
+        pageInfo: {
+          loadedPages: pageStateRef.current[key]?.pages ?? 1,
+          hasNextPage: pageStateRef.current[key]?.hasNextPage === true,
+        },
+        raw: JSON.stringify(rows),
+        entities,
+        lastSuccessAt: completedAt,
+        lastChangedAt: transition.kind === "changed" ? completedAt : meta.at,
+        nextDueAt: completedAt + pollPolicyInterval({
+          tab: key,
+          floorMs: acquisition.demand?.floorMs ?? runtime.refreshMs,
+          demand: acquisition.demand?.active ? "active" : "inactive",
+          unchangedCount: unchangedPolls[key],
+          inProgressCI: key === "actions" && actionsInProgress(rows),
+          background: runtime.background,
+        }),
+        hold: null,
+        capabilities: acquisition.capabilities ?? {},
+        requestMetrics: acquisition.requestMetrics ?? {},
+        uncertainReceipts: acquisition.uncertainReceipts ?? [],
+        repositoryIdentity: acquisition.repositoryIdentity,
+        meta,
+        securityNotes: key === "security"
+          ? transition.notes ?? securityNotesRef.current
+          : [],
+        securityBlind: key === "security"
+          ? transition.blind ?? securityBlindRef.current
+          : false,
+      };
+    }
+
+    function finishAcquisition(key, acquisition, transition, completedAt) {
+      if (!acquisition) return { ok: true };
+      const publication = acquisitionPublication(key, acquisition, transition, completedAt);
+      if (!publication) {
+        return acquisitionEngine.refresh(acquisition.id, { cancel: acquisition.claim });
+      }
+      return acquisitionEngine.refresh(acquisition.id, {
+        claim: acquisition.claim,
+        publish: publication,
+      });
+    }
+
+    function cancelAcquisition(acquisition) {
+      if (acquisition) void acquisitionEngine.refresh(acquisition.id, { cancel: acquisition.claim });
+    }
+
+    function failAcquisition(acquisition, failure) {
+      if (acquisition) void acquisitionEngine.refresh(acquisition.id, {
+        claim: acquisition.claim,
+        failure,
+      });
+    }
+
+    async function startPendingAcquisitionTransport(key, item, currentScope, reservationId, nowMs, signal,
+      automaticStatusVisible) {
+      const descriptor = tabForKey(key);
+      const transported = await runStartedAcquisitionTransport(
+        () => {
+          const admitted = inspectGovernor(currentScope, nowMs);
+          if (!admitted.ok) return admitted;
+          return acquisitionEngine.refresh(item.acquisition.id, { started: {
+            ...item.acquisition.claim,
+            receipt: {
+              reservationId,
+              accessKey: currentScope.accessKey,
+              epochs: admitted.value.epochs,
+            },
+          } });
+        },
+        () => {
+          replaceActivePoll(item.kind, nowMs);
+          if (item.force) coordinator.invalidate();
+          return commit(
+            key,
+            () => descriptor.fetch({
+              signal,
+              entities: entityRef.current,
+              force: item.force,
+              catalog: workflowCatalogRef.current,
+              pages: item.acquisition.demand?.pages ?? pageStateRef.current[key]?.pages ?? 1,
+              governor: { scope: currentScope, leaseId },
+              previousRaw: rawRef.current[key] ?? null,
+            }),
+            {
+              force: item.force,
+              manual: item.manual === true,
+              scope: currentScope,
+              reservationId,
+              admittedAt: nowMs,
+              automaticStatusVisible,
+              acquisition: item.acquisition,
+              onSettled: () => finishPending(key, item.intentId),
+            },
+          );
+        },
+      );
+      if (transported.ok) return transported;
+      pauseCoordination(key, transported.reason);
+      if (pendingFailureIsTerminal(transported.reason)) {
+        cancelAcquisition(item.acquisition);
+        finishPending(key, item.intentId);
+      } else {
+        armWake("data", governorControlRetryAt(nowMs, runtime.refreshMs), dataWake);
+      }
+      return transported;
+    }
 
     // Rows are the only record of whether CI is busy, so this reads them rather
     // than keeping a second copy that can fall out of step with the screen. A
     // caller that has just parsed newer rows passes them, because dataRef only
     // catches up on the next render.
     function actionsInProgress(rows = dataRef.current.actions) {
-      return Array.isArray(rows) && rows.some((row) => row.status !== "completed");
+      return hasActionsInProgress(rows);
     }
 
     function pollIntervalFor(key, activeKey, { actionRows } = {}) {
@@ -10485,7 +16503,11 @@ function App({ onCreateRemote = () => {} } = {}) {
 
     function retireCurrentScope() {
       if (!cleanupScope || !registeredScopeHash) return;
-      for (const item of pending.values()) cancelIntent(cleanupScope, item.intentId, Date.now());
+      for (const key of [...pending.keys()]) cancelPending(key, cleanupScope);
+      for (const subscription of acquisitionSubscriptions.values()) {
+        acquisitionEngine.unsubscribe(subscription.id);
+      }
+      acquisitionSubscriptions.clear();
       if (!Object.values(inFlightRef.current).some(Boolean)) releaseLease(cleanupScope, leaseId);
     }
 
@@ -10633,6 +16655,16 @@ function App({ onCreateRemote = () => {} } = {}) {
       armFromState();
     }
 
+    function cancelPending(key, currentScope, at = Date.now()) {
+      const item = pending.get(key);
+      if (!cancelCoordinatedPending(item, {
+        cancelGovernor: (intentId) => cancelIntent(currentScope, intentId, at),
+        cancelAcquisition,
+      })) return false;
+      pending.delete(key);
+      return true;
+    }
+
     // Manual and tab-switch work replaces the automatic check that would
     // otherwise be due, rather than being added to it.
     function replaceActivePoll(kind, at) {
@@ -10645,10 +16677,9 @@ function App({ onCreateRemote = () => {} } = {}) {
     // the tab's failure ladder. `force` is the separate, stronger request that
     // also drops validators -- the `R` key. `r` is manual and not forced, which
     // is what makes a quiet refresh cost nothing.
-    function requestTab(key, kind = "active", { force = false } = {}) {
+    async function requestTab(key, kind = "active", { force = false } = {}) {
       const manual = kind === "manual";
       const signal = controller.signal;
-      const descriptor = tabForKey(key);
       const monotonicNow = performance.now();
       if (pendingBlockPublications.size > 0) {
         pauseCoordination(key, "block-unpublished");
@@ -10718,21 +16749,71 @@ function App({ onCreateRemote = () => {} } = {}) {
         if (!manual || existing.kind === "manual") {
           return Promise.resolve({ persisted: true, retry: false, kind, key });
         }
-        cancelIntent(currentScope, existing.intentId, nowMs);
-        pending.delete(key);
+        cancelPending(key, currentScope, nowMs);
       }
+      const acquisitionSubscription = ensureAcquisitionSubscription(key, identity());
+      if (!acquisitionSubscription?.ok) {
+        pauseCoordination(key, acquisitionSubscription?.reason ?? "acquisition-unavailable");
+        return { persisted: false, retry: true, kind, key };
+      }
+      const ownership = await acquisitionEngine.refresh(acquisitionSubscription.value.id, {
+        // Manual refresh and viewport page demand both request a new shared
+        // generation now. Only uppercase R sets transport `force` below and
+        // drops validators; lowercase r and pagination remain conditional.
+        force: manual || force,
+      });
+      if (!ownership.ok) {
+        pauseCoordination(key, ownership.reason);
+        return { persisted: false, retry: true, kind, key };
+      }
+      setRuntimeAcquisitionHold(
+        acquisitionEngine,
+        acquisitionSubscriptions,
+        key,
+        null,
+        currentScope.accessKey,
+      );
+      if (ownership.value.role !== "producer") {
+        if (ownership.value.snapshot) adoptAcquisitionSnapshot(key, ownership.value.snapshot);
+        if (ownership.value.sharingCount > 1) {
+          setTabGovernorDecision(key, {
+            mode: "waiting",
+            waitCause: "shared-lane",
+            sharingCount: ownership.value.sharingCount,
+            sharedData: Boolean(ownership.value.snapshot),
+          });
+        } else if (ownership.value.reason === "fresh" &&
+            ownership.value.snapshot?.nextDueAt > nowMs) {
+          setTabGovernorDecision(key, { mode: "waiting", notBefore: ownership.value.snapshot.nextDueAt });
+        } else {
+          setTabGovernorDecision(key, null);
+        }
+        setTabWaiting(key, false);
+        rescheduleTab(key, nowMs);
+        return { persisted: true, retry: false, kind, key };
+      }
+      const acquisition = {
+        id: acquisitionSubscription.value.id,
+        demand: ownership.value.demand,
+        claim: {
+          nonce: ownership.value.nonce,
+          generation: ownership.value.generation,
+          accessKey: currentScope.accessKey,
+        },
+      };
       const intentId = governorId();
       const request = {
         id: intentId,
         leaseId,
         tab: key,
-        priority: kind,
+        priority: manual ? "manual" : ownership.value.demand?.active ? "active" : "background",
         costs: tabRequestCost(key),
         requestedAt: nowMs,
         expiresAt: nowMs + GOVERNOR_LEASE_TTL_MS,
       };
       const registered = registerIntent(currentScope, request);
       if (!registered.ok) {
+        cancelAcquisition(acquisition);
         pauseCoordination(key, registered.reason);
         return Promise.resolve({ persisted: false, retry: true, kind, key });
       }
@@ -10742,6 +16823,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         kind,
         force,
         manual,
+        acquisition,
         wasDeferred: false,
         ...sharedLaneEvidence(decision),
       });
@@ -10761,7 +16843,10 @@ function App({ onCreateRemote = () => {} } = {}) {
       const started = startReservation(currentScope, decision.reservationId, nowMs);
       if (!started.ok) {
         pauseCoordination(key, started.reason);
-        if (pendingFailureIsTerminal(started.reason)) finishPending(key, intentId);
+        if (pendingFailureIsTerminal(started.reason)) {
+          cancelAcquisition(acquisition);
+          finishPending(key, intentId);
+        }
         else armWake("data", governorControlRetryAt(nowMs, runtime.refreshMs), dataWake);
         return Promise.resolve({ persisted: true, retry: false, kind, key });
       }
@@ -10776,29 +16861,12 @@ function App({ onCreateRemote = () => {} } = {}) {
         return Promise.resolve({ persisted: true, retry: false, kind, key });
       }
       setTabWaiting(key, false);
-      replaceActivePoll(kind, nowMs);
-      if (force) coordinator.invalidate();
-      return commit(
-        key,
-        () => descriptor.fetch({
-          signal,
-          entities: entityRef.current,
-          force,
-          catalog: workflowCatalogRef.current,
-          pages: pageStateRef.current[key]?.pages ?? 1,
-          governor: { scope: currentScope, leaseId },
-          previousRaw: rawRef.current[key] ?? null,
-        }),
-        {
-          force,
-          manual,
-          scope: currentScope,
-          reservationId: decision.reservationId,
-          admittedAt: nowMs,
-          automaticStatusVisible: false,
-          onSettled: () => finishPending(key, intentId),
-        },
-      ).then(() => ({ persisted: true, retry: false, kind, key }));
+      const item = pending.get(key);
+      if (!item) return { persisted: false, retry: false, kind, key };
+      await startPendingAcquisitionTransport(
+        key, item, currentScope, decision.reservationId, nowMs, signal, false,
+      );
+      return { persisted: true, retry: false, kind, key };
     }
     fetchTabRef.current = (key, { force = false, kind = force ? "manual" : "active" } = {}) => {
       if (kind === "tab-switch") {
@@ -10819,8 +16887,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         if (kind === "tab-switch") {
           for (const [pendingKey, item] of [...pending]) {
             if (pendingKey !== key && ["active", "tab-switch"].includes(item.kind)) {
-              cancelIntent(currentScope, item.intentId, requestedAt);
-              pending.delete(pendingKey);
+              cancelPending(pendingKey, currentScope, requestedAt);
             }
           }
         }
@@ -10836,7 +16903,10 @@ function App({ onCreateRemote = () => {} } = {}) {
         const decision = readIntentDecision(currentScope, item.intentId, nowMs, item);
         if (!decision.ok) {
           pauseCoordination(key, decision.reason);
-          if (pendingFailureIsTerminal(decision.reason)) pending.delete(key);
+          if (pendingFailureIsTerminal(decision.reason)) {
+            cancelAcquisition(item.acquisition);
+            pending.delete(key);
+          }
           else armWake("data", governorControlRetryAt(nowMs, runtime.refreshMs), dataWake);
           continue;
         }
@@ -10854,7 +16924,10 @@ function App({ onCreateRemote = () => {} } = {}) {
         const started = startReservation(currentScope, decision.value.reservationId, nowMs);
         if (!started.ok) {
           pauseCoordination(key, started.reason);
-          if (pendingFailureIsTerminal(started.reason)) pending.delete(key);
+          if (pendingFailureIsTerminal(started.reason)) {
+            cancelAcquisition(item.acquisition);
+            pending.delete(key);
+          }
           else armWake("data", governorControlRetryAt(nowMs, runtime.refreshMs), dataWake);
           armFromState(nowMs);
           continue;
@@ -10870,29 +16943,14 @@ function App({ onCreateRemote = () => {} } = {}) {
           continue;
         }
         setTabWaiting(key, false);
-        replaceActivePoll(item.kind, nowMs);
-        if (item.force) coordinator.invalidate();
-        const descriptor = tabForKey(key);
-        void commit(
+        void startPendingAcquisitionTransport(
           key,
-          () => descriptor.fetch({
-            signal: controller.signal,
-            entities: entityRef.current,
-            force: item.force,
-            catalog: workflowCatalogRef.current,
-            pages: pageStateRef.current[key]?.pages ?? 1,
-            governor: { scope: currentScope, leaseId },
-            previousRaw: rawRef.current[key] ?? null,
-          }),
-          {
-            force: item.force,
-            manual: item.manual === true,
-            scope: currentScope,
-            reservationId: decision.value.reservationId,
-            admittedAt: nowMs,
-            automaticStatusVisible: item.wasDeferred && !item.force,
-            onSettled: () => finishPending(key, item.intentId),
-          },
+          item,
+          currentScope,
+          decision.value.reservationId,
+          nowMs,
+          controller.signal,
+          item.wasDeferred && !item.force,
         );
       }
     }
@@ -10974,6 +17032,8 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (cancelled) return;
       const nowMs = Date.now();
       const currentScope = ensureScope(nowMs, { maintain: true });
+      const activeKey = TABS[activeIndexRef.current].key;
+      if (currentScope) ensureAcquisitionSubscription(activeKey, identity(), { synchronizeDemand: false });
       if (currentScope && pendingBlockPublications.size > 0) {
         const beforeProbe = inspectGovernor(currentScope, nowMs);
         attemptPendingBlockPublications(
@@ -10984,12 +17044,12 @@ function App({ onCreateRemote = () => {} } = {}) {
         );
       }
       const refreshed = currentScope
-        ? await refreshSharedBudget(currentScope, leaseId, controller.signal)
+        ? await refreshRuntimeBudget(currentScope)
         : { ok: false, reason: runtimeIdentityCoordinator?.inspect()?.reason ?? "stale" };
       if (cancelled) return;
       const checkedAt = Date.now();
       const snapshot = currentScope ? inspectGovernor(currentScope, checkedAt) : refreshed;
-      const activeKey = TABS[activeIndexRef.current].key;
+      if (currentScope) reconcileRuntimeUncertainty(currentScope, snapshot);
       if (currentScope && snapshot.ok && pendingBlockPublications.size > 0) {
         attemptPendingBlockPublications(currentScope, checkedAt, snapshot.value);
       }
@@ -11048,11 +17108,13 @@ function App({ onCreateRemote = () => {} } = {}) {
         armWake("control", governorControlRetryAt(Date.now(), runtime.refreshMs), controlWake);
         return;
       }
-      const refreshed = await refreshSharedBudget(currentScope, leaseId, controller.signal);
+      const activeKey = TABS[activeIndexRef.current].key;
+      ensureAcquisitionSubscription(activeKey, identity(), { synchronizeDemand: false });
+      const refreshed = await refreshRuntimeBudget(currentScope);
       if (cancelled) return;
       const checkedAt = Date.now();
       const snapshot = inspectGovernor(currentScope, checkedAt);
-      const activeKey = TABS[activeIndexRef.current].key;
+      reconcileRuntimeUncertainty(currentScope, snapshot);
       publishControlStatus(activeKey, refreshed, snapshot, checkedAt);
       const controlReady = governorControlReady(
         refreshed,
@@ -11077,7 +17139,11 @@ function App({ onCreateRemote = () => {} } = {}) {
       queuedManual.clear();
       manualInFlight.clear();
       wakeScheduler.clearAll();
-      for (const item of pending.values()) cancelIntent(cleanupScope, item.intentId, Date.now());
+      for (const key of [...pending.keys()]) cancelPending(key, cleanupScope);
+      for (const subscription of acquisitionSubscriptions.values()) {
+        acquisitionEngine.unsubscribe(subscription.id);
+      }
+      acquisitionSubscriptions.clear();
       if (cleanupScope && registeredScopeHash) releaseLease(cleanupScope, leaseId);
       if (governorRef.current?.leaseId === leaseId) governorRef.current = null;
       if (contextCoordinatorRef.current === coordinator) contextCoordinatorRef.current = null;
@@ -11087,7 +17153,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       // needed.
       controller.abort();
     };
-  }, [dashboardCacheWriter, screenReader]);
+  }, [acquisitionEngine, cachedEntry?.tabs, dashboardCacheWriter, screenReader, sshCacheIdentity]);
 
   // Background tabs can be up to BACKGROUND_EVERY ticks stale, so the tab you
   // switch to refreshes straight away rather than showing old data until its
@@ -11116,16 +17182,21 @@ function App({ onCreateRemote = () => {} } = {}) {
     TABS.map((t) => [t.key, data[t.key] == null && !errors[t.key] && loading[t.key]]),
   );
   const anyFirstLoad = Object.values(firstLoad).some(Boolean);
-  const semanticStatus = refreshStatus({
+  const statusDisconnected = runtime.connect !== null
+    ? activeGovernorDecision?.disconnected === true
+    : data[tab.key] !== null && !runtimeIdentityCoordinator?.current();
+  let semanticStatus = refreshStatus({
     widthMode: resizeRef.current.active,
     remoteSetup,
-    visibleLoading: Boolean(loading[tab.key]),
+    visibleLoading: Boolean(loading[tab.key]) && !statusDisconnected,
     visibleInFlight: Boolean(activeRequestStatus),
     automaticStatusVisible: Boolean(activeRequestStatus?.automaticStatusVisible),
     governorDecision: activeGovernorDecision,
     activeError: tabError,
     securityIncomplete:
       tab.key === "security" && securityBlind,
+    sharedData: activeGovernorDecision?.sharedData === true,
+    disconnected: statusDisconnected,
     screenReader,
   });
   const showSpinner = !remoteSetup && ANIMATE && (semanticStatus.animate || hasRunningVisible);
@@ -11222,8 +17293,12 @@ function App({ onCreateRemote = () => {} } = {}) {
   // only moves when the *payload* changes -- see lastOkRef. Reading a ref during
   // render lags by one render, which is harmless here because `now` advances on
   // its own and the label is minute-granular by design.
-  const lastOk = lastOkRef.current[tab.key];
-  const staleFor = lastOk == null ? null : now.getTime() - lastOk;
+  const collectorAge = collectorSourceAgeRef.current[tab.key];
+  const sourceAgeMs = collectorAge
+    ? collectorAge.ageMs + Math.max(0, performance.now() - collectorAge.measuredAt)
+    : null;
+  const lastOk = sourceAgeMs === null ? lastOkRef.current[tab.key] : now.getTime() - sourceAgeMs;
+  const staleFor = sourceAgeMs ?? (lastOk == null ? null : now.getTime() - lastOk);
   const staleAt = freshnessDeadline({
     lastOk,
     refreshMs: runtime.refreshMs,
@@ -11235,6 +17310,12 @@ function App({ onCreateRemote = () => {} } = {}) {
     staleFor != null && staleAt != null && now.getTime() > staleAt
       ? `stale ${formatDuration(Math.min(staleFor, 359_999_000))}`
       : null;
+  if (staleLabel && ["watching", "shared"].includes(semanticStatus.kind)) {
+    semanticStatus = refreshStatus({
+      stale: true,
+      disconnected: data[tab.key] !== null && !runtimeIdentityCoordinator?.current(),
+    });
+  }
 
   const allItems = items ?? [];
   const tabOffsetRaw = offset[tab.key] ?? 0;
@@ -11627,6 +17708,13 @@ function restoreScreen() {
 // Both messages go through redact(): a stack can carry a URL with inline
 // credentials, and this output is what a user pastes into a bug report -- the
 // same reasoning --doctor already applies to its own report.
+function crashDiagnostic(label, err) {
+  return [
+    `gh-glance: ${label}`,
+    redact(err instanceof Error ? (err.stack ?? err.message) : String(err)),
+  ].join("\n");
+}
+
 function installCrashHandlers(unmountApp) {
   const fail = (label) => (err) => {
     unmountApp();
@@ -11636,15 +17724,28 @@ function installCrashHandlers(unmountApp) {
     } catch {
       // Nothing useful to do about a failure here, and the stack below matters more.
     }
-    console.error(`gh-glance: ${label}`);
-    console.error(redact(err instanceof Error ? (err.stack ?? err.message) : String(err)));
+    console.error(crashDiagnostic(label, err));
     process.exit(1);
   };
   process.on("uncaughtException", fail("crashed"));
   process.on("unhandledRejection", fail("unhandled promise rejection"));
 }
 
-if (IS_MAIN) {
+if (IS_MAIN && runtime.headlessMode) {
+  try {
+    if (runtime.headlessMode.type === "serve") {
+      await runCollectorForeground(runtime.headlessMode.config);
+    } else {
+      await runCollectorStdioBridge();
+    }
+    process.exit(0);
+  } catch (error) {
+    console.error(`gh-glance: ${redact(shortErr(error))}`);
+    process.exit(1);
+  }
+}
+
+if (IS_MAIN && !runtime.headlessMode) {
   let app;
   const unmountApp = () => {
     try {
@@ -11794,6 +17895,7 @@ if (IS_MAIN) {
 // Exported for unit tests. The dashboard itself is still one file; these are
 // the pure functions worth pinning, and nothing here is part of the public API.
 export {
+  runGh,
   retryIdentityCompletion,
   createSettlementContext,
   startIdentityControl,
@@ -11927,6 +18029,8 @@ export {
   AUTH_RETRY_MS,
   BACKOFF_STEPS_MS,
   redact,
+  verboseLogLine,
+  crashDiagnostic,
   classify,
   parseJsonOutput,
   parseGhApiResponse,
@@ -11948,6 +18052,55 @@ export {
   conditionalBatchResult,
   publishStagedEntities,
   fetchAlertSource,
+  fetchSecurity,
+  COLLECTOR_PROTOCOL_VERSION,
+  COLLECTOR_FRAME_MAX_BYTES,
+  COLLECTOR_CHUNK_FRAME_MAX_BYTES,
+  COLLECTOR_ASSEMBLY_MAX_BYTES,
+  COLLECTOR_ASSEMBLY_TIMEOUT_MS,
+  collectorSocketPath,
+  normalizeGitHubAppProvider,
+  signGitHubAppJwt,
+  githubAppChildEnvironment,
+  githubAppAccessIdentity,
+  githubAppResourceCapabilities,
+  githubAppSecurityPolicy,
+  applyGitHubAppSecurityPolicy,
+  createGitHubAppProvider,
+  requestGitHubAppToken,
+  readInstallationCoreBudget,
+  normalizeCollectorConfig,
+  loadCollectorConfig,
+  verifyWebhookSignature,
+  mapWebhookInvalidations,
+  createWebhookQueue,
+  createWebhookIngress,
+  webhookQueuePath,
+  webhookReconciliationInterval,
+  encodeCollectorFrame,
+  createCollectorFrameDecoder,
+  validateCollectorClientMessage,
+  encodeCollectorSnapshotFrames,
+  createCollectorSnapshotAssembler,
+  createCollectorSnapshotEncodingCache,
+  createCollectorSender,
+  projectCollectorSnapshot,
+  createCollectorService,
+  createCollectorAcquisitionRuntime,
+  collectorPublicationFromResult,
+  runCollectorForeground,
+  runCollectorStdioBridge,
+  createLocalCollectorClient,
+  createSshCollectorClient,
+  createSshCollectorTransport,
+  createCollectorSourceAgeTracker,
+  validateSshAlias,
+  collectorSshArgv,
+  collectorSshEnvironment,
+  sshReconnectDelay,
+  sshCollectorCacheIdentity,
+  collectorCachedSourceAge,
+  collectorDisplayDecision,
   formatAge,
   formatDuration,
   usableSize,
@@ -11983,6 +18136,24 @@ export {
   mergeDashboardCacheSnapshots,
   nextSecurityRaw,
   shouldCheckpointFreshness,
+  ACQUISITION_STORE_VERSION,
+  ACQUISITION_CLAIM_TTL_MS,
+  ACQUISITION_HEARTBEAT_MS,
+  ACQUISITION_MAX_BYTES,
+  ACQUISITION_MAX_ENTITY_BYTES,
+  ACQUISITION_MAX_ENTITIES,
+  ACQUISITION_MAX_LIVE_TARGETS,
+  ACQUISITION_MAX_SUBSCRIPTIONS,
+  acquisitionStorePath,
+  acquisitionQueryKey,
+  acquisitionQueryForTab,
+  acquisitionHold,
+  acquisitionDiagnostics,
+  acquisitionRequestMetrics,
+  acquisitionFailureHold,
+  setRuntimeAcquisitionHold,
+  loadAcquisitionStore,
+  createAcquisitionEngine,
   pollPolicyInterval,
   advanceUnchangedCount,
   POLL_ACTIVE_CI_MS,
@@ -12004,6 +18175,7 @@ export {
   createWakeScheduler,
   createSingleFlightWake,
   pendingFailureIsTerminal,
+  cancelCoordinatedPending,
   runtimeIntentGate,
   rateLimitBlockDecision,
   coordinationNotice,
@@ -12013,6 +18185,8 @@ export {
   rateLimitBlockProbeRecovered,
   admitGovernorOperation,
   runAdmittedOperation,
+  abortableDelay,
+  awaitCollectorReservation,
   GOVERNOR_ADMISSION_WAIT_MS,
   pollResultTransition,
   forcedBackoffKeys,
