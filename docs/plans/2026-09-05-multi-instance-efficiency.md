@@ -3,7 +3,7 @@
 Date: 2026-09-05  
 Source: `develop` at `b819f42e87922671a35bb72052bd0ede445b74be` (0.11.2)  
 Research: [multi-instance API efficiency and architecture](../research/2026-09-05-multi-instance-api-efficiency-and-architecture.md)  
-Status: Implementation underway; phases 1-6 completed and locally verified.
+Status: All 12 phases completed and locally verified; remote activation and release remain separate.
 
 ## Outcome and scope
 
@@ -196,6 +196,6 @@ Planning review is complete. Independent controller and whole-plan reviews ident
 - [x] Phase 9
 - [x] Phase 10
 - [x] Phase 11
-- [ ] Phase 12
+- [x] Phase 12
 
 No unresolved design questions. User setup values (SSH alias, repository allowlist, App installation ID and private-key path, webhook secret and reverse-proxy endpoint) are runtime configuration inputs, not placeholders in the implementation design. No live setup is required to complete its local automated acceptance.

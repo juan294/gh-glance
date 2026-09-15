@@ -60,8 +60,8 @@ Complete independent compliance and quality review, integrate all finished work 
 
 ## Completion
 
-- [ ] All scope and traceability criteria satisfied with local evidence.
-- [ ] Canonical gates, Node/platform selection, workload comparison and package checks passed.
-- [ ] Documentation and ADR guarantees match measured behavior.
-- [ ] Independent review complete; all requested work integrated locally.
-- [ ] Validation report records remaining external activation steps without calling them implemented deployments; stop before release.
+- [x] All scope and traceability criteria satisfied with local evidence.
+- [x] Canonical gates, Node/platform selection, workload comparison and package checks passed.
+- [x] Documentation and ADR guarantees match measured behavior.
+- [x] Independent review complete; all requested work integrated locally.
+- [x] [Validation report](phase-12-validation.md) records remaining external activation steps without calling them implemented deployments; stop before release.
