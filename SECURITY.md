@@ -6,7 +6,8 @@ Only the current release line receives security patches.
 
 | Version | Supported           |
 | ------- | ------------------- |
-| 0.14.x  | Yes                 |
+| 0.15.x  | Yes                 |
+| 0.14.x  | No                  |
 | 0.13.x  | No                  |
 | 0.12.x  | No                  |
 | 0.11.x  | No                  |
