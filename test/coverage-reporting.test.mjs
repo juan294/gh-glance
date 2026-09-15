@@ -89,6 +89,11 @@ test('coverage workflow reports PTY runtime visibility without a threshold gate'
   assert.doesNotMatch(workflow, /test-coverage-(?:lines|branches|functions)=/);
 });
 
+test('instrumented unit coverage is serialized so latency contracts measure the product path', () => {
+  const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+  assert.match(pkg.scripts['test:coverage'], /--test-concurrency=1/);
+});
+
 test('reporter fails before networking when required provenance is absent', () => {
   const result = spawnSync('bash', ['scripts/report-coverage.sh'], {
     encoding: 'utf8',

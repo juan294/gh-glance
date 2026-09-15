@@ -24,13 +24,14 @@ process.env.NODE_ENV ??= "production";
 
 import { execFile, spawn } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
   constants as fsConstants,
   chmodSync,
   closeSync,
   fstatSync,
+  fsyncSync,
   mkdirSync,
   lstatSync,
   openSync,
@@ -43,6 +44,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import { createServer as createHttpServer } from "node:http";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { createConnection, createServer } from "node:net";
 import { fileURLToPath } from "node:url";
@@ -5828,6 +5830,18 @@ const COLLECTOR_MAX_CLIENT_QUEUE_FRAMES = 64;
 const COLLECTOR_MAX_CLIENT_QUEUE_BYTES = 4 * 1024 * 1024;
 const COLLECTOR_MAX_AGGREGATE_QUEUE_BYTES = 64 * 1024 * 1024;
 const COLLECTOR_DRAIN_TIMEOUT_MS = 10_000;
+const WEBHOOK_BODY_MAX_BYTES = 25 * 1024 * 1024;
+const WEBHOOK_AGGREGATE_BODY_MAX_BYTES = WEBHOOK_BODY_MAX_BYTES * 2;
+const WEBHOOK_READ_TIMEOUT_MS = 10_000;
+const WEBHOOK_MAX_CONNECTIONS = 32;
+const WEBHOOK_DELIVERY_TTL_MS = 24 * 60 * 60 * 1_000;
+const WEBHOOK_MAX_DELIVERIES = 10_000;
+const WEBHOOK_MAX_INVALIDATIONS = 512;
+const WEBHOOK_COALESCE_MS = 1_000;
+const WEBHOOK_RECONCILE_MS = 300_000;
+const WEBHOOK_DORMANT_RETRY_MS = WEBHOOK_RECONCILE_MS;
+const WEBHOOK_QUEUE_MAX_BYTES = 2 * 1024 * 1024;
+const WEBHOOK_ROUTE = "/webhooks/github";
 const SSH_RECONNECT_STEPS_MS = Object.freeze([1_000, 2_000, 4_000, 8_000, 16_000, 30_000]);
 const SSH_STDERR_MAX_BYTES = 4_096;
 const SSH_ALIAS_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/;
@@ -6038,7 +6052,8 @@ function admitCollectorCanonicalOwnership(pathOptions, target, repositoryIdentit
 }
 
 function normalizeCollectorConfig(raw, { aliases = {} } = {}) {
-  if (!exactKeys(raw, ["version", "providers", "targets"]) || raw.version !== 1 ||
+  if ((!exactKeys(raw, ["version", "providers", "targets"]) &&
+       !exactKeys(raw, ["version", "providers", "targets", "webhook"])) || raw.version !== 1 ||
       !isRecord(raw.providers) || !Array.isArray(raw.targets) || raw.targets.length > 32) return null;
   const providers = {};
   for (const [name, provider] of Object.entries(raw.providers)) {
@@ -6066,7 +6081,661 @@ function normalizeCollectorConfig(raw, { aliases = {} } = {}) {
     targets.push({ host, repo, provider: target.provider, canonical });
   }
   if (targets.length === 0) return null;
-  return { version: 1, providers, targets };
+  const webhook = raw.webhook === undefined ? null : normalizeWebhookConfig(raw.webhook, targets);
+  if (raw.webhook !== undefined && webhook === null) return null;
+  return { version: 1, providers, targets, ...(webhook ? { webhook } : {}) };
+}
+
+function normalizeWebhookConfig(raw, collectorTargets) {
+  if (exactKeys(raw, ["enabled"]) && raw.enabled === false) return { enabled: false };
+  if (!exactKeys(raw, ["enabled", "address", "port", "secretFile", "targets"]) || raw.enabled !== true ||
+      !["127.0.0.1", "::1"].includes(raw.address) || !Number.isSafeInteger(raw.port) ||
+      raw.port < 1 || raw.port > 65_535 || typeof raw.secretFile !== "string" ||
+      raw.secretFile.length === 0 || raw.secretFile.length > 4_096 || !isAbsolute(raw.secretFile) ||
+      !Array.isArray(raw.targets) || raw.targets.length === 0 || raw.targets.length > 32) return null;
+  const targets = [];
+  const seen = new Set();
+  for (const candidate of raw.targets) {
+    if (!exactKeys(candidate, ["host", "repo", "provider", "resources"]) ||
+        !Array.isArray(candidate.resources) || candidate.resources.length === 0 ||
+        candidate.resources.length > TAB_KEYS.length || candidate.resources.some((resource) => !TAB_KEYS.includes(resource)) ||
+        new Set(candidate.resources).size !== candidate.resources.length) return null;
+    const host = normalizeHost(candidate.host);
+    let repo;
+    try { repo = parseRepoTarget(candidate.repo).slug.toLowerCase(); } catch { return null; }
+    const matched = collectorTargets.find((target) => target.host === host &&
+      target.repo.toLowerCase() === repo && target.provider === candidate.provider);
+    const key = `${host}\0${repo}\0${candidate.provider}`;
+    if (!matched || seen.has(key)) return null;
+    seen.add(key);
+    targets.push({ host, repo, provider: candidate.provider, resources: [...candidate.resources] });
+  }
+  return { enabled: true, address: raw.address, port: raw.port, secretFile: raw.secretFile, targets };
+}
+
+function validWebhookDeliveryId(value) {
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function validWebhookEventName(value) {
+  return typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value);
+}
+
+function verifyWebhookSignature(rawBody, signature, secret) {
+  if ((!Buffer.isBuffer(rawBody) && !(rawBody instanceof Uint8Array)) ||
+      typeof signature !== "string" || !/^sha256=[0-9a-f]{64}$/i.test(signature) ||
+      (!Buffer.isBuffer(secret) && !(secret instanceof Uint8Array))) return false;
+  const supplied = Buffer.from(signature.slice(7), "hex");
+  const expected = createHmac("sha256", secret).update(rawBody).digest();
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+}
+
+const WEBHOOK_EVENT_RESOURCES = Object.freeze({
+  workflow_run: "actions",
+  workflow_job: "actions",
+  issues: "issues",
+  pull_request: "prs",
+  pull_request_review: "prs",
+  pull_request_review_comment: "prs",
+  pull_request_review_thread: "prs",
+  dependabot_alert: "security",
+  repository_vulnerability_alert: "security",
+  code_scanning_alert: "security",
+  secret_scanning_alert: "security",
+  secret_scanning_alert_location: "security",
+});
+const WEBHOOK_ACCESS_EVENTS = new Set(["installation", "installation_repositories", "repository"]);
+
+function webhookPayloadRepositories(event, payload) {
+  if (event === "installation") return [];
+  if (event === "installation_repositories") {
+    return [...(Array.isArray(payload.repositories_added) ? payload.repositories_added : []),
+      ...(Array.isArray(payload.repositories_removed) ? payload.repositories_removed : [])]
+      .map((repository) => repository?.full_name);
+  }
+  return [payload.repository?.full_name];
+}
+
+function mapWebhookInvalidations({ event, payload, config, enterpriseHost = null } = {}) {
+  if (!validWebhookEventName(event) || !isRecord(payload) || config?.webhook?.enabled !== true) {
+    return { ok: false, reason: "invalid" };
+  }
+  let resource = WEBHOOK_EVENT_RESOURCES[event] ?? null;
+  if (event === "issue_comment") resource = isRecord(payload.issue?.pull_request) ? "prs" : "issues";
+  const accessRemoved = WEBHOOK_ACCESS_EVENTS.has(event);
+  if (!resource && !accessRemoved) return { ok: true, unsupported: true, invalidations: [] };
+  const selectedHost = enterpriseHost === null || enterpriseHost === undefined || enterpriseHost === ""
+    ? null : normalizeHost(enterpriseHost);
+  if (enterpriseHost && !selectedHost) return { ok: false, reason: "target" };
+  const repositoryNames = webhookPayloadRepositories(event, payload);
+  if (event !== "installation" && (repositoryNames.length === 0 || repositoryNames.some((name) => {
+    try { return parseRepoTarget(name).slug !== String(name); } catch { return true; }
+  }))) return { ok: false, reason: "target" };
+  const names = new Set(repositoryNames.map((name) => name.toLowerCase()));
+  let targets = config.webhook.targets.filter((target) =>
+    (!selectedHost || target.host === selectedHost) && (event === "installation" || names.has(target.repo)));
+  if (!selectedHost && event !== "installation") {
+    const hostsByRepo = new Map();
+    for (const target of targets) hostsByRepo.set(target.repo, (hostsByRepo.get(target.repo) ?? new Set()).add(target.host));
+    if ([...hostsByRepo.values()].some((hosts) => hosts.size !== 1)) return { ok: false, reason: "target" };
+  }
+  if (targets.length === 0) return { ok: false, reason: "target" };
+  const invalidations = targets.flatMap((target) => {
+    const resources = accessRemoved ? TAB_KEYS : target.resources.includes(resource) ? [resource] : [];
+    return resources.map((covered) => ({ host: target.host, repo: target.repo, provider: target.provider,
+      resource: covered, accessRemoved }));
+  });
+  if (invalidations.length === 0) return { ok: true, unsupported: true, invalidations: [] };
+  const unique = new Map(invalidations.map((item) => [webhookInvalidationKey(item), item]));
+  return { ok: true, invalidations: [...unique.values()] };
+}
+
+function webhookInvalidationKey(item) {
+  return createHash("sha256").update(`${item.host}\0${item.repo}\0${item.provider}\0${item.resource}`).digest("hex");
+}
+
+function webhookCoverageKey(item) {
+  return `${item.provider}\0${item.host}\0${item.repo.toLowerCase()}\0${item.resource}`;
+}
+
+function webhookQueuePath(options = {}) {
+  return join(identityRegistryRoot(options), "webhook-queue-v1.json");
+}
+
+function emptyWebhookQueueState() {
+  return { version: 1, deliveries: {}, invalidations: {} };
+}
+
+function normalizeWebhookInvalidationInput(raw) {
+  if (!exactKeys(raw, ["host", "repo", "provider", "resource", "accessRemoved"]) ||
+      !normalizeHost(raw.host) || typeof raw.repo !== "string" || !REPO_PATTERN.test(raw.repo) ||
+      !validCollectorId(raw.provider) || !TAB_KEYS.includes(raw.resource) || typeof raw.accessRemoved !== "boolean") {
+    return null;
+  }
+  return { ...raw, host: normalizeHost(raw.host), repo: raw.repo.toLowerCase() };
+}
+
+function normalizeWebhookInvalidation(raw, expectedKey = null, nowMs = Number.POSITIVE_INFINITY) {
+  if (!exactKeys(raw, ["host", "repo", "provider", "resource", "accessRemoved", "acceptedAt", "dueAt", "revision"]) ||
+      !Number.isFinite(raw.acceptedAt) || raw.acceptedAt < 0 || raw.acceptedAt > nowMs + WEBHOOK_COALESCE_MS ||
+      !Number.isFinite(raw.dueAt) || raw.dueAt < raw.acceptedAt ||
+      raw.dueAt > nowMs + WEBHOOK_DELIVERY_TTL_MS ||
+      !validGovernorId(raw.revision)) return null;
+  const input = normalizeWebhookInvalidationInput({ host: raw.host, repo: raw.repo, provider: raw.provider,
+    resource: raw.resource, accessRemoved: raw.accessRemoved });
+  if (!input) return null;
+  const value = { ...input, acceptedAt: raw.acceptedAt, dueAt: raw.dueAt, revision: raw.revision };
+  return expectedKey === null || webhookInvalidationKey(value) === expectedKey ? value : null;
+}
+
+function normalizeWebhookQueueState(raw, { maxDeliveries = WEBHOOK_MAX_DELIVERIES,
+  maxInvalidations = WEBHOOK_MAX_INVALIDATIONS, nowMs = Date.now() } = {}) {
+  if (!exactKeys(raw, ["version", "deliveries", "invalidations"]) || raw.version !== 1 ||
+      !isRecord(raw.deliveries) || !isRecord(raw.invalidations) ||
+      Object.keys(raw.deliveries).length > maxDeliveries ||
+      Object.keys(raw.invalidations).length > maxInvalidations) return null;
+  const deliveries = {};
+  for (const [id, acceptedAt] of Object.entries(raw.deliveries)) {
+    if (!validWebhookDeliveryId(id) || !Number.isFinite(acceptedAt) || acceptedAt < 0 ||
+        acceptedAt > nowMs + WEBHOOK_COALESCE_MS) return null;
+    deliveries[id.toLowerCase()] = acceptedAt;
+  }
+  const invalidations = {};
+  for (const [key, rawInvalidation] of Object.entries(raw.invalidations)) {
+    if (!/^[0-9a-f]{64}$/.test(key)) return null;
+    const invalidation = normalizeWebhookInvalidation(rawInvalidation, key, nowMs);
+    if (!invalidation) return null;
+    invalidations[key] = invalidation;
+  }
+  return { version: 1, deliveries, invalidations };
+}
+
+function loadWebhookQueueState(path, limits = {}, nowMs = Date.now()) {
+  let fd = null;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > WEBHOOK_QUEUE_MAX_BYTES ||
+        typeof process.getuid === "function" && stat.uid !== process.getuid() ||
+        process.platform !== "win32" && (stat.mode & 0o077) !== 0) return { ok: false, reason: "unsafe" };
+    const value = normalizeWebhookQueueState(JSON.parse(readFileSync(fd, "utf8")), { ...limits, nowMs });
+    return value ? { ok: true, value } : { ok: false, reason: "corrupt" };
+  } catch (error) {
+    return error?.code === "ENOENT" ? { ok: true, value: emptyWebhookQueueState() }
+      : { ok: false, reason: error instanceof SyntaxError ? "corrupt" : "unreadable", error };
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+function writeWebhookQueueState(path, state) {
+  const serialized = `${JSON.stringify(state)}\n`;
+  if (Buffer.byteLength(serialized) > WEBHOOK_QUEUE_MAX_BYTES) return { ok: false, reason: "capacity" };
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  let tempFd = null;
+  let directoryFd = null;
+  try {
+    tempFd = openSync(temp, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+    writeFileSync(tempFd, serialized, { encoding: "utf8" });
+    fsyncSync(tempFd);
+    closeSync(tempFd);
+    tempFd = null;
+    renameSync(temp, path);
+    directoryFd = openSync(dirname(path), fsConstants.O_RDONLY);
+    fsyncSync(directoryFd);
+    return { ok: true };
+  } catch (error) {
+    try { unlinkSync(temp); } catch { /* exact operation-owned temp */ }
+    return { ok: false, reason: "unwritable", error };
+  } finally {
+    if (tempFd !== null) try { closeSync(tempFd); } catch { /* already closed */ }
+    if (directoryFd !== null) try { closeSync(directoryFd); } catch { /* already closed */ }
+  }
+}
+
+function withWebhookQueueLock(path, operation, { pid = process.pid, kill = process.kill.bind(process),
+  waitMs = PERSISTENCE_LOCK_WAIT_MS } = {}) {
+  const lockPath = `${path}.lock`;
+  const deadline = Date.now() + waitMs;
+  const nonce = randomUUID();
+  let fd = null;
+  let identity = null;
+  while (fd === null) {
+    try {
+      fd = openSync(lockPath, "wx", 0o600);
+      identity = fstatSync(fd);
+      writeFileSync(fd, JSON.stringify({ pid, nonce }), { encoding: "utf8" });
+    } catch (error) {
+      if (fd !== null) { try { closeSync(fd); } catch { /* failed acquisition */ } fd = null; }
+      if (identity) unlinkMatchingInode(lockPath, identity);
+      identity = null;
+      if (error?.code !== "EEXIST") return { ok: false, reason: "unwritable" };
+      const owner = readCollectorLock(lockPath, { requireNonce: true });
+      if (owner && pidIsDead(owner.owner.pid, kill) && unlinkMatchingInode(lockPath, owner.identity)) continue;
+      if (Date.now() >= deadline) return { ok: false, reason: "busy" };
+      Atomics.wait(persistenceWaitCell, 0, 0, Math.min(10, waitMs));
+    }
+  }
+  try {
+    return operation();
+  } finally {
+    try { closeSync(fd); } finally { unlinkMatchingInode(lockPath, identity); }
+  }
+}
+
+function createWebhookQueue({ pathOptions = {}, now = Date.now, maxDeliveries = WEBHOOK_MAX_DELIVERIES,
+  maxInvalidations = WEBHOOK_MAX_INVALIDATIONS, pid = process.pid,
+  kill = process.kill.bind(process) } = {}) {
+  const path = webhookQueuePath(pathOptions);
+  ensurePrivateCollectorRoot(dirname(path), pathOptions.platform);
+  const limits = { maxDeliveries, maxInvalidations };
+  const inFlight = new Map();
+  const schedulingMetadata = (state, releasedKey = null) => {
+    const entries = Object.entries(state.invalidations);
+    const eligible = entries.filter(([key, item]) => {
+      const current = inFlight.get(key);
+      return key === releasedKey || !current || item.accessRemoved && !current.accessRemoved;
+    });
+    return {
+      pending: entries.length,
+      nextDueAt: eligible.length === 0 ? null : Math.min(...eligible.map(([, item]) => item.dueAt)),
+    };
+  };
+  const transact = (operation, lockOptions = {}) => withWebhookQueueLock(path, () => {
+    const loaded = loadWebhookQueueState(path, limits, now());
+    if (!loaded.ok) return loaded;
+    const result = operation(loaded.value);
+    if (result?.ok === false) return result;
+    if (result?.changed === false) return { ok: true, value: result.value };
+    const written = writeWebhookQueueState(path, loaded.value);
+    return written.ok ? { ok: true, value: result?.value } : written;
+  }, { pid, kill, ...lockOptions });
+  const pruneDeliveries = (state, at) => {
+    let changed = false;
+    for (const [knownId, acceptedAt] of Object.entries(state.deliveries)) {
+      if (acceptedAt > at - WEBHOOK_DELIVERY_TTL_MS) continue;
+      delete state.deliveries[knownId];
+      changed = true;
+    }
+    return changed;
+  };
+  const inspect = ({ waitMs = PERSISTENCE_LOCK_WAIT_MS } = {}) => transact((state) => ({
+    changed: pruneDeliveries(state, now()),
+    value: {
+      ...schedulingMetadata(state),
+      deliveries: Object.keys(state.deliveries).length,
+      invalidations: Object.values(state.invalidations).map((item) => ({ ...item })),
+    },
+  }), { waitMs });
+  const accept = ({ deliveryId, invalidations }) => {
+    if (!validWebhookDeliveryId(deliveryId) || !Array.isArray(invalidations)) {
+      return { ok: false, reason: "invalid" };
+    }
+    const normalizedInvalidations = invalidations.map(normalizeWebhookInvalidationInput);
+    if (normalizedInvalidations.some((item) => !item)) return { ok: false, reason: "invalid" };
+    const id = deliveryId.toLowerCase();
+    const result = transact((state) => {
+      const at = now();
+      const changed = pruneDeliveries(state, at);
+      if (Object.hasOwn(state.deliveries, id)) {
+        const metadata = schedulingMetadata(state);
+        return { changed, value: { duplicate: true, queued: metadata.pending, nextDueAt: metadata.nextDueAt } };
+      }
+      if (Object.keys(state.deliveries).length >= maxDeliveries) return { ok: false, reason: "capacity" };
+      const incoming = new Map(normalizedInvalidations.map((item) => [webhookInvalidationKey(item), item]));
+      const novel = [...incoming.keys()].filter((key) => !state.invalidations[key]);
+      if (Object.keys(state.invalidations).length + novel.length > maxInvalidations) {
+        return { ok: false, reason: "capacity" };
+      }
+      state.deliveries[id] = at;
+      for (const [key, item] of incoming) {
+        const current = state.invalidations[key];
+        state.invalidations[key] = {
+          host: item.host,
+          repo: item.repo.toLowerCase(),
+          provider: item.provider,
+          resource: item.resource,
+          accessRemoved: item.accessRemoved || current?.accessRemoved === true,
+          acceptedAt: Math.min(at, current?.acceptedAt ?? at),
+          dueAt: Math.min(at + WEBHOOK_COALESCE_MS, current?.dueAt ?? Number.POSITIVE_INFINITY),
+          revision: randomUUID(),
+        };
+      }
+      const metadata = schedulingMetadata(state);
+      return { value: { duplicate: false, queued: metadata.pending, nextDueAt: metadata.nextDueAt } };
+    });
+    return result.ok ? { ok: true, ...result.value } : result;
+  };
+  const drain = async (dispatch) => {
+    if (typeof dispatch !== "function") return { ok: false, reason: "invalid" };
+    const loaded = inspect({ waitMs: 0 });
+    if (!loaded.ok) return loaded;
+    const due = loaded.value.invalidations.filter((item) => item.dueAt <= now());
+    const started = [];
+    let lastMetadata = { pending: loaded.value.pending, nextDueAt: loaded.value.nextDueAt };
+    for (const item of due) {
+      const key = webhookInvalidationKey(item);
+      const current = inFlight.get(key);
+      if (current && (!item.accessRemoved || current.accessRemoved)) continue;
+      const task = (async () => {
+        try {
+          await dispatch({ host: item.host, repo: item.repo, provider: item.provider,
+            resource: item.resource, accessRemoved: item.accessRemoved });
+          const completed = transact((state) => {
+            if (state.invalidations[key]?.revision !== item.revision) {
+              return { changed: false, value: { processed: 0, ...schedulingMetadata(state, key) } };
+            }
+            delete state.invalidations[key];
+            return { value: { processed: 1, ...schedulingMetadata(state, key) } };
+          });
+          if (completed.ok) lastMetadata = completed.value;
+          return completed.ok ? { ok: true, ...completed.value } : completed;
+        } catch (error) {
+          const deferred = transact((state) => {
+            if (state.invalidations[key]?.revision !== item.revision) {
+              return { changed: false, value: { processed: 0, ...schedulingMetadata(state, key) } };
+            }
+            const retryAfterMs = Number.isFinite(error?.retryAfterMs) && error.retryAfterMs > 0
+              ? error.retryAfterMs : WEBHOOK_COALESCE_MS;
+            state.invalidations[key].dueAt = now() + retryAfterMs;
+            return { value: { processed: 0, ...schedulingMetadata(state, key) } };
+          });
+          if (deferred.ok) lastMetadata = deferred.value;
+          return deferred.ok ? { ok: true, ...deferred.value } : deferred;
+        }
+      })().finally(() => { if (inFlight.get(key)?.promise === task) inFlight.delete(key); });
+      inFlight.set(key, { promise: task, accessRemoved: item.accessRemoved });
+      started.push(task);
+    }
+    const results = await Promise.all(started);
+    const failed = results.find((result) => !result.ok);
+    if (failed) return failed;
+    const scheduled = results.map((result) => result.nextDueAt).filter(Number.isFinite);
+    return { ok: true,
+      processed: results.reduce((total, result) => total + result.processed, 0),
+      pending: lastMetadata.pending,
+      nextDueAt: scheduled.length === 0 ? lastMetadata.nextDueAt : Math.min(...scheduled) };
+  };
+  return { accept, inspect, drain, path };
+}
+
+function readWebhookSecret(path) {
+  let fd = null;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const identity = fstatSync(fd);
+    if (!identity.isFile() || identity.size < 1 || identity.size > 65_536 ||
+        typeof process.getuid === "function" && identity.uid !== process.getuid() ||
+        process.platform !== "win32" && (identity.mode & 0o077) !== 0) {
+      throw new Error("webhook secret unavailable");
+    }
+    return readFileSync(fd);
+  } catch {
+    throw new Error("webhook secret unavailable");
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+function webhookHeader(request, name) {
+  const value = request.headers?.[name];
+  return typeof value === "string" ? value : null;
+}
+
+function createWebhookWorker(queue, dispatch, {
+  now = Date.now,
+  setTimeout: setTimeout_ = setTimeout,
+  clearTimeout: clearTimeout_ = clearTimeout,
+} = {}) {
+  let closed = false;
+  let timer = null;
+  let timerDueAt = null;
+  const active = new Set();
+
+  const scheduleAt = (dueAt) => {
+    if (closed || !Number.isFinite(dueAt) || timer !== null && timerDueAt <= dueAt) return;
+    if (timer !== null) clearTimeout_(timer);
+    timerDueAt = dueAt;
+    timer = setTimeout_(() => {
+      timer = null;
+      timerDueAt = null;
+      void run();
+    }, Math.max(1, dueAt - now()));
+    timer?.unref?.();
+  };
+
+  const schedulePending = () => {
+    if (closed || timer !== null) return;
+    const inspected = queue.inspect({ waitMs: 0 });
+    scheduleAt(inspected.ok ? inspected.value.nextDueAt : now() + WEBHOOK_COALESCE_MS);
+  };
+
+  const run = () => {
+    if (closed) return null;
+    const task = queue.drain(dispatch).then((result) => {
+      if (!closed) scheduleAt(result.ok ? result.nextDueAt : now() + WEBHOOK_COALESCE_MS);
+      return result;
+    }).finally(() => { active.delete(task); });
+    active.add(task);
+    return task;
+  };
+
+  const wake = (dueAt = null) => {
+    if (closed) return;
+    if (Number.isFinite(dueAt)) scheduleAt(dueAt);
+    else schedulePending();
+  };
+  schedulePending();
+  return {
+    wake,
+    stop() {
+      closed = true;
+      if (timer !== null) clearTimeout_(timer);
+      timer = null;
+      timerDueAt = null;
+    },
+    async settle() { await Promise.allSettled([...active]); },
+  };
+}
+
+async function createWebhookIngress({
+  config,
+  pathOptions = {},
+  dispatch,
+  createServer: createServer_ = createHttpServer,
+  readSecret: readSecret_ = readWebhookSecret,
+  now = Date.now,
+  setTimeout: setTimeout_ = setTimeout,
+  clearTimeout: clearTimeout_ = clearTimeout,
+  requestTimeoutMs = WEBHOOK_READ_TIMEOUT_MS,
+  bodyMaxBytes = WEBHOOK_BODY_MAX_BYTES,
+  aggregateBodyMaxBytes = WEBHOOK_AGGREGATE_BODY_MAX_BYTES,
+} = {}) {
+  if (config?.webhook?.enabled !== true || typeof dispatch !== "function" ||
+      !Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0 ||
+      !Number.isSafeInteger(bodyMaxBytes) || bodyMaxBytes <= 0 ||
+      !Number.isSafeInteger(aggregateBodyMaxBytes) || aggregateBodyMaxBytes <= 0) {
+    throw new Error("invalid webhook ingress");
+  }
+  const secret = readSecret_(config.webhook.secretFile);
+  const requests = new Set();
+  let aggregateBufferedBytes = 0;
+  let queue = null;
+  let worker = null;
+  let server = null;
+  let serverError = null;
+  let stopping = null;
+  let closePromise = null;
+  try {
+    queue = createWebhookQueue({ pathOptions, now });
+    server = createServer_((request, response) => {
+      if (requests.size >= WEBHOOK_MAX_CONNECTIONS) {
+        response.statusCode = 503;
+        response.end();
+        return;
+      }
+      requests.add(request);
+      let done = false;
+      let bytes = 0;
+      let bodyBuffer = Buffer.alloc(0);
+      let capacity = 0;
+      let deadline = null;
+      const releaseBody = () => {
+        aggregateBufferedBytes -= capacity;
+        capacity = 0;
+        bodyBuffer = Buffer.alloc(0);
+      };
+      const finish = (status) => {
+        if (done) return;
+        done = true;
+        if (deadline !== null) clearTimeout_(deadline);
+        requests.delete(request);
+        releaseBody();
+        response.statusCode = status;
+        response.setHeader?.("cache-control", "no-store");
+        response.end();
+      };
+      const ensureBodyCapacity = (required, { exact = false } = {}) => {
+        if (required <= capacity) return true;
+        const nextCapacity = exact ? required
+          : Math.min(bodyMaxBytes, Math.max(required, Math.max(1_024, capacity * 2)));
+        if (aggregateBufferedBytes + nextCapacity > aggregateBodyMaxBytes) return false;
+        let next;
+        try { next = Buffer.allocUnsafe(nextCapacity); }
+        catch { return false; }
+        aggregateBufferedBytes += nextCapacity;
+        bodyBuffer.copy(next, 0, 0, bytes);
+        aggregateBufferedBytes -= capacity;
+        bodyBuffer = next;
+        capacity = nextCapacity;
+        return true;
+      };
+      deadline = setTimeout_(() => {
+        finish(408);
+        request.destroy?.();
+      }, requestTimeoutMs);
+      deadline?.unref?.();
+      if (request.method !== "POST" || request.url !== WEBHOOK_ROUTE) {
+        finish(request.method === "POST" ? 404 : 405);
+        return;
+      }
+      if (webhookHeader(request, "content-type") !== "application/json") {
+        finish(415);
+        return;
+      }
+      const contentLength = webhookHeader(request, "content-length");
+      const declaredBytes = contentLength === null || !/^\d+$/.test(contentLength) ? null : Number(contentLength);
+      if (contentLength !== null && (declaredBytes === null || declaredBytes > bodyMaxBytes)) {
+        finish(413);
+        request.destroy?.();
+        return;
+      }
+      if (declaredBytes > 0 && !ensureBodyCapacity(declaredBytes, { exact: true })) {
+        finish(503);
+        request.destroy?.();
+        return;
+      }
+      request.on("data", (chunk) => {
+        if (done) return;
+        const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        const required = bytes + value.length;
+        if (required > bodyMaxBytes) {
+          finish(413);
+          request.destroy?.();
+          return;
+        }
+        if (!ensureBodyCapacity(required)) {
+          finish(503);
+          request.destroy?.();
+          return;
+        }
+        value.copy(bodyBuffer, bytes);
+        bytes = required;
+      });
+      request.on("aborted", () => finish(400));
+      request.on("error", () => finish(400));
+      request.on("end", () => {
+        if (done) return;
+        const rawBody = bodyBuffer.subarray(0, bytes);
+        if (!verifyWebhookSignature(rawBody, webhookHeader(request, "x-hub-signature-256"), secret)) {
+          finish(401);
+          return;
+        }
+        const deliveryId = webhookHeader(request, "x-github-delivery");
+        const event = webhookHeader(request, "x-github-event");
+        if (!validWebhookDeliveryId(deliveryId) || !validWebhookEventName(event)) { finish(400); return; }
+        let payload;
+        try { payload = JSON.parse(rawBody.toString("utf8")); }
+        catch { finish(400); return; }
+        const mapped = mapWebhookInvalidations({
+          event,
+          payload,
+          config,
+          enterpriseHost: webhookHeader(request, "x-github-enterprise-host"),
+        });
+        if (!mapped.ok) { finish(400); return; }
+        const accepted = queue.accept({ deliveryId, invalidations: mapped.invalidations });
+        if (!accepted.ok) { finish(accepted.reason === "capacity" ? 503 : 500); return; }
+        worker?.wake(accepted.nextDueAt);
+        finish(202);
+      });
+    });
+    server.maxConnections = WEBHOOK_MAX_CONNECTIONS;
+    await new Promise((resolve, reject) => {
+      const failed = (error) => reject(error);
+      server.once("error", failed);
+      server.listen(config.webhook.port, config.webhook.address, () => {
+        server.off("error", failed);
+        resolve();
+      });
+    });
+    worker = createWebhookWorker(queue, dispatch, { now, setTimeout: setTimeout_, clearTimeout: clearTimeout_ });
+    server.on("error", (error) => { serverError ??= error; });
+    const stop = () => {
+      if (stopping) return stopping;
+      stopping = new Promise((resolve, reject) => {
+        server.close((error) => error || serverError ? reject(error ?? serverError) : resolve());
+        server.closeAllConnections?.();
+      }).finally(() => worker.stop());
+      return stopping;
+    };
+    return {
+      queue,
+      stop,
+      close() {
+        closePromise ??= (async () => {
+          let error = null;
+          try { await stop(); } catch (caught) { error = caught; }
+          try { await worker.settle(); } catch (caught) { error ??= caught; }
+          secret.fill(0);
+          if (error) throw error;
+        })();
+        return closePromise;
+      },
+    };
+  } catch (error) {
+    worker?.stop();
+    for (const request of requests) request.destroy?.();
+    server?.closeAllConnections?.();
+    try {
+      await new Promise((resolve) => {
+        if (!server) { resolve(); return; }
+        server.close(() => resolve());
+      });
+    }
+    catch { /* never started */ }
+    try { await worker?.settle(); } catch { /* preserve the setup error */ }
+    secret.fill(0);
+    throw error;
+  }
+}
+
+function webhookReconciliationInterval({ covered, resource, floorMs, rows, unchangedCount = 0 } = {}) {
+  if (!covered || !TAB_KEYS.includes(resource) || !Number.isFinite(floorMs) ||
+      unchangedCount < POLL_QUIET_AFTER) return null;
+  if (resource === "actions" && hasActionsInProgress(rows)) return null;
+  return Math.max(floorMs, WEBHOOK_RECONCILE_MS);
 }
 
 function loadCollectorConfig(path, options = {}) {
@@ -6664,14 +7333,15 @@ function unlinkMatchingInode(path, identity) {
   }
 }
 
-function readCollectorLock(lockPath) {
+function readCollectorLock(lockPath, { requireNonce = false } = {}) {
   let fd = null;
   try {
     fd = openSync(lockPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
     const identity = fstatSync(fd);
-    if (!identity.isFile() || typeof process.getuid === "function" && identity.uid !== process.getuid() ||
-        process.platform !== "win32" && (identity.mode & 0o077) !== 0) return null;
     const owner = JSON.parse(readFileSync(fd, "utf8"));
+    if (!identity.isFile() || typeof process.getuid === "function" && identity.uid !== process.getuid() ||
+        process.platform !== "win32" && (identity.mode & 0o077) !== 0 ||
+        requireNonce && (!Number.isSafeInteger(owner?.pid) || !validGovernorId(owner?.nonce))) return null;
     return { owner, identity };
   } catch {
     return null;
@@ -6688,7 +7358,7 @@ function removeOwnedCollectorLock(lockPath, nonce) {
 
 async function createCollectorService({ config, pathOptions = {}, runtime, platform = process.platform,
   pid = process.pid, kill = process.kill.bind(process), createServer: createServer_ = createServer,
-  chmod: chmod_ = chmodSync } = {}) {
+  createWebhookServer = createHttpServer, chmod: chmod_ = chmodSync } = {}) {
   if (!config || !runtime || typeof runtime.subscribe !== "function") throw new Error("invalid collector service");
   if (platform === "win32") throw new Error("collector mode is unsupported on Windows");
   const socketPath = collectorSocketPath(pathOptions);
@@ -6832,6 +7502,7 @@ async function createCollectorService({ config, pathOptions = {}, runtime, platf
   }
   let boundSocketIdentity = null;
   let socketIdentity;
+  let webhookIngress = null;
   try {
     boundSocketIdentity = lstatSync(socketPath);
     if (!boundSocketIdentity.isSocket() || boundSocketIdentity.isSymbolicLink()) {
@@ -6841,49 +7512,70 @@ async function createCollectorService({ config, pathOptions = {}, runtime, platf
     socketIdentity = lstatSync(socketPath);
     if (!socketIdentity.isSocket() || socketIdentity.dev !== boundSocketIdentity.dev ||
         socketIdentity.ino !== boundSocketIdentity.ino) throw new Error("collector endpoint ownership changed");
+    if (config.webhook?.enabled === true) {
+      if (typeof runtime.invalidate !== "function") throw new Error("collector webhook invalidation unavailable");
+      webhookIngress = await createWebhookIngress({
+        config,
+        pathOptions,
+        createServer: createWebhookServer,
+        dispatch: (invalidation) => runtime.invalidate(invalidation),
+      });
+    }
   } catch (error) {
-    await new Promise((resolve) => server.close(resolve));
+    try { await webhookIngress?.close(); } catch { /* preserve the startup error */ }
+    try { await new Promise((resolve) => server.close(resolve)); } catch { /* preserve the startup error */ }
+    try { await runtime.close?.(); } catch { /* preserve the startup error */ }
     removeOwnedCollectorLock(lockPath, nonce);
-    await runtime.close?.();
     if (boundSocketIdentity) unlinkMatchingInode(socketPath, boundSocketIdentity);
     throw error;
   }
-  let closed = false;
+  let closePromise = null;
   return {
     socketPath,
     serverEpoch,
-    async close() {
-      if (closed) return;
-      closed = true;
-      for (const client of clients) client.destroy();
-      const replacementPath = `${socketPath}.replacement-${nonce}`;
-      let parkedReplacement = false;
-      try {
-        const current = lstatSync(socketPath);
-        if (current.dev !== socketIdentity.dev || current.ino !== socketIdentity.ino) {
-          renameSync(socketPath, replacementPath);
-          parkedReplacement = true;
+    close() {
+      closePromise ??= (async () => {
+        let closeError = null;
+        try {
+          await webhookIngress?.stop();
+        } catch (error) {
+          closeError = error;
         }
-      } catch { /* the owned endpoint may already be absent */ }
-      let closeError = null;
-      try {
-        await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
-      } catch (error) {
-        closeError = error;
-      }
-      try {
-        await runtime.close?.();
-      } catch (error) {
-        closeError ??= error;
-      } finally {
-        removeOwnedCollectorLock(lockPath, nonce);
-        unlinkMatchingInode(socketPath, socketIdentity);
-        if (parkedReplacement) {
-          try { renameSync(replacementPath, socketPath); }
-          catch { /* retain replacement under its recovery name rather than overwrite a new owner */ }
+        for (const client of clients) client.destroy();
+        const replacementPath = `${socketPath}.replacement-${nonce}`;
+        let parkedReplacement = false;
+        try {
+          const current = lstatSync(socketPath);
+          if (current.dev !== socketIdentity.dev || current.ino !== socketIdentity.ino) {
+            renameSync(socketPath, replacementPath);
+            parkedReplacement = true;
+          }
+        } catch { /* the owned endpoint may already be absent */ }
+        try {
+          await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+        } catch (error) {
+          closeError ??= error;
         }
-      }
-      if (closeError) throw closeError;
+        try {
+          await runtime.close?.();
+        } catch (error) {
+          closeError ??= error;
+        }
+        try {
+          await webhookIngress?.close();
+        } catch (error) {
+          closeError ??= error;
+        } finally {
+          removeOwnedCollectorLock(lockPath, nonce);
+          unlinkMatchingInode(socketPath, socketIdentity);
+          if (parkedReplacement) {
+            try { renameSync(replacementPath, socketPath); }
+            catch { /* retain replacement under its recovery name rather than overwrite a new owner */ }
+          }
+        }
+        if (closeError) throw closeError;
+      })();
+      return closePromise;
     },
   };
 }
@@ -6958,7 +7650,12 @@ function createCollectorAcquisitionRuntime({
   const engine = createAcquisitionEngine({ pathOptions, now });
   const providerContexts = new Map();
   const targetInitializations = new Map();
+  const accessRefreshTargets = new Set();
   const canonicalOwners = new Map(config.targets.map((target) => [target.canonical, target.provider]));
+  const webhookTargets = new Map((config.webhook?.enabled === true ? config.webhook.targets : [])
+    .map((target) => [targetInitializationKey(target), target]));
+  const webhookCoveredQueries = new Set([...webhookTargets.values()].flatMap((target) =>
+    target.resources.map((resource) => webhookCoverageKey({ ...target, resource }))));
   const items = new Set();
   let closed = false;
 
@@ -7041,7 +7738,20 @@ function createCollectorAcquisitionRuntime({
             },
         now(),
       );
-      return collectorPublicationFromResult(resource, result, snapshot, demand, now(), claim.state);
+      const completedAt = now();
+      const publication = collectorPublicationFromResult(
+        resource, result, snapshot, demand, completedAt, claim.state,
+      );
+      const covered = webhookCoveredQueries.has(webhookCoverageKey({ ...target, resource }));
+      const reconciliation = webhookReconciliationInterval({
+        covered,
+        resource,
+        floorMs: demand.floorMs,
+        rows: publication.rows,
+        unchangedCount: claim.state.unchangedCount,
+      });
+      if (reconciliation !== null) publication.nextDueAt = completedAt + reconciliation;
+      return publication;
     } catch (error) {
       settleReservationWithBudgetObservations(
         { ...context.scope, identityProvider: null }, context.leaseId, reservationId,
@@ -7106,7 +7816,8 @@ function createCollectorAcquisitionRuntime({
         ? await resolveProvider(target.provider, target, { signal: controller.signal })
         : await defaultResolve(target);
       const identity = provider?.identity ?? provider;
-      const discovered = persisted.value ?? (resolveTargetIdentity
+      const requireAccessRefresh = accessRefreshTargets.has(key);
+      const discovered = !requireAccessRefresh && persisted.value ? persisted.value : (resolveTargetIdentity
         ? await resolveTargetIdentity({ target, provider, signal: controller.signal })
         : resolveProvider
           ? { id: `slug:${target.repo.toLowerCase()}`, nameWithOwner: target.repo }
@@ -7115,6 +7826,7 @@ function createCollectorAcquisitionRuntime({
       if (!admitted.ok || !admitCanonical(target, admitted.value)) {
         throw new Error("collector canonical provider conflict");
       }
+      if (requireAccessRefresh) accessRefreshTargets.delete(key);
       return { provider, identity, targetIdentity: admitted.value };
     })().finally(() => {
       // This map is a single-flight latch, not an identity cache. A later
@@ -7140,6 +7852,28 @@ function createCollectorAcquisitionRuntime({
 
   function demandEnabled(demand) {
     return demand.active || demand.background;
+  }
+
+  function rejectInvalidations(item, error) {
+    for (const waiter of item.invalidations) waiter.reject(error);
+    item.invalidations.clear();
+  }
+
+  function deliverCollectorSnapshot(item, snapshot, bindingRevision, { publication = false } = {}) {
+    if (bindingRevision !== item.bindingRevision) return false;
+    item.nextDueAt = snapshot.nextDueAt;
+    item.onSnapshot(snapshot);
+    if (!publication || !Number.isSafeInteger(snapshot.generation)) return true;
+    for (const waiter of item.invalidations) {
+      if (bindingRevision !== waiter.bindingRevision || waiter.requiredGeneration === null ||
+          snapshot.generation < waiter.requiredGeneration) continue;
+      item.invalidations.delete(waiter);
+      waiter.resolve(snapshot);
+    }
+    if (item.invalidations.size > 0 && !closed && !item.closed && demandEnabled(item.demand)) {
+      queueMicrotask(() => startPoll(item, { manual: true }));
+    }
+    return true;
   }
 
   function startPoll(item, { manual = false, force = false } = {}) {
@@ -7174,6 +7908,9 @@ function createCollectorAcquisitionRuntime({
       item.timer = null;
     }
     item.polling = true;
+    item.pollPhase = "preclaim";
+    const bindingRevision = item.bindingRevision;
+    const subscriptionId = item.id;
     let retryIn = item.demand.floorMs;
     let claim = null;
     try {
@@ -7183,7 +7920,7 @@ function createCollectorAcquisitionRuntime({
       const refreshedIdentity = refreshedProvider?.identity ?? refreshedProvider;
       if (refreshedIdentity?.accessKey !== item.identity?.accessKey ||
           refreshedIdentity?.generation !== item.identity?.generation) {
-        engine.unsubscribe(item.id);
+        engine.unsubscribe(subscriptionId);
         item.id = null;
         targetInitializations.delete(targetInitializationKey(item.target));
         item.onHold?.("shared-wait");
@@ -7191,10 +7928,12 @@ function createCollectorAcquisitionRuntime({
         return;
       }
       item.provider = refreshedProvider;
-      const ownership = await engine.refresh(item.id, { force: manual });
+      const ownership = await engine.refresh(subscriptionId, { force: manual });
       if (!ownership.ok) { item.onHold?.("disconnected"); retryIn = 1_000; return; }
       if (ownership.value.role !== "producer") {
-        if (ownership.value.snapshot) item.onSnapshot(ownership.value.snapshot);
+        if (ownership.value.snapshot) {
+          deliverCollectorSnapshot(item, ownership.value.snapshot, bindingRevision);
+        }
         if (ownership.value.reason !== "fresh") {
           item.onHold?.("shared-wait");
           retryIn = ACQUISITION_INSPECT_MS;
@@ -7208,6 +7947,7 @@ function createCollectorAcquisitionRuntime({
         generation: ownership.value.generation,
         accessKey: item.identity.accessKey,
       };
+      item.pollPhase = "claimed";
       const producer = produce ?? defaultProduce;
       item.controller = new AbortController();
       try {
@@ -7220,10 +7960,15 @@ function createCollectorAcquisitionRuntime({
           provider: item.provider,
           signal: item.controller.signal,
           force,
-          markStarted: (receipt) => engine.refresh(item.id, { started: { ...claim, ...(receipt ? { receipt } : {}) } }),
+          markStarted: (receipt) => engine.refresh(subscriptionId, { started: { ...claim, ...(receipt ? { receipt } : {}) } }),
         });
+        if (bindingRevision !== item.bindingRevision) {
+          engine.refresh(subscriptionId, { cancel: claim });
+          retryIn = 1;
+          return;
+        }
         if (!admitCanonical(item.target, produced.repositoryIdentity)) {
-          engine.refresh(item.id, { claim, failure: {
+          engine.refresh(subscriptionId, { claim, failure: {
             hold: "disconnected",
             requestMetrics: produced.requestMetrics ?? {},
             uncertainReceipts: produced.uncertainReceipts ?? [],
@@ -7232,18 +7977,19 @@ function createCollectorAcquisitionRuntime({
           retryIn = item.demand.floorMs;
           return;
         }
-        const published = await engine.refresh(item.id, { claim, publish: produced });
+        item.pollPhase = "publishing";
+        const published = await engine.refresh(subscriptionId, { claim, publish: produced });
         if (!published.ok) { item.onHold?.("disconnected"); retryIn = 1_000; }
         else retryIn = Math.max(1, published.value.snapshot.nextDueAt - now());
       } catch (error) {
         const hold = error?.notStarted ? "shared-wait" : acquisitionFailureHold(error);
-        if (claim && error?.notStarted) engine.refresh(item.id, { cancel: claim });
-        else if (claim) engine.refresh(item.id, { claim, failure: {
+        if (claim && error?.notStarted) engine.refresh(subscriptionId, { cancel: claim });
+        else if (claim) engine.refresh(subscriptionId, { claim, failure: {
           hold,
           requestMetrics: error?.requestMetrics ?? {},
           uncertainReceipts: error?.uncertainReceipts ?? [],
         } });
-        else engine.setHold(item.id, hold, { resource: item.resource, accessKey: item.identity.accessKey });
+        else engine.setHold(subscriptionId, hold, { resource: item.resource, accessKey: item.identity.accessKey });
         item.onHold?.(hold);
         try { onDiagnostic({ stage: "acquire", reason: redact(shortErr(error)) }); } catch { /* diagnostics are isolated */ }
         retryIn = error?.notStarted && Number.isFinite(error.retryAt)
@@ -7265,6 +8011,7 @@ function createCollectorAcquisitionRuntime({
       retryIn = Math.min(1_000, item.demand.floorMs);
     } finally {
       item.polling = false;
+      item.pollPhase = null;
       schedule(item, retryIn, item.id ? () => startPoll(item) : () => startInitialize(item));
     }
   }
@@ -7277,14 +8024,30 @@ function createCollectorAcquisitionRuntime({
       item.identity = resolved.identity;
       const query = canonicalCollectorQuery(item.resource, item.identity, resolved.targetIdentity, item.demand);
       if (!query) throw new Error("invalid collector query");
+      const bindingRevision = item.bindingRevision;
       const subscription = engine.subscribe(query, item.demand, (snapshot) => {
-        item.nextDueAt = snapshot.nextDueAt;
-        item.onSnapshot(snapshot);
+        deliverCollectorSnapshot(item, snapshot, bindingRevision, { publication: true });
       }, { resumeFreshSnapshot: true });
       if (!subscription.ok) throw new Error("collector subscription unavailable");
       item.id = subscription.value.id;
-      if (subscription.value.snapshot) item.onSnapshot(subscription.value.snapshot);
-      if (demandEnabled(item.demand)) await startPoll(item);
+      const generation = subscription.value.snapshot?.generation ?? 0;
+      const accessReset = [...item.invalidations].some((waiter) =>
+        waiter.bindingRevision === bindingRevision && waiter.accessRemoved);
+      for (const waiter of item.invalidations) {
+        if (waiter.bindingRevision !== bindingRevision) continue;
+        if (waiter.accessOnly) {
+          item.invalidations.delete(waiter);
+          waiter.resolve(null);
+        } else if (waiter.requiredGeneration === null) {
+          waiter.requiredGeneration = generation + 1;
+        }
+      }
+      if (subscription.value.snapshot && !accessReset) {
+        deliverCollectorSnapshot(item, subscription.value.snapshot, bindingRevision);
+      }
+      if (demandEnabled(item.demand)) {
+        await startPoll(item, { manual: item.invalidations.size > 0 });
+      }
     } catch (error) {
       try { onDiagnostic({ stage: "initialize", reason: redact(shortErr(error)) }); } catch { /* diagnostics are isolated */ }
       item.onHold?.("disconnected");
@@ -7303,8 +8066,9 @@ function createCollectorAcquisitionRuntime({
       const normalizedDemand = normalizeCollectorDemand(demand);
       if (!normalizedDemand) throw new Error("invalid collector demand");
       const item = { target, resource, demand: normalizedDemand, onSnapshot, onHold, id: null, identity: null,
-        provider: null, polling: false, pollPromise: null, controller: null,
-        initializePromise: null, closed: false, timer: null, queuedRefresh: null };
+        provider: null, polling: false, pollPhase: null, pollPromise: null, controller: null,
+        initializePromise: null, closed: false, timer: null, queuedRefresh: null,
+        bindingRevision: 0, invalidations: new Set() };
       items.add(item);
       void startInitialize(item);
       return {
@@ -7316,6 +8080,9 @@ function createCollectorAcquisitionRuntime({
           if (!demandEnabled(normalized) && item.timer !== null) {
             clearTimeout_(item.timer);
             item.timer = null;
+          }
+          if (wasEnabled && !demandEnabled(normalized) && item.invalidations.size > 0) {
+            rejectInvalidations(item, new Error("collector subscription inactive"));
           }
           const updated = item.id ? engine.updateDemand(item.id, normalized) : { ok: true };
           if (!wasEnabled && demandEnabled(normalized)) void startPoll(item);
@@ -7337,6 +8104,7 @@ function createCollectorAcquisitionRuntime({
         },
         close() {
           item.closed = true;
+          rejectInvalidations(item, new Error("collector subscription closed"));
           item.controller?.abort();
           if (item.timer !== null) clearTimeout_(item.timer);
           if (item.id) engine.unsubscribe(item.id);
@@ -7344,10 +8112,80 @@ function createCollectorAcquisitionRuntime({
         },
       };
     },
+    async invalidate(invalidation) {
+      const normalized = normalizeWebhookInvalidationInput(invalidation);
+      if (!normalized) throw new Error("invalid collector invalidation");
+      const configuredWebhookTarget = webhookTargets.get(targetInitializationKey(normalized));
+      const configuredCollectorTarget = collectorTarget(config, normalized.host, normalized.repo);
+      if (!configuredCollectorTarget || configuredCollectorTarget.provider !== normalized.provider ||
+          !configuredWebhookTarget || !normalized.accessRemoved &&
+            !configuredWebhookTarget.resources.includes(normalized.resource)) {
+        throw new Error("invalid collector invalidation");
+      }
+      const matching = [...items].filter((item) => !item.closed &&
+        (normalized.accessRemoved || demandEnabled(item.demand)) &&
+        item.target.host === normalized.host && item.target.repo.toLowerCase() === normalized.repo &&
+        item.target.provider === normalized.provider && item.resource === normalized.resource);
+      if (matching.length === 0) {
+        const error = new Error("collector invalidation has no subscriber");
+        error.retryAfterMs = WEBHOOK_DORMANT_RETRY_MS;
+        throw error;
+      }
+      await Promise.all(matching.map((item) => new Promise((resolve, reject) => {
+        let requiredGeneration = null;
+        if (item.id) {
+          const inspected = engine.inspect(item.id);
+          if (!inspected.ok) { reject(new Error("collector invalidation unavailable")); return; }
+          const generation = inspected.value?.generation ?? 0;
+          requiredGeneration = Math.max(generation + (item.pollPhase === "preclaim" ? 2 : 1),
+            (inspected.value?.claim?.generation ?? generation) + 1);
+        }
+        if (normalized.accessRemoved) {
+          item.bindingRevision += 1;
+          for (const waiter of item.invalidations) {
+            waiter.bindingRevision = item.bindingRevision;
+            waiter.requiredGeneration = null;
+          }
+          item.controller?.abort();
+          const key = targetInitializationKey(item.target);
+          accessRefreshTargets.add(key);
+          targetInitializations.get(key)?.controller.abort();
+          targetInitializations.delete(key);
+          requiredGeneration = null;
+        }
+        item.invalidations.add({
+          requiredGeneration,
+          bindingRevision: item.bindingRevision,
+          accessRemoved: normalized.accessRemoved,
+          accessOnly: normalized.accessRemoved && !demandEnabled(item.demand),
+          resolve,
+          reject,
+        });
+        if (item.timer !== null) { clearTimeout_(item.timer); item.timer = null; }
+        if (normalized.accessRemoved) {
+          const retire = async () => {
+            await Promise.allSettled([item.pollPromise, item.initializePromise].filter(Boolean));
+            if (closed || item.closed) return;
+            if (item.id) engine.unsubscribe(item.id);
+            item.id = null;
+            item.identity = null;
+            item.provider = null;
+            targetInitializations.delete(targetInitializationKey(item.target));
+            await startInitialize(item);
+          };
+          void retire().catch(() => { /* durable invalidation remains pending */ });
+        } else if (item.id) {
+          void startPoll(item, { manual: true });
+        } else {
+          void startInitialize(item);
+        }
+      })));
+    },
     async close() {
       closed = true;
       for (const item of items) {
         item.closed = true;
+        rejectInvalidations(item, new Error("collector runtime closed"));
         item.controller?.abort();
         if (item.timer !== null) clearTimeout_(item.timer);
       }
@@ -7383,11 +8221,18 @@ async function runCollectorForeground(configPath, {
   });
   const service = await createCollectorService({ config: loaded.value, pathOptions, platform, runtime: activeRuntime });
   stderr.write(`gh-glance: collector listening at ${service.socketPath}\n`);
-  await new Promise((resolve) => {
-    const stop = () => resolve();
-    process.once("SIGINT", stop);
-    process.once("SIGTERM", stop);
-  });
+  const stop = () => resolveStop?.();
+  let resolveStop;
+  try {
+    await new Promise((resolve) => {
+      resolveStop = resolve;
+      process.once("SIGINT", stop);
+      process.once("SIGTERM", stop);
+    });
+  } finally {
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+  }
   await service.close();
 }
 
@@ -16432,6 +17277,12 @@ export {
   collectorSocketPath,
   normalizeCollectorConfig,
   loadCollectorConfig,
+  verifyWebhookSignature,
+  mapWebhookInvalidations,
+  createWebhookQueue,
+  createWebhookIngress,
+  webhookQueuePath,
+  webhookReconciliationInterval,
   encodeCollectorFrame,
   createCollectorFrameDecoder,
   validateCollectorClientMessage,

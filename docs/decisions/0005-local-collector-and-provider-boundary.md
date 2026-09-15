@@ -17,8 +17,8 @@ the existing acquisition and governor machinery as a foreground collector.
 `--connect local` makes a normal terminal dashboard a data-only client, and
 `--collector-stdio` is a narrow bridge to an already running collector.
 `--connect ssh:<alias>` may carry that same bridge through an existing SSH
-configuration. Service installation, daemonization, webhooks, and GitHub App
-providers remain outside this decision.
+configuration. Service installation, daemonization, and GitHub App providers
+remain outside this decision.
 
 Use one fixed Unix-domain socket in the current OS user's private gh-glance
 config root. Support macOS and Linux. Reject collector and bridge modes on
@@ -63,4 +63,19 @@ standalone processes using the same config root can join collector acquisitions
 without starting another query generation. A service with no subscribers makes
 no data poll, while bounded last-known-good snapshots remain available for a
 later subscriber. Cross-computer operation depends on user-managed SSH and an
-already running collector; it adds no TCP listener or hosted service.
+already running collector; the SSH path adds no TCP listener or hosted service.
+The opt-in loopback webhook ingress below is the sole HTTP exception.
+
+The same explicit collector configuration may enable one loopback-only HTTP
+webhook route behind a user-managed HTTPS reverse proxy. The exact raw body is
+HMAC-authenticated before parsing. Request buffering is bounded per body and
+across all concurrent bodies. Durable state contains bounded delivery IDs
+and compact invalidation keys, never event bodies or signatures. A delivery
+marks a covered query dirty but supplies neither rows nor freshness: the worker
+uses ordinary shared governor admission, and durable work completes only after
+a newer API-validated generation publishes. Quiet covered resources reconcile
+at `max(floor, 300 seconds)`, while running Actions and manual refresh retain
+their ordinary behavior. Access-change events retire old bindings and require
+repository-access validation before new publication. The listener does not
+register hooks, expose a public client API, or introduce another dashboard
+transport.

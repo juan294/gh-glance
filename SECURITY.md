@@ -140,6 +140,35 @@ owner plus inode evidence. Shutdown removes only the lock and socket identities
 created by that service instance. Collector hosting and the stdio bridge are not
 supported on Windows; no TCP fallback exists.
 
+The collector's optional webhook listener is disabled by default and accepts
+only the fixed `/webhooks/github` route on literal loopback addresses. Public
+exposure, TLS termination, reverse-proxy configuration, and webhook
+registration remain user-owned. The secret path must be absolute and name a
+regular, current-user-owned mode-0600 file. The listener authenticates the
+exact raw body with HMAC SHA-256 and constant-time comparison before JSON
+parsing, target mapping, or queue mutation. It requires JSON content type and
+bounded delivery/event headers, limits reads to 25 MiB and ten seconds, and
+caps concurrent requests at 32. Buffered request bodies also share a 50 MiB
+aggregate allowance; excess concurrent bodies receive 503 without displacing
+accepted durable work. The ten-second limit is one absolute body deadline from
+handler entry; continued byte activity cannot extend it.
+
+Accepted delivery IDs are retained for at most 24 hours and capped at 10,000;
+pending invalidations are compact repository/resource keys capped at 512. Raw
+event bodies, signatures, and secrets are not persisted, logged, included in
+metrics, or sent over the collector protocol. A 202 response means that the
+compact invalidation was durably accepted, not that GitHub data is fresh. Queue
+capacity or storage failure returns an error so the sender can retry. Workers
+coalesce one key for one second, use the normal governor and secondary-limit
+admission path, and remove durable work only after a newer API-validated
+generation is published. Access-change events retire the old binding and
+revalidate repository access for every target subscription, including uncovered
+and background-off resources, before its in-flight result can publish. Queue
+replacement fsyncs the new file and its parent directory before 202. Its lock
+records PID and nonce ownership; recovery requires dead-owner evidence and an
+inode match rather than file age. Negative or materially future queue timestamps
+fail closed.
+
 The collector trust boundary is one OS user, not multiple tenants. Its strict
 configuration maps each exact host/repository target to one named `gh` provider.
 Clients never send credentials or arbitrary GitHub operations. Wire frames are

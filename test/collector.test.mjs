@@ -360,6 +360,16 @@ test("COL-01/03/06: twelve real sockets share one real-runtime acquisition strea
       return { ...publication(), nextDueAt: Date.now() + 60_000 };
     },
   });
+  let subscribedCount = 0;
+  let releaseSubscribed;
+  const allSubscribed = new Promise((resolve) => { releaseSubscribed = resolve; });
+  const subscribe = runtime.subscribe.bind(runtime);
+  runtime.subscribe = (options) => {
+    const handle = subscribe(options);
+    subscribedCount += 1;
+    if (subscribedCount === 12) releaseSubscribed();
+    return handle;
+  };
   const service = await createCollectorService({
     config,
     pathOptions: { env: { XDG_CONFIG_HOME: root }, platform: "linux" },
@@ -382,7 +392,7 @@ test("COL-01/03/06: twelve real sockets share one real-runtime acquisition strea
       host: "github.com", repo: "acme/widget", resource: "actions",
       demand: { active: true, background: true, floorMs: 5000, pages: 1 } }));
   }));
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await within(allSubscribed);
   releaseProvider();
   const snapshots = await within(Promise.all(received));
   assert.equal(providerResolutions, 1);

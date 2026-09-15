@@ -337,7 +337,8 @@ The collector is opt-in and stays in the foreground. It is supported on macOS
 and Linux. Windows continues to support the standalone dashboard, but rejects
 collector hosting and bridge modes. The endpoint is always
 `collector-v1.sock` inside gh-glance's private config directory; there is no TCP
-listener or custom socket flag.
+dashboard/client transport or custom socket flag. The optional loopback webhook
+ingress described below is the only HTTP listener.
 
 Create a mode-0600 configuration file:
 
@@ -366,6 +367,89 @@ providers, API paths, queries, commands, or filesystem paths. Renamed aliases
 that resolve to one repository cannot cross provider ownership. Disconnecting
 keeps last-known-good rows and their source age, then reconnects to a new server
 epoch without silently falling back to standalone polling.
+
+#### Optional webhook invalidation
+
+Webhook ingress is disabled unless the collector configuration contains an
+enabled `webhook` object. It listens only on the configured loopback address and
+fixed `/webhooks/github` route. Exposing that route requires a user-managed
+HTTPS reverse proxy; gh-glance does not create a public listener, register a
+GitHub webhook, or manage proxy/TLS infrastructure.
+
+Create a separate mode-0600 secret file with no trailing newline, then add the
+exact repositories and resource families covered by the GitHub webhook:
+
+```json
+{
+  "version": 1,
+  "providers": {
+    "personal": { "type": "gh", "host": "github.com" }
+  },
+  "targets": [
+    { "host": "github.com", "repo": "owner/repository", "provider": "personal" }
+  ],
+  "webhook": {
+    "enabled": true,
+    "address": "127.0.0.1",
+    "port": 8787,
+    "secretFile": "/absolute/private/path/webhook-secret",
+    "targets": [
+      {
+        "host": "github.com",
+        "repo": "owner/repository",
+        "provider": "personal",
+        "resources": ["actions", "issues", "prs", "security"]
+      }
+    ]
+  }
+}
+```
+
+Configure GitHub to send JSON payloads and select only the events needed for
+the covered resources: `workflow_run`/`workflow_job` for Actions, `issues` and
+issue comments for Issues, pull requests/reviews/review comments/review threads
+and PR issue comments for PRs, and the supported Dependabot, repository
+vulnerability, code-scanning, and secret-scanning alert events for Security.
+Installation and repository-access events fence permissions. Event availability
+depends on the target GitHub host. The collector verifies the SHA-256 signature
+over the exact request bytes before parsing, persists only delivery IDs and
+compact invalidations, and returns 202 only after durable acceptance. The
+listener buffers at most 25 MiB per request and 50 MiB across concurrent
+requests; aggregate pressure returns 503 so GitHub or the proxy can retry. A
+local signed-delivery check can use the same payload bytes and secret to POST
+`Content-Type: application/json`, `X-GitHub-Event`, `X-GitHub-Delivery`, and
+`X-Hub-Signature-256: sha256=<hex digest>` to
+`http://127.0.0.1:8787/webhooks/github`.
+
+For example, with the collector running and the paths adjusted locally:
+
+```sh
+printf '%s' '{"action":"opened","repository":{"full_name":"owner/repository"},"issue":{"number":1}}' > /tmp/gh-glance-hook.json
+signature=$(node --input-type=module - /absolute/private/path/webhook-secret /tmp/gh-glance-hook.json <<'NODE'
+import { createHmac } from "node:crypto";
+import { readFileSync } from "node:fs";
+const [, , secretPath, bodyPath] = process.argv;
+process.stdout.write(createHmac("sha256", readFileSync(secretPath)).update(readFileSync(bodyPath)).digest("hex"));
+NODE
+)
+curl -i --data-binary @/tmp/gh-glance-hook.json \
+  -H 'Content-Type: application/json' \
+  -H 'X-GitHub-Event: issues' \
+  -H 'X-GitHub-Delivery: 11111111-1111-4111-8111-111111111111' \
+  -H "X-Hub-Signature-256: sha256=$signature" \
+  http://127.0.0.1:8787/webhooks/github
+```
+
+The expected response is 202. Repeating the same delivery ID is acknowledged
+without scheduling duplicate work.
+
+Webhook events only request an ordinary governed GitHub refresh. They never
+become rows or freshness evidence, and they do not bypass quota or secondary
+cooldowns. After two validated unchanged observations, covered quiet resources
+reconcile at least every
+`max(--refresh, 300 seconds)`; Actions with running work keep their fast cadence,
+and manual refresh remains available. Missing deliveries therefore delay an
+update until reconciliation instead of disabling polling.
 
 ### Optional SSH collector client
 

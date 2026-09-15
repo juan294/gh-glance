@@ -1,0 +1,37 @@
+{
+  "workflow_run": {
+    "action": "completed",
+    "repository": { "full_name": "acme/widget" },
+    "workflow_run": { "id": 101 }
+  },
+  "issues": {
+    "action": "opened",
+    "repository": { "full_name": "acme/widget" },
+    "issue": { "number": 7 }
+  },
+  "pull_request": {
+    "action": "synchronize",
+    "repository": { "full_name": "acme/widget" },
+    "pull_request": { "number": 8 }
+  },
+  "issue_comment_issue": {
+    "action": "created",
+    "repository": { "full_name": "acme/widget" },
+    "issue": { "number": 7 }
+  },
+  "issue_comment_pr": {
+    "action": "created",
+    "repository": { "full_name": "acme/widget" },
+    "issue": { "number": 8, "pull_request": { "url": "https://api.github.com/repos/acme/widget/pulls/8" } }
+  },
+  "code_scanning_alert": {
+    "action": "appeared_in_branch",
+    "repository": { "full_name": "acme/widget" },
+    "alert": { "number": 9 }
+  },
+  "installation_repositories": {
+    "action": "removed",
+    "repositories_removed": [{ "full_name": "acme/widget" }],
+    "repositories_added": []
+  }
+}
