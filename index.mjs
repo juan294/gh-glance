@@ -3545,6 +3545,14 @@ const GOVERNOR_MAX_LEASES = 128;
 const GOVERNOR_MAX_INTENTS = 512;
 const GOVERNOR_MAX_RESERVATIONS = 512;
 const GOVERNOR_LOCK_WAIT_MS = 250;
+// How old an unreadable lock record may be before it counts as abandoned. A
+// creator owns the path from open("wx") until its owner record is written, a
+// gap of microseconds; a record still unreadable this long after the file was
+// last touched was left by a creator whose write failed (a full disk) or that
+// died between the two calls. Without this bound such a file was immortal: no
+// PID to test, so dead-owner recovery never fired, and every pane on the
+// machine reported busy on every request until someone deleted it by hand.
+const GOVERNOR_LOCK_ORPHAN_MS = 10_000;
 const GOVERNOR_PROBE_DRAIN_MS = 30_000;
 const GOVERNOR_PUBLICATION_REINSPECT_MS = 1_000;
 const GOVERNOR_PROBE_TRANSITION_MS = 5_000;
@@ -4108,17 +4116,80 @@ function pidIsDead(pid, kill = process.kill.bind(process)) {
   }
 }
 
+// An unreadable lock record whose file has not been touched for
+// GOVERNOR_LOCK_ORPHAN_MS. Readable records are never orphans here, whatever
+// their age: a live owner may legitimately hold a lock for as long as its
+// critical section runs, and a dead one is the PID path's business.
+function lockRecordOrphaned(path, now = Date.now()) {
+  try {
+    return lockOwner(path) === null && statSync(path).mtimeMs + GOVERNOR_LOCK_ORPHAN_MS <= now;
+  } catch {
+    return false;
+  }
+}
+
+// Creates the lock file and its owner record as one step from every other
+// process's point of view: either the path holds a complete record naming this
+// owner, or it does not exist. open("wx") makes the path exist before the
+// record is written, and a failure in between -- a full disk, most often --
+// used to propagate straight past the release, leaving an empty file that no
+// PID check could ever reclaim. Every failure after open now removes the exact
+// inode this call created before reporting, so nothing outlives the attempt.
+function claimGovernorLock(lockPath, owner) {
+  let descriptor;
+  let created = null;
+  try {
+    descriptor = openSync(lockPath, "wx", 0o600);
+  } catch (error) {
+    return error?.code === "EEXIST" ? "held" : "failed";
+  }
+  try {
+    created = fstatSync(descriptor).ino;
+    writeFileSync(descriptor, JSON.stringify(owner), "utf8");
+    closeSync(descriptor);
+    descriptor = undefined;
+    chmodSync(lockPath, 0o600);
+    // A stalled creator can be reclaimed as an orphan while it sits between
+    // open and write. Confirm the record on disk is still this one before the
+    // caller enters its critical section, and take back a record that was
+    // restored after the check below found it missing (see the own-record
+    // branch in withGovernorLock for the rest of that recovery).
+    return sameLockOwner(lockOwner(lockPath), owner) ? "acquired" : "held";
+  } catch {
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor); } catch { /* descriptor was already closed */ }
+    }
+    try {
+      if (created !== null && statSync(lockPath).ino === created) unlinkSync(lockPath);
+    } catch { /* already gone, or not the file this call created */ }
+    return "failed";
+  }
+}
+
 function releaseGovernorLock(lockPath, nonce) {
   const owner = lockOwner(lockPath);
   if (!owner || owner.nonce !== nonce) return false;
   const releasePath = `${lockPath}.release-${nonce}`;
   try {
     renameSync(lockPath, releasePath);
-    unlinkSync(releasePath);
-    return true;
   } catch {
-    return false;
+    // The rename-then-unlink order exists so the unlink can never hit a
+    // successor's lock. A rename can still fail on its own -- a full APFS
+    // volume needs fresh blocks for the directory update -- and giving up there
+    // left a complete record naming a live owner that would wait on itself, and
+    // every other pane on it, until that process exited. A lock still carrying
+    // this nonce has no successor to protect, so the direct unlink is safe.
+    try {
+      if (lockOwner(lockPath)?.nonce !== nonce) return false;
+      unlinkSync(lockPath);
+      return true;
+    } catch {
+      return false;
+    }
   }
+  // The path is free from here on; the uniquely named leftover is private.
+  try { unlinkSync(releasePath); } catch { /* exact private release file only */ }
+  return true;
 }
 
 function governorRecoveryPaths(lockPath) {
@@ -4136,7 +4207,18 @@ function governorRecoveryActive(lockPath, kill) {
   let active = false;
   for (const recoveryPath of governorRecoveryPaths(lockPath)) {
     const owner = lockOwner(recoveryPath);
-    if (!owner || !pidIsDead(owner.pid, kill)) {
+    if (!owner) {
+      // A marker whose record never arrived. Marker names are unique, so an
+      // unlink can only ever remove this one; the age bound is what separates a
+      // recoverer mid-write from one whose write failed and left this behind.
+      if (lockRecordOrphaned(recoveryPath)) {
+        try { unlinkSync(recoveryPath); } catch { /* re-listed below */ }
+        continue;
+      }
+      active = true;
+      continue;
+    }
+    if (!pidIsDead(owner.pid, kill)) {
       active = true;
       continue;
     }
@@ -4153,29 +4235,35 @@ function observeGovernorArtifact(observer, kind, path) {
   try { observer?.(kind, path); } catch { /* test observation cannot affect locking */ }
 }
 
-function quarantineDeadGovernorLock(lockPath, expectedOwner, {
+// Removes a lock nobody is going to release: either a complete record naming
+// a dead PID (expectedOwner), or -- with expectedOwner null -- an unreadable
+// record past GOVERNOR_LOCK_ORPHAN_MS, which is what a creator leaves when its
+// write fails or it dies between open and write. Both go through the same
+// recovery marker and the same re-check on both sides of the rename, so a
+// record that becomes valid at any point is restored rather than lost.
+function quarantineAbandonedGovernorLock(lockPath, expectedOwner, {
   pid = process.pid,
   kill = process.kill.bind(process),
   observeArtifact = null,
 } = {}) {
   const recoveryNonce = randomUUID();
   const recoveryPath = `${lockPath}.recovery-${recoveryNonce}`;
-  let descriptor;
-  try {
-    descriptor = openSync(recoveryPath, "wx", 0o600);
-    try {
-      writeFileSync(descriptor, JSON.stringify({ pid, nonce: recoveryNonce }), "utf8");
-    } finally {
-      closeSync(descriptor);
-    }
-    chmodSync(recoveryPath, 0o600);
-    observeGovernorArtifact(observeArtifact, "recovery", recoveryPath);
-  } catch (error) {
-    if (descriptor !== undefined) {
-      try { closeSync(descriptor); } catch { /* descriptor was already closed */ }
-    }
-    return error?.code === "EEXIST" ? "busy" : "failed";
-  }
+  const claim = claimGovernorLock(recoveryPath, { pid, nonce: recoveryNonce });
+  if (claim !== "acquired") return claim === "held" ? "busy" : "failed";
+  observeGovernorArtifact(observeArtifact, "recovery", recoveryPath);
+
+  // The lock is still the abandoned one this call was asked to remove. For a
+  // dead owner that is the same PID and nonce, confirmed dead again; for an
+  // orphan it is a record that is still unreadable and still past the age
+  // bound -- a creator that has since finished writing must be left alone.
+  const stillAbandoned = (path) => expectedOwner === null
+    ? lockRecordOrphaned(path)
+    : sameLockOwner(lockOwner(path), expectedOwner) && pidIsDead(expectedOwner.pid, kill);
+  // What the quarantined file must hold for the removal to be right: the same
+  // dead record, or still no record at all. Anything else is a successor.
+  const quarantinedAsExpected = (path) => expectedOwner === null
+    ? lockOwner(path) === null
+    : sameLockOwner(lockOwner(path), expectedOwner);
 
   const quarantinePath = `${lockPath}.quarantine-${randomUUID()}`;
   try {
@@ -4183,17 +4271,13 @@ function quarantineDeadGovernorLock(lockPath, expectedOwner, {
     // A killed recovery process leaves a uniquely named marker that another
     // process can remove only after its PID is confirmed dead; the path can
     // never be reused by a successor.
-    // Re-read both fields after taking that marker and again immediately before
-    // rename, so an owner that changed since the initial ESRCH result is never
-    // selected as the abandoned lock.
-    const confirmed = lockOwner(lockPath);
-    if (!sameLockOwner(confirmed, expectedOwner) || !pidIsDead(confirmed.pid, kill)) return "changed";
-    const beforeRename = lockOwner(lockPath);
-    if (!sameLockOwner(beforeRename, expectedOwner)) return "changed";
+    // Re-read after taking that marker, immediately before the rename, so an
+    // owner that changed since the initial check is never selected as the
+    // abandoned lock.
+    if (!stillAbandoned(lockPath)) return "changed";
     renameSync(lockPath, quarantinePath);
     observeGovernorArtifact(observeArtifact, "quarantine", quarantinePath);
-    const quarantined = lockOwner(quarantinePath);
-    if (!sameLockOwner(quarantined, expectedOwner)) {
+    if (!quarantinedAsExpected(quarantinePath)) {
       // Acquisitions that raced the recovery marker cannot enter their critical
       // section. Restoring here preserves that successor rather than deleting
       // or leaving it under an abandoned quarantine name.
@@ -4241,19 +4325,15 @@ function withGovernorLock(scope, operation, {
     Atomics.wait(persistenceWaitCell, 0, 0, 5);
     return true;
   };
+  const owner = { pid, nonce };
   for (;;) {
     if (governorRecoveryActive(lockPath, kill)) {
       if (!waitForLock()) return { ok: false, reason: "busy" };
       continue;
     }
-    try {
-      const descriptor = openSync(lockPath, "wx", 0o600);
-      try {
-        writeFileSync(descriptor, JSON.stringify({ pid, nonce }), "utf8");
-      } finally {
-        closeSync(descriptor);
-      }
-      chmodSync(lockPath, 0o600);
+    const claim = claimGovernorLock(lockPath, owner);
+    if (claim === "failed") return { ok: false, reason: "unwritable" };
+    if (claim === "acquired") {
       observeGovernorArtifact(observeArtifact, "canonical", lockPath);
       if (governorRecoveryActive(lockPath, kill)) {
         releaseGovernorLock(lockPath, nonce);
@@ -4262,28 +4342,40 @@ function withGovernorLock(scope, operation, {
       }
       try {
         return operation();
+      } catch {
+        return { ok: false, reason: "unwritable" };
       } finally {
         releaseGovernorLock(lockPath, nonce);
       }
-    } catch (error) {
-      if (error?.code !== "EEXIST") return { ok: false, reason: "unwritable" };
-      const owner = lockOwner(lockPath);
-      // The creator owns the canonical path as soon as open("wx") succeeds,
-      // before its small JSON owner record is fully visible. Treat an unreadable
-      // record as owned during the bounded wait; stealing it could overlap the
-      // creator, while returning busy is always fail-closed.
-      if (!owner) {
-        if (!waitForLock()) return { ok: false, reason: "busy" };
-        continue;
-      }
-      if (pidIsDead(owner.pid, kill)) {
-        const recovery = quarantineDeadGovernorLock(lockPath, owner, { pid, kill, observeArtifact });
+    }
+    const holder = lockOwner(lockPath);
+    if (sameLockOwner(holder, owner)) {
+      // This call's own record, found on the path without having been
+      // acquired: an orphan reclaim renamed it away while claimGovernorLock was
+      // verifying, then restored it. Nobody else will ever release it.
+      releaseGovernorLock(lockPath, nonce);
+      continue;
+    }
+    // The creator owns the canonical path as soon as open("wx") succeeds,
+    // before its small JSON owner record is fully visible. Treat an unreadable
+    // record as owned during the bounded wait; stealing it could overlap the
+    // creator, while returning busy is always fail-closed. Past the age bound
+    // there is no creator left to overlap, and waiting would be forever.
+    if (!holder) {
+      if (lockRecordOrphaned(lockPath)) {
+        const recovery = quarantineAbandonedGovernorLock(lockPath, null, { pid, kill, observeArtifact });
         if (recovery === "quarantined" || recovery === "changed") continue;
-        if (!waitForLock()) return { ok: false, reason: "busy" };
-        continue;
       }
       if (!waitForLock()) return { ok: false, reason: "busy" };
+      continue;
     }
+    if (pidIsDead(holder.pid, kill)) {
+      const recovery = quarantineAbandonedGovernorLock(lockPath, holder, { pid, kill, observeArtifact });
+      if (recovery === "quarantined" || recovery === "changed") continue;
+      if (!waitForLock()) return { ok: false, reason: "busy" };
+      continue;
+    }
+    if (!waitForLock()) return { ok: false, reason: "busy" };
   }
 }
 
@@ -5142,7 +5234,10 @@ function inspectGovernor(scope, nowMs) {
 }
 
 function governorHealth(result, nowMs = Date.now()) {
-  if (!result?.ok) return { status: "unavailable", leases: 0, resources: {} };
+  // The doctor is the one surface that may name the raw reason: a bare
+  // "unavailable" could not tell a lock nobody released (busy) from a file that
+  // failed validation (corrupt), and those are fixed in different places.
+  if (!result?.ok) return { status: `unavailable (${result?.reason ?? "unknown"})`, leases: 0, resources: {} };
   const state = result.value;
   let status = "healthy";
   if (RATE_RESOURCES.some((resource) => state.probeClaims[resource]?.leaseUntil > nowMs)) status = "waiting for probe";
@@ -17956,6 +18051,7 @@ export {
   GOVERNOR_MAX_LEASES,
   GOVERNOR_MAX_INTENTS,
   GOVERNOR_MAX_RESERVATIONS,
+  GOVERNOR_LOCK_ORPHAN_MS,
   GOVERNOR_LOCK_WAIT_MS,
   GOVERNOR_PROBE_DRAIN_MS,
   GOVERNOR_ID_PATTERN,
@@ -17972,6 +18068,7 @@ export {
   readGovernorState,
   writeGovernorState,
   pidIsDead,
+  claimGovernorLock,
   releaseGovernorLock,
   withGovernorLock,
   registerLease,
