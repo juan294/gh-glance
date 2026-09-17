@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gone untouched for ten seconds is quarantined through the same double-checked
   protocol dead-owner locks already use -- which also clears the files 0.15.0
   panes have already left behind.
+- **`--doctor --probe` names why the governor is unavailable.** The API
+  governor line read `unavailable` for a lock nobody released and for a state
+  file that failed validation alike, and those are fixed in different places.
+  It now reads `unavailable (busy)`, `unavailable (corrupt)`, and so on.
 
 ## [0.15.0] - 2026-09-15
 
