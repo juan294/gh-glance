@@ -461,7 +461,7 @@ test("--doctor reaches a contended live lock after its wait cell is initialized"
   });
   assert.match(out, /gh-glance doctor/);
   assert.match(out, /API governor\n------------/);
-  assert.match(out, /^status {12}unavailable$/m);
+  assert.match(out, /^status {12}unavailable \(busy\)$/m);
 });
 
 test("--doctor never prints a token that was planted in its environment", async () => {

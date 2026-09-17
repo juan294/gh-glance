@@ -5,6 +5,28 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.1] - 2026-09-17
+
+### Fixed
+
+- **A failed write no longer wedges every pane on the machine.** The shared
+  coordination lock is created with `open("wx")` and its owner record written
+  afterwards. When that write failed -- a full disk is the usual cause -- the
+  empty lock file stayed behind with no owner to test, so every pane, on every
+  request, reported "Coordinating with your other panes" until the file was
+  deleted by hand. A failed release (the rename can fail on a full APFS volume)
+  left a complete record naming a live owner that then waited on itself. Lock
+  creation now removes exactly what it created on any failure, a release that
+  cannot rename falls back to unlinking its own record, an acquirer that meets
+  its own record releases it, and an unreadable lock or recovery marker that has
+  gone untouched for ten seconds is quarantined through the same double-checked
+  protocol dead-owner locks already use -- which also clears the files 0.15.0
+  panes have already left behind.
+- **`--doctor --probe` names why the governor is unavailable.** The API
+  governor line read `unavailable` for a lock nobody released and for a state
+  file that failed validation alike, and those are fixed in different places.
+  It now reads `unavailable (busy)`, `unavailable (corrupt)`, and so on.
+
 ## [0.15.0] - 2026-09-15
 
 ### Added
@@ -1120,7 +1142,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.15.1...HEAD
+[0.15.1]: https://github.com/juan294/gh-glance/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/juan294/gh-glance/compare/v0.14.1...v0.15.0
 [0.14.1]: https://github.com/juan294/gh-glance/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/juan294/gh-glance/compare/v0.13.3...v0.14.0

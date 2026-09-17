@@ -10,6 +10,7 @@ import {
   readdirSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -25,6 +26,7 @@ import {
   OPERATION_COSTS,
   GOVERNOR_ACTIVE_PROBE_LEASE_MS,
   GOVERNOR_LEASE_TTL_MS,
+  GOVERNOR_LOCK_ORPHAN_MS,
   GOVERNOR_PHASE_WINDOW_MS,
   GOVERNOR_STATE_VERSION,
   RATE_RESOURCES,
@@ -71,6 +73,7 @@ import {
   readSharedBudgetSources,
   registerIntent,
   registerLease,
+  claimGovernorLock,
   releaseGovernorLock,
   releaseLease,
   renewProbeClaim,
@@ -2034,6 +2037,8 @@ test("a lagging same-epoch observer refreshes core without increasing capacity",
   assert.equal(result.value.budgets.core.observedAt, observedAt);
   assert.equal(result.value.budgets.core.source, "core-observer");
   assert.equal(governorHealth(result, observedAt).status, "healthy");
+  assert.equal(governorHealth({ ok: false, reason: "busy" }).status, "unavailable (busy)");
+  assert.equal(governorHealth(undefined).status, "unavailable (unknown)");
 });
 
 test("atomic response settlement applies monotonic headers without clearing owner-only state", (t) => {
@@ -2572,6 +2577,75 @@ test("lock ownership is live-PID conservative and dead owners are quarantined", 
   });
   assert.equal(raced.reason, "busy");
   assert.deepEqual(JSON.parse(readFileSync(lockPath, "utf8")), successor);
+});
+
+test("a lock whose owner record fails to land is not left behind", (t) => {
+  const { scope } = sandbox(t);
+  mkdirSync(dirname(scope.path), { recursive: true, mode: 0o700 });
+  const lockPath = `${scope.path}.lock`;
+  // open("wx") succeeds and the record write fails: the shape of a full disk,
+  // produced here by a record that cannot be serialized. Before the fix the
+  // path kept an empty lock file that no PID check could ever reclaim.
+  assert.equal(claimGovernorLock(lockPath, { pid: process.pid, nonce: 1n }), "failed");
+  assert.equal(existsSync(lockPath), false);
+  assert.equal(claimGovernorLock(lockPath, { pid: process.pid, nonce: randomUUID() }), "acquired");
+  assert.equal(claimGovernorLock(lockPath, { pid: process.pid, nonce: randomUUID() }), "held");
+  assert.equal(releaseGovernorLock(lockPath, JSON.parse(readFileSync(lockPath, "utf8")).nonce), true);
+  assert.equal(existsSync(lockPath), false);
+});
+
+test("an unreadable lock record is owned while young and reclaimed once orphaned", (t) => {
+  const { scope } = sandbox(t);
+  mkdirSync(dirname(scope.path), { recursive: true, mode: 0o700 });
+  const lockPath = `${scope.path}.lock`;
+  const age = (path, ms) => {
+    const at = new Date(Date.now() - ms);
+    utimesSync(path, at, at);
+  };
+  for (const record of ["", "{\"pid\":4"]) {
+    // Fresh: a creator may still be between open and write. Fail closed.
+    writeFileSync(lockPath, record, { mode: 0o600 });
+    assert.equal(withGovernorLock(scope, () => ({ ok: true }), { waitMs: 0 }).reason, "busy");
+    assert.equal(existsSync(lockPath), true);
+    // Past the bound: nobody is coming back for it.
+    age(lockPath, GOVERNOR_LOCK_ORPHAN_MS + 1);
+    const artifactModes = {};
+    const reclaimed = withGovernorLock(scope, () => ({ ok: true, value: "reclaimed" }), {
+      waitMs: 0,
+      observeArtifact: (kind, path) => { artifactModes[kind] = statSync(path).mode & 0o777; },
+    });
+    assert.equal(reclaimed.value, "reclaimed");
+    assert.equal(artifactModes.recovery, 0o600);
+    assert.equal(artifactModes.quarantine, 0o600);
+    assert.deepEqual(readdirSync(dirname(scope.path)).filter((name) => name.includes(".lock")), []);
+  }
+
+  // A complete record is never an orphan, however old: a live owner may hold
+  // its lock for as long as its critical section runs.
+  writeFileSync(lockPath, JSON.stringify({ pid: process.pid, nonce: randomUUID() }), { mode: 0o600 });
+  age(lockPath, GOVERNOR_LOCK_ORPHAN_MS * 10);
+  assert.equal(withGovernorLock(scope, () => ({ ok: true }), { waitMs: 0 }).reason, "busy");
+  assert.equal(existsSync(lockPath), true);
+  releaseGovernorLock(lockPath, JSON.parse(readFileSync(lockPath, "utf8")).nonce);
+
+  // The same bound applies to a recovery marker whose record never landed.
+  const markerPath = `${lockPath}.recovery-${randomUUID()}`;
+  writeFileSync(markerPath, "", { mode: 0o600 });
+  assert.equal(withGovernorLock(scope, () => ({ ok: true }), { waitMs: 0 }).reason, "busy");
+  age(markerPath, GOVERNOR_LOCK_ORPHAN_MS + 1);
+  assert.equal(withGovernorLock(scope, () => ({ ok: true, value: "marker reclaimed" }), { waitMs: 0 }).value, "marker reclaimed");
+  assert.equal(existsSync(markerPath), false);
+});
+
+test("an acquirer that finds its own restored record releases it instead of waiting on itself", (t) => {
+  const { scope } = sandbox(t);
+  mkdirSync(dirname(scope.path), { recursive: true, mode: 0o700 });
+  const lockPath = `${scope.path}.lock`;
+  const nonce = randomUUID();
+  writeFileSync(lockPath, JSON.stringify({ pid: process.pid, nonce }), { mode: 0o600 });
+  assert.equal(withGovernorLock(scope, () => ({ ok: true }), { waitMs: 0 }).reason, "busy");
+  assert.equal(withGovernorLock(scope, () => ({ ok: true, value: "own" }), { waitMs: 0, nonce }).value, "own");
+  assert.equal(existsSync(lockPath), false);
 });
 
 test("concurrent dead-owner recovery preserves successor unlock ownership", async (t) => {
