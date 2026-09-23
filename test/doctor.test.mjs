@@ -9,16 +9,17 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 
 import {
   BUDGET_SNAPSHOT_TTL_MS,
+  GOVERNOR_LOCK_ORPHAN_MS,
   GOVERNOR_LEASE_TTL_MS,
   acquisitionStorePath,
   claimProbe,
@@ -26,6 +27,7 @@ import {
   createAcquisitionEngine,
   createIdentityCoordinator,
   createQuotaScope,
+  doctorAcquisitionLockDiagnostic,
   inspectGovernor,
   publishProbe,
   redact,
@@ -281,6 +283,168 @@ test("OBS-03: doctor reports corrupt acquisition metadata instead of healthy zer
   const out = await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } });
   assert.match(out, /^status\s+corrupt$/m);
   assert.doesNotMatch(out, /^status\s+healthy$/m);
+});
+
+test("OBS-03: doctor reports an aged empty or partial lock without changing it or calling the API", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-orphan-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const path = acquisitionStorePath({ env: { XDG_CONFIG_HOME: root } });
+  const lockPath = `${path}.lock`;
+  const engine = createAcquisitionEngine({ pathOptions: { env: { XDG_CONFIG_HOME: root } } });
+  const subscribed = engine.subscribe({ host: "github.com", repositoryId: "R_DOCTOR_ORPHAN",
+    repository: "acme/widget", accessKey: "a".repeat(64), targetKey: "doctor-orphan",
+    resource: "actions", queryVersion: 2, filters: {}, pageSize: 60,
+    cursorGeneration: "first" }, { active: true, floorMs: 5_000 });
+  assert.equal(subscribed.ok, true);
+  engine.close();
+  const metadataBefore = readFileSync(path, "utf8");
+  const log = join(root, "gh.log");
+  for (const record of ["", '{"pid":4']) {
+    writeFileSync(lockPath, record, { mode: 0o600 });
+    const aged = new Date(Date.now() - GOVERNOR_LOCK_ORPHAN_MS - 1_000);
+    utimesSync(lockPath, aged, aged);
+    const before = statSync(lockPath);
+    const out = await doctor({ probe: false, env: { XDG_CONFIG_HOME: root, GH_GLANCE_FIXTURE_LOG: log } });
+    assert.match(out, /^lock\s+orphaned$/m);
+    assert.match(out, /^status\s+unavailable$/m);
+    assert.match(out, /^metadata\s+healthy$/m);
+    assert.match(out, /^lock age\s+\d+s$/m);
+    assert.equal(readFileSync(lockPath, "utf8"), record);
+    assert.equal(statSync(lockPath).ino, before.ino);
+    assert.equal(statSync(lockPath).mtimeMs, before.mtimeMs);
+    assert.equal(readFileSync(path, "utf8"), metadataBefore);
+    assert.doesNotMatch(out, /credential|accessKey|queryKey|nonce/i);
+    const calls = existsSync(log) ? readFileSync(log, "utf8") : "";
+    assert.doesNotMatch(calls, /\bapi\b|graphql|actions\/runs/);
+  }
+});
+
+test("OBS-03: doctor detects a missing or changed snapshot artifact without repairing it", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-snapshot-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const engine = createAcquisitionEngine({ pathOptions: { env: { XDG_CONFIG_HOME: root } } });
+  const subscribed = engine.subscribe({ host: "github.com", repositoryId: "R_DOCTOR_SNAPSHOT",
+    repository: "acme/widget", accessKey: "a".repeat(64), targetKey: "doctor-snapshot",
+    resource: "actions", queryVersion: 2, filters: {}, pageSize: 60,
+    cursorGeneration: "first" }, { active: true, floorMs: 5_000 });
+  assert.equal(subscribed.ok, true);
+  const at = Date.now();
+  const published = await engine.refresh(subscribed.value.id, { acquire: async () => ({
+    rows: [{ databaseId: 1, displayTitle: "private row" }], pageInfo: null,
+    raw: "private response", entities: [], lastSuccessAt: at, lastChangedAt: at,
+    nextDueAt: at + 5_000, hold: null, capabilities: {},
+    meta: { at, truncated: false }, securityNotes: [], securityBlind: false,
+  }) });
+  assert.equal(published.ok, true);
+  engine.close();
+  const path = acquisitionStorePath({ env: { XDG_CONFIG_HOME: root } });
+  const artifact = Object.values(JSON.parse(readFileSync(path, "utf8")).queries)
+    .find((record) => record.snapshot)?.snapshot.artifact;
+  assert.ok(artifact);
+  const artifactPath = join(`${path}.snapshots`, artifact);
+  const healthy = await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } });
+  assert.match(healthy, /^metadata\s+healthy$/m);
+  assert.match(healthy, /^lock\s+unobstructed$/m);
+  assert.doesNotMatch(healthy, /private row|private response|doctor-snapshot/);
+
+  const metadataBefore = readFileSync(path, "utf8");
+  const semantic = JSON.parse(readFileSync(artifactPath, "utf8"));
+  semantic.meta.truncated = "invalid";
+  const semanticBody = JSON.stringify(semantic);
+  const semanticDigest = createHash("sha256").update(semanticBody).digest("hex");
+  const semanticStore = JSON.parse(metadataBefore);
+  const [queryKey, queryRecord] = Object.entries(semanticStore.queries)
+    .find(([, record]) => record.snapshot);
+  const semanticArtifact = `${queryKey}.${queryRecord.generation}.${semanticDigest}.json`;
+  writeFileSync(join(`${path}.snapshots`, semanticArtifact), semanticBody, { mode: 0o600 });
+  queryRecord.snapshot = { ...queryRecord.snapshot, artifact: semanticArtifact,
+    digest: semanticDigest, bytes: Buffer.byteLength(semanticBody) };
+  writeFileSync(path, JSON.stringify(semanticStore), { mode: 0o600 });
+  const semanticallyInvalid = await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } });
+  assert.match(semanticallyInvalid, /^metadata\s+corrupt$/m);
+  writeFileSync(path, metadataBefore, { mode: 0o600 });
+
+  writeFileSync(artifactPath, "changed", { mode: 0o600 });
+  const changed = await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } });
+  assert.match(changed, /^metadata\s+corrupt$/m);
+  assert.match(changed, /^status\s+corrupt$/m);
+  assert.equal(readFileSync(artifactPath, "utf8"), "changed");
+  rmSync(artifactPath);
+  const missing = await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } });
+  assert.match(missing, /^metadata\s+corrupt$/m);
+  assert.equal(existsSync(artifactPath), false);
+});
+
+test("OBS-03: doctor uses the runtime store schema before declaring metadata healthy", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-schema-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const engine = createAcquisitionEngine({ pathOptions: { env: { XDG_CONFIG_HOME: root } } });
+  const subscribed = engine.subscribe({ host: "github.com", repositoryId: "R_DOCTOR_SCHEMA",
+    repository: "acme/widget", accessKey: "a".repeat(64), targetKey: "doctor-schema",
+    resource: "actions", queryVersion: 2, filters: {}, pageSize: 60,
+    cursorGeneration: "first" }, { active: true, floorMs: 5_000 });
+  assert.equal(subscribed.ok, true);
+  engine.close();
+  const path = acquisitionStorePath({ env: { XDG_CONFIG_HOME: root } });
+  const persisted = JSON.parse(readFileSync(path, "utf8"));
+  assert.match(await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } }),
+    /^metadata\s+healthy$/m);
+  const missingAliases = structuredClone(persisted);
+  delete missingAliases.aliases;
+  writeFileSync(path, JSON.stringify(missingAliases), { mode: 0o600 });
+  assert.match(await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } }),
+    /^metadata\s+corrupt$/m);
+  const invalidGeneration = structuredClone(persisted);
+  Object.values(invalidGeneration.queries)[0].generation = -1;
+  writeFileSync(path, JSON.stringify(invalidGeneration), { mode: 0o600 });
+  assert.match(await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } }),
+    /^metadata\s+corrupt$/m);
+});
+
+test("OBS-03: doctor separates young contention, live and dead owners, and unwritable storage", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-lock-state-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const path = acquisitionStorePath({ env: { XDG_CONFIG_HOME: root } });
+  const lockPath = `${path}.lock`;
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  for (const record of ["", JSON.stringify({ pid: process.pid, nonce: randomUUID() }),
+    JSON.stringify({ pid: 999_999_999, nonce: randomUUID() })]) {
+    writeFileSync(lockPath, record, { mode: 0o600 });
+    const out = await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } });
+    assert.match(out, /^lock\s+(?:busy|orphaned)$/m);
+    assert.doesNotMatch(out, /^lock\s+unobstructed$/m);
+    assert.equal(readFileSync(lockPath, "utf8"), record);
+    rmSync(lockPath);
+  }
+  chmodSync(dirname(path), 0o500);
+  const blocked = await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } });
+  assert.match(blocked, /^lock\s+unwritable$/m);
+  chmodSync(dirname(path), 0o700);
+});
+
+test("OBS-03: indeterminate owner and recovery markers remain read-only blockers", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-unknown-lock-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const lockPath = `${acquisitionStorePath({ env: { XDG_CONFIG_HOME: root } })}.lock`;
+  mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+  const owner = JSON.stringify({ pid: 987_654_321, nonce: randomUUID() });
+  writeFileSync(lockPath, owner, { mode: 0o600 });
+  const aged = new Date(Date.now() - GOVERNOR_LOCK_ORPHAN_MS - 1_000);
+  utimesSync(lockPath, aged, aged);
+  const kill = () => { throw Object.assign(new Error("indeterminate"), { code: "EPERM" }); };
+  const unknown = doctorAcquisitionLockDiagnostic(lockPath, { kill });
+  assert.equal(unknown.status, "busy");
+  assert.match(unknown.reason, /unknown/);
+  assert.equal(readFileSync(lockPath, "utf8"), owner);
+  rmSync(lockPath);
+
+  const markerPath = `${lockPath}.recovery-${randomUUID()}`;
+  writeFileSync(markerPath, "", { mode: 0o600 });
+  utimesSync(markerPath, aged, aged);
+  const orphaned = doctorAcquisitionLockDiagnostic(lockPath);
+  assert.equal(orphaned.status, "orphaned");
+  assert.match(orphaned.reason, /recovery marker/);
+  assert.equal(existsSync(markerPath), true);
 });
 
 test("OBS-03: doctor rejects malformed or unreconciled uncertainty metadata", async (t) => {

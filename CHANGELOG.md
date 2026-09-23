@@ -5,6 +5,21 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Recover aged incomplete acquisition locks through the same fenced owner
+  protocol as the quota governor, so one abandoned lock cannot stop every pane.
+- Bound live acquisition claims, fence late owners, and resume the current
+  generation after owner loss without publishing stale rows or advancing false
+  freshness.
+- Keep core-backed tabs progressing during a GraphQL observer failure and
+  retry held queries and pending intents automatically after recovery.
+- Report acquisition metadata and lock health separately in read-only doctor
+  output. Keep the visible acquisition cause across unrelated budget updates,
+  show source ages beyond 100 hours, and remove duplicate stale wording.
+
 ## [0.15.1] - 2026-09-17
 
 ### Fixed

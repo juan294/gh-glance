@@ -164,11 +164,18 @@ identity until admitted GitHub evidence provides a stable database ID; an
 unresolved alias is never guessed across targets.
 
 Each due query generation has one producer claim, identified by PID, nonce and
-generation. Claims live for 45 seconds and are heartbeated every ten seconds.
-Expiry is necessary but not sufficient for takeover: the local PID must also be
-confirmed dead. An inaccessible or suspended process retains ownership, while
-an explicit cancellation releases it. Publication checks nonce, generation and
-access partition, so an old completion cannot overwrite newer evidence.
+generation. The ten-second heartbeat reports owner activity but does not extend
+an unstarted claim beyond 180 seconds from its original claim time. After that
+absolute deadline another subscribed pane may atomically fence and replace the
+unstarted claim even if its owner PID remains alive. The old owner must persist
+the current nonce, generation, and exact governor reservation receipt before
+starting transport; a rejected or repeated start cannot dispatch another
+request. A started claim has a finite deadline derived from its declared
+bounded request sequence and per-request timeout. After takeover, an already
+in-flight old request may finish, but its cost remains conservatively charged
+and its result cannot update the shared snapshot or the old pane's local rows,
+cache, or freshness. A live claim before its deadline, an indeterminate PID,
+and a genuine future quota slot remain protected or held as appropriate.
 
 Claiming, governor admission, transport, settlement, and publication are
 separate operations. The acquisition lock is never held across GitHub I/O, and
@@ -227,3 +234,20 @@ data crossing the known reserve. CPU, RSS, and latency percentages are evidence,
 not universal thresholds. They may be compared only when baseline and candidate
 share the same workload, machine, platform, and runtime; otherwise the report
 names the incompatibility and makes no improvement claim.
+
+## Amendment: acquisition diagnostics and visible source age
+
+Plain `--doctor` evaluates acquisition metadata, referenced snapshot artifacts,
+and the lock path as separate read-only evidence. A parsed coordination file is
+not sufficient to declare acquisition healthy if its snapshot is missing or
+corrupt, or if an orphaned lock prevents progress. Lock status reports age and
+whether an owner is live, indeterminate, or confirmed dead without printing
+owner identifiers, query keys, or credential material. Diagnostic inspection
+does not acquire or repair a lock and cannot advance source success time.
+
+The footer keeps a source-age label and the last acquisition or pending-work
+failure until a validated snapshot or completed cleanup resolves that failure.
+A healthy budget observation alone cannot clear an acquisition failure. The
+visible age derives from the last successful source observation, including an
+unchanged 304, and is not capped after 99 hours. Narrow panes keep the refresh
+and quit keys; the longer sanitized cause appears in the notice line.

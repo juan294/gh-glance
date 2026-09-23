@@ -726,6 +726,94 @@ test("corrupt, live-locked, and blocked storage pause with no data calls", (t) =
   assert.equal(dataStarts(blocked.read()).length, 0);
 });
 
+test("stale cached rows retain an acquisition cause through budget observation and clear after recovery", (t) => {
+  for (const cols of [80, 24]) {
+    const box = sharedFixture(t);
+    capture({
+      cols: 80,
+      rows: 24,
+      signal: "none",
+      settle: 15,
+      stdin: quitAfterCached("actions"),
+      configHome: box.root,
+      env: { GH_GLANCE_FIXTURE_STATE: box.statePath },
+    });
+    const cachePath = join(box.root, "gh-glance", "dashboard-cache.json");
+    const document = JSON.parse(readFileSync(cachePath, "utf8"));
+    const old = Date.now() - 101 * 3_600_000;
+    for (const entry of Object.values(document.targets)) {
+      entry.updatedAt = old;
+      for (const cachedTab of Object.values(entry.tabs)) {
+        cachedTab.lastOk = old;
+        cachedTab.meta.at = old;
+      }
+    }
+    writeFileSync(cachePath, `${JSON.stringify(document)}\n`, { mode: 0o600 });
+    const lockPath = `${acquisitionStorePath({ env: { XDG_CONFIG_HOME: box.root } })}.lock`;
+    writeFileSync(lockPath, `${JSON.stringify({ pid: process.pid, nonce: "live-acquisition-owner" })}\n`, {
+      mode: 0o600,
+    });
+    const blocked = capture({
+      cols,
+      rows: 24,
+      signal: "none",
+      settle: 25,
+      stdin: waitForAwk(
+        '"$GH_GLANCE_CAPTURE_OUT"',
+        cols === 80
+          ? 'index($0, "Acquisition store is busy") { ok=1 }'
+          : 'index($0, "Shared lock busy") { ok=1 }',
+        120,
+      ) + "sleep .4; printf q",
+      configHome: box.root,
+      env: {
+        GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+        GH_GLANCE_FIXTURE_STATE: box.statePath,
+      },
+    });
+    rmSync(lockPath, { force: true });
+    const blockedStatuses = blocked.liveScreen.statusHistory;
+    assert.match(blocked.raw, cols === 80
+      ? /Acquisition store is busy; checking the shared lock/
+      : /Shared lock busy/);
+    assert.doesNotMatch(blocked.raw, /Stale stale/);
+    const staleLine = blocked.finalFrame.lines.find((line) => /^\? Stale/.test(line));
+    assert.ok(staleLine || blockedStatuses.some((line) => /^\? Stale/.test(line)),
+      blocked.finalFrame.lines.join("\n"));
+    if (cols === 80) {
+      assert.ok(blockedStatuses.some((line) => /Stale.*101h\d+m lock busy/.test(line)),
+        blockedStatuses.join(" -> "));
+    }
+    const line = staleLine ?? blockedStatuses.find((entry) => /^\? Stale/.test(entry)) ?? "";
+    assert.match(line, /(?:Refresh: )?r(?:\s|$)/);
+    assert.match(line, /(?:Quit: )?q(?:\s|$)/);
+    assert.ok(blocked.finalFrame.widest <= cols);
+    assert.ok(blocked.liveScreen.maxStatusLines <= 1);
+    assert.equal(blocked.liveScreen.lines.at(-1), "");
+    if (cols === 80) {
+      const recovered = capture({
+        cols,
+        rows: 24,
+        signal: "none",
+        settle: 20,
+        stdin: waitForAwk(
+          '"$GH_GLANCE_CAPTURE_OUT"',
+          'index($0, "Watching") { ok=1 }',
+          150,
+        ) + "sleep .4; printf q",
+        configHome: box.root,
+        env: {
+          GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+          GH_GLANCE_FIXTURE_STATE: box.statePath,
+        },
+      });
+      assert.match(statusLine(recovered) ?? "", /^· Watching/);
+      assert.doesNotMatch(recovered.finalFrame.lines.join("\n"), /lock busy|Acquisition store is busy/);
+      assert.ok(actionsRuns(box.read()).length > 0);
+    }
+  }
+});
+
 test("a sub-threshold coordination blip stays silent", (t) => {
   const root = configRoot(t, "gh-glance-status-notice-blip-");
   capture({
@@ -803,6 +891,7 @@ test("a sustained coordination notice can appear and clear without overflowing t
   });
 
   assert.match(result.raw, /Coordinating with your other panes/);
+  assert.doesNotMatch(result.raw, /Acquisition store is busy; checking the shared lock/);
   assert.doesNotMatch(result.finalFrame.lines.join("\n"), /Coordinating with your other panes/);
   assert.ok(result.liveScreen.statusHistory.some((line) => /^‖ Paused/.test(line)));
   assert.match(statusLine(result) ?? "", /^· Watching/);
@@ -1071,7 +1160,7 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
     stdin: waitForAwk(
       '"$GH_GLANCE_CAPTURE_OUT"',
       'index($0, "GitHub rate limit reached -- backing off") { failed=1 } ' +
-        'failed && index($0, "stale 2m") { ok=1 }',
+        'failed && index($0, "Stale 2m") { ok=1 }',
       250,
     ) + "sleep .3; printf q",
     configHome: staleRoot,
@@ -1085,5 +1174,5 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
   assert.match(staleError.raw, /ci: pin actions to commit/);
   assert.match(staleError.raw, /GitHub rate limit reached -- backing off/);
   assert.match(staleError.raw, /Paused/);
-  assert.match(staleError.raw, /stale 2m/);
+  assert.match(staleError.raw, /Stale 2m\d+s/);
 });

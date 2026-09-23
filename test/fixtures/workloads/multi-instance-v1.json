@@ -29,6 +29,24 @@
         { "id": "seven-duplicates", "panes": 7, "repositories": ["acme/widget"] },
         { "id": "ten-duplicates", "panes": 10, "repositories": ["acme/widget"] },
         { "id": "ten-distinct", "panes": 10, "repositoryPattern": "acme/project-{pane}" },
+        { "id": "mixed-tabs", "panes": 8, "disabledEvents": ["accountSwitch"],
+          "events": [
+            { "type": "observerFailure", "atMs": 1080000, "resource": "core" },
+            { "type": "observerFailure", "atMs": 1320000, "resource": "graphql" }
+          ],
+          "demandChanges": [
+            { "atMs": 900000, "activeIndices": [2, 3, 4, 6] },
+            { "atMs": 960000, "activeIndices": [0, 2, 4, 5] }
+          ], "subscribers": [
+          { "repository": "acme/widget", "resource": "actions", "active": true },
+          { "repository": "acme/widget", "resource": "actions", "active": false },
+          { "repository": "acme/widget", "resource": "issues", "active": true },
+          { "repository": "acme/widget", "resource": "prs", "active": false },
+          { "repository": "acme/widget", "resource": "security", "active": true },
+          { "repository": "acme/other", "resource": "actions", "active": true },
+          { "repository": "acme/other", "resource": "issues", "active": false },
+          { "repository": "acme/other", "resource": "security", "active": false }
+        ] },
         { "id": "two-machines", "panes": 7, "clientsByRoot": [3, 4], "repositories": ["acme/widget"], "transport": "collector" }
       ],
       "publishedProbes": { "graphql": { "mode": "pinned" } },

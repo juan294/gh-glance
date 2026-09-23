@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
 import {
   ACQUISITION_CLAIM_TTL_MS,
+  ACQUISITION_STARTED_DEADLINE_MS,
   ACQUISITION_HEARTBEAT_MS,
   ACQUISITION_MAX_BYTES,
   ACQUISITION_MAX_ENTITIES,
@@ -14,6 +15,7 @@ import {
   ACQUISITION_MAX_SUBSCRIPTIONS,
   ACQUISITION_STORE_VERSION,
   GOVERNOR_LEASE_TTL_MS,
+  GOVERNOR_LOCK_ORPHAN_MS,
   acquisitionQueryKey,
   acquisitionDiagnostics,
   acquisitionRequestMetrics,
@@ -21,12 +23,17 @@ import {
   actionsRunsArgs,
   actionsWorkflowsArgs,
   claimProbe,
+  claimGovernorLock,
   cancelCoordinatedPending,
+  cancelIntent,
+  coalescedAcquisitionIntentMatches,
   createAcquisitionEngine,
   createGovernorScope,
   fetchActions,
   fetchSecurity,
   fetchGraphqlList,
+  frozenGovernorScope,
+  pendingAcquisitionMatches,
   ghApi,
   inspectGovernor,
   loadAcquisitionStore,
@@ -34,7 +41,10 @@ import {
   publishStagedEntities,
   registerIntent,
   registerLease,
+  runStartedAcquisitionTransport,
+  withFileLock,
   startReservation,
+  stagedAcquisitionPublicationView,
   setRuntimeAcquisitionHold,
 } from "../index.mjs";
 
@@ -248,6 +258,101 @@ test("SHARE-03: admitted database identity remaps explicit and inferred slug sub
   const resumed = restarted.subscribe(query(), { active: true, floorMs: 5_000 });
   assert.equal(resumed.value.queryKey, followed.value.query.queryKey);
   assert.equal(resumed.value.snapshot.rows[0].displayTitle, "canonical");
+});
+
+test("SHARE-03: a later Actions subscriber joins its live slug claim after Issues learns the ID", async (t) => {
+  const box = fixture(t);
+  const first = createAcquisitionEngine(box);
+  const issueEngine = createAcquisitionEngine(box);
+  const later = createAcquisitionEngine(box);
+  t.after(() => { first.close(); issueEngine.close(); later.close(); });
+  const actionsQuery = query("slug:acme/widget", "actions", {
+    repository: "acme/widget", targetKey: "target-widget",
+  });
+  const issuesQuery = query("slug:acme/widget", "issues", {
+    repository: "acme/widget", targetKey: "target-widget",
+  });
+  const original = first.subscribe(actionsQuery, { active: true, floorMs: 5_000 });
+  const owned = await first.refresh(original.value.id);
+  assert.equal(owned.value.role, "producer");
+  assert.equal((await first.refresh(original.value.id, { started: owned.value })).value.status,
+    "started");
+
+  const issueSubscription = issueEngine.subscribe(issuesQuery, { active: true, floorMs: 5_000 });
+  const observed = await issueEngine.refresh(issueSubscription.value.id, {
+    acquire: async () => ({ ...snapshot("identity"), rows: [], entities: [], raw: "[]",
+      repositoryIdentity: { id: "R_acme_widget", nameWithOwner: "acme/widget" } }),
+  });
+  assert.equal(observed.ok, true);
+  const joined = later.subscribe(actionsQuery, { active: true, floorMs: 5_000 });
+  assert.equal(joined.value.queryKey, original.value.queryKey);
+  const followed = await later.refresh(joined.value.id);
+  assert.equal(followed.value.role, "follower");
+  const stored = loadAcquisitionStore(acquisitionStorePath(box.pathOptions));
+  assert.equal(Object.values(stored.value.queries).filter(({ query: record }) =>
+    record.resource === "actions" && record.repository === "acme/widget").length, 1);
+  assert.equal(stored.value.queries[original.value.queryKey].claim.nonce, owned.value.nonce);
+  assert.equal(stored.value.queries[original.value.queryKey].claim.started, true);
+});
+
+test("SHARE-03: legacy split aliases converge after their subscriptions retire", async (t) => {
+  const box = fixture(t);
+  const slugEngine = createAcquisitionEngine(box);
+  const canonicalEngine = createAcquisitionEngine(box);
+  const issueEngine = createAcquisitionEngine(box);
+  const follower = createAcquisitionEngine(box);
+  t.after(() => { slugEngine.close(); canonicalEngine.close(); issueEngine.close(); follower.close(); });
+  const slug = query("slug:acme/widget", "actions", {
+    repository: "acme/widget", targetKey: "target-widget",
+  });
+  const canonical = { ...slug, repositoryId: "R_acme_widget" };
+  const original = slugEngine.subscribe(slug, { active: true, floorMs: 5_000 });
+  assert.equal((await slugEngine.refresh(original.value.id, {
+    acquire: async () => snapshot("slug"),
+  })).ok, true);
+  box.setNow(NOW + 100);
+  const second = canonicalEngine.subscribe(canonical, { active: false, floorMs: 5_000 });
+  assert.equal((await canonicalEngine.refresh(second.value.id, {
+    acquire: async () => snapshot("canonical", { at: NOW + 100 }),
+  })).ok, true);
+  const issue = issueEngine.subscribe(query("slug:acme/widget", "issues", {
+    repository: "acme/widget", targetKey: "target-widget",
+  }), { active: true, floorMs: 5_000 });
+  assert.equal((await issueEngine.refresh(issue.value.id, {
+    acquire: async () => ({ ...snapshot("identity", { at: NOW + 100 }),
+      rows: [], entities: [], raw: "[]",
+      repositoryIdentity: { id: "R_acme_widget", nameWithOwner: "acme/widget" } }),
+  })).ok, true);
+
+  const joined = follower.subscribe(slug, { active: true, floorMs: 5_000 });
+  assert.equal(joined.value.aliasConflict, true);
+  assert.ok([original.value.queryKey, second.value.queryKey].includes(joined.value.queryKey));
+  let stored = loadAcquisitionStore(acquisitionStorePath(box.pathOptions));
+  assert.equal(Object.values(stored.value.queries).filter(({ query: record }) =>
+    record.resource === "actions" && record.repository === "acme/widget").length, 2);
+
+  assert.equal(slugEngine.unsubscribe(original.value.id).ok, true);
+  assert.equal(canonicalEngine.unsubscribe(second.value.id).ok, true);
+  assert.equal(issueEngine.unsubscribe(issue.value.id).ok, true);
+  assert.equal(follower.unsubscribe(joined.value.id).ok, true);
+  const resumed = follower.subscribe(slug, { active: true, floorMs: 5_000 });
+  assert.equal(resumed.value.aliasConflict, false);
+  assert.equal(resumed.value.queryKey, second.value.queryKey);
+  assert.equal(resumed.value.snapshot.rows[0].displayTitle, "canonical");
+  stored = loadAcquisitionStore(acquisitionStorePath(box.pathOptions));
+  const actions = Object.values(stored.value.queries).filter(({ query: record }) =>
+    record.resource === "actions" && record.repository === "acme/widget");
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].generation, 1);
+  assert.equal(actions[0].snapshot.queryKey, second.value.queryKey);
+  assert.equal(follower.unsubscribe(resumed.value.id).ok, true);
+  follower.close();
+  const reopened = createAcquisitionEngine(box);
+  t.after(() => reopened.close());
+  const readback = reopened.subscribe(slug, { active: true, floorMs: 5_000 }, null,
+    { resumeFreshSnapshot: true });
+  assert.equal(readback.value.queryKey, second.value.queryKey);
+  assert.equal(readback.value.snapshot.rows[0].displayTitle, "canonical");
 });
 
 test("SHARE-03: concurrent old and new slugs merge into one canonical generation across restart", async (t) => {
@@ -1120,6 +1225,291 @@ test("SHARE-05: a suspended live owner is not stolen, but a confirmed dead owner
   assert.equal(takeover.value.snapshot.rows[0].displayTitle, "takeover");
 });
 
+test("SHARE-05: heartbeats cannot extend a live owner's unstarted claim past 180 seconds", async (t) => {
+  const box = fixture(t);
+  let beat;
+  const options = { ...box, kill: () => {}, setInterval: (run) => { beat ??= run; return { unref() {} }; },
+    clearInterval: () => {} };
+  const owner = createAcquisitionEngine({ ...options, pid: 111 });
+  const follower = createAcquisitionEngine({ ...options, pid: 222 });
+  t.after(() => { owner.close(); follower.close(); });
+  const a = owner.subscribe(query(), { active: true, floorMs: 5_000 });
+  const b = follower.subscribe(query(), { active: true, floorMs: 5_000 });
+  const first = await owner.refresh(a.value.id);
+  for (let elapsed = 10_000; elapsed < 180_000; elapsed += 10_000) {
+    box.setNow(NOW + elapsed);
+    beat();
+  }
+  assert.equal((await follower.refresh(b.value.id)).value.role, "follower");
+  box.setNow(NOW + 180_000);
+  const second = await follower.refresh(b.value.id);
+  assert.equal(second.value.role, "producer");
+  assert.notEqual(second.value.nonce, first.value.nonce);
+  assert.equal((await owner.refresh(a.value.id, { started: first.value })).reason, "stale");
+});
+
+test("SHARE-05: repeated start accepts only the exact receipt and authorizes one dispatch", async (t) => {
+  const box = fixture(t);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  const sub = engine.subscribe(query(), { active: true, floorMs: 5_000 });
+  const claim = (await engine.refresh(sub.value.id)).value;
+  const receipt = { reservationId: "reservation:one", accessKey: ACCESS, epochs: { core: "core:one" } };
+  const first = await engine.refresh(sub.value.id, { started: { ...claim, receipt } });
+  assert.equal(first.value.status, "started");
+  const repeated = await engine.refresh(sub.value.id, { started: { ...claim, receipt } });
+  assert.equal(repeated.value.status, "already-started");
+  const other = await engine.refresh(sub.value.id, { started: { ...claim, receipt: {
+    ...receipt, reservationId: "reservation:two" } } });
+  assert.equal(other.reason, "receipt-mismatch");
+  const differentEpoch = await engine.refresh(sub.value.id, { started: { ...claim, receipt: {
+    ...receipt, epochs: { core: "core:two" } } } });
+  assert.equal(differentEpoch.reason, "receipt-mismatch");
+  let dispatches = 0;
+  const repeatedDispatch = await runStartedAcquisitionTransport(
+    () => engine.refresh(sub.value.id, { started: { ...claim, receipt } }),
+    () => { dispatches += 1; return "dispatched"; });
+  assert.equal(repeatedDispatch.reason, "already-started");
+  assert.equal(dispatches, 0);
+});
+
+test("SHARE-04/05: staged publication carries changed validators, page info, and 304 cadence", () => {
+  const key = "issues\0page:one";
+  const local = new Map([[key, { etag: '"old"', body: "old" }]]);
+  const changed = stagedAcquisitionPublicationView({
+    entities: local,
+    stagedEntities: new Map([[key, { etag: '"new"', body: "new" }]]),
+    transitionKind: "changed",
+    pageState: { pages: 1, hasNextPage: false },
+    loadedPages: 2,
+    hasNextPage: true,
+    unchangedCount: 2,
+  });
+  assert.equal(local.get(key).etag, '"old"', "publication must leave local cache untouched until fenced");
+  assert.equal(changed.entities.get(key).etag, '"new"');
+  assert.deepEqual(changed.pageState, { pages: 2, hasNextPage: true });
+  assert.equal(changed.unchangedCount, 0);
+  const notModified = stagedAcquisitionPublicationView({
+    entities: changed.entities,
+    stagedEntities: new Map(),
+    transitionKind: "unchanged",
+    pageState: changed.pageState,
+    loadedPages: 2,
+    hasNextPage: true,
+    unchangedCount: 1,
+  });
+  assert.equal(notModified.entities.get(key).etag, '"new"');
+  assert.deepEqual(notModified.pageState, { pages: 2, hasNextPage: true });
+  assert.equal(notModified.unchangedCount, 2);
+});
+
+test("SHARE-07: a coalesced governor intent is adopted only for its exact local claim and scope", () => {
+  const scope = { accessKey: ACCESS, hash: "quota:one" };
+  const acquisition = { claim: { nonce: "nonce:one", generation: 1, accessKey: ACCESS } };
+  const existing = { intentId: "intent:old", acquisition, cleanupScope: scope };
+  const decision = { intentId: "intent:old", status: "pending", coalesced: true };
+  assert.equal(coalescedAcquisitionIntentMatches(existing, decision, acquisition, scope), true);
+  assert.equal(coalescedAcquisitionIntentMatches(existing, { ...decision, intentId: "intent:new" },
+    acquisition, scope), false);
+  assert.equal(coalescedAcquisitionIntentMatches(existing, decision, {
+    claim: { ...acquisition.claim, nonce: "nonce:other" },
+  }, scope), false);
+  assert.equal(coalescedAcquisitionIntentMatches(existing, decision, acquisition,
+    { ...scope, hash: "quota:other" }), false);
+  assert.equal(coalescedAcquisitionIntentMatches({ ...existing, cleanupPending: true },
+    decision, acquisition, scope), false);
+});
+
+test("SHARE-07: cleanup retry is terminal after unsubscribe removed the same claim", async (t) => {
+  const box = fixture(t);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  const sub = engine.subscribe(query(), { active: true, floorMs: 5_000 });
+  const claim = (await engine.refresh(sub.value.id)).value;
+  assert.equal(engine.unsubscribe(sub.value.id).ok, true);
+  assert.equal((await engine.refresh(sub.value.id, { cancel: claim })).reason, "stale");
+  assert.equal(Object.values(loadAcquisitionStore(engine.path).value.queries)[0].claim, null);
+});
+
+test("SHARE-07: pending replay rejects a replaced same-account query before its slot starts", () => {
+  const pending = { acquisition: { id: "subscription:one", queryKey: "query:one",
+    claim: { accessKey: ACCESS } } };
+  const subscription = { id: "subscription:one", requestedKey: "query:one" };
+  assert.equal(pendingAcquisitionMatches(pending, subscription, "query:one", ACCESS), true);
+  assert.equal(pendingAcquisitionMatches(pending, { ...subscription, id: "subscription:two" },
+    "query:one", ACCESS), false);
+  assert.equal(pendingAcquisitionMatches(pending, subscription, "query:two", ACCESS), false);
+  assert.equal(pendingAcquisitionMatches(pending, subscription, "query:one", "b".repeat(64)), false);
+});
+
+test("SHARE-07: old-account cleanup uses its frozen ledger after identity changes", (t) => {
+  const box = fixture(t);
+  let current = { effectiveHost: "github.com", authIdentity: "old" };
+  const live = createGovernorScope({ effectiveHost: "github.com", authIdentity: "old",
+    identityProvider: () => current, now: box.now, env: box.pathOptions.env }).value;
+  const frozen = frozenGovernorScope(live);
+  assert.equal(frozen.identityProvider, null);
+  const leaseId = randomUUID();
+  assert.equal(registerLease(live, { id: leaseId, expiresAt: NOW + GOVERNOR_LEASE_TTL_MS,
+    floorMs: 5_000, activeTab: "actions", phaseSeed: { seed: leaseId, registeredAt: NOW },
+    demand: { core: 1, graphql: 0 } }).ok, true);
+  const intentId = randomUUID();
+  assert.equal(registerIntent(live, { id: intentId, leaseId, tab: "actions", priority: "active",
+    costs: { core: 1, graphql: 0 }, requestedAt: NOW,
+    expiresAt: NOW + GOVERNOR_LEASE_TTL_MS }).ok, true);
+  current = { effectiveHost: "github.com", authIdentity: "new" };
+  assert.equal(cancelIntent(live, intentId, NOW).reason, "stale");
+  assert.equal(cancelIntent(frozen, intentId, NOW).value.status, "cancelled");
+});
+
+test("SHARE-07: cross-query coalescing cancels the old intent before a fresh claim binds", async (t) => {
+  const box = fixture(t);
+  const scope = createGovernorScope({ effectiveHost: "github.com", authIdentity: "coalesced-query",
+    now: box.now, env: box.pathOptions.env }).value;
+  const leaseId = randomUUID();
+  assert.equal(registerLease(scope, { id: leaseId, expiresAt: NOW + GOVERNOR_LEASE_TTL_MS,
+    floorMs: 5_000, activeTab: "actions", phaseSeed: { seed: leaseId, registeredAt: NOW },
+    demand: { core: 1, graphql: 0 } }).ok, true);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  const oldSub = engine.subscribe(query("R_old"), { active: true, floorMs: 5_000 });
+  const newSub = engine.subscribe(query("R_new"), { active: true, floorMs: 5_000 });
+  const oldClaim = (await engine.refresh(oldSub.value.id)).value;
+  const newClaim = (await engine.refresh(newSub.value.id)).value;
+  const oldId = randomUUID();
+  const newId = randomUUID();
+  const request = (id) => ({ id, leaseId, tab: "actions", priority: "active",
+    costs: { core: 1, graphql: 0 }, requestedAt: NOW,
+    expiresAt: NOW + GOVERNOR_LEASE_TTL_MS });
+  assert.equal(registerIntent(scope, request(oldId)).ok, true);
+  const duplicate = registerIntent(scope, request(newId));
+  assert.equal(duplicate.value.coalesced, true);
+  assert.equal(duplicate.value.intentId, oldId);
+  const localOld = { intentId: oldId,
+    acquisition: { claim: { ...oldClaim, accessKey: ACCESS } },
+    cleanupScope: frozenGovernorScope(scope) };
+  assert.equal(coalescedAcquisitionIntentMatches(localOld, duplicate.value,
+    { claim: { ...newClaim, accessKey: ACCESS } }, scope), false);
+  assert.equal(cancelIntent(scope, duplicate.value.intentId, NOW).value.status, "cancelled");
+  const fresh = registerIntent(scope, request(newId));
+  assert.equal(fresh.ok, true);
+  assert.equal(fresh.value.intentId, newId);
+});
+
+test("SHARE-05/07: a started governor slot remains charged after claim takeover beats markStarted", async (t) => {
+  const box = fixture(t);
+  const scope = createGovernorScope({ effectiveHost: "github.com", authIdentity: "start-race",
+    now: box.now, env: box.pathOptions.env }).value;
+  const leaseId = randomUUID();
+  assert.equal(registerLease(scope, { id: leaseId, expiresAt: NOW + GOVERNOR_LEASE_TTL_MS,
+    floorMs: 5_000, activeTab: "actions", phaseSeed: { seed: leaseId, registeredAt: NOW },
+    demand: { core: 1, graphql: 0 } }).ok, true);
+  const budgets = { core: { limit: 5_000, used: 0, remaining: 5_000, resetMs: NOW + 3_600_000 },
+    graphql: { limit: 5_000, used: 0, remaining: 5_000, resetMs: NOW + 3_600_000 } };
+  for (const resource of ["core", "graphql"]) {
+    const probe = claimProbe(scope, leaseId, NOW, resource);
+    assert.equal(publishProbe(scope, leaseId, probe.value.nonce, budgets, NOW, resource).ok, true);
+  }
+  const owner = createAcquisitionEngine({ ...box, pid: 111, kill: () => {} });
+  const follower = createAcquisitionEngine({ ...box, pid: 222, kill: () => {} });
+  t.after(() => { owner.close(); follower.close(); });
+  const a = owner.subscribe(query(), { active: true, floorMs: 5_000 });
+  const b = follower.subscribe(query(), { active: true, floorMs: 5_000 });
+  const claim = (await owner.refresh(a.value.id)).value;
+  const intentId = randomUUID();
+  const decision = registerIntent(scope, { id: intentId, leaseId, tab: "actions", priority: "active",
+    costs: { core: 1, graphql: 0 }, requestedAt: NOW,
+    expiresAt: NOW + GOVERNOR_LEASE_TTL_MS }).value;
+  assert.equal(decision.status, "scheduled");
+  assert.equal(startReservation(scope, decision.reservationId, decision.notBefore).value.status, "started");
+  box.setNow(NOW + 180_000);
+  assert.equal((await follower.refresh(b.value.id)).value.role, "producer");
+  assert.equal((await owner.refresh(a.value.id, { started: { ...claim,
+    receipt: { reservationId: decision.reservationId, accessKey: ACCESS,
+      epochs: { core: "core:old" } } } })).reason, "stale");
+  assert.equal(inspectGovernor(scope, NOW + 180_000).value.reservations[decision.reservationId].status,
+    "started");
+});
+
+test("SHARE-07: failed two-store cleanup retries exact intent and claim", async (t) => {
+  const box = fixture(t);
+  const scope = createGovernorScope({ effectiveHost: "github.com", authIdentity: "cleanup-retry",
+    now: box.now, env: box.pathOptions.env }).value;
+  const leaseId = randomUUID();
+  assert.equal(registerLease(scope, { id: leaseId, expiresAt: NOW + GOVERNOR_LEASE_TTL_MS,
+    floorMs: 5_000, activeTab: "actions", phaseSeed: { seed: leaseId, registeredAt: NOW },
+    demand: { core: 1, graphql: 0 } }).ok, true);
+  const intentId = randomUUID();
+  assert.equal(registerIntent(scope, { id: intentId, leaseId, tab: "actions", priority: "active",
+    costs: { core: 1, graphql: 0 }, requestedAt: NOW,
+    expiresAt: NOW + GOVERNOR_LEASE_TTL_MS }).ok, true);
+  const storage = memoryStorage();
+  const engine = createAcquisitionEngine({ ...box, storage });
+  t.after(() => engine.close());
+  const sub = engine.subscribe(query(), { active: true, floorMs: 5_000 });
+  const claim = (await engine.refresh(sub.value.id)).value;
+  const governorLock = `${scope.path}.lock`;
+  writeFileSync(governorLock, JSON.stringify({ pid: process.pid, nonce: randomUUID() }), { mode: 0o600 });
+  assert.equal(cancelIntent(scope, intentId, NOW).reason, "busy");
+  storage.failNext("busy");
+  assert.equal((await engine.refresh(sub.value.id, { cancel: claim })).reason, "busy");
+  unlinkSync(governorLock);
+  assert.equal(cancelIntent(scope, intentId, NOW).value.status, "cancelled");
+  assert.equal((await engine.refresh(sub.value.id, { cancel: claim })).ok, true);
+  assert.equal(engine.inspect(sub.value.id).value.claim, null);
+});
+
+test("SHARE-05: a started live claim has a finite deadline and keeps uncertain receipt debt", async (t) => {
+  const box = fixture(t);
+  const owner = createAcquisitionEngine({ ...box, pid: 111, kill: () => {} });
+  const follower = createAcquisitionEngine({ ...box, pid: 222, kill: () => {} });
+  t.after(() => { owner.close(); follower.close(); });
+  const a = owner.subscribe(query(), { active: true, floorMs: 5_000 });
+  const b = follower.subscribe(query(), { active: true, floorMs: 5_000 });
+  const first = (await owner.refresh(a.value.id)).value;
+  const receipt = { reservationId: "reservation:old", accessKey: ACCESS,
+    epochs: { core: "core:old" } };
+  assert.equal((await owner.refresh(a.value.id, { started: { ...first, receipt } })).value.status, "started");
+  box.setNow(NOW + ACQUISITION_STARTED_DEADLINE_MS - 1);
+  assert.equal((await follower.refresh(b.value.id)).value.role, "follower");
+  box.setNow(NOW + ACQUISITION_STARTED_DEADLINE_MS);
+  const next = (await follower.refresh(b.value.id)).value;
+  assert.equal(next.role, "producer");
+  assert.equal(owner.currentClaim(a.value.id, { ...first, receipt }).reason, "stale");
+  const denied = await owner.refresh(a.value.id, { claim: { ...first, accessKey: ACCESS },
+    publish: snapshot("old") });
+  assert.equal(denied.reason, "stale");
+  assert.equal(owner.inspect(a.value.id).value.snapshot, null);
+  const saved = loadAcquisitionStore(owner.path).value;
+  assert.equal(saved.uncertainReceipts["reservation:old:core"].reservationId, "reservation:old");
+  assert.equal((await follower.refresh(b.value.id, { started: {
+    ...next, receipt: { reservationId: "reservation:new", accessKey: ACCESS,
+      epochs: { core: "core:old" } },
+  } })).value.status, "started");
+});
+
+test("SHARE-05: an overbound started producer cannot publish without a follower takeover", async (t) => {
+  const box = fixture(t);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  const sub = engine.subscribe(query(), { active: true, floorMs: 5_000 });
+  const claim = (await engine.refresh(sub.value.id)).value;
+  const receipt = { reservationId: "reservation:overbound", accessKey: ACCESS,
+    epochs: { core: "core:one" } };
+  assert.equal((await engine.refresh(sub.value.id, { started: { ...claim, receipt } })).ok, true);
+  box.setNow(NOW + ACQUISITION_STARTED_DEADLINE_MS - 1);
+  assert.equal(engine.currentClaim(sub.value.id, { ...claim, receipt }).ok, true);
+  box.setNow(NOW + ACQUISITION_STARTED_DEADLINE_MS);
+  assert.equal(engine.currentClaim(sub.value.id, { ...claim, receipt }).reason, "stale");
+  const late = await engine.refresh(sub.value.id, { claim: { ...claim, accessKey: ACCESS },
+    publish: snapshot("late") });
+  assert.equal(late.reason, "stale");
+  assert.equal(engine.inspect(sub.value.id).value.snapshot, null);
+  const saved = loadAcquisitionStore(engine.path).value;
+  assert.equal(Object.values(saved.queries)[0].claim, null);
+  assert.equal(saved.uncertainReceipts["reservation:overbound:core"].units, 1);
+});
+
 test("SHARE-05: takeover after a durable start leaves the dead owner's governor cost uncertain", async (t) => {
   const box = fixture(t);
   const scope = createGovernorScope({
@@ -1380,6 +1770,148 @@ test("SHARE-05/06: unwritable storage denies ownership without a polling fallbac
   const engine = createAcquisitionEngine({ pathOptions: { env: { XDG_CONFIG_HOME: blockedRoot } } });
   t.after(() => engine.close());
   assert.equal(engine.subscribe(query(), { active: true, floorMs: 5_000 }).reason, "unwritable");
+});
+
+test("SHARE-05: an aged empty acquisition lock is recovered without losing metadata", (t) => {
+  const box = fixture(t);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  assert.equal(engine.subscribe(query(), { active: true, floorMs: 5_000 }).ok, true);
+  const path = acquisitionStorePath(box.pathOptions);
+  const before = readFileSync(path, "utf8");
+  const lockPath = `${path}.lock`;
+  writeFileSync(lockPath, "", { mode: 0o600 });
+  const aged = new Date(Date.now() - GOVERNOR_LOCK_ORPHAN_MS - 1_000);
+  utimesSync(lockPath, aged, aged);
+  assert.equal(engine.subscribe(query("R_after_orphan"), { active: true, floorMs: 5_000 }).ok, true);
+  assert.equal(existsSync(lockPath), false);
+  const previousId = Object.keys(JSON.parse(before).subscriptions)[0];
+  assert.deepEqual(JSON.parse(readFileSync(path, "utf8")).subscriptions[previousId],
+    JSON.parse(before).subscriptions[previousId]);
+  assert.equal(Object.keys(JSON.parse(readFileSync(path, "utf8")).subscriptions).length, 2);
+});
+
+test("SHARE-05: young unreadable locks and live or unknown owners remain protected", (t) => {
+  const box = fixture(t);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  assert.equal(engine.subscribe(query(), { active: true, floorMs: 5_000 }).ok, true);
+  const lockPath = `${engine.path}.lock`;
+  for (const record of ["", "{\"pid\":4"]) {
+    writeFileSync(lockPath, record, { mode: 0o600 });
+    assert.equal(engine.subscribe(query("R_young"), { active: true, floorMs: 5_000 }).reason, "busy");
+    assert.equal(readFileSync(lockPath, "utf8"), record);
+    unlinkSync(lockPath);
+  }
+  const owner = { pid: process.pid, nonce: randomUUID() };
+  writeFileSync(lockPath, JSON.stringify(owner), { mode: 0o600 });
+  const aged = new Date(Date.now() - 10 * GOVERNOR_LOCK_ORPHAN_MS);
+  utimesSync(lockPath, aged, aged);
+  assert.equal(engine.subscribe(query("R_live"), { active: true, floorMs: 5_000 }).reason, "busy");
+  assert.deepEqual(JSON.parse(readFileSync(lockPath, "utf8")), owner);
+  unlinkSync(lockPath);
+
+  const unknown = createAcquisitionEngine({ ...box, kill: () => {
+    throw Object.assign(new Error("unavailable"), { code: "EPERM" });
+  } });
+  t.after(() => unknown.close());
+  writeFileSync(lockPath, JSON.stringify({ pid: 999_999_999, nonce: randomUUID() }), { mode: 0o600 });
+  assert.equal(unknown.subscribe(query("R_unknown"), { active: true, floorMs: 5_000 }).reason, "busy");
+  assert.equal(existsSync(lockPath), true);
+});
+
+test("SHARE-05: aged partial records, dead owners, and stale recovery markers are reclaimed", (t) => {
+  const box = fixture(t);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  assert.equal(engine.subscribe(query(), { active: true, floorMs: 5_000 }).ok, true);
+  const lockPath = `${engine.path}.lock`;
+  const age = (path) => {
+    const aged = new Date(Date.now() - GOVERNOR_LOCK_ORPHAN_MS - 1_000);
+    utimesSync(path, aged, aged);
+  };
+  writeFileSync(lockPath, "{\"pid\":4", { mode: 0o600 });
+  age(lockPath);
+  assert.equal(engine.subscribe(query("R_partial"), { active: true, floorMs: 5_000 }).ok, true);
+  assert.equal(existsSync(lockPath), false);
+  writeFileSync(lockPath, JSON.stringify({ pid: 999_999_999, nonce: randomUUID() }), { mode: 0o600 });
+  assert.equal(engine.subscribe(query("R_dead"), { active: true, floorMs: 5_000 }).ok, true);
+  assert.equal(existsSync(lockPath), false);
+  const staleMarker = `${lockPath}.recovery-${randomUUID()}`;
+  writeFileSync(staleMarker, "", { mode: 0o600 });
+  assert.equal(engine.subscribe(query("R_marker_young"), { active: true, floorMs: 5_000 }).reason, "busy");
+  age(staleMarker);
+  assert.equal(engine.subscribe(query("R_marker_old"), { active: true, floorMs: 5_000 }).ok, true);
+  assert.equal(existsSync(staleMarker), false);
+  assert.equal(loadAcquisitionStore(engine.path).ok, true);
+});
+
+test("SHARE-05: failed owner-record creation leaves no lock and a live marker blocks recovery", (t) => {
+  const box = fixture(t);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  assert.equal(engine.subscribe(query(), { active: true, floorMs: 5_000 }).ok, true);
+  const lockPath = `${engine.path}.lock`;
+  assert.equal(claimGovernorLock(lockPath, { pid: process.pid, nonce: 1n }), "failed");
+  assert.equal(existsSync(lockPath), false);
+  const markerPath = `${lockPath}.recovery-${randomUUID()}`;
+  writeFileSync(markerPath, JSON.stringify({ pid: process.pid, nonce: randomUUID() }), { mode: 0o600 });
+  const aged = new Date(Date.now() - 10 * GOVERNOR_LOCK_ORPHAN_MS);
+  utimesSync(markerPath, aged, aged);
+  assert.equal(engine.subscribe(query("R_live_marker"), { active: true, floorMs: 5_000 }).reason, "busy");
+  assert.equal(existsSync(markerPath), true);
+});
+
+test("SHARE-05: recovery marker preserves a successor that replaces a dead lock", (t) => {
+  const box = fixture(t);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  assert.equal(engine.subscribe(query(), { active: true, floorMs: 5_000 }).ok, true);
+  const lockPath = `${engine.path}.lock`;
+  const abandoned = { pid: 999_999_999, nonce: randomUUID() };
+  const successor = { pid: process.pid, nonce: randomUUID() };
+  writeFileSync(lockPath, JSON.stringify(abandoned), { mode: 0o600 });
+  let entered = false;
+  const raced = withFileLock(lockPath, () => { entered = true; return { ok: true }; }, {
+    waitMs: 0,
+    observeArtifact: (kind) => {
+      if (kind === "recovery") writeFileSync(lockPath, JSON.stringify(successor));
+    },
+  });
+  assert.equal(raced.reason, "busy");
+  assert.equal(entered, false);
+  assert.deepEqual(JSON.parse(readFileSync(lockPath, "utf8")), successor);
+});
+
+test("SHARE-05: a stalled creator cannot enter after its empty lock is reclaimed", (t) => {
+  const box = fixture(t);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  assert.equal(engine.subscribe(query(), { active: true, floorMs: 5_000 }).ok, true);
+  const lockPath = `${engine.path}.lock`;
+  const successor = { pid: process.pid, nonce: randomUUID() };
+  let recoveryEntered = false;
+  let stalled = false;
+  const staleNonce = randomUUID();
+  const stalledOwner = {
+    pid: process.pid,
+    get nonce() {
+      if (stalled) return staleNonce;
+      stalled = true;
+      const aged = new Date(Date.now() - GOVERNOR_LOCK_ORPHAN_MS - 1_000);
+      utimesSync(lockPath, aged, aged);
+      const recovered = withFileLock(lockPath, () => {
+        recoveryEntered = true;
+        return { ok: true };
+      }, { waitMs: 0 });
+      assert.equal(recovered.ok, true);
+      writeFileSync(lockPath, JSON.stringify(successor), { mode: 0o600 });
+      return staleNonce;
+    },
+  };
+  assert.equal(claimGovernorLock(lockPath, stalledOwner), "held");
+  assert.equal(recoveryEntered, true);
+  assert.deepEqual(JSON.parse(readFileSync(lockPath, "utf8")), successor);
 });
 
 test("SHARE-05/06: malformed pairs and hard subscription caps fail closed", (t) => {

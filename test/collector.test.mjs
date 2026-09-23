@@ -14,6 +14,8 @@ import {
   acquisitionQueryForTab,
   acquisitionStorePath,
   collectorPublicationFromResult,
+  collectorBudgetRefreshAllowsAdmission,
+  refreshCollectorRequiredBudget,
   createAcquisitionEngine,
   createCollectorAcquisitionRuntime,
   collectorSocketPath,
@@ -25,6 +27,28 @@ import {
   normalizeCollectorConfig,
   runCollectorStdioBridge,
 } from "../index.mjs";
+
+test("COL-01: a collector read never waits on an unrelated budget observer", async () => {
+  const requested = [];
+  const refresh = async (_scope, _leaseId, _signal, resource) => {
+    requested.push(resource);
+    return resource === "core" ? { ok: true, value: { status: "published" } }
+      : new Promise(() => {});
+  };
+  const core = await within(refreshCollectorRequiredBudget({}, "lease", null,
+    "actions", {}, refresh), 50);
+  assert.equal(core.ok, true);
+  assert.deepEqual(requested, ["core"]);
+
+  requested.length = 0;
+  const graphql = await refreshCollectorRequiredBudget({}, "lease", null,
+    "issues", {}, async (...args) => {
+      requested.push(args[3]);
+      return { ok: true, value: { status: "published" } };
+    });
+  assert.equal(graphql.ok, true);
+  assert.deepEqual(requested, ["graphql"]);
+});
 
 const CONFIG = {
   version: 1,
@@ -100,6 +124,124 @@ test("COL-01: a paused collector admission retries at its persisted observer dea
     }),
     (error) => error.notStarted === true && error.retryAt === 61_000,
   );
+});
+
+test("COL-01: collector retains one scheduled reservation past the short wait until its safe slot", async () => {
+  const intentId = "11111111-1111-4111-8111-111111111111";
+  const reservationId = `reservation:${intentId}`;
+  let at = 1_000;
+  const started = [];
+  const cancelled = [];
+  let checks = 0;
+  const result = await awaitCollectorReservation({
+    scope: {}, leaseId: "22222222-2222-4222-8222-222222222222",
+    operation: "tab:issues", priority: "background", now: () => at,
+    waitMs: 2_000, retainUntil: 10_000,
+    admit: () => ({ ok: true, value: { status: "scheduled", reservationId, notBefore: 7_000 } }),
+    wait: async (delay) => { at += delay; return true; },
+    onRetainedWait: async () => { checks += 1; return true; },
+    start(_scope, id, now) {
+      started.push({ id, now });
+      return { ok: true, value: now >= 7_000
+        ? { status: "started", reservationId: id }
+        : { status: "waiting", notBefore: 7_000 } };
+    },
+    cancel(_scope, id) { cancelled.push(id); return { ok: true }; },
+  });
+  assert.equal(result.status, "started");
+  assert.deepEqual(started, [{ id: reservationId, now: 7_000 }]);
+  assert.equal(checks, 1);
+  assert.deepEqual(cancelled, []);
+});
+
+test("COL-01: an active retained reservation sees returned lane credit before its old slot", async () => {
+  const intentId = "11111111-1111-4111-8111-111111111111";
+  const reservationId = `reservation:${intentId}`;
+  let at = 0;
+  let dueAt = 16_000;
+  const result = await awaitCollectorReservation({
+    scope: {}, leaseId: "22222222-2222-4222-8222-222222222222",
+    operation: "tab:actions", priority: "active", now: () => at,
+    retainUntil: 20_000,
+    admit: () => ({ ok: true, value: { status: "scheduled", reservationId, notBefore: dueAt } }),
+    wait: async (delay) => { at += delay; if (at >= 5_000) dueAt = 7_000; return true; },
+    onRetainedWait: async () => true,
+    start(_scope, id) {
+      return { ok: true, value: at >= dueAt
+        ? { status: "started", reservationId: id }
+        : { status: "waiting", notBefore: dueAt } };
+    },
+    cancel() { throw new Error("started admission must not be cancelled"); },
+  });
+  assert.equal(result.status, "started");
+  assert.equal(at, 7_000);
+});
+
+test("COL-01: a probe denial retains its exact intent until observation schedules the same reservation", async () => {
+  const intentId = "33333333-3333-4333-8333-333333333333";
+  const reservationId = `reservation:${intentId}`;
+  let at = 1_000;
+  const inspected = [];
+  const started = [];
+  const cancelled = [];
+  const result = await awaitCollectorReservation({
+    scope: {}, leaseId: "22222222-2222-4222-8222-222222222222",
+    operation: "tab:prs", priority: "background", now: () => at,
+    retainUntil: 10_000,
+    admit: () => ({ ok: true, value: { status: "probe", intentId, reason: "budget-stale" } }),
+    wait: async (delay) => { at += delay; return true; },
+    onRetainedWait: async () => true,
+    inspect(_scope, id) {
+      inspected.push(id);
+      return { ok: true, value: { status: "scheduled", reservationId, notBefore: 4_000 } };
+    },
+    start(_scope, id, now) {
+      started.push({ id, now });
+      return { ok: true, value: { status: "started", reservationId: id } };
+    },
+    cancel(_scope, id) { cancelled.push(id); return { ok: true }; },
+  });
+  assert.equal(result.status, "started");
+  assert.deepEqual(inspected, [intentId]);
+  assert.deepEqual(started, [{ id: reservationId, now: 4_000 }]);
+  assert.deepEqual(cancelled, []);
+});
+
+test("COL-01: a changed collector claim cancels only its retained reservation before transport", async () => {
+  const intentId = "44444444-4444-4444-8444-444444444444";
+  const reservationId = `reservation:${intentId}`;
+  let at = 1_000;
+  const cancelled = [];
+  let starts = 0;
+  await assert.rejects(awaitCollectorReservation({
+    scope: {}, leaseId: "22222222-2222-4222-8222-222222222222",
+    operation: "tab:security", priority: "background", now: () => at,
+    retainUntil: 10_000,
+    admit: () => ({ ok: true, value: { status: "scheduled", reservationId, notBefore: 5_000 } }),
+    wait: async (delay) => { at += delay; return true; },
+    onRetainedWait: async () => false,
+    start() { starts += 1; return { ok: true, value: { status: "started", reservationId } }; },
+    cancel(_scope, id) { cancelled.push(id); return { ok: true }; },
+  }), (error) => error.notStarted === true);
+  assert.equal(starts, 0);
+  assert.deepEqual(cancelled, [intentId]);
+});
+
+test("COL-01: GraphQL observer failure cannot reject a healthy core collector lane", () => {
+  const at = 10_000;
+  const snapshot = { ok: true, value: {
+    probeClaims: { core: null, graphql: null },
+    observers: { core: { outcome: "healthy" }, graphql: { outcome: "failed" } },
+    budgets: { core: { observedAt: at }, graphql: { observedAt: at } },
+  } };
+  const combinedFailure = { ok: false, reason: "provider-capability", capability: "graphql-unavailable" };
+  const inspect = () => snapshot;
+  assert.equal(collectorBudgetRefreshAllowsAdmission(combinedFailure, {}, "actions", at, inspect), true);
+  assert.equal(collectorBudgetRefreshAllowsAdmission(combinedFailure, {}, "security", at, inspect), true);
+  assert.equal(collectorBudgetRefreshAllowsAdmission(combinedFailure, {}, "issues", at, inspect), false);
+  assert.equal(collectorBudgetRefreshAllowsAdmission(combinedFailure, {}, "prs", at, inspect), false);
+  snapshot.value.probeClaims.core = { nonce: "busy" };
+  assert.equal(collectorBudgetRefreshAllowsAdmission(combinedFailure, {}, "actions", at, inspect), false);
 });
 
 test("COL-05: stdio bridge finalizes once and removes listeners after failure", async () => {
@@ -659,6 +801,108 @@ test("COL-01: headless publication uses exact active, inactive, and background-o
   assert.equal(active.nextDueAt, 5100);
   assert.ok(inactive.nextDueAt > active.nextDueAt);
   assert.equal(off.nextDueAt, Number.POSITIVE_INFINITY);
+});
+
+test("COL-01: inactive collector producer carries background demand through shared acquisition", async (t) => {
+  const root = mkdtempSync("/tmp/ggc-background-demand-");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  let producerDemand = null;
+  const runtime = createCollectorAcquisitionRuntime({
+    config: normalizeCollectorConfig(CONFIG),
+    pathOptions: { env: { XDG_CONFIG_HOME: root }, platform: "linux" },
+    resolveProvider: async () => IDENTITY,
+    async produce({ demand, markStarted }) {
+      producerDemand = demand;
+      await markStarted();
+      return publication();
+    },
+  });
+  t.after(() => runtime.close());
+  const received = new Promise((resolve) => runtime.subscribe({
+    target: normalizeCollectorConfig(CONFIG).targets[0], resource: "prs",
+    demand: { active: false, background: true, floorMs: 5000, pages: 1 },
+    onSnapshot: resolve, onHold() {},
+  }));
+  await within(received);
+  assert.equal(producerDemand.active, false);
+  assert.equal(producerDemand.background, true);
+});
+
+test("COL-01: promoting a background query starts one conditional active generation before its old due time", async (t) => {
+  const root = mkdtempSync("/tmp/ggc-active-promotion-");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const now = 1_000;
+  let starts = 0;
+  const snapshots = [];
+  let nextSnapshot;
+  const delivered = () => new Promise((resolve) => { nextSnapshot = resolve; });
+  const runtime = createCollectorAcquisitionRuntime({
+    config: normalizeCollectorConfig(CONFIG),
+    pathOptions: { env: { XDG_CONFIG_HOME: root }, platform: "linux" },
+    now: () => now,
+    setTimeout() { return { unref() {} }; }, clearTimeout() {},
+    resolveProvider: async () => IDENTITY,
+    async produce({ markStarted }) {
+      starts += 1;
+      await markStarted();
+      return { ...publication(), lastSuccessAt: now, lastChangedAt: now,
+        nextDueAt: now + 120_000, meta: { at: now, truncated: false } };
+    },
+  });
+  t.after(() => runtime.close());
+  const first = delivered();
+  const handle = runtime.subscribe({ target: normalizeCollectorConfig(CONFIG).targets[0],
+    resource: "actions", demand: { active: false, background: true, floorMs: 5000, pages: 1 },
+    onSnapshot(snapshot) { snapshots.push(snapshot); nextSnapshot?.(); }, onHold() {},
+  });
+  await within(first);
+  await handle.whenCurrentPollSettled();
+  assert.equal(starts, 1);
+  const second = delivered();
+  handle.updateDemand({ active: true, background: true, floorMs: 5000, pages: 1 });
+  await within(second);
+  await handle.whenCurrentPollSettled();
+  assert.equal(starts, 2);
+  assert.equal(snapshots.at(-1).generation, 2);
+  handle.updateDemand({ active: true, background: true, floorMs: 5000, pages: 1 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(starts, 2);
+});
+
+test("COL-01: promotion joins an in-flight background publication without a duplicate fetch", async (t) => {
+  const root = mkdtempSync("/tmp/ggc-promotion-join-");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  let starts = 0;
+  let began;
+  let finish;
+  const begun = new Promise((resolve) => { began = resolve; });
+  const release = new Promise((resolve) => { finish = resolve; });
+  const runtime = createCollectorAcquisitionRuntime({
+    config: normalizeCollectorConfig(CONFIG),
+    pathOptions: { env: { XDG_CONFIG_HOME: root }, platform: "linux" },
+    now: () => 1_000,
+    setTimeout() { return { unref() {} }; }, clearTimeout() {},
+    resolveProvider: async () => IDENTITY,
+    async produce({ markStarted }) {
+      starts += 1;
+      await markStarted();
+      began();
+      if (starts === 1) await release;
+      return { ...publication(), lastSuccessAt: 1_000, lastChangedAt: 1_000,
+        nextDueAt: 121_000, meta: { at: 1_000, truncated: false } };
+    },
+  });
+  t.after(() => runtime.close());
+  const handle = runtime.subscribe({ target: normalizeCollectorConfig(CONFIG).targets[0],
+    resource: "actions", demand: { active: false, background: true, floorMs: 5000, pages: 1 },
+    onSnapshot() {}, onHold() {},
+  });
+  await within(begun);
+  handle.updateDemand({ active: true, background: true, floorMs: 5000, pages: 1 });
+  finish();
+  await handle.whenCurrentPollSettled();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(starts, 1);
 });
 
 test("COL-01: provider failure schedules recovery instead of wedging the subscription", async (t) => {

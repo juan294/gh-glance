@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
+  existsSync,
   mkdtempSync,
+  mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -14,9 +17,15 @@ import { fileURLToPath } from "node:url";
 
 import {
   ACQUISITION_CLAIM_TTL_MS,
+  ACQUISITION_STARTED_DEADLINE_MS,
+  BUDGET_SNAPSHOT_TTL_MS,
+  GOVERNOR_LOCK_ORPHAN_MS,
+  acquisitionStorePath,
   loadAcquisitionStore,
   resourceReserve,
   tabRequestCost,
+  withFileLock,
+  writeGovernorState,
 } from "../../index.mjs";
 import { captureAsync } from "./capture.mjs";
 import { seedKnownHeldIdentity } from "./fixtures/known-identity.mjs";
@@ -24,7 +33,6 @@ import { seedKnownHeldIdentity } from "./fixtures/known-identity.mjs";
 const STATE_HELPER = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "gh-state.mjs");
 const LIMIT = 10_000;
 const WINDOW_MS = 600_000;
-const CAPTURE_ARGS = "--repo acme/widget --refresh 40";
 // Phase 6 makes duplicate panes followers of one acquisition generation. The
 // one producer owns the governor reservation and every follower consumes its
 // published snapshot.
@@ -34,6 +42,14 @@ const STARTUP_DATA_STARTS = ACTIONS_CALLS;
 // What the external burn below deliberately leaves spendable: room for two
 // Actions batches and no more.
 const BURN_HEADROOM = 2 * ACTIONS_CALLS;
+const SIX_PANE_MIX = [
+  ["widget-actions-a", "acme/widget", "actions"],
+  ["widget-actions-b", "acme/widget", "actions"],
+  ["widget-issues", "acme/widget", "issues"],
+  ["widget-prs", "acme/widget", "prs"],
+  ["widget-security", "acme/widget", "security"],
+  ["other-actions", "acme/other", "actions"],
+];
 
 function fixture(t, overrides = {}) {
   const root = mkdtempSync(join(tmpdir(), "gh-glance-governor-pty-"));
@@ -94,6 +110,45 @@ function actionsRuns(state) {
     .filter((event) => event.argv.some((argument) => argument.includes("/actions/runs?")));
 }
 
+function widgetActionsEvidence(fixtureState, acquisition) {
+  const records = Object.values(acquisition.queries).filter((record) =>
+    record.query.repository === "acme/widget" && record.query.resource === "actions");
+  const subscriptions = Object.values(acquisition.subscriptions).filter(({ queryKey }) =>
+    records.some((record) => record.query.queryKey === queryKey));
+  const starts = actionsRuns(fixtureState).filter(({ pane }) => pane?.startsWith("widget-"));
+  return { records, subscriptions, starts };
+}
+
+function assertSharedWidgetActions(fixtureState, acquisition, {
+  expectedSubscribers = null, expectedActive = null, require304 = false, requireSettled = false,
+} = {}) {
+  const { records, subscriptions, starts } = widgetActionsEvidence(fixtureState, acquisition);
+  assert.equal(records.length, 1,
+    "widget panes must share one logical Actions query after identity discovery");
+  const record = records[0];
+  assert.ok(record.snapshot?.generation > 0);
+  if (expectedSubscribers !== null) assert.equal(subscriptions.length, expectedSubscribers);
+  if (expectedActive !== null) {
+    assert.equal(subscriptions.filter(({ demand }) => demand.active).length, expectedActive);
+  }
+  assert.equal(starts.length, record.snapshot.generation,
+    "one shared source request must publish each Actions generation");
+  const sequences = new Set(starts.map(({ sequence }) => sequence));
+  let inFlight = 0;
+  for (const event of fixtureState.events) {
+    if (!sequences.has(event.sequence)) continue;
+    inFlight += event.type === "start" ? 1 : event.type === "end" ? -1 : 0;
+    assert.ok(inFlight <= 1, "one shared Actions producer may run at a time");
+  }
+  if (requireSettled) assert.equal(inFlight, 0);
+  if (require304) {
+    assert.ok(starts.some(({ sequence }) => fixtureState.events.some((event) =>
+      event.type === "end" && event.sequence === sequence && event.status === 304)),
+    "the shared query must advance on an unchanged response");
+  }
+  return record;
+}
+
 async function observeUntil(read, predicate, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let lastValue;
@@ -119,6 +174,8 @@ function readyInput(path, attempts = 1_000, delaySeconds = 0) {
 
 function startPane(box, pane, {
   tab = "actions",
+  repo = "acme/widget",
+  refresh = 40,
   readyPath,
   readyAttempts = 1_000,
   readyDelay = 0,
@@ -133,7 +190,7 @@ function startPane(box, pane, {
     signal: "none",
     settle,
     stdin: stdin ?? (readyPath ? readyInput(readyPath, readyAttempts, readyDelay) : "sleep 120"),
-    args: `${CAPTURE_ARGS} --tab ${tab}`,
+    args: `--repo ${repo} --refresh ${refresh} --tab ${tab}`,
     animation,
     configHome: box.root,
     env: {
@@ -340,6 +397,206 @@ test("twelve mixed active panes pace core and GraphQL without consuming either r
     if (event.pane.includes("-security-")) assert.equal(event.argv[0], "api");
   }
   assertDebitsStayOutsideReserve(data);
+});
+
+test("mixed panes join one Actions query after repository identity discovery", { timeout: 50_000 }, async (t) => {
+  const box = fixture(t, { delayByCommand: { actions: { ms: 4_000, remaining: 1 } } });
+  const readyPath = join(box.root, "alias-ready");
+  const captures = SIX_PANE_MIX.map(([pane, repo, tab]) => startPane(box, pane, {
+    repo, tab, refresh: 5, readyPath, readyAttempts: 900, settle: 90,
+  }));
+  const startedAt = Date.now();
+  let observed;
+  try {
+    observed = await observeUntil(
+      () => ({ fixture: box.read(), acquisition: box.readAcquisition() }),
+      ({ fixture, acquisition }) => {
+        const { records, subscriptions, starts } = widgetActionsEvidence(fixture, acquisition);
+        return Date.now() - startedAt >= 30_000 && records.some((record) => record.snapshot) &&
+          Object.values(acquisition.aliases).includes("R_acme_widget") &&
+          subscriptions.length >= 5 &&
+          starts.length > 0 && starts.every(({ sequence }) =>
+            fixture.events.some((event) => event.type === "end" && event.sequence === sequence));
+      }, 45_000,
+    );
+  } finally {
+    await releasePanes(readyPath, captures);
+  }
+  assertSharedWidgetActions(observed.fixture, observed.acquisition,
+    { expectedSubscribers: 5, expectedActive: 2, require304: true, requireSettled: true });
+});
+
+test("six mixed panes cross an orphan bound and keep duplicate and distinct targets live", { timeout: 220_000 }, async (t) => {
+  const box = fixture(t, { delayByCommand: { actions: { ms: 4_000, remaining: 1 } } });
+  const lockPath = `${acquisitionStorePath({ env: { XDG_CONFIG_HOME: box.root } })}.lock`;
+  mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+  writeFileSync(lockPath, "", { mode: 0o600 });
+  const readyPath = join(box.root, "mixed-orphan-ready");
+  const panes = SIX_PANE_MIX;
+  const startedAt = Date.now();
+  const captures = panes.map(([pane, repo, tab]) => startPane(box, pane, {
+    repo, tab, refresh: 5, readyPath, readyAttempts: 3_600, settle: 180,
+  }));
+  let progress;
+  let shared;
+  const observations = new Map();
+  let firstActionSuccessAt = null;
+  try {
+    ({ fixture: progress, acquisition: shared } = await observeUntil(
+      () => ({ fixture: box.read(), acquisition: box.readAcquisition() }),
+      ({ fixture, acquisition }) => {
+        const records = Object.values(acquisition.queries);
+        for (const record of records) {
+          const successAt = record.snapshot?.lastSuccessAt;
+          if (!Number.isFinite(successAt)) continue;
+          const key = `${record.query.repository}:${record.query.resource}`;
+          const values = observations.get(key) ?? [];
+          if (!values.some((value) => value.successAt === successAt)) values.push({
+            successAt, changedAt: record.snapshot.lastChangedAt,
+            nextDueAt: record.snapshot.nextDueAt,
+            generation: record.snapshot.generation ?? record.generation,
+          });
+          observations.set(key, values);
+          if (key === "acme/widget:actions" && firstActionSuccessAt === null) {
+            firstActionSuccessAt = successAt;
+          }
+        }
+        return Date.now() - startedAt >= 145_000 &&
+          panes.every(([, repo, tab]) => records.some((record) =>
+          record.query.repository === repo && record.query.resource === tab &&
+          record.snapshot?.lastSuccessAt >= startedAt)) &&
+          (observations.get("acme/other:issues")?.length ?? 0) >= 2 &&
+          fixture.events.some((event) => event.type === "end" && event.status === 304);
+      }, 170_000,
+    ));
+  } finally {
+    await releasePanes(readyPath, captures);
+  }
+  assertSharedWidgetActions(progress, shared);
+  assert.ok(firstActionSuccessAt >= startedAt + GOVERNOR_LOCK_ORPHAN_MS,
+    "the fresh incomplete lock must remain protected until its orphan age");
+  assert.ok(firstActionSuccessAt < startedAt + GOVERNOR_LOCK_ORPHAN_MS + 30_000,
+    "the first eligible query must recover within 30 seconds of orphan age");
+  assert.equal(existsSync(lockPath), false);
+  const activeKeys = new Set(panes.map(([, repo, tab]) => `${repo}:${tab}`));
+  for (const key of activeKeys) {
+    assert.ok((observations.get(key)?.length ?? 0) >= 2,
+      `${key} lacks a second validated source observation`);
+  }
+  assert.ok([...observations.values()].some((values) => values.slice(1).some(
+    ({ successAt, changedAt }, index) =>
+      successAt > values[index].successAt && changedAt === values[index].changedAt,
+  )), "an unchanged response must advance source success without changing rows");
+  for (const [key, values] of observations) {
+    assert.ok(values.length >= 1, `${key} has no validated source observation`);
+    if (values.length < 2) continue;
+    const ordered = [...values].sort((left, right) => left.successAt - right.successAt);
+    const maxGapMs = Math.max(0, ...ordered.slice(1).map(({ successAt }, index) =>
+      successAt - ordered[index].successAt));
+    assert.ok(Number.isFinite(maxGapMs), `${key} has no finite observed gap`);
+    const overdue = ordered.slice(1).map(({ successAt }, index) =>
+      successAt - ordered[index].nextDueAt);
+    const maxOverdueMs = Math.max(0, ...overdue);
+    const worstIndex = Math.max(0, overdue.indexOf(maxOverdueMs));
+    const previous = ordered[worstIndex];
+    const current = ordered[worstIndex + 1];
+    assert.ok(maxOverdueMs <= 15_000,
+      `${key} had ${maxOverdueMs}ms overdue: prior success ${previous.successAt}, ` +
+      `due ${previous.nextDueAt}, generation ${previous.generation}; ` +
+      `next success ${current.successAt}, generation ${current.generation}`);
+  }
+  assert.ok((observations.get("acme/other:issues")?.length ?? 0) >= 2,
+    "an inactive query must advance across its background poll interval");
+  assertDebitsStayOutsideReserve(dataStarts(progress));
+});
+
+test("failed GraphQL observer leaves core background tabs live and recovers without input", { timeout: 210_000 }, async (t) => {
+  const box = fixture(t, { failure: { remaining: 2, selector: "graphql-observer",
+    message: "temporary GraphQL observer failure" } });
+  const readyPath = join(box.root, "observer-ready");
+  const captures = [startPane(box, "observer-isolation", {
+    tab: "issues", refresh: 5, readyPath, readyAttempts: 4_400, settle: 200,
+  })];
+  let held;
+  let recovered;
+  try {
+    held = await observeUntil(() => ({ fixture: box.read(), governor: box.readGovernor() }),
+      ({ fixture: state, governor }) =>
+      state.failure.remaining === 0 && governor.observers.graphql.outcome === "failed" &&
+      governor.observers.core.outcome === "healthy" &&
+      actionsRuns(state).length > 0 &&
+      dataStarts(state).some((event) => event.cost.core > 0 && !isActionsEndpoint(event)) &&
+      dataStarts(state).every((event) => event.cost.graphql === 0), 105_000);
+    recovered = await observeUntil(() => ({ fixture: box.read(), acquisition: box.readAcquisition() }),
+      ({ fixture: state, acquisition }) =>
+        dataStarts(state).some((event) => event.graphqlOperation === "issues.page") &&
+        Object.values(acquisition.queries).some((record) =>
+          record.query.resource === "issues" && record.snapshot?.lastSuccessAt > 0), 90_000);
+  } finally {
+    await releasePanes(readyPath, captures);
+  }
+  assert.equal(held.fixture.failure.remaining, 0);
+  assert.ok(dataStarts(held.fixture).some((event) => event.cost.core > 0));
+  assertDebitsStayOutsideReserve(dataStarts(recovered.fixture));
+});
+
+test("failed core observer leaves GraphQL background tabs live and recovers without input", { timeout: 210_000 }, async (t) => {
+  const box = fixture(t);
+  // The fixture calls /user for both identity proof and core observation.
+  // Prove identity first, then make only the quota observer due and fail it.
+  const warmReady = join(box.root, "core-identity-ready");
+  const warm = [startPane(box, "core-identity", { tab: "issues", readyPath: warmReady,
+    readyAttempts: 400, settle: 20 })];
+  try {
+    await observeUntil(box.readGovernor, (governor) =>
+      governor.observers.core.outcome === "healthy" &&
+      governor.observers.graphql.outcome === "healthy", 15_000);
+  } finally {
+    await releasePanes(warmReady, warm);
+  }
+  const directory = join(box.root, "gh-glance", "coordination-v2");
+  const name = readdirSync(directory).find((entry) => /^quota-[a-f0-9]{64}\.json$/.test(entry));
+  assert.ok(name);
+  const quotaPath = join(directory, name);
+  const governor = JSON.parse(readFileSync(quotaPath, "utf8"));
+  const failedAt = Date.now();
+  governor.budgets.core.observedAt = failedAt - BUDGET_SNAPSHOT_TTL_MS - 1_000;
+  governor.budgets.core.factorBaseline.observedAt = governor.budgets.core.observedAt;
+  governor.observers.core.nextAt = failedAt - 1;
+  assert.equal(writeGovernorState(quotaPath, governor).ok, true);
+  const state = box.read();
+  const baselineSequence = state.sequence ?? 0;
+  state.failure = { remaining: 2, selector: "core-observer",
+    message: "temporary core observer failure" };
+  writeFileSync(box.statePath, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+  const readyPath = join(box.root, "core-observer-ready");
+  const captures = [startPane(box, "core-observer-isolation", {
+    tab: "actions", refresh: 5, readyPath, readyAttempts: 4_400, settle: 200,
+  })];
+  let held;
+  let recovered;
+  try {
+    held = await observeUntil(() => ({ fixture: box.read(), governor: box.readGovernor() }),
+      ({ fixture: state, governor }) =>
+      state.failure.remaining === 0 && governor.observers.core.outcome === "failed" &&
+      governor.observers.graphql.outcome === "healthy" &&
+      dataStarts(state).filter((event) => event.sequence > baselineSequence)
+        .some((event) => event.graphqlOperation === "issues.page" ||
+        event.graphqlOperation === "pulls.page") &&
+      dataStarts(state).filter((event) => event.sequence > baselineSequence)
+        .every((event) => event.cost.core === 0), 105_000);
+    recovered = await observeUntil(() => ({ fixture: box.read(), acquisition: box.readAcquisition() }),
+      ({ fixture: state, acquisition }) =>
+        actionsRuns(state).some((event) => event.sequence > baselineSequence) &&
+        Object.values(acquisition.queries).some((record) =>
+          record.query.resource === "actions" && record.snapshot?.lastSuccessAt > failedAt), 90_000);
+  } finally {
+    await releasePanes(readyPath, captures);
+  }
+  assert.equal(held.fixture.failure.remaining, 0);
+  assert.ok(dataStarts(held.fixture).some((event) =>
+    event.sequence > baselineSequence && event.cost.graphql > 0));
+  assertDebitsStayOutsideReserve(dataStarts(recovered.fixture));
 });
 
 test("manual refresh wins a held lane without stacking repeated requests", { timeout: 60_000 }, async (t) => {
@@ -704,4 +961,59 @@ test("probe and reservation owner crashes recover without optimistic spend", { t
   assert.equal(recoveredReservation.active, 0);
   assert.equal(recoveredReservation.dataActive, 0);
   assertDebitsStayOutsideReserve(dataStarts(recoveredReservation));
+});
+
+test("live started takeover fences a late pane's shared rows and local cache", { timeout: 70_000 }, async (t) => {
+  const oldBody = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "fixtures", "actions-runs.json"), "utf8");
+  const newBody = oldBody.replace("ci: pin actions to commit SHAs", "successor-only run");
+  const path = "repos/acme/widget/actions/runs?exclude_pull_requests=true&per_page=60";
+  const box = fixture(t, {
+    delayByCommand: { actions: { ms: 15_000, remaining: 1 } },
+    apiEntities: { [path]: { sequence: [
+      { etag: '"old-generation"', body: oldBody },
+      { etag: '"new-generation"', body: newBody },
+    ] } },
+  });
+  const ownerReady = join(box.root, "late-owner-ready");
+  const survivorReady = join(box.root, "late-survivor-ready");
+  const owner = startPane(box, "late-owner", { readyPath: ownerReady, settle: 40 });
+  await observeUntil(box.read, (state) => actionsRuns(state)
+    .some((event) => event.pane === "late-owner"), 12_000);
+  const storePath = join(box.root, "gh-glance", "coordination-v2", "acquisition.json");
+  const aged = withFileLock(`${storePath}.lock`, () => {
+    const state = JSON.parse(readFileSync(storePath, "utf8"));
+    const record = Object.values(state.queries).find((candidate) => candidate.query.resource === "actions");
+    assert.equal(record.claim.started, true);
+    record.claim.startedAt = Date.now() - ACQUISITION_STARTED_DEADLINE_MS;
+    const staged = `${storePath}.test-replace`;
+    writeFileSync(staged, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+    renameSync(staged, storePath);
+    return { ok: true };
+  });
+  assert.equal(aged.ok, true);
+  const survivor = startPane(box, "late-survivor", { readyPath: survivorReady, settle: 40 });
+  let ownerFrame;
+  try {
+    await observeUntil(box.read, (fixtureState) => actionsRuns(fixtureState)
+      .some((event) => event.pane === "late-survivor"), 30_000);
+    await observeUntil(box.readAcquisition, (shared) => Object.values(shared.queries)
+      .some((candidate) => candidate.snapshot?.rows?.[0]?.displayTitle === "successor-only run"), 15_000);
+    await observeUntil(box.read, (fixtureState) => fixtureState.events.some((event) =>
+      event.type === "end" && event.pane === "late-owner" && isActionsEndpoint(event)), 20_000);
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  } finally {
+    [ownerFrame] = await releasePanes(ownerReady, [owner]);
+    await releasePanes(survivorReady, [survivor]);
+  }
+  const shared = box.readAcquisition();
+  const snapshot = Object.values(shared.queries).find((candidate) =>
+    candidate.snapshot?.rows?.[0]?.displayTitle === "successor-only run")?.snapshot;
+  assert.ok(snapshot);
+  const ownerScreen = ownerFrame.finalFrame.lines.join("\n");
+  assert.ok(ownerScreen.includes("successor-only r"), ownerScreen);
+  assert.equal(ownerScreen.includes("ci: pin actions"), false);
+  const cache = JSON.parse(readFileSync(join(box.root, "gh-glance", "dashboard-cache.json"), "utf8"));
+  const cached = Object.values(cache.targets).find((target) => target.tabs?.actions)?.tabs.actions;
+  assert.equal(cached.data[0].displayTitle, "successor-only run");
+  assert.equal(cached.lastOk, snapshot.lastSuccessAt);
 });
