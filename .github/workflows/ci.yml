@@ -107,42 +107,14 @@ jobs:
             exit 1
           fi
 
-  # Required on `main`, and only on `main`. It was advisory at first because
-  # issue #37 records pty capture as "the classic source of flaky CI", with the
-  # stated bar for promoting it being a clean streak: 38 runs from 2026-08-02 to
-  # 2026-08-04, zero failures. Promoted 2026-08-04.
-  #
-  # `develop` is unprotected, so this gates nothing day to day -- it gates the
-  # `develop` -> `main` release PR and nothing else. That is the right place for
-  # it. The cost of a flake lands roughly once a week and is paid by re-running
-  # a job; the cost of not running it lands on whatever ships to npm. And what
-  # it covers is what unit tests structurally cannot see -- alternate-screen
-  # balance, cursor restore, exit codes, and whether unmount erases the user's
-  # scrollback, which *is* issue #37.
-  #
-  # If it does flake at release time, re-run the job. If it flakes twice in a
-  # quarter, reconsider rather than tolerate -- the name is the contract, so
-  # demoting it means renaming it back and updating the required contexts in
-  # settings, since protection matches by job name.
-  #
-  # One Node version, not a matrix: this exercises terminal behaviour, which does
-  # not vary by Node minor, and every extra leg multiplies the flake surface for
-  # no additional signal.
-  pty:
-    name: PTY
+  # Run files serially within each shard: individual files already create
+  # concurrent panes. The governor file exceeded the old 10-minute per-file
+  # runner timeout on 2026-09-23; one serial job took 32 minutes at 144 tests.
+  # Isolated runners avoid a timed-out file disrupting later PTY fixtures.
+  pty-governor:
+    name: PTY governor
     runs-on: ubuntu-latest
-    # PTY files are serialized because individual files already create real
-    # concurrent panes, and that is a correctness constraint rather than a
-    # scheduling preference: parallel files starve each other's real deadlines.
-    #
-    # Measured 20-21 minutes locally at 124 tests, up from about 13 at 115. The
-    # growth is mostly deliberate -- the adaptive-cadence scenarios have to wait
-    # out a real 30-second quiet interval to observe one -- and a CI runner is
-    # slower than a workstation at spawning this many processes. A 20-minute cap
-    # cancelled the job mid-suite twice, which reads as a flake and is not one,
-    # so the ceiling is now well clear of the measurement rather than beside it.
-    # If a run ever approaches this, split the job rather than raise it again.
-    timeout-minutes: 35
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -150,7 +122,46 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      # Drives the real binary under a pseudo-terminal. This is the GNU
-      # (util-linux) branch of run.sh -- the BSD branch only ever runs on a
-      # developer's machine, so CI is the first place both are exercised.
-      - run: npm run test:pty
+      - run: node --test --test-concurrency=1 --test-timeout=900000 test/pty/governor.test.mjs
+
+  pty-rest:
+    name: PTY other files
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Exercise the GNU (util-linux) branch of run.sh while keeping each
+      # file serial; the local full suite exercises the BSD branch.
+      - run: |
+          files=()
+          for file in test/pty/*.test.mjs; do
+            if [[ "$file" != test/pty/governor.test.mjs ]]; then
+              files+=("$file")
+            fi
+          done
+          test "${#files[@]}" -gt 0
+          node --test --test-concurrency=1 --test-timeout=900000 "${files[@]}"
+
+  # Keep the existing required `PTY` context on main. A cancelled or failed
+  # shard must make it fail, not leave a skipped check that protection accepts.
+  pty:
+    name: PTY
+    needs: [pty-governor, pty-rest]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require both PTY shards
+        env:
+          GOVERNOR_RESULT: ${{ needs.pty-governor.result }}
+          REST_RESULT: ${{ needs.pty-rest.result }}
+        run: |
+          if [[ "$GOVERNOR_RESULT" != success || "$REST_RESULT" != success ]]; then
+            echo "PTY governor: $GOVERNOR_RESULT; PTY other files: $REST_RESULT" >&2
+            exit 1
+          fi
