@@ -259,7 +259,7 @@ test("a real reset gets one fresh probe then one shared active acquisition", asy
     rows: 24,
     signal: "none",
     settle: 90,
-    args: "--refresh 40",
+    args: "--repo acme/widget --refresh 40",
     stdin:
       "i=0; while [ ! -f \"$GH_GLANCE_FIXTURE_READY\" ] && [ \"$i\" -lt 1200 ]; do " +
       "sleep .1; i=$((i + 1)); done; " +
@@ -339,8 +339,9 @@ test("a real reset gets one fresh probe then one shared active acquisition", asy
   assert.equal(progress?.matched, true, `the shared acquisition missed the reset horizon ${progressDeadline}`);
   assert.ok(probes.length >= 2, `expected reset probe, got ${probes.length}`);
   assert.equal(runs.length, 1, `expected one shared active request, got ${runs.length}`);
-  assert.equal(dataStarts(state).length, runs.length * ACTIONS_CORE_COST,
-    "background work joined the reset phase");
+  assert.equal(dataStarts(state).filter((event) => event.cost.core > 0).length,
+    runs.length * ACTIONS_CORE_COST,
+    "core background work joined the reset phase");
   for (const result of results) {
     assert.match(result.raw, /ci: pin actions/,
       "a reset follower never rendered the shared Actions rows");
