@@ -333,15 +333,20 @@ test("a real reset gets one fresh probe then one shared active acquisition", asy
     `slots ${plannedReservations.map(({ notBefore }) => notBefore).join(",")}; ` +
     `starts ${runs.map(({ at }) => at).join(",")}; horizon ${progressDeadline}; ` +
     `lane ${laneInterval}`);
+  const coreStartsBeforeActive = dataStarts(state)
+    .filter((event) => event.cost.core > 0 && event.at <= runs[0]?.at);
   assert.ok(publication?.matched, "the reset budget publication was not observed");
   assert.ok(resetProbe?.matched, "the core reset did not make the GraphQL observer due");
   assert.equal(resetDecision?.mode, "open", "reset publication did not reopen the core lane");
   assert.equal(progress?.matched, true, `the shared acquisition missed the reset horizon ${progressDeadline}`);
   assert.ok(probes.length >= 2, `expected reset probe, got ${probes.length}`);
   assert.equal(runs.length, 1, `expected one shared active request, got ${runs.length}`);
-  assert.equal(dataStarts(state).filter((event) => event.cost.core > 0).length,
-    runs.length * ACTIONS_CORE_COST,
-    "core background work joined the reset phase");
+  // A background tab can become due after the active Actions fetch during a
+  // loaded run. The reset must give the first data slot to the active tab; it
+  // does not prevent later, independently due background work.
+  assert.deepEqual(coreStartsBeforeActive.map((event) => event.sequence),
+    [runs[0].sequence],
+    `core background work preceded the active reset fetch: ${JSON.stringify(coreStartsBeforeActive)}`);
   for (const result of results) {
     assert.match(result.raw, /ci: pin actions/,
       "a reset follower never rendered the shared Actions rows");

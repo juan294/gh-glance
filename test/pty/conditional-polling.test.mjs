@@ -60,6 +60,19 @@ function waitForNotModified(count = 2) {
   );
 }
 
+function waitForCompletedUnconditionalRuns(count) {
+  const predicate = [
+    "try {",
+    'const { events } = JSON.parse(require("node:fs").readFileSync(process.env.GH_GLANCE_FIXTURE_STATE, "utf8"));',
+    `const starts = events.filter((event) => event.type === "start" && event.argv?.includes("${RUNS_PATH}") &&`,
+    "!event.argv.some((arg) => /^If-None-Match:/i.test(arg)));",
+    `if (starts.length >= ${count} && events.some((event) => event.type === "end" &&`,
+    `event.sequence === starts[${count - 1}].sequence)) process.exit(0);`,
+    "} catch {} process.exit(1);",
+  ].join(" ");
+  return `i=0; while ! node -e '${predicate}' && [ $i -lt 300 ]; do i=$((i + 1)); sleep .1; done; `;
+}
+
 // Three checks: the unconditional first and two conditional 304s. A fourth
 // would wait out the whole quiet interval the adaptive cadence now applies once
 // two checks in a row come back unchanged, and prove nothing the third does not.
@@ -151,8 +164,11 @@ test("R resynchronizes a quiet tab by dropping If-None-Match and spending again"
     rows: 24,
     signal: "none",
     settle: 20,
+    // A scheduled conditional check can be the third call while R waits for
+    // that work to finish. Wait for R's completed unconditional response, not
+    // an unrelated call count, before ending the PTY session.
     stdin: waitForActionsRuns(2) + waitForNotModified() + "printf R; " +
-      waitForActionsRuns(3) + "sleep .3; printf q",
+      waitForCompletedUnconditionalRuns(2) + "printf q",
     args: "--repo acme/widget --refresh 5 --tab actions",
     configHome: box.root,
     env: { GH_GLANCE_FIXTURE_STATE: box.statePath },
