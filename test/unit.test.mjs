@@ -887,6 +887,7 @@ test("formatDuration() guards non-finite input and keeps in-range output", () =>
   assert.equal(formatDuration(-Infinity), "-");
   assert.equal(formatDuration(59999), "59s");
   assert.equal(formatDuration(3600000), "1h0m");
+  assert.equal(formatDuration(100 * 3600000), "100h0m");
   assert.equal(formatDuration(-5), "0s");
 });
 
@@ -1629,6 +1630,14 @@ test("refresh status pins active-tab precedence, copy, motion, and details", () 
     tone: "inert", animate: false, detailKind: "sharing",
   });
   assert.equal(status({ activeError: { verdict: "other" }, securityIncomplete: true }).kind, "failed");
+  for (const mode of ["waiting", "pending", "probe"]) {
+    assert.equal(status({ governorDecision: { mode, notBefore: 456 }, securityIncomplete: true }).kind,
+      "limited", `an incomplete Security result was hidden by ${mode}`);
+  }
+  assert.equal(status({
+    governorDecision: { mode: "waiting", notBefore: 456 },
+    activeError: { verdict: "other" },
+  }).kind, "failed");
   assert.equal(status({ securityIncomplete: false, securityNotes: ["Dependabot is not enabled"] }).kind, "watching");
   assert.equal(status({ securityIncomplete: true }).kind, "limited");
   assert.deepEqual(status({ sharedData: true }), {
@@ -1815,11 +1824,11 @@ test("status bar layout preserves a fixed state region before deterministic hint
     availableHints: hints,
     status: sharingStatus,
     detail: { ...detail, waitCause: "shared-lane", sharingCount: 4 },
-    stale: "stale 99h59m",
+    stale: formatDuration(100 * 3600000),
     nowMs,
   });
   assert.equal(staleSharing.detail, null);
-  assert.equal(staleSharing.stale, "stale 99h59m");
+  assert.equal(staleSharing.stale, "100h0m");
 
   const steady = statusBarLayout({
     cols: 80,
@@ -1832,15 +1841,28 @@ test("status bar layout preserves a fixed state region before deterministic hint
     cols: 80,
     interactive: true,
     availableHints: hints,
-    status,
+    status: refreshStatus({ stale: true }),
     detail,
-    stale: "stale 99h59m",
+    stale: formatDuration(100 * 3600000),
     nowMs,
   });
   assert.equal(layouts[80].mandatoryHints[0].start, steady.mandatoryHints[0].start);
   assert.equal(stale.mandatoryHints[0].start, steady.mandatoryHints[0].start);
   assert.equal(stale.detail, null);
-  assert.equal(stale.stale, "stale 99h59m");
+  assert.equal(stale.stale, "100h0m");
+  assert.equal(`Stale ${stale.stale}`, "Stale 100h0m");
+  const cause = { mode: "paused", cause: "lock busy", coordinationError: true };
+  const causeStatus = refreshStatus({ governorDecision: cause });
+  assert.equal(causeStatus.detailKind, "cause");
+  const longAge = formatDuration(101 * 3600000);
+  const wideCause = statusBarLayout({ cols: 80, interactive: true, availableHints: hints,
+    status: refreshStatus({ stale: true }), detail: cause, stale: longAge, nowMs });
+  assert.equal(wideCause.stale, "101h0m lock busy");
+  assert.equal(wideCause.mandatoryHints.length, 2);
+  const narrowCause = statusBarLayout({ cols: 23, interactive: true, availableHints: hints,
+    status: refreshStatus({ stale: true }), detail: cause, stale: longAge, nowMs });
+  assert.equal(narrowCause.stale, null);
+  assert.deepEqual(narrowCause.mandatoryHints.map((hint) => hint.keys), ["r", "q"]);
 });
 
 test("admitted starts track granted cadence per tab", () => {
@@ -2967,6 +2989,31 @@ test("manual priority wins but never bypasses the reserve", () => {
   });
   assert.equal(denied.grants.length, 0);
   assert.equal(denied.denied[0].mode, "paused");
+});
+
+test("a future background slot remains reorderable for a later active intent", () => {
+  const background = { id: "background-security", leaseId: "background-lease",
+    tab: "security", priority: "background", expiresAt: POLICY_NOW + 60_000 };
+  const active = { id: "active-actions", leaseId: "active-lease",
+    tab: "actions", priority: "active", expiresAt: POLICY_NOW + 60_000 };
+  const leases = {
+    "background-lease": policyLease("background-lease"),
+    "active-lease": policyLease("active-lease"),
+  };
+  const options = { leases, budgets: { core: policyBudget() },
+    lanes: { core: { nextAt: POLICY_NOW + 7_000 } }, deferFutureBackground: true };
+  const early = scheduleIntents({ ...options, intents: [background], nowMs: POLICY_NOW });
+  assert.equal(early.grants.length, 0);
+  assert.equal(early.denied[0].mode, "waiting");
+  assert.ok(early.denied[0].notBefore >= POLICY_NOW + 7_000);
+
+  const joined = scheduleIntents({ ...options, intents: [background, active],
+    nowMs: POLICY_NOW + 1_000 });
+  assert.deepEqual(joined.grants.map(({ intentId }) => intentId), [active.id]);
+  assert.equal(joined.denied.find(({ intentId }) => intentId === background.id)?.mode, "waiting");
+
+  const due = scheduleIntents({ ...options, intents: [background], nowMs: POLICY_NOW + 7_000 });
+  assert.deepEqual(due.grants.map(({ intentId }) => intentId), [background.id]);
 });
 
 test("manual and diagnostic requests from several leases remain lane paced", () => {

@@ -95,6 +95,15 @@ manual probe demand, rate-limit blocks, and a conservative external-spend
 factor. REST and GraphQL are scheduled separately, so a held REST resource does
 not stop Issues or Pull Requests when the current GraphQL probe permits them.
 
+The acquisition store uses the same private lock-owner protocol as the
+governor. A missing or incomplete owner record gets a bounded wall-clock grace
+period. After that, a contender quarantines only the same inode it inspected,
+then retries the lock; it does not infer ownership from age when a live or
+unconfirmed PID is recorded. A failed owner-record write removes its own lock.
+Plain `--doctor` reads lock and snapshot evidence without claiming, repairing,
+or deleting it. It reports metadata integrity and lock obstruction separately,
+so a valid metadata file cannot hide an orphaned lock or missing snapshot.
+
 A short synchronous lock section validates and atomically writes each state
 transition. Each resource has its own observer claim: one process owns core's
 and one owns GraphQL's, and the others wait for that resource's publication.

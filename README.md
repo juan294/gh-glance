@@ -718,7 +718,9 @@ cached subscription is a cache hit, not a coalesced request. Active queries are
 queries with a live subscriber. Retained queries remain listed as `cache-only`
 without inflating that count. Holds distinguish observer failure, primary and
 secondary limits, disconnected acquisition, shared producer waits, and local
-coordination.
+coordination. Doctor checks acquisition metadata, referenced snapshot artifacts,
+and the lock path separately. A readable metadata file does not make an aged
+orphan lock or invalid snapshot healthy; plain doctor never repairs either.
 
 Use `gh-glance --doctor --probe` when live capability evidence is needed. Probe
 mode uses an ephemeral governor lease and admits every quota-consuming endpoint
@@ -881,6 +883,33 @@ when the candidate and baseline used a compatible workload, machine, platform,
 and runtime. Missing or incompatible baseline values stay labelled as such;
 fixture performance is not presented as live GitHub performance.
 
+### Live freshness monitor
+
+The repository includes a read-only monitor for a declared set of live panes.
+Create its manifest independently of the acquisition store, after each pane has
+installed its subscription. Each entry fixes the pane ID, process ID, expected
+repository and tab, start time in Unix milliseconds, and effective cadence:
+
+```json
+{"schema":1,"panes":[{"id":"my-pane","pid":12345,"repository":"owner/repo","tab":"actions","startedAt":1800000000000,"cadenceMs":5000}]}
+```
+
+Use the same private config root as the panes and write a new report path:
+
+```sh
+node scripts/freshness-monitor.mjs --manifest panes.json \
+  --store "$XDG_CONFIG_HOME/gh-glance/coordination-v2/acquisition.json" \
+  --report freshness.jsonl --interval-ms 5000 --duration-ms 86400000
+```
+
+The JSONL contains hashed pane/target labels, validated source-success times,
+maximum eligible gaps, overdue time, lock status, and declared hold intervals.
+Missing or expired subscriptions and corrupt stores fail the run, even when no
+subscriber remains in the store. To close an expectation after an intentional
+pane exit, add its `exitedAt` timestamp to the manifest. Only a `holds` interval
+declared in that pane entry and confirmed by the runtime excludes time from
+the cadence check. No GitHub request is made by the monitor.
+
 ## Limitations
 
 - **Security tab**: code scanning and secret scanning alerts require [GitHub
@@ -983,6 +1012,9 @@ GH_GLANCE_ICONS=ascii gh-glance
 | `Shared` | This pane is using a generation acquired for matching local subscribers. This is coalescing, not quota scarcity. |
 | `Paused` with a reset time | The active tab's REST or GraphQL resource is at its reserve, exhausted, or under a shared rate-limit block. Wait for the stated reset/probe. Other tabs can continue when they use the healthy resource. |
 | `Paused` without a reset time | Budget or coordinator evidence is unknown, corrupt, locked, or unwritable. No data call is started. Run `gh-glance --doctor`; also check the config directory permissions and whether another live process owns its private lock. |
+| `--doctor` reports an acquisition lock as `orphaned` | A dead owner or an aged incomplete lock record was found. A running pane retries recovery through the private lock protocol; plain doctor only inspects it. If the state does not change, inspect the reported lock age and the config directory permissions. |
+| `--doctor` reports an acquisition lock as `busy` | A live or unconfirmed owner, or a recent incomplete lock record, is present. Keep the other pane running and check again after the reported age advances; plain doctor does not steal a lock. |
+| Rows stay old while the footer shows a coordination reason | The rows remain last-known-good data. The reason persists until a valid shared snapshot or completed cleanup clears that acquisition failure; a healthy rate-budget probe alone does not prove that acquisition succeeded. The footer shows the source age and the notice line gives the longer reason. |
 | A failing tab seems to have stopped retrying | Recognized endpoint failures back off rather than re-spawning `gh` at the floor. Press `r` to request a higher-priority retry, or `R` to also clear the endpoint backoff; either way the retry waits for a safe grant, so the tab remains Watching or Paused. |
 | `unknown argument: -v` | `-v` used to mean `--version` and no longer does, because this CLI also has `--verbose`. Use `--version` or `--verbose` explicitly. |
 | Cached rows plus `Paused`, `Stale`, or `Disconnected` | The rows are last-known-good data while the live source is blocked, overdue, or unavailable. A cache read never advances source success. The footer never calls stale or disconnected rows `Watching`. |

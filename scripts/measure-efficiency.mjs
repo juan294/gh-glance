@@ -57,6 +57,12 @@ const OBSERVER_GRAPHQL = [
   "api", "graphql", "-f",
   "query=query { rateLimit { cost used remaining resetAt } }",
 ];
+const QUERY_OPERATIONS = {
+  actions: ["actions.runs"],
+  issues: ["issues.page"],
+  prs: ["pulls.page"],
+  security: ["security.dependabot", "security.code", "security.secret"],
+};
 let cachedFixturePrivateKeyPem = null;
 
 function deterministicUuid(...parts) {
@@ -74,6 +80,88 @@ function percentile(values, fraction) {
   if (values.length === 0) return null;
   const ordered = [...values].sort((left, right) => left - right);
   return ordered[Math.min(ordered.length - 1, Math.floor(ordered.length * fraction))];
+}
+
+export function evaluateEligibleQueryGaps(queries, { endAt, floorMs = 5_000 } = {}) {
+  if (!Number.isFinite(endAt) || !Number.isFinite(floorMs) || floorMs < 5_000) {
+    throw new Error("invalid eligible-query measurement bounds");
+  }
+  const grace = (interval) => Math.max(2 * interval, 15_000);
+  const measured = queries.map(({ repository, resource, eligibleAt, firstPolicyMs = floorMs,
+    observations = [], holds = [], activations = [] }) => {
+    const successes = [...observations].sort((a, b) => a.lastSuccessAt - b.lastSuccessAt);
+    const exclusions = holds.filter(({ injected, reported, startAt, endAt: holdEnd }) =>
+      injected === true && reported === true && Number.isFinite(startAt) &&
+      Number.isFinite(holdEnd) && holdEnd > startAt)
+      .sort((left, right) => left.startAt - right.startAt);
+    const eligibleMs = (start, end) => {
+      let excludedMs = 0;
+      let coveredUntil = start;
+      for (const hold of exclusions) {
+        if (hold.startAt >= end) break;
+        const from = Math.max(start, coveredUntil, hold.startAt);
+        const until = Math.min(end, hold.endAt);
+        if (until > from) excludedMs += until - from;
+        coveredUntil = Math.max(coveredUntil, hold.endAt);
+      }
+      return Math.max(0, end - start - excludedMs);
+    };
+    let maximum = { maxOverdueMs: 0, allowedMs: grace(firstPolicyMs), generation: null,
+      trace: [] };
+    let largestBreachMs = Number.NEGATIVE_INFINITY;
+    let maxOverdueMs = 0;
+    const consider = (start, end, allowedMs, generation, label) => {
+      const overdue = eligibleMs(start, end);
+      maxOverdueMs = Math.max(maxOverdueMs, overdue);
+      const breachMs = overdue - allowedMs;
+      if (breachMs >= largestBreachMs) {
+        largestBreachMs = breachMs;
+        maximum = {
+        maxOverdueMs: overdue, allowedMs, generation,
+        trace: [`${repository}/${resource}`, `generation ${generation ?? "none"}`,
+          `${label} ${start}..${end}`, `eligible overdue ${overdue}ms`,
+          `allowed ${allowedMs}ms`],
+        };
+      }
+    };
+    if (successes.length === 0) {
+      consider(eligibleAt, endAt, grace(firstPolicyMs), null, "no source success");
+    } else {
+      consider(eligibleAt, successes[0].lastSuccessAt, grace(firstPolicyMs),
+        successes[0].generation, "first source success");
+      for (let index = 0; index < successes.length; index += 1) {
+        const current = successes[index];
+        const nextAt = successes[index + 1]?.lastSuccessAt ?? endAt;
+        const interval = Math.max(floorMs, current.nextDueAt - current.lastSuccessAt);
+        consider(current.nextDueAt, nextAt, grace(interval), current.generation,
+          successes[index + 1] ? "next source success" : "end of observation");
+      }
+    }
+    for (const activatedAt of activations) {
+      if (!Number.isFinite(activatedAt) || activatedAt < eligibleAt || activatedAt >= endAt) continue;
+      const next = successes.find(({ lastSuccessAt }) => lastSuccessAt >= activatedAt);
+      consider(activatedAt, next?.lastSuccessAt ?? endAt, grace(floorMs),
+        next?.generation ?? null, "foreground activation");
+    }
+    return { repository, resource, successes: successes.length,
+      firstSuccessDelayMs: successes.length > 0 ? successes[0].lastSuccessAt - eligibleAt : null,
+      response200: successes.filter(({ status }) => status === 200).length,
+      response304: successes.filter(({ status }) => status === 304).length,
+      maximumSuccessGapMs: successes.length > 0
+        ? Math.max(successes[0].lastSuccessAt - eligibleAt,
+          ...successes.slice(1).map((value, index) =>
+            value.lastSuccessAt - successes[index].lastSuccessAt),
+          endAt - successes.at(-1).lastSuccessAt) : endAt - eligibleAt,
+      ...maximum, maxOverdueMs,
+      passed: successes.length > 0 && largestBreachMs <= 0,
+      largestBreachMs,
+      excludedHolds: exclusions.length };
+  });
+  const worst = measured.reduce((current, candidate) =>
+    current === null || candidate.largestBreachMs > current.largestBreachMs
+      ? candidate : current, null);
+  return { passed: measured.length > 0 && measured.every(({ passed }) => passed),
+    queries: measured, worst };
 }
 
 async function within(promise, timeoutMs, message) {
@@ -220,6 +308,7 @@ function queryFor(repository, accessKey = ACCESS_FULL) {
 }
 
 function expandRepositories(topology) {
+  if (Array.isArray(topology.subscribers)) return topology.subscribers.map(({ repository }) => repository);
   if (topology.repositoryPattern) {
     return Array.from({ length: topology.panes }, (_, pane) =>
       topology.repositoryPattern.replace("{pane}", String(pane)));
@@ -249,6 +338,9 @@ function fixtureEvent(state, event, now) {
   } else if (event.type === "secondaryHold") {
     state.scriptedEvents.push({ type: "throttle", at: now,
       durationMs: event.durationMs, format: "seconds" });
+  } else if (event.type === "observerFailure") {
+    state.scriptedEvents.push({ type: "response", at: now,
+      operation: `${event.resource}.observer`, response: { status: 503 } });
   }
 }
 
@@ -348,6 +440,15 @@ function createOracleTransport(oracle, clock, credential, observations, response
           const response = handleOracleRequest(oracle, {
             argv, input, credential: credential(), now: clock.now(),
           });
+          // The oracle's connection projection omits the repository name,
+          // while the collector requires that identity to prove canonical
+          // target ownership before publishing a GraphQL snapshot.
+          if (["issues.page", "pulls.page"].includes(response.event.operation) &&
+              response.status === 200) {
+            const envelope = JSON.parse(response.body);
+            envelope.data.repository.nameWithOwner = response.event.repository;
+            response.body = `${JSON.stringify(envelope)}\n`;
+          }
           finishObservation = observations?.(response) ?? null;
           const latencyMs = Math.max(response.delayMs ?? 0, responseLatencyMs);
           clock.elapse(latencyMs);
@@ -530,10 +631,12 @@ async function runCollectorCohort(now) {
 
 async function runTopology(scenario, topology, root) {
   mkdirSync(root, { recursive: true });
-  const clock = createVirtualScheduler(START_AT);
+  const clock = createVirtualScheduler(START_AT, topology.subscribers ? 5_000 : 40_000);
   const createId = deterministicIdFactory(topology.id);
   const oracle = createOracleState({ now: START_AT, limit: 5_000,
-    publishedProbes: scenario.publishedProbes });
+    publishedProbes: topology.subscribers
+      ? { ...scenario.publishedProbes, graphql: { mode: "accurate" } }
+      : scenario.publishedProbes });
   oracle.scriptedEvents.push({ type: "reset", at: START_AT + 1,
     resetMs: START_AT + 3_601_000 });
   oracle.credentials["fixture-restricted"] = {
@@ -542,6 +645,9 @@ async function runTopology(scenario, topology, root) {
     permissions: ["actions.runs", "actions.workflows"],
   };
   const repositories = expandRepositories(topology);
+  const subscriptions = topology.subscribers ?? repositories.map((repository) => ({
+    repository, resource: "actions", active: true,
+  }));
   for (const repository of new Set(repositories)) {
     const request = identifyOracleRequest(actionArgs(repository));
     oracle.entities[oracleEntityKey(request)] = { version: 1, payload: actionPayload(repository) };
@@ -554,11 +660,13 @@ async function runTopology(scenario, topology, root) {
   const activeProducerStarts = new Map();
   const maximumProducerStarts = new Map();
   const transport = createOracleTransport(oracle, clock, () => credentialName, (response) => {
-    if (response.event.operation === "actions.runs") {
-      latestTransportStart.set(response.event.repository, response.event.at);
+    const resource = Object.entries(QUERY_OPERATIONS)
+      .find(([, operations]) => operations.includes(response.event.operation))?.[0];
+    if (resource) {
+      latestTransportStart.set(`${response.event.repository}:${resource}`, response.event.at);
       const loaded = loadAcquisitionStore(acquisitionStorePath({ env: { XDG_CONFIG_HOME: root } }));
       const active = loaded.ok ? Object.values(loaded.value.queries).filter(({ query, claim }) =>
-        query.resource === "actions" && claim?.started) : [];
+        query.resource === resource && claim?.started) : [];
       const record = active.find(({ query }) => query.repository?.toLowerCase() ===
         response.event.repository.toLowerCase()) ?? (active.length === 1 ? active[0] : null);
       if (record) {
@@ -643,49 +751,96 @@ async function runTopology(scenario, topology, root) {
   const acknowledgments = [];
   const queueDelays = [];
   const latestChangeAt = new Map();
-  const deliveries = new Map();
+  const firstDeliveries = new Set();
+  const sourceObservations = new Map();
   const dueGenerations = new Map([...new Set(repositories)].map((repository) =>
     [repository.toLowerCase(), new Set()]));
   const handles = [];
-  for (const repository of repositories) {
+  const activeDemand = subscriptions.map(({ active }) => active !== false);
+  const observerFailureEvents = (topology.events ?? [])
+    .filter(({ type }) => type === "observerFailure");
+  const observerTransitions = new Map();
+  const sampleObserverTransitions = () => {
+    if (observerFailureEvents.length === 0 ||
+        !observerFailureEvents.some(({ atMs }) =>
+          clock.now() >= START_AT + atMs && clock.now() <= START_AT + atMs + 180_000)) return;
+    const state = inspectGovernor(providerContext.scope, clock.now());
+    if (!state.ok) return;
+    for (const { resource } of observerFailureEvents) {
+      const observer = state.value.observers[resource];
+      const transition = observerTransitions.get(resource) ?? {};
+      if (!transition.failed && observer?.outcome === "failed") {
+        transition.failed = { at: observer.at, sampledAt: clock.now() };
+      } else if (transition.failed && !transition.recovered &&
+          observer?.outcome === "healthy" && observer.at > transition.failed.at) {
+        transition.recovered = { at: observer.at, sampledAt: clock.now() };
+      }
+      observerTransitions.set(resource, transition);
+    }
+  };
+  for (const [subscriberIndex, subscriber] of subscriptions.entries()) {
+    const { repository, resource } = subscriber;
+    const queryLabel = `${repository.toLowerCase()}:${resource}`;
     let firstDelivery = false;
     const handle = runtime.subscribe({
       target: config.targets.find((target) => target.repo === repository),
-      resource: "actions",
-      demand: { active: true, background: true, floorMs: scenario.tickMs, pages: 1 },
+      resource,
+      demand: { active: subscriber.active !== false, background: true,
+        floorMs: topology.subscribers ? 5_000 : scenario.tickMs, pages: 1 },
       onSnapshot(snapshot) {
         firstDelivery = true;
+        const observations = sourceObservations.get(queryLabel) ?? new Map();
+        if (Number.isFinite(snapshot.lastSuccessAt) && !observations.has(snapshot.lastSuccessAt)) {
+          observations.set(snapshot.lastSuccessAt, {
+            lastSuccessAt: snapshot.lastSuccessAt, nextDueAt: snapshot.nextDueAt,
+            generation: snapshot.generation,
+          });
+          sourceObservations.set(queryLabel, observations);
+        }
         if (Number.isSafeInteger(snapshot.generation)) {
           dueGenerations.get(repository.toLowerCase())?.add(snapshot.generation);
         }
-        const deliveryKey = `${repository}:${snapshot.generation}`;
-        const delivered = deliveries.get(deliveryKey) ?? 0;
-        deliveries.set(deliveryKey, delivered + 1);
-        if (delivered > 0 && latestTransportStart.has(repository)) {
-          queueDelays.push(Math.max(0, clock.now() - latestTransportStart.get(repository)));
+        const deliveryKey = `${subscriberIndex}:${repository}:${resource}:${snapshot.generation}`;
+        const firstForSubscriber = !firstDeliveries.has(deliveryKey);
+        firstDeliveries.add(deliveryKey);
+        const firstForQuery = subscriptions.findIndex((candidate) =>
+          candidate.repository.toLowerCase() === repository.toLowerCase() &&
+          candidate.resource === resource) === subscriberIndex;
+        if (firstForSubscriber && !firstForQuery && latestTransportStart.has(queryLabel)) {
+          queueDelays.push(Math.max(0, clock.now() - latestTransportStart.get(queryLabel)));
         }
         const changedAt = latestChangeAt.get(repository);
-        if (changedAt !== undefined && snapshot.rows.some(({ databaseId }) => Number(databaseId) > 1)) {
+        if (resource === "actions" && changedAt !== undefined &&
+            snapshot.rows.some(({ databaseId }) => Number(databaseId) > 1)) {
           acknowledgments.push(Math.max(0, clock.now() - changedAt));
           latestChangeAt.delete(repository);
         }
       },
-      onHold() {},
+      onHold(hold) {
+        if (topology.subscribers) runtimeDiagnostics.push({
+          stage: "subscription-hold", repository, resource, hold, at: clock.now(),
+        });
+      },
     });
     handles.push(handle);
-    for (let turn = 0; !firstDelivery; turn += 1) {
-      if (turn >= 200) throw new Error(`efficiency ${repository} initialization timed out: ${JSON.stringify({
-        handle: handle.inspect(), diagnostics: runtimeDiagnostics.slice(-5),
-        oracle: oracle.events.slice(-5).map(({ at, operation, status }) => ({ at, operation, status })),
-        acquisition: acquisitionEvidence(root, clock.now()).diagnostics,
-      })}`);
-      await driveHandle(handle, repository);
+    if (!topology.subscribers) {
+      for (let turn = 0; !firstDelivery; turn += 1) {
+        if (turn >= 200) throw new Error(`efficiency ${repository} initialization timed out: ${JSON.stringify({
+          handle: handle.inspect(), diagnostics: runtimeDiagnostics.slice(-5),
+          oracle: oracle.events.slice(-5).map(({ at, operation, status }) => ({ at, operation, status })),
+          acquisition: acquisitionEvidence(root, clock.now()).diagnostics,
+        })}`);
+        await driveHandle(handle, repository);
+      }
     }
   }
+  if (topology.subscribers) await clock.advanceTo(START_AT + 15_000);
   const advance = async (at) => {
     try {
       while (clock.now() < at) {
-        await clock.advanceTo(Math.min(at, clock.now() + scenario.tickMs));
+        await clock.advanceTo(Math.min(at,
+          clock.now() + (topology.subscribers ? 5_000 : scenario.tickMs)));
+        sampleObserverTransitions();
       }
     } catch (error) {
       error.message += `; diagnostics=${JSON.stringify(runtimeDiagnostics.slice(-5))}`;
@@ -695,7 +850,12 @@ async function runTopology(scenario, topology, root) {
   };
   try {
     await clock.flush();
-    for (const event of scenario.timeline) {
+    const timeline = [...scenario.timeline, ...(topology.events ?? []),
+      ...(topology.demandChanges ?? []).map((change) => ({ ...change, type: "demandChange" }))]
+      .sort((left, right) => left.atMs - right.atMs);
+    for (const event of timeline) {
+      if (event.atMs >= scenario.durationMs) continue;
+      if (topology.disabledEvents?.includes(event.type)) continue;
       await advance(START_AT + event.atMs - 1);
       clock.set(START_AT + event.atMs);
       if (event.type === "change") {
@@ -704,12 +864,12 @@ async function runTopology(scenario, topology, root) {
           oracle.entities[key] = { version: event.version,
             payload: actionPayload(repository, event.version, event.state) };
           latestChangeAt.set(repository, clock.now());
-      } else if (["externalSpend", "primaryReset", "secondaryHold"].includes(event.type)) {
+      } else if (["externalSpend", "primaryReset", "secondaryHold", "observerFailure"].includes(event.type)) {
         fixtureEvent(oracle, event, clock.now());
         if (event.type === "secondaryHold") {
           for (const handle of handles.slice(1)) {
             handle.updateDemand({ active: false, background: false,
-              floorMs: scenario.tickMs, pages: 1 });
+              floorMs: topology.subscribers ? 5_000 : scenario.tickMs, pages: 1 });
           }
         }
       } else if (event.type === "producerLoss") {
@@ -727,18 +887,61 @@ async function runTopology(scenario, topology, root) {
         await advance(clock.now() + scenario.tickMs);
         await refresh;
       } else if (event.type === "recovery" && event.from === "secondaryHold") {
-        for (const handle of handles.slice(1)) {
-          handle.updateDemand({ active: true, background: true,
-            floorMs: scenario.tickMs, pages: 1 });
+        for (const [index, handle] of handles.entries()) {
+          handle.updateDemand({ active: activeDemand[index], background: true,
+            floorMs: topology.subscribers ? 5_000 : scenario.tickMs, pages: 1 });
+        }
+      } else if (event.type === "demandChange") {
+        for (const [index, handle] of handles.entries()) {
+          activeDemand[index] = event.activeIndices.includes(index);
+          handle.updateDemand({ active: activeDemand[index], background: true,
+            floorMs: topology.subscribers ? 5_000 : scenario.tickMs, pages: 1 });
         }
       }
       await advance(clock.now());
     }
     await advance(START_AT + scenario.durationMs - 1);
-    const { diagnostics: diagnostic } = acquisitionEvidence(root, clock.now());
+    const { diagnostics: diagnostic, state: acquisitionState } = acquisitionEvidence(root, clock.now());
+    const queryState = Object.values(acquisitionState.queries).map((record) => ({
+      repository: record.query.repository,
+      resource: record.query.resource,
+      generation: record.generation,
+      claim: record.claim ? {
+        started: record.claim.started, generation: record.claim.generation,
+        claimedAt: record.claim.claimedAt, leaseUntil: record.claim.leaseUntil,
+      } : null,
+      hold: record.hold,
+      lastSuccessAt: record.snapshot?.lastSuccessAt ?? null,
+      nextDueAt: record.snapshot?.nextDueAt ?? null,
+    }));
+    const governor = inspectGovernor(providerContext.scope, clock.now());
+    const governorState = governor.ok ? {
+      budgets: Object.fromEntries(["core", "graphql"].map((resource) => [resource, {
+        remaining: governor.value.budgets[resource]?.remaining,
+        observedAt: governor.value.budgets[resource]?.observedAt,
+        resetMs: governor.value.budgets[resource]?.resetMs,
+        laneNextAt: governor.value.budgets[resource]?.laneNextAt,
+      }])),
+      observers: Object.fromEntries(["core", "graphql"].map((resource) => [resource, {
+        outcome: governor.value.observers[resource]?.outcome,
+        at: governor.value.observers[resource]?.at,
+        nextAt: governor.value.observers[resource]?.nextAt,
+      }])),
+      intents: Object.values(governor.value.intents ?? {}).map(({ tab, priority, requestedAt, expiresAt }) =>
+        ({ tab, priority, requestedAt, expiresAt })),
+      scheduled: Object.values(governor.value.reservations ?? {})
+        .filter(({ status }) => status === "scheduled")
+        .map(({ operation, priority, notBefore }) => ({ operation, priority, notBefore })),
+    } : { status: governor.reason };
     const pinnedAfter = JSON.parse(handleOracleRequest(oracle,
       { argv: ["api", "rate_limit"], now: clock.now() }).body).resources.graphql.used;
     const account = oracle.accounts.octocat;
+    const graphqlResetIndex = oracle.events.findLastIndex(({ before, after }) =>
+      after.graphql.used < before.graphql.used);
+    const witnessedGraphqlCost = oracle.events.slice(Math.max(0, graphqlResetIndex))
+      .reduce((total, { cost }) => total + cost.graphql, 0);
+    const graphqlObserverCalls = oracle.events.filter(({ operation }) =>
+      operation === "graphql.observer").length;
     const maximumProducersPerGeneration = Math.max(0, ...maximumProducerStarts.values());
     const duplicateProducerPerGeneration = [...maximumProducerStarts.values()].filter((starts) => starts > 1).length;
     const switchAt = START_AT + (scenario.timeline.find(({ type }) => type === "accountSwitch")?.atMs ?? Infinity);
@@ -759,6 +962,107 @@ async function runTopology(scenario, topology, root) {
         postResetSuccesses: successes.filter(({ at }) => at >= resetAt).length,
       }];
     }));
+    const observerWindows = Object.fromEntries(["core", "graphql"].map((resource) => {
+      const injection = observerFailureEvents.find((event) => event.resource === resource);
+      const failure = oracle.events.find(({ operation, status, at }) =>
+        operation === `${resource}.observer` && status === 503 &&
+        at >= START_AT + (injection?.atMs ?? Infinity));
+      const recovery = failure && oracle.events.find(({ operation, status, at }) =>
+        operation === `${resource}.observer` && status === 200 && at > failure.at);
+      const transition = observerTransitions.get(resource);
+      const reported = transition?.failed?.at >= failure?.at &&
+        transition?.recovered?.at >= recovery?.at &&
+        transition.recovered.at <= recovery.at + 5_000;
+      return [resource, { injected: Boolean(injection && failure), reported: reported === true,
+        startAt: transition?.failed?.at ?? failure?.at ?? null,
+        endAt: transition?.recovered?.at ?? recovery?.at ?? null,
+        observedFailed: transition?.failed ?? null, observedRecovered: transition?.recovered ?? null }];
+    }));
+    const validatedSourceSuccesses = [];
+    const queryFreshness = evaluateEligibleQueryGaps(
+      [...new Map(subscriptions.map(({ repository, resource }) =>
+        [`${repository.toLowerCase()}:${resource}`, { repository: repository.toLowerCase(), resource }])).values()]
+        .map(({ repository, resource }) => {
+          const observed = [...(sourceObservations.get(`${repository}:${resource}`)?.values() ?? [])];
+          let previousSuccessAt = START_AT;
+          const validated = observed.sort((left, right) => left.lastSuccessAt - right.lastSuccessAt)
+            .map((snapshot) => {
+            // A transport can complete before the collector publishes its
+            // snapshot, especially when other queries advance the virtual
+            // clock concurrently. Tie each publication to new source evidence
+            // in its own query since the previous publication.
+            const event = oracle.events.filter((candidate) =>
+              candidate.repository?.toLowerCase() === repository &&
+              QUERY_OPERATIONS[resource].includes(candidate.operation) &&
+              [200, 304].includes(candidate.status) &&
+              candidate.simulatedCompletedAt > previousSuccessAt &&
+              candidate.simulatedCompletedAt <= snapshot.lastSuccessAt)
+              .sort((left, right) => right.simulatedCompletedAt - left.simulatedCompletedAt)[0];
+            previousSuccessAt = snapshot.lastSuccessAt;
+            return event ? { ...snapshot, status: event.status } : null;
+          }).filter(Boolean);
+          validatedSourceSuccesses.push(...validated.map(({ lastSuccessAt }) =>
+            ({ resource, at: lastSuccessAt })));
+          const subscriber = subscriptions.find((item) =>
+            item.repository.toLowerCase() === repository && item.resource === resource);
+          const matchingIndices = subscriptions.flatMap((item, index) =>
+            item.repository.toLowerCase() === repository && item.resource === resource ? [index] : []);
+          let wasActive = matchingIndices.some((index) => subscriptions[index].active !== false);
+          const activations = [];
+          for (const change of [...(topology.demandChanges ?? [])]
+            .sort((left, right) => left.atMs - right.atMs)) {
+            const active = matchingIndices.some((index) => change.activeIndices.includes(index));
+            if (active && !wasActive) activations.push(START_AT + change.atMs);
+            wasActive = active;
+          }
+          return { repository, resource, eligibleAt: START_AT,
+            firstPolicyMs: subscriber?.active === false
+              ? resource === "security" ? 300_000 : 120_000
+              : topology.subscribers ? 5_000 : scenario.tickMs,
+            observations: validated, activations,
+            holds: [resource === "issues" || resource === "prs" ?
+              observerWindows.graphql : observerWindows.core] };
+        }),
+      { endAt: clock.now(), floorMs: topology.subscribers ? 5_000 : scenario.tickMs },
+    );
+    const oracleTrace = Object.fromEntries(queryFreshness.queries.map(({ repository, resource }) => {
+      const events = oracle.events.filter((event) =>
+        event.repository?.toLowerCase() === repository &&
+        QUERY_OPERATIONS[resource].includes(event.operation));
+      const brief = ({ at, operation, status }) => ({ at, operation, status });
+      return [`${repository}:${resource}`, { count: events.length,
+        first: events.slice(0, 5).map(brief), last: events.slice(-5).map(brief) }];
+    }));
+    const observerFailures = Object.fromEntries(["core", "graphql"].map((resource) => {
+      const failures = oracle.events.filter(({ operation, status }) =>
+        operation === `${resource}.observer` && status === 503);
+      const sourceResources = resource === "core" ? ["actions", "security"] : ["issues", "prs"];
+      const failedAt = failures.at(-1)?.at ?? null;
+      const recoveredAt = failedAt === null ? null : oracle.events.find(({ operation, status, at }) =>
+        operation === `${resource}.observer` && status === 200 && at > failedAt)?.at ?? null;
+      const window = observerWindows[resource];
+      const nextSourceAt = window.reported
+        ? validatedSourceSuccesses.filter((success) =>
+          sourceResources.includes(success.resource) && success.at >= window.endAt)
+          .map(({ at }) => at).sort((left, right) => left - right)[0] ?? null : null;
+      return [resource, { observed: failures.length,
+        failedAt, recoveredAt,
+        reportedHold: window.reported,
+        excludedWindow: window.reported ? { startAt: window.startAt, endAt: window.endAt } : null,
+        postRecoveryDelayMs: nextSourceAt === null ? null : nextSourceAt - window.endAt,
+        observerTrace: failedAt === null ? [] : oracle.events.filter(({ operation, at }) =>
+          operation === `${resource}.observer` && at >= failedAt - 60_000 &&
+          at <= (recoveredAt ?? failedAt + 120_000) + 20_000)
+          .map(({ at, status }) => ({ at, status })),
+        sourceTrace: failedAt === null ? [] : oracle.events.filter(({ operation, at }) =>
+          sourceResources.some((source) => QUERY_OPERATIONS[source].includes(operation)) &&
+          at >= failedAt - 20_000 && at <= (recoveredAt ?? failedAt + 120_000) + 20_000)
+          .map(({ at, operation, status, repository }) => ({ at, operation, status, repository })),
+        postFailureValidatedSourceSuccess: failures.length > 0 &&
+          validatedSourceSuccesses.some((success) =>
+            sourceResources.includes(success.resource) && success.at > failures.at(-1).at),
+        observerHealthyAtEnd: governorState.observers?.[resource]?.outcome === "healthy" }];
+    }));
     return {
       id: topology.id,
       panes: topology.panes,
@@ -773,16 +1077,27 @@ async function runTopology(scenario, topology, root) {
       oracleEvents: oracle.events,
       acknowledgments,
       queueDelays,
-      accountSwitchIsolated: afterSwitch.some(({ credential }) => credential === "fixture-restricted") &&
+      accountSwitchIsolated: topology.disabledEvents?.includes("accountSwitch") ||
+        afterSwitch.some(({ credential }) => credential === "fixture-restricted") &&
         afterSwitch.every(({ credential }) => credential === "fixture-restricted"),
       progressAfterReset: oracle.events.some(({ at, status, observer }) =>
         !observer && status < 400 && at > resetAt),
       secondaryHoldObserved: oracle.events.some(({ status }) => status === 429),
       minimumCoreRemaining,
       minimumGraphqlRemaining: Math.min(...oracle.events.map(({ after }) => after.graphql.remaining)),
-      pinnedGraphqlProbe: { before: pinnedBefore, after: pinnedAfter,
-        actualUsed: account.graphql.used },
+      pinnedGraphqlProbe: topology.subscribers ? null : { before: pinnedBefore, after: pinnedAfter,
+        actualUsed: account.graphql.used, witnessedGraphqlCost, graphqlObserverCalls },
       repositoryProgress,
+      queryFreshness,
+      observerFailures,
+      oracleTrace,
+      queryState,
+      governorState,
+      runtimeDiagnostics: runtimeDiagnostics.reduce((counts, { stage, reason, hold, admissionReason, detail }) => {
+        const key = `${stage}:${detail ?? admissionReason ?? reason ?? hold ?? "none"}`;
+        counts[key] = (counts[key] ?? 0) + 1;
+        return counts;
+      }, {}),
     };
   } finally {
     for (const handle of handles) handle.close();
@@ -1223,6 +1538,11 @@ export async function runEfficiencyMeasurement({
     const metrics = aggregateEvents(topologies);
     const acknowledgments = topologies.flatMap(({ acknowledgments: values }) => values);
     const queueValues = topologies.flatMap(({ queueDelays: values }) => values);
+    const eligibleQueries = topologies.flatMap(({ id, queryFreshness }) =>
+      queryFreshness.queries.map((query) => ({ topology: id, ...query })));
+    const worstEligibleQuery = eligibleQueries.reduce((current, candidate) =>
+      current === null || candidate.largestBreachMs > current.largestBreachMs
+        ? candidate : current, null);
     const remote = topologies.find(({ id }) => id === "two-machines");
     const safety = await runCombinedSafetyEvidence(join(root, "combined-safety"));
     const appWebhook = await runAppWebhookEvidence(join(root, "app-webhook"));
@@ -1247,11 +1567,19 @@ export async function runEfficiencyMeasurement({
       },
       topologies: reportTopologies,
       metrics,
-      freshness: { sourceToDisplayMs: {
-        samples: acknowledgments.length,
-        p50: percentile(acknowledgments, 0.5),
-        p95: percentile(acknowledgments, 0.95),
-      } },
+      freshness: {
+        sourceToDisplayMs: {
+          samples: acknowledgments.length,
+          p50: percentile(acknowledgments, 0.5),
+          p95: percentile(acknowledgments, 0.95),
+        },
+        eligibleQueryGaps: {
+          passed: eligibleQueries.length > 0 && eligibleQueries.every(({ passed }) => passed),
+          queries: eligibleQueries.length,
+          maxOverdueMs: Math.max(0, ...eligibleQueries.map(({ maxOverdueMs }) => maxOverdueMs)),
+          worst: worstEligibleQuery,
+        },
+      },
       queueDelayMs: {
         kind: "shared-follower-delivery-after-producer-start",
         samples: queueValues.length,
@@ -1281,8 +1609,10 @@ export async function runEfficiencyMeasurement({
         minimumCoreRemaining: Math.min(...topologies.map(({ minimumCoreRemaining }) => minimumCoreRemaining)),
         minimumGraphqlRemaining: Math.min(...topologies.map(({ minimumGraphqlRemaining }) => minimumGraphqlRemaining)),
         pinnedGraphqlProbeStable: topologies.every(({ pinnedGraphqlProbe }) =>
+          pinnedGraphqlProbe === null ||
           pinnedGraphqlProbe.before === pinnedGraphqlProbe.after &&
-          pinnedGraphqlProbe.actualUsed > pinnedGraphqlProbe.after),
+          pinnedGraphqlProbe.actualUsed === pinnedGraphqlProbe.witnessedGraphqlCost &&
+          pinnedGraphqlProbe.graphqlObserverCalls === 0),
         e2e4Combinations: {
           standalone: safety.staleCompletionFenced && safety.producerLossRecovered,
           localCollector: remote?.collectorDeliveries === remote?.panes,
@@ -1326,6 +1656,10 @@ export function formatEfficiencyMarkdown(report) {
     `- Acquisition proven/uncertain cost: ${report.metrics.provenCoreUnits}/${report.metrics.uncertainCoreUnits} core, ${report.metrics.provenGraphqlUnits}/${report.metrics.uncertainGraphqlUnits} GraphQL`,
     `- Observer calls/combined charged units: ${report.metrics.observerCalls}/${report.metrics.observerCost}`,
     `- Source-to-display p50/p95: ${freshness.p50 ?? "unavailable"}/${freshness.p95 ?? "unavailable"} ms`,
+    `- Eligible query maximum overdue: ${report.freshness.eligibleQueryGaps.maxOverdueMs} ms (${report.freshness.eligibleQueryGaps.passed ? "pass" : "fail"})`,
+    ...(report.freshness.eligibleQueryGaps.worst
+      ? [`- Worst query: ${report.freshness.eligibleQueryGaps.worst.topology} ${report.freshness.eligibleQueryGaps.worst.repository}/${report.freshness.eligibleQueryGaps.worst.resource} generation ${report.freshness.eligibleQueryGaps.worst.generation ?? "none"}`]
+      : []),
     `- Shared follower-delivery delay p50/p95: ${report.queueDelayMs.p50 ?? "unavailable"}/${report.queueDelayMs.p95 ?? "unavailable"} ms`,
     ...(report.queueDelayMs.unavailableReason ? [`- Follower-delivery delay note: ${report.queueDelayMs.unavailableReason}`] : []),
     `- Baseline comparison: ${report.baselineComparison.status}`,

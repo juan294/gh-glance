@@ -41,11 +41,14 @@ import {
   createGovernorScope,
   createOpenRequestRegistry,
   createSingleFlightWake,
+  createRecurringWake,
   createWakeScheduler,
   doctorProbePlan,
   emptyGovernorState,
   failProbeClaim,
   governorControlReady,
+  governorTabControlReady,
+  followerNeedsClaimRecheck,
   governorDataReady,
   governorControlRetryAt,
   governorHealth,
@@ -79,6 +82,8 @@ import {
   renewProbeClaim,
   requestManualProbe,
   retryPollAfterAdmissionFailure,
+  retryFailedPollBatch,
+  sharedAcquisitionPollDeadline,
   retryRateLimitBlockPublication,
   runtimeIntentGate,
   runAdmittedOperation,
@@ -334,7 +339,11 @@ test("pending intents coalesce while persisted priorities compete", (t) => {
   const scheduled = inspectGovernor(box.scope, NOW + 1).value.reservations;
   const activeReservation = Object.values(scheduled).find((reservation) => reservation.intentId === activeId);
   const backgroundReservation = Object.values(scheduled).find((reservation) => reservation.intentId === backgroundId);
-  assert.ok(activeReservation.notBefore < backgroundReservation.notBefore);
+  assert.ok(Number.isFinite(activeReservation.notBefore));
+  assert.equal(backgroundReservation, undefined);
+  const waitingBackground = readIntentDecision(box.scope, backgroundId, NOW + 1);
+  assert.equal(waitingBackground.value.status, "waiting");
+  assert.ok(waitingBackground.value.notBefore > activeReservation.notBefore);
 });
 
 test("only measured success can reduce the worst-case reservation", (t) => {
@@ -371,6 +380,61 @@ test("only measured success can reduce the worst-case reservation", (t) => {
     actualCost: { core: 1, graphql: 0 },
   }, measuredGrant.notBefore + 1);
   assert.equal(registerIntent(measuredBox.scope, intent(randomUUID(), measuredLeaseId, measuredGrant.notBefore + 1)).value.status, "scheduled");
+});
+
+test("unused measured cost pulls a waiting active reservation into the freed lane", (t) => {
+  const { scope } = sandbox(t);
+  const leaseId = randomUUID();
+  registerLease(scope, lease(leaseId));
+  publishInitial(scope, leaseId);
+
+  const securityId = randomUUID();
+  const security = registerIntent(scope, intent(securityId, leaseId, NOW, {
+    tab: "security", costs: operationCost("tab:security"), priority: "active",
+  }));
+  assert.equal(security.value.status, "scheduled");
+  const securityStart = security.value.notBefore;
+  assert.equal(startReservation(scope, security.value.reservationId, securityStart).value.status, "started");
+
+  const actionsId = randomUUID();
+  const actions = registerIntent(scope, intent(actionsId, leaseId, securityStart + 1, {
+    tab: "actions", costs: operationCost("tab:actions"), priority: "active",
+  }));
+  assert.equal(actions.value.status, "scheduled");
+  const oldDue = actions.value.notBefore;
+  assert.ok(oldDue > securityStart + 1_000);
+
+  const settled = completeReservation(scope, security.value.reservationId, {
+    outcome: "measured-success", actualCost: { core: 3, graphql: 0 },
+  }, securityStart + 100);
+  assert.equal(settled.ok, true);
+  const revised = readIntentDecision(scope, actionsId, securityStart + 100);
+  assert.equal(revised.value.reservationId, actions.value.reservationId);
+  assert.ok(revised.value.notBefore < oldDue - 1_000,
+    `unused cost did not advance ${oldDue} past ${revised.value.notBefore}`);
+  assert.equal(startReservation(scope, actions.value.reservationId,
+    revised.value.notBefore).value.status, "started");
+});
+
+test("uncertain settlement keeps a later reservation's paced deadline", (t) => {
+  const { scope } = sandbox(t, { authIdentity: "uncertain-lane-credit" });
+  const leaseId = randomUUID();
+  registerLease(scope, lease(leaseId));
+  publishInitial(scope, leaseId);
+  const security = registerIntent(scope, intent(randomUUID(), leaseId, NOW, {
+    tab: "security", costs: operationCost("tab:security"), priority: "active",
+  }));
+  const at = security.value.notBefore;
+  assert.equal(startReservation(scope, security.value.reservationId, at).value.status, "started");
+  const actionsId = randomUUID();
+  const actions = registerIntent(scope, intent(actionsId, leaseId, at + 1, {
+    tab: "actions", costs: operationCost("tab:actions"), priority: "active",
+  }));
+  assert.equal(actions.value.status, "scheduled");
+  assert.equal(completeReservation(scope, security.value.reservationId,
+    { outcome: "abort" }, at + 100).ok, true);
+  assert.equal(readIntentDecision(scope, actionsId, at + 100).value.notBefore,
+    actions.value.notBefore);
 });
 
 test("heartbeats extend leases while release and expiry prune only unstarted work", (t) => {
@@ -727,7 +791,7 @@ test("failed probes wait for their persisted retry instead of spinning on an old
   assert.equal(afterCore.observers.graphql.nextAt, NOW + BUDGET_PROBE_MS);
   // GraphQL is due and healthy, so the control wake stays immediate. One failed
   // observer silencing the other's cadence is the bug this half guards.
-  assert.equal(governorWakeTimes(afterCore, failedAt, 5000).controlAt, failedAt + 1);
+  assert.equal(governorWakeTimes(afterCore, failedAt, 5000).controlAt, failedAt + 1000);
 
   const graphql = claimProbe(box.scope, leaseId, failedAt, "graphql");
   assert.equal(graphql.value.status, "claimed");
@@ -760,6 +824,19 @@ test("data wakes follow the current lease reservation instead of another pane", 
   assert.equal(governorWakeTimes(state, NOW, 5000).dataAt, NOW + 100);
   assert.equal(governorWakeTimes(state, NOW, 5000, "lease-b").dataAt, NOW + 300);
   assert.equal(governorWakeTimes(state, NOW, 5000, "lease-c").dataAt, Number.POSITIVE_INFINITY);
+  state.reservations["reservation:first"].notBefore = NOW - 1;
+  assert.equal(governorWakeTimes(state, NOW, 5000, "lease-a").dataAt, NOW + 1000);
+});
+
+test("persistently overdue control and reservation slots retry no faster than one second", () => {
+  const state = { budgets: { core: { observedAt: NOW - BUDGET_PROBE_MS - 1,
+    resetMs: NOW - 1 } }, observers: { core: { outcome: "healthy", nextAt: NOW - 1 } },
+  reservations: { stale: { leaseId: "pane", status: "scheduled", notBefore: NOW - 1 } } };
+  for (let offset = 0; offset < 5_000; offset += 1000) {
+    const wakes = governorWakeTimes(state, NOW + offset, 5000, "pane");
+    assert.equal(wakes.controlAt, NOW + offset + 1000);
+    assert.equal(wakes.dataAt, NOW + offset + 1000);
+  }
 });
 
 test("bootstrap readiness requires a successful publication and a safe active resource", (t) => {
@@ -785,6 +862,12 @@ test("bootstrap readiness requires a successful publication and a safe active re
   );
   const failed = structuredClone(snapshot);
   failed.value.observers.graphql = { outcome: "failed", at: NOW, nextAt: NOW + BUDGET_PROBE_MS };
+  assert.equal(governorDataReady({ ok: true, value: { status: "published" } }, failed, "actions", NOW), true);
+  assert.equal(governorDataReady({ ok: true, value: { status: "published" } }, failed, "security", NOW), true);
+  assert.equal(governorDataReady({ ok: true, value: { status: "published" } }, failed, "issues", NOW), false);
+  assert.equal(governorDataReady({ ok: true, value: { status: "published" } }, failed, "prs", NOW), false);
+  assert.equal(governorTabControlReady(failed, "actions", NOW), true);
+  assert.equal(governorTabControlReady(failed, "issues", NOW), false);
   assert.equal(
     governorControlReady({ ok: true, value: { status: "waiting" } }, failed, NOW),
     false,
@@ -795,6 +878,10 @@ test("bootstrap readiness requires a successful publication and a safe active re
   const blocked = inspectGovernor(box.scope, NOW);
   assert.equal(governorDataReady({ ok: true, value: {} }, blocked, "actions", NOW), false);
   assert.equal(governorDataReady({ ok: true, value: {} }, blocked, "issues", NOW), true);
+  const coreFailed = structuredClone(snapshot);
+  coreFailed.value.observers.core = { outcome: "failed", at: NOW, nextAt: NOW + BUDGET_PROBE_MS };
+  assert.equal(governorDataReady({ ok: true, value: {} }, coreFailed, "actions", NOW), false);
+  assert.equal(governorDataReady({ ok: true, value: {} }, coreFailed, "issues", NOW), true);
   assert.equal(governorControlRetryAt(NOW, 40_000), NOW + 1000);
   assert.equal(governorControlRetryAt(NOW, 500), NOW + 500);
 });
@@ -963,6 +1050,52 @@ test("independent wake schedulers clear every pending callback", () => {
   now = 500;
 });
 
+test("recurring liveness wake rearms after a rejected callback with a finite floor", async () => {
+  let clock = 100;
+  let callback;
+  const scheduler = createWakeScheduler({
+    now: () => clock,
+    set: (run, delay) => { callback = { run, delay }; return 1; },
+    clear: () => { callback = null; },
+  });
+  let attempts = 0;
+  const wake = createRecurringWake({ scheduler, now: () => clock, intervalMs: 100,
+    run: async () => { attempts += 1; if (attempts === 1) throw new Error("temporary"); },
+  });
+  wake.start();
+  assert.equal(callback.delay, 1000);
+  clock += 1000;
+  await callback.run();
+  assert.equal(attempts, 1);
+  assert.equal(callback.delay, 1000);
+  clock += 1000;
+  await callback.run();
+  assert.equal(attempts, 2);
+  assert.equal(scheduler.at("liveness"), clock + 1000);
+  wake.stop();
+  assert.equal(scheduler.at("liveness"), Number.POSITIVE_INFINITY);
+});
+
+test("heartbeat wake rearms after a synchronous lease failure", async () => {
+  let at = 100;
+  let callback;
+  const scheduler = createWakeScheduler({ now: () => at,
+    set: (run, delay) => { callback = { run, delay }; return 1; }, clear: () => {} });
+  let attempts = 0;
+  const heartbeat = createRecurringWake({ scheduler, now: () => at,
+    kind: "heartbeat", intervalMs: 15_000,
+    run: () => { if (++attempts === 1) throw new Error("lease busy"); },
+  });
+  heartbeat.start();
+  at += 15_000;
+  await callback.run();
+  assert.equal(callback.delay, 15_000);
+  at += 15_000;
+  await callback.run();
+  assert.equal(attempts, 2);
+  heartbeat.stop();
+});
+
 test("overlapping reset data wakes coalesce and retain the later reservation wake", async () => {
   let releaseFirst;
   const firstPending = new Promise((resolve) => { releaseFirst = resolve; });
@@ -1071,6 +1204,59 @@ test("a due poll retries a pre-persistence admission failure without waiting for
   });
   assert.deepEqual(duplicate.due, []);
   assert.equal(Object.keys(inspectGovernor(box.scope, retryAt).value.reservations).length, 1);
+});
+
+test("rejected work and a wake throw restore exact due polls to a bounded retry", () => {
+  const advanced = { actions: NOW + 40_000, issues: NOW + 80_000, prs: NOW + 90_000 };
+  const due = [{ key: "actions", kind: "active" }, { key: "issues", kind: "background" }];
+  const rejected = retryFailedPollBatch({ due, outcomes: [
+    { status: "rejected", reason: new Error("failed inspection") },
+    { status: "fulfilled", value: { retry: false } },
+  ], dueAt: advanced, backgroundIndex: 1, previousBackgroundIndex: 0, retryAt: NOW + 1000 });
+  assert.equal(rejected.dueAt.actions, NOW + 1000);
+  assert.equal(rejected.dueAt.issues, advanced.issues);
+  const thrown = retryFailedPollBatch({ due, outcomes: null, dueAt: advanced,
+    backgroundIndex: 1, previousBackgroundIndex: 0, retryAt: NOW + 1000 });
+  assert.equal(thrown.dueAt.actions, NOW + 1000);
+  assert.equal(thrown.dueAt.issues, NOW + 1000);
+  assert.equal(thrown.dueAt.prs, advanced.prs);
+  assert.equal(thrown.backgroundIndex, 0);
+});
+
+test("active follower wakes at the shared source deadline despite a later local quiet poll", () => {
+  let at = NOW;
+  let timer;
+  const scheduler = createWakeScheduler({ now: () => at,
+    set: (run, delay) => { timer = { run, delay }; return 1; },
+    clear: () => { timer = null; },
+  });
+  const localDueAt = NOW + 30_000;
+  const sourceDueAt = NOW + 5_000;
+  const dueAt = sharedAcquisitionPollDeadline(localDueAt, sourceDueAt, at, true);
+  scheduler.arm("data", dueAt, () => {});
+  assert.equal(dueAt, sourceDueAt);
+  assert.equal(timer.delay, 5_000);
+  assert.equal(sharedAcquisitionPollDeadline(localDueAt, sourceDueAt, at, false), localDueAt);
+  at = sourceDueAt + 1;
+  assert.equal(sharedAcquisitionPollDeadline(localDueAt, sourceDueAt, at, true), at + 1_000);
+  scheduler.clearAll();
+});
+
+test("a healthy-resource follower rechecks an uncommitted claim before quiet cadence", () => {
+  assert.equal(followerNeedsClaimRecheck("claimed"), true);
+  assert.equal(followerNeedsClaimRecheck("owner-dead"), true);
+  assert.equal(followerNeedsClaimRecheck("owner-alive"), true);
+  assert.equal(followerNeedsClaimRecheck("fresh"), false);
+  const floorMs = 5_000;
+  const planned = pollSchedule({ nowMs: NOW, floorMs, activeKey: "issues",
+    dueAt: { actions: NOW, issues: NOW + floorMs, prs: Infinity, security: Infinity },
+    backgroundIndex: 0 });
+  assert.deepEqual(planned.due, [{ key: "actions", kind: "background" }]);
+  const retry = retryPollAfterAdmissionFailure({ key: "actions", kind: "background",
+    retryAt: NOW + 1000, dueAt: planned.dueAt,
+    backgroundIndex: planned.backgroundIndex, previousBackgroundIndex: 0 });
+  assert.equal(retry.dueAt.actions, NOW + 1000);
+  assert.equal(retry.backgroundIndex, 0);
 });
 
 test("rate-limit status is shared only after the block is durably published", () => {
@@ -1326,10 +1512,19 @@ test("the shared probe wrapper publishes once and failed probes pause only backg
   assert.equal(inspectGovernor(scope, NOW + 1).value.observers.graphql.outcome, "failed");
 
   const background = registerIntent(scope, intent(randomUUID(), leaseId, NOW + 1, {
+    tab: "issues",
+    costs: { core: 0, graphql: 2 },
     priority: "background",
   }));
   assert.equal(background.value.status, "paused");
   assert.equal(background.value.reason, "probe-failed");
+  const coreBackground = registerIntent(scope, intent(randomUUID(), leaseId, NOW + 1, {
+    tab: "security",
+    costs: operationCost("tab:security"),
+    priority: "background",
+  }));
+  assert.equal(coreBackground.value.status, "waiting");
+  assert.ok(coreBackground.value.notBefore > NOW + 1);
   const active = registerIntent(scope, intent(randomUUID(), leaseId, NOW + 1, {
     tab: "issues",
     costs: { core: 0, graphql: 2 },
@@ -1383,6 +1578,49 @@ test("the shared probe wrapper publishes once and failed probes pause only backg
   });
   assert.equal(inspected.value.status, "published");
   assert.equal(waits, 0);
+});
+
+test("GraphQL provider capability failure leaves an authoritative core tab ready", async (t) => {
+  const box = sandbox(t, { authIdentity: "partial-provider-capability" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  const refreshed = await refreshSharedBudget(box.scope, leaseId, null, {
+    now: () => NOW,
+    readBudgets: async (_signal, _host, options) => {
+      if (options.resources[0] === "graphql") {
+        const error = new Error("GraphQL unavailable");
+        error.providerCapability = "graphql-unavailable";
+        throw error;
+      }
+      return budgets();
+    },
+  });
+  assert.equal(refreshed.reason, "provider-capability");
+  const snapshot = inspectGovernor(box.scope, NOW);
+  assert.equal(governorTabControlReady(snapshot, "actions", NOW), true);
+  assert.equal(governorTabControlReady(snapshot, "security", NOW), true);
+  assert.equal(governorTabControlReady(snapshot, "issues", NOW), false);
+  assert.equal(governorDataReady({ ok: true, value: { status: "published" } },
+    snapshot, "actions", NOW), true);
+});
+
+test("a scheduled reservation cannot start while its own observer is failed", (t) => {
+  const box = sandbox(t, { authIdentity: "failed-start-observer" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const scheduled = registerIntent(box.scope, intent(randomUUID(), leaseId, NOW, {
+    tab: "actions", costs: operationCost("tab:actions"),
+  }));
+  assert.equal(scheduled.value.status, "scheduled");
+  makeProbeDue(box.scope, leaseId, NOW + 1);
+  const claim = claimProbe(box.scope, leaseId, NOW + 1, "core");
+  assert.equal(claim.value.status, "claimed");
+  failProbeClaim(box.scope, leaseId, claim.value.nonce, NOW + 1, "core");
+  const started = startReservation(box.scope, scheduled.value.reservationId,
+    Math.max(NOW + 1, scheduled.value.notBefore));
+  assert.equal(started.value.status, "waiting");
+  assert.equal(started.value.reason, "observer");
 });
 
 test("slow independent sources hold their own claim and spend one core bootstrap", async (t) => {

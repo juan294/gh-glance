@@ -114,9 +114,10 @@ test("POLL-02 a quiet list waits its 30s interval and is checked within two seco
   const pages = graphqlEvents(box.read(), "issues.page");
   assert.ok(pages.length >= 4, `issue page calls: ${pages.length}`);
   const observed = gaps(pages.slice(0, 4));
-  // The first two gaps are the floor: nothing is known to be quiet yet.
-  assert.ok(observed[0] <= 4_000, `first gap ${observed[0]}ms should be the 2s floor`);
-  assert.ok(observed[1] <= 4_000, `second gap ${observed[1]}ms should be the 2s floor`);
+  // The first two gaps are the floor: nothing is known to be quiet yet. Allow
+  // subprocess start overhead under CI load while distinguishing the 5s cadence.
+  assert.ok(observed[0] <= 4_500, `first gap ${observed[0]}ms should be the 2s floor`);
+  assert.ok(observed[1] <= 4_500, `second gap ${observed[1]}ms should be the 2s floor`);
   // The third is the quiet cadence: 30 seconds, arriving within two of it.
   assert.ok(observed[2] >= 28_000 && observed[2] <= 32_000,
     `quiet gap ${observed[2]}ms outside 30s +2s`);

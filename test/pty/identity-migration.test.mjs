@@ -162,6 +162,7 @@ test("ID-08: two real panes serialize all four tabs and control requests through
     cols: 80, rows: 24, signal: "none", settle: 180, stdin: exerciseAllTabs(),
     args: "--repo acme/widget --refresh 300 --background off", configHome: box.root,
     env: {
+      GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       GH_GLANCE_BARRIER: barrier,
       GH_GLANCE_FIXTURE_STATE: box.statePath,
       GH_GLANCE_FIXTURE_PANE: String(pane),
