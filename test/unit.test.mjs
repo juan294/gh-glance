@@ -1630,6 +1630,14 @@ test("refresh status pins active-tab precedence, copy, motion, and details", () 
     tone: "inert", animate: false, detailKind: "sharing",
   });
   assert.equal(status({ activeError: { verdict: "other" }, securityIncomplete: true }).kind, "failed");
+  for (const mode of ["waiting", "pending", "probe"]) {
+    assert.equal(status({ governorDecision: { mode, notBefore: 456 }, securityIncomplete: true }).kind,
+      "limited", `an incomplete Security result was hidden by ${mode}`);
+  }
+  assert.equal(status({
+    governorDecision: { mode: "waiting", notBefore: 456 },
+    activeError: { verdict: "other" },
+  }).kind, "failed");
   assert.equal(status({ securityIncomplete: false, securityNotes: ["Dependabot is not enabled"] }).kind, "watching");
   assert.equal(status({ securityIncomplete: true }).kind, "limited");
   assert.deepEqual(status({ sharedData: true }), {

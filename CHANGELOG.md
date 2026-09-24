@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retry held queries and pending intents automatically after recovery.
 - Report acquisition metadata and lock health separately in read-only doctor
   output. Keep the visible acquisition cause across unrelated budget updates,
-  show source ages beyond 100 hours, and remove duplicate stale wording.
+  show source ages beyond 100 hours, and remove duplicate stale wording. Keep
+  incomplete Security observations marked Limited while a retry is scheduled.
 - Flush Linux PTY captures and run governor tests separately from the other
   terminal tests to address CI timing failures.
 

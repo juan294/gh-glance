@@ -15042,6 +15042,10 @@ function refreshStatus({
     return status("disconnected", "failed", "Disconnected", "attention", false, stale ? "stale" : null);
   }
   if (stale) return status("stale", "limited", "Stale", "attention", false, "stale");
+  // A scheduled retry cannot make a failed or incomplete observation healthy.
+  // Keep the cause visible until a successful result clears it.
+  if (activeError) return status("failed", "failed", "Failed", "attention");
+  if (securityIncomplete) return status("limited", "limited", "Limited", "attention");
   if (sharedData) return status("shared", "watching", "Shared", "inert", false, "sharing");
   if (["waiting", "pending", "probe"].includes(mode)) {
     const sharing = sharedLaneProvenance(governorDecision).waitCause === "shared-lane";
@@ -15050,8 +15054,6 @@ function refreshStatus({
       : Number.isFinite(governorDecision?.notBefore) ? "next" : detailKind;
     return status("watching", "watching", "Watching", "inert", false, watchingDetail);
   }
-  if (activeError) return status("failed", "failed", "Failed", "attention");
-  if (securityIncomplete) return status("limited", "limited", "Limited", "attention");
   return status("watching", "watching", "Watching", "inert");
 }
 
