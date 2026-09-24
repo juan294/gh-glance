@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-09-24
+
 ### Fixed
 
 - Recover aged incomplete acquisition locks through the same fenced owner
@@ -19,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Report acquisition metadata and lock health separately in read-only doctor
   output. Keep the visible acquisition cause across unrelated budget updates,
   show source ages beyond 100 hours, and remove duplicate stale wording.
+- Flush Linux PTY captures and run governor tests separately from the other
+  terminal tests to address CI timing failures.
+
+### Changed
+
+- Pin the Sutura CI workflow to v0.3.3 and declare its Node runtime.
 
 ## [0.15.1] - 2026-09-17
 
@@ -1157,7 +1165,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.15.1...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.15.2...HEAD
+[0.15.2]: https://github.com/juan294/gh-glance/compare/v0.15.1...v0.15.2
 [0.15.1]: https://github.com/juan294/gh-glance/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/juan294/gh-glance/compare/v0.14.1...v0.15.0
 [0.14.1]: https://github.com/juan294/gh-glance/compare/v0.14.0...v0.14.1
