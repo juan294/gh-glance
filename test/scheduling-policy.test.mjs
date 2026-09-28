@@ -452,6 +452,13 @@ function asVersion(state, version) {
   const older = structuredClone(state);
   older.version = version;
   delete older.fairness;
+  delete older.revision;
+  delete older.controlReceipts;
+  delete older.debt;
+  delete older.debtGroups;
+  delete older.ownerGenerations;
+  delete older.importMarkers;
+  for (const reservation of Object.values(older.reservations)) delete reservation.receipt;
   if (version < 4) {
     // The pre-split shape: one observer for core, a differently shaped
     // probeOutcome standing in for GraphQL, and a single claim naming both.

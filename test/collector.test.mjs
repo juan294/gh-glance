@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, sy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createConnection } from "node:net";
+import { randomUUID } from "node:crypto";
 import { EventEmitter, once } from "node:events";
 import { test } from "node:test";
 
@@ -12,6 +13,13 @@ import {
   abortableDelay,
   awaitCollectorReservation,
   acquisitionQueryForTab,
+  createGovernorScope,
+  registerLease,
+  claimProbe,
+  publishProbe,
+  runAdmittedOperation,
+  runGh,
+  inspectGovernor,
   acquisitionStorePath,
   collectorPublicationFromResult,
   collectorBudgetRefreshAllowsAdmission,
@@ -998,10 +1006,23 @@ test("COL-01: background-off starts no inactive work, promotion polls, and demot
   assert.equal(cleared.includes(scheduled[0]), true);
 });
 
-test("COL-04/08: close aborts and awaits started acquisition while retaining conservative uncertainty", async (t) => {
+test("COL-04/08: close aborts and awaits started acquisition without duplicating quota uncertainty", async (t) => {
   const root = mkdtempSync("/tmp/ggc-abort-");
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const pathOptions = { env: { XDG_CONFIG_HOME: root }, platform: "linux" };
+  let clock = Date.now();
+  const scope = createGovernorScope({ effectiveHost: "github.com", authIdentity: "collector-abort",
+    env: pathOptions.env, now: () => clock }).value;
+  const leaseId = randomUUID();
+  assert.equal(registerLease(scope, {
+    id: leaseId, expiresAt: clock + 60_000, floorMs: 5000, activeTab: "actions",
+    phaseSeed: { seed: leaseId, registeredAt: clock }, demand: { core: 1, graphql: 0 },
+  }, clock).ok, true);
+  const claimed = claimProbe(scope, leaseId, clock, "core");
+  assert.equal(claimed.value.status, "claimed");
+  assert.equal(publishProbe(scope, leaseId, claimed.value.nonce, {
+    core: { limit: 5000, remaining: 5000, used: 0, resetMs: clock + 3_600_000 },
+  }, clock, "core").ok, true);
   let started;
   const began = new Promise((resolve) => { started = resolve; });
   let settled = false;
@@ -1010,15 +1031,24 @@ test("COL-04/08: close aborts and awaits started acquisition while retaining con
     resolveProvider: async () => IDENTITY,
     async produce({ markStarted, signal }) {
       await markStarted();
-      started();
       try {
-        await new Promise((resolve, reject) => {
-          signal.addEventListener("abort", () => {
-            const error = new Error("aborted");
-            error.name = "AbortError";
-            reject(error);
-          }, { once: true });
+        const result = await runAdmittedOperation({
+          scope, leaseId, operation: "tab:actions-runs", signal,
+          now: () => clock, waitMs: 5_000,
+          wait: async (ms) => { clock += ms + 1; return true; },
+          run: () => runGh(["api", "collector-abort"], {
+            operation: "tab:actions-runs", signal,
+            execute: () => new Promise((_resolve, reject) => {
+              started();
+              signal.addEventListener("abort", () => {
+                const error = new Error("aborted");
+                error.name = "AbortError";
+                reject(error);
+              }, { once: true });
+            }),
+          }),
         });
+        if (!result.ok) throw result.error;
       } finally {
         settled = true;
       }
@@ -1031,7 +1061,13 @@ test("COL-04/08: close aborts and awaits started acquisition while retaining con
   assert.equal(settled, true);
   const stored = loadAcquisitionStore(acquisitionStorePath(pathOptions));
   assert.equal(stored.ok, true);
-  assert.ok(stored.value.metrics.uncertainCoreUnits > 0);
+  assert.equal(stored.value.metrics.uncertainCoreUnits, 0);
+  assert.equal(Object.hasOwn(stored.value, "uncertainReceipts"), false);
+  const quota = inspectGovernor(scope, clock);
+  assert.equal(quota.ok, true);
+  assert.equal(Object.values(quota.value.reservations).reduce((sum, item) =>
+    sum + (item.status === "completed" ? item.actualCosts.core : item.costs.core), 0), 1,
+  "the interrupted collector transport remains charged in the quota ledger");
 });
 
 test("COL-01: manual refresh queues behind a poll and R coalesces to one unconditional generation", async (t) => {

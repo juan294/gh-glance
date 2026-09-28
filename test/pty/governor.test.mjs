@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdtempSync,
@@ -8,6 +9,7 @@ import {
   readdirSync,
   renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,9 +21,19 @@ import {
   ACQUISITION_CLAIM_TTL_MS,
   ACQUISITION_STARTED_DEADLINE_MS,
   BUDGET_SNAPSHOT_TTL_MS,
+  GOVERNOR_LEASE_TTL_MS,
   GOVERNOR_LOCK_ORPHAN_MS,
   acquisitionStorePath,
+  claimIdentityBootstrap,
+  claimProbe,
+  createQuotaScope,
+  finishIdentityBootstrap,
+  identityRegistryRoot,
+  inspectGovernor,
   loadAcquisitionStore,
+  publishProbe,
+  registerLease,
+  resolveEffectiveCredential,
   resourceReserve,
   tabRequestCost,
   withFileLock,
@@ -29,6 +41,7 @@ import {
 } from "../../index.mjs";
 import { captureAsync } from "./capture.mjs";
 import { seedKnownHeldIdentity } from "./fixtures/known-identity.mjs";
+import { agedGovernorV6, agedGovernorResiduals } from "../fixtures/aged-governor-v6.mjs";
 
 const STATE_HELPER = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "gh-state.mjs");
 const LIMIT = 10_000;
@@ -103,6 +116,18 @@ function dataStarts(state) {
 function isActionsEndpoint(event) {
   return event.argv[0] === "api" &&
     event.argv.some((argument) => argument.includes("/actions/"));
+}
+
+function isSecurityEndpoint(event) {
+  return event.argv[0] === "api" && event.argv.some((argument) =>
+    /\/(?:dependabot|code-scanning|secret-scanning)\/alerts(?:\?|$)/.test(argument));
+}
+
+function assertOtherTabData(events, label, details) {
+  assert.ok(events.every((event) =>
+    (event.cost.core === 0 && event.cost.graphql > 0) ||
+    (event.cost.core === 1 && event.cost.graphql === 0 && isSecurityEndpoint(event))),
+  `${label} admitted unclassified background data: ${details()}`);
 }
 
 function actionsRuns(state) {
@@ -200,6 +225,88 @@ function startPane(box, pane, {
     },
   });
 }
+
+test("aged v6 packed CLI automatically renders a newer Actions run", { timeout: 70_000 }, async (t) => {
+  const oldBody = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "fixtures", "actions-runs.json"), "utf8");
+  const newBody = oldBody.replace("ci: pin actions to commit SHAs", "durable freshness new run");
+  const endpoint = "repos/acme/widget/actions/runs?exclude_pull_requests=true&per_page=60";
+  const limit = 5_000;
+  const resetMs = Math.floor((Date.now() + WINDOW_MS) / 1000) * 1000;
+  const box = fixture(t, { core: { limit, used: 0, remaining: limit, resetMs },
+    graphql: { limit, used: 0, remaining: limit, resetMs },
+    apiEntities: { [endpoint]: { etag: '"durable-new"', body: newBody } } });
+  const packageRoot = join(box.root, "packed-cli");
+  mkdirSync(packageRoot);
+  const tarball = execFileSync("npm", ["pack", "--ignore-scripts", "--pack-destination", packageRoot], {
+    cwd: join(dirname(fileURLToPath(import.meta.url)), "../.."), encoding: "utf8",
+  }).trim().split("\n").at(-1);
+  execFileSync("tar", ["-xzf", join(packageRoot, tarball), "-C", packageRoot]);
+  const packedEntry = join(packageRoot, "package", "index.mjs");
+  assert.equal(existsSync(packedEntry), true);
+  symlinkSync(join(dirname(fileURLToPath(import.meta.url)), "../../node_modules"),
+    join(packageRoot, "package", "node_modules"), "dir");
+  const now = box.read().createdAt;
+  const root = identityRegistryRoot({ env: { XDG_CONFIG_HOME: box.root } });
+  const credential = await resolveEffectiveCredential({ host: "github.com",
+    env: { GH_TOKEN: "fixture-keyring-token" } });
+  assert.equal(credential.ok, true);
+  const claimed = claimIdentityBootstrap(root, { host: "github.com",
+    credentialKey: credential.value.credentialKey, now: now - 100_000 });
+  assert.equal(claimed.ok, true);
+  const finished = finishIdentityBootstrap(root, { credentialKey: credential.value.credentialKey,
+    ...claimed.value, now: now - 100_000,
+    response: { status: 200, body: { id: 1, login: "octocat" },
+      rateLimit: { resource: "core", limit, used: 0, remaining: limit,
+        resetMs }, etag: '"aged-core"' } });
+  assert.equal(finished.ok, true);
+  const scope = createQuotaScope(finished.value, { root });
+  const leaseId = randomUUID();
+  assert.equal(registerLease(scope, { id: leaseId, expiresAt: now + GOVERNOR_LEASE_TTL_MS,
+    floorMs: 5_000, activeTab: "actions", phaseSeed: { seed: leaseId, registeredAt: now },
+    demand: { core: 1, graphql: 0 } }, now).ok, true);
+  const graphClaim = claimProbe(scope, leaseId, now, "graphql");
+  assert.equal(graphClaim.value.status, "claimed");
+  assert.equal(publishProbe(scope, leaseId, graphClaim.value.nonce, {
+    graphql: { limit, used: 0, remaining: limit, resetMs },
+  }, now, "graphql").ok, true);
+  const aged = agedGovernorV6(inspectGovernor(scope, now).value, now);
+  aged.budgets.core.observedAt = now - BUDGET_SNAPSHOT_TTL_MS - 1_000;
+  aged.budgets.core.factorBaseline.observedAt = aged.budgets.core.observedAt;
+  assert.deepEqual(agedGovernorResiduals(aged), { core: 456, graphql: 162 });
+  assert.equal(writeGovernorState(scope.path, aged).ok, true);
+
+  const readyPath = join(box.root, "aged-ready");
+  const pane = startPane(box, "aged-recovery", { readyPath, refresh: 5, settle: 65,
+    env: { GH_GLANCE_CAPTURE_ENTRY: packedEntry } });
+  let recovered;
+  let frame;
+  const startedAt = Date.now();
+  try {
+    try {
+      recovered = await observeUntil(() => ({ fixture: box.read(), shared: box.readAcquisition(),
+        governor: box.readGovernor() }), ({ fixture: state, shared }) =>
+        actionsRuns(state).length > 0 && Object.values(shared.queries).some((record) =>
+          record.query.resource === "actions" &&
+          record.snapshot?.rows?.some((row) => row.displayTitle === "durable freshness new run")), 60_000);
+    } catch {
+      const governor = box.readGovernor();
+      const shared = box.readAcquisition();
+      assert.fail(JSON.stringify({ core: governor.budgets.core, observer: governor.observers.core,
+        claims: Object.values(shared.queries).map((record) => ({ resource: record.query.resource,
+          hold: record.hold, claim: record.claim, lastSuccessAt: record.snapshot?.lastSuccessAt })),
+        starts: dataStarts(box.read()).map((event) => event.argv) }));
+    }
+  } finally {
+    [frame] = await releasePanes(readyPath, [pane]);
+  }
+  assert.ok(Date.now() - startedAt < 60_000);
+  assert.equal(recovered.governor.version, 7);
+  assert.equal(recovered.governor.debt.core.unresolvedUnits, 456);
+  assert.equal(recovered.governor.debt.graphql.unresolvedUnits, 162);
+  assert.ok(Object.values(recovered.shared.queries).some((record) =>
+    record.query.resource === "actions" && record.snapshot?.lastSuccessAt >= startedAt));
+  assert.match(frame.finalFrame.lines.join("\n"), /durable freshnes.*#443/);
+});
 
 async function releasePanes(readyPath, captures) {
   writeFileSync(readyPath, "ready\n", { mode: 0o600 });
@@ -808,10 +915,15 @@ test("a real reset resumes all panes, while atomic external burn limits the next
   assert.equal(probes(resetProgress).length, 2);
   const resetData = dataStarts(resetProgress);
   const resetRuns = actionsRuns(resetProgress);
+  const resetActionsData = resetData.filter(isActionsEndpoint);
+  const resetOtherData = resetData.filter((event) => !isActionsEndpoint(event));
+  const resetDetails = () => JSON.stringify(resetData.map(({ sequence, at, pane, argv, cost }) =>
+    ({ sequence, at, pane, argv, cost })));
   assert.equal(resetRuns.length, 1, "reset launched duplicate Actions batches");
-  assert.equal(resetData.length, STARTUP_DATA_STARTS,
-    "reset launched work outside the shared Actions batch");
-  assert.equal(new Set(resetData.map((event) => event.pane)).size, 1);
+  assert.equal(resetActionsData.length, STARTUP_DATA_STARTS,
+    `reset launched extra Actions work: ${resetDetails()}`);
+  assertOtherTabData(resetOtherData, "reset", resetDetails);
+  assert.equal(new Set(resetActionsData.map((event) => event.pane)).size, 1);
   assertDebitsStayOutsideReserve(resetData);
   assertPhasedStarts(resetSchedule, resetRuns, "core", 1, "reset");
 
@@ -861,12 +973,22 @@ test("a real reset resumes all panes, while atomic external burn limits the next
   const burnEvent = finalBurn.events.find((event) => event.type === "external-burn");
   const burnData = dataStarts(finalBurn);
   const burnRuns = actionsRuns(finalBurn);
+  const burnActionsData = burnData.filter(isActionsEndpoint);
+  const burnOtherData = burnData.filter((event) => !isActionsEndpoint(event));
+  const burnDetails = () => JSON.stringify({
+    burnAt: burnEvent.at - finalBurn.createdAt,
+    data: burnData.map(({ sequence, at, pane, argv, cost, before, after }) => ({
+      sequence, at: at - finalBurn.createdAt, pane, argv, cost, before, after,
+      status: finalBurn.events.find((event) => event.type === "end" && event.sequence === sequence)?.status,
+    })),
+  });
   assert.equal(burnEvent.amount, LIMIT - resourceReserve(LIMIT) - BURN_HEADROOM);
   assert.equal(burnEvent.after.core.remaining, resourceReserve(LIMIT) + BURN_HEADROOM);
   assert.ok(burnRuns.length >= 1 && burnRuns.length <= 2,
     `burn admitted ${burnRuns.length} Actions batches`);
-  assert.equal(burnData.length, burnRuns.length * ACTIONS_CALLS,
-    `burn admitted incomplete Actions batches: ${burnData.length} calls`);
+  assert.equal(burnActionsData.length, burnRuns.length * ACTIONS_CALLS,
+    `burn admitted incomplete or extra Actions work: ${burnDetails()}`);
+  assertOtherTabData(burnOtherData, "burn", burnDetails);
   assert.equal(probes(burned).length, 2);
   assertDebitsStayOutsideReserve(burnData);
 });

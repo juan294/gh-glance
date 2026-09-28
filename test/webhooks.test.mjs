@@ -306,7 +306,7 @@ test("HOOK-01/07: real loopback slow drip hits one absolute body deadline withou
     dispatch: async () => {} });
   t.after(() => ingress.close());
   const body = Buffer.from("{}");
-  const status = await postLoopback({ port, body, dripMs: 20,
+  const status = await postLoopback({ port, body, dripMs: 100,
     headers: { "content-type": "application/json", "content-length": String(body.length),
       "x-github-delivery": "17171717-1717-4171-8171-171717171717",
       "x-github-event": "issues", "x-hub-signature-256": signature(body) } });

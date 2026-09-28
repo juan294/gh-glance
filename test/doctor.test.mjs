@@ -447,7 +447,7 @@ test("OBS-03: indeterminate owner and recovery markers remain read-only blockers
   assert.equal(existsSync(markerPath), true);
 });
 
-test("OBS-03: doctor rejects malformed or unreconciled uncertainty metadata", async (t) => {
+test("OBS-03: doctor rejects malformed quota projections and legacy summaries", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-receipts-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const engine = createAcquisitionEngine({ pathOptions: { env: { XDG_CONFIG_HOME: root } } });
@@ -475,25 +475,23 @@ test("OBS-03: doctor rejects malformed or unreconciled uncertainty metadata", as
   } });
   const path = acquisitionStorePath({ env: { XDG_CONFIG_HOME: root } });
   const persisted = JSON.parse(readFileSync(path, "utf8"));
-  const receiptId = Object.keys(persisted.uncertainReceipts)[0];
+  const scopeHash = "a".repeat(64);
+  persisted.quotaProjections[scopeHash] = { revision: 1, units: { core: 1, graphql: 0 },
+    at: Date.now(), status: "current" };
 
   const malformed = structuredClone(persisted);
-  malformed.uncertainReceipts[receiptId].units = 0;
+  malformed.quotaProjections[scopeHash].units.core = -1;
   writeFileSync(path, JSON.stringify(malformed));
   assert.match(await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } }), /^status\s+corrupt$/m);
 
   const mismatched = structuredClone(persisted);
-  mismatched.metrics.uncertainCoreUnits += 1;
+  mismatched.legacyUnverified.coreUnits = -1;
   writeFileSync(path, JSON.stringify(mismatched));
   assert.match(await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } }), /^status\s+corrupt$/m);
 
   const numericClaimId = structuredClone(persisted);
-  const receipt = numericClaimId.uncertainReceipts[receiptId];
-  delete numericClaimId.uncertainReceipts[receiptId];
-  receipt.id = "0";
-  numericClaimId.uncertainReceipts["0"] = receipt;
-  const queryRecord = Object.values(numericClaimId.queries)[0];
-  queryRecord.claim.receiptIds = [0];
+  numericClaimId.quotaProjections["0"] = numericClaimId.quotaProjections[scopeHash];
+  delete numericClaimId.quotaProjections[scopeHash];
   writeFileSync(path, JSON.stringify(numericClaimId));
   assert.match(await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } }), /^status\s+corrupt$/m);
 });

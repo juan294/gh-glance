@@ -365,3 +365,32 @@ by a 200. Such a validator is dropped on the spot rather than through the staged
 publication, which runs only on a usable transition, and the tab reports unusable
 for that poll — keeping its last-good rows and their freshness clock. One
 recovery, and the next admitted check is unconditional.
+
+## Amendment: bounded durable receipts and causal retirement (2026-09-28)
+
+Protocol version 7 separates the two resource observer receipts from the 512
+data reservation slots. A data receipt binds its original quota scope, lease,
+owner generation, process birth, boot identity, absolute deadline, declared
+allowance, and each issued dispatch. The dispatch is persisted before the `gh`
+child starts. A settled promise alone is insufficient to mark it terminal; the
+child must close. A proven pre-spawn failure records that no request started and
+can return its cost. An uncertain or orphaned child keeps the full charge.
+
+At capacity, completed and expired data receipts transfer their residual cost
+to bounded debt groups while the generation is sealed and rotated. The ledger
+limits data receipts to 512, control receipts to two, debt groups to 128, and
+the serialized quota file to 2 MiB. A group with unknown ownership cannot be
+retired merely because time passed or an observer saw a new reset. A verified
+local owner may acknowledge its sealed group only with its group nonce, matching
+process and boot identity, and no active children. Repeating an acknowledgement
+cannot cover a later generation. Arithmetic overflow and oversized files deny
+admission without replacing the canonical ledger.
+
+A claimed observer captures the quiescent debt units, count, revision, and
+barrier at claim time. Its authoritative publication can retire only that
+captured portion after the quiescence boundary. Debt added after the claim and
+all unresolved ownership stay charged. Version 6 ledgers migrate at their
+canonical path under the quota lock. Their reservation residuals become one
+unknown-owner debt group, and a private pre-v7 backup preserves the original
+document. An older writer rejects the new schema, so mixed-version execution
+requires the controlled restart boundary described above.

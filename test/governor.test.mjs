@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 import {
   chmodSync,
   existsSync,
@@ -18,6 +19,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { test } from "node:test";
+import { agedGovernorV6, agedGovernorResiduals } from "./fixtures/aged-governor-v6.mjs";
 
 import {
   BUDGET_SNAPSHOT_TTL_MS,
@@ -50,6 +52,9 @@ import {
   governorTabControlReady,
   followerNeedsClaimRecheck,
   governorDataReady,
+  governorAvailableForGrant,
+  governorResourceDecision,
+  governorResourceHeld,
   governorControlRetryAt,
   governorHealth,
   governorWakeTimes,
@@ -61,6 +66,7 @@ import {
   inspectGovernor,
   maintainControlLease,
   admitGovernorOperation,
+  acknowledgeSealedGeneration,
   openInBrowser,
   operationCost,
   pendingFailureIsTerminal,
@@ -87,6 +93,7 @@ import {
   retryRateLimitBlockPublication,
   runtimeIntentGate,
   runAdmittedOperation,
+  runGh,
   GOVERNOR_ADMISSION_WAIT_MS,
   resolveFailureContext,
   resolveEffectiveHost,
@@ -102,6 +109,15 @@ const execFileAsync = promisify(execFile);
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WORKER = join(HERE, "fixtures", "governor-worker.mjs");
 const NOW = 1_800_000_000_000;
+
+function closedGh(stdout) {
+  const child = new EventEmitter();
+  child.pid = process.pid;
+  const pending = Promise.resolve({ stdout });
+  pending.child = child;
+  queueMicrotask(() => child.emit("close", 0));
+  return pending;
+}
 
 function sandbox(t, { host = "github.com", authIdentity = "auth-a", now = NOW } = {}) {
   const root = mkdtempSync(join(tmpdir(), "gh-glance-governor-"));
@@ -160,6 +176,12 @@ function publishInitial(scope, leaseId, now = NOW, values = budgets(now)) {
 function asV1GovernorState(state) {
   const legacy = structuredClone(state);
   legacy.version = 1;
+  delete legacy.controlReceipts;
+  delete legacy.revision;
+  delete legacy.debt;
+  delete legacy.debtGroups;
+  delete legacy.ownerGenerations;
+  delete legacy.importMarkers;
   delete legacy.observers;
   // v1 held one claim for both resources and a separately-shaped outcome. The
   // fixture has to be a genuine v1 document, not the current shape with its
@@ -203,6 +225,16 @@ function intent(id, leaseId, now = NOW, overrides = {}) {
     requestedAt: now,
     expiresAt: now + GOVERNOR_LEASE_TTL_MS,
     ...overrides,
+  };
+}
+
+function testDebtGroup({ units = 1, at, revision = 1, quiescent = true } = {}) {
+  return {
+    nonce: randomUUID(), ownerNonce: null, ownerPid: null, ownerBirth: null, bootId: null,
+    unknownChild: true, sealed: true, quiescent,
+    units: { core: units, graphql: 0 }, counts: { core: 1, graphql: 0 }, at,
+    barrierAt: quiescent ? at : null,
+    barrierRevisions: { core: quiescent ? revision : 0, graphql: 0 },
   };
 }
 
@@ -568,9 +600,13 @@ test("a separately admitted operation waits out a lane gap instead of being refu
     waitMs: GOVERNOR_PHASE_WINDOW_MS + 3_600_000,
     now: box.now,
     wait: async (ms) => box.setNow(box.now() + ms + 1),
-    run: async () => "runs",
+    run: async () => runGh(["api", "synthetic-runs"], {
+      operation: "tab:actions-runs",
+      execute: () => closedGh("runs"),
+    }),
   });
   assert.equal(first.ok, true, JSON.stringify(first.decision ?? first.error?.message));
+  assert.equal(inspectGovernor(box.scope, box.now()).value.reservations[first.reservationId].receipt.dispatches.length, 1);
 
   let refusedCalls = 0;
   const refused = await runAdmittedOperation({
@@ -670,7 +706,7 @@ test("OBS-01: nested reservation settlement distinguishes proven 304 from unknow
     requestMetrics: { httpRequests: 1, rest200: 0, rest304: 1, coreUnits: 0, failedRequests: 0 },
   }));
   assert.equal(notModified.result.ok, true);
-  assert.deepEqual(notModified.result.uncertainReceipts, []);
+  assert.equal(Object.hasOwn(notModified.result, "uncertainReceipts"), false);
   assert.deepEqual(inspectGovernor(notModified.box.scope, notModified.box.now())
     .value.reservations[notModified.result.reservationId].actualCosts, { core: 0, graphql: 0 });
 
@@ -681,8 +717,10 @@ test("OBS-01: nested reservation settlement distinguishes proven 304 from unknow
     });
   });
   assert.equal(unknown.result.ok, false);
-  assert.equal(unknown.result.uncertainReceipts.length, 1);
-  assert.equal(unknown.result.uncertainReceipts[0].resource, "core");
+  assert.equal(Object.hasOwn(unknown.result, "uncertainReceipts"), false);
+  assert.equal(inspectGovernor(unknown.box.scope, unknown.box.now()).value
+    .reservations[unknown.result.reservationId].actualCosts.core, 1,
+  "the quota ledger retains an unknown nested request's full cost");
 });
 
 test("a lane gap past the admission bound is still declined, not waited out", async (t) => {
@@ -692,7 +730,7 @@ test("a lane gap past the admission bound is still declined, not waited out", as
   const box = sandbox(t, { now, authIdentity: "admission-wait-bound" });
   const leaseId = randomUUID();
   registerLease(box.scope, lease(leaseId, now));
-  publishInitial(box.scope, leaseId, now, budgets(now, { remaining: 1010 }));
+  publishInitial(box.scope, leaseId, now, budgets(now, { remaining: 1001 }));
   // A pane's first grant carries its stable epoch phase, which is minutes wide
   // by design. Waiting past the ordinary bound here is what puts the lane at a
   // known point; the gap this test is about is the one *after* it.
@@ -703,7 +741,13 @@ test("a lane gap past the admission bound is still declined, not waited out", as
     waitMs: GOVERNOR_PHASE_WINDOW_MS + 3_600_000,
     now: box.now,
     wait: async (ms) => box.setNow(box.now() + ms + 1),
-    run: async () => "runs",
+    run: async () => {
+      await runGh(["api", "synthetic-runs"], {
+        operation: "tab:actions-runs",
+        execute: () => closedGh("{}"),
+      });
+      return { result: "runs", requestMetrics: { coreUnits: 1, graphqlPoints: 0 } };
+    },
   });
   assert.equal(first.ok, true, JSON.stringify(first.decision ?? first.error?.message));
 
@@ -716,7 +760,7 @@ test("a lane gap past the admission bound is still declined, not waited out", as
     priority: "background",
     waitMs: GOVERNOR_ADMISSION_WAIT_MS,
     now: box.now,
-    wait: async () => assert.fail("a gap past the bound must not be waited out"),
+    wait: async (ms) => assert.fail(`a gap past the bound must not be waited out: ${ms}`),
     run: async () => assert.fail("a gap past the bound must not run"),
   });
   assert.equal(beyond.skipped, true);
@@ -740,6 +784,13 @@ test("a live pane's file stays readable across a change to what a tab costs", (t
   assert.equal(current.ok, true, JSON.stringify(current));
   const olderPaneFile = structuredClone(current.value);
   olderPaneFile.version = GOVERNOR_STATE_VERSION - 1;
+  delete olderPaneFile.controlReceipts;
+  delete olderPaneFile.revision;
+  delete olderPaneFile.debt;
+  delete olderPaneFile.debtGroups;
+  delete olderPaneFile.ownerGenerations;
+  delete olderPaneFile.importMarkers;
+  for (const reservation of Object.values(olderPaneFile.reservations)) delete reservation.receipt;
   const pendingId = randomUUID();
   olderPaneFile.intents[pendingId] = {
     leaseId,
@@ -760,7 +811,9 @@ test("a live pane's file stays readable across a change to what a tab costs", (t
   // and dropping it forgives nothing: an intent still in the file has not been
   // granted, so the pane that registered it re-registers at the current price.
   assert.deepEqual(Object.keys(read.value.leases), [leaseId]);
-  assert.equal(read.value.reservations[started.reservationId]?.status, "started");
+  assert.equal(read.value.reservations[started.reservationId], undefined);
+  assert.equal(read.value.debt.core.unresolvedUnits, 1);
+  assert.equal(read.value.debt.core.unresolvedCount, 1);
   assert.equal(read.value.intents[pendingId], undefined);
 
   // An intent whose costs still agree is kept exactly as it was.
@@ -886,6 +939,26 @@ test("bootstrap readiness requires a successful publication and a safe active re
   assert.equal(governorControlRetryAt(NOW, 500), NOW + 500);
 });
 
+test("readiness, standalone decisions and runtime holds charge durable debt", (t) => {
+  const box = sandbox(t, { authIdentity: "debt-readiness" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const snapshot = inspectGovernor(box.scope, NOW);
+  assert.equal(snapshot.ok, true);
+  assert.equal(governorDataReady({ ok: true, value: { status: "published" } },
+    snapshot, "actions", NOW), true);
+  const charged = structuredClone(snapshot);
+  charged.value.debt.core.unresolvedUnits = 4000;
+  charged.value.debt.core.unresolvedCount = 4000;
+  assert.equal(governorAvailableForGrant(charged.value, "core", NOW).spendable, 0);
+  assert.equal(governorDataReady({ ok: true, value: { status: "published" } },
+    charged, "actions", NOW), false);
+  assert.equal(governorResourceDecision(charged.value, "core", NOW, 1).reason, "reserve");
+  assert.equal(governorResourceHeld(charged.value, "core", NOW), true);
+  assert.equal(governorResourceHeld(charged.value, "graphql", NOW), false);
+});
+
 test("a new epoch advances only tabs that spend its resource", () => {
   const previous = { core: "core-a", graphql: "graphql-a" };
   assert.equal(tabEpochChanged(previous, { ...previous, core: "core-b" }, "actions"), true);
@@ -963,13 +1036,244 @@ test("abort and signal outcomes retain each operation's worst-case reservation",
       scope: box.scope,
       leaseId,
       operation: "doctor:security-endpoint",
-      run: async () => { throw error; },
+      now: box.now,
+      run: async () => runGh(["api", "synthetic-error"], {
+        operation: "doctor:security-endpoint",
+        execute: () => Promise.reject(error),
+      }),
     });
     assert.equal(result.ok, false);
     const reservation = inspectGovernor(box.scope, Date.now()).value.reservations[result.reservationId];
+    assert.equal(reservation.receipt.dispatches.length, 1, result.error?.message);
     assert.equal(reservation.outcome, name);
     assert.deepEqual(reservation.actualCosts, operationCost("doctor:security-endpoint"));
   }
+});
+
+test("a stopped real child cannot authorize another dispatch after the absolute receipt deadline", async (t) => {
+  const at = Date.now();
+  const box = sandbox(t, { authIdentity: "stopped-child-deadline", now: at });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId, at));
+  publishInitial(box.scope, leaseId, at, budgets(at));
+  let child = null;
+  let starts = 0;
+  const execute = () => {
+    starts += 1;
+    child = spawn(process.execPath, ["-e", "setTimeout(() => process.stdout.write('{}'), 100)"],
+      { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    const pending = new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code) => code === 0 ? resolve({ stdout }) : reject(new Error(`child ${code}`)));
+    });
+    pending.child = child;
+    return pending;
+  };
+  t.after(() => { if (child?.exitCode === null) process.kill(child.pid, "SIGCONT"); });
+  const result = await runAdmittedOperation({
+    scope: box.scope, leaseId, operation: "tab:actions-runs",
+    now: box.now, waitMs: GOVERNOR_PHASE_WINDOW_MS + 2_000,
+    wait: async (ms) => box.setNow(box.now() + ms + 1),
+    run: async () => {
+      const first = runGh(["api", "synthetic-running-child"], {
+        operation: "tab:actions-runs", execute,
+      });
+      assert.ok(child?.pid > 1);
+      process.kill(child.pid, "SIGSTOP");
+      const issued = inspectGovernor(box.scope, box.now()).value;
+      const pending = Object.values(issued.reservations).find((reservation) =>
+        reservation.receipt?.dispatches.some((dispatch) => dispatch.childPid === child.pid));
+      assert.equal(pending.receipt.dispatches[0].terminalAt, null);
+      box.setNow(box.now() + 200_000);
+      await assert.rejects(runGh(["api", "synthetic-second-child"], {
+        operation: "tab:actions-runs", execute,
+      }), /receipt-(?:expired|allowance)|API receipt paused/);
+      assert.equal(starts, 1, "expired capability cannot spawn another child");
+      box.setNow(box.now() + 4 * 3_600_000);
+      const successorLease = randomUUID();
+      registerLease(box.scope, lease(successorLease, box.now()));
+      const observer = claimProbe(box.scope, successorLease, box.now(), "core");
+      assert.equal(observer.value.status, "claimed");
+      assert.equal(publishProbe(box.scope, successorLease, observer.value.nonce,
+        budgets(box.now()), box.now(), "core").ok, true);
+      await assert.rejects(runGh(["api", "synthetic-after-reset"], {
+        operation: "tab:actions-runs", execute,
+      }), /API receipt paused/);
+      assert.equal(starts, 1, "a new epoch cannot revive the old capability");
+      process.kill(child.pid, "SIGCONT");
+      await first;
+      return { requestMetrics: { coreUnits: 1 } };
+    },
+  });
+  assert.equal(result.ok, false, "late completion is compacted instead of refunded");
+  const ledger = inspectGovernor(box.scope, box.now()).value;
+  assert.equal(ledger.debt.core.unresolvedUnits + ledger.debt.core.quiescentUnits, 1,
+    JSON.stringify({ error: result.error?.message, reservations: ledger.reservations, debt: ledger.debt }));
+  assert.equal(starts, 1);
+});
+
+test("a proven pre-spawn fault refunds its never-started dispatch, while an opaque fault stays charged", async (t) => {
+  for (const [name, proven] of [["proven", true], ["opaque", false]]) {
+    const at = Date.now();
+    const box = sandbox(t, { authIdentity: `pre-spawn-${name}`, now: at });
+    const leaseId = randomUUID();
+    registerLease(box.scope, lease(leaseId, at));
+    publishInitial(box.scope, leaseId, at);
+    let calls = 0;
+    const result = await runAdmittedOperation({
+      scope: box.scope, leaseId, operation: "tab:actions-runs", now: box.now,
+      waitMs: GOVERNOR_PHASE_WINDOW_MS + 2_000,
+      wait: async (ms) => box.setNow(box.now() + ms + 1),
+      run: () => runGh(["api", "pre-spawn"], { operation: "tab:actions-runs", execute: () => {
+        calls += 1;
+        const error = new Error("pre-spawn fault");
+        if (proven) error.notStarted = true;
+        throw error;
+      } }),
+    });
+    assert.equal(result.ok, false);
+    assert.equal(calls, 1);
+    const reservation = inspectGovernor(box.scope, box.now()).value.reservations[result.reservationId];
+    assert.equal(reservation.status, "completed");
+    assert.equal(reservation.receipt.dispatches[0].neverStarted, proven);
+    assert.equal(reservation.actualCosts.core, proven ? 0 : 1);
+  }
+});
+
+test("a settled transport promise cannot terminalize before its real child closes", async (t) => {
+  const at = Date.now();
+  const box = sandbox(t, { authIdentity: "close-proof", now: at });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId, at));
+  publishInitial(box.scope, leaseId, at);
+  let child;
+  const result = await runAdmittedOperation({
+    scope: box.scope, leaseId, operation: "tab:actions-runs", now: box.now,
+    waitMs: GOVERNOR_PHASE_WINDOW_MS + 2_000,
+    wait: async (ms) => box.setNow(box.now() + ms + 1),
+    run: async () => {
+      const pending = runGh(["api", "early-promise"], {
+        operation: "tab:actions-runs",
+        execute: () => {
+          child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 250)"],
+            { stdio: "ignore" });
+          const immediate = Promise.resolve({ stdout: "{}" });
+          immediate.child = child;
+          return immediate;
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      const reservation = Object.values(inspectGovernor(box.scope, box.now()).value.reservations)
+        .find((item) => item.receipt?.dispatches.some((dispatch) => dispatch.childPid === child.pid));
+      assert.equal(reservation.receipt.dispatches[0].terminalAt, null);
+      await pending;
+      return { requestMetrics: { coreUnits: 1 } };
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.ok(child.exitCode !== null);
+  assert.ok(inspectGovernor(box.scope, box.now()).value.reservations[result.reservationId]
+    .receipt.dispatches[0].terminalAt !== null);
+});
+
+test("a child still open past close wait fails transport and retains full quota charge", async (t) => {
+  const at = Date.now();
+  const box = sandbox(t, { authIdentity: "unclosed-transport", now: at });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId, at));
+  publishInitial(box.scope, leaseId, at);
+  let child;
+  t.after(() => { if (child?.exitCode === null) process.kill(child.pid, "SIGCONT"); });
+  const result = await runAdmittedOperation({
+    scope: box.scope, leaseId, operation: "tab:actions-runs", now: box.now,
+    waitMs: GOVERNOR_PHASE_WINDOW_MS + 2_000,
+    wait: async (ms) => box.setNow(box.now() + ms + 1),
+    run: () => runGh(["api", "premature-success"], {
+      operation: "tab:actions-runs", closeWaitMs: 20,
+      execute: () => {
+        child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 100)"],
+          { stdio: "ignore" });
+        process.kill(child.pid, "SIGSTOP");
+        const premature = Promise.resolve({ stdout: "HTTP/2 200\r\n\r\n{}" });
+        premature.child = child;
+        return premature;
+      },
+    }),
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error.message, /child close unverified/);
+  const charged = inspectGovernor(box.scope, box.now()).value.reservations[result.reservationId];
+  assert.equal(charged.actualCosts.core, 1);
+  assert.equal(charged.receipt.dispatches[0].terminalAt, null);
+  process.kill(child.pid, "SIGCONT");
+  await new Promise((resolve) => child.once("close", resolve));
+  assert.equal(inspectGovernor(box.scope, box.now()).value.reservations[result.reservationId].actualCosts.core, 1);
+});
+
+test("a fulfilled transport without a child handle cannot refund its charge", async (t) => {
+  const at = Date.now();
+  const box = sandbox(t, { authIdentity: "missing-child-close", now: at });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId, at));
+  publishInitial(box.scope, leaseId, at);
+  const result = await runAdmittedOperation({
+    scope: box.scope, leaseId, operation: "tab:actions-runs", now: box.now,
+    waitMs: GOVERNOR_PHASE_WINDOW_MS + 2_000,
+    wait: async (ms) => box.setNow(box.now() + ms + 1),
+    run: () => runGh(["api", "missing-child"], {
+      operation: "tab:actions-runs", execute: async () => ({ stdout: "{}" }),
+    }),
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error.message, /child close unverified/);
+  const reservation = inspectGovernor(box.scope, box.now()).value.reservations[result.reservationId];
+  assert.equal(reservation.actualCosts.core, 1);
+  assert.equal(reservation.receipt.dispatches[0].terminalAt, null);
+});
+
+test("a completion lock failure retries the original receipt without repeating HTTP", async (t) => {
+  const at = Date.now();
+  const box = sandbox(t, { authIdentity: "completion-retry", now: at });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId, at));
+  publishInitial(box.scope, leaseId, at);
+  const lockPath = `${box.scope.path}.lock`;
+  const nonce = randomUUID();
+  let calls = 0;
+  const result = await runAdmittedOperation({
+    scope: box.scope, leaseId, operation: "tab:actions-runs",
+    now: box.now, waitMs: GOVERNOR_PHASE_WINDOW_MS + 2_000,
+    wait: async (ms) => box.setNow(box.now() + ms + 1),
+    run: async () => {
+      await runGh(["api", "synthetic-completion"], {
+        operation: "tab:actions-runs",
+        execute: () => { calls += 1; return closedGh("{}"); },
+      });
+      writeFileSync(lockPath, JSON.stringify({ pid: process.pid, nonce }), { mode: 0o600 });
+      return { requestMetrics: { coreUnits: 1 } };
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(calls, 1);
+  const before = JSON.parse(readFileSync(box.scope.path, "utf8"));
+  assert.equal(before.reservations[result.reservationId].status, "started");
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  assert.equal(releaseGovernorLock(lockPath, nonce), true);
+  const deadline = Date.now() + 15_000;
+  let settled = null;
+  while (Date.now() < deadline) {
+    const current = inspectGovernor(box.scope, box.now());
+    if (current.ok && current.value.reservations[result.reservationId]?.status === "completed") {
+      settled = current.value.reservations[result.reservationId];
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.equal(settled?.status, "completed", "writable storage must settle within 15 seconds");
+  assert.equal(settled.actualCosts.core, 1);
+  assert.equal(calls, 1, "storage retry cannot repeat the HTTP request");
 });
 
 test("every doctor endpoint reserves its declared exact cost", (t) => {
@@ -2698,6 +3002,231 @@ test("schema, bounds, corrupt data, and future timestamps fail closed", (t) => {
   assert.equal(inspectGovernor(scope, NOW).reason, "corrupt");
 });
 
+test("aged v6 receipt capacity retains exact charge and admits new work", (t) => {
+  for (const remaining of [5_000, 4_999]) {
+    const { scope } = sandbox(t, { authIdentity: `synthetic-aged-v6-${remaining}` });
+    const leaseId = randomUUID();
+    registerLease(scope, lease(leaseId));
+    publishInitial(scope, leaseId, NOW, budgets(NOW, { remaining }));
+    const aged = agedGovernorV6(inspectGovernor(scope, NOW).value, NOW);
+    aged.budgets.core.observedAt = NOW - 1000;
+    assert.deepEqual(agedGovernorResiduals(aged), { core: 456, graphql: 162 });
+    assert.equal(Object.keys(aged.reservations).length, 512);
+    assert.equal(writeGovernorState(scope.path, aged).ok, true);
+
+    const id = randomUUID();
+    const admitted = registerIntent(scope, intent(id, leaseId));
+    assert.equal(admitted.ok, true);
+    assert.equal(admitted.value.status, "scheduled", `remaining ${remaining}`);
+    const migrated = inspectGovernor(scope, NOW).value;
+    assert.equal(migrated.version, GOVERNOR_STATE_VERSION);
+    assert.ok(Object.keys(migrated.reservations).length <= GOVERNOR_MAX_RESERVATIONS);
+  }
+});
+
+test("one thousand persisted compactions retain exact charge within bounded groups and bytes", (t) => {
+  const box = sandbox(t, { authIdentity: "thousand-compactions" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const grant = registerIntent(box.scope, intent(randomUUID(), leaseId)).value;
+  assert.equal(startReservation(box.scope, grant.reservationId, grant.notBefore).value.status, "started");
+  box.setNow(grant.notBefore);
+  const template = inspectGovernor(box.scope, box.now()).value.reservations[grant.reservationId];
+  for (let index = 0; index < 1_000; index += 1) {
+    const state = readGovernorState(box.scope.path, box.now(), { persistMigration: false }).value;
+    const id = randomUUID();
+    const generation = randomUUID();
+    const reservation = structuredClone(template);
+    reservation.intentId = id;
+    reservation.notBefore = box.now() - 200_000;
+    reservation.startedAt = box.now() - 200_000;
+    reservation.receipt.generation = generation;
+    reservation.receipt.ownerNonce = randomUUID();
+    reservation.receipt.deadline = box.now() - 1;
+    reservation.receipt.dispatches = [{ sequence: 1, operation: "tab:actions-runs",
+      costs: { core: 1, graphql: 0 }, issuedAt: box.now() - 200_000,
+      terminalAt: null, childPid: null, childBirth: null, neverStarted: false }];
+    state.reservations = { [`reservation:${id}`]: reservation };
+    state.ownerGenerations[leaseId] = generation;
+    assert.equal(writeGovernorState(box.scope.path, state).ok, true);
+    assert.equal(registerLease(box.scope, lease(leaseId, box.now()), box.now()).ok, true);
+    const persisted = readGovernorState(box.scope.path, box.now());
+    assert.equal(persisted.ok, true, `restart read ${index}`);
+    assert.equal(persisted.value.debt.core.unresolvedUnits, index + 1);
+    assert.ok(Object.keys(persisted.value.debtGroups).length <= 128);
+    assert.ok(Object.keys(persisted.value.reservations).length <= GOVERNOR_MAX_RESERVATIONS);
+    assert.ok(Buffer.byteLength(readFileSync(box.scope.path)) <= 2 * 1024 * 1024);
+  }
+});
+
+test("more than 128 sequential lease owners retire generation metadata without losing debt", (t) => {
+  const box = sandbox(t, { authIdentity: "owner-generation-churn" });
+  const seedLeaseId = randomUUID();
+  registerLease(box.scope, lease(seedLeaseId));
+  publishInitial(box.scope, seedLeaseId);
+  const grant = registerIntent(box.scope, intent(randomUUID(), seedLeaseId)).value;
+  assert.equal(startReservation(box.scope, grant.reservationId, grant.notBefore).value.status, "started");
+  box.setNow(grant.notBefore);
+  const template = inspectGovernor(box.scope, box.now()).value.reservations[grant.reservationId];
+  assert.equal(completeReservation(box.scope, grant.reservationId,
+    { outcome: "measured-success", actualCost: { core: 0, graphql: 0 } }, box.now()).ok, true);
+  for (let index = 0; index < 256; index += 1) {
+    box.setNow(NOW + (index + 1) * 200_000);
+    const leaseId = randomUUID();
+    assert.equal(registerLease(box.scope, lease(leaseId, box.now()), box.now()).ok, true);
+    const state = inspectGovernor(box.scope, box.now()).value;
+    const id = randomUUID();
+    const generation = randomUUID();
+    const reservation = structuredClone(template);
+    reservation.leaseId = leaseId;
+    reservation.intentId = id;
+    reservation.startedAt = box.now() - 100;
+    reservation.notBefore = reservation.startedAt;
+    reservation.receipt.generation = generation;
+    reservation.receipt.ownerNonce = generation;
+    reservation.receipt.deadline = box.now() - 1;
+    reservation.receipt.dispatches = [{ sequence: 1, operation: "tab:actions-runs",
+      costs: { core: 1, graphql: 0 }, issuedAt: box.now() - 100,
+      terminalAt: null, childPid: null, childBirth: null, neverStarted: false }];
+    state.reservations = { [`reservation:${id}`]: reservation };
+    state.ownerGenerations[leaseId] = generation;
+    assert.equal(writeGovernorState(box.scope.path, state).ok, true);
+    assert.equal(registerLease(box.scope, lease(leaseId, box.now()), box.now()).ok, true);
+    const persisted = inspectGovernor(box.scope, box.now()).value;
+    assert.equal(persisted.debt.core.unresolvedUnits, index + 1);
+    assert.ok(Object.keys(persisted.ownerGenerations).length <= GOVERNOR_MAX_LEASES);
+  }
+});
+
+test("two receipts in one owner generation compact together and require the sealed nonce", (t) => {
+  const box = sandbox(t, { authIdentity: "same-owner-generation" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const grant = registerIntent(box.scope, intent(randomUUID(), leaseId)).value;
+  const started = startReservation(box.scope, grant.reservationId, grant.notBefore).value;
+  assert.equal(started.status, "started");
+  box.setNow(grant.notBefore);
+  const state = inspectGovernor(box.scope, box.now()).value;
+  const first = state.reservations[grant.reservationId];
+  const secondId = randomUUID();
+  const second = structuredClone(first);
+  second.intentId = secondId;
+  second.receipt.dispatches = [{ sequence: 1, operation: "tab:actions-runs",
+    costs: { core: 1, graphql: 0 }, issuedAt: box.now(),
+    terminalAt: box.now(), childPid: null, childBirth: null, neverStarted: false }];
+  first.receipt.dispatches = structuredClone(second.receipt.dispatches);
+  state.reservations[`reservation:${secondId}`] = second;
+  assert.equal(first.receipt.ownerNonce, second.receipt.ownerNonce);
+  assert.equal(writeGovernorState(box.scope.path, state).ok, true);
+
+  const expiredAt = first.receipt.deadline + 1;
+  box.setNow(expiredAt);
+  assert.equal(registerLease(box.scope, lease(leaseId, expiredAt), expiredAt).ok, true);
+  const compacted = inspectGovernor(box.scope, expiredAt).value;
+  const group = compacted.debtGroups[first.receipt.generation];
+  assert.ok(group);
+  assert.equal(group.units.core, 2);
+  assert.equal(compacted.debt.core.quiescentUnits, 2);
+  assert.equal(acknowledgeSealedGeneration(box.scope, started.receiptCapability,
+    randomUUID(), expiredAt).reason, "stale");
+  assert.equal(inspectGovernor(box.scope, expiredAt).value.debt.core.quiescentUnits, 2);
+  assert.equal(acknowledgeSealedGeneration(box.scope, started.receiptCapability,
+    group.nonce, expiredAt).value.status, "acknowledged");
+  const acknowledged = inspectGovernor(box.scope, expiredAt).value;
+  assert.equal(acknowledged.debt.core.unresolvedUnits, 0);
+  assert.equal(acknowledged.debt.core.quiescentUnits, 2);
+  assert.equal(acknowledgeSealedGeneration(box.scope, started.receiptCapability,
+    group.nonce, expiredAt).value.status, "acknowledged");
+  const secondGenerationState = inspectGovernor(box.scope, expiredAt).value;
+  const nextGeneration = randomUUID();
+  const nextId = randomUUID();
+  const next = structuredClone(first);
+  next.intentId = nextId;
+  next.startedAt = expiredAt;
+  next.notBefore = expiredAt;
+  next.receipt.generation = nextGeneration;
+  next.receipt.ownerNonce = nextGeneration;
+  next.receipt.deadline = expiredAt;
+  next.receipt.dispatches[0].issuedAt = expiredAt;
+  next.receipt.dispatches[0].terminalAt = null;
+  secondGenerationState.reservations[`reservation:${nextId}`] = next;
+  secondGenerationState.ownerGenerations[leaseId] = nextGeneration;
+  assert.equal(writeGovernorState(box.scope.path, secondGenerationState).ok, true);
+  assert.equal(registerLease(box.scope, lease(leaseId, expiredAt + 1), expiredAt + 1).ok, true);
+  const laterDebt = inspectGovernor(box.scope, expiredAt + 1).value;
+  assert.equal(laterDebt.debtGroups[nextGeneration].units.core, 1);
+  assert.equal(laterDebt.debt.core.unresolvedUnits, 1);
+  assert.equal(acknowledgeSealedGeneration(box.scope, started.receiptCapability,
+    group.nonce, expiredAt + 1).value.status, "acknowledged");
+  assert.equal(inspectGovernor(box.scope, expiredAt + 1).value.debt.core.unresolvedUnits, 1,
+    "replaying the old nonce cannot acknowledge a later generation");
+});
+
+test("one of two stopped children cannot acknowledge their sealed generation alone", async (t) => {
+  const at = Date.now();
+  const box = sandbox(t, { authIdentity: "two-stopped-children", now: at });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId, at));
+  publishInitial(box.scope, leaseId, at);
+  const children = [];
+  t.after(() => children.forEach((child) => {
+    if (child.exitCode === null) process.kill(child.pid, "SIGCONT");
+  }));
+  const start = () => {
+    let announce;
+    const started = new Promise((resolve) => { announce = resolve; });
+    const result = runAdmittedOperation({
+      scope: box.scope, leaseId, operation: "tab:actions-runs", now: box.now,
+      waitMs: GOVERNOR_PHASE_WINDOW_MS + 2_000,
+      wait: async (ms) => { box.setNow(box.now() + ms + 1); return true; },
+      run: async () => {
+        await runGh(["api", "same-generation-child"], {
+          operation: "tab:actions-runs", execute: () => {
+            const child = spawn(process.execPath,
+              ["-e", "setTimeout(() => process.stdout.write('{}'), 100)"],
+              { stdio: ["ignore", "pipe", "pipe"] });
+            children.push(child);
+            let stdout = "";
+            child.stdout.on("data", (chunk) => { stdout += chunk; });
+            const pending = new Promise((resolve, reject) => {
+              child.once("error", reject);
+              child.once("close", (code) => code === 0 ? resolve({ stdout }) : reject(new Error(`child ${code}`)));
+            });
+            pending.child = child;
+            process.kill(child.pid, "SIGSTOP");
+            announce(child);
+            return pending;
+          },
+        });
+        return { requestMetrics: { coreUnits: 1 } };
+      },
+    });
+    return { started, result };
+  };
+  const first = start();
+  const firstChild = await first.started;
+  const second = start();
+  const secondChild = await second.started;
+  const before = inspectGovernor(box.scope, box.now()).value;
+  const receipts = Object.values(before.reservations).filter((item) => item.receipt?.dispatches.length);
+  assert.equal(receipts.length, 2);
+  assert.equal(receipts[0].receipt.generation, receipts[1].receipt.generation);
+  box.setNow(Math.max(...receipts.map((item) => item.receipt.deadline)) + 1);
+  assert.equal(registerLease(box.scope, lease(leaseId, box.now()), box.now()).ok, true);
+  assert.equal(inspectGovernor(box.scope, box.now()).value.debt.core.unresolvedUnits, 2);
+  process.kill(firstChild.pid, "SIGCONT");
+  await first.result;
+  assert.equal(inspectGovernor(box.scope, box.now()).value.debt.core.unresolvedUnits, 2,
+    "the second stopped child is still live");
+  process.kill(secondChild.pid, "SIGCONT");
+  await second.result;
+  const after = inspectGovernor(box.scope, box.now()).value;
+  assert.equal(after.debt.core.unresolvedUnits, 0);
+  assert.equal(after.debt.core.quiescentUnits, 2);
+});
+
 test("the 511th and 512th reservations never create a ghost lane grant", (t) => {
   const { scope } = sandbox(t, { authIdentity: "reservation-cap" });
   const leaseId = randomUUID();
@@ -2710,14 +3239,15 @@ test("the 511th and 512th reservations never create a ghost lane grant", (t) => 
       leaseId,
       intentId,
       costs: { core: 0, graphql: 0 },
-      actualCosts: { core: 0, graphql: 0 },
+      actualCosts: null,
       accountedCosts: { core: 0, graphql: 0 },
       notBefore: NOW,
-      status: "completed",
+      status: "scheduled",
       epochs: { core: null, graphql: null },
-      startedAt: NOW,
-      completedAt: NOW,
-      outcome: "measured-success",
+      startedAt: null,
+      completedAt: null,
+      outcome: null,
+      receipt: null,
     };
   }
   assert.equal(writeGovernorState(scope.path, state).ok, true);
@@ -2738,6 +3268,332 @@ test("the 511th and 512th reservations never create a ghost lane grant", (t) => 
   assert.equal(capped.intents[pendingIntentId].leaseId, leaseId);
   assert.equal(capped.budgets.core.laneNextAt, laneAtCap);
   assert.equal(capped.budgets.core.roundRobinCursor, cursorAtCap);
+});
+
+test("a full ledger of completed records reclaims data slots without losing charge", (t) => {
+  const box = sandbox(t, { authIdentity: "completed-slot-reclaim" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const state = inspectGovernor(box.scope, NOW).value;
+  for (let index = 0; index < GOVERNOR_MAX_RESERVATIONS; index += 1) {
+    const intentId = randomUUID();
+    state.reservations[`reservation:${intentId}`] = {
+      leaseId, intentId,
+      costs: { core: 1, graphql: 0 },
+      actualCosts: { core: 1, graphql: 0 },
+      accountedCosts: { core: 0, graphql: 0 },
+      notBefore: NOW, status: "completed", epochs: { core: state.epochs.core, graphql: null },
+      startedAt: NOW, completedAt: NOW, outcome: "measured-success", receipt: null,
+    };
+  }
+  assert.equal(writeGovernorState(box.scope.path, state).ok, true);
+  const admitted = registerIntent(box.scope, intent(randomUUID(), leaseId));
+  assert.equal(admitted.ok, true);
+  assert.equal(admitted.value.status, "scheduled");
+  const persisted = inspectGovernor(box.scope, NOW).value;
+  assert.equal(persisted.debt.core.unresolvedUnits, 512);
+  assert.ok(Object.keys(persisted.reservations).length <= GOVERNOR_MAX_RESERVATIONS);
+});
+
+test("observer retires only its claimed quiescent debt and preserves later additions", (t) => {
+  const box = sandbox(t, { authIdentity: "causal-debt-observer" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const before = inspectGovernor(box.scope, NOW).value;
+  const unresolvedId = randomUUID();
+  before.debtGroups[unresolvedId] = testDebtGroup({ at: NOW - 1, quiescent: false });
+  before.debt.core.unresolvedUnits = 1;
+  before.debt.core.unresolvedCount = 1;
+  before.debt.core.revision = 1;
+  assert.equal(writeGovernorState(box.scope.path, before).ok, true);
+
+  const firstAt = NOW + 1;
+  const firstClaim = claimNow(box.scope, leaseId, firstAt);
+  assert.equal(firstClaim.value.status, "claimed");
+  assert.equal(publishProbe(box.scope, leaseId, firstClaim.value.nonce,
+    { core: { limit: 5000, used: 1, remaining: 4999, resetMs: NOW + 3_600_000 } },
+    firstAt + 1, "core").ok, true);
+  assert.equal(inspectGovernor(box.scope, firstAt + 1).value.debt.core.unresolvedUnits, 1,
+    "fresh observer evidence cannot clear non-quiescent ownership");
+
+  const quiescent = inspectGovernor(box.scope, firstAt + 1).value;
+  quiescent.debtGroups[unresolvedId].quiescent = true;
+  quiescent.debtGroups[unresolvedId].barrierAt = firstAt + 2;
+  quiescent.debt.core.unresolvedUnits = 0;
+  quiescent.debt.core.unresolvedCount = 0;
+  quiescent.debt.core.quiescentUnits = 1;
+  quiescent.debt.core.quiescentCount = 1;
+  quiescent.debt.core.revision += 1;
+  quiescent.debtGroups[unresolvedId].barrierRevisions.core = quiescent.debt.core.revision;
+  assert.equal(writeGovernorState(box.scope.path, quiescent).ok, true);
+
+  const secondAt = firstAt + 3;
+  const secondClaim = claimNow(box.scope, leaseId, secondAt);
+  assert.equal(secondClaim.value.status, "claimed");
+  const during = inspectGovernor(box.scope, secondAt).value;
+  const addedId = randomUUID();
+  during.debt.core.quiescentUnits += 2;
+  during.debt.core.quiescentCount += 1;
+  during.debt.core.revision += 1;
+  during.debtGroups[addedId] = testDebtGroup({ units: 2, at: secondAt + 1,
+    revision: during.debt.core.revision });
+  assert.equal(writeGovernorState(box.scope.path, during).ok, true);
+  const published = publishProbe(box.scope, leaseId, secondClaim.value.nonce,
+    { core: { limit: 5000, used: 2, remaining: 4998, resetMs: NOW + 3_600_000 } },
+    secondAt + 2, "core");
+  assert.equal(published.ok, true, published.reason);
+  const after = inspectGovernor(box.scope, secondAt + 2).value;
+  assert.equal(after.debt.core.quiescentUnits, 2,
+    "only the old claimed unit is retired; post-claim addition survives");
+  assert.equal(after.debtGroups[unresolvedId], undefined);
+  assert.equal(after.debtGroups[addedId].units.core, 2);
+});
+
+test("a same-millisecond quiescence barrier is excluded from the observer claim", (t) => {
+  const box = sandbox(t, { authIdentity: "equal-time-barrier" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const at = NOW + 1;
+  const state = inspectGovernor(box.scope, NOW).value;
+  const olderId = randomUUID();
+  const concurrentId = randomUUID();
+  state.debtGroups[olderId] = testDebtGroup({ units: 1, at: NOW, revision: 1 });
+  state.debtGroups[concurrentId] = testDebtGroup({ units: 2, at, revision: 2 });
+  state.debt.core.quiescentUnits = 3;
+  state.debt.core.quiescentCount = 2;
+  state.debt.core.revision = 2;
+  assert.equal(writeGovernorState(box.scope.path, state).ok, true);
+  const claim = claimNow(box.scope, leaseId, at);
+  assert.equal(inspectGovernor(box.scope, at).value.probeClaims.core.debtSnapshot.units, 1);
+  const published = publishProbe(box.scope, leaseId, claim.value.nonce,
+    { core: { limit: 5000, used: 1, remaining: 4999, resetMs: NOW + 3_600_000 } },
+    at + 1, "core");
+  assert.equal(published.ok, true, published.reason);
+  const after = inspectGovernor(box.scope, at + 1).value;
+  assert.equal(after.debt.core.quiescentUnits, 2);
+  assert.equal(after.debtGroups[olderId], undefined);
+  assert.equal(after.debtGroups[concurrentId].units.core, 2);
+});
+
+test("unknown legacy debt waits through one boot and retires only after a later-boot observer", (t) => {
+  const box = sandbox(t, { authIdentity: "legacy-boot-quiescence" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const legacy = agedGovernorV6(inspectGovernor(box.scope, NOW).value, NOW);
+  assert.equal(writeGovernorState(box.scope.path, legacy).ok, true);
+  assert.equal(registerLease(box.scope, lease(leaseId), NOW).ok, true);
+  const sameBoot = inspectGovernor(box.scope, NOW).value;
+  assert.equal(sameBoot.debt.core.unresolvedUnits, 456);
+  assert.equal(sameBoot.debt.core.quiescentUnits, 0);
+  const group = Object.values(sameBoot.debtGroups)[0];
+  assert.ok(group.bootId, "the migration records the current boot identity");
+
+  const rebootFixture = structuredClone(sameBoot);
+  rebootFixture.debtGroups[Object.keys(rebootFixture.debtGroups)[0]].bootId = "synthetic-prior-boot";
+  assert.equal(writeGovernorState(box.scope.path, rebootFixture).ok, true);
+  const quiescedAt = NOW + 1;
+  assert.equal(registerLease(box.scope, lease(leaseId, quiescedAt), quiescedAt).ok, true);
+  const afterBoot = inspectGovernor(box.scope, quiescedAt).value;
+  assert.equal(afterBoot.debt.core.unresolvedUnits, 0);
+  assert.equal(afterBoot.debt.core.quiescentUnits, 456,
+    "a reboot proves process quiescence but is not quota reconciliation");
+  const claimAt = NOW + 2;
+  const claim = claimNow(box.scope, leaseId, claimAt);
+  assert.equal(inspectGovernor(box.scope, claimAt).value.probeClaims.core.debtSnapshot.units, 456);
+  assert.equal(publishProbe(box.scope, leaseId, claim.value.nonce,
+    { core: { limit: 5000, used: 1, remaining: 4999, resetMs: NOW + 3_600_000 } },
+    claimAt + 1, "core").ok, true);
+  const afterObserver = inspectGovernor(box.scope, claimAt + 1).value;
+  assert.equal(afterObserver.debt.core.quiescentUnits, 0);
+  assert.equal(afterObserver.debt.graphql.quiescentUnits, 162,
+    "the core observer cannot retire GraphQL debt");
+});
+
+test("an expired prior-boot detailed receipt quiesces during compaction before a later claim", (t) => {
+  const box = sandbox(t, { authIdentity: "prior-boot-detailed-receipt" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const granted = registerIntent(box.scope, intent(randomUUID(), leaseId)).value;
+  const startedAt = granted.notBefore;
+  assert.equal(startReservation(box.scope, granted.reservationId, startedAt).value.status, "started");
+  const priorBoot = inspectGovernor(box.scope, startedAt).value;
+  const receipt = priorBoot.reservations[granted.reservationId].receipt;
+  receipt.bootId = "synthetic-prior-boot";
+  receipt.deadline = startedAt + 1;
+  receipt.dispatches = [{ sequence: 1, operation: "tab:actions-runs",
+    costs: { core: 1, graphql: 0 }, issuedAt: startedAt,
+    terminalAt: null, childPid: null, childBirth: null, neverStarted: false }];
+  assert.equal(writeGovernorState(box.scope.path, priorBoot).ok, true);
+  const compactAt = startedAt + 1;
+  assert.equal(registerLease(box.scope, lease(leaseId, compactAt), compactAt).ok, true);
+  const compacted = inspectGovernor(box.scope, compactAt).value;
+  assert.equal(compacted.debt.core.unresolvedUnits, 0);
+  assert.equal(compacted.debt.core.quiescentUnits, 1);
+  assert.equal(compacted.reservations[granted.reservationId], undefined);
+  const claimAt = compactAt + 1;
+  const claim = claimNow(box.scope, leaseId, claimAt);
+  assert.equal(inspectGovernor(box.scope, claimAt).value.probeClaims.core.debtSnapshot.units, 1);
+  assert.equal(publishProbe(box.scope, leaseId, claim.value.nonce,
+    { core: { limit: 5000, used: 1, remaining: 4999, resetMs: NOW + 3_600_000 } },
+    claimAt + 1, "core").ok, true);
+  assert.equal(inspectGovernor(box.scope, claimAt + 1).value.debt.core.quiescentUnits, 0);
+});
+
+test("an old-boot overflow group never absorbs a current-boot child charge", (t) => {
+  const box = sandbox(t, { authIdentity: "mixed-boot-overflow" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const granted = registerIntent(box.scope, intent(randomUUID(), leaseId)).value;
+  const startedAt = granted.notBefore;
+  assert.equal(startReservation(box.scope, granted.reservationId, startedAt).value.status, "started");
+  const state = inspectGovernor(box.scope, startedAt).value;
+  const oldId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+  state.debtGroups[oldId] = testDebtGroup({ at: startedAt - 1, quiescent: false });
+  state.debtGroups[oldId].bootId = "synthetic-prior-boot";
+  state.debt.core.unresolvedUnits = 1;
+  state.debt.core.unresolvedCount = 1;
+  state.debt.core.revision = 1;
+  const receipt = state.reservations[granted.reservationId].receipt;
+  receipt.deadline = startedAt + 1;
+  receipt.dispatches = [{ sequence: 1, operation: "tab:actions-runs",
+    costs: { core: 1, graphql: 0 }, issuedAt: startedAt,
+    terminalAt: null, childPid: null, childBirth: null, neverStarted: false }];
+  assert.equal(writeGovernorState(box.scope.path, state).ok, true);
+  const compactAt = startedAt + 1;
+  assert.equal(registerLease(box.scope, lease(leaseId, compactAt), compactAt).ok, true);
+  const after = inspectGovernor(box.scope, compactAt).value;
+  assert.equal(after.debt.core.quiescentUnits, 1);
+  assert.equal(after.debt.core.unresolvedUnits, 1);
+  assert.equal(after.debtGroups[oldId].units.core, 1);
+  assert.equal(Object.values(after.debtGroups).length, 2);
+  const claimAt = compactAt + 1;
+  const claim = claimNow(box.scope, leaseId, claimAt);
+  assert.equal(inspectGovernor(box.scope, claimAt).value.probeClaims.core.debtSnapshot.units, 1);
+  assert.equal(publishProbe(box.scope, leaseId, claim.value.nonce,
+    { core: { limit: 5000, used: 1, remaining: 4999, resetMs: NOW + 3_600_000 } },
+    claimAt + 1, "core").ok, true);
+  assert.equal(inspectGovernor(box.scope, claimAt + 1).value.debt.core.unresolvedUnits, 1);
+});
+
+test("a full debt journal defers compaction so an old-boot observer can free space", (t) => {
+  const box = sandbox(t, { authIdentity: "full-debt-observer" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const granted = registerIntent(box.scope, intent(randomUUID(), leaseId)).value;
+  const startedAt = granted.notBefore;
+  assert.equal(startReservation(box.scope, granted.reservationId, startedAt).value.status, "started");
+  const state = inspectGovernor(box.scope, startedAt).value;
+  for (let index = 0; index < 127; index += 1) {
+    state.debtGroups[randomUUID()] = testDebtGroup({ at: startedAt - 1 });
+  }
+  const oldId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+  state.debtGroups[oldId] = testDebtGroup({ at: startedAt - 1, quiescent: false });
+  state.debtGroups[oldId].bootId = "synthetic-prior-boot";
+  state.debt.core.quiescentUnits = 127;
+  state.debt.core.quiescentCount = 127;
+  state.debt.core.unresolvedUnits = 1;
+  state.debt.core.unresolvedCount = 1;
+  state.debt.core.revision = 1;
+  const receipt = state.reservations[granted.reservationId].receipt;
+  receipt.deadline = startedAt + 1;
+  receipt.dispatches = [{ sequence: 1, operation: "tab:actions-runs",
+    costs: { core: 1, graphql: 0 }, issuedAt: startedAt,
+    terminalAt: null, childPid: null, childBirth: null, neverStarted: false }];
+  assert.equal(writeGovernorState(box.scope.path, state).ok, true);
+  const compactAt = startedAt + 1;
+  assert.equal(registerLease(box.scope, lease(leaseId, compactAt), compactAt).ok, true);
+  const deferred = inspectGovernor(box.scope, compactAt).value;
+  assert.ok(deferred.reservations[granted.reservationId], "the current child remains detailed");
+  assert.equal(deferred.debt.core.quiescentUnits, 128);
+  const claimAt = compactAt + 1;
+  const claim = claimNow(box.scope, leaseId, claimAt);
+  assert.equal(inspectGovernor(box.scope, claimAt).value.probeClaims.core.debtSnapshot.units, 128);
+  assert.equal(publishProbe(box.scope, leaseId, claim.value.nonce,
+    { core: { limit: 5000, used: 1, remaining: 4999, resetMs: NOW + 3_600_000 } },
+    claimAt + 1, "core").ok, true);
+  const released = inspectGovernor(box.scope, claimAt + 1).value;
+  assert.equal(released.debt.core.quiescentUnits, 0);
+  assert.equal(released.debt.core.unresolvedUnits, 0);
+  assert.ok(released.reservations[granted.reservationId]);
+  assert.equal(registerLease(box.scope, lease(leaseId, claimAt + 2), claimAt + 2).ok, true);
+  assert.equal(inspectGovernor(box.scope, claimAt + 2).value.debt.core.unresolvedUnits, 1);
+});
+
+test("maximum cardinality ledger fits 2 MiB and oversized writes preserve the canonical file", (t) => {
+  const box = sandbox(t, { authIdentity: "ledger-byte-ceiling" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const state = inspectGovernor(box.scope, NOW).value;
+  for (let index = 1; index < GOVERNOR_MAX_LEASES; index += 1) {
+    const id = randomUUID();
+    const value = lease(id);
+    delete value.id;
+    state.leases[id] = value;
+  }
+  for (let index = 0; index < GOVERNOR_MAX_INTENTS; index += 1) {
+    const id = randomUUID();
+    const value = intent(id, leaseId);
+    delete value.id;
+    state.intents[id] = value;
+  }
+  for (let index = 0; index < GOVERNOR_MAX_RESERVATIONS; index += 1) {
+    const id = randomUUID();
+    state.reservations[`reservation:${id}`] = {
+      leaseId, intentId: id, costs: { core: 0, graphql: 0 },
+      actualCosts: { core: 0, graphql: 0 }, accountedCosts: { core: 0, graphql: 0 },
+      notBefore: NOW, status: "completed", epochs: { core: null, graphql: null },
+      startedAt: NOW, completedAt: NOW, outcome: "measured-success", receipt: null,
+    };
+  }
+  for (let index = 0; index < 128; index += 1) {
+    state.debtGroups[randomUUID()] = testDebtGroup({ at: NOW - 1, quiescent: false });
+  }
+  state.debt.core.unresolvedUnits = 128;
+  state.debt.core.unresolvedCount = 128;
+  state.debt.core.revision = 128;
+  for (let index = 0; index < 4096; index += 1) state.importMarkers[randomUUID()] = true;
+  assert.equal(writeGovernorState(box.scope.path, state).ok, true);
+  const before = readFileSync(box.scope.path);
+  assert.ok(before.length < 2 * 1024 * 1024, `valid maximum fixture is ${before.length} bytes`);
+  assert.equal(inspectGovernor(box.scope, NOW).ok, true);
+  const oversized = { ...state, padding: "x".repeat(2 * 1024 * 1024) };
+  assert.equal(writeGovernorState(box.scope.path, oversized).reason, "capacity");
+  assert.deepEqual(readFileSync(box.scope.path), before);
+  writeFileSync(box.scope.path, Buffer.alloc(2 * 1024 * 1024 + 1, "x"));
+  assert.equal(inspectGovernor(box.scope, NOW).reason, "capacity");
+});
+
+test("unsafe accounting overflow fails before mutating the quota ledger", (t) => {
+  const box = sandbox(t, { authIdentity: "accounting-overflow" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const state = inspectGovernor(box.scope, NOW).value;
+  state.debtGroups[randomUUID()] = testDebtGroup({
+    units: Number.MAX_SAFE_INTEGER, at: NOW - 1, quiescent: false,
+  });
+  state.debt.core.unresolvedUnits = Number.MAX_SAFE_INTEGER;
+  state.debt.core.unresolvedCount = 1;
+  state.debt.core.revision = 1;
+  const id = randomUUID();
+  state.reservations[`reservation:${id}`] = {
+    leaseId, intentId: id, costs: { core: 1, graphql: 0 },
+    actualCosts: null, accountedCosts: { core: 0, graphql: 0 },
+    notBefore: NOW, status: "scheduled", epochs: { core: state.epochs.core, graphql: null },
+    startedAt: null, completedAt: null, outcome: null, receipt: null,
+  };
+  assert.equal(writeGovernorState(box.scope.path, state).ok, true);
+  const before = readFileSync(box.scope.path);
+  assert.equal(registerLease(box.scope, lease(leaseId), NOW).reason, "accounting-overflow");
+  assert.deepEqual(readFileSync(box.scope.path), before);
 });
 
 test("atomic storage is private and persisted JSON excludes identity and process data", (t) => {
@@ -3185,6 +4041,30 @@ test("real probe and request owner crashes recover without releasing uncertain c
   const state = inspectGovernor(requestBox.scope, afterExpiry).value;
   assert.equal(state.leases[requestLeaseId], undefined);
   assert.equal(state.reservations[grant.reservationId].status, "started");
+});
+
+test("an expired GraphQL control owner frees the probe slot but retains its charge", (t) => {
+  const box = sandbox(t);
+  const ownerId = randomUUID();
+  const waiterId = randomUUID();
+  assert.equal(registerLease(box.scope, lease(ownerId)).ok, true);
+  assert.equal(registerLease(box.scope, lease(waiterId)).ok, true);
+  const first = claimProbe(box.scope, ownerId, NOW, "graphql");
+  assert.equal(first.value.status, "claimed");
+  const issued = inspectGovernor(box.scope, NOW).value;
+  issued.controlReceipts.graphql.receipt.dispatches = [{ sequence: 1,
+    operation: "graphql-observer", costs: { core: 0, graphql: 1 }, issuedAt: NOW,
+    terminalAt: null, childPid: process.pid, childBirth: null, neverStarted: false }];
+  assert.equal(writeGovernorState(box.scope.path, issued).ok, true);
+  const takeoverAt = NOW + GOVERNOR_PROBE_LEASE_MS + 1;
+  const second = claimProbe(box.scope, waiterId, takeoverAt, "graphql");
+  assert.equal(second.value.status, "claimed");
+  assert.notEqual(second.value.nonce, first.value.nonce);
+  const ledger = inspectGovernor(box.scope, takeoverAt).value;
+  assert.equal(ledger.debt.graphql.unresolvedUnits, 1);
+  assert.equal(ledger.controlReceipts.graphql.intentId, second.value.nonce);
+  assert.equal(publishProbe(box.scope, ownerId, first.value.nonce, budgets(takeoverAt),
+    takeoverAt, "graphql").reason, "stale");
 });
 
 test("a suspended real lock owner is never replaced and a killed owner recovers", async (t) => {

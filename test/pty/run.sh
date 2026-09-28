@@ -82,6 +82,7 @@ trap abort_capture HUP INT TERM
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO=$(CDPATH= cd -- "$HERE/../.." && pwd)
+APP_ENTRY="${GH_GLANCE_CAPTURE_ENTRY:-$REPO/index.mjs}"
 LOG="${OUT}.calls"
 : > "$LOG"
 
@@ -128,13 +129,13 @@ if [ "$SIGNAL" = "none" ]; then
   INNER="$ENV_PREFIX
     stty cols $COLS rows $ROWS;
     cd \"$APP_CWD\";
-    env -u CI -u CONTINUOUS_INTEGRATION node \"$REPO/index.mjs\" $APP_ARGS;
+    env -u CI -u CONTINUOUS_INTEGRATION node \"$APP_ENTRY\" $APP_ARGS;
     printf '\nEXITCODE=%s\n' \"\$?\""
 else
   INNER="$ENV_PREFIX
     stty cols $COLS rows $ROWS;
     cd \"$APP_CWD\";
-    env -u CI -u CONTINUOUS_INTEGRATION node \"$REPO/index.mjs\" $APP_ARGS &
+    env -u CI -u CONTINUOUS_INTEGRATION node \"$APP_ENTRY\" $APP_ARGS &
     p=\$!;
     sleep $SETTLE;
     kill -$SIGNAL \$p 2>/dev/null;

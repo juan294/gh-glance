@@ -251,3 +251,21 @@ A healthy budget observation alone cannot clear an acquisition failure. The
 visible age derives from the last successful source observation, including an
 unchanged 304, and is not capped after 99 hours. Narrow panes keep the refresh
 and quit keys; the longer sanitized cause appears in the notice line.
+
+## Amendment: quota-authoritative acquisition diagnostics (2026-09-28)
+
+Acquisition metadata version 2 no longer keeps a second per-request uncertainty
+ledger. The quota ledger remains the authority for outstanding cost across
+access keys that share one verified principal. Acquisition stores at most 128
+bounded scope projections keyed by quota scope and its ledger revision. A
+missing or stale projection is reported as unavailable, never as zero, and
+cannot prevent a valid new source generation from publishing. Request metrics
+remain measures of transport work, not an authority for quota retirement.
+
+Migration from version 1 preserves snapshots and request counters, fences old
+producer claims with a new epoch, and folds up to 1,024 legacy uncertainty
+receipts into a fixed diagnostic summary. Their quota charge remains in the
+governor; elapsed time in the acquisition store does not forgive it. New
+started claims still require a durable exact governor receipt before transport.
+A failed acquisition-start write starts no HTTP call, and its already-admitted
+but never-issued quota envelope settles to zero through the original scope.

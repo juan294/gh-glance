@@ -42,11 +42,14 @@ import {
   registerIntent,
   registerLease,
   runStartedAcquisitionTransport,
+  runAdmittedOperation,
   withFileLock,
   startReservation,
+  writeGovernorState,
   stagedAcquisitionPublicationView,
   setRuntimeAcquisitionHold,
 } from "../index.mjs";
+import { agedGovernorV6, agedGovernorResiduals } from "./fixtures/aged-governor-v6.mjs";
 
 const NOW = 1_800_000_000_000;
 const ACCESS = "a".repeat(64);
@@ -827,7 +830,7 @@ test("OBS-01: cached subscribers are cache hits, not joined producer followers",
   assert.equal(metrics.joinedFollowers, 0);
 });
 
-test("OBS-01: failed requests preserve last-good data and only release proven cost", async (t) => {
+test("OBS-01: failed requests preserve last-good data and leave quota diagnosis unavailable", async (t) => {
   const box = fixture(t);
   const engine = createAcquisitionEngine(box);
   t.after(() => engine.close());
@@ -845,7 +848,8 @@ test("OBS-01: failed requests preserve last-good data and only release proven co
   let diagnostic = engine.diagnostics().value;
   assert.equal(diagnostic.metrics.httpRequests, 1);
   assert.equal(diagnostic.metrics.failedRequests, 1);
-  assert.equal(diagnostic.metrics.uncertainCoreUnits, 1);
+  assert.equal(diagnostic.metrics.uncertainCoreUnits, 0);
+  assert.equal(diagnostic.queries[0].uncertainCost.status, "unavailable");
   assert.equal(diagnostic.queries[0].hold, "primary");
 
   const second = await engine.refresh(subscription.value.id, { force: true });
@@ -861,14 +865,31 @@ test("OBS-01: failed requests preserve last-good data and only release proven co
   assert.equal(diagnostic.metrics.httpRequests, 2);
   assert.equal(diagnostic.metrics.failedRequests, 2);
   assert.equal(diagnostic.metrics.coreUnits, 1);
-  assert.equal(diagnostic.metrics.uncertainCoreUnits, 1);
+  assert.equal(diagnostic.metrics.uncertainCoreUnits, 0);
+  assert.equal(diagnostic.queries[0].uncertainCost.status, "unavailable");
   assert.equal(diagnostic.queries[0].hold, "secondary");
 });
 
-test("OBS-01: authoritative observer evidence retires bounded uncertainty by access and epoch", async (t) => {
+test("OBS-01: quota projection is scope-wide and time cannot forgive a started charge", async (t) => {
   const box = fixture(t);
   const engine = createAcquisitionEngine(box);
   t.after(() => engine.close());
+  const scope = createGovernorScope({ effectiveHost: "github.com", authIdentity: "projection-scope",
+    env: box.pathOptions.env, now: box.now }).value;
+  const leaseId = randomUUID();
+  assert.equal(registerLease(scope, { id: leaseId, expiresAt: NOW + GOVERNOR_LEASE_TTL_MS,
+    floorMs: 5_000, activeTab: "actions", phaseSeed: { seed: leaseId, registeredAt: NOW },
+    demand: { core: 1, graphql: 0 } }).ok, true);
+  const budgets = { core: { limit: 5_000, used: 0, remaining: 5_000, resetMs: NOW + 3_600_000 },
+    graphql: { limit: 5_000, used: 0, remaining: 5_000, resetMs: NOW + 3_600_000 } };
+  for (const resource of ["core", "graphql"]) {
+    const probe = claimProbe(scope, leaseId, NOW, resource);
+    assert.equal(publishProbe(scope, leaseId, probe.value.nonce, budgets, NOW, resource).ok, true);
+  }
+  const grant = registerIntent(scope, { id: randomUUID(), leaseId, tab: "actions", priority: "active",
+    costs: { core: 1, graphql: 0 }, requestedAt: NOW,
+    expiresAt: NOW + GOVERNOR_LEASE_TTL_MS }).value;
+  assert.equal(startReservation(scope, grant.reservationId, grant.notBefore).value.status, "started");
   const accessA = engine.subscribe(query("R_receipt", "actions", { accessKey: "a".repeat(64) }),
     { active: true, floorMs: 5_000 });
   const accessB = engine.subscribe(query("R_receipt", "actions", { accessKey: "b".repeat(64) }),
@@ -885,21 +906,87 @@ test("OBS-01: authoritative observer evidence retires bounded uncertainty by acc
       failure: { hold: "disconnected", requestMetrics: { httpRequests: 1, failedRequests: 1 } },
     });
   }
-  assert.equal(engine.diagnostics().value.metrics.uncertainCoreUnits, 2);
-  assert.equal(engine.reconcileUncertainty("a".repeat(64), {
-    core: { epoch: "core:one", observedAt: NOW - 1 },
-  }).ok, true);
-  assert.equal(engine.diagnostics().value.metrics.uncertainCoreUnits, 2);
-  box.setNow(NOW + 1);
-  engine.reconcileUncertainty("a".repeat(64), {
-    core: { epoch: "core:one", observedAt: box.now() },
+  box.setNow(grant.notBefore);
+  assert.equal(engine.syncQuotaProjection({ ...scope, accessKey: "a".repeat(64) }).ok, true);
+  assert.equal(engine.syncQuotaProjection({ ...scope, accessKey: "b".repeat(64) }).ok, true);
+  let diagnostics = engine.diagnostics().value;
+  assert.equal(diagnostics.outstandingQuota.length, 1, "two access keys share one quota projection");
+  assert.equal(diagnostics.outstandingQuota[0].units.core, 1);
+  assert.equal(diagnostics.metrics.uncertainCoreUnits, 0, "query metrics do not duplicate scope debt");
+  assert.deepEqual(loadAcquisitionStore(acquisitionStorePath(box.pathOptions)).value
+    .quotaProjections[scope.hash].accessKeys.sort(), ["a".repeat(64), "b".repeat(64)]);
+  const revision = diagnostics.outstandingQuota[0].revision;
+  box.setNow(grant.notBefore + 1);
+  assert.equal(engine.syncQuotaProjection(scope).ok, true);
+  diagnostics = engine.diagnostics().value;
+  assert.equal(diagnostics.outstandingQuota[0].units.core, 1,
+    "a later timestamp alone cannot retire quota authority");
+  assert.ok(diagnostics.outstandingQuota[0].revision >= revision);
+  assert.equal(loadAcquisitionStore(acquisitionStorePath(box.pathOptions)).value.legacyUnverified.coreUnits, 0);
+  box.setNow(grant.notBefore + 60_002);
+  diagnostics = engine.diagnostics().value;
+  assert.equal(diagnostics.outstandingQuota[0].status, "unavailable");
+  assert.equal(diagnostics.outstandingQuota[0].units, null);
+  assert.equal(inspectGovernor(scope, box.now()).value.reservations[grant.reservationId].costs.core, 1,
+    "stale projection disclosure cannot forgive authoritative quota debt");
+});
+
+test("v1 acquisition's 1,024 receipts migrate to fixed diagnostics without blocking a new publication", async (t) => {
+  const box = fixture(t);
+  const bootstrap = createAcquisitionEngine(box);
+  const path = bootstrap.path;
+  assert.equal(bootstrap.subscribe(query(), { active: true, floorMs: 5_000 }).ok, true);
+  bootstrap.close();
+  const legacy = loadAcquisitionStore(path).value;
+  legacy.version = 1;
+  delete legacy.quotaProjections;
+  delete legacy.legacyUnverified;
+  legacy.subscriptions = {};
+  legacy.queries = {};
+  legacy.metrics.uncertainCoreUnits = 1_024;
+  legacy.uncertainReceipts = Object.fromEntries(Array.from({ length: 1_024 }, (_, index) => {
+    const reservationId = `reservation:legacy-${index}`;
+    const id = `${reservationId}:core`;
+    return [id, { id, reservationId, accessKey: ACCESS, resource: "core",
+      epoch: "unknown", units: 1, startedAt: NOW - 1 }];
+  }));
+  writeFileSync(path, `${JSON.stringify(legacy)}\n`, { mode: 0o600 });
+
+  const scope = createGovernorScope({ effectiveHost: "github.com", authIdentity: "acquisition-v1-full",
+    env: box.pathOptions.env, now: box.now }).value;
+  const leaseId = randomUUID();
+  assert.equal(registerLease(scope, { id: leaseId, expiresAt: NOW + GOVERNOR_LEASE_TTL_MS,
+    floorMs: 5_000, activeTab: "actions", phaseSeed: { seed: leaseId, registeredAt: NOW },
+    demand: { core: 1, graphql: 0 } }).ok, true);
+  const budgets = { core: { limit: 5_000, used: 0, remaining: 5_000, resetMs: NOW + 3_600_000 },
+    graphql: { limit: 5_000, used: 0, remaining: 5_000, resetMs: NOW + 3_600_000 } };
+  for (const resource of ["core", "graphql"]) {
+    const probe = claimProbe(scope, leaseId, NOW, resource);
+    assert.equal(publishProbe(scope, leaseId, probe.value.nonce, budgets, NOW, resource).ok, true);
+  }
+  const aged = agedGovernorV6(inspectGovernor(scope, NOW).value, NOW);
+  assert.deepEqual(agedGovernorResiduals(aged), { core: 456, graphql: 162 });
+  assert.equal(writeGovernorState(scope.path, aged).ok, true);
+
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  const subscribed = engine.subscribe(query(), { active: true, floorMs: 5_000 });
+  assert.equal(subscribed.ok, true);
+  const published = await engine.refresh(subscribed.value.id, {
+    acquire: async () => snapshot("newer run"),
   });
-  assert.equal(engine.diagnostics().value.metrics.uncertainCoreUnits, 1);
-  engine.reconcileUncertainty("b".repeat(64), {
-    core: { epoch: "core:two", observedAt: NOW - 1 },
-  });
-  assert.equal(engine.diagnostics().value.metrics.uncertainCoreUnits, 0);
-  assert.deepEqual(loadAcquisitionStore(acquisitionStorePath(box.pathOptions)).value.uncertainReceipts, {});
+  assert.equal(published.ok, true);
+  assert.equal(engine.inspect(subscribed.value.id).value.snapshot.rows[0].displayTitle, "newer run");
+  const store = loadAcquisitionStore(path).value;
+  assert.equal(store.version, ACQUISITION_STORE_VERSION);
+  assert.equal(Object.hasOwn(store, "uncertainReceipts"), false);
+  assert.deepEqual(store.legacyUnverified, { coreUnits: 1_024, graphqlUnits: 0, receiptCount: 1_024 });
+  assert.equal(engine.syncQuotaProjection(scope).ok, true);
+  const projections = engine.diagnostics().value.outstandingQuota;
+  assert.equal(projections.length, 1);
+  assert.equal(projections[0].units.core, 456);
+  assert.equal(projections[0].units.graphql, 162);
+  assert.equal(inspectGovernor(scope, NOW).value.debt.core.unresolvedUnits, 456);
 });
 
 test("OBS-01: production fetch seams reconcile 200, 304, GraphQL, and failed HTTP", async (t) => {
@@ -981,7 +1068,7 @@ test("OBS-01: production fetch seams reconcile 200, 304, GraphQL, and failed HTT
     rest304: 1,
     coreUnits: 1,
     graphqlUnits: 2,
-    uncertainCoreUnits: 4,
+    uncertainCoreUnits: 0,
     uncertainGraphqlUnits: 0,
     failedRequests: 4,
     observerCalls: 0,
@@ -1030,7 +1117,7 @@ test("OBS-01: Actions catalog metrics include mixed and failed admitted requests
   });
 });
 
-test("OBS-01: mixed Security endpoints retain only failed request uncertainty", async (t) => {
+test("OBS-01: mixed Security endpoints keep request metrics separate from quota uncertainty", async (t) => {
   const sources = [
     { key: "security-ok", name: "Security ok", path: "ok", priorityQueries: [], jq: ".",
       unavailable: "unavailable", map: (row) => row },
@@ -1084,7 +1171,8 @@ test("OBS-01: mixed Security endpoints retain only failed request uncertainty", 
   assert.equal(metrics.rest200, 1);
   assert.equal(metrics.coreUnits, 1);
   assert.equal(metrics.failedRequests, 1);
-  assert.equal(metrics.uncertainCoreUnits, 1);
+  assert.equal(metrics.uncertainCoreUnits, 0);
+  assert.equal(engine.diagnostics().value.queries[0].uncertainCost.status, "unavailable");
 });
 
 test("OBS-01: invalid Security JSON counts its received 200 exactly once", async () => {
@@ -1273,6 +1361,91 @@ test("SHARE-05: repeated start accepts only the exact receipt and authorizes one
   assert.equal(dispatches, 0);
 });
 
+test("an acquisition-start persistence fault runs zero HTTP and settles never-issued quota", async (t) => {
+  const box = fixture(t);
+  const storage = memoryStorage();
+  const engine = createAcquisitionEngine({ ...box, storage });
+  t.after(() => engine.close());
+  const subscribed = engine.subscribe(query(), { active: true, floorMs: 5_000 });
+  const claimed = await engine.refresh(subscribed.value.id);
+  assert.equal(claimed.value.role, "producer");
+  const scope = createGovernorScope({ effectiveHost: "github.com", authIdentity: "start-fault",
+    env: box.pathOptions.env, now: box.now }).value;
+  const leaseId = randomUUID();
+  assert.equal(registerLease(scope, { id: leaseId,
+    expiresAt: NOW + GOVERNOR_LEASE_TTL_MS, floorMs: 5000, activeTab: "actions",
+    phaseSeed: { seed: leaseId, registeredAt: NOW }, demand: { core: 1, graphql: 0 },
+  }, NOW).ok, true);
+  const probe = claimProbe(scope, leaseId, NOW, "core");
+  assert.equal(probe.value.status, "claimed");
+  assert.equal(publishProbe(scope, leaseId, probe.value.nonce,
+    { core: { limit: 5000, used: 0, remaining: 5000, resetMs: NOW + 3_600_000 } },
+    NOW, "core").ok, true);
+  storage.failAfterNext("unwritable");
+  let http = 0;
+  const result = await runAdmittedOperation({
+    scope, leaseId, operation: "tab:actions-runs", now: box.now,
+    waitMs: 5_000, wait: async (ms) => { box.setNow(box.now() + ms + 1); return true; },
+    run: () => runStartedAcquisitionTransport(
+      () => engine.refresh(subscribed.value.id, { started: {
+        ...claimed.value, receipt: { reservationId: "reservation:synthetic", accessKey: ACCESS,
+          epochs: { core: "epoch" } },
+      } }),
+      () => { http += 1; return snapshot("must not run"); },
+    ),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.value.reason, "unwritable");
+  assert.equal(http, 0);
+  const quota = inspectGovernor(scope, box.now()).value.reservations[result.reservationId];
+  assert.equal(quota.status, "completed");
+  assert.equal(quota.actualCosts.core, 0);
+  assert.equal(engine.inspect(subscribed.value.id).value.claim.started, false);
+  assert.equal(engine.inspect(subscribed.value.id).value.generation, 0);
+});
+
+test("quota projection eviction protects active scopes and keeps publication independent", async (t) => {
+  const box = fixture(t);
+  const scope = createGovernorScope({ effectiveHost: "github.com", authIdentity: "projection-eviction",
+    env: box.pathOptions.env, now: box.now }).value;
+  const leaseId = randomUUID();
+  assert.equal(registerLease(scope, { id: leaseId, expiresAt: NOW + GOVERNOR_LEASE_TTL_MS,
+    floorMs: 5_000, activeTab: "actions", phaseSeed: { seed: leaseId, registeredAt: NOW },
+    demand: { core: 1, graphql: 0 } }).ok, true);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  const active = engine.subscribe(query(), { active: true, floorMs: 5_000 });
+  assert.equal(active.ok, true);
+  const activeHash = "a".repeat(64);
+  const inactiveHash = "b".repeat(64);
+  assert.equal(engine.syncQuotaProjection({ ...scope, hash: activeHash, accessKey: ACCESS }).ok, true);
+  assert.equal(engine.syncQuotaProjection({ ...scope, hash: inactiveHash }).ok, true);
+  for (let index = 2; index < 128; index += 1) {
+    const hash = index.toString(16).padStart(64, "0");
+    assert.equal(engine.syncQuotaProjection({ ...scope, hash }).ok, true);
+  }
+  const overflowHash = "c".repeat(64);
+  assert.equal(engine.syncQuotaProjection({ ...scope, hash: overflowHash }).ok, true);
+  const projections = loadAcquisitionStore(acquisitionStorePath(box.pathOptions)).value.quotaProjections;
+  assert.equal(Object.keys(projections).length, 128);
+  assert.ok(projections[activeHash], "active projection survives oldest-first eviction");
+  assert.equal(projections[inactiveHash], undefined);
+  assert.ok(projections[overflowHash]);
+  assert.equal(projections[activeHash].accessKeys[0], ACCESS);
+  const claim = await engine.refresh(active.value.id);
+  assert.equal(claim.value.role, "producer", "projection capacity cannot deny source ownership");
+  const published = await engine.refresh(active.value.id, {
+    started: { ...claim.value, receipt: { reservationId: "reservation:eviction",
+      accessKey: ACCESS, epochs: { core: "current" } } },
+  });
+  assert.equal(published.value.status, "started");
+  const result = await engine.refresh(active.value.id, {
+    claim: { ...claim.value, accessKey: ACCESS },
+    publish: snapshot("projection eviction succeeds"),
+  });
+  assert.equal(result.ok, true);
+});
+
 test("SHARE-04/05: staged publication carries changed validators, page info, and 304 cadence", () => {
   const key = "issues\0page:one";
   const local = new Map([[key, { etag: '"old"', body: "old" }]]);
@@ -1459,7 +1632,7 @@ test("SHARE-07: failed two-store cleanup retries exact intent and claim", async 
   assert.equal(engine.inspect(sub.value.id).value.claim, null);
 });
 
-test("SHARE-05: a started live claim has a finite deadline and keeps uncertain receipt debt", async (t) => {
+test("SHARE-05: a started live claim has a finite deadline without a second receipt ledger", async (t) => {
   const box = fixture(t);
   const owner = createAcquisitionEngine({ ...box, pid: 111, kill: () => {} });
   const follower = createAcquisitionEngine({ ...box, pid: 222, kill: () => {} });
@@ -1481,7 +1654,8 @@ test("SHARE-05: a started live claim has a finite deadline and keeps uncertain r
   assert.equal(denied.reason, "stale");
   assert.equal(owner.inspect(a.value.id).value.snapshot, null);
   const saved = loadAcquisitionStore(owner.path).value;
-  assert.equal(saved.uncertainReceipts["reservation:old:core"].reservationId, "reservation:old");
+  assert.equal(Object.hasOwn(saved, "uncertainReceipts"), false);
+  assert.equal(saved.legacyUnverified.coreUnits, 0);
   assert.equal((await follower.refresh(b.value.id, { started: {
     ...next, receipt: { reservationId: "reservation:new", accessKey: ACCESS,
       epochs: { core: "core:old" } },
@@ -1507,7 +1681,8 @@ test("SHARE-05: an overbound started producer cannot publish without a follower 
   assert.equal(engine.inspect(sub.value.id).value.snapshot, null);
   const saved = loadAcquisitionStore(engine.path).value;
   assert.equal(Object.values(saved.queries)[0].claim, null);
-  assert.equal(saved.uncertainReceipts["reservation:overbound:core"].units, 1);
+  assert.equal(Object.hasOwn(saved, "uncertainReceipts"), false);
+  assert.equal(saved.legacyUnverified.coreUnits, 0);
 });
 
 test("SHARE-05: takeover after a durable start leaves the dead owner's governor cost uncertain", async (t) => {
@@ -1562,6 +1737,7 @@ test("SHARE-05: takeover after a durable start leaves the dead owner's governor 
     acquire: async () => snapshot("after crash", { at: box.now() }),
   });
   assert.equal(takeover.ok, true);
+  assert.equal(successor.inspect(subscribed.value.id).value.snapshot.rows[0].displayTitle, "after crash");
   const governor = inspectGovernor(scope, box.now()).value;
   const retained = governor.reservations[grant.reservationId];
   assert.equal(retained.status, "started");
@@ -1569,6 +1745,11 @@ test("SHARE-05: takeover after a durable start leaves the dead owner's governor 
   assert.equal(retained.actualCosts, null);
   assert.deepEqual(retained.accountedCosts, { core: 0, graphql: 0 });
   assert.equal(retained.outcome, null);
+  assert.equal(successor.syncQuotaProjection(scope).ok, true);
+  const outstanding = successor.diagnostics().value.outstandingQuota;
+  assert.equal(outstanding.length, 1);
+  assert.equal(outstanding[0].units.core, 1,
+    "source publication does not release the dead producer's quota charge");
 });
 
 test("SHARE-05: delayed publication is nonce fenced and malformed data cancels its claim", async (t) => {
