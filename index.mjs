@@ -207,7 +207,7 @@ const STALE_AFTER_MS = 30_000;
 // A coordination hold must persist long enough to be meaningful before it
 // takes the notice row. Short startup and lock-contention states recover on
 // their own and should not present themselves as user-visible failures.
-const COORDINATION_NOTICE_AFTER_MS = 2_000;
+const COORDINATION_NOTICE_AFTER_MS = 800;
 
 // Mutable because the fetchers below are defined before argv is parsed, and the
 // argv block is what fills this in. Everything here has a working default, so
@@ -4681,7 +4681,7 @@ function readGovernorState(path, nowMs, { persistMigration = true } = {}) {
     if (normalized) return { ok: true, value: normalized };
     const migrated = migrateGovernorState(parsed, nowMs);
     if (!migrated) return { ok: false, reason: "corrupt" };
-    if (parsed.version === 6) {
+    if (persistMigration && parsed.version === 6) {
       const backupPath = `${path}.pre-v7.backup`;
       try {
         writeFileSync(backupPath, raw, { encoding: "utf8", mode: 0o600, flag: "wx" });
@@ -5851,9 +5851,7 @@ function startReservation(scope, reservationId, nowMs) {
       dispatches: [],
     };
     return { value: { status: "started", reservationId,
-      receiptCapability: { reservationId, leaseId: reservation.leaseId,
-        scopeHash: scope.hash, ownerNonce: reservation.receipt.ownerNonce,
-        generation, deadline: reservation.receipt.deadline } } };
+      receiptCapability: receiptCapabilityFromReservation(reservationId, reservation) } };
   });
 }
 
@@ -5988,6 +5986,27 @@ function terminalizeReservation(scope, capability, completion, nowMs) {
 }
 
 const terminalizationBacklog = new Map();
+function terminalizationBacklogForResource(backlog, scopeHash, resource) {
+  if (!scopeHash) return 0;
+  let count = 0;
+  for (const item of backlog.values()) {
+    if (item.scope.hash !== scopeHash) continue;
+    if (item.capability?.costs?.[resource] > 0 ||
+        !RATE_RESOURCES.some((name) => item.capability?.costs?.[name] > 0)) count += 1;
+  }
+  return count;
+}
+function receiptCapabilityFromReservation(reservationId, reservation) {
+  if (!reservation?.receipt || !reservation?.costs) return null;
+  return {
+    reservationId, leaseId: reservation.leaseId,
+    scopeHash: reservation.receipt.scopeHash,
+    ownerNonce: reservation.receipt.ownerNonce,
+    generation: reservation.receipt.generation,
+    deadline: reservation.receipt.deadline,
+    costs: { ...reservation.costs },
+  };
+}
 function queueTerminalization(scope, capability, completion, now = Date.now) {
   const frozen = { ...scope, identityProvider: null };
   const key = `${scope.hash}:${capability?.reservationId ?? "invalid"}`;
@@ -6211,6 +6230,39 @@ function governorHealth(result, nowMs = Date.now()) {
       }]] : [];
     })),
   };
+}
+
+// Plain doctor must not call the identity coordinator: even its inspection
+// path may retire old registry attempts and persist the resulting registry.
+// A cached identity is useful only when it identifies one quota account for
+// the requested host. Multiple accounts cannot be resolved without probing.
+function doctorCachedQuotaScope(host, { root = identityRegistryRoot(), nowMs = Date.now() } = {}) {
+  const registryPath = join(root, "registry.json");
+  let registry;
+  try {
+    const file = lstatSync(registryPath);
+    if (!file.isFile() || file.size > GOVERNOR_MAX_LEDGER_BYTES) return { ok: false, reason: "unsafe registry" };
+    registry = normalizeIdentityRegistry(JSON.parse(readFileSync(registryPath, "utf8")));
+  } catch (error) {
+    return { ok: false, reason: error?.code === "ENOENT" ? "cached identity missing" : "cached registry unreadable" };
+  }
+  if (!registry) return { ok: false, reason: "cached registry corrupt" };
+  const quotas = new Set(Object.values(registry.identities)
+    .filter((identity) => identity.host === host)
+    .map((identity) => identity.quotaKey));
+  if (quotas.size === 0) return { ok: false, reason: "cached identity missing" };
+  if (quotas.size !== 1) return { ok: false, reason: "ambiguous cached identities" };
+  const quotaKey = quotas.values().next().value;
+  const path = join(root, `quota-${quotaKey}.json`);
+  try {
+    if (!lstatSync(path).isFile()) return { ok: false, reason: "unsafe quota path", path };
+  } catch (error) {
+    return { ok: false, reason: error?.code === "ENOENT" ? "cached quota missing" : "cached quota unreadable", path };
+  }
+  const result = readGovernorState(path, nowMs, { persistMigration: false });
+  return result.ok && !result.missing
+    ? { ok: true, result, path, quotaKey }
+    : { ok: false, reason: result.missing ? "cached quota missing" : result.reason, path };
 }
 
 async function retryGovernorMutation(run, { now, wait, deadline, signal }) {
@@ -6947,7 +6999,7 @@ const SSH_RECONNECT_STEPS_MS = Object.freeze([1_000, 2_000, 4_000, 8_000, 16_000
 const SSH_STDERR_MAX_BYTES = 4_096;
 const SSH_ALIAS_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/;
 const COLLECTOR_HOLD_REASONS = new Set([
-  "observer", "primary", "secondary", "disconnected", "coordination", "shared-wait", "cache-only",
+  "observer", "primary", "secondary", "disconnected", "app-auth", "coordination", "shared-wait", "cache-only",
 ]);
 const COLLECTOR_ROW_KEYS = Object.freeze({
   actions: ["databaseId", "displayTitle", "workflowName", "number", "headBranch", "status", "conclusion",
@@ -9798,7 +9850,7 @@ function createCollectorAcquisitionRuntime({
           engine.unsubscribe(subscriptionId);
           item.id = null;
           targetInitializations.delete(targetInitializationKey(item.target));
-          item.onHold?.("disconnected");
+          item.onHold?.("app-auth");
           retryIn = 1;
           return;
         }
@@ -9835,7 +9887,10 @@ function createCollectorAcquisitionRuntime({
           requestMetrics: error?.requestMetrics ?? {},
         } });
         else engine.setHold(subscriptionId, hold, { resource: item.resource, accessKey: item.identity.accessKey });
-        item.onHold?.(hold);
+        item.onHold?.(item.provider?.definition?.type === "github-app" &&
+          (error?.apiResponse?.status === 401 || error?.message === "GitHub App token unavailable" ||
+            classify(error) === "auth-problem")
+          ? "app-auth" : hold);
         try { onDiagnostic({ stage: "acquire", reason: redact(shortErr(error)) }); } catch { /* diagnostics are isolated */ }
         retryIn = error?.notStarted && Number.isFinite(error.retryAt)
           ? Math.max(50, error.retryAt - now()) : Math.min(1_000, item.demand.floorMs);
@@ -9851,7 +9906,8 @@ function createCollectorAcquisitionRuntime({
       if (item.id && item.identity?.accessKey) {
         engine.setHold(item.id, hold, { resource: item.resource, accessKey: item.identity.accessKey });
       }
-      item.onHold?.(hold);
+      item.onHold?.(config.providers[item.target.provider]?.type === "github-app" &&
+        error?.message === "GitHub App token unavailable" ? "app-auth" : hold);
       try { onDiagnostic({ stage: "provider-refresh", reason: redact(shortErr(error)) }); } catch { /* isolated */ }
       retryIn = Math.min(1_000, item.demand.floorMs);
     } finally {
@@ -9895,7 +9951,8 @@ function createCollectorAcquisitionRuntime({
       }
     } catch (error) {
       try { onDiagnostic({ stage: "initialize", reason: redact(shortErr(error)) }); } catch { /* diagnostics are isolated */ }
-      item.onHold?.("disconnected");
+      item.onHold?.(config.providers[item.target.provider]?.type === "github-app" &&
+        error?.message === "GitHub App token unavailable" ? "app-auth" : "disconnected");
       schedule(item, 1_000, () => startInitialize(item));
     }
   }
@@ -10380,6 +10437,7 @@ function createSshCollectorClient({ alias, createTransport = null, random = Math
 }
 
 function collectorDisplayDecision({ connected, hasSnapshot, hold = null }) {
+  if (hold === "app-auth") return { disconnected: true, reason: "app-auth" };
   if (!connected || hold === "disconnected") return { disconnected: true };
   if (hold === "shared-wait") return { mode: "waiting", waitCause: "shared-lane" };
   if (["observer", "primary", "secondary", "coordination"].includes(hold)) {
@@ -11009,9 +11067,32 @@ async function runDoctor({ probeEndpoints = false } = {}) {
       governorResult = inspectGovernor(cleanup, Date.now());
     }
   }
+  const cachedQuota = !probeEndpoints ? doctorCachedQuotaScope(effectiveHost) : null;
   const governor = probeEndpoints
     ? governorHealth(governorResult, Date.now())
-    : { status: "not inspected (--probe not requested)", leases: 0, resources: {} };
+    : cachedQuota?.ok ? governorHealth(cachedQuota.result, Date.now())
+      : { status: `unavailable (${cachedQuota?.reason ?? "cached scope unavailable"})`, leases: 0, resources: {} };
+  const diagnosticScope = probeEndpoints
+    ? scopeResult?.ok ? scopeResult.value : null
+    : cachedQuota?.ok ? { path: cachedQuota.path } : null;
+  const recoveryJournal = diagnosticScope ? readRecoveryTransitions(diagnosticScope) : null;
+  const recoveryDetails = Object.fromEntries(RATE_RESOURCES.map((resource) => [resource,
+    diagnosticScope ? recoveryLedgerSummary(diagnosticScope, resource) : null]));
+  const currentRecovery = RATE_RESOURCES.map((resource) => recoveryJournal?.current[resource])
+    .filter(Boolean).sort((left, right) => right.at - left.at)[0] ?? null;
+  const lastFailedRecovery = [...(recoveryJournal?.entries ?? [])].reverse()
+    .find((entry) => entry.code !== "clear") ?? null;
+  const retryDates = RATE_RESOURCES.flatMap((resource) => {
+    const active = recoveryJournal?.current[resource];
+    const observer = (probeEndpoints ? governorResult : cachedQuota?.result)?.value?.observers[resource];
+    return [active?.retryAt, observer?.outcome === "failed" ? observer.nextAt : null];
+  }).filter((value) => Number.isFinite(value) && value > Date.now());
+  const nextRecoveryAt = retryDates.length > 0 ? Math.min(...retryDates) : null;
+  let recoveryReason = "unavailable";
+  if (currentRecovery) recoveryReason = `${currentRecovery.resource}: ${currentRecovery.code}`;
+  else if (recoveryJournal?.status === "corrupt") recoveryReason = "diagnostic journal corrupt";
+  else if (recoveryJournal?.status === "unavailable") recoveryReason = "diagnostic journal unavailable";
+  else if (["healthy", "missing"].includes(recoveryJournal?.status)) recoveryReason = "none recorded";
   const diagnosticSource = runtime.connect === "local"
     ? "local collector"
     : runtime.connect?.startsWith("ssh:") ? "SSH collector" : "standalone";
@@ -11056,6 +11137,10 @@ async function runDoctor({ probeEndpoints = false } = {}) {
     ),
     "",
     ...section("API governor"),
+    field("cached scope", probeEndpoints ? "verified by probe" : cachedQuota?.ok ? "read-only cached identity" : `unavailable (${cachedQuota?.reason ?? "unknown"})`),
+    ...(cachedQuota?.path && !cachedQuota.ok
+      ? [field("state file", `${join(dirname(cachedQuota.path), "quota-[redacted].json")} (quota fingerprint withheld)`)]
+      : []),
     field("status", governor.status),
     field("live leases", governor.leases),
     ...RATE_RESOURCES.map((resource) => {
@@ -11067,6 +11152,21 @@ async function runDoctor({ probeEndpoints = false } = {}) {
           : "unavailable",
       );
     }),
+    field("recovery reason", recoveryReason),
+    field("last failed transition", lastFailedRecovery?.code ?? "unavailable"),
+    ...RATE_RESOURCES.flatMap((resource) => [
+      field(`${resource} receipt units`, recoveryDetails[resource]?.receiptUnits ?? "unavailable"),
+      field(`${resource} receipt count`, recoveryDetails[resource]?.receiptCount ?? "unavailable"),
+      field(`${resource} debt units`, recoveryDetails[resource]?.debtUnits ?? "unavailable"),
+      field(`${resource} debt count`, recoveryDetails[resource]?.debtCount ?? "unavailable"),
+      field(`${resource} oldest unresolved`, recoveryDetails[resource]?.oldestUnresolvedAt == null
+        ? "unavailable" : formatDuration(Math.max(0, Date.now() - recoveryDetails[resource].oldestUnresolvedAt))),
+      field(`${resource} observer age`, recoveryDetails[resource]?.observerAt == null
+        ? "unavailable" : formatDuration(Math.max(0, Date.now() - recoveryDetails[resource].observerAt))),
+    ]),
+    field("next retry", nextRecoveryAt == null ? "unavailable" : new Date(nextRecoveryAt).toISOString()),
+    field("terminalization backlog", currentRecovery?.terminalizationBacklog == null
+      ? "unavailable" : `${currentRecovery.terminalizationBacklog} (last recorded)`),
     "",
     ...section("Acquisition metrics"),
     field("source", acquisitionDiagnostic?.source ?? "standalone"),
@@ -15304,6 +15404,314 @@ function coordinationNotice(reason) {
   return "Can't coordinate API use — retrying";
 }
 
+// Recovery diagnostics have no request payloads, credential identifiers or
+// owner capabilities. The journal is advisory: a failed write must never deny
+// an otherwise valid data operation. The quota ledger remains authoritative.
+const RECOVERY_JOURNAL_MAX_ENTRIES = 128;
+const RECOVERY_JOURNAL_MAX_BYTES = 128 * 1024;
+const RECOVERY_ENTRY_MAX_BYTES = 1024;
+const RECOVERY_COPY = Object.freeze({
+  busy: ["Coordinating with your other panes", "Retry automatically", "Other pane; retry"],
+  stale: ["Coordinating with your other panes", "Retry automatically", "Other pane; retry"],
+  "identity-busy": ["GitHub budget check is shared", "Retry automatically after the current check", "Budget check; retry"],
+  "transport-busy": ["Shared GitHub request is in progress", "Retry automatically", "Request; retry"],
+  unwritable: ["Local coordination cannot be written", "Run gh-glance --doctor; check storage permissions", "Store blocked; doctor"],
+  corrupt: ["Local coordination is corrupt", "Run gh-glance --doctor; preserve the reported state file", "State corrupt; doctor"],
+  capacity: ["Local coordination is full", "Run gh-glance --doctor; preserve the reported state file", "State full; doctor"],
+  "accounting-overflow": ["Local coordination accounting overflow", "Run gh-glance --doctor; preserve the reported state file", "Overflow; doctor"],
+  "reservations-invalid": ["Local coordination reservation invalid", "Run gh-glance --doctor; preserve the reported state file", "Reservation; doctor"],
+  "external-factor-invalid": ["Local coordination budget invalid", "Run gh-glance --doctor; preserve the reported state file", "Budget invalid; doctor"],
+  "pacing-invalid": ["Local coordination pacing invalid", "Run gh-glance --doctor; preserve the reported state file", "Pacing invalid; doctor"],
+  "budget-resource": ["Local coordination budget invalid", "Run gh-glance --doctor; preserve the reported state file", "Budget invalid; doctor"],
+  "legacy-unresolved": ["Older requests still reserve quota", "Verify old children ended; a verified system restart can resolve unknown ownership", "Old debt; restart"],
+  "legacy-corrupt": ["Older coordination evidence is corrupt", "Run gh-glance --doctor; preserve the reported state file", "Old state; doctor"],
+  "migration-hold": ["Older session still uses coordination", "Wait for the older quota reset; retry automatically at the shown time", "Old quota; wait"],
+  "restart-required": ["Older session still uses coordination", "Restart older gh-glance panes with this version", "Old pane; restart"],
+  "identity-backoff": ["GitHub budget check failed", "Retry automatically at the shown time", "Budget check; retry"],
+  "identity-capacity": ["GitHub budget check allowance is full", "Retry automatically when the rolling window renews", "Budget check; retry"],
+  "budget-unknown": ["GitHub budget check pending", "Retry automatically", "Budget check; retry"],
+  "budget-stale": ["GitHub budget evidence is old", "Retry the shared budget check automatically", "Budget old; retry"],
+  "budget-future": ["Clock changed; budget needs recheck", "Retry the shared budget check automatically", "Clock; retry"],
+  "probe-failed": ["GitHub budget check failed", "Retry automatically at the shown time", "Budget check; retry"],
+  "block-unpublished": ["Saving GitHub request limit", "Retry sharing the hold automatically", "Saving hold; retry"],
+  "budget-reset": ["GitHub quota pacing", "Retry automatically after reset", "Quota; retry"],
+  "rate-limit": ["GitHub quota pacing", "Retry automatically after reset", "Quota; retry"],
+  "rate-limited": ["GitHub request limit", "Retry automatically after the shared hold", "Limit; retry"],
+  "local-reserve": ["Local quota reserve pacing", "Retry automatically at the next grant", "Reserve; retry"],
+  reserve: ["Local quota reserve pacing", "Retry automatically at the next grant", "Reserve; retry"],
+  blocked: ["GitHub request hold", "Retry automatically when the hold ends", "Request hold; retry"],
+  secondary: ["GitHub request limit", "Retry after GitHub's hold; refresh only if the pause asks", "Limit; retry"],
+  "secondary-rate-limit": ["GitHub request limit", "Retry after GitHub's hold; refresh only if the pause asks", "Limit; retry"],
+  "abuse-limit": ["GitHub request limit", "Retry after GitHub's hold; refresh only if the pause asks", "Limit; retry"],
+  "throttle-paused": ["Repeated GitHub request limit", "Press r to retry after checking the hold", "Limit; press r"],
+  "network-outage": ["GitHub connection failed", "Retry automatically when the connection returns", "Network; retry"],
+  "credential-unavailable": ["GitHub login unavailable", "Run gh auth status, then restore login", "Login; gh auth status"],
+  "identity-unavailable": ["GitHub login unavailable", "Run gh auth status, then restore login", "Login; gh auth status"],
+  disconnected: ["Collector connection unavailable", "Restore the selected collector connection", "Collector; connection"],
+  "app-auth": ["GitHub App authorization unavailable", "Restore the selected App authorization", "App; restore auth"],
+  "security-incomplete": ["Security data incomplete", "Run gh-glance --doctor --probe for endpoint access", "Security; doctor"],
+  "receipt-retry": ["Saving request result", "Retry automatically without repeating the request", "Saving; retry"],
+  "interrupted-request": ["Recovering interrupted request", "Retry source observation when quota allows", "Interrupted; retry"],
+  "request-queue": ["Recovering local request queue", "Retry automatically after compaction", "Queue; retry"],
+  "acquisition-busy": ["Acquisition store is busy", "Check the shared lock; retry automatically", "Store lock; retry"],
+  "clock-recovery": ["Rechecking after sleep or clock change", "Retry source observation automatically", "Clock; retry"],
+  "auth-problem": ["GitHub authorization failed", "Run gh auth status, then restore authorization", "Auth; gh auth status"],
+  unavailable: ["Repository or endpoint unavailable", "Check the selected repository and permissions", "Repo; check access"],
+  "source-incomplete": ["GitHub response incomplete", "Retry source observation automatically", "Incomplete; retry"],
+  "unknown-scope": ["GitHub account scope unavailable", "Run gh auth status; retry when identity is verified", "Login; gh auth status"],
+  "version-mismatch": ["Older session cannot share coordination", "Restart older gh-glance panes with this version", "Old pane; restart"],
+  "unsafe-permissions": ["Local coordination permissions are unsafe", "Run gh-glance --doctor; repair directory permissions", "Permissions; doctor"],
+  "disk-full": ["Local coordination storage is full", "Run gh-glance --doctor; free local storage", "Disk full; doctor"],
+  coordination: ["Local coordination unavailable", "Run gh-glance --doctor; retry when storage works", "Coordination; doctor"],
+});
+
+function recoveryCause({ reason, resource = null, at = Date.now(), retryAt = null,
+  sourceAt = null, receiptUnits = null, debtUnits = null, oldestUnresolvedAt = null,
+  observerAt = null, terminalizationBacklog = null, lastFailedTransition = null,
+  origin = "coordination", tab = null } = {}) {
+  const code = typeof reason === "string" && Object.hasOwn(RECOVERY_COPY, reason)
+    ? reason : "coordination";
+  const copy = RECOVERY_COPY[code] ?? RECOVERY_COPY.coordination;
+  const time = (value) => Number.isFinite(value) && value >= 0 ? value : null;
+  const units = (value) => Number.isSafeInteger(value) && value >= 0 ? value : null;
+  return {
+    code, resource: RATE_RESOURCES.includes(resource) ? resource : null,
+    origin: origin === "source" ? "source" : "coordination",
+    tab: TAB_KEYS.includes(tab) ? tab : null,
+    at: time(at) ?? Date.now(), firstAt: time(at) ?? Date.now(),
+    retryAt: time(retryAt), sourceAt: time(sourceAt),
+    receiptUnits: units(receiptUnits), debtUnits: units(debtUnits),
+    oldestUnresolvedAt: time(oldestUnresolvedAt), observerAt: time(observerAt),
+    terminalizationBacklog: units(terminalizationBacklog),
+    lastFailedTransition: typeof lastFailedTransition === "string" && Object.hasOwn(RECOVERY_COPY, lastFailedTransition)
+      ? lastFailedTransition : code,
+    summary: copy[0], action: copy[1], short: copy[2],
+  };
+}
+
+function shouldClearRecoveryCause(cause, { sourceSuccess = false, tab = null } = {}) {
+  if (!cause) return false;
+  return cause.origin !== "source" || sourceSuccess && cause.tab === tab;
+}
+
+function recoveryRetryAt(decision, budget, observer, nowMs) {
+  if (budget?.blockUntil > nowMs) return budget.blockUntil;
+  if (["reservations-invalid", "external-factor-invalid", "pacing-invalid", "budget-resource",
+    "accounting-overflow", "corrupt", "unwritable", "capacity"].includes(decision?.reason)) return null;
+  const resetHold = ["budget-reset", "reset", "rate-limit"].includes(decision?.reason);
+  if (decision?.mode === "probe" && !resetHold) {
+    return observer?.nextAt > nowMs ? observer.nextAt : null;
+  }
+  const deadline = decision?.retryAt ?? decision?.resetMs ?? budget?.resetMs;
+  return deadline > nowMs ? deadline : null;
+}
+
+function terminalizationRecoveryCode(terminal) {
+  if (terminal?.status === "retryable") return "receipt-retry";
+  if (terminal?.status === "compacted") return "interrupted-request";
+  if (terminal?.reason === "completion-capacity") return "capacity";
+  return terminal?.reason ?? terminal?.status ?? "coordination";
+}
+
+function requestFailureRecoveryCode(error, verdict) {
+  if (verdict === "rate-limited") return "rate-limited";
+  if (verdict === "other" && error?.httpStarted === true) return "interrupted-request";
+  return verdict === "other" ? "network-outage" : verdict;
+}
+
+function wallClockRecovery(previousAt, at, intervalMs) {
+  if (!Number.isFinite(previousAt) || !Number.isFinite(at)) return null;
+  return at < previousAt || at - previousAt > Math.max(30_000, 3 * intervalMs)
+    ? "clock-recovery" : null;
+}
+
+function collectorSourceAdvanced(previousAt, sourceAt) {
+  return Number.isFinite(previousAt) && Number.isFinite(sourceAt) && sourceAt > previousAt;
+}
+
+function cleanupQueueForResource(queue, resource) {
+  let count = 0;
+  for (const item of queue) if (tabRequestCost(item.cleanupKey)?.[resource] > 0) count += 1;
+  return count;
+}
+
+function presentRecovery(cause, { nowMs = Date.now(), cols = 80 } = {}) {
+  if (!cause) return [];
+  const width = Math.max(1, Number.isSafeInteger(cols) ? cols - 1 : 79);
+  const resource = cause.resource === "graphql" ? "GraphQL" : cause.resource === "core" ? "Core" : "GitHub";
+  const age = Number.isFinite(cause.sourceAt) && cause.sourceAt <= nowMs
+    ? `cached ${formatDuration(nowMs - cause.sourceAt)}` : "cached age unavailable";
+  const retry = Number.isFinite(cause.retryAt)
+    ? `; next ${statusInterval(cause.retryAt, nowMs)}` : "";
+  const summary = cause.code === "legacy-unresolved" && Number.isSafeInteger(cause.debtUnits)
+    ? `Older requests still reserve ${cause.debtUnits} units` : cause.summary;
+  if (width < 60) {
+    const action = cause.action.toLowerCase();
+    const narrowAction = cause.code === "legacy-unresolved" ? "Check children; restart"
+      : action.includes("gh-glance --doctor") ? "Run gh-glance --doctor"
+      : action.includes("gh auth") ? "Run gh auth status"
+        : action.includes("selected repository") ? "Check repository access"
+        : action.includes("connection") ? "Restore connection"
+          : action.includes("app authorization") ? "Restore App auth"
+            : action.includes("permissions") ? "Check permissions"
+              : action.includes("restart") ? "Restart and recheck"
+              : action.includes("press r") ? "Press r to retry"
+              : "Retry automatically";
+    const narrowDeadline = Number.isFinite(cause.retryAt)
+      ? statusInterval(cause.retryAt, nowMs) : null;
+    const timedAction = narrowDeadline && cause.code === "migration-hold"
+      ? `Wait; next ${narrowDeadline}`
+      : narrowDeadline && narrowAction === "Retry automatically"
+        ? `Retry; next ${narrowDeadline}`
+        : narrowDeadline && narrowAction === "Press r to retry"
+          ? `Press r after ${narrowDeadline}` : narrowAction;
+    const short = cause.code === "legacy-unresolved" && Number.isSafeInteger(cause.debtUnits)
+      ? `Debt ${cause.debtUnits} units` : cause.short.split(";")[0];
+    return [`${resource}: ${short}`.slice(0, width), timedAction.slice(0, width), age.slice(0, width)];
+  }
+  const full = `${resource}: ${summary}; ${cause.action}${retry}; ${age}`;
+  if (full.length <= width) return [full];
+  return [`${resource}: ${summary}`.slice(0, width),
+    `${cause.action}${retry}`.slice(0, width), age.slice(0, width)];
+}
+
+function recoveryJournalPath(scope) {
+  return `${scope.path}.recovery.json`;
+}
+
+function emptyRecoveryJournal() {
+  return { version: 1, current: { core: null, graphql: null }, entries: [] };
+}
+
+const RECOVERY_EVENT_KEYS = ["code", "resource", "at", "firstAt", "retryAt", "sourceAt",
+  "receiptUnits", "debtUnits", "oldestUnresolvedAt", "observerAt", "terminalizationBacklog",
+  "lastFailedTransition", "origin", "tab"];
+
+function recoveryEvent(entry) {
+  if (!isRecord(entry)) return null;
+  if (exactKeys(entry, ["code", "resource", "at"]) && entry.code === "clear" &&
+      RATE_RESOURCES.includes(entry.resource) && Number.isFinite(entry.at)) return entry;
+  if (!exactKeys(entry, RECOVERY_EVENT_KEYS) || !RATE_RESOURCES.includes(entry.resource) ||
+      typeof entry.code !== "string" || !Object.hasOwn(RECOVERY_COPY, entry.code) ||
+      !Number.isFinite(entry.at) || !Number.isFinite(entry.firstAt) || entry.firstAt > entry.at ||
+      ["retryAt", "sourceAt", "oldestUnresolvedAt", "observerAt"].some((key) =>
+        entry[key] !== null && (!Number.isFinite(entry[key]) || entry[key] < 0)) ||
+      ["receiptUnits", "debtUnits", "terminalizationBacklog"].some((key) =>
+        entry[key] !== null && (!Number.isSafeInteger(entry[key]) || entry[key] < 0)) ||
+      typeof entry.lastFailedTransition !== "string" ||
+      !Object.hasOwn(RECOVERY_COPY, entry.lastFailedTransition) ||
+      !["source", "coordination"].includes(entry.origin) ||
+      (entry.tab !== null && !TAB_KEYS.includes(entry.tab)) ||
+      Buffer.byteLength(JSON.stringify(entry)) > RECOVERY_ENTRY_MAX_BYTES) return null;
+  return entry;
+}
+
+function visibleRecoveryEvent(entry) {
+  if (!entry || entry.code === "clear") return entry;
+  const copy = RECOVERY_COPY[entry.code] ?? RECOVERY_COPY.coordination;
+  return { ...entry, summary: copy[0], action: copy[1], short: copy[2] };
+}
+
+function readRecoveryTransitions(scope) {
+  const path = recoveryJournalPath(scope);
+  let raw;
+  try {
+    const file = lstatSync(path);
+    if (!file.isFile() || file.size > RECOVERY_JOURNAL_MAX_BYTES) return { ...emptyRecoveryJournal(), status: "unavailable" };
+    raw = readFileSync(path, "utf8");
+    if (Buffer.byteLength(raw) > RECOVERY_JOURNAL_MAX_BYTES) return { ...emptyRecoveryJournal(), status: "unavailable" };
+  } catch (error) {
+    return { ...emptyRecoveryJournal(), status: error?.code === "ENOENT" ? "missing" : "unavailable" };
+  }
+  try {
+    const journal = JSON.parse(raw);
+    if (!exactKeys(journal, ["version", "current", "entries"]) || journal.version !== 1 ||
+        !exactKeys(journal.current, RATE_RESOURCES) || !Array.isArray(journal.entries) ||
+        journal.entries.length > RECOVERY_JOURNAL_MAX_ENTRIES ||
+        journal.entries.some((entry) => recoveryEvent(entry) === null) ||
+        Object.values(journal.current).some((entry) => entry !== null &&
+          (recoveryEvent(entry) === null || entry.code === "clear"))) {
+      return { ...emptyRecoveryJournal(), status: "corrupt" };
+    }
+    return { version: 1, current: Object.fromEntries(RATE_RESOURCES.map((resource) =>
+      [resource, visibleRecoveryEvent(journal.current[resource])])),
+    entries: journal.entries.map(visibleRecoveryEvent), status: "healthy" };
+  } catch {
+    return { ...emptyRecoveryJournal(), status: "corrupt" };
+  }
+}
+
+function recordRecoveryTransition(scope, event) {
+  if (!scope?.path || !RATE_RESOURCES.includes(event?.resource)) return { ok: false, reason: "invalid" };
+  const path = recoveryJournalPath(scope);
+  return withPersistenceLock(path, () => {
+    const previous = readRecoveryTransitions(scope);
+    if (!["healthy", "missing"].includes(previous.status)) return { ok: false, reason: previous.status };
+    const plain = (entry) => entry && Object.fromEntries(RECOVERY_EVENT_KEYS.map((key) => [key, entry[key]]));
+    const journal = { version: 1, current: Object.fromEntries(RATE_RESOURCES.map((resource) =>
+      [resource, plain(previous.current[resource])])),
+    entries: previous.entries.map((entry) => entry.code === "clear" ? entry : plain(entry)) };
+    const former = journal.current[event.resource];
+    const at = Number.isFinite(event.at) ? event.at : Date.now();
+    if (event.clear === true) {
+      if (!former) return { ok: true, changed: false };
+      journal.current[event.resource] = null;
+      journal.entries.push({ code: "clear", resource: event.resource, at });
+    } else {
+      const entry = plain(recoveryCause({ ...event, reason: event.reason ?? event.code, at }));
+      entry.firstAt = former?.code === entry.code && former?.origin === entry.origin &&
+        former?.tab === entry.tab ? former.firstAt : at;
+      if (Buffer.byteLength(JSON.stringify(entry)) > RECOVERY_ENTRY_MAX_BYTES) return { ok: false, reason: "capacity" };
+      journal.current[event.resource] = entry;
+      if (former?.code !== entry.code || former?.origin !== entry.origin || former?.tab !== entry.tab) {
+        journal.entries.push(entry);
+      }
+    }
+    journal.entries = journal.entries.slice(-RECOVERY_JOURNAL_MAX_ENTRIES);
+    while (Buffer.byteLength(JSON.stringify(journal)) + 1 > RECOVERY_JOURNAL_MAX_BYTES && journal.entries.length > 0) {
+      journal.entries.shift();
+    }
+    if (Buffer.byteLength(JSON.stringify(journal)) + 1 > RECOVERY_JOURNAL_MAX_BYTES) return { ok: false, reason: "capacity" };
+    const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temp, `${JSON.stringify(journal)}\n`, { mode: 0o600, flag: "wx" });
+      renameSync(temp, path);
+      return { ok: true, changed: true };
+    } catch (error) {
+      try { unlinkSync(temp); } catch { /* only our temporary file */ }
+      return { ok: false, reason: error?.code ?? "unwritable" };
+    }
+  });
+}
+
+function safeRecordRecoveryTransition(scope, event, write = recordRecoveryTransition) {
+  try { return write(scope, event); } catch { return { ok: false, reason: "unavailable" }; }
+}
+
+function recoveryLedgerSummary(scope, resource, nowMs = Date.now()) {
+  if (!scope?.path || !RATE_RESOURCES.includes(resource)) return null;
+  const loaded = readGovernorState(scope.path, nowMs, { persistMigration: false });
+  if (!loaded.ok) return null;
+  const state = loaded.value;
+  const debt = state.debt[resource];
+  const debtUnits = debt.unresolvedUnits + debt.quiescentUnits;
+  const charged = governorChargedCost(state, resource, nowMs);
+  const oldest = Object.values(state.debtGroups)
+    .filter((group) => !group.quiescent && group.units[resource] > 0)
+    .map((group) => group.at);
+  return {
+    receiptUnits: Number.isSafeInteger(charged) ? charged - debtUnits : null,
+    debtUnits,
+    oldestUnresolvedAt: oldest.length > 0 ? Math.min(...oldest) : null,
+    observerAt: state.observers[resource]?.at > 0 && state.observers[resource].at <= nowMs
+      ? state.observers[resource].at : null,
+    debtCount: debt.unresolvedCount + debt.quiescentCount,
+    receiptCount: Object.values(state.reservations).filter((reservation) =>
+      reservationCost(reservation, resource, state.leases, nowMs) > 0).length +
+      (reservationCost(state.controlReceipts[resource], resource, state.leases, nowMs) > 0 ? 1 : 0),
+  };
+}
+
 function acquisitionFailureCopy(reason) {
   if (reason === "busy") return { short: "lock busy", narrow: "Shared lock busy", full: "Acquisition store is busy; checking the shared lock" };
   if (reason === "unwritable") return { short: "store blocked", narrow: "Store blocked", full: "Acquisition store cannot be written; check config permissions" };
@@ -16372,6 +16780,8 @@ function App({ onCreateRemote = () => {} } = {}) {
   const [waiting, setWaiting] = useState({ actions: true, issues: true, prs: true, security: true });
   const [governorDecisions, setGovernorDecisions] = useState(probingGovernorDecisions);
   const [acquisitionFailures, setAcquisitionFailures] = useState({});
+  const [recoveryCauses, setRecoveryCauses] = useState({ core: null, graphql: null });
+  const recoveryRef = useRef(recoveryCauses);
   const [governorEpochs, setGovernorEpochs] = useState(null);
   const [requestStatuses, setRequestStatuses] = useState(() =>
     Object.fromEntries(TABS.map((candidate) => [candidate.key, null])),
@@ -16397,6 +16807,10 @@ function App({ onCreateRemote = () => {} } = {}) {
     ? { mode: "paused", reason: activeFailure, coordinationError: true,
       cause: acquisitionFailureCopy(activeFailure).short }
     : governorDecisions[tab.key];
+  const activeResource = RATE_RESOURCES.find((resource) => tabRequestCost(tab.key)[resource] > 0) ?? null;
+  const retainedRecovery = activeResource ? recoveryCauses[activeResource] : null;
+  const activeRecovery = retainedRecovery?.origin === "source" && retainedRecovery.tab !== tab.key
+    ? null : retainedRecovery;
   const activeRequestStatus = requestStatuses[tab.key];
   // Once any endpoint proves the folder has no remote, the whole dashboard is
   // in setup mode. Keeping this tab-local made a quick tab switch replace the
@@ -16427,7 +16841,10 @@ function App({ onCreateRemote = () => {} } = {}) {
   // Counts the lines actually rendered, not the notes collected -- getting this
   // wrong by one row is what makes ink repaint the whole frame.
   const extraLines =
-    NOTICE_ROWS +
+    (activeRecovery || tabError || activeGovernorDecision?.coordinationError ||
+      activeGovernorDecision?.mode === "paused" || activeGovernorDecision?.disconnected ||
+      data[tab.key] !== null && !runtimeIdentityCoordinator?.current()
+      ? 3 : NOTICE_ROWS) +
     (tab.key === "security" && !remoteSetup ? securityLines.length : 0);
   // Reserve lines for: the tab bar and the divider under it (2), the panel's
   // top and bottom edges (2), the column header and its separator (2), and
@@ -16477,6 +16894,14 @@ function App({ onCreateRemote = () => {} } = {}) {
     const cachedTab = cachedEntry?.tabs[candidate.key];
     const ageMs = collectorCachedSourceAge(cachedTab);
     return ageMs === null ? [] : [[candidate.key, { ageMs, measuredAt: performance.now() }]];
+  })));
+  // Keep server source timestamps separate from client-local age estimates.
+  // An SSH receipt's age is measured on the client and cannot prove a new
+  // source observation when a cached snapshot is delivered again.
+  const collectorSourceSuccessRef = useRef(Object.fromEntries(TABS.flatMap((candidate) => {
+    const cachedTab = cachedEntry?.tabs[candidate.key];
+    const sourceAt = cachedTab?.source?.lastSuccessAt ?? cachedTab?.lastOk;
+    return Number.isFinite(sourceAt) ? [[candidate.key, sourceAt]] : [];
   })));
   const fetchTabRef = useRef(null);
   const contextCoordinatorRef = useRef(null);
@@ -16943,6 +17368,51 @@ function App({ onCreateRemote = () => {} } = {}) {
         : { ...current, [key]: value });
     }
 
+    function recordRuntimeRecovery(key, reason, { retryAt = null, origin = "coordination" } = {}) {
+      const resource = RATE_RESOURCES.find((candidate) => tabRequestCost(key)[candidate] > 0);
+      if (!resource) return;
+      const at = Date.now();
+      const previous = recoveryRef.current[resource];
+      const candidate = recoveryCause({
+        reason, resource, at, retryAt, sourceAt: lastOkRef.current[key] ?? null,
+        origin, tab: origin === "source" ? key : null,
+      });
+      const hardFailure = ["corrupt", "unwritable", "capacity", "accounting-overflow"].includes(candidate.code);
+      if (!hardFailure && previous?.code === "receipt-retry" &&
+          terminalizationBacklogForResource(terminalizationBacklog, scope?.hash, resource) > 0) return;
+      if (!hardFailure && previous?.code === "request-queue" &&
+          cleanupQueueForResource(cleanupQueue, resource) > 0) return;
+      if (previous?.origin === "source" && previous.tab === key && origin === "coordination" &&
+          !["corrupt", "unwritable", "capacity", "accounting-overflow",
+            "receipt-retry", "interrupted-request"].includes(candidate.code)) return;
+      if (previous?.code === candidate.code && previous?.retryAt === candidate.retryAt &&
+          previous?.origin === candidate.origin && previous?.tab === candidate.tab &&
+          at - previous.at < 60_000) return;
+      const cause = recoveryCause({ ...candidate, reason: candidate.code,
+        terminalizationBacklog: cleanupQueueForResource(cleanupQueue, resource) +
+          terminalizationBacklogForResource(terminalizationBacklog, scope?.hash, resource),
+        ...recoveryLedgerSummary(scope, resource, at) });
+      cause.firstAt = previous?.code === cause.code && previous?.origin === cause.origin &&
+        previous?.tab === cause.tab ? previous.firstAt : at;
+      recoveryRef.current = { ...recoveryRef.current, [resource]: cause };
+      setRecoveryCauses(recoveryRef.current);
+      if (scope) setTimeout(() => { safeRecordRecoveryTransition(scope, cause); }, 0).unref?.();
+    }
+
+    function clearRuntimeRecovery(resource, { sourceSuccess = false, tab = null } = {}) {
+      const previous = recoveryRef.current[resource];
+      if (previous?.code === "receipt-retry" &&
+          terminalizationBacklogForResource(terminalizationBacklog, scope?.hash, resource) > 0) return;
+      if (previous?.code === "request-queue" &&
+          cleanupQueueForResource(cleanupQueue, resource) > 0) return;
+      if (!shouldClearRecoveryCause(previous, { sourceSuccess, tab })) return;
+      recoveryRef.current = { ...recoveryRef.current, [resource]: null };
+      setRecoveryCauses(recoveryRef.current);
+      if (scope) setTimeout(() => {
+        safeRecordRecoveryTransition(scope, { resource, clear: true, at: Date.now() });
+      }, 0).unref?.();
+    }
+
     function publishGovernorEpochs(snapshot) {
       const epochs = snapshot?.value?.epochs;
       if (!isRecord(epochs)) return;
@@ -16972,7 +17442,9 @@ function App({ onCreateRemote = () => {} } = {}) {
       return null;
     }
 
-    function pauseCoordination(key, reason, diagnosticHold = null, acquisitionFailure = false) {
+    function pauseCoordination(key, reason, diagnosticHold = null, acquisitionFailure = false, retryAt = null) {
+      recordRuntimeRecovery(key, acquisitionFailure && reason === "busy" ? "acquisition-busy" : reason,
+        { retryAt });
       if (acquisitionFailure) setAcquisitionFailures((current) => current[key] === reason
         ? current : { ...current, [key]: reason ?? "unavailable" });
       const hold = diagnosticHold ?? (
@@ -17017,16 +17489,27 @@ function App({ onCreateRemote = () => {} } = {}) {
         return;
       }
       if (!snapshot?.ok) {
-        pauseCoordination(key, snapshot?.reason);
+        pauseCoordination(key, snapshot?.reason, null, false, snapshot?.retryAt);
         return;
       }
       const tabReady = governorTabControlReady(snapshot, key, nowMs);
       if (!refreshed?.ok && !tabReady) {
-        pauseCoordination(key, refreshed?.reason, "observer");
+        const resource = RATE_RESOURCES.find((candidate) => tabRequestCost(key)[candidate] > 0 &&
+          snapshot.value.observers[candidate]?.outcome !== "healthy");
+        pauseCoordination(key, refreshed?.reason, "observer", false,
+          resource ? snapshot.value.observers[resource]?.nextAt : null);
         return;
       }
       publishGovernorEpochs(snapshot);
       if (refreshed.value?.status === "waiting" && !tabReady) {
+        const resource = RATE_RESOURCES.find((candidate) => tabRequestCost(key)[candidate] > 0);
+        if (resource && !recoveryRef.current[resource] && scope) {
+          const shared = readRecoveryTransitions(scope).current[resource];
+          if (shared?.origin === "coordination") {
+            recoveryRef.current = { ...recoveryRef.current, [resource]: shared };
+            setRecoveryCauses(recoveryRef.current);
+          }
+        }
         setTabGovernorDecision(key, { mode: "waiting", probing: true });
         return;
       }
@@ -17054,6 +17537,11 @@ function App({ onCreateRemote = () => {} } = {}) {
         if (decision.mode === "open") continue;
         const resetHold = ["budget-reset", "reset", "rate-limit"].includes(decision.reason) ||
           budget?.blockUntil > nowMs;
+        const holdReason = budget?.blockUntil > nowMs
+          ? budget.blockReason ?? decision.reason : decision.reason;
+        recordRuntimeRecovery(key, holdReason, {
+          retryAt: recoveryRetryAt(decision, budget, snapshot.value.observers[resource], nowMs),
+        });
         setRuntimeAcquisitionHold(
           acquisitionEngine,
           acquisitionSubscriptions,
@@ -17065,7 +17553,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         );
         setTabGovernorDecision(key, {
           mode: resetHold || decision.mode === "paused" ? "paused" : "waiting",
-          reason: decision.reason,
+          reason: holdReason,
           resetMs: budget?.resetMs ?? decision.resetMs ?? null,
           probing: decision.mode === "probe" && !resetHold,
         });
@@ -17079,6 +17567,9 @@ function App({ onCreateRemote = () => {} } = {}) {
         identity()?.accessKey ?? null,
       );
       setTabGovernorDecision(key, null);
+      for (const resource of RATE_RESOURCES) {
+        if (costs[resource] > 0) clearRuntimeRecovery(resource);
+      }
     }
 
     async function refreshRuntimeBudget(currentScope) {
@@ -17154,9 +17645,10 @@ function App({ onCreateRemote = () => {} } = {}) {
                 },
                 observations: result?.observations ?? [],
               });
+          if (terminal.status === "retryable") recordRuntimeRecovery(key, "receipt-retry");
           if (terminal.status === "blocked" || terminal.status === "compacted") {
             failAcquisition(acquisition, { requestMetrics: acquisitionRequestMetrics(result), hold: "primary" });
-            pauseCoordination(key, terminal.reason ?? terminal.status, null, true);
+            pauseCoordination(key, terminalizationRecoveryCode(terminal), null, true);
             return;
           }
           if (!currentAccess()) {
@@ -17215,6 +17707,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           // so the next admitted tick parses its response instead of taking the
           // identical-output fast path.
           if (transition.kind === "unusable") {
+            recordRuntimeRecovery(key, "source-incomplete", { origin: "source" });
             failAcquisition(acquisition, {
               requestMetrics: acquisition?.requestMetrics ?? {},
               hold: "primary",
@@ -17229,6 +17722,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           // freshness. Do not retain its raw value either, so the next source
           // retry is parsed instead of taking the identical-payload fast path.
           if (transition.kind === "blind") {
+            recordRuntimeRecovery(key, "security-incomplete", { origin: "source" });
             failAcquisition(acquisition, {
               requestMetrics: acquisition?.requestMetrics ?? {},
               hold: "primary",
@@ -17265,6 +17759,9 @@ function App({ onCreateRemote = () => {} } = {}) {
           publishStagedEntities(entityRef.current, stagedEntities, transition.kind);
           if (transition.kind === "unchanged") {
             lastOkRef.current[key] = completedAt;
+            for (const resource of RATE_RESOURCES) if (tabRequestCost(key)[resource] > 0) {
+              clearRuntimeRecovery(resource, { sourceSuccess: true, tab: key });
+            }
             clearBackoff(`tab:${key}`);
             setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
             const cachedTab = pick(
@@ -17281,6 +17778,9 @@ function App({ onCreateRemote = () => {} } = {}) {
           const tabData = transition.data;
           const tabMeta = transition.meta;
           lastOkRef.current[key] = completedAt;
+          for (const resource of RATE_RESOURCES) if (tabRequestCost(key)[resource] > 0) {
+            clearRuntimeRecovery(resource, { sourceSuccess: true, tab: key });
+          }
           clearBackoff(`tab:${key}`);
           rawRef.current[key] = transition.nextRaw;
           setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
@@ -17304,8 +17804,9 @@ function App({ onCreateRemote = () => {} } = {}) {
             outcome: governorOutcomeForError(err),
             observations: err?.budgetObservations ?? [],
           });
+          if (terminal.status === "retryable") recordRuntimeRecovery(key, "receipt-retry");
           if (terminal.status === "blocked" || terminal.status === "compacted") {
-            pauseCoordination(key, terminal.reason ?? terminal.status, null, true);
+            pauseCoordination(key, terminalizationRecoveryCode(terminal), null, true);
           }
           if (cancelled || !currentAccess() || err?.name === "AbortError") return;
           // Preserve both the verdict and the bounded raw error in state. The
@@ -17323,6 +17824,13 @@ function App({ onCreateRemote = () => {} } = {}) {
           // recover on the very next tick once the network is back.
           const steps = verdict === "rate-limited" ? null : pick(FAILURE_LADDER, verdict, null);
           if (steps) recordFailure(`tab:${key}`, performance.now(), steps);
+          const backoffUntil = alertBackoff.get(backoffStorageKey(`tab:${key}`))?.until;
+          const retryAt = Number.isFinite(backoffUntil)
+            ? Date.now() + Math.max(0, backoffUntil - performance.now()) : null;
+          if (terminal.status !== "blocked" && terminal.status !== "compacted") {
+            recordRuntimeRecovery(key, requestFailureRecoveryCode(err, verdict),
+              { origin: "source", retryAt });
+          }
           if (verdict === "rate-limited") {
             const snapshot = inspectGovernor(scope, Date.now());
             const costs = tabRequestCost(key);
@@ -17337,6 +17845,13 @@ function App({ onCreateRemote = () => {} } = {}) {
               });
             }
             handleRateLimitBlocks(key, blocks, Date.now());
+            const held = inspectGovernor(scope, Date.now());
+            const heldUntil = RATE_RESOURCES.filter((resource) => costs[resource] > 0)
+              .map((resource) => held.value?.budgets?.[resource]?.blockUntil)
+              .filter((deadline) => Number.isFinite(deadline) && deadline > Date.now());
+            if (heldUntil.length > 0) recordRuntimeRecovery(key, "rate-limited", {
+              origin: "source", retryAt: Math.min(...heldUntil),
+            });
           }
         })
         .finally(() => {
@@ -17370,6 +17885,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     const leaseId = governorId();
     const pending = new Map();
     const cleanupQueue = new Set();
+    let lastWallAt = Date.now();
     // One manual handoff per tab, carrying which key produced it. A keypress
     // during an automatic request must not be lost, but repeated keypresses
     // during the manual request itself must not create a trailing second batch.
@@ -17525,15 +18041,30 @@ function App({ onCreateRemote = () => {} } = {}) {
             sourceCheckpoint: cachedEntry?.tabs[key]?.source ?? null,
             onSnapshot: (snapshot, receipt) => {
               receivedSnapshots.add(key);
+              const sourceAdvanced = collectorSourceAdvanced(
+                collectorSourceSuccessRef.current[key], snapshot.lastSuccessAt);
               adoptAcquisitionSnapshot(key, snapshot, receipt);
+              if (Number.isFinite(snapshot.lastSuccessAt) &&
+                  (!Number.isFinite(collectorSourceSuccessRef.current[key]) ||
+                    snapshot.lastSuccessAt > collectorSourceSuccessRef.current[key])) {
+                collectorSourceSuccessRef.current[key] = snapshot.lastSuccessAt;
+              }
+              if (sourceAdvanced) {
+                for (const resource of RATE_RESOURCES) if (tabRequestCost(key)[resource] > 0) {
+                  clearRuntimeRecovery(resource, { sourceSuccess: true, tab: key });
+                }
+              }
               setErrors((current) => current[key] === null ? current : { ...current, [key]: null });
               setWaiting((current) => current[key] ? { ...current, [key]: false } : current);
               setGovernorDecisions((current) => ({ ...current, [key]:
                 collectorDisplayDecision({ connected: collectorReady, hasSnapshot: true }) }));
             },
-            onHold: (hold) => setGovernorDecisions((current) => ({ ...current, [key]:
-              collectorDisplayDecision({ connected: collectorReady,
-                hasSnapshot: receivedSnapshots.has(key), hold }) })),
+            onHold: (hold) => {
+              if (hold === "app-auth") recordRuntimeRecovery(key, "app-auth", { origin: "source" });
+              setGovernorDecisions((current) => ({ ...current, [key]:
+                collectorDisplayDecision({ connected: collectorReady,
+                  hasSnapshot: receivedSnapshots.has(key), hold }) }));
+            },
           });
           if (subscribed.ok) handles.set(key, subscribed.value);
       }
@@ -17678,13 +18209,8 @@ function App({ onCreateRemote = () => {} } = {}) {
           if (!admittedReservation?.receipt || admittedReservation.status !== "started") {
             return { ok: false, reason: "compacted" };
           }
-          transportScope = { ...currentScope, receiptCapability: {
-            reservationId, leaseId: admittedReservation.leaseId,
-            scopeHash: admittedReservation.receipt.scopeHash,
-            ownerNonce: admittedReservation.receipt.ownerNonce,
-            generation: admittedReservation.receipt.generation,
-            deadline: admittedReservation.receipt.deadline,
-          } };
+          transportScope = { ...currentScope,
+            receiptCapability: receiptCapabilityFromReservation(reservationId, admittedReservation) };
           acquisitionStartAttempted = true;
           const receipt = {
             reservationId,
@@ -17885,6 +18411,8 @@ function App({ onCreateRemote = () => {} } = {}) {
       coordinator.invalidate();
       setFailureContext(null);
       if (discardData) {
+        recoveryRef.current = { core: null, graphql: null };
+        setRecoveryCauses(recoveryRef.current);
         rawRef.current = {};
         entityRef.current.clear();
         lastOkRef.current = {};
@@ -17962,6 +18490,10 @@ function App({ onCreateRemote = () => {} } = {}) {
         }
         scope = createQuotaScope(current, { root: runtimeIdentityCoordinator.root, identityProvider: identity });
         cleanupScope = { ...scope, identityProvider: null };
+        const savedRecovery = readRecoveryTransitions(scope);
+        recoveryRef.current = savedRecovery.status === "healthy"
+          ? { ...savedRecovery.current } : { core: null, graphql: null };
+        setRecoveryCauses(recoveryRef.current);
         const nextTarget = dashboardCacheTarget({ repo: runtime.repo, ghRepo: process.env.GH_REPO, host: current.host, account: current.accessKey });
         // The mount-time target had to guess the account, and guesses
         // "unverified" whenever the bounded warm resolution above did not land
@@ -18023,6 +18555,11 @@ function App({ onCreateRemote = () => {} } = {}) {
     function finishPendingCleanup(key, item) {
       if (pending.get(key) === item) pending.delete(key);
       cleanupQueue.delete(item);
+      const resource = RATE_RESOURCES.find((candidate) => tabRequestCost(key)[candidate] > 0);
+      if (resource && cleanupQueueForResource(cleanupQueue, resource) === 0 &&
+          recoveryRef.current[resource]?.code === "request-queue") {
+        clearRuntimeRecovery(resource);
+      }
       setAcquisitionFailures((current) => {
         if (!Object.hasOwn(current, key)) return current;
         const next = { ...current };
@@ -18051,7 +18588,10 @@ function App({ onCreateRemote = () => {} } = {}) {
     }
 
     function retryPendingCleanup(key, item, at = Date.now()) {
-      if (item.cleanupInFlight) return false;
+      if (item.cleanupInFlight) {
+        recordRuntimeRecovery(key, "request-queue");
+        return false;
+      }
       item.cleanupPending = true;
       item.cleanupKey = key;
       cleanupQueue.add(item);
@@ -18077,6 +18617,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         finishPendingCleanup(key, item);
       }
       if (!item.governorClean) armWake("data", governorControlRetryAt(at, runtime.refreshMs), dataWake);
+      if (pending.has(key)) recordRuntimeRecovery(key, "request-queue");
       return !pending.has(key);
     }
 
@@ -18512,6 +19053,13 @@ function App({ onCreateRemote = () => {} } = {}) {
 
     async function runControlWake() {
       if (cancelled) return;
+      const controlAt = Date.now();
+      const clockCause = wallClockRecovery(lastWallAt, controlAt, Math.min(runtime.refreshMs, 5_000));
+      lastWallAt = controlAt;
+      if (clockCause) {
+        recordRuntimeRecovery(TABS[activeIndexRef.current].key, clockCause, { origin: "source" });
+        setNow(new Date(controlAt));
+      }
       for (const item of [...cleanupQueue]) retryPendingCleanup(item.cleanupKey, item);
       await runtimeIdentityCoordinator.refresh();
       if (cancelled) return;
@@ -18530,7 +19078,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       }
       const refreshed = currentScope
         ? await refreshRuntimeBudget(currentScope)
-        : { ok: false, reason: runtimeIdentityCoordinator?.inspect()?.reason ?? "stale" };
+        : { ok: false, ...(runtimeIdentityCoordinator?.inspect() ?? { reason: "stale" }) };
       if (cancelled) return;
       const checkedAt = Date.now();
       const snapshot = currentScope ? inspectGovernor(currentScope, checkedAt) : refreshed;
@@ -18599,6 +19147,19 @@ function App({ onCreateRemote = () => {} } = {}) {
       run: async () => {
         if (cancelled || remoteSetupRef.current) return;
         const at = Date.now();
+        const clockCause = wallClockRecovery(lastWallAt, at, Math.min(runtime.refreshMs, 5_000));
+        lastWallAt = at;
+        for (const resource of RATE_RESOURCES) {
+          if (["receipt-retry", "request-queue"].includes(recoveryRef.current[resource]?.code)) {
+            clearRuntimeRecovery(resource);
+          }
+        }
+        if (clockCause) {
+          recordRuntimeRecovery(TABS[activeIndexRef.current].key, clockCause, { origin: "source" });
+          setNow(new Date(at));
+          await controlWake();
+          return;
+        }
         if (wakeScheduler.at("control") <= at ||
           !Number.isFinite(wakeScheduler.at("control"))) await controlWake();
         if (pending.size > 0 || cleanupQueue.size > 0 ||
@@ -18619,7 +19180,9 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (cancelled) return;
       const currentScope = ensureScope(Date.now());
       if (!currentScope) {
-        pauseCoordination(TABS[activeIndexRef.current].key, runtimeIdentityCoordinator?.inspect()?.reason ?? "unknown-scope");
+        const identityFailure = runtimeIdentityCoordinator?.inspect();
+        pauseCoordination(TABS[activeIndexRef.current].key,
+          identityFailure?.reason ?? "unknown-scope", null, false, identityFailure?.retryAt);
         armWake("control", governorControlRetryAt(Date.now(), runtime.refreshMs), controlWake);
         return;
       }
@@ -18753,7 +19316,14 @@ function App({ onCreateRemote = () => {} } = {}) {
   const displayError = formatTabErrorForWidth(tabError, failureContext, Math.max(1, cols - 5));
   const coordinationError = activeGovernorDecision?.coordinationError && !remoteSetup;
   const coordinationReason = activeFailure ?? activeGovernorDecision?.reason ?? "unavailable";
-  const coordinationCondition = coordinationError ? `${tab.key}\0${coordinationReason}` : null;
+  const noticeReason = activeRecovery?.code ??
+    (tabError?.kind === "fetch" ? tabError.verdict : null) ??
+    (coordinationError || activeGovernorDecision?.mode === "paused" ? coordinationReason : null) ??
+    (statusDisconnected ? runtime.connect === null ? "identity-unavailable"
+      : activeGovernorDecision?.reason === "app-auth" ? "app-auth" : "disconnected" : null);
+  // A continuous fault stays sustained when its explanation becomes more
+  // specific. Only losing the fault (or switching tabs) restarts the debounce.
+  const coordinationCondition = !remoteSetup && noticeReason ? tab.key : null;
   useEffect(() => {
     setVisibleCoordinationCondition(null);
     if (coordinationCondition === null) return;
@@ -18765,10 +19335,21 @@ function App({ onCreateRemote = () => {} } = {}) {
   }, [coordinationCondition]);
   const showCoordinationNotice = coordinationCondition !== null &&
     visibleCoordinationCondition === coordinationCondition;
-  const noticeLine = showCoordinationNotice
-    ? activeFailure ? acquisitionFailureCopy(activeFailure)[cols < 40 ? "narrow" : "full"]
-      : coordinationNotice(coordinationReason)
-    : !remoteSetup && displayError ? displayError : "";
+  const noticeResource = activeResource;
+  const noticeSourceAt = collectorSourceAgeRef.current[tab.key]
+    ? now.getTime() - collectorSourceAgeRef.current[tab.key].ageMs -
+      Math.max(0, performance.now() - collectorSourceAgeRef.current[tab.key].measuredAt)
+    : lastOkRef.current[tab.key] ?? null;
+  const noticeCause = activeRecovery ?? (noticeReason ? recoveryCause({
+    reason: noticeReason === "other" ? "network-outage" : noticeReason,
+    resource: noticeResource, sourceAt: noticeSourceAt,
+    retryAt: activeGovernorDecision?.retryAt ?? activeGovernorDecision?.resetMs ??
+      activeGovernorDecision?.notBefore ?? null,
+    origin: tabError ? "source" : "coordination", tab: tabError ? tab.key : null,
+  }) : null);
+  const noticeLines = showCoordinationNotice && noticeCause
+    ? presentRecovery(noticeCause, { nowMs: now.getTime(), cols })
+    : [!remoteSetup && displayError ? displayError : ""];
   const noticeTone = showCoordinationNotice ? ATTENTION : displayError ? ERROR_TEXT : undefined;
   const spin = SPINNER[frame % SPINNER.length];
 
@@ -19045,7 +19626,8 @@ function App({ onCreateRemote = () => {} } = {}) {
       !showHelp &&
         tooNarrow &&
         e(Text, { dimColor: true, wrap: "truncate-end" }, "too narrow"),
-      e(Text, { color: noticeTone, wrap: "truncate-end" }, noticeLine),
+      ...noticeLines.map((line, index) =>
+        e(Text, { key: `recovery:${index}`, color: noticeTone, wrap: "truncate-end" }, line)),
       !showHelp &&
         !tooNarrow &&
         !remoteSetup &&
@@ -19734,11 +20316,26 @@ export {
   runtimeIntentGate,
   rateLimitBlockDecision,
   coordinationNotice,
+  recoveryCause,
+  shouldClearRecoveryCause,
+  recoveryRetryAt,
+  terminalizationRecoveryCode,
+  terminalizationBacklogForResource,
+  receiptCapabilityFromReservation,
+  requestFailureRecoveryCode,
+  wallClockRecovery,
+  collectorSourceAdvanced,
+  cleanupQueueForResource,
+  presentRecovery,
+  recordRecoveryTransition,
+  safeRecordRecoveryTransition,
+  readRecoveryTransitions,
   mergeRateLimitBlockPublications,
   hydrateRateLimitBlockPublication,
   retryRateLimitBlockPublication,
   rateLimitBlockProbeRecovered,
   admitGovernorOperation,
+  queueTerminalization,
   runAdmittedOperation,
   abortableDelay,
   awaitCollectorReservation,

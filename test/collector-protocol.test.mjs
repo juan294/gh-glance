@@ -82,6 +82,8 @@ test("COL-05: Shared is earned by a full snapshot and never masks holds or disco
   assert.deepEqual(collectorDisplayDecision({ connected: true, hasSnapshot: true, hold: "shared-wait" }),
     { mode: "waiting", waitCause: "shared-lane" });
   assert.deepEqual(collectorDisplayDecision({ connected: false, hasSnapshot: true }), { disconnected: true });
+  assert.deepEqual(collectorDisplayDecision({ connected: true, hasSnapshot: true, hold: "app-auth" }),
+    { disconnected: true, reason: "app-auth" });
 });
 
 test("COL-08: large snapshots assemble only after bounded digest validation", () => {

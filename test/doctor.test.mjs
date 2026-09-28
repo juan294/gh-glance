@@ -13,7 +13,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 
@@ -32,11 +32,14 @@ import {
   publishProbe,
   redact,
   registerLease,
+  recordRecoveryTransition,
+  recoveryCause,
   requestManualProbe,
   setRuntimeAcquisitionHold,
   crashDiagnostic,
   verboseLogLine,
 } from "../index.mjs";
+import { agedGovernorV6 } from "./fixtures/aged-governor-v6.mjs";
 
 const execFileAsync = promisify(execFile);
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -246,6 +249,133 @@ test("OBS-02: plain --doctor is local-only and invokes no GitHub API command", a
   assert.match(out, /disabled \(use --doctor --probe\)/);
   const calls = readFileSync(log, "utf8").trim().split("\n").filter(Boolean);
   assert.ok(calls.every((line) => !line.includes('"api"') && !line.includes('"auth"')), calls.join("\n"));
+});
+
+test("D6: plain doctor reads the sole cached quota scope without an API call or a state write", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-cached-quota-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = await seededDoctorScope(root);
+  const before = readFileSync(scope.path);
+  const registryPath = join(root, "gh-glance", "coordination-v2", "registry.json");
+  const registryBefore = readFileSync(registryPath);
+  const log = join(root, "gh.log");
+  const out = await doctor({ probe: false, args: ["--repo", "acme/widget"],
+    env: { XDG_CONFIG_HOME: root, GH_GLANCE_FIXTURE_LOG: log } });
+  assert.match(out, /API governor/);
+  assert.match(out, /cached scope/i);
+  assert.match(out, /core.*remaining/i);
+  assert.match(out, /^next retry\s+unavailable$/m);
+  assert.match(out, /^graphql observer age\s+unavailable$/m);
+  assert.deepEqual(readFileSync(scope.path), before);
+  assert.deepEqual(readFileSync(registryPath), registryBefore);
+  const calls = existsSync(log) ? readFileSync(log, "utf8") : "";
+  assert.doesNotMatch(calls, /"api"|"auth"/);
+  assert.doesNotMatch(out, new RegExp(scope.quotaKey));
+});
+
+test("D6: plain doctor discloses ambiguous cached identity instead of selecting a quota", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-ambiguous-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = await seededDoctorScope(root);
+  const registryPath = join(root, "gh-glance", "coordination-v2", "registry.json");
+  const registry = JSON.parse(readFileSync(registryPath, "utf8"));
+  const first = Object.values(registry.identities)[0];
+  registry.identities["b".repeat(64)] = { ...first, quotaKey: "c".repeat(64), accessKey: "d".repeat(64) };
+  writeFileSync(registryPath, JSON.stringify(registry));
+  const out = await doctor({ probe: false, args: ["--repo", "acme/widget"],
+    env: { XDG_CONFIG_HOME: root } });
+  assert.match(out, /cached scope.*unavailable.*ambiguous/i);
+  assert.doesNotMatch(out, new RegExp(scope.quotaKey));
+});
+
+test("D6: corrupt cached quota reports a usable redacted location and cause", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-corrupt-location-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = await seededDoctorScope(root);
+  writeFileSync(scope.path, "{corrupt\n");
+  const before = readFileSync(scope.path);
+  const out = await doctor({ probe: false, args: ["--repo", "acme/widget"],
+    env: { XDG_CONFIG_HOME: root } });
+  assert.match(out, /^cached scope\s+unavailable \(corrupt\)$/m);
+  assert.match(out, new RegExp(`${join(root, "gh-glance", "coordination-v2").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/quota-\\[redacted\\]\\.json`));
+  assert.doesNotMatch(out, new RegExp(scope.quotaKey));
+  assert.deepEqual(readFileSync(scope.path), before);
+});
+
+test("D6: failed observer retry time is separate from the quota reset", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-observer-retry-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = await seededDoctorScope(root);
+  const state = JSON.parse(readFileSync(scope.path, "utf8"));
+  const nextAt = Date.now() + 60_000;
+  state.observers.core = { ...state.observers.core, outcome: "failed", nextAt };
+  writeFileSync(scope.path, `${JSON.stringify(state)}\n`);
+  const out = await doctor({ probe: false, args: ["--repo", "acme/widget"],
+    env: { XDG_CONFIG_HOME: root } });
+  assert.match(out, new RegExp(`^next retry\\s+${new Date(nextAt).toISOString()}$`, "m"));
+  assert.doesNotMatch(out, new RegExp(`^next retry\\s+${new Date(state.budgets.core.resetMs).toISOString()}$`, "m"));
+});
+
+test("D6: doctor reports cached recovery debt and retry without changing any coordination artifact", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-recovery-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = await seededDoctorScope(root);
+  const at = Date.now();
+  assert.equal(recordRecoveryTransition(scope, recoveryCause({ reason: "unwritable", resource: "core",
+    at, retryAt: at + 60_000, sourceAt: at - 120_000, terminalizationBacklog: 2 })).ok, true);
+  const coordination = join(root, "gh-glance", "coordination-v2");
+  const before = Object.fromEntries(readdirSync(coordination).sort().map((name) => {
+    const path = join(coordination, name);
+    return [name, { data: readFileSync(path), mtimeMs: lstatSync(path).mtimeMs }];
+  }));
+  const out = await doctor({ probe: false, args: ["--repo", "acme/widget"],
+    env: { XDG_CONFIG_HOME: root } });
+  assert.match(out, /^recovery reason\s+core: unwritable$/m);
+  assert.match(out, /^last failed transition\s+unwritable$/m);
+  assert.match(out, /^core receipt units\s+0$/m);
+  assert.match(out, /^core debt units\s+0$/m);
+  assert.match(out, /^terminalization backlog\s+2 \(last recorded\)$/m);
+  assert.match(out, /^next retry\s+\d{4}-\d\d-\d\dT/m);
+  assert.deepEqual(readdirSync(coordination).sort(), Object.keys(before));
+  for (const [name, old] of Object.entries(before)) {
+    assert.deepEqual(readFileSync(join(coordination, name)), old.data, name);
+    assert.equal(lstatSync(join(coordination, name)).mtimeMs, old.mtimeMs, name);
+  }
+});
+
+test("D6: an unreadable recovery journal is reported as unavailable without changing it", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-recovery-unavailable-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = await seededDoctorScope(root);
+  const journalPath = `${scope.path}.recovery.json`;
+  writeFileSync(journalPath, "x".repeat(128 * 1024 + 1));
+  const before = readFileSync(journalPath);
+  const stamp = lstatSync(journalPath).mtimeMs;
+  const out = await doctor({ probe: false, args: ["--repo", "acme/widget"],
+    env: { XDG_CONFIG_HOME: root } });
+  assert.match(out, /^recovery reason\s+diagnostic journal unavailable$/m);
+  assert.doesNotMatch(out, /^recovery reason\s+none recorded$/m);
+  assert.deepEqual(readFileSync(journalPath), before);
+  assert.equal(lstatSync(journalPath).mtimeMs, stamp);
+});
+
+test("D6: plain doctor inspects aged v6 without backup, writes, or quota-fingerprint disclosure", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-v6-readonly-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = await seededDoctorScope(root);
+  const now = Date.now();
+  const old = agedGovernorV6(JSON.parse(readFileSync(scope.path, "utf8")), now);
+  writeFileSync(scope.path, `${JSON.stringify(old)}\n`);
+  const before = readFileSync(scope.path);
+  const stamp = lstatSync(scope.path).mtimeMs;
+  const out = await doctor({ probe: false, args: ["--repo", "acme/widget"],
+    env: { XDG_CONFIG_HOME: root } });
+  assert.match(out, /^core debt units\s+456$/m);
+  assert.match(out, /^graphql debt units\s+162$/m);
+  assert.deepEqual(readFileSync(scope.path), before);
+  assert.equal(lstatSync(scope.path).mtimeMs, stamp);
+  assert.equal(existsSync(`${scope.path}.pre-v7.backup`), false);
+  assert.doesNotMatch(out, new RegExp(scope.quotaKey));
 });
 
 test("COL-02/05: local collector doctor reports source and never probes GitHub", async (t) => {

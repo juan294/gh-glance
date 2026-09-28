@@ -12,6 +12,7 @@ import {
   identityRegistryRoot, claimIdentityBootstrap, finishIdentityBootstrap, createQuotaScope,
   inspectGovernor, acquireIdentityHttpPermit, releaseIdentityHttpPermit,
   runAdmittedOperation, runGh, pauseOperation,
+  recoveryCause, presentRecovery,
   GOVERNOR_PROBE_LEASE_MS,
 } from "../index.mjs";
 
@@ -289,6 +290,17 @@ test("ID-05 pinned legacy v1 core cooldown survives migration inspection without
   const denied = claimIdentityBootstrap(coordinator.root, { credentialKey: "c".repeat(64), host: "github.com", now: NOW + 250 });
   assert.equal(denied.reason, "migration-hold");
   assert.equal(denied.retryAt, NOW + 120_000);
+  const waiting = createIdentityCoordinator({ host: "github.com", pathOptions,
+    env: { GH_TOKEN: "synthetic-other" }, now: () => NOW + 250,
+    requestIdentity: async () => proof() });
+  const waited = await waiting.refresh();
+  assert.equal(waited.reason, "migration-hold");
+  assert.equal(waiting.inspect().retryAt, denied.retryAt);
+  const visible = presentRecovery(recoveryCause({ reason: waited.reason, resource: "core",
+    at: NOW + 250, retryAt: waiting.inspect().retryAt }), { nowMs: NOW + 250, cols: 80 });
+  assert.match(visible.join(" "), /Wait for the older quota reset.*next/i);
+  assert.doesNotMatch(visible.join(" "), /Restart older/);
+  waiting.close();
   assert.equal(readFileSync(path, "utf8"), raw);
 });
 

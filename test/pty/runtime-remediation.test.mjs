@@ -389,7 +389,7 @@ test("NO_COLOR retains an ASCII failure marker in the tab bar", () => {
 });
 
 test("a narrow auth failure starts with the recovery action", () => {
-  assert.match(narrowAuthFailure.finalFrame.lines.join("\n"), /Run: gh auth status/);
+  assert.match(narrowAuthFailure.finalFrame.lines.join("\n"), /Run gh auth status/);
 });
 
 test("a cache-hydrated adapted check is static and settles before routine polls", () => {

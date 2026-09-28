@@ -112,7 +112,7 @@ test("ID-05: expired legacy leases do not forgive started uncertainty or a futur
   const dataCalls = box.read().events.filter((event) => event.type === "start" &&
     (["issue", "pr", "run"].includes(event.argv[0]) || event.argv.some((arg) => arg.includes("/actions/") || arg.includes("/alerts"))));
   assert.equal(dataCalls.length, 0, "legacy uncertainty permitted new data");
-  assert.match(result.finalFrame.lines.join("\n"), /waiting.*legacy quota reset/i,
+  assert.match(result.finalFrame.lines.join("\n"), /Older session still uses coordination.*Wait for the older quota reset/is,
     "valid legacy uncertainty was mistaken for corrupt state");
   const registry = JSON.parse(readFileSync(join(box.directory, "coordination-v2", "registry.json"), "utf8"));
   assert.equal(registry.migration.activated, false);
@@ -129,7 +129,7 @@ test("ID-05: corrupt legacy protocol fails closed without replacing its evidence
   const result = runPane(box);
   assertRestored(result);
   assert.equal(box.read().events.filter(isHttpStart).length, 0);
-  assert.match(result.finalFrame.lines.join("\n"), /state unavailable|evidence preserved/i);
+  assert.match(result.finalFrame.lines.join("\n"), /Older coordination evidence is corrupt.*Run gh-glance --doctor; preserve the reported state file/is);
   assert.equal(readFileSync(box.legacyPath, "utf8"), original);
 });
 

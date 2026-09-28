@@ -434,7 +434,7 @@ test("APP-05: collector GraphQL 401 performs one controlled App remint", async (
   assert.equal(mints, 2);
   assert.equal(graphCalls, 2);
   assert.equal(new Set(accessKeys).size, 1);
-  assert.deepEqual(holds, ["disconnected"]);
+  assert.deepEqual(holds, ["app-auth"]);
   await runtime.close();
 });
 

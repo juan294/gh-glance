@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve bounded Core and GraphQL recovery causes across observer handoffs and
+  show the next action and truthful cached source age in normal, narrow,
+  no-color, and screen-reader output.
+- Let plain `--doctor` inspect a unique cached quota scope without GitHub calls
+  or state writes. Report bounded receipt/debt and recovery diagnostics while
+  withholding credential and quota fingerprints.
+- Keep legacy and interrupted request charges until causal observer evidence
+  can retire them; the diagnostic journal does not grant or refund quota.
+
 ## [0.15.2] - 2026-09-24
 
 ### Fixed

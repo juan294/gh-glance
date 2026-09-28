@@ -66,6 +66,10 @@ import {
   inspectGovernor,
   maintainControlLease,
   admitGovernorOperation,
+  queueTerminalization,
+  terminalizationRecoveryCode,
+  recoveryCause,
+  presentRecovery,
   acknowledgeSealedGeneration,
   openInBrowser,
   operationCost,
@@ -1231,6 +1235,40 @@ test("a fulfilled transport without a child handle cannot refund its charge", as
   const reservation = inspectGovernor(box.scope, box.now()).value.reservations[result.reservationId];
   assert.equal(reservation.actualCosts.core, 1);
   assert.equal(reservation.receipt.dispatches[0].terminalAt, null);
+});
+
+test("a contended real completion shows the receipt retry action until storage settles", async (t) => {
+  const at = Date.now();
+  const box = sandbox(t, { authIdentity: "completion-recovery-copy", now: at });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId, at));
+  publishInitial(box.scope, leaseId, at);
+  const scheduled = registerIntent(box.scope, intent(randomUUID(), leaseId, at));
+  assert.equal(scheduled.ok, true);
+  const admitted = startReservation(box.scope, scheduled.value.reservationId, scheduled.value.notBefore);
+  assert.equal(admitted.ok, true);
+  assert.equal(admitted.value.status, "started");
+  box.setNow(scheduled.value.notBefore);
+  const lockPath = `${box.scope.path}.lock`;
+  const nonce = randomUUID();
+  writeFileSync(lockPath, JSON.stringify({ pid: process.pid, nonce }), { mode: 0o600 });
+  const terminal = queueTerminalization(box.scope, admitted.value.receiptCapability,
+    { outcome: "measured-success", actualCost: { core: 1, graphql: 0 } }, box.now);
+  assert.equal(terminal.status, "retryable");
+  const code = terminalizationRecoveryCode(terminal);
+  assert.equal(code, "receipt-retry");
+  assert.match(presentRecovery(recoveryCause({ reason: code, resource: "core" })).join(" "),
+    /Saving request result.*Retry automatically/i);
+  assert.equal(releaseGovernorLock(lockPath, nonce), true);
+  const deadline = Date.now() + 10_000;
+  let settled = false;
+  while (Date.now() < deadline) {
+    const current = inspectGovernor(box.scope, box.now());
+    settled = current.ok && current.value.reservations[admitted.value.reservationId]?.status === "completed";
+    if (settled) break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.equal(settled, true);
 });
 
 test("a completion lock failure retries the original receipt without repeating HTTP", async (t) => {
