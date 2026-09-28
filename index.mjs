@@ -20118,6 +20118,8 @@ export {
   readIntentDecision,
   cancelIntent,
   startReservation,
+  issueGovernorDispatch,
+  terminalGovernorDispatch,
   acknowledgeSealedGeneration,
   completeReservation,
   settleReservationWithBudgetObservations,

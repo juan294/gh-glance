@@ -4038,6 +4038,83 @@ test("twelve real workers share one probe, preserve state, pace grants, and isol
   assert.equal(starts.filter((result) => result.value?.status === "waiting").length, 11);
 });
 
+test("twelve workers oversubscribe five spendable Core units and retain the local reserve", async (t) => {
+  const box = sandbox(t, { authIdentity: "paced-five-unit-window" });
+  const leaseIds = Array.from({ length: 12 }, () => randomUUID());
+  const base = { root: box.root, host: "github.com",
+    authIdentity: "paced-five-unit-window", now: NOW };
+  const registrations = await Promise.all(leaseIds.map((leaseId) => worker({
+    ...base, operation: "registerLease", payload: lease(leaseId),
+  })));
+  assert.ok(registrations.every((result) => result.ok), JSON.stringify(registrations));
+  publishInitial(box.scope, leaseIds[0], NOW, budgets(NOW, { remaining: 1005 }));
+  const initial = inspectGovernor(box.scope, NOW).value;
+  const initiallySpendable = governorAvailableForGrant(initial, "core", NOW).spendable;
+  assert.ok(initiallySpendable > 0 && initiallySpendable <= 5);
+  const results = await Promise.all(leaseIds.map((leaseId) => worker({
+    ...base, operation: "registerIntent", payload: intent(randomUUID(), leaseId),
+  })));
+  assert.ok(results.every((result) => result.ok), JSON.stringify(results));
+  const scheduled = results.filter((result) => result.value.status === "scheduled");
+  const paced = results.filter((result) => result.value.status === "waiting" &&
+    result.value.reason === "reset" && result.value.resetMs === initial.budgets.core.resetMs);
+  const waitingLeaseIds = leaseIds.filter((_, index) => results[index].value.status === "waiting");
+  assert.ok(scheduled.length > 0 && scheduled.length <= initiallySpendable,
+    JSON.stringify(results.map((result) => result.value)));
+  assert.equal(scheduled.length + paced.length, 12,
+    JSON.stringify(results.map((result) => result.value)));
+  const state = inspectGovernor(box.scope, NOW).value;
+  assert.equal(Object.keys(state.reservations).length, scheduled.length);
+  assert.ok(Object.values(state.reservations).reduce((sum, reservation) =>
+    sum + reservation.costs.core, 0) <= 5);
+  assert.equal(new Set(Object.values(state.reservations)
+    .map((reservation) => reservation.notBefore)).size, scheduled.length);
+  assert.ok(Object.values(state.reservations).every((reservation) =>
+    reservation.notBefore >= NOW && reservation.notBefore < initial.budgets.core.resetMs));
+  assert.equal(governorAvailableForGrant(state, "core", NOW).spendable,
+    initiallySpendable - scheduled.length);
+  // The lane deliberately spreads admitted grants across the hour. The first
+  // worker starts at its actual slot; the later slots remain reserved until
+  // their owners reobserve/heartbeat, and no additional worker can charge.
+  const firstGrant = scheduled.sort((left, right) =>
+    left.value.notBefore - right.value.notBefore)[0];
+  const started = await worker({ ...base, now: firstGrant.value.notBefore,
+    operation: "startReservation", reservationId: firstGrant.value.reservationId });
+  assert.equal(started.value.status, "started", JSON.stringify(started));
+  const issuedAt = firstGrant.value.notBefore;
+  const settled = completeReservation(box.scope, firstGrant.value.reservationId,
+    { outcome: "measured-success", actualCost: { core: 1, graphql: 0 } }, issuedAt + 1);
+  assert.equal(settled.ok, true, JSON.stringify(settled));
+  assert.equal(settled.value.actualCosts.core, 1);
+  const charged = inspectGovernor(box.scope, issuedAt + 1).value;
+  assert.equal(charged.reservations[firstGrant.value.reservationId].actualCosts.core, 1);
+  assert.equal(charged.reservations[firstGrant.value.reservationId].status, "completed");
+  assert.ok(charged.budgets.core.remaining - charged.budgets.core.knownLocalUsed >= 1000);
+  const extra = registerIntent(box.scope, intent(randomUUID(), waitingLeaseIds[0],
+    issuedAt + 2));
+  assert.equal(extra.ok, true);
+  assert.notEqual(extra.value.status, "scheduled", JSON.stringify(extra.value));
+  const resetAt = initial.budgets.core.resetMs + 1;
+  box.setNow(resetAt);
+  const renewed = await Promise.all(waitingLeaseIds.map((leaseId) => worker({
+    ...base, now: resetAt, operation: "registerLease", payload: lease(leaseId, resetAt),
+  })));
+  assert.ok(renewed.every((result) => result.ok), JSON.stringify(renewed));
+  const resetClaim = claimProbe(box.scope, waitingLeaseIds[0], resetAt, "core");
+  assert.equal(resetClaim.value.status, "claimed");
+  const resetPublish = publishProbe(box.scope, waitingLeaseIds[0], resetClaim.value.nonce,
+    budgets(resetAt, { remaining: 5000 }), resetAt, "core");
+  assert.equal(resetPublish.ok, true);
+  const resumed = await Promise.all(waitingLeaseIds.map((leaseId) => worker({
+    ...base, now: resetAt, operation: "registerIntent",
+    payload: intent(randomUUID(), leaseId, resetAt),
+  })));
+  assert.ok(resumed.some((result) => result.ok && result.value.status === "scheduled"),
+    JSON.stringify(resumed));
+  assert.ok(resumed.filter((result) => result.value?.status === "scheduled")
+    .every((result) => result.value.notBefore >= resetAt));
+});
+
 test("real probe and request owner crashes recover without releasing uncertain cost", async (t) => {
   const probeBox = sandbox(t);
   const ownerId = randomUUID();

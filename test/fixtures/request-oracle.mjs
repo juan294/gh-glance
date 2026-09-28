@@ -377,10 +377,11 @@ export function handleOracleRequest(state, { argv, input = null, credential = "f
   const body = status === 304 ? "" : `${JSON.stringify(payload)}\n`;
   const event = {
     sequence: state.sequence, type: "request", operation: request.operation, host: request.host,
+    resource: request.resource, accessKey: identity.accessKey ?? null,
     repository: request.repository, variant: entityKey, principal: identity.principal,
     credential, pane, configRoot, pid, observer: request.observer === true,
     at: now, startedAt: Date.now(), simulatedCompletedAt: now + (overrides.delayMs ?? 0),
-    status, cost: { core: 0, graphql: 0, [request.resource]: charge }, httpRequests: 1,
+    status, headers, cost: { core: 0, graphql: 0, [request.resource]: charge }, httpRequests: 1,
     before, after: copy(account), ...(overrides.disconnect ? { disconnected: true } : {}),
   };
   state.events.push(event);

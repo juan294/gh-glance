@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add a strict 24-hour freshness monitor with a fixed candidate hash, declared
+  pane cohort and cadence, source-clock checks, process-liveness checks, and
+  independently captured provider-hold evidence. Earlier monitor manifests
+  remain available for diagnostics but cannot qualify a run.
+- Add a deterministic 72-hour request and governor oracle with repeated quota
+  resets, persistent pane cohorts, interrupted requests, and a completion-write
+  retry that reconciles charges without repeating HTTP requests.
+
 ### Fixed
 
 - Preserve bounded Core and GraphQL recovery causes across observer handoffs and

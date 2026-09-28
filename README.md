@@ -902,29 +902,51 @@ fixture performance is not presented as live GitHub performance.
 ### Live freshness monitor
 
 The repository includes a read-only monitor for a declared set of live panes.
-Create its manifest independently of the acquisition store, after each pane has
-installed its subscription. Each entry fixes the pane ID, process ID, expected
-repository and tab, start time in Unix milliseconds, and effective cadence:
+For a qualifying run, create a schema 2 manifest independently of the
+acquisition store before sampling. Fix `candidateHash` to the SHA-256 of the
+exact executable, `requestedDurationMs` to the full observation window, and
+`sampleIntervalMs` to `5000`. Each expected pane needs its ID, live PID,
+repository, repository ID, tab, host, access-key fingerprint, start time in
+Unix milliseconds, and declared `cadenceMs`. The monitor checks the live PID
+and subscription against that fixed identity on every sample. It derives the
+source deadline from the declared cadence, not from the app's `nextDueAt`.
 
-```json
-{"schema":1,"panes":[{"id":"my-pane","pid":12345,"repository":"owner/repo","tab":"actions","startedAt":1800000000000,"cadenceMs":5000}]}
-```
-
-Use the same private config root as the panes and write a new report path:
+Use the panes' private config root and a new report path:
 
 ```sh
-node scripts/freshness-monitor.mjs --manifest panes.json \
+node scripts/freshness-monitor.mjs --manifest "$GH_GLANCE_QUALIFICATION_MANIFEST" \
   --store "$XDG_CONFIG_HOME/gh-glance/coordination-v2/acquisition.json" \
-  --report freshness.jsonl --interval-ms 5000 --duration-ms 86400000
+  --quota "$GH_GLANCE_MONITORED_QUOTA" \
+  --candidate "$(command -v gh-glance)" --report freshness.jsonl \
+  --interval-ms 5000 --duration-ms 86400000
 ```
 
-The JSONL contains hashed pane/target labels, validated source-success times,
-maximum eligible gaps, overdue time, lock status, and declared hold intervals.
-Missing or expired subscriptions and corrupt stores fail the run, even when no
-subscriber remains in the store. To close an expectation after an intentional
-pane exit, add its `exitedAt` timestamp to the manifest. Only a `holds` interval
-declared in that pane entry and confirmed by the runtime excludes time from
-the cadence check. No GitHub request is made by the monitor.
+Set `GH_GLANCE_MONITORED_QUOTA` to the quota file selected by the cached
+registry entry matching every declared host and access-key fingerprint; the
+monitor rejects an unrelated or ambiguous scope. Resolve the installed
+executable with `command -v gh-glance` only after confirming it is the exact
+candidate under observation. The JSONL records requested and actual
+elapsed time, sample gaps, source clocks, maximum eligible gaps, overdue time,
+observer/debt counts, and separate wall, external-outage, and eligible windows.
+Its `windowClass` is derived from requested duration: `short` below 30
+minutes, `initial` from 30 minutes to under 24 hours, and `full` from 24 hours.
+A successful short or initial report does not complete 24-hour acceptance;
+that requires a separate full window and its declared live transitions.
+Missing or expired subscriptions, a disappeared PID, corrupt stores, an early
+SIGINT, or a sample gap over 15 seconds makes the report nonqualifying. A sleep
+gap requires a new uninterrupted window. A schema 1 manifest supports a
+diagnostic `--once` read only; it cannot qualify a run.
+
+Provider-limit exclusions require `--external-evidence` pointing to an
+append-only JSON trace with `schema: 1` and an `events` array. Each `raw-http`
+event records the independently captured issue and finish timestamps, host,
+access-key fingerprint, Core or GraphQL resource, and raw HTTP status line and
+bounded headers. The monitor derives the interval from a matching 429 or
+rate-exhausted 403 response with `Retry-After`. It reloads the trace on every
+sample and rejects changed past records or future responses. App hold labels
+and synthetic request-oracle records grant no exclusion. Local coordination
+holds fail qualification even when brief. Keep this trace and the manifest private. The
+monitor makes no GitHub request or coordination write.
 
 ## Limitations
 

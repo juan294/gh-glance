@@ -9,7 +9,6 @@ import {
   readdirSync,
   renameSync,
   rmSync,
-  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -226,25 +225,8 @@ function startPane(box, pane, {
   });
 }
 
-test("aged v6 packed CLI automatically renders a newer Actions run", { timeout: 70_000 }, async (t) => {
-  const oldBody = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "fixtures", "actions-runs.json"), "utf8");
-  const newBody = oldBody.replace("ci: pin actions to commit SHAs", "durable freshness new run");
-  const endpoint = "repos/acme/widget/actions/runs?exclude_pull_requests=true&per_page=60";
-  const limit = 5_000;
-  const resetMs = Math.floor((Date.now() + WINDOW_MS) / 1000) * 1000;
-  const box = fixture(t, { core: { limit, used: 0, remaining: limit, resetMs },
-    graphql: { limit, used: 0, remaining: limit, resetMs },
-    apiEntities: { [endpoint]: { etag: '"durable-new"', body: newBody } } });
-  const packageRoot = join(box.root, "packed-cli");
-  mkdirSync(packageRoot);
-  const tarball = execFileSync("npm", ["pack", "--ignore-scripts", "--pack-destination", packageRoot], {
-    cwd: join(dirname(fileURLToPath(import.meta.url)), "../.."), encoding: "utf8",
-  }).trim().split("\n").at(-1);
-  execFileSync("tar", ["-xzf", join(packageRoot, tarball), "-C", packageRoot]);
-  const packedEntry = join(packageRoot, "package", "index.mjs");
-  assert.equal(existsSync(packedEntry), true);
-  symlinkSync(join(dirname(fileURLToPath(import.meta.url)), "../../node_modules"),
-    join(packageRoot, "package", "node_modules"), "dir");
+async function seedAgedV6Quota(box, limit) {
+  const resetMs = box.read().core.resetMs;
   const now = box.read().createdAt;
   const root = identityRegistryRoot({ env: { XDG_CONFIG_HOME: box.root } });
   const credential = await resolveEffectiveCredential({ host: "github.com",
@@ -272,40 +254,132 @@ test("aged v6 packed CLI automatically renders a newer Actions run", { timeout: 
   const aged = agedGovernorV6(inspectGovernor(scope, now).value, now);
   aged.budgets.core.observedAt = now - BUDGET_SNAPSHOT_TTL_MS - 1_000;
   aged.budgets.core.factorBaseline.observedAt = aged.budgets.core.observedAt;
+  const completedLegacy = Object.values(aged.reservations)
+    .find((reservation) => reservation.status === "completed");
+  completedLegacy.startedAt = aged.budgets.core.observedAt - 10_000;
+  completedLegacy.completedAt = aged.budgets.core.observedAt - 9_000;
   assert.deepEqual(agedGovernorResiduals(aged), { core: 456, graphql: 162 });
   assert.equal(writeGovernorState(scope.path, aged).ok, true);
+}
 
-  const readyPath = join(box.root, "aged-ready");
-  const pane = startPane(box, "aged-recovery", { readyPath, refresh: 5, settle: 65,
-    env: { GH_GLANCE_CAPTURE_ENTRY: packedEntry } });
-  let recovered;
-  let frame;
+test("aged v6 packed CLI renders queued, running, and completed Actions values", { timeout: 120_000 }, async (t) => {
+  const oldRows = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)),
+    "fixtures", "actions-runs.json"), "utf8"));
+  const stages = [
+    { status: "queued", conclusion: null, icon: "o" },
+    { status: "in_progress", conclusion: null, icon: "!" },
+    { status: "completed", conclusion: "success", icon: "+" },
+  ];
+  const stageBodies = stages.map((stage, index) => JSON.stringify([
+    { ...oldRows[0], displayTitle: "durable freshness new run", status: stage.status,
+      conclusion: stage.conclusion, updatedAt: new Date(Date.now() + index * 1_000).toISOString() },
+    ...oldRows.slice(1),
+  ]));
+  const endpoint = "repos/acme/widget/actions/runs?exclude_pull_requests=true&per_page=60";
+  const limit = 5_000;
+  const resetMs = Math.floor((Date.now() + WINDOW_MS) / 1000) * 1000;
+  const box = fixture(t, { core: { limit, used: 0, remaining: limit, resetMs },
+    graphql: { limit, used: 0, remaining: limit, resetMs },
+    apiEntities: { [endpoint]: { sequence: stageBodies.map((body, index) => ({
+      etag: `"durable-stage-${index}"`, body,
+    })) } } });
+  const packageRoot = join(box.root, "packed-cli");
+  mkdirSync(packageRoot);
+  const tarball = execFileSync("npm", ["pack", "--ignore-scripts", "--pack-destination", packageRoot], {
+    cwd: join(dirname(fileURLToPath(import.meta.url)), "../.."), encoding: "utf8",
+  }).trim().split("\n").at(-1);
+  execFileSync("tar", ["-xzf", join(packageRoot, tarball), "-C", packageRoot]);
+  const packedEntry = join(packageRoot, "package", "index.mjs");
+  assert.equal(existsSync(packedEntry), true);
+  execFileSync("npm", ["install", "--omit=dev", "--ignore-scripts", "--prefer-offline",
+    "--no-audit", "--no-fund"], { cwd: join(packageRoot, "package"), encoding: "utf8" });
+  const emptyCwd = join(box.root, "empty-cwd");
+  mkdirSync(emptyCwd);
+  await seedAgedV6Quota(box, limit);
+
+  const observed = [];
   const startedAt = Date.now();
-  try {
+  for (const [index, stage] of stages.entries()) {
+    const readyPath = join(box.root, `aged-ready-${index}`);
+    const pane = startPane(box, `aged-recovery-${index}`, { readyPath, refresh: 5,
+      settle: 70, env: { GH_GLANCE_CAPTURE_ENTRY: packedEntry,
+        GH_GLANCE_CAPTURE_CWD: emptyCwd, GH_GLANCE_ICONS: "unicode", NO_COLOR: "1" } });
+    let recovered;
+    let frame;
+    let failureDiagnostic = null;
     try {
       recovered = await observeUntil(() => ({ fixture: box.read(), shared: box.readAcquisition(),
         governor: box.readGovernor() }), ({ fixture: state, shared }) =>
-        actionsRuns(state).length > 0 && Object.values(shared.queries).some((record) =>
-          record.query.resource === "actions" &&
-          record.snapshot?.rows?.some((row) => row.displayTitle === "durable freshness new run")), 60_000);
+        actionsRuns(state).length >= index + 1 && Object.values(shared.queries).some((record) =>
+          record.query.resource === "actions" && record.snapshot?.rows?.some((row) =>
+            row.displayTitle === "durable freshness new run" && row.status === stage.status)), 60_000);
     } catch {
       const governor = box.readGovernor();
       const shared = box.readAcquisition();
-      assert.fail(JSON.stringify({ core: governor.budgets.core, observer: governor.observers.core,
+      failureDiagnostic = { core: governor.budgets.core, observer: governor.observers.core,
+        version: governor.version, control: governor.controlReceipts?.core,
+        debt: governor.debt?.core,
         claims: Object.values(shared.queries).map((record) => ({ resource: record.query.resource,
           hold: record.hold, claim: record.claim, lastSuccessAt: record.snapshot?.lastSuccessAt })),
-        starts: dataStarts(box.read()).map((event) => event.argv) }));
+        starts: box.read().events.filter((event) => event.type === "start" || event.type === "end")
+          .map((event) => ({ type: event.type, argv: event.argv, status: event.status,
+            cost: event.cost })), stage };
+    } finally {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      [frame] = await releasePanes(readyPath, [pane]);
     }
-  } finally {
-    [frame] = await releasePanes(readyPath, [pane]);
+    if (failureDiagnostic) assert.fail(JSON.stringify({ ...failureDiagnostic,
+      closeUnverified: frame.raw.includes("GitHub child close unverified"),
+      exitCode: frame.exitCode, frame: frame.finalFrame.lines.slice(-12) }));
+    assert.match(frame.finalFrame.lines.join("\n"),
+      new RegExp(`${stage.icon === "+" ? "\\+" : stage.icon}\\s+durable freshnes`),
+      `${stage.status} was published but not rendered`);
+    observed.push(recovered);
   }
   assert.ok(Date.now() - startedAt < 60_000);
-  assert.equal(recovered.governor.version, 7);
-  assert.equal(recovered.governor.debt.core.unresolvedUnits, 456);
-  assert.equal(recovered.governor.debt.graphql.unresolvedUnits, 162);
-  assert.ok(Object.values(recovered.shared.queries).some((record) =>
-    record.query.resource === "actions" && record.snapshot?.lastSuccessAt >= startedAt));
-  assert.match(frame.finalFrame.lines.join("\n"), /durable freshnes.*#443/);
+  assert.equal(observed.at(-1).governor.version, 7);
+  assert.equal(observed.at(-1).governor.debt.core.unresolvedUnits, 456);
+  assert.equal(observed.at(-1).governor.debt.graphql.unresolvedUnits, 162);
+  const sourceTimes = observed.map(({ shared }) => Object.values(shared.queries)
+    .find((record) => record.query.resource === "actions")?.snapshot?.lastSuccessAt);
+  assert.ok(sourceTimes[0] >= startedAt && sourceTimes[1] > sourceTimes[0] &&
+    sourceTimes[2] > sourceTimes[1], `source timestamps did not advance: ${sourceTimes}`);
+});
+
+test("unmodified 0.15.2 stays source-stale on the same valid aged v6 ledger", {
+  timeout: 45_000,
+}, async (t) => {
+  const entry = process.env.GH_GLANCE_BASELINE_ENTRY;
+  if (!entry) return t.skip("set GH_GLANCE_BASELINE_ENTRY for the installed 0.15.2 reproduction");
+  const manifest = JSON.parse(readFileSync(join(dirname(entry), "package.json"), "utf8"));
+  assert.equal(manifest.version, "0.15.2");
+  const limit = 5_000;
+  const resetMs = Math.floor((Date.now() + WINDOW_MS) / 1000) * 1000;
+  const oldBody = readFileSync(join(dirname(fileURLToPath(import.meta.url)),
+    "fixtures", "actions-runs.json"), "utf8");
+  const box = fixture(t, { core: { limit, used: 0, remaining: limit, resetMs },
+    graphql: { limit, used: 0, remaining: limit, resetMs },
+    apiEntities: { "repos/acme/widget/actions/runs?exclude_pull_requests=true&per_page=60": {
+      etag: '"durable-new"', body: oldBody.replace("ci: pin actions to commit SHAs",
+        "durable freshness new run"),
+    } } });
+  await seedAgedV6Quota(box, limit);
+  const emptyCwd = join(box.root, "baseline-empty-cwd");
+  mkdirSync(emptyCwd);
+  const readyPath = join(box.root, "baseline-ready");
+  const pane = startPane(box, "baseline-aged", { readyPath, refresh: 5, settle: 25,
+    env: { GH_GLANCE_CAPTURE_ENTRY: entry, GH_GLANCE_CAPTURE_CWD: emptyCwd } });
+  await new Promise((resolve) => setTimeout(resolve, 15_000));
+  const [frame] = await releasePanes(readyPath, [pane]);
+  const shared = box.readAcquisition();
+  assert.equal(box.readGovernor().version, 6, "the old CLI must read valid v6 evidence");
+  assert.ok(box.read().events.length > 0, "the old CLI never exercised the fixture");
+  assert.equal(actionsRuns(box.read()).length, 0, "the old CLI unexpectedly refreshed the source");
+  assert.ok(!Object.values(shared.queries).some((record) => record.query.resource === "actions" &&
+    record.snapshot?.rows?.some((row) => row.displayTitle === "durable freshness new run")));
+  assert.doesNotMatch(frame.finalFrame.lines.join("\n"), /durable freshnes/);
+  assert.doesNotMatch(frame.finalFrame.lines.join("\n"), /corrupt/i,
+    "baseline failure must be source staleness, not a schema mismatch");
 });
 
 async function releasePanes(readyPath, captures) {
