@@ -44,6 +44,34 @@ test("D6: success in one core tab cannot clear another tab's source failure", ()
     sourceSuccess: false, tab: "actions" }), true);
 });
 
+test("D6: scheduled grants clear only transient causes after a confirmed hold write", () => {
+  for (const reason of ["busy", "stale", "acquisition-busy"]) {
+    const cause = recoveryCause({ reason, resource: "core" });
+    assert.equal(shouldClearRecoveryCause(cause, {
+      scheduledHold: { ok: true, value: "cleared" },
+    }), true, reason);
+    for (const scheduledHold of [
+      { ok: true, value: "already-clear" },
+      { ok: true, value: "retained" },
+      { ok: false, reason: "unwritable" },
+      { ok: false, reason: "stale-hold" },
+    ]) {
+      assert.equal(shouldClearRecoveryCause(cause, { scheduledHold }), false,
+        `${reason}: ${scheduledHold.value ?? scheduledHold.reason}`);
+    }
+  }
+  for (const reason of ["unwritable", "corrupt", "capacity", "accounting-overflow",
+    "unsafe-permissions", "disk-full", "coordination", "receipt-retry", "request-queue",
+    "legacy-unresolved", "probe-failed", "rate-limit", "secondary", "network-outage"]) {
+    assert.equal(shouldClearRecoveryCause(recoveryCause({ reason, resource: "core" }), {
+      scheduledHold: { ok: true, value: "cleared" },
+    }), false, reason);
+  }
+  assert.equal(shouldClearRecoveryCause(recoveryCause({
+    reason: "busy", resource: "core", origin: "source", tab: "actions",
+  }), { scheduledHold: { ok: true, value: "cleared" } }), false);
+});
+
 test("D6: recovery cause maps resource, action, retry and cached age without raw errors", () => {
   const at = Date.now();
   const cases = [

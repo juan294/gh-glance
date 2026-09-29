@@ -1296,6 +1296,8 @@ test("scheduled control clears only an observed coordination hold in the same ac
     NOW + 1).value, "cleared");
   assert.equal(runtime.inspect(subscribed.value.id).value.hold, null);
 
+  assert.equal(clearScheduledRuntimeControlHold(runtime, current, "actions", accessKey,
+    NOW + 1).value, "already-clear");
   assert.equal(setRuntimeAcquisitionHold(runtime, current, "actions", "primary", accessKey).ok,
     true);
   assert.equal(clearScheduledRuntimeControlHold(runtime, current, "actions", accessKey,
@@ -1310,6 +1312,14 @@ test("scheduled control clears only an observed coordination hold in the same ac
   assert.equal(runtime.inspect(subscribed.value.id).value.hold?.reason, "coordination");
   assert.equal(clearScheduledRuntimeControlHold(runtime, current, "actions", "b".repeat(64),
     NOW + 1).reason, "stale-access");
+  const observedHold = runtime.inspect(subscribed.value.id).value.hold;
+  box.setNow(NOW + 2);
+  assert.equal(setRuntimeAcquisitionHold(runtime, current, "actions", "primary", accessKey).ok, true);
+  assert.equal(setRuntimeAcquisitionHold(runtime, current, "actions", "coordination", accessKey).ok, true);
+  assert.equal(runtime.setHold(subscribed.value.id, null, {
+    resource: "actions", accessKey, currentHold: observedHold,
+  }).reason, "stale-hold");
+  assert.equal(runtime.inspect(subscribed.value.id).value.hold.at, NOW + 2);
 });
 
 test("SHARE-05: a suspended live owner is not stolen, but a confirmed dead owner is fenced", async (t) => {

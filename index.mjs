@@ -15575,8 +15575,12 @@ function recoveryCause({ reason, resource = null, at = Date.now(), retryAt = nul
   };
 }
 
-function shouldClearRecoveryCause(cause, { sourceSuccess = false, tab = null } = {}) {
+function shouldClearRecoveryCause(cause, { sourceSuccess = false, tab = null, scheduledHold = null } = {}) {
   if (!cause) return false;
+  if (scheduledHold !== null) {
+    return scheduledHold.ok === true && scheduledHold.value === "cleared" &&
+      cause.origin === "coordination" && ["busy", "stale", "acquisition-busy"].includes(cause.code);
+  }
   return cause.origin !== "source" || sourceSuccess && cause.tab === tab;
 }
 
@@ -17496,13 +17500,13 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (scope) setTimeout(() => { safeRecordRecoveryTransition(scope, cause); }, 0).unref?.();
     }
 
-    function clearRuntimeRecovery(resource, { sourceSuccess = false, tab = null } = {}) {
+    function clearRuntimeRecovery(resource, { sourceSuccess = false, tab = null, scheduledHold = null } = {}) {
       const previous = recoveryRef.current[resource];
       if (previous?.code === "receipt-retry" &&
           terminalizationBacklogForResource(terminalizationBacklog, scope?.hash, resource) > 0) return;
       if (previous?.code === "request-queue" &&
           cleanupQueueForResource(cleanupQueue, resource) > 0) return;
-      if (!shouldClearRecoveryCause(previous, { sourceSuccess, tab })) return;
+      if (!shouldClearRecoveryCause(previous, { sourceSuccess, tab, scheduledHold })) return;
       recoveryRef.current = { ...recoveryRef.current, [resource]: null };
       setRecoveryCauses(recoveryRef.current);
       if (scope) setTimeout(() => {
@@ -17624,14 +17628,12 @@ function App({ onCreateRemote = () => {} } = {}) {
             identity()?.accessKey === accessKey &&
             (lastAttempt?.id !== reservationId || nowMs - lastAttempt.at >= 30_000)) {
           scheduledControlAttempts.set(key, { id: reservationId, at: nowMs });
-          // A future grant proves quota progress, while this read and guarded
-          // update establish that acquisition storage is available too.
+          // A guarded hold write can retire an older transient notice. Merely
+          // reading a future grant or an absent hold cannot prove recovery.
           const cleared = clearScheduledRuntimeControlHold(acquisitionEngine,
             acquisitionSubscriptions, key, accessKey, nowMs);
-          if (cleared.ok && cleared.value !== "retained") {
-            for (const resource of RATE_RESOURCES) {
-              if (costs[resource] > 0) clearRuntimeRecovery(resource);
-            }
+          for (const resource of RATE_RESOURCES) {
+            if (costs[resource] > 0) clearRuntimeRecovery(resource, { scheduledHold: cleared });
           }
         }
         setTabGovernorDecision(key, visibleGovernorDecision({
