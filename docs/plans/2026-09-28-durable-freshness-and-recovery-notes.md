@@ -2,6 +2,13 @@
 
 ## Deviations
 
+### Phase 4 advisory recovery journal clock skew
+
+- Plan said: retained recovery diagnostics disclose current cause and retry information without blocking source publication.
+- Found: a same-cause event with an earlier `at` than the previous `firstAt` produced a journal that the strict reader rejected. The installed candidate's retained Core event has this exact shape, so plain doctor reports a corrupt diagnostic journal despite a separately readable quota ledger.
+- Chose: preserve a red-then-green repair on local branch `fix/recovery-journal-clock-skew` at `47d1b2b`. It clamps only the known timestamp skew on read and write, keeps all retained events and rejects other invalid fields. The branch is unmerged because the complete local gate could not pass in the managed sandbox.
+- Why: deleting or overwriting the live journal would discard evidence, while leaving the writer unchanged would recreate the same invalid shape after any later event-clock rollback. The advisory repair must be fully verified before it can become a new installed candidate.
+
 ### Phase 4 cutover snapshot
 
 - Plan said: capture a private snapshot after stopping all old panes and before migration.
