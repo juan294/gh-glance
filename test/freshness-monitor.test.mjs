@@ -150,6 +150,62 @@ test("an active pane gets a 60-second observation deadline after background reac
   assert.equal(monitor.summary().ok, false);
 });
 
+test("first source deadline respects background cadence while active remains 60 seconds", () => {
+  for (const [active, cadenceMs, expected] of [
+    [true, 30_000, "overdue"],
+    [false, 120_000, "awaiting-first"],
+    [false, 300_000, "awaiting-first"],
+  ]) {
+    let at = AT + 60_001;
+    const current = store(null, null, AT + 1_000_000);
+    current.value.queries[QUERY_KEY].query.repositoryId = "R_secret";
+    current.value.subscriptions.a.demand.active = active;
+    const monitor = createFreshnessMonitor({ manifest: qualificationManifest({
+      panes: [{ ...qualificationManifest().panes[0], cadenceMs }],
+    }), candidateHash: CANDIDATE_HASH, storePath: "/unused/acquisition.json",
+    ...quotaOptions, now: () => at, monotonicNow: () => at - AT,
+    readStore: () => current,
+    inspectLock: () => ({ status: "unobstructed", ageMs: null }) });
+    assert.equal(monitor.sample().panes[0].state, expected);
+    if (!active) {
+      at = AT + cadenceMs + Math.max(2 * cadenceMs, 15_000) + 1;
+      assert.equal(monitor.sample().panes[0].state, "overdue");
+    }
+  }
+});
+
+test("quota read uses the clock after acquisition hydration", () => {
+  let at = AT;
+  const current = store(AT);
+  current.value.queries[QUERY_KEY].query.repositoryId = "R_secret";
+  const monitor = createFreshnessMonitor({ manifest: qualificationManifest(),
+    candidateHash: CANDIDATE_HASH, storePath: "/unused/acquisition.json",
+    quotaPath: "/unused/quota.json", verifyQuotaScope: () => true,
+    isPidAlive: () => "live", now: () => at, monotonicNow: () => at - AT,
+    readStore: () => { at += 100; return current; },
+    readQuota: (_path, observedAt) => observedAt >= AT + 100
+      ? quota : { ok: false, reason: "future-clock" },
+    inspectLock: () => ({ status: "unobstructed", ageMs: null }) });
+  assert.equal(monitor.sample().diagnostics.status, "available");
+});
+
+test("a publication during hydration is not a future source timestamp", () => {
+  let at = AT;
+  const current = store(AT + 100, AT + 100);
+  current.value.queries[QUERY_KEY].query.repositoryId = "R_secret";
+  current.value.subscriptions.a.demand.active = true;
+  const monitor = createFreshnessMonitor({ manifest: qualificationManifest(),
+    candidateHash: CANDIDATE_HASH, storePath: "/unused/acquisition.json",
+    ...quotaOptions, now: () => at, monotonicNow: () => at - AT,
+    readStore: () => { at += 100; return current; },
+    inspectLock: () => ({ status: "unobstructed", ageMs: null }) });
+  const sample = monitor.sample();
+  assert.equal(sample.panes[0].state, "eligible");
+  assert.equal(sample.at, AT);
+  assert.equal(sample.sourceReadAt, AT + 100);
+  assert.ok(sample.panes[0].lastSuccessAt <= sample.sourceReadAt);
+});
+
 test("a complete uninterrupted qualification window passes with new source generations", () => {
   let at = AT;
   const current = store(AT);

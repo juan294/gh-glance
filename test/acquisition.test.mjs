@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -37,6 +37,7 @@ import {
   ghApi,
   inspectGovernor,
   loadAcquisitionStore,
+  readAcquisitionSnapshot,
   publishProbe,
   publishStagedEntities,
   registerIntent,
@@ -2167,4 +2168,143 @@ test("SHARE-06: the 513th query evicts atomically instead of writing an unreadab
   const stored = loadAcquisitionStore(acquisitionStorePath(box.pathOptions));
   assert.equal(stored.ok, true);
   assert.equal(Object.keys(stored.value.queries).length, ACQUISITION_MAX_ENTITIES);
+});
+
+test("a stale acquisition descriptor follows a replaced metadata snapshot, while a current missing artifact fails", async (t) => {
+  const box = fixture(t);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  const subscription = engine.subscribe(query(), { active: true, floorMs: 5_000 });
+  assert.equal(subscription.ok, true);
+  assert.equal((await engine.refresh(subscription.value.id, {
+    acquire: async () => snapshot("first"),
+  })).ok, true);
+  const firstMetadata = JSON.parse(readFileSync(engine.path, "utf8"));
+  const stale = firstMetadata.queries[subscription.value.queryKey];
+  box.setNow(NOW + 5_000);
+  assert.equal((await engine.refresh(subscription.value.id, { force: true,
+    acquire: async () => snapshot("second", { at: box.now() }),
+  })).ok, true);
+  assert.equal(existsSync(join(`${engine.path}.snapshots`, stale.snapshot.artifact)), false);
+  const replaced = readAcquisitionSnapshot(engine.path, stale);
+  assert.equal(replaced.ok, true);
+  assert.equal(replaced.value.rows[0].displayTitle, "second");
+  const current = JSON.parse(readFileSync(engine.path, "utf8"))
+    .queries[subscription.value.queryKey];
+  unlinkSync(join(`${engine.path}.snapshots`, current.snapshot.artifact));
+  assert.equal(readAcquisitionSnapshot(engine.path, current).reason, "corrupt");
+  assert.equal(loadAcquisitionStore(engine.path).reason, "corrupt");
+});
+
+test("subscription binds to a canonical query remapped after its commit", async (t) => {
+  const box = fixture(t);
+  const base = memoryStorage();
+  let canonicalKey = null;
+  let remapped = false;
+  const storage = {
+    load: () => base.load(),
+    transact(operation) {
+      const committed = base.transact(operation);
+      if (!remapped && committed.ok && committed.value?.id) {
+        remapped = true;
+        base.transact((state) => {
+          const shared = state.subscriptions[committed.value.id];
+          const oldKey = shared.queryKey;
+          const record = state.queries[oldKey];
+          const canonical = { ...record.query, repositoryId: "R_widget" };
+          canonicalKey = acquisitionQueryKey(canonical);
+          canonical.queryKey = canonicalKey;
+          state.queries[canonicalKey] = { ...record, query: canonical };
+          delete state.queries[oldKey];
+          shared.queryKey = canonicalKey;
+          return { value: true };
+        });
+      }
+      return committed;
+    },
+  };
+  const engine = createAcquisitionEngine({ ...box, storage });
+  t.after(() => engine.close());
+  const subscribed = engine.subscribe(query("slug:acme/widget", "actions", {
+    repository: "acme/widget",
+  }), { active: true, floorMs: 5_000 });
+  assert.equal(subscribed.ok, true);
+  assert.equal(subscribed.value.queryKey, canonicalKey);
+  assert.equal((await engine.refresh(subscribed.value.id)).value.role, "producer");
+});
+
+test("first refresh follows a remap after subscription hydration", async (t) => {
+  const box = fixture(t);
+  const base = memoryStorage();
+  let remapped = false;
+  const storage = {
+    transact: (operation) => base.transact(operation),
+    load() {
+      const observed = base.load();
+      if (!remapped && Object.keys(observed.value.subscriptions).length === 1) {
+        remapped = true;
+        base.transact((state) => {
+          const shared = Object.values(state.subscriptions)[0];
+          const oldKey = shared.queryKey;
+          const record = state.queries[oldKey];
+          const canonical = { ...record.query, repositoryId: "R_widget" };
+          canonical.queryKey = acquisitionQueryKey(canonical);
+          state.queries[canonical.queryKey] = { ...record, query: canonical };
+          delete state.queries[oldKey];
+          shared.queryKey = canonical.queryKey;
+          return { value: true };
+        });
+      }
+      return observed;
+    },
+  };
+  const engine = createAcquisitionEngine({ ...box, storage });
+  t.after(() => engine.close());
+  const subscribed = engine.subscribe(query("slug:acme/widget", "actions", {
+    repository: "acme/widget",
+  }), { active: true, floorMs: 5_000 });
+  assert.equal(subscribed.ok, true);
+  const refreshed = await engine.refresh(subscribed.value.id);
+  assert.equal(refreshed.ok, true);
+  assert.equal(refreshed.value.role, "producer");
+});
+
+test("full-store hydration survives four consecutive replaced artifacts", async (t) => {
+  const box = fixture(t);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  const subscribed = engine.subscribe(query(), { active: true, floorMs: 5_000 });
+  assert.equal(subscribed.ok, true);
+  assert.equal((await engine.refresh(subscribed.value.id, {
+    acquire: async () => snapshot("first"),
+  })).ok, true);
+  let replacements = 0;
+  const loaded = loadAcquisitionStore(engine.path, { onMetadataLoaded() {
+    if (replacements === 4) return;
+    const metadata = JSON.parse(readFileSync(engine.path, "utf8"));
+    const record = metadata.queries[subscribed.value.queryKey];
+    const oldArtifact = join(`${engine.path}.snapshots`, record.snapshot.artifact);
+    const nextGeneration = record.generation + 1;
+    const payload = JSON.parse(readFileSync(oldArtifact, "utf8"));
+    payload.generation = nextGeneration;
+    payload.lastSuccessAt += 1;
+    payload.lastChangedAt += 1;
+    payload.nextDueAt += 1;
+    const raw = JSON.stringify(payload);
+    const digest = createHash("sha256").update(raw).digest("hex");
+    const artifact = `${subscribed.value.queryKey}.${nextGeneration}.${digest}.json`;
+    writeFileSync(join(`${engine.path}.snapshots`, artifact), raw);
+    record.generation = nextGeneration;
+    record.snapshot = { ...record.snapshot, artifact, generation: nextGeneration, digest,
+      bytes: Buffer.byteLength(raw), lastSuccessAt: payload.lastSuccessAt,
+      lastChangedAt: payload.lastChangedAt, nextDueAt: payload.nextDueAt };
+    const temp = `${engine.path}.replacement.tmp`;
+    writeFileSync(temp, JSON.stringify(metadata));
+    renameSync(temp, engine.path);
+    unlinkSync(oldArtifact);
+    replacements += 1;
+  } });
+  assert.equal(replacements, 4);
+  assert.equal(loaded.ok, true);
+  assert.equal(loaded.value.queries[subscribed.value.queryKey].generation, 5);
 });

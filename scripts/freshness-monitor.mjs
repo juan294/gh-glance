@@ -262,13 +262,20 @@ function createFreshnessMonitor({ manifest, storePath, now = Date.now,
     const fileMissing = readStore === loadAcquisitionStore && !existsSync(storePath);
     let loaded;
     try { loaded = readStore(storePath); } catch { loaded = { ok: false, reason: "corrupt" }; }
+    const sourceReadAt = now();
+    if (!Number.isFinite(sourceReadAt) || sourceReadAt < at) {
+      clockFaults += 1;
+      failed = true;
+    }
     const storeState = fileMissing || loaded?.missing ||
       readStore === loadAcquisitionStore && !existsSync(storePath)
       ? "missing-store" : !loaded?.ok ? "corrupt-store" : null;
     let quota = null;
     if (qualifying) {
       try {
-        const read = quotaBound && quotaPath ? readQuota(quotaPath, at) : null;
+        // Hydrating acquisition artifacts may take long enough for a writer to
+        // advance the quota ledger after the sample clock was captured.
+        const read = quotaBound && quotaPath ? readQuota(quotaPath, now()) : null;
         quota = read?.ok && !read.missing ? read.value : null;
       } catch { quota = null; }
       if (!quota) failed = true;
@@ -383,7 +390,7 @@ function createFreshnessMonitor({ manifest, storePath, now = Date.now,
       if (qualifying && snapshot && (!Number.isFinite(snapshot.lastSuccessAt) ||
           !Number.isFinite(snapshot.lastChangedAt) ||
           snapshot.lastChangedAt > snapshot.lastSuccessAt ||
-          snapshot.lastChangedAt > at ||
+          snapshot.lastChangedAt > sourceReadAt ||
           !Number.isSafeInteger(snapshot.generation) || snapshot.generation < 1 ||
           entry.generation !== null && snapshot.generation < entry.generation ||
           entry.lastSuccessAt !== null && snapshot.lastSuccessAt > entry.lastSuccessAt &&
@@ -391,7 +398,7 @@ function createFreshnessMonitor({ manifest, storePath, now = Date.now,
           entry.lastChangedAt !== null && snapshot.lastChangedAt < entry.lastChangedAt)) {
         entry.state = "invalid-source-clock";
         entry.failed = failed = true;
-      } else if (successAt !== null && successAt > at) {
+      } else if (successAt !== null && successAt > sourceReadAt) {
         entry.state = "future-success";
         entry.failed = failed = true;
       } else if (successAt !== null && entry.lastSuccessAt !== null && successAt < entry.lastSuccessAt) {
@@ -420,8 +427,9 @@ function createFreshnessMonitor({ manifest, storePath, now = Date.now,
         const demandDueAt = entry.activeNeedsSuccess
           ? Math.min(sourceDueAt, entry.activeSinceAt + pane.cadenceMs)
           : sourceDueAt;
+        const firstAllowance = demand === "active" ? 60_000 : pane.cadenceMs + allowance;
         const dueAt = qualifying && entry.lastSuccessAt === null
-          ? Math.max(pane.startedAt, entry.releasedAt ?? pane.startedAt) + 60_000
+          ? Math.max(pane.startedAt, entry.releasedAt ?? pane.startedAt) + firstAllowance
           : entry.lastSuccessAt === null
           ? Math.max(pane.startedAt, entry.releasedAt ?? pane.startedAt) + allowance
           : Math.max(demandDueAt,
@@ -434,7 +442,7 @@ function createFreshnessMonitor({ manifest, storePath, now = Date.now,
           const activeBaseAt = entry.activeNeedsSuccess ? Math.max(baseAt, entry.activeSinceAt) : baseAt;
           const elapsed = at - activeBaseAt - coveredDuration(outageIntervals, activeBaseAt, at);
           const allowed = entry.activeNeedsSuccess ? 60_000
-            : entry.lastSuccessAt === null ? 60_000 : pane.cadenceMs + allowance;
+            : entry.lastSuccessAt === null ? firstAllowance : pane.cadenceMs + allowance;
           const overdue = qualifying ? Math.max(0, elapsed - allowed)
             : Math.max(0, at - dueAt);
           entry.maxOverdueMs = Math.max(entry.maxOverdueMs, overdue);
@@ -458,7 +466,7 @@ function createFreshnessMonitor({ manifest, storePath, now = Date.now,
           quiescentUnits: quota.debt[resource].quiescentUnits } : null])) } : null;
     const report = { schema: qualifying ? 2 : 1, type: "sample", at,
       elapsedMs: mono - firstMono, ok: !failed, lock, panes: results,
-      ...(qualifying ? { diagnostics } : {}) };
+      ...(qualifying ? { sourceReadAt, diagnostics } : {}) };
     emit(JSON.stringify(report));
     return report;
   }

@@ -13308,6 +13308,8 @@ const ACQUISITION_MAX_ENTITY_BYTES = 1024 * 1024;
 const ACQUISITION_MAX_ENTITIES = 512;
 const ACQUISITION_MAX_LIVE_TARGETS = 32;
 const ACQUISITION_MAX_SUBSCRIPTIONS = 128;
+const ACQUISITION_READ_MAX_ATTEMPTS = 24;
+const ACQUISITION_READ_MAX_MS = 1_500;
 let acquisitionTempSequence = 0;
 
 function acquisitionStorePath(options = {}) {
@@ -13944,37 +13946,63 @@ function loadAcquisitionMetadata(path) {
   }
 }
 
-function readAcquisitionSnapshot(path, record) {
-  if (!record?.snapshot) return { ok: true, value: null };
-  if (Array.isArray(record.snapshot.rows)) return { ok: true, value: record.snapshot };
-  try {
-    const raw = readFileSync(join(acquisitionSnapshotRoot(path), record.snapshot.artifact), "utf8");
-    if (Buffer.byteLength(raw) !== record.snapshot.bytes ||
-        createHash("sha256").update(raw).digest("hex") !== record.snapshot.digest) {
-      return { ok: false, reason: "corrupt" };
+function readAcquisitionSnapshot(path, record, { deadline = performance.now() + ACQUISITION_READ_MAX_MS } = {}) {
+  let current = record;
+  for (let attempt = 0; attempt < ACQUISITION_READ_MAX_ATTEMPTS &&
+      performance.now() < deadline; attempt += 1) {
+    if (!current?.snapshot) return current === record ? { ok: true, value: null }
+      : { ok: false, reason: "stale" };
+    if (Array.isArray(current.snapshot.rows)) {
+      return { ok: true, value: current.snapshot, replaced: current !== record };
     }
-    const parsed = JSON.parse(raw);
-    const snapshot = normalizeAcquisitionSnapshot(
-      parsed, record.query, record.generation, parsed.producerEpoch,
-    );
-    return snapshot ? { ok: true, value: snapshot } : { ok: false, reason: "corrupt" };
-  } catch (error) {
-    return { ok: false, reason: "corrupt", error };
+    try {
+      const raw = readFileSync(join(acquisitionSnapshotRoot(path), current.snapshot.artifact), "utf8");
+      if (Buffer.byteLength(raw) !== current.snapshot.bytes ||
+          createHash("sha256").update(raw).digest("hex") !== current.snapshot.digest) {
+        return { ok: false, reason: "corrupt" };
+      }
+      const parsed = JSON.parse(raw);
+      const snapshot = normalizeAcquisitionSnapshot(
+        parsed, current.query, current.generation, parsed.producerEpoch,
+      );
+      return snapshot ? { ok: true, value: snapshot, replaced: current !== record }
+        : { ok: false, reason: "corrupt" };
+    } catch (error) {
+      if (error?.code !== "ENOENT") return { ok: false, reason: "corrupt", error };
+      const latest = loadAcquisitionMetadata(path);
+      if (!latest.ok) return latest;
+      const replacement = latest.value.queries[current.query.queryKey];
+      if (!replacement) return { ok: false, reason: "stale" };
+      if (replacement.snapshot?.artifact === current.snapshot.artifact) {
+        return { ok: false, reason: "corrupt", error };
+      }
+      current = replacement;
+    }
   }
+  return { ok: false, reason: "busy" };
 }
 
-function hydrateAcquisitionStore(path, state) {
+function hydrateAcquisitionStore(path, state, deadline) {
   for (const record of Object.values(state.queries)) {
-    const loaded = readAcquisitionSnapshot(path, record);
+    const loaded = readAcquisitionSnapshot(path, record, { deadline });
     if (!loaded.ok) return loaded;
+    if (loaded.replaced) return { ok: false, reason: "stale" };
     record.snapshot = loaded.value;
   }
   return { ok: true, value: state };
 }
 
-function loadAcquisitionStore(path) {
-  const loaded = loadAcquisitionMetadata(path);
-  return loaded.ok ? hydrateAcquisitionStore(path, loaded.value) : loaded;
+function loadAcquisitionStore(path, { onMetadataLoaded = null } = {}) {
+  const deadline = performance.now() + ACQUISITION_READ_MAX_MS;
+  for (let attempt = 0; attempt < ACQUISITION_READ_MAX_ATTEMPTS &&
+      performance.now() < deadline; attempt += 1) {
+    const loaded = loadAcquisitionMetadata(path);
+    if (!loaded.ok) return loaded;
+    onMetadataLoaded?.();
+    const hydrated = hydrateAcquisitionStore(path, loaded.value, deadline);
+    if (hydrated.reason !== "stale") return hydrated;
+  }
+  return { ok: false, reason: "busy" };
 }
 
 function writeAcquisitionArtifact(root, artifact, payload) {
@@ -14198,7 +14226,7 @@ function createAcquisitionEngine({
     }
     const loaded = loadRecordSnapshot(record);
     if (!loaded.ok) return loaded;
-    item.generation = record.generation;
+    item.generation = loaded.value.generation;
     try { item.callback?.(loaded.value); } catch { /* subscriber callback is isolated */ }
     return { ok: true, value: true, snapshot: loaded.value };
   }
@@ -14231,7 +14259,8 @@ function createAcquisitionEngine({
     const record = loaded.value.queries[item.queryKey] ?? null;
     if (!record?.snapshot) return { ok: true, value: record };
     const snapshot = loadRecordSnapshot(record);
-    return snapshot.ok ? { ok: true, value: { ...record, snapshot: snapshot.value } } : snapshot;
+    return snapshot.ok ? { ok: true, value: { ...record,
+      generation: snapshot.value?.generation ?? record.generation, snapshot: snapshot.value } } : snapshot;
   }
 
   function heartbeat() {
@@ -14399,14 +14428,38 @@ function createAcquisitionEngine({
         aliasConflict: matching.length > 1 } };
     });
     if (!result.ok) return result;
-    const record = result.state.queries[result.value.queryKey];
-    const loadedSnapshot = loadRecordSnapshot(record);
-    if (!loadedSnapshot.ok) return loadedSnapshot;
-    result.value.snapshot = loadedSnapshot.value;
-    local.set(id, { nonce, queryKey: result.value.queryKey, callback, generation: record?.generation ?? 0,
+    // A publisher can canonicalize the query and remap this just-committed
+    // shared subscription before its snapshot is hydrated. Register locally
+    // first so every failure still has a cleanup owner, then follow the
+    // subscription ID in fresh metadata rather than the old query key.
+    local.set(id, { nonce, queryKey: result.value.queryKey, callback, generation: 0,
       claimNonce: null, pending: null });
     ensureTimer();
-    return result;
+    const deadline = performance.now() + ACQUISITION_READ_MAX_MS;
+    for (let attempt = 0; attempt < ACQUISITION_READ_MAX_ATTEMPTS &&
+        performance.now() < deadline; attempt += 1) {
+      const latest = load();
+      if (!latest.ok) { unsubscribe(id); return latest; }
+      const shared = latest.value.subscriptions[id];
+      if (!shared || shared.nonce !== nonce) { unsubscribe(id); return { ok: false, reason: "stale" }; }
+      const item = local.get(id);
+      item.queryKey = shared.queryKey;
+      const record = latest.value.queries[shared.queryKey];
+      if (!record) continue;
+      const loadedSnapshot = loadRecordSnapshot(record);
+      if (!loadedSnapshot.ok) {
+        if (["stale", "busy"].includes(loadedSnapshot.reason)) continue;
+        unsubscribe(id);
+        return loadedSnapshot;
+      }
+      if (loadedSnapshot.replaced) continue;
+      result.value.queryKey = shared.queryKey;
+      result.value.snapshot = loadedSnapshot.value;
+      item.generation = loadedSnapshot.value?.generation ?? record.generation;
+      return result;
+    }
+    unsubscribe(id);
+    return { ok: false, reason: "busy" };
   }
 
   function updateDemand(id, demandInput) {
@@ -14675,7 +14728,8 @@ function createAcquisitionEngine({
     const claimed = transact((state) => {
       const reaped = reapAcquisitionSubscriptions(state, now(), kill);
       const subscription = state.subscriptions[id];
-      const record = state.queries[item.queryKey];
+      const queryKey = subscription?.queryKey;
+      const record = state.queries[queryKey];
       if (!subscription || subscription.nonce !== item.nonce || !record) return { ok: false, reason: "stale" };
       const requestedGeneration = force
         ? Math.max(subscription.requestedGeneration,
@@ -14687,8 +14741,8 @@ function createAcquisitionEngine({
       }
       if (requestedGeneration <= record.generation && record.snapshot?.nextDueAt > now()) {
         return { changed: reaped > 0 || demandChanged,
-          value: { role: "follower", reason: "fresh", snapshot: record.snapshot,
-            sharingCount: acquisitionSharingCount(state, item.queryKey) } };
+          value: { role: "follower", reason: "fresh", queryKey, snapshot: record.snapshot,
+            sharingCount: acquisitionSharingCount(state, queryKey) } };
       }
       if (record.claim) {
         const absoluteDeadline = acquisitionClaimDeadline(record.claim);
@@ -14703,10 +14757,10 @@ function createAcquisitionEngine({
           }
           return { changed: reaped > 0 || demandChanged || joined,
             value: { role: "follower", reason: expired ? `owner-${owner}` : "claimed",
-            snapshot: record.snapshot, sharingCount: acquisitionSharingCount(state, item.queryKey) } };
+            queryKey, snapshot: record.snapshot, sharingCount: acquisitionSharingCount(state, queryKey) } };
         }
       }
-      const nonce = createId("acquisition-claim", item.queryKey, record.generation + 1);
+      const nonce = createId("acquisition-claim", queryKey, record.generation + 1);
       record.claim = {
         pid,
         nonce,
@@ -14720,11 +14774,13 @@ function createAcquisitionEngine({
       subscription.waitingSinceAt = null;
       record.lastUsedAt = now();
       return { value: { role: "producer", nonce, generation: record.claim.generation,
-        query: record.query, snapshot: record.snapshot, demand: aggregateAcquisitionDemand(state, item.queryKey),
-        sharingCount: acquisitionSharingCount(state, item.queryKey) } };
+        queryKey, query: record.query, snapshot: record.snapshot,
+        demand: aggregateAcquisitionDemand(state, queryKey),
+        sharingCount: acquisitionSharingCount(state, queryKey) } };
     });
+    if (claimed.ok && claimed.value?.queryKey) item.queryKey = claimed.value.queryKey;
     if (claimed.ok && claimed.value?.snapshot) {
-      const record = claimed.state.queries[item.queryKey];
+      const record = claimed.state.queries[claimed.value.queryKey];
       const loadedSnapshot = loadRecordSnapshot(record);
       if (!loadedSnapshot.ok) return loadedSnapshot;
       claimed.value.snapshot = loadedSnapshot.value;
@@ -20283,6 +20339,7 @@ export {
   acquisitionFailureHold,
   setRuntimeAcquisitionHold,
   loadAcquisitionStore,
+  readAcquisitionSnapshot,
   createAcquisitionEngine,
   pollPolicyInterval,
   advanceUnchangedCount,
