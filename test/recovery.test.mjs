@@ -151,6 +151,33 @@ test("D6: recovery journal is bounded, payload-free, survives handoff and clears
   assert.equal(blocked.ok, false);
 });
 
+test("D6: recovery journal survives an earlier event clock and repairs retained timestamp skew", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-recovery-clock-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = { path: join(root, "quota.json") };
+  const at = Date.now();
+  const cause = (time) => recoveryCause({ reason: "busy", resource: "core", at: time });
+
+  assert.equal(recordRecoveryTransition(scope, cause(at)).ok, true);
+  assert.equal(recordRecoveryTransition(scope, cause(at - 500)).ok, true);
+  const afterRollback = readRecoveryTransitions(scope);
+  assert.equal(afterRollback.status, "healthy");
+  assert.equal(afterRollback.current.core.firstAt, at - 500);
+  assert.equal(afterRollback.current.core.at, at - 500);
+
+  const path = `${scope.path}.recovery.json`;
+  const retained = JSON.parse(readFileSync(path, "utf8"));
+  retained.current.core.firstAt = at + 500;
+  writeFileSync(path, JSON.stringify(retained));
+  const repairedRead = readRecoveryTransitions(scope);
+  assert.equal(repairedRead.status, "healthy");
+  assert.equal(repairedRead.current.core.firstAt, at - 500);
+  assert.equal(repairedRead.entries.length, retained.entries.length);
+  assert.equal(recordRecoveryTransition(scope, cause(at + 1000)).ok, true);
+  assert.equal(readRecoveryTransitions(scope).status, "healthy");
+  assert.equal(JSON.parse(readFileSync(path, "utf8")).current.core.firstAt, at - 500);
+});
+
 test("D6: valid-shaped private strings cannot become recovery codes or doctor text", (t) => {
   const root = mkdtempSync(join(tmpdir(), "gh-glance-recovery-private-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
