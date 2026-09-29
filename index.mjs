@@ -15647,19 +15647,24 @@ function recoveryEvent(entry) {
   if (!isRecord(entry)) return null;
   if (exactKeys(entry, ["code", "resource", "at"]) && entry.code === "clear" &&
       RATE_RESOURCES.includes(entry.resource) && Number.isFinite(entry.at)) return entry;
-  if (!exactKeys(entry, RECOVERY_EVENT_KEYS) || !RATE_RESOURCES.includes(entry.resource) ||
-      typeof entry.code !== "string" || !Object.hasOwn(RECOVERY_COPY, entry.code) ||
-      !Number.isFinite(entry.at) || !Number.isFinite(entry.firstAt) || entry.firstAt > entry.at ||
+  // An earlier clock sample can arrive after a later one for the same cause.
+  // Repair only this bounded timestamp skew; every other field stays subject
+  // to the strict journal validation below.
+  const event = Number.isFinite(entry.at) && Number.isFinite(entry.firstAt) && entry.firstAt > entry.at
+    ? { ...entry, firstAt: entry.at } : entry;
+  if (!exactKeys(event, RECOVERY_EVENT_KEYS) || !RATE_RESOURCES.includes(event.resource) ||
+      typeof event.code !== "string" || !Object.hasOwn(RECOVERY_COPY, event.code) ||
+      !Number.isFinite(event.at) || !Number.isFinite(event.firstAt) ||
       ["retryAt", "sourceAt", "oldestUnresolvedAt", "observerAt"].some((key) =>
-        entry[key] !== null && (!Number.isFinite(entry[key]) || entry[key] < 0)) ||
+        event[key] !== null && (!Number.isFinite(event[key]) || event[key] < 0)) ||
       ["receiptUnits", "debtUnits", "terminalizationBacklog"].some((key) =>
-        entry[key] !== null && (!Number.isSafeInteger(entry[key]) || entry[key] < 0)) ||
-      typeof entry.lastFailedTransition !== "string" ||
-      !Object.hasOwn(RECOVERY_COPY, entry.lastFailedTransition) ||
-      !["source", "coordination"].includes(entry.origin) ||
-      (entry.tab !== null && !TAB_KEYS.includes(entry.tab)) ||
-      Buffer.byteLength(JSON.stringify(entry)) > RECOVERY_ENTRY_MAX_BYTES) return null;
-  return entry;
+        event[key] !== null && (!Number.isSafeInteger(event[key]) || event[key] < 0)) ||
+      typeof event.lastFailedTransition !== "string" ||
+      !Object.hasOwn(RECOVERY_COPY, event.lastFailedTransition) ||
+      !["source", "coordination"].includes(event.origin) ||
+      (event.tab !== null && !TAB_KEYS.includes(event.tab)) ||
+      Buffer.byteLength(JSON.stringify(event)) > RECOVERY_ENTRY_MAX_BYTES) return null;
+  return event;
 }
 
 function visibleRecoveryEvent(entry) {
@@ -15681,17 +15686,21 @@ function readRecoveryTransitions(scope) {
   }
   try {
     const journal = JSON.parse(raw);
+    const entries = journal.entries?.map(recoveryEvent);
+    const current = journal.current && Object.fromEntries(RATE_RESOURCES.map((resource) => [
+      resource, journal.current[resource] === null ? null : recoveryEvent(journal.current[resource]),
+    ]));
     if (!exactKeys(journal, ["version", "current", "entries"]) || journal.version !== 1 ||
         !exactKeys(journal.current, RATE_RESOURCES) || !Array.isArray(journal.entries) ||
         journal.entries.length > RECOVERY_JOURNAL_MAX_ENTRIES ||
-        journal.entries.some((entry) => recoveryEvent(entry) === null) ||
-        Object.values(journal.current).some((entry) => entry !== null &&
-          (recoveryEvent(entry) === null || entry.code === "clear"))) {
+        entries.some((entry) => entry === null) ||
+        RATE_RESOURCES.some((resource) => journal.current[resource] !== null &&
+          (current[resource] === null || current[resource].code === "clear"))) {
       return { ...emptyRecoveryJournal(), status: "corrupt" };
     }
     return { version: 1, current: Object.fromEntries(RATE_RESOURCES.map((resource) =>
-      [resource, visibleRecoveryEvent(journal.current[resource])])),
-    entries: journal.entries.map(visibleRecoveryEvent), status: "healthy" };
+      [resource, visibleRecoveryEvent(current[resource])])),
+    entries: entries.map(visibleRecoveryEvent), status: "healthy" };
   } catch {
     return { ...emptyRecoveryJournal(), status: "corrupt" };
   }
@@ -15716,7 +15725,7 @@ function recordRecoveryTransition(scope, event) {
     } else {
       const entry = plain(recoveryCause({ ...event, reason: event.reason ?? event.code, at }));
       entry.firstAt = former?.code === entry.code && former?.origin === entry.origin &&
-        former?.tab === entry.tab ? former.firstAt : at;
+        former?.tab === entry.tab ? Math.min(former.firstAt, at) : at;
       if (Buffer.byteLength(JSON.stringify(entry)) > RECOVERY_ENTRY_MAX_BYTES) return { ok: false, reason: "capacity" };
       journal.current[event.resource] = entry;
       if (former?.code !== entry.code || former?.origin !== entry.origin || former?.tab !== entry.tab) {
