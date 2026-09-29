@@ -49,6 +49,7 @@ import {
   writeGovernorState,
   stagedAcquisitionPublicationView,
   setRuntimeAcquisitionHold,
+  clearScheduledRuntimeControlHold,
 } from "../index.mjs";
 import { agedGovernorV6, agedGovernorResiduals } from "./fixtures/aged-governor-v6.mjs";
 
@@ -1278,6 +1279,37 @@ test("OBS-03: runtime holds target one access partition and clear on cached foll
   assert.equal(runtime.inspect(accessB.value.id).value.hold, null);
   diagnostics = runtime.diagnostics().value.queries;
   assert.equal(diagnostics.some((item) => item.hold === "observer" || item.hold === "primary"), false);
+});
+
+test("scheduled control clears only an observed coordination hold in the same access partition", (t) => {
+  const box = fixture(t);
+  const runtime = createAcquisitionEngine(box);
+  t.after(() => runtime.close());
+  const accessKey = "a".repeat(64);
+  const subscribed = runtime.subscribe(query("R_widget", "actions", { accessKey }),
+    { active: true, floorMs: 5_000 });
+  const current = new Map([["actions", subscribed.value]]);
+
+  assert.equal(setRuntimeAcquisitionHold(runtime, current, "actions", "coordination", accessKey).ok,
+    true);
+  assert.equal(clearScheduledRuntimeControlHold(runtime, current, "actions", accessKey,
+    NOW + 1).value, "cleared");
+  assert.equal(runtime.inspect(subscribed.value.id).value.hold, null);
+
+  assert.equal(setRuntimeAcquisitionHold(runtime, current, "actions", "primary", accessKey).ok,
+    true);
+  assert.equal(clearScheduledRuntimeControlHold(runtime, current, "actions", accessKey,
+    NOW).value, "retained");
+  assert.equal(runtime.inspect(subscribed.value.id).value.hold?.reason, "primary");
+
+  box.setNow(NOW + 1);
+  assert.equal(setRuntimeAcquisitionHold(runtime, current, "actions", "coordination", accessKey).ok,
+    true);
+  assert.equal(clearScheduledRuntimeControlHold(runtime, current, "actions", accessKey,
+    NOW + 1).reason, "newer-hold");
+  assert.equal(runtime.inspect(subscribed.value.id).value.hold?.reason, "coordination");
+  assert.equal(clearScheduledRuntimeControlHold(runtime, current, "actions", "b".repeat(64),
+    NOW + 1).reason, "stale-access");
 });
 
 test("SHARE-05: a suspended live owner is not stolen, but a confirmed dead owner is fenced", async (t) => {

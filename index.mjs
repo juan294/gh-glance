@@ -14636,7 +14636,11 @@ function createAcquisitionEngine({
     const item = local.get(id);
     if (!item || reason !== null && !ACQUISITION_HOLD_REASONS.has(reason) ||
         expected !== null && (!isRecord(expected) || !TAB_KEYS.includes(expected.resource) ||
-          typeof expected.accessKey !== "string" || expected.accessKey.length === 0)) {
+          typeof expected.accessKey !== "string" || expected.accessKey.length === 0 ||
+          expected.currentHold !== undefined &&
+            (!isRecord(expected.currentHold) ||
+              !ACQUISITION_HOLD_REASONS.has(expected.currentHold.reason) ||
+              !Number.isFinite(expected.currentHold.at)))) {
       return { ok: false, reason: "invalid" };
     }
     return transact((state) => {
@@ -14644,6 +14648,11 @@ function createAcquisitionEngine({
       if (!record) return { ok: false, reason: "stale" };
       if (expected && (record.query.resource !== expected.resource ||
           record.query.accessKey !== expected.accessKey)) return { ok: false, reason: "stale-access" };
+      if (expected?.currentHold !== undefined &&
+          (record.hold?.reason !== expected.currentHold.reason ||
+            record.hold?.at !== expected.currentHold.at)) {
+        return { ok: false, reason: "stale-hold" };
+      }
       if ((record.hold?.reason ?? null) === reason) return { changed: false, value: true };
       const next = reason === null ? null : { reason, at: now() };
       record.hold = next;
@@ -14966,6 +14975,27 @@ function setRuntimeAcquisitionHold(engine, subscriptions, resource, reason, acce
     return { ok: false, reason: "stale-access" };
   }
   return engine.setHold(subscription.id, reason, { resource, accessKey });
+}
+
+function clearScheduledRuntimeControlHold(engine, subscriptions, resource, accessKey, observedAt) {
+  const subscription = subscriptions?.get(resource);
+  if (!subscription?.id) return { ok: false, reason: "stale" };
+  if (typeof accessKey !== "string" || !Number.isFinite(observedAt)) {
+    return { ok: false, reason: "stale-access" };
+  }
+  const inspected = engine.inspect(subscription.id);
+  if (!inspected.ok) return inspected;
+  const record = inspected.value;
+  if (record?.query?.resource !== resource || record.query.accessKey !== accessKey) {
+    return { ok: false, reason: "stale-access" };
+  }
+  const hold = record.hold;
+  if (!hold) return { ok: true, value: "already-clear" };
+  if (hold.reason !== "coordination") return { ok: true, value: "retained" };
+  if (hold.at >= observedAt) return { ok: false, reason: "newer-hold" };
+  const cleared = engine.setHold(subscription.id, null,
+    { resource, accessKey, currentHold: hold });
+  return cleared.ok ? { ok: true, value: "cleared" } : cleared;
 }
 
 // The one place the cadence table is decided. It used to be spread across a
@@ -17424,6 +17454,8 @@ function App({ onCreateRemote = () => {} } = {}) {
         : { ...current, [key]: value });
     }
 
+    const scheduledControlAttempts = new Map();
+
     function recordRuntimeRecovery(key, reason, { retryAt = null, origin = "coordination" } = {}) {
       const resource = RATE_RESOURCES.find((candidate) => tabRequestCost(key)[candidate] > 0);
       if (!resource) return;
@@ -17574,16 +17606,33 @@ function App({ onCreateRemote = () => {} } = {}) {
       const reservation = pendingIntent
         ? snapshot.value.reservations[`reservation:${pendingIntent.intentId}`]
         : null;
+      const costs = tabRequestCost(key);
       if (reservation?.status === "scheduled" && reservation.notBefore > nowMs) {
+        const accessKey = pendingIntent.cleanupScope?.accessKey;
+        const reservationId = `reservation:${pendingIntent.intentId}`;
+        const lastAttempt = scheduledControlAttempts.get(key);
+        if (accessKey && pendingIntent.cleanupScope?.hash === scope?.hash &&
+            identity()?.accessKey === accessKey &&
+            (lastAttempt?.id !== reservationId || nowMs - lastAttempt.at >= 30_000)) {
+          scheduledControlAttempts.set(key, { id: reservationId, at: nowMs });
+          // A future grant proves quota progress, while this read and guarded
+          // update establish that acquisition storage is available too.
+          const cleared = clearScheduledRuntimeControlHold(acquisitionEngine,
+            acquisitionSubscriptions, key, accessKey, nowMs);
+          if (cleared.ok && cleared.value !== "retained") {
+            for (const resource of RATE_RESOURCES) {
+              if (costs[resource] > 0) clearRuntimeRecovery(resource);
+            }
+          }
+        }
         setTabGovernorDecision(key, visibleGovernorDecision({
           status: "scheduled",
-          reservationId: `reservation:${pendingIntent.intentId}`,
+          reservationId,
           ...reservation,
           ...currentSharedLaneProvenance(pendingIntent, snapshot.value.leases, nowMs),
         }));
         return;
       }
-      const costs = tabRequestCost(key);
       for (const resource of RATE_RESOURCES) {
         if (costs[resource] <= 0) continue;
         const budget = snapshot.value.budgets[resource];
@@ -20338,6 +20387,7 @@ export {
   acquisitionRequestMetrics,
   acquisitionFailureHold,
   setRuntimeAcquisitionHold,
+  clearScheduledRuntimeControlHold,
   loadAcquisitionStore,
   readAcquisitionSnapshot,
   createAcquisitionEngine,
