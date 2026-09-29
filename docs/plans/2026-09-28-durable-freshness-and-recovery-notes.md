@@ -22,3 +22,10 @@
 - Found: the strict monitor applied 60 seconds to every first observation, including 120-second and 300-second background tabs. It also read quota using a clock captured before acquisition hydration, so a newer valid quota record could be rejected.
 - Chose: retain 60 seconds for active demand, use cadence plus allowance for background demand, and validate quota against a fresh post-hydration clock.
 - Why: the previous monitor could fail a valid background interval and could report quota unavailable during a concurrent valid write.
+
+### Phase 4 subscription remap and source-read clock
+
+- Plan said: one shared acquisition query survives repository identity discovery, and the strict report rejects genuinely future source timestamps.
+- Found: a concurrent canonical query-key remap can occur after a subscription commits or after its snapshot hydrates, leaving a local first refresh on the old key. A source publication during monitor hydration can also be newer than the sample-start clock while remaining valid at read completion.
+- Chose: register a cleanup owner before subscription hydration, follow the authoritative shared subscription key in setup and first refresh, and record a separate source-read completion time for validation and JSONL audit.
+- Why: a committed subscription must not be orphaned by a remap, and a valid concurrent source publication must not fail the entire strict window as a future timestamp.
