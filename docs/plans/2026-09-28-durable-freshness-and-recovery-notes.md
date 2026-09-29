@@ -2,6 +2,13 @@
 
 ## Deviations
 
+### Phase 4 combined repair review
+
+- Plan said: preserve actionable recovery causes until matching evidence proves recovery.
+- Found: the pending scheduled-disclosure experiment cleared coordination-origin recovery after inspecting a null acquisition hold, although the missing hold could itself be caused by a failed write.
+- Chose: combine the three pending repairs on local branch `integrate/recovery-repairs`, then require a successful guarded hold write and a known transient coordination cause before scheduled progress clears recovery. Retain hard storage, quota, observer, debt, source and backlog causes. An independent reviewer approved the corrected boundary.
+- Why: future scheduling and a readable empty hold do not prove storage recovery. The red regression, 88 acquisition/recovery tests, four pacing regressions and four-pane pacing PTY fixture pass on the repaired combined source, but full native gates remain pending because local listeners and boot identity reads are still denied. Source commit `96f4b853f05d6dc54b1d248ccb825166d6e03221` remains unmerged and uninstalled; Phase 4 validation records the execution prerequisite.
+
 ### Phase 4 retained debt and unused pacing
 
 - Plan said: preserve conservative retained debt while permitting bounded recovery and valid conditional observations.
