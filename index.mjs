@@ -5097,7 +5097,7 @@ const GOVERNOR_MAX_ATOMIC_COST = Math.max(...Object.values(OPERATION_COSTS)
 function returnPacingCredit(state, resource, unusedCost, nowMs) {
   const budget = state.budgets[resource];
   if (!budget || !(unusedCost > 0)) return;
-  const decision = resourceDecision({ budget, resource, nowMs, cost: 0, chargedCost: 0 });
+  const decision = governorResourceDecision(state, resource, nowMs, 0);
   const callsPerMs = decision?.callsPerMs;
   if (!Number.isFinite(callsPerMs) || callsPerMs <= 0) return;
   const credit = Math.min(unusedCost, GOVERNOR_MAX_ATOMIC_COST) / callsPerMs;
