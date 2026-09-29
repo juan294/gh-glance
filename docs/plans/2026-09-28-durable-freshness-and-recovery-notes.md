@@ -2,6 +2,14 @@
 
 ## Deviations
 
+### Phase 4 retained debt and unused pacing
+
+- Plan said: preserve conservative retained debt while permitting bounded recovery and valid conditional observations.
+- Found: the scheduler includes retained debt when it prices a grant, but `returnPacingCredit` in index.mjs:5097 calculates unused-slot credit with `chargedCost: 0`. With a stable budget and retained debt, a zero-cost completion leaves a delay for quota it never consumed. The live external multiplier magnifies that discrepancy.
+- Chose: reproduce the mismatch through production grant/start/settlement in an isolated local fixture, then make credit use the same authoritative charge calculation as admission. Preserve the reserve, debt, external factor, shared transport floor, credit cap and start-time affordability check.
+- Why: this repairs the existing pacing-credit contract without requiring Cirujano to stop or changing the selected authentication setup. Local replay and any passing regression do not replace the required installed personal and EMU windows.
+- Disposition: independently approved repair retained on local branch `investigate/pacing-recovery` at `a881d1d60df0ab666b8983e452c0955f07fc404b`. The three red regressions pass after repair, lint and syntax pass, and the existing four-pane pacing PTY fixture passes. Complete local verification remains failed/incomplete, including explicit socket restrictions in all three failed efficiency cases. See the Phase 4 validation for all outcomes. Do not merge or install this repair until those gates pass.
+
 ### Phase 4 advisory recovery journal clock skew
 
 - Plan said: retained recovery diagnostics disclose current cause and retry information without blocking source publication.
