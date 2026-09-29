@@ -242,6 +242,20 @@ function testDebtGroup({ units = 1, at, revision = 1, quiescent = true } = {}) {
   };
 }
 
+function retainedDebtPacing(t, authIdentity) {
+  const { scope } = sandbox(t, { authIdentity });
+  const leaseId = randomUUID();
+  registerLease(scope, lease(leaseId));
+  publishInitial(scope, leaseId, NOW, budgets(NOW, { remaining: 2056 }));
+  const initial = inspectGovernor(scope, NOW).value;
+  initial.debtGroups[randomUUID()] = testDebtGroup({ units: 462, at: NOW - 1, quiescent: false });
+  initial.debt.core.unresolvedUnits = 462;
+  initial.debt.core.unresolvedCount = 1;
+  initial.budgets.core.lastExternalFactor = 177;
+  assert.equal(writeGovernorState(scope.path, initial).ok, true);
+  return { scope, leaseId };
+}
+
 async function worker(command) {
   const { stdout } = await execFileAsync(process.execPath, [WORKER, JSON.stringify(command)], {
     maxBuffer: 4 * 1024 * 1024,
@@ -471,6 +485,84 @@ test("uncertain settlement keeps a later reservation's paced deadline", (t) => {
     { outcome: "abort" }, at + 100).ok, true);
   assert.equal(readIntentDecision(scope, actionsId, at + 100).value.notBefore,
     actions.value.notBefore);
+});
+
+test("zero-cost completion returns unused pacing while retaining unresolved debt", (t) => {
+  const { scope, leaseId } = retainedDebtPacing(t, "debt-pacing-credit");
+
+  const at = NOW + GOVERNOR_PHASE_WINDOW_MS + 1;
+  const grant = registerIntent(scope, intent(randomUUID(), leaseId, at)).value;
+  assert.equal(grant.notBefore, at);
+  assert.equal(startReservation(scope, grant.reservationId, at).value.status, "started");
+  const before = inspectGovernor(scope, at).value;
+  assert.ok(before.budgets.core.laneNextAt > at + 60_000,
+    "fixture must reserve more than a minute of pacing");
+  assert.equal(completeReservation(scope, grant.reservationId, {
+    outcome: "measured-success", actualCost: { core: 0, graphql: 0 },
+  }, at).ok, true);
+  const after = inspectGovernor(scope, at).value;
+  assert.deepEqual(after.debt, before.debt, "pacing credit cannot retire debt");
+  assert.equal(after.budgets.core.remaining, 2056, "pacing credit cannot invent quota");
+  assert.equal(after.budgets.core.lastExternalFactor, 177, "pacing credit cannot weaken external pressure");
+  assert.equal(after.budgets.core.laneNextAt, at + 250,
+    "a zero-cost observation must return its entire unused slot to the transport floor");
+  const next = registerIntent(scope, intent(randomUUID(), leaseId, at)).value;
+  assert.equal(next.notBefore, at + 250);
+  assert.equal(startReservation(scope, next.reservationId, next.notBefore).value.status, "started");
+});
+
+test("cancellation returns debt-adjusted pacing without bypassing the reserve", (t) => {
+  const { scope, leaseId } = retainedDebtPacing(t, "debt-pacing-cancel");
+  const id = randomUUID();
+  const at = NOW + GOVERNOR_PHASE_WINDOW_MS + 1;
+  const grant = registerIntent(scope, intent(id, leaseId, at)).value;
+  assert.equal(grant.notBefore, at);
+  const debt = inspectGovernor(scope, at).value.debt;
+  assert.equal(cancelIntent(scope, id, at).ok, true);
+  const next = registerIntent(scope, intent(randomUUID(), leaseId, at)).value;
+  assert.equal(next.notBefore, at + 250,
+    "unissued work must return its entire unused pacing slot");
+
+  const state = inspectGovernor(scope, at).value;
+  assert.deepEqual(state.debt, debt);
+  state.budgets.core.remaining = 1462;
+  state.budgets.core.used = 3538;
+  assert.equal(writeGovernorState(scope.path, state).ok, true);
+  const start = startReservation(scope, next.reservationId, next.notBefore);
+  assert.equal(start.ok, false);
+  assert.equal(start.reason, "stale");
+});
+
+test("zero-cost pacing credit advances queued panes without dropping debt or their grant", (t) => {
+  const { scope, leaseId } = retainedDebtPacing(t, "debt-pacing-queue");
+  const otherLeaseId = randomUUID();
+  registerLease(scope, lease(otherLeaseId));
+  const at = NOW + GOVERNOR_PHASE_WINDOW_MS + 1;
+  const first = registerIntent(scope, intent(randomUUID(), leaseId, at)).value;
+  assert.equal(startReservation(scope, first.reservationId, at).value.status, "started");
+  const nextId = randomUUID();
+  const next = registerIntent(scope, intent(nextId, otherLeaseId, at)).value;
+  assert.ok(next.notBefore > at + 60_000);
+  const debt = inspectGovernor(scope, at).value.debt;
+  assert.equal(completeReservation(scope, first.reservationId, {
+    outcome: "measured-success", actualCost: { core: 0, graphql: 0 },
+  }, at).ok, true);
+  const revised = readIntentDecision(scope, nextId, at).value;
+  assert.equal(revised.reservationId, next.reservationId);
+  assert.equal(revised.notBefore, at + 250,
+    "a queued pane must receive the pacing returned by a zero-cost observation");
+  assert.equal(startReservation(scope, revised.reservationId, revised.notBefore).value.status, "started");
+  assert.equal(completeReservation(scope, revised.reservationId, {
+    outcome: "measured-success", actualCost: { core: 0, graphql: 0 },
+  }, revised.notBefore).ok, true);
+  const state = inspectGovernor(scope, revised.notBefore).value;
+  assert.deepEqual(state.debt, debt);
+  assert.equal(state.budgets.core.lastExternalFactor, 177);
+  // The second grant was priced while the first still reserved one unit.
+  // Its later credit is an estimate at the now-larger available capacity.
+  assert.ok(state.budgets.core.laneNextAt >= revised.notBefore + 250);
+  assert.ok(state.budgets.core.laneNextAt < revised.notBefore + 60_000,
+    "settling both zero-cost requests must not retain minutes of unused pacing");
 });
 
 test("heartbeats extend leases while release and expiry prune only unstarted work", (t) => {
