@@ -2,6 +2,12 @@
 
 ## Deviations
 
+### Phase 4 unavailable Security capability, decision pending
+
+- Found: the corrected, authorized ten-pane attempt stopped before measurement on a Chapa Security HTTP 403. Its exact subendpoint is not logged and its cost remains unknown. A separate bounded read-only request verified that Chapa code scanning currently returns an explicit disabled-feature response, with available Core quota.
+- Proposed: qualify accessible source data and verify explicit unavailable notices for disabled Security capabilities. Preserve D6: partial Security must never advance complete source freshness or count as complete Security coverage. Do not silently remove the failed windows, change repository settings or waive unexplained internal stalls.
+- Decision: pending user response. The full-Security cohort contract is incompatible with an explicitly disabled source; changing that acceptance requirement needs the owner's decision before dependent monitor or relay work. Product and helper behavior remain unchanged.
+
 ### Phase 4 personal harness startup allowance
 
 - Plan said: prepare a bounded ten-pane window with all forty subscriptions registered before 1,800 seconds of strict measurement. The prepared helper allowed only sixty seconds outside measurement, shared between setup and end comparisons.
