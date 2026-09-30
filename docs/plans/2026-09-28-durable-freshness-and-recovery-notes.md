@@ -2,6 +2,13 @@
 
 ## Deviations
 
+### Phase 4 personal harness startup allowance
+
+- Plan said: prepare a bounded ten-pane window with all forty subscriptions registered before 1,800 seconds of strict measurement. The prepared helper allowed only sixty seconds outside measurement, shared between setup and end comparisons.
+- Found: the authorized attempt stopped at its sixty-second setup deadline before creating a monitor manifest. The production bootstrap registers the active tab only (`index.mjs:19306`). Background deadlines open at one, two and three multiples of four refresh floors (`index.mjs:18426`); at the selected ten-second floor, the inactive tabs become due approximately forty, eighty and 120 seconds after bootstrap. Their subscriptions are created on the corresponding request path (`index.mjs:18817`). Requiring all forty subscriptions within sixty seconds contradicts that normal startup schedule. This is a harness design defect; the previous offline registration fixtures did not cover the production delay.
+- Chose: preserve the failed attempt and prepare a separate helper revision with at most 180 seconds for setup, 1,800 seconds of strict measurement and sixty seconds for end capture, inside an immutable 2,040-second outer bound. Keep the 1,200 request and per-resource cost caps and the 2,000-unit remaining floor. Review and verify locally before requesting authorization for the longer operational window. Do not change the application startup schedule or extend an active run.
+- Why: the existing 31-minute authorization cannot fit the application's normal startup plus the complete measurement and end comparisons. A stopped attempt is incomplete, not a qualifying shorter window. The final interrupted GraphQL request retains unknown cost and its conservative reservation.
+
 ### Phase 4 terminal-test observation contracts
 
 - Plan said: verify reset recovery and governed failure diagnosis through the full terminal suite.
