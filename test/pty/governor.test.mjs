@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import {
   ACQUISITION_CLAIM_TTL_MS,
   ACQUISITION_STARTED_DEADLINE_MS,
+  BUDGET_RESET_GRACE_MS,
   BUDGET_SNAPSHOT_TTL_MS,
   GOVERNOR_LEASE_TTL_MS,
   GOVERNOR_LOCK_ORPHAN_MS,
@@ -100,6 +101,36 @@ function probes(state) {
   // The shared budget probe is the claimed GraphQL observer now. `api
   // rate_limit` is no longer authority, so it is not what panes coordinate on.
   return starts(state, (event) => event.graphqlOperation === "graphql.observer");
+}
+
+function observedReset(governor, previousEpoch, boundary) {
+  return governor?.epochs?.core !== previousEpoch &&
+    ["core", "graphql"].every((resource) =>
+      governor?.observers?.[resource]?.outcome === "healthy" &&
+      governor.observers[resource].at >= boundary);
+}
+
+function assertResetObservers(state, governor, previousEpoch, boundary) {
+  assert.ok(observedReset(governor, previousEpoch, boundary),
+    JSON.stringify({ epochs: governor.epochs, observers: governor.observers, boundary }));
+  // The first GraphQL publication can fall on either side of the core reset
+  // grace boundary. Only a publication before it needs another observation.
+  const observed = probes(state);
+  assert.ok(observed.length >= 1 && observed.length <= 2,
+    `expected one shared observer, with at most one earlier startup observation: ${JSON.stringify(observed)}`);
+  const sequences = new Set(observed.map((event) => event.sequence));
+  const active = new Set();
+  for (const event of state.events) {
+    if (!sequences.has(event.sequence)) continue;
+    if (event.type === "start") active.add(event.sequence);
+    if (event.type === "end") active.delete(event.sequence);
+    assert.ok(active.size <= 1, "GraphQL observers overlapped across panes");
+  }
+  assert.equal(active.size, 0, "reset observation did not complete");
+  assert.ok(state.events.some((event) => event.type === "end" &&
+    event.argv.includes("user") && [200, 304].includes(event.status) &&
+    event.at >= state.createdAt + state.resetSequence[0].offsetMs),
+  "core has no successful response after the fixture reset");
 }
 
 function dataStarts(state) {
@@ -954,6 +985,8 @@ test("a real reset resumes all panes, while atomic external burn limits the next
   let resetProgress;
   let resetSchedule;
   let firstEpoch;
+  let resetBoundary;
+  let resetObservedGovernor;
   try {
     const first = await observeUntil(
       () => ({ fixture: resetBox.read(), governor: resetBox.readGovernor() }),
@@ -961,6 +994,7 @@ test("a real reset resumes all panes, while atomic external burn limits the next
       15_000,
     );
     firstEpoch = first.governor.epochs.core;
+    resetBoundary = first.governor.budgets.core.resetMs + BUDGET_RESET_GRACE_MS;
     resetCaptures.push(...Array.from({ length: 11 }, (_, offset) =>
       startPane(resetBox, `reset-${offset + 1}`, {
         readyPath: resetReady,
@@ -976,17 +1010,20 @@ test("a real reset resumes all panes, while atomic external burn limits the next
       30_000,
     );
     resetSchedule = scheduled;
-    resetProgress = await observeUntil(
-      resetBox.read,
-      (state) => probes(state).length === 2 && actionsRuns(state).length === 1,
+    const observed = await observeUntil(
+      () => ({ fixture: resetBox.read(), governor: resetBox.readGovernor() }),
+      ({ fixture: state, governor }) => observedReset(governor, firstEpoch, resetBoundary) &&
+        actionsRuns(state).length === 1,
       reservationHorizon(scheduled, "core"),
     );
+    resetProgress = observed.fixture;
+    resetObservedGovernor = observed.governor;
   } finally {
     await releasePanes(resetReady, resetCaptures);
   }
   const resetGovernor = resetBox.readGovernor();
   assert.notEqual(resetGovernor.epochs.core, firstEpoch);
-  assert.equal(probes(resetProgress).length, 2);
+  assertResetObservers(resetProgress, resetObservedGovernor, firstEpoch, resetBoundary);
   const resetData = dataStarts(resetProgress);
   const resetRuns = actionsRuns(resetProgress);
   const resetActionsData = resetData.filter(isActionsEndpoint);
@@ -1017,8 +1054,14 @@ test("a real reset resumes all panes, while atomic external burn limits the next
   })];
 
   let burned;
+  let burnObservedGovernor;
+  let burnEpoch;
+  let burnBoundary;
   try {
     const anchored = await observeUntil(burnBox.read, (state) => Number.isFinite(state.createdAt), 10_000);
+    const initial = burnBox.readGovernor();
+    burnEpoch = initial.epochs.core;
+    burnBoundary = initial.budgets.core.resetMs + BUDGET_RESET_GRACE_MS;
     burnCaptures.push(...Array.from({ length: 11 }, (_, offset) =>
       startPane(burnBox, `burn-${offset + 1}`, { readyPath: burnReady, settle: 35 })));
     await new Promise((resolve) => setTimeout(
@@ -1033,11 +1076,14 @@ test("a real reset resumes all panes, while atomic external burn limits the next
     ], {
       env: { GH_GLANCE_FIXTURE_STATE: burnBox.statePath },
     });
-    burned = await observeUntil(
-      burnBox.read,
-      (state) => probes(state).length === 2 && dataStarts(state).length >= 1,
+    const observed = await observeUntil(
+      () => ({ fixture: burnBox.read(), governor: burnBox.readGovernor() }),
+      ({ fixture: state, governor }) => observedReset(governor, burnEpoch, burnBoundary) &&
+        dataStarts(state).length >= 1,
       20_000,
     );
+    burned = observed.fixture;
+    burnObservedGovernor = observed.governor;
     await new Promise((resolve) => setTimeout(resolve, 11_000));
   } finally {
     await releasePanes(burnReady, burnCaptures);
@@ -1063,7 +1109,7 @@ test("a real reset resumes all panes, while atomic external burn limits the next
   assert.equal(burnActionsData.length, burnRuns.length * ACTIONS_CALLS,
     `burn admitted incomplete or extra Actions work: ${burnDetails()}`);
   assertOtherTabData(burnOtherData, "burn", burnDetails);
-  assert.equal(probes(burned).length, 2);
+  assertResetObservers(burned, burnObservedGovernor, burnEpoch, burnBoundary);
   assertDebitsStayOutsideReserve(burnData);
 });
 

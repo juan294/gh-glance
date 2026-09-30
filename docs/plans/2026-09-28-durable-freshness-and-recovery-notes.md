@@ -2,6 +2,20 @@
 
 ## Deviations
 
+### Phase 4 terminal-test observation contracts
+
+- Plan said: verify reset recovery and governed failure diagnosis through the full terminal suite.
+- Found: the complete native run passed 145 terminal tests, failed two and skipped the expected opt-in baseline. The reset case recovered Actions but rejected one GraphQL observer where it assumed two; the unchanged isolated case passed with two. The first GraphQL publication can legitimately fall before or after the Core reset grace boundary. The inaccessible-repository capture stopped after seven seconds without reaching its Issues failure, and its repository-context assertion still checked the retired `repo view` command. A preserved isolated replay reached the expected Failed frame.
+- Chose: assert changed Core epoch and healthy observer publications after the reset boundary, while retaining bounded shared observations, reservation timing, duplicate-work and reserve checks. Wait for the actual Failed frame under a 20-second bound and verify current GraphQL repository-context requests against their admitted reservation receipts. Independent review approved both test repairs and found no additional simplify change.
+- Why: terminal tests must observe the required behavior and current transport without depending on an incidental observer count or startup timing. Application source remains unchanged at SHA-256 `a7a442c1c4083b7b6f85e7871b023d65e9c348a2a729ad6fdf77ff7c4cf687ae`; the complete repaired terminal gate remains required before integration.
+
+### Phase 4 shared-account impact reported by the user
+
+- Plan said: qualify the installed candidate on the personal account while preserving its existing login and conservative quota accounting.
+- Found: the user reported a verified personal-token rate-limit failure in coach-upptime and the same exposure in spoken-letter-upptime. They separately reported fixing workflow approval blocks in archy-upptime and paisaxe-upptime by updating Upptime workflows; those approval blocks are distinct from quota exhaustion. Their 20-second process sample attributed substantial traffic to candidate panes. At the initial report this session could not independently inspect ancestry because `/bin/ps` was denied; a later approved passive sample after pane closure found no candidate processes or API calls and cannot reconstruct earlier ownership. The installed executable contains no literal `actions/runners` endpoint. Raw request counts alone do not establish charged primary units because authenticated conditional 304s are uncharged.
+- Chose: stop further live qualification and diagnostic GitHub API calls during the audit. The user closed the candidate panes. Keep other GitHub tasks and Upptime configuration unchanged. Require verified request ancestry and charged-unit accounting, including identity/observer traffic, through a bounded one-pane diagnostic before considering multi-pane activation. Do not attribute unaccounted demand exclusively to Cirujano or require moving Upptime credentials as a prerequisite to fixing the candidate.
+- Why: the live experiment must not compromise other account workloads. Current local counters are partial evidence: over a 35.5-second snapshot interval acquisition recorded three GraphQL requests and two observer calls; the cached Core counter advanced 211 units between observations 60.609 seconds apart. The intervals do not align and the counters do not cover every possible call, so exact client attribution remains unmeasured. No live qualification or candidate restart should resume on the strength of offline passes alone.
+
 ### Phase 4 combined repair review
 
 - Plan said: preserve actionable recovery causes until matching evidence proves recovery.
@@ -51,3 +65,9 @@
 - Found: a concurrent canonical query-key remap can occur after a subscription commits or after its snapshot hydrates, leaving a local first refresh on the old key. A source publication during monitor hydration can also be newer than the sample-start clock while remaining valid at read completion.
 - Chose: register a cleanup owner before subscription hydration, follow the authoritative shared subscription key in setup and first refresh, and record a separate source-read completion time for validation and JSONL audit.
 - Why: a committed subscription must not be orphaned by a remap, and a valid concurrent source publication must not fail the entire strict window as a future timestamp.
+
+### Phase 4 completed native gates, 2026-09-30
+
+- The combined source now has valid sequential local results: lint and syntax passed, 713 unit tests passed, nine efficiency tests passed, and the repaired complete terminal suite passed 147 tests with one expected skip and zero failures. The terminal rerun ended at 06:12:32Z; its source hash is unchanged from the earlier unit and efficiency checks.
+- These results supersede the native execution blocker recorded above. They permit local integration of the reviewed source and test repairs. They do not waive the failed personal windows or the unmeasured work EMU qualification.
+- The immutable package and bounded one-pane request-accounting diagnostic are recorded in Phase 4 validation. Cirujano and Upptime configuration remain unchanged; broad candidate activation is not authorized by a passing offline gate.
