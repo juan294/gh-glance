@@ -3479,13 +3479,24 @@ function settleIdentityControl(coordinator, control, stdout, now = Date.now(),
   }, { now });
 }
 
+const HTTP_PERMIT_FAILURE_HOLDS = Object.freeze({
+  "transport-busy": "coordination",
+  "throttle-paused": "secondary",
+});
+
+function httpPermitFailure(reason) {
+  const error = new Error(identityCoordinationMessage(reason));
+  if (Object.hasOwn(HTTP_PERMIT_FAILURE_HOLDS, reason)) error.coordinationReason = reason;
+  return error;
+}
+
 async function acquireIdentityHttpPermit(coordinator, {
   signal,
   now = Date.now,
   wait = (delay) => new Promise((resolve) => setTimeout(resolve, delay)),
 } = {}) {
   const flushed = await coordinator.flushCompletions?.();
-  if (flushed && !flushed.ok) throw new Error(identityCoordinationMessage(flushed.reason));
+  if (flushed && !flushed.ok) throw httpPermitFailure(flushed.reason);
   const identity = coordinator.current();
   if (!identity) throw new Error("Verified identity unavailable");
   const queuedAt = now();
@@ -3496,7 +3507,7 @@ async function acquireIdentityHttpPermit(coordinator, {
     for (;;) {
       if (signal?.aborted) throw new Error("Request cancelled");
       if (coordinator.current()?.accessKey !== identity.accessKey) throw new Error("Credential changed before request start");
-      if (now() >= deadline) throw new Error(identityCoordinationMessage("transport-busy"));
+      if (now() >= deadline) throw httpPermitFailure("transport-busy");
       const result = withIdentityRegistry(coordinator.root, (state) => {
         const migration = inspectLegacyMigration(coordinator.root, state, now());
         if (!migration.ok) return migration;
@@ -3530,7 +3541,7 @@ async function acquireIdentityHttpPermit(coordinator, {
       // retryAt, so give the rest the poll interval the loop already uses.
       const retryAt = result.retryAt ?? now() + 50;
       if ((result.reason !== "transport-busy" && !retryableCoordination(result.reason)) ||
-          now() >= deadline || retryAt >= deadline) throw new Error(identityCoordinationMessage(result.reason));
+          now() >= deadline || retryAt >= deadline) throw httpPermitFailure(result.reason);
       await wait(Math.max(1, Math.min(50, retryAt - now())));
     }
   } finally {
@@ -13488,6 +13499,9 @@ function acquisitionOutstandingText(diagnostic) {
 
 function acquisitionFailureHold(error) {
   if (typeof error?.providerCapability === "string") return "observer";
+  if (Object.hasOwn(HTTP_PERMIT_FAILURE_HOLDS, error?.coordinationReason)) {
+    return HTTP_PERMIT_FAILURE_HOLDS[error.coordinationReason];
+  }
   if (SECONDARY_LIMIT_PATTERN.test(errText(error))) return "secondary";
   if (isRateLimited(error) || /API budget paused/i.test(errText(error))) return "primary";
   const attemptedHttp = Number.isSafeInteger(error?.requestMetrics?.httpRequests) &&
@@ -15605,8 +15619,14 @@ function terminalizationRecoveryCode(terminal) {
 
 function requestFailureRecoveryCode(error, verdict) {
   if (verdict === "rate-limited") return "rate-limited";
+  if (Object.hasOwn(HTTP_PERMIT_FAILURE_HOLDS, error?.coordinationReason)) return error.coordinationReason;
   if (verdict === "other" && error?.httpStarted === true) return "interrupted-request";
   return verdict === "other" ? "network-outage" : verdict;
+}
+
+function requestFailureRecovery(error, verdict) {
+  const reason = requestFailureRecoveryCode(error, verdict);
+  return { reason, origin: reason === "transport-busy" ? "coordination" : "source" };
 }
 
 function wallClockRecovery(previousAt, at, intervalMs) {
@@ -17944,8 +17964,8 @@ function App({ onCreateRemote = () => {} } = {}) {
           const retryAt = Number.isFinite(backoffUntil)
             ? Date.now() + Math.max(0, backoffUntil - performance.now()) : null;
           if (terminal.status !== "blocked" && terminal.status !== "compacted") {
-            recordRuntimeRecovery(key, requestFailureRecoveryCode(err, verdict),
-              { origin: "source", retryAt });
+            const recovery = requestFailureRecovery(err, verdict);
+            recordRuntimeRecovery(key, recovery.reason, { origin: recovery.origin, retryAt });
           }
           if (verdict === "rate-limited") {
             const snapshot = inspectGovernor(scope, Date.now());
@@ -20443,6 +20463,7 @@ export {
   terminalizationBacklogForResource,
   receiptCapabilityFromReservation,
   requestFailureRecoveryCode,
+  requestFailureRecovery,
   wallClockRecovery,
   collectorSourceAdvanced,
   cleanupQueueForResource,

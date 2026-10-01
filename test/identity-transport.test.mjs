@@ -7,6 +7,8 @@ import { test } from "node:test";
 import {
   acquireIdentityHttpPermit, releaseIdentityHttpPermit, createIdentityCoordinator,
   inspectIdentityRegistry, claimIdentityBootstrap, createQuotaScope,
+  requestFailureRecoveryCode, acquisitionFailureHold,
+  requestFailureRecovery, recoveryCause, shouldClearRecoveryCause,
 } from "../index.mjs";
 
 const NOW = 1_800_000_000_000;
@@ -138,6 +140,70 @@ for (const exit of ["timeout", "credential change"]) {
     assert.equal(readFileSync(join(coordinator.root, "registry.json"), "utf8").includes("synthetic-"), false);
   });
 }
+
+for (const [boundary, elapsedMs] of [["elapsed deadline", 30_000], ["retry deadline", 29_975]]) {
+  test(`HTTP permit ${boundary} preserves its local coordination cause`, async (t) => {
+    const { coordinator, read } = await fixture(t);
+    const live = await acquireIdentityHttpPermit(coordinator, { now: () => NOW + 250 });
+    const quota = createQuotaScope(coordinator.current(), { root: coordinator.root });
+    const quotaBefore = readFileSync(quota.path, "utf8");
+    const queuedAt = NOW + 500;
+    let at = queuedAt;
+    let waits = 0;
+    let failure;
+    await assert.rejects(acquireIdentityHttpPermit(coordinator, {
+      now: () => at,
+      wait: async () => { waits += 1; at = queuedAt + elapsedMs; },
+    }), (error) => { failure = error; return true; });
+    assert.equal(waits, 1);
+    assert.equal(read(at).waiters.length, 0);
+    assert.equal(read(at).permit.nonce, live.nonce);
+    assert.equal(readFileSync(quota.path, "utf8"), quotaBefore);
+    assert.equal(failure.coordinationReason, "transport-busy");
+    assert.equal(requestFailureRecoveryCode(failure, "other"), "transport-busy");
+    assert.equal(acquisitionFailureHold(failure), "coordination");
+    const recovery = requestFailureRecovery(failure, "other");
+    const cause = recoveryCause({ ...recovery, resource: "core", tab: "actions", at });
+    assert.equal(cause.origin, "coordination");
+    assert.equal(shouldClearRecoveryCause(cause, { sourceSuccess: false, tab: "security" }), true,
+      "shared coordination recovery must clear without an Actions source success");
+  });
+}
+
+test("HTTP permit throttle pause retains its rate-limit cause", async (t) => {
+  const { coordinator } = await fixture(t);
+  const path = join(coordinator.root, "registry.json");
+  const state = JSON.parse(readFileSync(path, "utf8"));
+  state.hosts["github.com"].throttle = { attempts: 5, lastAt: NOW, paused: true };
+  state.hosts["github.com"].cooldownUntil = NOW + 60_000;
+  writeFileSync(path, JSON.stringify(state));
+  let failure;
+  await assert.rejects(acquireIdentityHttpPermit(coordinator, { now: () => NOW + 250 }),
+    (error) => { failure = error; return true; });
+  assert.equal(requestFailureRecoveryCode(failure, "other"), "throttle-paused");
+  assert.equal(acquisitionFailureHold(failure), "secondary");
+  const cause = recoveryCause({ ...requestFailureRecovery(failure, "other"), resource: "core", tab: "actions" });
+  assert.equal(cause.origin, "source");
+  assert.equal(shouldClearRecoveryCause(cause, { sourceSuccess: false, tab: "security" }), false);
+});
+
+test("HTTP permit cause classification ignores message text and unknown reason fields", () => {
+  for (const error of [new Error("connect ECONNRESET"),
+    new Error("Shared HTTP request or cooldown in progress"),
+    Object.assign(new Error("network failed"), { coordinationReason: "unrecognized" })]) {
+    assert.equal(requestFailureRecoveryCode(error, "other"), "network-outage");
+    assert.equal(acquisitionFailureHold(error), "disconnected");
+    const cause = recoveryCause({ ...requestFailureRecovery(error, "other"), resource: "core", tab: "actions" });
+    assert.equal(cause.origin, "source");
+    assert.equal(shouldClearRecoveryCause(cause, { sourceSuccess: true, tab: "security" }), false);
+    assert.equal(shouldClearRecoveryCause(cause, { sourceSuccess: true, tab: "actions" }), true);
+  }
+  const interrupted = Object.assign(new Error("request interrupted"), { httpStarted: true });
+  assert.equal(requestFailureRecoveryCode(interrupted, "other"), "interrupted-request");
+  const limited = new Error("secondary rate limit");
+  assert.equal(requestFailureRecoveryCode(limited, "rate-limited"), "rate-limited");
+  assert.equal(acquisitionFailureHold(limited), "secondary");
+});
 
 test("the FIFO head still waits for the shared secondary cooldown", async (t) => {
   const { coordinator, read } = await fixture(t);

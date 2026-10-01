@@ -2,6 +2,13 @@
 
 ## Deviations
 
+
+### Phase 4 local transport cause preservation
+
+- Found: an offline call to the actual permit producer reproduced a local transport-wait timeout being classified as `network-outage` with a `disconnected` acquisition hold. This contradicts D6 cause preservation. The live window does not establish that this timeout caused every recorded hold or delay.
+- Repair scope: carry a typed, allowlisted local permit reason through the existing recovery and acquisition consumers. Preserve timeout, admission, accounting, cleanup and freshness policy. Keep throttle pause distinct from a local busy transport and retain ordinary network classification for untyped errors.
+- Evidence boundary: product source changes invalidate the prior installed candidate identity for this repair. Complete independent review, simplify and all applicable local gates before preparing a new candidate. The failed live windows remain failed; improved cause reporting alone does not prove timely multi-pane recovery.
+
 ### Phase 4 unavailable Security capability, accepted 2026-10-01
 
 - Found: the corrected, authorized ten-pane attempt stopped before measurement on a Chapa Security HTTP 403. Its exact subendpoint is not logged and its cost remains unknown. A separate bounded read-only request verified that Chapa code scanning currently returns an explicit disabled-feature response, with available Core quota.
