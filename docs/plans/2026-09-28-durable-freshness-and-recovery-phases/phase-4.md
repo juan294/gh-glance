@@ -35,6 +35,18 @@ The bounded rerun retains 180 seconds maximum setup, 1,800 seconds strict measur
 
 Before activation, complete independent review and offline regression checks for the revised qualification helpers. Actual terminal captures must establish unavailable notices; application snapshot flags alone are insufficient. Earlier failed windows remain failed. This adjustment does not waive source stalls or invent complete Security freshness.
 
+## Accepted release prerequisite adjustment, 2026-10-01
+
+After the locally verified v0.16.0 candidate, complete release evidence and
+worktree cleanup were presented, the owner instructed: “go ahead and finish
+the /rpi-release now.” This accepts publication of v0.16.0 before the personal
+and work EMU windows in Procedure step 7 are complete. Release remains subject
+to local gates, exact-commit hosted checks, protected production merge and npm
+provenance verification. This exception permits release only: F12, both live
+qualification windows and incident acceptance remain incomplete. Historical
+failures remain failed; unavailable EMU evidence remains unmeasured. It does
+not authorize a new live trial, session restart or employer infrastructure change.
+
 ## Manual success criteria (unchanged)
 
 Only visual judgment that automated PTY/render comparisons cannot measure may be manually confirmed. User satisfaction can supplement evidence but cannot substitute for missing windows. All routine inventory, installation, monitoring and readback should be automated after authorization.
