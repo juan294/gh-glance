@@ -19696,6 +19696,16 @@ function App({ onCreateRemote = () => {} } = {}) {
     semanticStatus = refreshStatus({ onDemand: true });
   }
 
+  // A settled on-demand view has no data wake to advance its visible age.
+  // Tick only its display clock; source timestamps and acquisition stay idle.
+  const showCachedAge = semanticStatus.kind === "cached" && staleFor !== null;
+  useEffect(() => {
+    if (!showCachedAge) return;
+    setNow(new Date());
+    const timer = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, [showCachedAge]);
+
   const allItems = items ?? [];
   const tabOffsetRaw = offset[tab.key] ?? 0;
   const selectedKey = selected[tab.key] ?? null;

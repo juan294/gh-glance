@@ -284,8 +284,9 @@ credential or repository rows. The root registry lock precedes a quota-ledger
 lock, and neither lock is held across a network request. Unknown identities
 must claim a persisted, bounded `/user` attempt before any data is admitted.
 Started attempts retain conservative debt across crashes and restarts. Shared
-HTTP permits serialize calls and preserve a minimum 250 ms start gap and the
-maximum observed cooldown deadline. Each host permits at most 128 FIFO waiters
+HTTP permits allow up to three concurrent admitted requests per host, preserve
+FIFO starts with a minimum 250 ms gap, and enforce the maximum observed cooldown
+deadline. Each host permits at most 128 FIFO waiters
 containing only process IDs, nonces and bounded timing data. Dead or expired
 waiters are pruned. Cancellation removes its matching nonce; if storage is
 temporarily unavailable, deferred cleanup remains bounded by the deadline.

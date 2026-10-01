@@ -186,6 +186,9 @@ test("COL on-demand: real collector refreshes secondary data exactly on request"
   assert.equal(serverLog.split("\n").filter((line) => line.startsWith("graphql issues.page")).length, 2, serverLog);
   assert.doesNotMatch(serverLog, /actions\/runs|pulls\.page|alerts/);
   assert.equal(clientLog, "");
+  const cachedAge = result.finalFrame.lines.join("\n").match(/Cached\s+(\d+)s/);
+  assert.ok(cachedAge && Number(cachedAge[1]) >= 2,
+    `collector cached age did not advance: ${result.finalFrame.lines.join("\n")}`);
   service.kill("SIGTERM");
   await waitForExit(service);
 });

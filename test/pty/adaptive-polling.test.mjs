@@ -351,3 +351,21 @@ test("default on-demand tabs stop after opening and refresh again with r", (t) =
   assert.doesNotMatch(frame, /Watching/);
   assert.equal(result.exitCode, 0);
 });
+
+test("cached secondary age advances while no new observation is requested", (t) => {
+  const box = fixture(t);
+  const result = capture({
+    cols: 110, rows: 24, signal: "none", settle: 25,
+    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Cached") { ok=1 }') +
+      "sleep 5; printf q",
+    args: "--repo acme/widget --refresh 2 --tab issues", configHome: box.root,
+    env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1", GH_GLANCE_FIXTURE_STATE: box.statePath },
+  });
+  const frame = result.finalFrame.lines.join("\n");
+  const age = frame.match(/Cached\s+(\d+)s/);
+  assert.ok(age, `cached age missing: ${frame}`);
+  assert.ok(Number(age[1]) >= 4, `cached age froze at ${age[1]}s after five idle seconds`);
+  assert.equal(graphqlEvents(box.read(), "issues.page").length, 1,
+    "advancing displayed age must not fetch secondary data again");
+  assert.equal(result.exitCode, 0);
+});
