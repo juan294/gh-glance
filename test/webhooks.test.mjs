@@ -10,6 +10,9 @@ import { test } from "node:test";
 
 import {
   createCollectorAcquisitionRuntime,
+  budgetEpoch,
+  governorPhaseOffset,
+  GOVERNOR_PHASE_WINDOW_MS,
   createCollectorService,
   createCollectorFrameDecoder,
   createGovernorScope,
@@ -135,10 +138,10 @@ function connectCollector(path) {
   });
 }
 
-function publishGovernorCapacity(scope, leaseId, at = Date.now()) {
+function publishGovernorCapacity(scope, leaseId, at = Date.now(), resetMs = at + 3_600_000) {
   const values = {
-    core: { limit: 5_000, remaining: 5_000, used: 0, resetMs: at + 3_600_000 },
-    graphql: { limit: 5_000, remaining: 5_000, used: 0, resetMs: at + 3_600_000 },
+    core: { limit: 5_000, remaining: 5_000, used: 0, resetMs },
+    graphql: { limit: 5_000, remaining: 5_000, used: 0, resetMs },
   };
   for (const resource of ["core", "graphql"]) {
     const claim = claimProbe(scope, leaseId, at, resource);
@@ -715,9 +718,17 @@ test("HOOK-04/05/07: signed HTTP reaches governed collector display and holds st
   const governor = createGovernorScope({ effectiveHost: "github.com", authIdentity: "hook-e2e", ...pathOptions });
   assert.equal(governor.ok, true);
   const scope = governor.value;
-  const leaseId = randomUUID();
-  assert.equal(maintainControlLease(scope, leaseId, 5_000, "issues", Date.now()).ok, true);
-  publishGovernorCapacity(scope, leaseId);
+  const initialAt = Date.now();
+  const initialResetMs = initialAt + 3_600_000;
+  const initialEpoch = budgetEpoch({ limit: 5_000, remaining: 5_000, used: 0,
+    resetMs: initialResetMs, observedAt: initialAt });
+  assert.equal(typeof initialEpoch, "string");
+  let leaseId = randomUUID();
+  while (governorPhaseOffset(leaseId, initialEpoch) !== GOVERNOR_PHASE_WINDOW_MS) leaseId = randomUUID();
+  const registeredAt = Date.now();
+  assert.equal(maintainControlLease(scope, leaseId, 5_000, "issues", registeredAt).ok, true);
+  publishGovernorCapacity(scope, leaseId, registeredAt, initialResetMs);
+  assert.equal(inspectGovernor(scope, Date.now()).value.budgets.graphql.epoch, initialEpoch);
   let sequence = 0;
   let gateNext = false;
   let signalGatedStart = null;
@@ -784,7 +795,9 @@ test("HOOK-04/05/07: signed HTTP reaches governed collector display and holds st
   socket.write(encodeCollectorFrame({ type: "subscribe", id: "hook-e2e", host: "github.com",
     repo: "acme/widget", resource: "issues",
     demand: { active: true, background: true, floorMs: 5_000, pages: 1 } }));
-  await within(waitForSequence(1)).catch((error) => {
+  // Initial readiness includes the full seeded phase window plus processing.
+  // The webhook delivery latency assertion below begins only after readiness.
+  await within(waitForSequence(1), GOVERNOR_PHASE_WINDOW_MS + 5_000).catch((error) => {
     error.message = `${error.message}: ${JSON.stringify(diagnostics)}`;
     throw error;
   });
