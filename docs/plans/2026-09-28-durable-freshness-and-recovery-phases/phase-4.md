@@ -25,7 +25,17 @@ This plan alone does not authorize live migration, installation, session restart
 - All exclusions have external evidence. Local observer/coordination holds fail acceptance. A healthy footer without matching source/render evidence fails acceptance.
 - Any candidate-changing repair goes back through local gates and restarts invalidated live evidence. No remote rerun/fix-and-repush loop without new authority.
 
-## Manual success criteria
+## Accepted capability scope adjustment, 2026-10-01
+
+The user approved qualifying accessible data while verifying explicit unavailable notices for disabled Security features, followed by the bounded ten-pane rerun. Retain all ten repositories and forty subscriptions and the complete uninterrupted source-monitor window. A Security observation establishes freshness only for its accessible subset; unavailable endpoints never count as complete Security coverage. Report the endpoint inventory and each unavailable capability separately. Keep full personal and work EMU requirements separate.
+
+Accept a disabled endpoint only with a current, endpoint-bound provider refusal that explicitly identifies the feature as disabled and a matching visible notice in the actual captured Security tab. Generic 403/404, authentication failures, rate limits, transport errors, missing headers, internal holds and stale capability notes cannot supply this evidence. Accessible endpoints require successful response evidence and existing freshness bounds. If a capability becomes accessible, validate its new data rather than retaining an exclusion. Never change repository settings to obtain a pass.
+
+The bounded rerun retains 180 seconds maximum setup, 1,800 seconds strict measurement and a 2,040-second immutable outer deadline including end capture. All setup, polling and comparison requests share the 1,200-admission and 1,200-unit per-resource caps and 2,000-unit remaining floor. A recognized disabled-endpoint response without an exact measured charge must retain its conservative one-Core-unit allowance in the bounded ledger, distinctly labeled rather than reported as measured cost. All other unknown outcomes stop admission. No active-run extension, budget reset, automatic full-day run or publication is authorized.
+
+Before activation, complete independent review and offline regression checks for the revised qualification helpers. Actual terminal captures must establish unavailable notices; application snapshot flags alone are insufficient. Earlier failed windows remain failed. This adjustment does not waive source stalls or invent complete Security freshness.
+
+## Manual success criteria (unchanged)
 
 Only visual judgment that automated PTY/render comparisons cannot measure may be manually confirmed. User satisfaction can supplement evidence but cannot substitute for missing windows. All routine inventory, installation, monitoring and readback should be automated after authorization.
 
