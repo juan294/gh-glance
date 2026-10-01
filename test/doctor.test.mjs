@@ -870,7 +870,7 @@ test("--doctor reports the host-qualified target it was given", async () => {
 // --refresh flag it cannot be reached by calling validateArgs directly. These
 // spawn a real child, which is the wiring under test.
 test("GH_GLANCE_REFRESH sets the interval and is reported by name", async () => {
-  const report = await doctor({ env: { GH_GLANCE_REFRESH: "30" } });
+  const report = await doctor({ env: { GH_GLANCE_REFRESH: "30" }, args: ["--background", "all"] });
   assert.match(report, /GH_GLANCE_REFRESH\s+30/);
   assert.match(report, /projected demand .*floor 30s/);
   // At a 30s floor every cadence in the table is the floor itself -- 30s is
@@ -882,7 +882,7 @@ test("GH_GLANCE_REFRESH sets the interval and is reported by name", async () => 
 });
 
 test("--refresh beats GH_GLANCE_REFRESH", async () => {
-  const report = await doctor({ env: { GH_GLANCE_REFRESH: "30" }, args: ["--refresh", "10"] });
+  const report = await doctor({ env: { GH_GLANCE_REFRESH: "30" }, args: ["--refresh", "10", "--background", "all"] });
   assert.match(report, /projected demand .*floor 10s/);
   // A 10s floor is slower than the 5s running-CI interval but faster than the
   // 30s quiet one, so Actions alone spans 360-720 REST per hour.

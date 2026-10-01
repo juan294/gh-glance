@@ -84,10 +84,11 @@ current.
 - `lazygit`-style panel frame: the tab name sits in the top border, the
   visible-of-total row count in the bottom
 - A semantic footer for the active tab: **Watching** is settled or scheduled;
+  **Cached** shows a secondary view's source age until its next requested refresh;
   **Checking** means admitted work is live; **Paused** protects a held or
   unavailable budget; **Failed** names a normal fetch error; and **Limited**
   means Security visibility is incomplete. Startup and manual Checking can
-  animate. Adapted automatic checks, Watching, Paused, Failed, and Limited are
+  animate. Adapted automatic checks, Watching, Cached, Paused, Failed, and Limited are
   static. A pure shared-lane wait adds `sharing N` without moving the key hints
 - Row state icons are real GitHub Octicons (via the Nerd Font glyph set), not emoji
   -- with a plain-ASCII fallback for terminals without one
@@ -319,9 +320,9 @@ pane definition. Flags are there when you want them:
 | Flag | Effect |
 |---|---|
 | `-R`, `--repo [host/]owner/name` | Watch a specific repository instead of the current directory's. Works from anywhere -- you do not need a local clone. The optional host targets a GitHub Enterprise or EMU data-residency tenant, e.g. `tenant.ghe.com/acme/widget`. |
-| `--refresh <seconds>` | Minimum active-tab poll interval, 2-3600, default 5. A floor, never a ceiling: a tab whose content is unchanged twice in a row slows to 30 seconds (60 for Security), and Actions with a running or queued job is checked every 5. Safe shared grants can make any check later. |
+| `--refresh <seconds>` | Minimum automatic poll interval, 2-3600, default 5. A floor, never a ceiling: a tab whose content is unchanged twice in a row slows to 30 seconds (60 for Security), and Actions with a running or queued job is checked every 5. Safe shared grants can make any check later. |
 | `--tab <name>` | Start on `actions`, `issues`, `prs` or `security`. |
-| `--background <mode>` | `all` (default) or `off`. `off` never requests data for a tab you are not looking at. Its count keeps the last known value and ages visibly, and switching to the tab fetches it. |
+| `--background <mode>` | `on-demand` (default): active Actions updates automatically; Issues, PRs and Security use cached data and check when opened or refreshed with `r`. Unopened tabs make no data requests. `all` continuously polls active and inactive tabs; `off` continuously polls only the selected tab. |
 | `--verbose` | Log one line per dashboard `gh` call to stderr, with timing and outcome. Credential lookup and the account-identity proof are deliberately excluded, so that they cannot log anything derived from a token. stderr must be redirected: `gh-glance --verbose 2>gh-glance.log`. |
 | `--doctor` | Print a diagnostic report and exit. See [Diagnostics](#diagnostics). |
 | `--doctor --probe` | Add bounded, admitted GitHub capability probes to the local diagnostic report. |
@@ -769,7 +770,15 @@ The default five seconds is a healthy single-pane floor, not an unconditional
 request frequency. Each check first needs an atomic grant from the private
 governor shared by local panes using the same effective host and account
 namespace. Beyond that floor, the cadence follows what the repository is
-actually doing:
+actually doing. By default only active Actions polls automatically. Secondary
+views show Cached with source age after their requested observation; open the tab
+or press `r` to check again. Opening can reuse a fresh shared snapshot. An
+outstanding request continues through admission delays and transient failures.
+Cached tab counts are last known values, not live counts. `--background all`
+restores continuous polling of all tabs; `--background off` continuously polls
+only the selected tab.
+
+The following cadence table applies to automatically polled tabs:
 
 | State | Earliest normal check |
 |---|---|

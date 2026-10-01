@@ -221,7 +221,7 @@ const runtime = {
   host: null,
   repoExplicit: false,
   refreshMs: REFRESH_MS,
-  background: "all",
+  background: "on-demand",
   verbose: false,
   connect: null,
   initialTabIndex: 0,
@@ -759,6 +759,7 @@ async function runGh(args, { signal, operation, input = null, execute = null,
   const requestNow = typeof bound?.now === "function" ? bound.now : Date.now;
   const permit = identityCoordinator && !local
     ? await acquireIdentityHttpPermit(identityCoordinator, { signal, now: requestNow,
+        operationDeadline: CONTROL_OPERATIONS.includes(operation) ? undefined : bound?.receiptCapability?.deadline,
         ...(typeof bound?.httpWait === "function" ? { wait: bound.httpWait } : {}) }) : null;
   const startedAt = requestNow();
   let requestError = null;
@@ -2832,17 +2833,17 @@ function scheduleIntents({
 }
 
 // ---------- Credential identities and restart-safe coordination ----------
-const IDENTITY_VERSION = 1;
+const IDENTITY_VERSION = 2;
 const IDENTITY_ATTEMPT_WINDOW_MS = 15 * 60_000;
 const IDENTITY_ATTEMPT_LIMIT = 3;
 const IDENTITY_HOST_ATTEMPT_LIMIT = 12;
 const IDENTITY_MAX_ATTEMPTS = 4096;
 const HTTP_START_GAP_MS = 250;
 const HTTP_MAX_WAITERS = 128;
-// A permit is reclaimable once it cannot still belong to a live request. The
-// owner-death check alone cannot see a process that is stopped, or one whose
-// release lost its lock, so a permit outliving the subprocess timeout it guards
-// is stale by construction rather than by guess.
+const HTTP_MAX_PERMITS = 3;
+// Retain the existing bounded permit lease for managed requests. This bounds
+// unexpired admissions, not surviving OS children after suspension or owner
+// death; quota receipts separately retain uncertain transport charges.
 const HTTP_PERMIT_MAX_MS = GH_TIMEOUT_MS + 5_000;
 // The longest a primary window can run. An attempt that never obtained reset
 // evidence is still covered once a full window has demonstrably elapsed since it
@@ -2876,11 +2877,15 @@ function retryableCoordination(reason) {
   return RETRYABLE_COORDINATION_REASONS.includes(reason);
 }
 
-// A dead owner releases its permit immediately; a live owner keeps it only for
-// as long as a request could still be running under it. Without the second
-// test a stopped process, or one whose release never won the lock, holds the
-// single machine-wide permit forever and every pane queues behind it.
+// Managed permit leases retain their existing age/dead-owner reclamation law.
+// Reclaiming a slot never retires its quota receipt or proves child quiescence.
 function staleHttpPermit(permit, now, kill = process.kill.bind(process)) {
+  // A dead v1 parent does not prove its untracked child ended. Reserve its
+  // one slot until a subsequent verified boot; two managed slots remain usable.
+  if (permit.kind === "legacy") {
+    const bootId = coordinationBootId();
+    return permit.bootId !== null && bootId !== null && permit.bootId !== bootId;
+  }
   if (pidIsDead(permit.pid, kill)) return true;
   return Number.isFinite(permit.startedAt) && now - permit.startedAt > HTTP_PERMIT_MAX_MS;
 }
@@ -2951,8 +2956,8 @@ function emptyIdentityRegistry() {
   return { version: IDENTITY_VERSION, migration: { activated: false, holdUntil: 0 }, identities: {}, attempts: {}, hosts: {} };
 }
 
-function normalizeIdentityRegistry(raw) {
-  if (!exactKeys(raw, ["version", "migration", "identities", "attempts", "hosts"]) || raw.version !== IDENTITY_VERSION ||
+function normalizeIdentityRegistry(raw, version = IDENTITY_VERSION) {
+  if (!exactKeys(raw, ["version", "migration", "identities", "attempts", "hosts"]) || raw.version !== version ||
       !exactKeys(raw.migration, ["activated", "holdUntil"]) || typeof raw.migration.activated !== "boolean" ||
       !Number.isFinite(raw.migration.holdUntil) || raw.migration.holdUntil < 0 ||
       !isRecord(raw.identities) || !isRecord(raw.attempts) || !isRecord(raw.hosts) ||
@@ -2975,13 +2980,20 @@ function normalizeIdentityRegistry(raw) {
   }
   for (const [host, transport] of Object.entries(raw.hosts)) {
     if (!isRecord(transport)) return null;
-    const keys = ["lastStartedAt", "cooldownUntil", "permit"];
+    const keys = ["lastStartedAt", "cooldownUntil", version === 1 ? "permit" : "permits"];
     if (Object.hasOwn(transport, "waiters")) keys.push("waiters");
     if (Object.hasOwn(transport, "throttle")) keys.push("throttle");
     if (!normalizeHost(host) || !exactKeys(transport, keys) ||
         !time(transport.lastStartedAt) || !time(transport.cooldownUntil)) return null;
-    if (transport.permit !== null && (!exactKeys(transport.permit, ["pid", "nonce", "startedAt"]) ||
-        !Number.isSafeInteger(transport.permit.pid) || transport.permit.pid < 1 || !validGovernorId(transport.permit.nonce) || !time(transport.permit.startedAt))) return null;
+    const permits = version === 1 ? (transport.permit === null ? [] : [transport.permit]) : transport.permits;
+    if (!Array.isArray(permits) || permits.length > HTTP_MAX_PERMITS ||
+        new Set(permits.map((permit) => permit?.nonce)).size !== permits.length ||
+        permits.filter((permit) => permit?.kind === "legacy").length > 1 ||
+        permits.some((permit) => !exactKeys(permit, version === 1
+          ? ["pid", "nonce", "startedAt"] : ["pid", "nonce", "startedAt", "kind", "bootId"]) ||
+          !Number.isSafeInteger(permit.pid) || permit.pid < 1 || !validGovernorId(permit.nonce) || !time(permit.startedAt) ||
+          version !== 1 && (!["request", "bootstrap", "legacy"].includes(permit.kind) ||
+            permit.bootId !== null && (typeof permit.bootId !== "string" || permit.bootId.length > 128)))) return null;
     if (!Object.hasOwn(transport, "throttle")) transport.throttle = emptyTransportThrottle();
     if (!isRecord(transport.throttle) || !exactKeys(transport.throttle, ["attempts", "lastAt", "paused"]) ||
         !Number.isSafeInteger(transport.throttle.attempts) || transport.throttle.attempts < 0 ||
@@ -3012,8 +3024,10 @@ function withIdentityRegistry(root, operation, { now = Date.now(), kill = proces
     let state;
     if (raw === null) state = emptyIdentityRegistry();
     else {
-      try { state = normalizeIdentityRegistry(JSON.parse(raw)); }
-      catch { return { ok: false, reason: "corrupt" }; }
+      try {
+        const parsed = JSON.parse(raw);
+        state = normalizeIdentityRegistry(parsed, parsed.version === 1 ? 1 : IDENTITY_VERSION);
+      } catch { return { ok: false, reason: "corrupt" }; }
     }
     if (!state) return { ok: false, reason: "corrupt" };
     // Captured before the prunes below so their deletions still count as a
@@ -3021,6 +3035,19 @@ function withIdentityRegistry(root, operation, { now = Date.now(), kill = proces
     // funnels through here, and each one used to serialize and rename the
     // registry while holding the one machine-wide lock.
     const before = JSON.stringify(state);
+    if (state.version === 1) {
+      // Keep v1 writable until a live owner commits its response and cooldown.
+      // Returning the shared transient reason preserves cached identity/leases.
+      if (Object.values(state.hosts).some((transport) =>
+        transport.permit && !pidIsDead(transport.permit.pid, kill))) return { ok: false, reason: "busy" };
+      for (const transport of Object.values(state.hosts)) {
+        transport.permits = transport.permit
+          ? [{ ...transport.permit, kind: "legacy", bootId: coordinationBootId() }] : [];
+        delete transport.permit;
+      }
+      state.version = IDENTITY_VERSION;
+    }
+
     for (const transport of Object.values(state.hosts)) {
       transport.waiters = transport.waiters.filter((waiter) => waiter.deadline > now && !pidIsDead(waiter.pid, kill));
     }
@@ -3149,9 +3176,10 @@ function claimIdentityBootstrap(root, { credentialKey, host, resource = "core", 
   return withIdentityRegistry(root, (state) => {
     const migration = inspectLegacyMigration(root, state, now);
     if (!migration.ok) return migration;
-    const transport = state.hosts[host] ??= { lastStartedAt: 0, cooldownUntil: 0, permit: null };
-    if (transport.permit && staleHttpPermit(transport.permit, now, kill)) transport.permit = null;
-    if (transport.permit || transport.waiters?.length) return { ok: false, reason: "identity-busy", retryAt: now + 1000 };
+    const transport = state.hosts[host] ??= emptyIdentityTransport();
+    transport.permits = transport.permits.filter((permit) => !staleHttpPermit(permit, now, kill));
+    if (transport.throttle.paused) return { ok: false, reason: "throttle-paused", retryAt: transport.cooldownUntil };
+    if (transport.permits.some((permit) => permit.kind !== "legacy") || transport.waiters.length) return { ok: false, reason: "identity-busy", retryAt: now + 1000 };
     const attempts = Object.values(state.attempts);
     const recent = attempts.filter((attempt) => attempt.startedAt > now - IDENTITY_ATTEMPT_WINDOW_MS);
     const own = recent.filter((attempt) => attempt.credentialKey === credentialKey && attempt.resource === resource && attempt.exceptional);
@@ -3166,7 +3194,7 @@ function claimIdentityBootstrap(root, { credentialKey, host, resource = "core", 
     const nonce = governorId();
     state.attempts[id] = { credentialKey, host, resource, startedAt: now, retryAt: now + attemptRetryDelayMs(own.length),
       ownerPid: process.pid, nonce, status: "started", quotaKey: null, resetMs: null, accounted: false, imported: false, exceptional: true };
-    transport.permit = { pid: process.pid, nonce, startedAt: now };
+    transport.permits.push({ pid: process.pid, nonce, startedAt: now, kind: "bootstrap", bootId: null });
     transport.lastStartedAt = now;
     return { ok: true, value: { id, nonce } };
   }, { now, kill });
@@ -3228,7 +3256,7 @@ function finishIdentityBootstrap(root, { credentialKey, id, nonce, response = nu
     const attempt = state.attempts[id];
     if (!attempt || attempt.nonce !== nonce || attempt.credentialKey !== credentialKey) return { ok: false, reason: "stale" };
     const transport = state.hosts[attempt.host];
-    if (transport.permit?.nonce === nonce) transport.permit = null;
+    transport.permits = transport.permits.filter((permit) => permit.nonce !== nonce);
     attempt.status = response ? "finished" : "uncertain";
     const parsed = response?.body;
     const evidence = response?.rateLimit;
@@ -3494,13 +3522,16 @@ async function acquireIdentityHttpPermit(coordinator, {
   signal,
   now = Date.now,
   wait = (delay) => new Promise((resolve) => setTimeout(resolve, delay)),
+  operationDeadline,
 } = {}) {
   const flushed = await coordinator.flushCompletions?.();
   if (flushed && !flushed.ok) throw httpPermitFailure(flushed.reason);
   const identity = coordinator.current();
   if (!identity) throw new Error("Verified identity unavailable");
   const queuedAt = now();
-  const deadline = queuedAt + GH_TIMEOUT_MS;
+  const deadline = Number.isFinite(operationDeadline)
+    ? Math.min(operationDeadline, queuedAt + ACQUISITION_STARTED_DEADLINE_MS)
+    : queuedAt + GH_TIMEOUT_MS;
   const nonce = governorId();
   let acquired = false;
   try {
@@ -3511,28 +3542,39 @@ async function acquireIdentityHttpPermit(coordinator, {
       const result = withIdentityRegistry(coordinator.root, (state) => {
         const migration = inspectLegacyMigration(coordinator.root, state, now());
         if (!migration.ok) return migration;
-        if (now() >= deadline) return { ok: false, reason: "transport-busy", retryAt: deadline };
-        const transport = state.hosts[identity.host] ??= { lastStartedAt: 0, cooldownUntil: 0, permit: null, waiters: [], throttle: emptyTransportThrottle() };
+        const permitAt = now();
+        if (permitAt >= deadline) return { ok: false, reason: "transport-busy", retryAt: deadline };
+        const transport = state.hosts[identity.host] ??= emptyIdentityTransport();
         // Five consecutive throttles means the ladder has stopped being useful.
         // Waiting out the deadline is what produced the last one, so the pause
         // holds until a person retries or a primary reset opens a recovery.
         if (transport.throttle?.paused) {
           return { ok: false, reason: "throttle-paused", retryAt: transport.cooldownUntil };
         }
-        if (transport.permit && staleHttpPermit(transport.permit, now())) transport.permit = null;
+        transport.permits = transport.permits.filter((permit) => !staleHttpPermit(permit, permitAt));
         // Admission can happen during the mandatory start gap. Persist call
         // order once so later polling cannot overtake an earlier caller.
-        if (!transport.waiters.some((waiter) => waiter.nonce === nonce)) {
+        let waiter = transport.waiters.find((item) => item.nonce === nonce);
+        if (!waiter) {
           if (transport.waiters.length >= HTTP_MAX_WAITERS) return { ok: false, reason: "identity-capacity" };
-          transport.waiters.push({ pid: process.pid, nonce, queuedAt, deadline });
+          waiter = { pid: process.pid, nonce, queuedAt: permitAt, deadline: Math.min(deadline, permitAt + GH_TIMEOUT_MS) };
+          transport.waiters.push(waiter);
+        } else if (waiter.deadline - permitAt <= GH_TIMEOUT_MS / 2 && waiter.deadline < deadline) {
+          // Keep the existing registry's short waiter lease and FIFO position.
+          // Renewing this lease cannot extend the admitted operation deadline
+          // above, or the separate timeout of a child that actually starts.
+          waiter.queuedAt = permitAt;
+          waiter.deadline = Math.min(deadline, waiter.queuedAt + GH_TIMEOUT_MS);
         }
         const retryAt = Math.max(transport.cooldownUntil, transport.lastStartedAt + HTTP_START_GAP_MS);
-        if (transport.permit || transport.waiters[0].nonce !== nonce || retryAt > now()) {
-          return { ok: false, reason: "transport-busy", retryAt: Math.max(retryAt, now() + 50) };
+        if (transport.permits.length >= HTTP_MAX_PERMITS ||
+            transport.permits.some((permit) => permit.kind === "bootstrap") ||
+            transport.waiters[0].nonce !== nonce || retryAt > permitAt) {
+          return { ok: false, reason: "transport-busy", retryAt: Math.max(retryAt, permitAt + 50) };
         }
         transport.waiters.shift();
-        transport.permit = { pid: process.pid, nonce, startedAt: now() };
-        transport.lastStartedAt = now();
+        transport.permits.push({ pid: process.pid, nonce, startedAt: permitAt, kind: "request", bootId: null });
+        transport.lastStartedAt = permitAt;
         return { ok: true, value: { nonce, host: identity.host } };
       }, { now: now() });
       if (result.ok) { acquired = true; return result.value; }
@@ -3625,6 +3667,10 @@ function transportCooldownDeadline({ retryAfter, status, secondary, at, attempts
   return status === 429 || secondary === true ? at + throttleLadderMs(attempts) : null;
 }
 
+function emptyIdentityTransport() {
+  return { lastStartedAt: 0, cooldownUntil: 0, permits: [], waiters: [], throttle: emptyTransportThrottle() };
+}
+
 function emptyTransportThrottle() {
   return { attempts: 0, lastAt: 0, paused: false };
 }
@@ -3652,10 +3698,21 @@ function clearTransportThrottle(transport) {
   }
 }
 
+// Completion retries keep their original response time and become no-ops
+// after a successful durable write. Weak keys do not accumulate tombstones.
+const identityPermitCompletions = new WeakMap();
 function releaseIdentityHttpPermit(coordinator, permit, error = null, now = Date.now()) {
-  return withIdentityRegistry(coordinator.root, (state) => {
+  let completion = identityPermitCompletions.get(permit);
+  if (!completion) {
+    completion = { at: now, done: false };
+    identityPermitCompletions.set(permit, completion);
+  }
+  if (completion.done) return { ok: true };
+  now = completion.at;
+  const result = withIdentityRegistry(coordinator.root, (state) => {
     const transport = state.hosts[permit.host];
-    if (transport?.permit?.nonce === permit.nonce) transport.permit = null;
+    const held = transport?.permits.find((item) => item.nonce === permit.nonce);
+    if (transport) transport.permits = transport.permits.filter((item) => item.nonce !== permit.nonce);
     if (transport && error) {
       const response = parseGhApiResponse(error.stdout ?? "");
       const verdict = classifyThrottle({
@@ -3674,11 +3731,14 @@ function releaseIdentityHttpPermit(coordinator, permit, error = null, now = Date
           at: now,
         });
       }
-    } else if (transport && !error) {
+    } else if (transport && !error && held && held.startedAt > transport.throttle.lastAt &&
+        held.startedAt >= transport.cooldownUntil) {
       clearTransportThrottle(transport);
     }
     return { ok: true };
   });
+  if (result.ok) completion.done = true;
+  return result;
 }
 
 // The explicit retry a paused transport waits for. Clears the ladder and the
@@ -4731,8 +4791,9 @@ function writeGovernorState(path, state) {
     tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
     writeFileSync(tempPath, serialized, { encoding: "utf8", mode: 0o600, flag: "wx" });
     chmodSync(tempPath, 0o600);
+    // The private temporary inode already has mode 0600. Rename is the commit
+    // point: no fallible operation may report failure after state replacement.
     renameSync(tempPath, path);
-    chmodSync(path, 0o600);
     return { ok: true };
   } catch {
     if (tempPath !== null) {
@@ -6253,7 +6314,8 @@ function doctorCachedQuotaScope(host, { root = identityRegistryRoot(), nowMs = D
   try {
     const file = lstatSync(registryPath);
     if (!file.isFile() || file.size > GOVERNOR_MAX_LEDGER_BYTES) return { ok: false, reason: "unsafe registry" };
-    registry = normalizeIdentityRegistry(JSON.parse(readFileSync(registryPath, "utf8")));
+    const parsed = JSON.parse(readFileSync(registryPath, "utf8"));
+    registry = normalizeIdentityRegistry(parsed, parsed.version === 1 ? 1 : IDENTITY_VERSION);
   } catch (error) {
     return { ok: false, reason: error?.code === "ENOENT" ? "cached identity missing" : "cached registry unreadable" };
   }
@@ -9732,6 +9794,9 @@ function createCollectorAcquisitionRuntime({
     item.nextDueAt = snapshot.nextDueAt;
     if (Number.isSafeInteger(snapshot.generation)) item.lastDeliveredGeneration = snapshot.generation;
     if (Number.isFinite(snapshot.lastSuccessAt)) item.lastDeliveredSuccessAt = snapshot.lastSuccessAt;
+    if (publication && item.requestedAt !== null && snapshot.lastSuccessAt >= item.requestedAt) {
+      item.requestedAt = null;
+    }
     item.onSnapshot(snapshot);
     if (!publication || !Number.isSafeInteger(snapshot.generation)) return true;
     for (const waiter of item.invalidations) {
@@ -9747,11 +9812,17 @@ function createCollectorAcquisitionRuntime({
   }
 
   function startPoll(item, { manual = false, force = false } = {}) {
+    if (closed || item.closed) return null;
+    if (manual && !demandEnabled(item.demand)) item.requestedAt ??= now();
+    if (!item.id) {
+      if (manual) item.queuedRefresh = { force: force || item.queuedRefresh?.force === true };
+      return startInitialize(item);
+    }
     if (item.pollPromise) {
       if (manual) item.queuedRefresh = { force: force || item.queuedRefresh?.force === true };
       return item.pollPromise;
     }
-    if (closed || item.closed || !demandEnabled(item.demand)) return null;
+    if (!demandEnabled(item.demand) && item.requestedAt === null) return null;
     item.pollPromise = poll(item, { manual, force }).finally(() => {
       item.pollPromise = null;
       if (item.promotionGeneration !== null) {
@@ -9770,7 +9841,7 @@ function createCollectorAcquisitionRuntime({
   }
 
   function schedule(item, delay, operation = () => startPoll(item)) {
-    if (closed || item.closed || !demandEnabled(item.demand)) return;
+    if (closed || item.closed || (!demandEnabled(item.demand) && item.requestedAt === null)) return;
     if (item.timer !== null) clearTimeout_(item.timer);
     item.timer = setTimeout_(() => {
       item.timer = null;
@@ -9836,7 +9907,8 @@ function createCollectorAcquisitionRuntime({
           () => engine.currentClaim(subscriptionId, claim), () => producer({
           target: item.target,
           resource: item.resource,
-          demand: { ...ownership.value.demand, background: item.demand.background },
+          demand: { ...ownership.value.demand, background: item.demand.background,
+            active: ownership.value.demand?.active || item.requestedAt !== null },
           snapshot: ownership.value.snapshot,
           claim: { ...claim, state: item },
           provider: item.provider,
@@ -9924,7 +9996,9 @@ function createCollectorAcquisitionRuntime({
     } finally {
       item.polling = false;
       item.pollPhase = null;
-      schedule(item, retryIn, item.id ? () => startPoll(item) : () => startInitialize(item));
+      schedule(item, retryIn, item.id
+        ? () => startPoll(item, { manual: item.requestedAt !== null })
+        : () => startInitialize(item));
     }
   }
 
@@ -9957,8 +10031,11 @@ function createCollectorAcquisitionRuntime({
       if (subscription.value.snapshot && !accessReset) {
         deliverCollectorSnapshot(item, subscription.value.snapshot, bindingRevision);
       }
-      if (demandEnabled(item.demand)) {
-        await startPoll(item, { manual: item.invalidations.size > 0 });
+      if (demandEnabled(item.demand) || item.requestedAt !== null) {
+        const queued = item.queuedRefresh;
+        item.queuedRefresh = null;
+        await startPoll(item, { manual: item.invalidations.size > 0 || item.requestedAt !== null || Boolean(queued),
+          force: queued?.force === true });
       }
     } catch (error) {
       try { onDiagnostic({ stage: "initialize", reason: redact(shortErr(error)) }); } catch { /* diagnostics are isolated */ }
@@ -9980,7 +10057,7 @@ function createCollectorAcquisitionRuntime({
       if (!normalizedDemand) throw new Error("invalid collector demand");
       const item = { target, resource, demand: normalizedDemand, onSnapshot, onHold, id: null, identity: null,
         provider: null, polling: false, pollPhase: null, pollPromise: null, controller: null,
-        initializePromise: null, closed: false, timer: null, queuedRefresh: null,
+        initializePromise: null, closed: false, timer: null, queuedRefresh: null, requestedAt: null,
         bindingRevision: 0, invalidations: new Set(), lastDeliveredGeneration: null,
         lastDeliveredSuccessAt: null, promotionGeneration: null, promotionAt: null };
       items.add(item);
@@ -10289,7 +10366,14 @@ function createCollectorProtocolClient({ createTransport, onReady = () => {},
     },
   });
   const write = (message) => {
-    if (welcomed && socket?.writable) socket.write(encodeCollectorFrame(message));
+    if (!welcomed || !socket?.writable) return false;
+    socket.write(encodeCollectorFrame(message));
+    return true;
+  };
+  const flushRefresh = (item) => {
+    if (item.pendingRefresh !== null && write({ type: "refresh", id: item.id, force: item.pendingRefresh })) {
+      item.pendingRefresh = null;
+    }
   };
   const resubscribe = (resetGenerations) => {
     for (const item of subscriptions.values()) {
@@ -10299,6 +10383,7 @@ function createCollectorProtocolClient({ createTransport, onReady = () => {},
       }
       write({ type: "subscribe", id: item.id, host: item.host, repo: item.repo,
         resource: item.resource, demand: item.demand });
+      flushRefresh(item);
     }
   };
   const connect = () => {
@@ -10389,7 +10474,7 @@ function createCollectorProtocolClient({ createTransport, onReady = () => {},
         return { ok: false, reason: "invalid" };
       }
       const item = { ...subscription,
-        onSnapshot, onHold, onError, onDiagnostic, generation: -1, controlGeneration: -1,
+        onSnapshot, onHold, onError, onDiagnostic, generation: -1, controlGeneration: -1, pendingRefresh: null,
         sourceAge: createCollectorSourceAgeTracker({ now, monotonicNow, checkpoint: sourceCheckpoint }) };
       subscriptions.set(id, item);
       if (welcomed) write({ type: "subscribe", id: item.id, host: item.host, repo: item.repo,
@@ -10407,7 +10492,10 @@ function createCollectorProtocolClient({ createTransport, onReady = () => {},
           write({ type: "demand", id, demand: normalized });
           return { ok: true, changed: true };
         },
-        refresh(force = false) { write({ type: "refresh", id, force: force === true }); },
+        refresh(force = false) {
+          item.pendingRefresh = force === true || item.pendingRefresh === true;
+          flushRefresh(item);
+        },
         inspect() { write({ type: "inspect", id }); },
         close() { write({ type: "unsubscribe", id }); subscriptions.delete(id); assembler.cancel(id); },
       } };
@@ -11314,7 +11402,7 @@ function parseRepoTarget(value) {
 // in-flight guard absorbs every other one and the effective rate is whatever
 // `gh` can sustain -- the requested interval silently stops being real. Clamping
 // with a stated minimum is honest where silently accepting it would not be.
-const BACKGROUND_MODES = ["all", "off"];
+const BACKGROUND_MODES = ["all", "off", "on-demand"];
 const MIN_REFRESH_SECONDS = 2;
 const MAX_REFRESH_SECONDS = 3600;
 
@@ -11544,7 +11632,11 @@ Options:
                            and running Actions are checked every ${POLL_ACTIVE_CI_MS / 1000}s.
                            Safe shared grants may run later.
   --tab <name>             Tab to start on: ${TAB_KEYS.join(", ")}.
-  --background <mode>      ${BACKGROUND_MODES.join(" or ")} (default all). \`off\` never requests data
+  --background <mode>      ${BACKGROUND_MODES.join(" or ")} (default on-demand).
+                           on-demand watches active Actions; other tabs refresh
+                           when opened or with r, then keep cached results.
+                           all polls every tab; off polls the selected tab.
+                           \`off\` never requests data
                            for a tab you are not looking at; its count stays at
                            the last known value and visibly ages.
   --verbose                Write one line per gh invocation to stderr. stderr
@@ -11572,9 +11664,11 @@ Run it from inside a locally cloned GitHub repository; the repo is inferred
 from the git remote, the same way \`gh\` does it. Requires the \`gh\` CLI
 (2.20 or newer), authenticated via \`gh auth login\`.
 
-On a healthy single pane, the active tab is considered every ${REFRESH_MS / 1000}s while its
+By default, active Actions is considered every ${REFRESH_MS / 1000}s while its
 content is changing, then every ${POLL_QUIET_MS.actions / 1000}s once two checks in a row come back
-unchanged; each background tab is considered about every ${Math.max(REFRESH_MS * BACKGROUND_EVERY, POLL_BACKGROUND_MS.actions) / 1000}s. Quota-consuming
+unchanged. Secondary tabs check on opening or r and retain cached results.
+With --background all, inactive tabs are considered about every
+${Math.max(REFRESH_MS * BACKGROUND_EVERY, POLL_BACKGROUND_MS.actions) / 1000}s (Security is slower). Quota-consuming
 calls still need a shared, resource-specific grant that preserves a hard reserve.
 Scheduled checks and manual refresh do not bypass that safety check: neither
 refresh key can spend past the reserve.
@@ -15025,7 +15119,10 @@ function pollPolicyInterval({
   unchangedCount = 0,
   inProgressCI = false,
   background = "all",
+  requested = false,
 }) {
+  if (background === "on-demand" &&
+      (demand !== "active" || (tab !== "actions" && !requested))) return Number.POSITIVE_INFINITY;
   if (demand === "none") return Number.POSITIVE_INFINITY;
   if (demand === "inactive") {
     if (background === "off") return Number.POSITIVE_INFINITY;
@@ -15153,6 +15250,7 @@ function pollSchedule({
       demand: isActive ? "active" : "inactive",
       unchangedCount: states[key]?.unchangedCount ?? 0,
       inProgressCI: states[key]?.inProgressCI === true,
+      requested: states[key]?.requested === true,
       background,
     });
     if (!Number.isFinite(step)) {
@@ -16374,6 +16472,7 @@ function refreshStatus({
   stale = false,
   disconnected = false,
   screenReader = false,
+  onDemand = false,
 } = {}) {
   const status = (kind, glyphKind, label, tone, animate = false, detailKind = null) => ({
     kind,
@@ -16410,6 +16509,7 @@ function refreshStatus({
   // Keep the cause visible until a successful result clears it.
   if (activeError) return status("failed", "failed", "Failed", "attention");
   if (securityIncomplete) return status("limited", "limited", "Limited", "attention");
+  if (onDemand) return status("cached", "watching", "Cached", "inert");
   if (sharedData) return status("shared", "watching", "Shared", "inert", false, "sharing");
   if (["waiting", "pending", "probe"].includes(mode)) {
     const sharing = sharedLaneProvenance(governorDecision).waitCause === "shared-lane";
@@ -18060,12 +18160,20 @@ function App({ onCreateRemote = () => {} } = {}) {
     const unchangedPolls = Object.fromEntries(TAB_KEYS.map((key) => [key, 0]));
     let pendingBlockPublications = new Map();
     const acquisitionSubscriptions = new Map();
+    // One-shot demand survives admission delays, but ends when an observation arrives.
+    const requestedTabs = new Map();
 
     function adoptAcquisitionSnapshot(key, snapshot, receipt = null) {
       if (!snapshot || cancelled) return;
+      if (requestedTabs.has(key) && !queuedManual.has(key) &&
+          snapshot.lastSuccessAt >= requestedTabs.get(key)) {
+        requestedTabs.delete(key);
+        if (runtime.background === "on-demand" && key !== "actions") pollDueAt[key] = Infinity;
+      }
       if (runtime.connect === null && Number.isFinite(snapshot.nextDueAt)) {
         sharedSnapshotDueAt = { ...sharedSnapshotDueAt, [key]: snapshot.nextDueAt };
-        if (pollDeadlinesOpen && key === TABS[activeIndexRef.current].key) {
+        if (pollDeadlinesOpen && key === TABS[activeIndexRef.current].key &&
+            Number.isFinite(pollIntervalFor(key, key))) {
           const at = Date.now();
           const due = sharedAcquisitionPollDeadline(pollDueAt[key], snapshot.nextDueAt, at, true);
           if (due < pollDueAt[key]) {
@@ -18138,6 +18246,14 @@ function App({ onCreateRemote = () => {} } = {}) {
       const host = effectiveRuntimeHost({ remoteUrls: runtimeRemoteUrls });
       const handles = new Map();
       const receivedSnapshots = new Set();
+      const initialKey = TABS[activeIndexRef.current].key;
+      const collectorDemand = (key) => ({
+        active: TABS[activeIndexRef.current].key === key &&
+          (runtime.background !== "on-demand" || key === "actions"),
+        background: runtime.background === "all",
+        floorMs: runtime.refreshMs,
+        pages: pageStateRef.current[key]?.pages ?? 1,
+      });
       let collectorReady = false;
       setGovernorDecisions(Object.fromEntries(TAB_KEYS.map((key) => [key, { disconnected: true }])));
       if (!repository || !host) {
@@ -18167,12 +18283,7 @@ function App({ onCreateRemote = () => {} } = {}) {
             },
           });
       for (const key of TAB_KEYS) {
-          const demand = {
-            active: TABS[activeIndexRef.current].key === key,
-            background: runtime.background !== "off",
-            floorMs: runtime.refreshMs,
-            pages: pageStateRef.current[key]?.pages ?? 1,
-          };
+          const demand = collectorDemand(key);
           const subscribed = client.subscribe({ host, repo: repository, resource: key, demand,
             sourceCheckpoint: cachedEntry?.tabs[key]?.source ?? null,
             onSnapshot: (snapshot, receipt) => {
@@ -18204,17 +18315,14 @@ function App({ onCreateRemote = () => {} } = {}) {
           });
           if (subscribed.ok) handles.set(key, subscribed.value);
       }
+      if (runtime.background === "on-demand" && initialKey !== "actions") {
+        handles.get(initialKey)?.refresh();
+      }
       fetchTabRef.current = (key, request = {}) => {
         const handle = handles.get(key);
         if (!handle) return;
-        if (request.kind === "tab-switch") {
-          for (const [candidate, candidateHandle] of handles) {
-            candidateHandle.updateDemand({ active: candidate === key, background: runtime.background !== "off",
-              floorMs: runtime.refreshMs, pages: pageStateRef.current[candidate]?.pages ?? 1 });
-          }
-        } else {
-          handle.updateDemand({ active: true, background: runtime.background !== "off",
-            floorMs: runtime.refreshMs, pages: pageStateRef.current[key]?.pages ?? 1 });
+        for (const [candidate, candidateHandle] of handles) {
+          candidateHandle.updateDemand(collectorDemand(candidate));
         }
         handle.refresh(request.force === true);
       };
@@ -18291,7 +18399,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           demand: acquisition.demand?.active ? "active" : "inactive",
           unchangedCount: publicationView.unchangedCount,
           inProgressCI: key === "actions" && actionsInProgress(rows),
-          background: runtime.background,
+          background: runtime.background === "on-demand" ? "all" : runtime.background,
         }),
         hold: null,
         capabilities: acquisition.capabilities ?? {},
@@ -18424,6 +18532,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         demand: key === activeKey ? "active" : "inactive",
         unchangedCount: unchangedPolls[key],
         inProgressCI: key === "actions" && actionsInProgress(actionRows),
+        requested: requestedTabs.has(key),
         background: runtime.background,
       });
     }
@@ -18434,7 +18543,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       const localDueAt = Number.isFinite(step) ? at + step : Number.POSITIVE_INFINITY;
       pollDueAt = {
         ...pollDueAt,
-        [key]: sharedAcquisitionPollDeadline(localDueAt, sharedSnapshotDueAt[key], at, active),
+        [key]: sharedAcquisitionPollDeadline(localDueAt, sharedSnapshotDueAt[key], at, active && Number.isFinite(step)),
       };
     }
 
@@ -18446,6 +18555,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     function openPollDeadlines(at) {
       const activeKey = TABS[activeIndexRef.current].key;
       const opened = { ...NEVER_DUE };
+      if (runtime.background === "on-demand") requestedTabs.set(activeKey, at);
       opened[activeKey] = at + 1;
       let slot = 1;
       for (const key of TAB_KEYS) {
@@ -18776,7 +18886,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     // the tab's failure ladder. `force` is the separate, stronger request that
     // also drops validators -- the `R` key. `r` is manual and not forced, which
     // is what makes a quiet refresh cost nothing.
-    async function requestTab(key, kind = "active", { force = false } = {}) {
+    async function requestTab(key, kind = "active", { force = false, detachTransport = false } = {}) {
       const manual = kind === "manual";
       const signal = controller.signal;
       const monotonicNow = performance.now();
@@ -18857,7 +18967,10 @@ function App({ onCreateRemote = () => {} } = {}) {
         currentScope.accessKey,
       );
       if (ownership.value.role !== "producer") {
-        if (ownership.value.snapshot) adoptAcquisitionSnapshot(key, ownership.value.snapshot);
+        if (ownership.value.snapshot) {
+          if (ownership.value.reason === "fresh") requestedTabs.delete(key);
+          adoptAcquisitionSnapshot(key, ownership.value.snapshot);
+        }
         if (ownership.value.sharingCount > 1) {
           setTabGovernorDecision(key, {
             mode: "waiting",
@@ -18981,9 +19094,19 @@ function App({ onCreateRemote = () => {} } = {}) {
       setTabWaiting(key, false);
       const item = pending.get(key);
       if (!item) return { persisted: false, retry: false, kind, key };
-      await startPendingAcquisitionTransport(
+      const transport = startPendingAcquisitionTransport(
         key, item, currentScope, decision.reservationId, nowMs, signal, false,
       );
+      if (detachTransport) {
+        // The scheduling single-flight owns admission, not the HTTP lifetime.
+        // A background response must not block the next active-tab wake.
+        void transport.catch((error) => {
+          if (cancelled || pending.get(key) !== item) return;
+          item.retryOnCleanup = true;
+          cancelPending(key, currentScope);
+          pauseCoordination(key, error?.reason ?? "stale");
+        });
+      } else await transport;
       return { persisted: true, retry: false, kind, key };
     }
     fetchTabRef.current = (key, { force = false, kind = force ? "manual" : "active" } = {}) => {
@@ -18994,6 +19117,10 @@ function App({ onCreateRemote = () => {} } = {}) {
         unchangedPolls[key] = advanceUnchangedCount(unchangedPolls[key], "subscribed");
       }
       const requestedAt = Date.now();
+      if (runtime.background === "on-demand") {
+        if (kind === "tab-switch") requestedTabs.clear();
+        requestedTabs.set(key, requestedAt);
+      }
       // Manual work replaces the active poll that would otherwise be due. Move
       // that deadline before touching the governor so a data wake already in
       // this event-loop turn cannot start a second batch as soon as the forced
@@ -19130,13 +19257,14 @@ function App({ onCreateRemote = () => {} } = {}) {
         states: Object.fromEntries(TAB_KEYS.map((key) => [key, {
           unchangedCount: unchangedPolls[key],
           inProgressCI: key === "actions" && actionsInProgress(),
+          requested: requestedTabs.has(key),
         }])),
       });
       scheduledWakePolls = planned.due;
       pollDueAt = planned.dueAt;
       backgroundIndex = planned.backgroundIndex;
       const outcomes = await Promise.allSettled(
-        planned.due.map(({ key, kind }) => requestTab(key, kind)),
+        planned.due.map(({ key, kind }) => requestTab(key, kind, { detachTransport: true })),
       );
       const retryAt = governorControlRetryAt(Date.now(), runtime.refreshMs);
       const retried = retryFailedPollBatch({ due: planned.due, outcomes,
@@ -19280,7 +19408,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     const livenessWake = createRecurringWake({
       scheduler: wakeScheduler,
       intervalMs: Math.min(runtime.refreshMs, 5000),
-      run: async () => {
+      run: () => {
         if (cancelled || remoteSetupRef.current) return;
         const at = Date.now();
         const clockCause = wallClockRecovery(lastWallAt, at, Math.min(runtime.refreshMs, 5_000));
@@ -19293,14 +19421,14 @@ function App({ onCreateRemote = () => {} } = {}) {
         if (clockCause) {
           recordRuntimeRecovery(TABS[activeIndexRef.current].key, clockCause, { origin: "source" });
           setNow(new Date(at));
-          await controlWake();
+          void controlWake();
           return;
         }
         if (wakeScheduler.at("control") <= at ||
-          !Number.isFinite(wakeScheduler.at("control"))) await controlWake();
+          !Number.isFinite(wakeScheduler.at("control"))) void controlWake();
         if (pending.size > 0 || cleanupQueue.size > 0 ||
           wakeScheduler.at("data") <= Date.now() ||
-          Object.values(pollDueAt).some((due) => due <= Date.now())) await dataWake();
+          Object.values(pollDueAt).some((due) => due <= Date.now())) void dataWake();
       },
       onError: (error) => {
         if (!cancelled) pauseCoordination(TABS[activeIndexRef.current].key, error?.reason ?? "stale");
@@ -19560,6 +19688,12 @@ function App({ onCreateRemote = () => {} } = {}) {
       stale: true,
       disconnected: data[tab.key] !== null && !runtimeIdentityCoordinator?.current(),
     });
+  }
+
+  if (runtime.background === "on-demand" && tab.key !== "actions" && data[tab.key] !== null &&
+      ["watching", "shared", "stale"].includes(semanticStatus.kind) && !tabError &&
+      !activeFailure && !(tab.key === "security" && securityBlind)) {
+    semanticStatus = refreshStatus({ onDemand: true });
   }
 
   const allItems = items ?? [];
@@ -19858,7 +19992,8 @@ function App({ onCreateRemote = () => {} } = {}) {
       status: semanticStatus,
       detail: activeGovernorDecision,
       spin: showSpinner ? spin : null,
-      stale: staleLabel,
+      stale: semanticStatus.kind === "cached" && staleFor != null
+        ? formatDuration(Math.max(0, staleFor)) : staleLabel,
       nowMs: now.getTime(),
       interactive,
       cols: frameCols,
@@ -20153,6 +20288,7 @@ export {
   resolveEffectiveCredential,
   identityRegistryRoot,
   inspectIdentityRegistry,
+  doctorCachedQuotaScope,
   claimIdentityBootstrap,
   finishIdentityBootstrap,
   createIdentityCoordinator,

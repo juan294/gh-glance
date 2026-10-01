@@ -144,7 +144,7 @@ test("four ample panes explain a shared lane without moving the hint group", asy
     settle: 65,
     stdin: `i=0; while [ ! -f "${releasePath}" ] && [ "$i" -lt 1200 ]; do ` +
       "sleep .05; i=$((i + 1)); done; printf q",
-    args: "--refresh 40 --tab security",
+    args: "--refresh 40 --tab security --background all",
     configHome: box.root,
     env: {
       GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
@@ -182,7 +182,7 @@ test("four ample panes explain a shared lane without moving the hint group", asy
         'index($0, "sharing 4") { ok=1 }',
         400,
       ) + "printf q",
-      args: "--refresh 40 --tab security",
+      args: "--refresh 40 --tab security --background all",
       configHome: box.root,
       env: {
         GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",

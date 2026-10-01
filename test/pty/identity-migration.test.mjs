@@ -147,7 +147,7 @@ function exerciseAllTabs() {
     waitForRow("no alerts") + barrier("security") + "printf q";
 }
 
-test("ID-08: two real panes serialize all four tabs and control requests through the shared permit", async (t) => {
+test("ID-08: two real panes share all four tabs and control requests through the bounded pool", async (t) => {
   const box = fixture(t);
   const state = box.read();
   // Keep the first Actions generation open long enough for both independently
@@ -207,14 +207,17 @@ test("ID-08: two real panes serialize all four tabs and control requests through
     assert.equal(matching[0].generation, generation,
       `${resource} transports did not match its admitted shared generations`);
   }
-  // These timestamps are independent server process entry/exit, not permit
-  // grant timestamps. Unit seam tests pin the exact 250ms grant interval.
-  // Here every operation must finish before the next HTTP operation starts.
-  for (let index = 1; index < starts.length; index += 1) {
-    const previous = ends.get(starts[index - 1].sequence);
-    assert.ok(previous, "HTTP call never completed");
-    assert.ok(starts[index].at >= previous.at, "HTTP requests overlapped across panes");
+  // Server entry/exit observes actual HTTP overlap. Permit-level tests pin
+  // the exact start gap; this fixture checks the approved normal-execution cap.
+  let peak = 0;
+  for (const start of starts) {
+    const overlapping = starts.filter((other) => other.at <= start.at &&
+      ends.get(other.sequence)?.at > start.at).length;
+    peak = Math.max(peak, overlapping);
+    assert.ok(ends.has(start.sequence), "HTTP call never completed");
   }
+  assert.ok(peak <= 3, `HTTP pool exceeded three concurrent calls: ${peak}`);
+
 });
 
 test("cold identity verification keeps quit responsive and stops its owned HTTP child", async (t) => {

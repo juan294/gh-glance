@@ -1205,3 +1205,42 @@ test("COL-01: rejected provider refresh publishes a scoped hold and schedules re
   await within(received);
   assert.equal(refreshes, 2);
 });
+
+
+test("COL on-demand refresh recovers failed inactive initialization and stops after one observation", async (t) => {
+  const root = mkdtempSync("/tmp/ggc-on-demand-");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  let attempts = 0;
+  let starts = 0;
+  const scheduled = [];
+  const runtime = createCollectorAcquisitionRuntime({
+    config: normalizeCollectorConfig(CONFIG),
+    pathOptions: { env: { XDG_CONFIG_HOME: root }, platform: "linux" },
+    now: () => 10,
+    setTimeout(callback, delay) { const timer = { callback, delay, unref() {} }; scheduled.push(timer); return timer; },
+    clearTimeout() {},
+    resolveProvider: async () => { if (++attempts === 1) throw new Error("temporary provider error"); return IDENTITY; },
+    async produce({ markStarted, demand }) {
+      starts += 1; await markStarted();
+      const result = { raw: "[]", parse: () => [], requestMetrics: {}, repositoryIdentity: { id: "R_1", nameWithOwner: "acme/widget" } };
+      return collectorPublicationFromResult("issues", result, null, demand, 10);
+    },
+  });
+  t.after(() => runtime.close());
+  const snapshots = [];
+  const handle = runtime.subscribe({ target: normalizeCollectorConfig(CONFIG).targets[0], resource: "issues",
+    demand: { active: false, background: false, floorMs: 5000, pages: 1 },
+    onSnapshot(snapshot) { snapshots.push(snapshot); }, onHold() {} });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(attempts, 1);
+  assert.equal(starts, 0);
+  await handle.refresh();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(starts, 1, "explicit demand must retry initialization and produce once");
+  assert.equal(snapshots.length, 1);
+  assert.equal(scheduled.length, 0, "fulfilled on-demand work must not schedule another poll");
+  await handle.refresh();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(starts, 2, "the next explicit request must get one new observation");
+  assert.equal(scheduled.length, 0);
+});

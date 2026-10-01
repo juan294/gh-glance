@@ -231,6 +231,7 @@ function startPane(box, pane, {
   tab = "actions",
   repo = "acme/widget",
   refresh = 40,
+  background = "all",
   readyPath,
   readyAttempts = 1_000,
   readyDelay = 0,
@@ -245,7 +246,7 @@ function startPane(box, pane, {
     signal: "none",
     settle,
     stdin: stdin ?? (readyPath ? readyInput(readyPath, readyAttempts, readyDelay) : "sleep 120"),
-    args: `--repo ${repo} --refresh ${refresh} --tab ${tab}`,
+    args: `--repo ${repo} --refresh ${refresh} --tab ${tab} --background ${background}`,
     animation,
     configHome: box.root,
     env: {

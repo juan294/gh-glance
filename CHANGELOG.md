@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Default to `--background on-demand`: automatically update active Actions,
+  check secondary tabs when opened or refreshed, and retain cached results with
+  visible source age. Keep `all` and `off` for continuous polling.
+
 ### Added
 
 - Add a strict 24-hour freshness monitor with a fixed candidate hash, declared

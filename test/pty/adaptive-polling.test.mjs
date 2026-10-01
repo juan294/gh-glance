@@ -107,7 +107,7 @@ test("POLL-02 a quiet list waits its 30s interval and is checked within two seco
     // Three observations at the 2s floor take the tab into quiet mode (two
     // unchanged), and the fourth is the one this asserts on.
     stdin: waitForIssuePages(4) + "sleep .3; printf q",
-    args: "--repo acme/widget --refresh 2 --tab issues",
+    args: "--repo acme/widget --refresh 2 --tab issues --background off",
     configHome: box.root,
     env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1", GH_GLANCE_FIXTURE_STATE: box.statePath },
   });
@@ -324,4 +324,30 @@ test("PAGE-01 a list nobody scrolls never asks for a second page", (t) => {
   assert.ok(pages[0].endsWith("after=-"));
   // Fifty of 120, and the count says so rather than presenting 50 as the total.
   assert.match(result.finalFrame.lines.join("\n"), /Issues \(50\+\)/);
+});
+
+
+test("default on-demand tabs stop after opening and refresh again with r", (t) => {
+  const box = fixture(t, { apiEntities: { [RUNS_PATH]: { sequence: [{ etag: '"running"',
+    body: readFileSync(join(HERE, "fixtures", "actions-runs-running.json"), "utf8") }] } } });
+  const result = capture({
+    cols: 110, rows: 24, signal: "none", settle: 65,
+    stdin: waitForActionsRuns(3) + "printf 2; " + waitForIssuePages(1) +
+      "sleep 12; printf r; " + waitForIssuePages(2) + "sleep 4; printf q",
+    args: "--repo acme/widget --refresh 2", configHome: box.root,
+    env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1", GH_GLANCE_FIXTURE_STATE: box.statePath },
+  });
+  const state = box.read();
+  const issues = graphqlEvents(state, "issues.page");
+  assert.equal(issues.length, 2, "secondary data must only load on opening and explicit refresh");
+  assert.ok(issues[1].at - issues[0].at >= 11_000, "secondary tab polled before the key press");
+  assert.ok(pathEvents(state, RUNS_PATH).length >= 3, "active Actions must keep updating");
+  assert.equal(graphqlEvents(state, "pulls.page").length, 0, "unopened PRs must not fetch");
+  assert.equal(state.events.filter((event) => event.type === "start" &&
+    event.argv?.some((argument) => /alerts/.test(String(argument)))).length, 0,
+  "unopened Security must not fetch");
+  const frame = result.finalFrame.lines.join("\n");
+  assert.match(frame, /Cached/);
+  assert.doesNotMatch(frame, /Watching/);
+  assert.equal(result.exitCode, 0);
 });

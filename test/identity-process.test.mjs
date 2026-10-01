@@ -132,5 +132,46 @@ test("ID-05: reappearing legacy leases pause an already active identity", async 
   assert.equal(readFileSync(legacyPath, "utf8"), serialized);
   const after = inspectIdentityRegistry(coordinator.root).value;
   assert.equal(after.hosts["github.com"].lastStartedAt, before.hosts["github.com"].lastStartedAt);
-  assert.equal(after.hosts["github.com"].permit, null);
+  assert.equal(after.hosts["github.com"].permits.length, 0);
+});
+
+test("independent processes share three HTTP slots and the host start gap", { timeout: 20_000 }, async (t) => {
+  const box = fixture(t);
+  await box.run(COORDINATE);
+  const script = `
+    const { createIdentityCoordinator, acquireIdentityHttpPermit, releaseIdentityHttpPermit,
+      inspectIdentityRegistry } = await import(process.env.TEST_MODULE_URL);
+    const { appendFileSync } = await import('node:fs');
+    const coordinator = createIdentityCoordinator({ host: 'github.com',
+      pathOptions: { env: { XDG_CONFIG_HOME: process.env.TEST_ROOT } } });
+    if (!(await coordinator.refresh({ allowBootstrap: false })).ok) throw new Error('missing identity');
+    const permit = await acquireIdentityHttpPermit(coordinator);
+    const held = inspectIdentityRegistry(coordinator.root).value.hosts['github.com'].permits
+      .find(item => item.nonce === permit.nonce);
+    appendFileSync(process.env.TEST_JOURNAL, JSON.stringify({ type: 'start', nonce: permit.nonce,
+      at: Date.now(), grantedAt: held.startedAt }) + '\\n');
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    appendFileSync(process.env.TEST_JOURNAL, JSON.stringify({ type: 'end', nonce: permit.nonce,
+      at: Date.now() }) + '\\n');
+    if (!releaseIdentityHttpPermit(coordinator, permit).ok) throw new Error('release failed');
+    coordinator.close();
+    process.stdout.write(JSON.stringify({ nonce: permit.nonce }));
+  `;
+  await Promise.all(Array.from({ length: 8 }, () => box.run(script)));
+  const events = readFileSync(box.env.TEST_JOURNAL, "utf8").trim().split("\n").map(JSON.parse)
+    .filter((event) => event.type);
+  let active = 0;
+  let peak = 0;
+  for (const event of events) {
+    active += event.type === "start" ? 1 : -1;
+    peak = Math.max(peak, active);
+    assert.ok(active >= 0 && active <= 3, "shared capacity exceeded across processes");
+  }
+  assert.equal(active, 0);
+  assert.equal(peak, 3, "independent requests remained serialized");
+  const starts = events.filter((event) => event.type === "start").sort((a, b) => a.grantedAt - b.grantedAt);
+  assert.equal(starts.length, 8);
+  for (let index = 1; index < starts.length; index += 1) {
+    assert.ok(starts[index].grantedAt - starts[index - 1].grantedAt >= 250);
+  }
 });

@@ -93,7 +93,7 @@ test("COL-03: a real local dashboard renders shared collector data without GitHu
   t.after(() => service.close());
   const result = await captureAsync({
     cols: 80, rows: 20, signal: "none", settle: 12, configHome: root,
-    args: "--connect local --repo acme/widget --tab actions",
+    args: "--connect local --repo acme/widget --tab actions --background off",
     stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Shared") { ok=1 }') + "printf 2; sleep .3; printf q",
   });
   assert.ok(result.liveScreen.statusHistory.some((line) => /Shared/.test(line)));
@@ -147,6 +147,44 @@ test("COL-01/06: foreground collector performs governor-backed acquisition while
   assert.ok(result.liveScreen.statusHistory.some((line) => /Shared/.test(line)),
     JSON.stringify({ statuses: result.liveScreen.statusHistory, serverLog, clientLog, stderr }));
   assert.match(serverLog, /(?:actions\/runs|issues\.page|pulls\.page)/);
+  assert.equal(clientLog, "");
+  service.kill("SIGTERM");
+  await waitForExit(service);
+});
+
+test("COL on-demand: real collector refreshes secondary data exactly on request", async (t) => {
+  const root = mkdtempSync("/tmp/ggc-demand-");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const config = join(root, "collector.json");
+  const serverCalls = join(root, "server.calls");
+  const clientCalls = join(root, "client.calls");
+  writeFileSync(config, JSON.stringify(CONFIG), { mode: 0o600 });
+  const fixturePath = `${FIXTURES}:${process.env.PATH}`;
+  const service = spawn(process.execPath, [ENTRY, "--serve", "--config", config], {
+    env: { ...process.env, PATH: fixturePath, XDG_CONFIG_HOME: root, GH_CONFIG_DIR: root,
+      GH_GLANCE_FIXTURE_LOG: serverCalls },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  t.after(() => service.kill("SIGTERM"));
+  let stderr = "";
+  service.stderr.on("data", (chunk) => { stderr += chunk; });
+  for (let index = 0; index < 200 && !stderr.includes("collector listening"); index += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.match(stderr, /collector listening/);
+  const result = await captureAsync({
+    cols: 80, rows: 20, signal: "none", settle: 40, configHome: root,
+    args: "--connect local --repo acme/widget --tab issues --refresh 2",
+    env: { PATH: fixturePath, GH_GLANCE_FIXTURE_LOG: clientCalls },
+    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Cached") { ok=1 }', 200) +
+      "sleep 6; printf r; sleep 6; printf q",
+  });
+  const serverLog = existsSync(serverCalls) ? readFileSync(serverCalls, "utf8") : "";
+  const clientLog = existsSync(clientCalls) ? readFileSync(clientCalls, "utf8") : "";
+  assert.ok(result.liveScreen.statusHistory.some((line) => /Cached/.test(line)),
+    JSON.stringify({ statuses: result.liveScreen.statusHistory, serverLog, clientLog, stderr }));
+  assert.equal(serverLog.split("\n").filter((line) => line.startsWith("graphql issues.page")).length, 2, serverLog);
+  assert.doesNotMatch(serverLog, /actions\/runs|pulls\.page|alerts/);
   assert.equal(clientLog, "");
   service.kill("SIGTERM");
   await waitForExit(service);

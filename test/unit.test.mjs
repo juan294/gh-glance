@@ -2678,24 +2678,36 @@ test("projected hourly demand is a policy-derived range, not one fixed figure", 
   // Actions treated as busy -- and the minimum is the quiet cadence each tab
   // settles into. Inactive tabs contribute their background interval to both.
   //
-  // Actions active: 720/h at the 5s floor, or 120/h once quiet, plus Security
+  // Explicit all mode, Actions active: 720/h at the 5s floor, or 120/h once quiet, plus Security
   // at 12/h x 6 calls in the background. Issues and PRs are GraphQL only.
-  assert.deepEqual(projectedHourlyCost("actions"), {
+  assert.deepEqual(projectedHourlyCost("actions", { background: "all" }), {
     rest: { min: 192, max: 792 },
     graphql: { min: 120, max: 120 },
   });
-  assert.deepEqual(projectedHourlyCost("issues"), {
+  assert.deepEqual(projectedHourlyCost("issues", { background: "all" }), {
     rest: { min: 102, max: 102 },
     graphql: { min: 300, max: 1500 },
   });
-  assert.deepEqual(projectedHourlyCost("prs"), {
+  assert.deepEqual(projectedHourlyCost("prs", { background: "all" }), {
     rest: { min: 102, max: 102 },
     graphql: { min: 300, max: 1500 },
   });
-  assert.deepEqual(projectedHourlyCost("security"), {
+  assert.deepEqual(projectedHourlyCost("security", { background: "all" }), {
     rest: { min: 390, max: 4350 },
     graphql: { min: 120, max: 120 },
   });
+  // The default budgets automatic active Actions only. Secondary observations
+  // are requested by the user and do not contribute a recurring hourly cost.
+  assert.deepEqual(projectedHourlyCost("actions"), {
+    rest: { min: 120, max: 720 },
+    graphql: { min: 0, max: 0 },
+  });
+  for (const key of ["issues", "prs", "security"]) {
+    assert.deepEqual(projectedHourlyCost(key), {
+      rest: { min: 0, max: 0 },
+      graphql: { min: 0, max: 0 },
+    });
+  }
   // Nothing inactive is requested with background polling off, so the range
   // collapses onto the one tab being watched.
   assert.deepEqual(projectedHourlyCost("actions", { background: "off" }), {
@@ -3665,4 +3677,13 @@ test("setup signal forwarding escalates when a child ignores SIGTERM", async () 
   const [code, signal] = await exited;
   assert.equal(code, null);
   assert.equal(signal, "SIGKILL");
+});
+
+
+test("on-demand status labels cached data without hiding errors or incomplete Security", () => {
+  assert.equal(refreshStatus({ onDemand: true }).label, "Cached");
+  assert.equal(refreshStatus({ onDemand: true, visibleLoading: true }).label, "Checking");
+  assert.equal(refreshStatus({ onDemand: true, activeError: { verdict: "other" } }).label, "Failed");
+  assert.equal(refreshStatus({ onDemand: true, securityIncomplete: true }).label, "Limited");
+  assert.equal(refreshStatus({ onDemand: true, disconnected: true }).label, "Disconnected");
 });

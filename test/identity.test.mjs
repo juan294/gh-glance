@@ -193,7 +193,7 @@ test("ID-03 configuration change invalidates the synchronous published identity 
   assert.equal(readFileSync(join(coordinator.root, "registry.json"), "utf8").includes("synthetic-"), false);
 });
 
-test("ID-08 shared transport permit is single-owner and retains start gap", async (t) => {
+test("ID-08 shared transport permit retains its nonce and start gap", async (t) => {
   const { pathOptions } = box(t);
   let at = NOW;
   const coordinator = createIdentityCoordinator({ host: "github.com", pathOptions, env: { GH_TOKEN: "synthetic-one" }, now: () => at, requestIdentity: async () => proof() });
@@ -202,10 +202,10 @@ test("ID-08 shared transport permit is single-owner and retains start gap", asyn
   const first = await acquireIdentityHttpPermit(coordinator, { now: () => at });
   assert.ok(first.nonce);
   const inspected = inspectIdentityRegistry(coordinator.root, { now: at }).value;
-  assert.equal(inspected.hosts["github.com"].permit.nonce, first.nonce);
+  assert.equal(inspected.hosts["github.com"].permits.at(-1).nonce, first.nonce);
   assert.equal(inspected.hosts["github.com"].lastStartedAt, at);
   assert.equal(releaseIdentityHttpPermit(coordinator, first).ok, true);
-  assert.equal(inspectIdentityRegistry(coordinator.root).value.hosts["github.com"].permit, null);
+  assert.equal(inspectIdentityRegistry(coordinator.root).value.hosts["github.com"].permits.length, 0);
 });
 
 test("local credential retrieval is cached until configuration revision changes and close fences delayed proof", async (t) => {
@@ -384,7 +384,7 @@ test("nonce-specific permit completion retries real lock contention without stea
   t.after(() => clearTimeout(release));
   const result = await retryIdentityCompletion(() => releaseIdentityHttpPermit(coordinator, permit));
   assert.equal(result.ok, true);
-  assert.equal(inspectIdentityRegistry(coordinator.root, { now: at }).value.hosts["github.com"].permit, null);
+  assert.equal(inspectIdentityRegistry(coordinator.root, { now: at }).value.hosts["github.com"].permits.length, 0);
 });
 
 test("identity changes during delayed proof cannot persist a mapping under the old credential", async (t) => {
@@ -402,7 +402,7 @@ test("identity changes during delayed proof cannot persist a mapping under the o
   const state = inspectIdentityRegistry(coordinator.root, { now: NOW }).value;
   assert.equal(state.identities[old.credentialKey], undefined);
   assert.equal(Object.values(state.attempts)[0].accounted, false);
-  assert.equal(state.hosts["github.com"].permit, null);
+  assert.equal(state.hosts["github.com"].permits.length, 0);
 });
 
 test("deferred malformed completion is terminal storage work and does not prevent later refresh", async (t) => {
@@ -435,7 +435,7 @@ test("proof completion rechecks configuration after waiting for the registry loc
   const state = inspectIdentityRegistry(coordinator.root, { now: NOW }).value;
   assert.equal(state.identities[old.credentialKey], undefined);
   assert.equal(Object.values(state.attempts)[0].accounted, false);
-  assert.equal(state.hosts["github.com"].permit, null);
+  assert.equal(state.hosts["github.com"].permits.length, 0);
 });
 
 test("known deleted quota ledgers cannot be recreated by control start or settlement", async (t) => {
@@ -496,7 +496,7 @@ test("a credential revision changed during bootstrap claim lock wait starts no o
   assert.equal(requests, 0);
   const registry = inspectIdentityRegistry(root, { now: NOW }).value;
   assert.equal(registry.identities[old.credentialKey], undefined);
-  assert.equal(registry.hosts["github.com"].permit, null);
+  assert.equal(registry.hosts["github.com"].permits.length, 0);
   assert.equal(Object.values(registry.attempts)[0].accounted, false);
 });
 
@@ -534,7 +534,7 @@ test("closing the identity coordinator aborts in-flight proof and preserves cons
   const registry = inspectIdentityRegistry(coordinator.root, { now: NOW }).value;
   assert.equal(Object.keys(registry.identities).length, 0);
   assert.equal(Object.values(registry.attempts)[0].accounted, false);
-  assert.equal(registry.hosts["github.com"].permit, null);
+  assert.equal(registry.hosts["github.com"].permits.length, 0);
 });
 
 
@@ -642,7 +642,7 @@ test("a permit outliving the request it guards is reclaimed from a live owner", 
   at += 35_001;
   const next = await acquireIdentityHttpPermit(coordinator, { now: () => at });
   assert.notEqual(next.nonce, held.nonce);
-  assert.equal(inspectIdentityRegistry(coordinator.root, { now: at }).value.hosts["github.com"].permit.nonce, next.nonce);
+  assert.equal(inspectIdentityRegistry(coordinator.root, { now: at }).value.hosts["github.com"].permits.at(-1).nonce, next.nonce);
 });
 
 test("a quota import marker prevents double charge when registry persistence is replayed", async (t) => {
