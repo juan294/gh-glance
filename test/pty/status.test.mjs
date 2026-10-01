@@ -17,6 +17,7 @@ import {
   loadAcquisitionStore,
   resourceReserve,
   tabRequestCost,
+  COORDINATION_NOTICE_AFTER_MS,
 } from "../../index.mjs";
 import { capture, captureAsync, isStatusLine, waitForAwk } from "./capture.mjs";
 import { seedKnownHeldIdentity } from "./fixtures/known-identity.mjs";
@@ -904,12 +905,20 @@ test("a sub-threshold coordination blip stays silent", (t) => {
   const [pausedAt, releasedAt, watchingAt] = readFileSync(blipTimer, "utf8").trim().split("\n").map(Number);
   t.diagnostic(`blip visible Paused→release ${releasedAt - pausedAt}ms, Paused→Watching ${watchingAt - pausedAt}ms`);
 
-  assert.ok(result.liveScreen.statusHistory.some((line) => /^‖ Paused/.test(line)));
+  const statuses = result.liveScreen.statusHistory;
+  const pausedIndex = statuses.findIndex((line) => /^‖ Paused/.test(line));
+  assert.ok(pausedIndex >= 0, "fixture must expose the temporary hold");
+  assert.ok(statuses.slice(pausedIndex + 1).some((line) => /^· Watching/.test(line)),
+    "the temporary hold must recover to Watching");
+  assert.ok([pausedAt, releasedAt, watchingAt].every(Number.isFinite));
+  assert.ok(pausedAt <= releasedAt && releasedAt <= watchingAt);
+  assert.ok(watchingAt - pausedAt < COORDINATION_NOTICE_AFTER_MS,
+    "fixture must recover before the sustained-notice threshold");
   assert.doesNotMatch(
     result.raw,
     /Confirming your GitHub login|Holding until|Coordinating with your other panes|Can't coordinate/,
   );
-  assert.match(statusLine(result) ?? "", /^· Watching/);
+  assert.equal(result.exitCode, 0);
 });
 
 test("a sustained coordination notice can appear and clear without overflowing the frame", (t) => {

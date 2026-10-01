@@ -274,11 +274,14 @@ test("admitted HTTP queue respects a sooner immutable operation deadline", async
   assert.equal(read(at).waiters.length, 0);
 });
 
-for (const operation of ["tab:actions-runs", "budget-core-observer"]) {
-  test(`runGh binds the queue deadline only for admitted data: ${operation}`, async (t) => {
-    const { coordinator } = await fixture(t, { occupied: true });
+for (const [operation, admissionDelay] of [
+  ["tab:actions-runs", 0], ["tab:actions-runs", 10_000],
+  ["budget-core-observer", 0], ["budget-core-observer", 10_000],
+]) {
+  test(`runGh binds the queue deadline only for admitted data: ${operation}, delay ${admissionDelay}`, async (t) => {
+    const { coordinator } = await fixture(t);
     let at = NOW + 1_000;
-    const live = await acquireIdentityHttpPermit(coordinator, { now: () => at });
+    let live;
     let requestQueuedAt;
     const scope = {
       ...createQuotaScope(coordinator.current(), { root: coordinator.root, now: () => at }),
@@ -297,16 +300,25 @@ for (const operation of ["tab:actions-runs", "budget-core-observer"]) {
     let executions = 0;
     const result = await runAdmittedOperation({ scope, leaseId, operation, now: () => at,
       waitMs: 5_000, wait: async (ms) => { at += ms + 1; return true; },
-      run: () => runGh(["api", "user"], { operation, execute: (_command, _args, options) => {
-        executions += 1;
-        assert.equal(options.timeout, 30_000, "queue waiting must not extend an HTTP child's timeout");
-        const child = new EventEmitter();
-        child.pid = process.pid;
-        const pending = Promise.resolve({ stdout: "{}" });
-        pending.child = child;
-        queueMicrotask(() => child.emit("close", 0));
-        return pending;
-      } }),
+      run: async () => {
+        at += admissionDelay;
+        // Admission has a seeded phase delay. Fill the pool afterward so no
+        // blocker can age out before the control request's own queue deadline.
+        for (let slot = 0; slot < 3; slot += 1) {
+          if (slot > 0) at += 250;
+          live = await acquireIdentityHttpPermit(coordinator, { now: () => at });
+        }
+        return runGh(["api", "user"], { operation, execute: (_command, _args, options) => {
+          executions += 1;
+          assert.equal(options.timeout, 30_000, "queue waiting must not extend an HTTP child's timeout");
+          const child = new EventEmitter();
+          child.pid = process.pid;
+          const pending = Promise.resolve({ stdout: "{}" });
+          pending.child = child;
+          queueMicrotask(() => child.emit("close", 0));
+          return pending;
+        } });
+      },
     });
     if (operation === "tab:actions-runs") {
       assert.equal(result.ok, true, result.error?.message);
