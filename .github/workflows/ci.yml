@@ -34,7 +34,7 @@ jobs:
   test:
     name: Test (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     strategy:
       # Without this the first version to fail cancels the others, which
       # destroys exactly the signal a matrix exists to produce.

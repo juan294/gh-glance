@@ -28,7 +28,7 @@ jobs:
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     environment: npm
     permissions:
       contents: read
