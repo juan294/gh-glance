@@ -22,7 +22,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { capture, waitForAwk } from "./capture.mjs";
+import { capture, lazyCapture, waitForAwk } from "./capture.mjs";
 
 // Width-mode probes do not depend on data rows; keep their short input spacing.
 const REFRESH_SECONDS = 5;
@@ -30,7 +30,7 @@ const SETTLE = Math.ceil(REFRESH_SECONDS * 0.6);
 
 // Move is advertised only after rows arrive. Force slow provider responses and
 // wait for actual fixture rows before switching tabs and quitting.
-const keyed = (() => {
+const keyed = lazyCapture(() => {
   const configHome = mkdtempSync(join(tmpdir(), "gh-glance-pty-keys-"));
   const statePath = join(configHome, "fixture.json");
   const now = Date.now();
@@ -53,24 +53,24 @@ const keyed = (() => {
   } finally {
     rmSync(configHome, { recursive: true, force: true });
   }
-})();
+});
 
 // The same app, backgrounded, so stdin is not a tty. Used only to prove the
 // interactive gate works in both directions.
-const detached = capture({ cols: 80, rows: 24, settle: 4 });
+const detached = lazyCapture(() => capture({ cols: 80, rows: 24, settle: 4 }));
 
 const noRemoteEnv = {
   GH_GLANCE_FIXTURE_FAIL: "failed to determine base repo: no git remotes found",
   GH_GLANCE_FIXTURE_FAIL_ON: "run,graphql,api",
 };
-const remoteSetupDeclined = capture({
+const remoteSetupDeclined = lazyCapture(() => capture({
   cols: 80,
   rows: 24,
   signal: "none",
   settle: 10,
   stdin: "sleep 3; printf 'q'; sleep 2",
   env: noRemoteEnv,
-});
+}));
 
 function assertCleanInteractiveCapture(result, { cols, rows, label }) {
   assert.equal(result.exitCode, 0, `${label}: q should exit 0`);
@@ -96,24 +96,24 @@ test("keys are advertised only when stdin is interactive", () => {
   // are checked. index.mjs shows the full hints when raw mode is supported and
   // only "Quit: ^C" when it is not -- advertising keys that cannot fire would be
   // telling the user something untrue about what the app can do.
-  assert.match(keyed.raw, /ci: pin actions/, "Actions rows must arrive before switching");
-  assert.match(keyed.finalFrame.lines.join("\n"), /SIGTERM erases/, "Issues rows must arrive before quitting");
+  assert.match(keyed().raw, /ci: pin actions/, "Actions rows must arrive before switching");
+  assert.match(keyed().finalFrame.lines.join("\n"), /SIGTERM erases/, "Issues rows must arrive before quitting");
   assert.ok(
-    keyed.hasFullKeyHints,
+    keyed().hasFullKeyHints,
     "expected the full key hints on a foreground run with an interactive stdin",
   );
   assert.ok(
-    !detached.hasFullKeyHints,
+    !detached().hasFullKeyHints,
     "expected only the Ctrl+C hint when stdin is not a tty",
   );
-  assert.match(detached.finalFrame.lines.join("\n"), /Quit:\s+\^C/,
+  assert.match(detached().finalFrame.lines.join("\n"), /Quit:\s+\^C/,
     "noninteractive stdin must advertise Ctrl+C even before rows arrive");
 });
 
 test("a digit switches tabs", () => {
   // The active tab is bracketed rather than only inverse, so this survives
   // NO_COLOR -- which is why it is assertable at all after escapes are stripped.
-  const plain = keyed.raw.replace(
+  const plain = keyed().raw.replace(
     new RegExp(String.fromCharCode(27) + "\\[[0-9;?]*[A-Za-z]", "g"),
     "",
   );
@@ -128,18 +128,18 @@ test("q quits cleanly and leaves nothing on the primary buffer", () => {
   // Together they are the pair that distinguishes #41: this path was always
   // clean because ink unmounts before restoreScreen runs, while the signal path
   // had the two in the opposite order.
-  assert.equal(keyed.exitCode, 0, "q should exit 0");
-  assert.equal(keyed.altEnter, 1);
-  assert.equal(keyed.altExit, 1);
+  assert.equal(keyed().exitCode, 0, "q should exit 0");
+  assert.equal(keyed().altEnter, 1);
+  assert.equal(keyed().altExit, 1);
   assert.equal(
-    keyed.afterRestore.hasScrollbackErase,
+    keyed().afterRestore.hasScrollbackErase,
     false,
     "the clean-quit path must not erase the scrollback either",
   );
   assert.equal(
-    keyed.afterRestore.visible,
+    keyed().afterRestore.visible,
     "",
-    `a dead frame was left on the primary buffer: ${JSON.stringify(keyed.afterRestore.visible.slice(0, 120))}`,
+    `a dead frame was left on the primary buffer: ${JSON.stringify(keyed().afterRestore.visible.slice(0, 120))}`,
   );
 });
 
@@ -220,11 +220,11 @@ test("compact width-mode input is a persistence no-op", () => {
 
 test("quitting the missing-remote prompt makes no repository change", () => {
   assert.ok(
-    !remoteSetupDeclined.fixtureCalls.some((call) => call.startsWith("repo create")),
+    !remoteSetupDeclined().fixtureCalls.some((call) => call.startsWith("repo create")),
     "declining setup unexpectedly invoked gh repo create",
   );
-  assert.equal(remoteSetupDeclined.exitCode, 0);
-  assert.equal(remoteSetupDeclined.altEnter, 1);
-  assert.equal(remoteSetupDeclined.altExit, 1);
-  assert.equal(remoteSetupDeclined.afterRestore.visible, "");
+  assert.equal(remoteSetupDeclined().exitCode, 0);
+  assert.equal(remoteSetupDeclined().altEnter, 1);
+  assert.equal(remoteSetupDeclined().altExit, 1);
+  assert.equal(remoteSetupDeclined().afterRestore.visible, "");
 });

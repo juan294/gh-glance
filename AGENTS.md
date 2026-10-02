@@ -117,6 +117,8 @@ describe what exists; do not suggest improvements unless asked.
   committed directly to it; `main` is production and moves only via a
   `develop` -> `main` pull request
 - Keep implementation work in isolated worktrees or temporary branches
+- Releases follow `docs/release/release-playbook.md`, which also decides
+  when the `rpi-pre-launch` sequence below applies.
 <!-- rpi:push-accountability:start -->
 # Push Accountability
 

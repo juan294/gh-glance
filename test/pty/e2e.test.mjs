@@ -10,8 +10,9 @@
 // counts, widths, escape balance and exit codes are stable under copy changes;
 // the text in a cell is not, and asserting it would red the build for no defect.
 //
-// Captures cost several seconds each, so each one is taken once at module scope
-// and asserted against repeatedly.
+// Captures cost several seconds each, so each one is taken once, lazily, by the
+// first test that needs it and asserted against repeatedly. Lazy setup lets a
+// name-filtered run (the terminal smoke selection) spawn only what it uses.
 
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
@@ -19,18 +20,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 
-import { capture } from "./capture.mjs";
+import { capture, lazyCapture } from "./capture.mjs";
 import { MIN_TABLE_WIDTH } from "../../index.mjs";
 
 // 80x24: the full column set. 45x20: below MIN_TABLE_WIDTH (61), so the compact
 // set. Both are killed with SIGTERM, which is the path #41 lives on.
-const wide = capture({ cols: 80, rows: 24, settle: 7 });
-const narrow = capture({ cols: 45, rows: 20, settle: 7 });
+const wide = lazyCapture(() => capture({ cols: 80, rows: 24, settle: 7 }));
+const narrow = lazyCapture(() => capture({ cols: 45, rows: 20, settle: 7 }));
 const repositoryResolutionFailure =
   "GraphQL: Could not resolve to a Repository with the name 'Nvteca/cashflor-forecast'. (repository)";
 const inaccessibleConfig = mkdtempSync(join(tmpdir(), "gh-glance-inaccessible-pty-"));
 after(() => rmSync(inaccessibleConfig, { recursive: true, force: true }));
-const inaccessibleRepository = capture({
+const inaccessibleRepository = lazyCapture(() => capture({
   cols: 80,
   rows: 24,
   signal: "none",
@@ -44,8 +45,8 @@ const inaccessibleRepository = capture({
     GH_GLANCE_FIXTURE_FAIL: repositoryResolutionFailure,
     GH_GLANCE_FIXTURE_FAIL_ON: "graphql-data",
   },
-});
-const missingRemoteDetached = capture({
+}));
+const missingRemoteDetached = lazyCapture(() => capture({
   cols: 80,
   rows: 24,
   settle: 7,
@@ -53,36 +54,36 @@ const missingRemoteDetached = capture({
     GH_GLANCE_FIXTURE_FAIL: "failed to determine base repo: no git remotes found",
     GH_GLANCE_FIXTURE_FAIL_ON: "run,graphql-data,api-data",
   },
-});
+}));
 
 test("the app reaches the data layer at all", () => {
   // Guards the silent failures: a zero-byte BSD capture when stdin is a socket,
   // and a preflight exit(3) before anything renders. Without this, every
   // assertion below could be passing against an empty screen.
   assert.ok(
-    wide.fixtureCalls.length > 0,
+    wide().fixtureCalls.length > 0,
     `the fixture gh was never invoked -- the capture is not of a running dashboard`,
   );
   assert.ok(
-    wide.fixtureCalls.some((call) => call.includes("/actions/runs?")),
+    wide().fixtureCalls.some((call) => call.includes("/actions/runs?")),
     "expected the Actions tab to fetch on first paint",
   );
 });
 
 test("healthy startup does not probe optional failure context", () => {
   assert.ok(
-    !wide.fixtureCalls.some((call) => call.startsWith("graphql repository.identity")),
+    !wide().fixtureCalls.some((call) => call.startsWith("graphql repository.identity")),
     "healthy startup unexpectedly probed repository context",
   );
   assert.ok(
-    !wide.fixtureCalls.some((call) => call.startsWith("auth status") && call.includes("--json hosts")),
+    !wide().fixtureCalls.some((call) => call.startsWith("auth status") && call.includes("--json hosts")),
     "healthy startup unexpectedly probed compact auth context",
   );
 });
 
 test("an inaccessible repository uses cached auth context and respects paced repository slots", () => {
-  const calls = inaccessibleRepository.fixtureCalls;
-  const frame = inaccessibleRepository.finalFrame.lines.join("\n");
+  const calls = inaccessibleRepository().fixtureCalls;
+  const frame = inaccessibleRepository().finalFrame.lines.join("\n");
   const details = JSON.stringify({ calls, frame });
   assert.ok(calls.some((call) => call.startsWith("graphql issues.page")), `Issues did not fail: ${details}`);
   assert.match(frame, /Failed/, details);
@@ -110,64 +111,64 @@ test("an inaccessible repository uses cached auth context and respects paced rep
 });
 
 test("the failure frame preserves terminal geometry and clean teardown", () => {
-  assert.equal(inaccessibleRepository.finalFrame.lines.length, 23);
+  assert.equal(inaccessibleRepository().finalFrame.lines.length, 23);
   assert.ok(
-    inaccessibleRepository.finalFrame.widest <= 80,
-    `widest failure line was ${inaccessibleRepository.finalFrame.widest} in an 80-column terminal`,
+    inaccessibleRepository().finalFrame.widest <= 80,
+    `widest failure line was ${inaccessibleRepository().finalFrame.widest} in an 80-column terminal`,
   );
-  assert.equal(inaccessibleRepository.altEnter, 1);
-  assert.equal(inaccessibleRepository.altExit, 1);
-  assert.equal(inaccessibleRepository.afterRestore.hasScrollbackErase, false);
-  assert.equal(inaccessibleRepository.afterRestore.hasClear, false);
-  assert.equal(inaccessibleRepository.afterRestore.visible, "");
+  assert.equal(inaccessibleRepository().altEnter, 1);
+  assert.equal(inaccessibleRepository().altExit, 1);
+  assert.equal(inaccessibleRepository().afterRestore.hasScrollbackErase, false);
+  assert.equal(inaccessibleRepository().afterRestore.hasClear, false);
+  assert.equal(inaccessibleRepository().afterRestore.visible, "");
 });
 
 test("detached missing-remote setup advertises no unavailable keys", () => {
-  const frame = missingRemoteDetached.finalFrame.lines.join("\n");
+  const frame = missingRemoteDetached().finalFrame.lines.join("\n");
   assert.ok(!frame.includes("Enter"), frame);
   assert.ok(!frame.includes("q/Esc"), frame);
   assert.ok(frame.includes("Ctrl+C"), frame);
-  assert.equal(missingRemoteDetached.finalFrame.lines.length, 23);
-  assert.ok(missingRemoteDetached.finalFrame.widest <= 80);
+  assert.equal(missingRemoteDetached().finalFrame.lines.length, 23);
+  assert.ok(missingRemoteDetached().finalFrame.widest <= 80);
 });
 
 test("the alternate screen is entered exactly once and left exactly once", () => {
   // An unbalanced pair strands the user's terminal in the alternate buffer,
   // which outlives the process.
-  assert.equal(wide.altEnter, 1, "entered the alternate screen more than once");
-  assert.equal(wide.altExit, 1, "left the alternate screen more than once");
+  assert.equal(wide().altEnter, 1, "entered the alternate screen more than once");
+  assert.equal(wide().altExit, 1, "left the alternate screen more than once");
 });
 
 test("the cursor is restored before exit", () => {
   // index.mjs writes ?25h itself because an explicit process.exit() skips ink's
   // own unmount restore.
-  assert.ok(wide.cursorShows >= 1, "the cursor was never shown again");
+  assert.ok(wide().cursorShows >= 1, "the cursor was never shown again");
 });
 
 test("the final frame leaves one physical terminal row as a scroll guard", () => {
   // Dynamic content must not occupy the terminal's last row. Ink parks its
   // cursor on that unused row, so a status-only incremental update cannot
   // scroll the viewport and leave an old footer behind.
-  assert.equal(wide.finalFrame.lines.length, 23);
-  assert.equal(narrow.finalFrame.lines.length, 19);
-  assert.equal(wide.liveScreen.lines.at(-1), "", "wide terminal guard row was not blank");
-  assert.equal(narrow.liveScreen.lines.at(-1), "", "narrow terminal guard row was not blank");
-  assert.equal(wide.liveScreen.statusLines, 1, "wide terminal accumulated status lines");
-  assert.equal(narrow.liveScreen.statusLines, 1, "narrow terminal accumulated status lines");
-  assert.equal(wide.liveScreen.maxStatusLines, 1, "wide terminal transiently duplicated status");
-  assert.equal(narrow.liveScreen.maxStatusLines, 1, "narrow terminal transiently duplicated status");
+  assert.equal(wide().finalFrame.lines.length, 23);
+  assert.equal(narrow().finalFrame.lines.length, 19);
+  assert.equal(wide().liveScreen.lines.at(-1), "", "wide terminal guard row was not blank");
+  assert.equal(narrow().liveScreen.lines.at(-1), "", "narrow terminal guard row was not blank");
+  assert.equal(wide().liveScreen.statusLines, 1, "wide terminal accumulated status lines");
+  assert.equal(narrow().liveScreen.statusLines, 1, "narrow terminal accumulated status lines");
+  assert.equal(wide().liveScreen.maxStatusLines, 1, "wide terminal transiently duplicated status");
+  assert.equal(narrow().liveScreen.maxStatusLines, 1, "narrow terminal transiently duplicated status");
 });
 
 test("no rendered line exceeds the terminal width", () => {
   // Measured before the narrow-width fix: 45x20 rendered 48 columns wide, so
   // rows hard-wrapped and ink repainted the whole screen every frame.
   assert.ok(
-    wide.finalFrame.widest <= 80,
-    `widest line was ${wide.finalFrame.widest} in an 80-column terminal`,
+    wide().finalFrame.widest <= 80,
+    `widest line was ${wide().finalFrame.widest} in an 80-column terminal`,
   );
   assert.ok(
-    narrow.finalFrame.widest <= 45,
-    `widest line was ${narrow.finalFrame.widest} in a 45-column terminal`,
+    narrow().finalFrame.widest <= 45,
+    `widest line was ${narrow().finalFrame.widest} in a 45-column terminal`,
   );
 });
 
@@ -179,13 +180,13 @@ test("a pane narrower than the table minimum still renders its chrome", () => {
     MIN_TABLE_WIDTH > 45,
     `45 must stay below the compact-mode threshold (currently ${MIN_TABLE_WIDTH})`,
   );
-  assert.ok(narrow.hasPanelFrame, "panel frame missing in compact mode");
-  assert.ok(narrow.hasTabBar, "tab bar missing in compact mode");
+  assert.ok(narrow().hasPanelFrame, "panel frame missing in compact mode");
+  assert.ok(narrow().hasTabBar, "tab bar missing in compact mode");
 });
 
 test("the panel frame and tab bar are drawn at full width", () => {
-  assert.ok(wide.hasPanelFrame);
-  assert.ok(wide.hasTabBar);
+  assert.ok(wide().hasPanelFrame);
+  assert.ok(wide().hasTabBar);
 });
 
 test("the frame does not repaint by full clear in steady state", () => {
@@ -195,18 +196,18 @@ test("the frame does not repaint by full clear in steady state", () => {
   // every frame instead of diffing -- which is what a frame wider or taller than
   // the viewport causes, and the reason the width assertions above exist.
   assert.ok(
-    wide.fullClears <= 2,
-    `${wide.fullClears} full clears suggests an overflow repaint loop`,
+    wide().fullClears <= 2,
+    `${wide().fullClears} full clears suggests an overflow repaint loop`,
   );
   assert.ok(
-    narrow.fullClears <= 2,
-    `${narrow.fullClears} full clears in compact mode suggests an overflow repaint loop`,
+    narrow().fullClears <= 2,
+    `${narrow().fullClears} full clears in compact mode suggests an overflow repaint loop`,
   );
 });
 
 test("SIGTERM exits 143", () => {
   // Documented in CHANGELOG.md but asserted nowhere until now.
-  assert.equal(wide.exitCode, 143);
+  assert.equal(wide().exitCode, 143);
 });
 
 test("SIGINT exits 130 and SIGHUP exits 129", () => {
@@ -225,7 +226,7 @@ test("nothing is written to the primary buffer after the alternate screen is lef
   // exactly fills the viewport, so that repaint takes the
   // `isUnmounting && previousOutputHeight >= viewportRows` branch and is
   // preceded by ESC[2J ESC[3J -- and ESC[3J erases the user's scrollback.
-  const after = wide.afterRestore;
+  const after = wide().afterRestore;
   assert.equal(
     after.hasScrollbackErase,
     false,

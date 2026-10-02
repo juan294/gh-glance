@@ -1,5 +1,23 @@
 name: CI
 
+# One authoritative candidate selection per release. The `plan` job decides the
+# role of this run (scripts/release-candidate.mjs planCi):
+#
+#   push to develop        quick integration checks, or nothing while the
+#                          develop -> main release PR is open (its run covers it)
+#   PR develop -> main     the release candidate: selected suites plus ONE packed
+#                          tarball that every package job and the publisher reuse
+#   other PRs              read-only checks; can never produce a publishable artifact
+#   push to main           promotion identity only (merge tree == tested tree)
+#
+# Every job runs only when the plan selected it. `Release candidate` always runs
+# and fails if a selected job did not succeed or an unselected one ran, so a
+# skipped job can never stand in for missing work. The legacy required context
+# names (Lint, Test (Node N), Smoke (Node N), PTY) stay on the jobs that now do
+# the selected work until the protection migration retires them. Only
+# pull_request runs carry those names and `Release candidate`: a push run on
+# the same commit reports under "(push)" names, so its skipped or quicker
+# checks can never stand in for the candidate's in branch protection.
 on:
   push:
     branches: [main, develop]
@@ -9,38 +27,111 @@ on:
 permissions:
   contents: read
 
+# Supersede older runs for the same PR or branch. Publication lives in
+# release.yml and is never cancelled from here.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 # Actions are pinned to full commit SHAs rather than floating major tags: a tag
 # is retargetable by its owner at any moment, and release.yml holds an OIDC
 # token with publish rights. The trailing version comment is what makes a
 # Dependabot SHA bump reviewable, so it is load-bearing rather than decoration.
+# Runtime pins (Node 22.22.2 / 24.21.0, npm 11.21.0) are held to
+# scripts/release-candidate.mjs PINS by test/workflows.test.mjs.
 jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      plan: ${{ steps.plan.outputs.plan }}
+      jobs: ${{ steps.plan.outputs.jobs }}
+      terminal-os: ${{ steps.plan.outputs.terminal-os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22.22.2
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: node scripts/release-candidate.mjs plan-ci
+
   lint:
-    name: Lint
+    name: ${{ github.event_name == 'pull_request' && 'Lint' || 'Lint (push)' }}
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'lint')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: 22
+          node-version: 22.22.2
           cache: npm
       - run: npm ci
       - run: npm run lint
+      - run: node --check index.mjs
+
+  # The candidate's one pack. Pinned Node and npm, locked install, one
+  # `npm pack --ignore-scripts`, then the tarball and its immutable input
+  # manifest are uploaded once (never overwritten) for 30 days.
+  pack:
+    name: Pack candidate
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'pack')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      tarball-sha256: ${{ steps.manifest.outputs.tarball-sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22.22.2
+          cache: npm
+      - run: npm install -g npm@11.21.0 && npm --version
+      - run: npm ci
+      - run: node scripts/release-candidate.mjs pack candidate
+      - id: manifest
+        env:
+          CI_PLAN: ${{ needs.plan.outputs.plan }}
+        run: node scripts/release-candidate.mjs manifest candidate/artifact.tgz candidate/manifest.json
+      - id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.manifest.outputs.artifact-name }}
+          path: |
+            candidate/artifact.tgz
+            candidate/manifest.json
+          retention-days: 30
+          overwrite: false
+          if-no-files-found: error
 
   test:
-    name: Test (Node ${{ matrix.node-version }})
+    name: ${{ github.event_name == 'pull_request' && format('Test (Node {0})', matrix.node) || format('Test (Node {0}, push)', matrix.node) }}
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'test')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       # Without this the first version to fail cancels the others, which
       # destroys exactly the signal a matrix exists to produce.
       fail-fast: false
+      # The context name keeps the major ("Test (Node 22)") because main's
+      # protection requires it; the exact pinned runtime is the version.
       matrix:
-        node-version: [22, 24]
+        include:
+          - { node: 22, node-version: 22.22.2 }
+          - { node: 24, node-version: 24.21.0 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -48,120 +139,218 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
-      # Until this job existed, no function body in index.mjs was executed by
-      # any gate -- every smoke check below returns from the argv block long
-      # before render(), so a green tick meant only "this file parses".
-      - run: npm test
+      - run: node scripts/test-select.mjs run fast
 
-  # The dashboard is a single ESM script with no build step, so the remaining
-  # version-dependent checks are that it parses and boots on every supported
-  # Node. 22 is the floor declared in `engines`: ink, cli-truncate and
-  # slice-ansi all require >=22, and Node 20 reached end of life on 2026-04-30.
+  # The package selection on each supported Node: exact five files and bytes,
+  # installed bin, version/help, blocked imports, the original smoke's refusals
+  # (exit 1 non-TTY, exit 2 unknown flag) and the installed collector routes. A
+  # candidate run checks the one uploaded tarball, downloaded by ID and
+  # hard-checked against the pack job's digest, and may never repack; other
+  # runs let the test pack privately.
   smoke:
-    name: Smoke (Node ${{ matrix.node-version }})
+    name: ${{ github.event_name == 'pull_request' && format('Smoke (Node {0})', matrix.node) || format('Smoke (Node {0}, push)', matrix.node) }}
+    needs: [plan, pack]
+    if: >-
+      always() && contains(fromJSON(needs.plan.outputs.jobs), 'smoke') &&
+      (needs.pack.result == 'success' || needs.pack.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
       fail-fast: false
+      # The context name keeps the major ("Smoke (Node 22)") because main's
+      # protection requires it; the exact pinned runtime is the version.
       matrix:
-        node-version: [22, 24]
+        include:
+          - { node: 22, node-version: 22.22.2 }
+          - { node: 24, node-version: 24.21.0 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: ${{ matrix.node-version }}
-          cache: npm
-      - run: npm ci
-      - name: Syntax check
-        run: node --check index.mjs
-      - name: CLI boots
-        run: |
-          node index.mjs --version
-          node index.mjs --help
-      # This previously asserted only "some non-zero exit", which any startup
-      # crash or module-resolution failure would also satisfy. Pin the exact
-      # code and a short stable fragment of the message -- short so that
-      # rewording the sentence does not red the build.
-      - name: Refuses a non-TTY stdout
-        run: |
-          set +e
-          stderr=$(node index.mjs 2>&1 >/dev/null)
-          code=$?
-          set -e
-          if [ "$code" -ne 1 ]; then
-            echo "expected exit 1 for a non-TTY stdout, got $code" >&2
-            exit 1
-          fi
-          case "$stderr" in
-            *"not a terminal"*) ;;
-            *) echo "expected the non-TTY explanation, got: $stderr" >&2; exit 1 ;;
-          esac
-      - name: Rejects an unknown argument
-        run: |
-          set +e
-          node index.mjs --definitely-not-a-flag >/dev/null 2>&1
-          code=$?
-          set -e
-          if [ "$code" -ne 2 ]; then
-            echo "expected exit 2 for an unknown argument, got $code" >&2
-            exit 1
-          fi
+      - if: needs.pack.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.pack.outputs.artifact-id }}
+          path: candidate
+          digest-mismatch: error
+      - if: needs.pack.result == 'success'
+        env:
+          EXPECTED_SHA256: ${{ needs.pack.outputs.tarball-sha256 }}
+        run: node scripts/release-candidate.mjs use-candidate candidate
+      - run: node scripts/test-select.mjs run package
 
-  # Run files serially within each shard: individual files already create
-  # concurrent panes. The governor file exceeded the old 10-minute per-file
-  # runner timeout on 2026-09-23; one serial job took 32 minutes at 144 tests.
-  # Isolated runners avoid a timed-out file disrupting later PTY fixtures.
-  pty-governor:
-    name: PTY governor
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  # Startup, Actions rows, navigation, quit, cached age and Paused -> Watching
+  # recovery against the installed candidate on GNU (Linux) script(1), and on
+  # BSD (macOS) for release candidates.
+  terminal-smoke:
+    name: Terminal smoke (${{ matrix.os }})
+    needs: [plan, pack]
+    if: >-
+      always() && contains(fromJSON(needs.plan.outputs.jobs), 'terminal-smoke') &&
+      (needs.pack.result == 'success' || needs.pack.result == 'skipped')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.plan.outputs.terminal-os) }}
+    env:
+      GH_GLANCE_TEST_EVIDENCE_DIR: ${{ github.workspace }}/../evidence
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: 22
+          node-version: 22.22.2
           cache: npm
       - run: npm ci
-      - run: node --test --test-concurrency=1 --test-timeout=900000 test/pty/governor.test.mjs
+      - if: needs.pack.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.pack.outputs.artifact-id }}
+          path: candidate
+          digest-mismatch: error
+      - if: needs.pack.result == 'success'
+        env:
+          EXPECTED_SHA256: ${{ needs.pack.outputs.tarball-sha256 }}
+        run: node scripts/release-candidate.mjs use-candidate candidate --install
+      - run: node scripts/test-select.mjs run pty:smoke
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: terminal-smoke-evidence-${{ matrix.os }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/../evidence
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # The 72-hour recovery oracle and the simulated-hour efficiency acceptance,
+  # once, on Node 22. The runner keeps going after a failure and fails if
+  # either selection did.
+  sustained:
+    name: Recovery and efficiency
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'sustained')
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22.22.2
+          cache: npm
+      - run: npm ci
+      - run: node scripts/test-select.mjs run recovery efficiency
+
+  # Full terminal suite in two shards (scripts/test-select.mjs pty:governor and
+  # pty:rest, which together must equal the full selection), files serial
+  # within each: individual files already create concurrent panes. The governor
+  # file exceeded the old 10-minute per-file runner timeout on 2026-09-23;
+  # isolated runners avoid a timed-out file disrupting later PTY fixtures.
+  # Exercises the GNU branch of run.sh.
+  pty-governor:
+    name: PTY governor
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'pty-governor')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_GLANCE_TEST_EVIDENCE_DIR: ${{ github.workspace }}/../evidence
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22.22.2
+          cache: npm
+      - run: npm ci
+      - run: node scripts/test-select.mjs run pty:governor
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pty-governor-evidence-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/../evidence
+          retention-days: 7
+          if-no-files-found: ignore
 
   pty-rest:
     name: PTY other files
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'pty-rest')
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
+    env:
+      GH_GLANCE_TEST_EVIDENCE_DIR: ${{ github.workspace }}/../evidence
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: 22
+          node-version: 22.22.2
           cache: npm
       - run: npm ci
-      # Exercise the GNU (util-linux) branch of run.sh while keeping each
-      # file serial; the local full suite exercises the BSD branch.
-      - run: |
-          files=()
-          for file in test/pty/*.test.mjs; do
-            if [[ "$file" != test/pty/governor.test.mjs ]]; then
-              files+=("$file")
-            fi
-          done
-          test "${#files[@]}" -gt 0
-          node --test --test-concurrency=1 --test-timeout=900000 "${files[@]}"
+      - run: node scripts/test-select.mjs run pty:rest
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pty-rest-evidence-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/../evidence
+          retention-days: 7
+          if-no-files-found: ignore
 
-  # Keep the existing required `PTY` context on main. A cancelled or failed
-  # shard must make it fail, not leave a skipped check that protection accepts.
+  # Legacy required `PTY` context, on pull requests only (protection reads it
+  # there). It reports the terminal work this run selected: the full shards
+  # for broad candidates, the smoke otherwise. A job skipped by its `if` still
+  # posts a check run, so push runs name it "PTY (push)".
   pty:
-    name: PTY
-    needs: [pty-governor, pty-rest]
+    name: ${{ github.event_name == 'pull_request' && 'PTY' || 'PTY (push)' }}
+    needs: [plan, terminal-smoke, pty-governor, pty-rest]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          sparse-checkout: scripts
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22.22.2
+      - env:
+          CI_PLAN: ${{ needs.plan.outputs.plan }}
+          CI_NEEDS: ${{ toJSON(needs) }}
+          CI_ONLY: terminal-smoke,pty-governor,pty-rest
+        run: node scripts/release-candidate.mjs aggregate
+
+  promotion:
+    name: Promotion identity
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'promotion')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22.22.2
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/release-candidate.mjs verify-promotion "$GITHUB_SHA"
+
+  candidate:
+    name: ${{ github.event_name == 'pull_request' && 'Release candidate' || 'Push checks' }}
+    needs: [plan, lint, pack, test, smoke, terminal-smoke, sustained, pty-governor, pty-rest, pty, promotion]
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 5
     steps:
-      - name: Require both PTY shards
-        env:
-          GOVERNOR_RESULT: ${{ needs.pty-governor.result }}
-          REST_RESULT: ${{ needs.pty-rest.result }}
-        run: |
-          if [[ "$GOVERNOR_RESULT" != success || "$REST_RESULT" != success ]]; then
-            echo "PTY governor: $GOVERNOR_RESULT; PTY other files: $REST_RESULT" >&2
-            exit 1
-          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          sparse-checkout: scripts
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22.22.2
+      - env:
+          CI_PLAN: ${{ needs.plan.outputs.plan }}
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: node scripts/release-candidate.mjs aggregate
