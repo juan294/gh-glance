@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reset, panes now show "GitHub quota pacing; retry automatically after reset"
   instead of "Local coordination unavailable ... retry when storage works".
   Deferred background refreshes also get their own notice.
+- Heavy API use by other tools on the same account no longer starves every
+  pane until the quota resets. Pacing now divides by at most 4 times the
+  measured external pressure, while the reserve still stops gh-glance before
+  the account runs out.
+- Uncertain charges left by dead panes are released one quota window after
+  their newest charge, instead of reducing every hour's budget until the next
+  reboot.
 
 ## [0.16.0] - 2026-10-01
 

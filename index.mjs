@@ -2289,6 +2289,12 @@ function sharedLaneEvidence(value) {
 // Below this many completed shared calls in a probe window, external-spend
 // inference is noise. Under the threshold the loop retains the previous factor.
 const MIN_SAMPLE_CALLS = 5;
+// Pacing divides the spendable share by the external factor, so a large factor
+// compounds: gh-glance's own paid calls shrink, the next sample's ratio grows,
+// and the lane is pushed past the reset while quota sits unused. The reserve,
+// not this divisor, is what keeps gh-glance off the floor, so the divisor can
+// be bounded without letting external load exhaust the account.
+const MAX_PACING_EXTERNAL_FACTOR = 4;
 
 const REQUEST_PRIORITIES = Object.freeze({
   manual: 0,
@@ -2517,7 +2523,8 @@ function resourceDecision({
       epoch: capacity.epoch,
     };
   }
-  const callsPerMs = capacity.spendable / (capacity.resetMs - nowMs) / externalFactor;
+  const callsPerMs = capacity.spendable / (capacity.resetMs - nowMs) /
+    Math.min(externalFactor, MAX_PACING_EXTERNAL_FACTOR);
   if (!Number.isFinite(callsPerMs) || callsPerMs <= 0) {
     return {
       mode: "paused",
@@ -4564,6 +4571,9 @@ function transferReceiptToDebt(state, receipt, nowMs, groupId = null) {
     group.units[resource] += amount;
     group.counts[resource] += amount > 0 ? 1 : 0;
   }
+  // The newest charge, not the group's creation, starts the window after
+  // which reconcileBootDebt may treat the group as settled.
+  group.at = Math.max(group.at, nowMs);
   state.debtGroups[id] = group;
   return true;
 }
@@ -4611,12 +4621,17 @@ function retireControlReceiptToDebt(state, resource, at) {
   return true;
 }
 
+// A reboot proves an unknown owner's children are gone. So does age: a group's
+// `at` is its newest charge, and once a full window has elapsed since then
+// GitHub has charged every covered request to a window that is already over.
 function reconcileBootDebt(state, at) {
   const bootId = coordinationBootId();
-  if (bootId === null) return { ok: true, changed: false };
   let changed = false;
   for (const group of Object.values(state.debtGroups)) {
-    if (group.quiescent || group.bootId === null || group.bootId === bootId) continue;
+    if (group.quiescent) continue;
+    const priorBoot = bootId !== null && group.bootId !== null && group.bootId !== bootId;
+    const outlivedWindow = group.sealed && at - group.at >= IDENTITY_UNCERTAIN_MAX_MS;
+    if (!priorBoot && !outlivedWindow) continue;
     if (!makeDebtGroupQuiescent(state, group, at)) {
       return { ok: false, reason: "accounting-overflow" };
     }
@@ -20340,6 +20355,8 @@ export {
   GOVERNOR_PHASE_WINDOW_MS,
   BUDGET_PROBE_MS,
   MIN_SAMPLE_CALLS,
+  MAX_PACING_EXTERNAL_FACTOR,
+  IDENTITY_UNCERTAIN_MAX_MS,
   REQUEST_PRIORITIES,
   normalizeBudgetResource,
   budgetEpoch,

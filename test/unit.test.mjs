@@ -120,6 +120,7 @@ import {
   GOVERNOR_PHASE_WINDOW_MS,
   BUDGET_PROBE_MS,
   MIN_SAMPLE_CALLS,
+  MAX_PACING_EXTERNAL_FACTOR,
   REQUEST_PRIORITIES,
   normalizeBudgetResource,
   budgetEpoch,
@@ -3391,6 +3392,34 @@ test("pacing becomes no earlier as pressure increases", () => {
   assert.ok(duration({ budget: policyBudget({ resetMs: POLICY_NOW + 7_200_000 }) }) >= baseline);
   assert.ok(duration({ cost: 6 }) >= baseline);
   assert.ok(duration({ factor: 4 }) >= baseline);
+});
+
+test("an extreme external factor cannot pace every pane past the reset", () => {
+  // The 0.16.0 incident: external tools spent 3000 core units, the measured
+  // factor reached 156.8, and eight panes' one-unit Actions polls were all
+  // denied "reset" with half the window's spendable quota still unused.
+  const resetMs = POLICY_NOW + 300_000;
+  const budget = (lastExternalFactor) => policyBudget({ remaining: 2000, used: 3000, resetMs,
+    lastExternalFactor });
+  const rate = (factor) => resourceDecision({ budget: budget(factor), resource: "core", cost: 1,
+    nowMs: POLICY_NOW }).callsPerMs;
+  assert.equal(rate(156.8), rate(MAX_PACING_EXTERNAL_FACTOR));
+  assert.ok(rate(2) > rate(MAX_PACING_EXTERNAL_FACTOR), "a factor below the cap still paces");
+
+  const leases = Object.fromEntries(Array.from({ length: 8 }, (_, index) => [
+    `pane-${index}`, policyLease(`pane-${index}`, resetMs + GOVERNOR_LEASE_TTL_MS),
+  ]));
+  const result = scheduleIntents({
+    intents: Object.keys(leases).map((leaseId) => ({ id: `${leaseId}:actions`, leaseId,
+      priority: "active", costs: { core: 1, graphql: 0 }, requestedAt: POLICY_NOW,
+      expiresAt: resetMs + GOVERNOR_LEASE_TTL_MS })),
+    leases,
+    budgets: { core: budget(156.8) },
+    nowMs: POLICY_NOW,
+  });
+  assert.deepEqual(result.denied, []);
+  assert.equal(result.grants.length, 8);
+  assert.ok(result.grants.every(({ notBefore }) => notBefore < resetMs));
 });
 
 test("small external-spend samples retain the prior factor", () => {
