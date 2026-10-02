@@ -98,12 +98,12 @@ test("POLL-02 running CI is checked every five seconds, not at the two-second fl
 });
 
 test("POLL-02 a quiet list waits its 30s interval and is checked within two seconds of it", (t) => {
-  const box = fixture(t);
+  const box = fixture(t, { delayByCommand: { "graphql-data": 3000 } });
   capture({
     cols: 80,
     rows: 24,
     signal: "none",
-    settle: 45,
+    settle: 60,
     // Three observations at the 2s floor take the tab into quiet mode (two
     // unchanged), and the fourth is the one this asserts on.
     stdin: waitForIssuePages(4) + "sleep .3; printf q",
@@ -113,14 +113,20 @@ test("POLL-02 a quiet list waits its 30s interval and is checked within two seco
   });
   const pages = graphqlEvents(box.read(), "issues.page");
   assert.ok(pages.length >= 4, `issue page calls: ${pages.length}`);
-  const observed = gaps(pages.slice(0, 4));
-  // The first two gaps are the floor: nothing is known to be quiet yet. Allow
-  // subprocess start overhead under CI load while distinguishing the 5s cadence.
+  const completed = new Map(box.read().events
+    .filter((event) => event.type === "end").map((event) => [event.sequence, event]));
+  // Production schedules from successful completion. Provider response time
+  // belongs to the preceding request, not to the next polling interval.
+  const observed = pages.slice(1, 4).map((event, index) => {
+    const previous = completed.get(pages[index].sequence);
+    assert.ok(previous && !previous.failed, "previous page must complete successfully");
+    assert.ok(previous.at >= pages[index].at, "completion cannot precede request start");
+    return event.at - previous.at;
+  });
   assert.ok(observed[0] <= 4_500, `first gap ${observed[0]}ms should be the 2s floor`);
   assert.ok(observed[1] <= 4_500, `second gap ${observed[1]}ms should be the 2s floor`);
-  // The third is the quiet cadence: 30 seconds, arriving within two of it.
   assert.ok(observed[2] >= 28_000 && observed[2] <= 32_000,
-    `quiet gap ${observed[2]}ms outside 30s +2s`);
+    `quiet completion gap ${observed[2]}ms outside 30s +2s`);
 });
 
 // ---------- POLL-01 ----------
