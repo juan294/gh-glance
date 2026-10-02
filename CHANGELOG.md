@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- When external API use pushes every pane's next request slot past the quota
+  reset, panes now show "GitHub quota pacing; retry automatically after reset"
+  instead of "Local coordination unavailable ... retry when storage works".
+  Deferred background refreshes also get their own notice.
+
 ## [0.16.0] - 2026-10-01
 
 ### Changed

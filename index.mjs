@@ -15633,6 +15633,8 @@ const RECOVERY_COPY = Object.freeze({
   "probe-failed": ["GitHub budget check failed", "Retry automatically at the shown time", "Budget check; retry"],
   "block-unpublished": ["Saving GitHub request limit", "Retry sharing the hold automatically", "Saving hold; retry"],
   "budget-reset": ["GitHub quota pacing", "Retry automatically after reset", "Quota; retry"],
+  reset: ["GitHub quota pacing", "Retry automatically after reset", "Quota; retry"],
+  priority: ["Background refresh waiting its turn", "Retry automatically at the next slot", "Queued; retry"],
   "rate-limit": ["GitHub quota pacing", "Retry automatically after reset", "Quota; retry"],
   "rate-limited": ["GitHub request limit", "Retry automatically after the shared hold", "Limit; retry"],
   "local-reserve": ["Local quota reserve pacing", "Retry automatically at the next grant", "Reserve; retry"],
