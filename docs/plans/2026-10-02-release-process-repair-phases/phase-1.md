@@ -1,6 +1,6 @@
 # Phase 1: one release procedure and accurate status
 
-Parent: [release process repair](../2026-10-02-release-process-repair.md). Entry: accepted plan and authorization for local implementation. Status: planned.
+Parent: [release process repair](../2026-10-02-release-process-repair.md). Entry: accepted plan and authorization for local implementation. Status: **locally complete** -- see [validation](phase-1-validation.md).
 
 ## Outcome and scope
 

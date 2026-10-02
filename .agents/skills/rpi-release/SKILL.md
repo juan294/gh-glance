@@ -5,6 +5,12 @@ description: "Prepare and publish the explicitly requested version after complet
 
 # Release the Requested Version
 
+**gh-glance project override.** Where this generic skill differs from
+[`docs/release/release-playbook.md`](../../../docs/release/release-playbook.md)
+(authority coverage, the Wave B charter, the push and publication steps), the
+playbook governs. It replaces `references/e2e-pro-playbook.md` and is the
+"adapted playbook" named below; do not read the generic reference.
+
 Use the version and release scope already supplied in the request. Ask for a
 version only if absent; never guess or auto-increment. Prepare a concrete,
 fully verified candidate before any still-required publication approval. Read the

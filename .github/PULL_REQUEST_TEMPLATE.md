@@ -24,7 +24,11 @@
       scheduling, collectors, or efficiency behavior)
 - [ ] `npm run test:pty` passes (required on `main`; run it for anything
       touching rendering or the terminal lifecycle)
-- [ ] Ran `node index.mjs` in a real repository and confirmed all four tabs render
+- [ ] Fixture-driven tests cover the change. A live run is only for a named
+      integration risk; if you ran one, state the risk, environment and
+      request/time budget
+- [ ] A flaky failure was fixed at its cause (fixture assumption or product);
+      no meaningful assertion was deleted or weakened
 - [ ] If this changes how `gh` is invoked (argv, host routing, or error
       classification): ran `node index.mjs --doctor --probe` and confirmed the
       argv and classification for each endpoint are what you intended

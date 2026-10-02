@@ -69,18 +69,14 @@ git pull --rebase && git push
 ```
 
 `main` stays protected (PR + passing checks, admins included) since it drives
-npm publishing -- only move it via a `develop` -> `main` PR:
+npm publishing -- only move it via a `develop` -> `main` PR.
 
-```bash
-git checkout develop
-# bump version, update changelog, verify, commit, then push develop
-gh pr create --base main --head develop --title "release: vX.Y.Z"
-gh pr merge --merge --auto             # once checks are green; never delete develop
-# tag the resulting main commit, then publish the GitHub release
-```
+The complete release procedure, its authority and stopping conditions live in
+[`docs/release/release-playbook.md`](docs/release/release-playbook.md).
 
-Use a merge commit, not squash: `main` must remain a superset of the permanent
-`develop` history. Publishing the GitHub release triggers the OIDC npm workflow;
+Use a merge commit (`gh pr merge --merge`; auto-merge is disabled), not
+squash, and never delete `develop`: `main` must remain a superset of the
+permanent `develop` history. Publishing the GitHub release triggers the OIDC npm workflow;
 do not run `npm publish` from a workstation.
 
 Run verification sequentially with `;` or `&&`, never as parallel Bash calls.

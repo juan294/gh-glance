@@ -1,5 +1,37 @@
 # Phase 4 validation: installed personal and EMU qualification
 
+## Current status, 2026-10-02
+
+- **Releases:** v0.16.0 was published and delivered on 2026-10-02 under the
+  release-only exception in [Phase 4](phase-4.md#accepted-release-prerequisite-adjustment-2026-10-01);
+  see its [current receipt](../../release/2026-10-01-v0.16.0.md#current-status).
+  v0.16.1 was published later the same day (release workflow run
+  [36998649214](https://github.com/juan294/gh-glance/actions/runs/36998649214),
+  production `5647e41091d370f069ecd5f319747977db060485`, npm `latest` 0.16.1).
+  Neither publication qualifies F12.
+- **F12 and incident acceptance: OPEN.** No qualifying personal 30-minute or
+  24-hour window and no work EMU window exists. The work environment remains
+  unavailable to this project; that is unmeasured, not passed. Every failed
+  window below remains failed.
+- **Current default-demand inventory (corrected).** Since the accepted
+  on-demand default ([notes](../2026-09-28-durable-freshness-and-recovery-notes.md#active-actions-and-on-demand-secondary-views-accepted-2026-10-01)),
+  a default pane continuously watches only the active Actions tab. Issues,
+  Pull Requests and Security are fetched when opened or on `r`, then shown as
+  cached with their source age; unopened secondary tabs make no data requests.
+  Continuous forty-subscription cadence expectations (10 panes x 4 tabs) apply
+  only to explicit `--background all`. A future default-mode qualification
+  measures continuously active Actions freshness, separately bounded requested
+  secondary observations, and the absence of unsolicited secondary requests.
+- **What this does not change.** The F12 duration and environment
+  requirements (personal and work EMU, 30-minute then uninterrupted 24-hour)
+  are unchanged and this correction does not complete qualification. Earlier
+  forty-subscription runs keep their recorded results; they were measured
+  against the then-current all-tabs demand.
+- The release process repair ([plan](../2026-10-02-release-process-repair.md))
+  separates release, canary and incident outcomes. It adds no live window.
+
+## Earlier record
+
 Latest result, 2026-09-30: **the single-pane diagnostic passed; both ten-pane attempts stopped before measurement**. The first exposed a setup-harness timing mismatch, corrected and locally verified. The corrected attempt stopped on a Chapa Security HTTP 403 with unknown cost. A separate bounded read confirmed that Chapa code scanning is disabled. Owned process cleanup completed. The strict ten-pane, personal 24-hour and work EMU gates remain incomplete; a decision about qualifying accessible data with explicit unavailable Security sources is pending. The historical attempts below remain evidence. Implementation is integrated locally into develop and the task worktree is removed; nothing has been pushed or released.
 
 Earlier summary, before the completed diagnostic below: **candidate panes stopped after reported shared-account impact; combined local repairs passed all local gates; F12 and incident acceptance remain open**. Phases 1–3 were integrated locally into develop at a732381dfbf1db13cd3f01e0a83644cf0bac6d70. The first personal candidate's strict 30-minute attempt failed after 41 seconds. The earlier repair is merged locally at 44dd0bc4bf5b1cc8299b7424a7cd6918f88cfc3e and packaged. Its two complete ten-pane 30-minute reports failed as detailed below. The combined repairs passed local gates and were packaged separately. After two early stops, an exact-dependency one-pane diagnostic completed its three-minute window; a subsequent capped 30-minute attempt stopped after 17 minutes on insufficient shared-account quota; the candidate alias still selects the earlier executable. The repairs were integrated locally at `b2c47f3567b35be4d74243f539862374d4023c33`, and the task worktree was removed after its helpers and evidence were preserved. No qualifying 30-minute or 24-hour window, work EMU qualification, push, release, or workflow dispatch has occurred.

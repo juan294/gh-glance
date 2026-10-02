@@ -69,8 +69,14 @@ It is a separate script from `npm test` on purpose. The unit run is fast and is
 required everywhere; the pty run is slow and timing-sensitive, so it reports on
 every pull request but is **required only on `main`** -- which in practice means
 it gates the release and nothing else. It was advisory until 2026-08-04 and was
-promoted after 38 consecutive runs without a failure. If you make it flake, the
-right response is to delete the offending assertion, not to add retries.
+promoted after 38 consecutive runs without a failure. If it flakes, find the
+cause: repair a proven fixture assumption (readiness, deadline, cleanup or
+platform behavior) or fix the product. Keep every meaningful assertion -- never
+delete or weaken one to get a pass -- and do not add blind retries.
+
+Validate with fixtures by default; the
+[release playbook](docs/release/release-playbook.md#outcomes-are-separate) sets
+when a live check is justified and its limits.
 
 `npm run test:coverage:runtime` repeats the PTY suite under V8 coverage and
 summarizes observed `index.mjs` functions. It is an informational scheduled or
