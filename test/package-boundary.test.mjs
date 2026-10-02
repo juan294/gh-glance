@@ -7,6 +7,8 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 
+import { PACKAGE_FILES, exerciseInstalled, inspectTarball, packCheckout } from "../scripts/package-check.mjs";
+
 const execFileAsync = promisify(execFile);
 
 async function run(command, args, options = {}) {
@@ -16,13 +18,6 @@ async function run(command, args, options = {}) {
     timeout: 120_000,
     ...options,
   });
-}
-
-function parsePackManifest(stdout, packageName) {
-  const payload = JSON.parse(stdout);
-  const manifest = Array.isArray(payload) ? payload[0] : payload?.[packageName];
-  assert.ok(manifest && typeof manifest === "object", "npm pack must report the package manifest");
-  return manifest;
 }
 
 async function waitForOutput(child, stream, pattern) {
@@ -49,87 +44,41 @@ async function waitForExit(child, timeoutMs = 5_000) {
   }
 }
 
-test("npm pack manifests support npm 11 and npm 12 JSON shapes", () => {
-  const manifest = { filename: "gh-glance.tgz", files: [] };
-  assert.deepEqual(parsePackManifest(JSON.stringify([manifest]), "gh-glance"), manifest);
-  assert.deepEqual(
-    parsePackManifest(JSON.stringify({ "gh-glance": manifest }), "gh-glance"),
-    manifest,
-  );
-});
-
+// Exercises one exact tarball: GH_GLANCE_PACKAGE_TARBALL when a candidate job
+// passes its already packed artifact (never repacked here), otherwise a fresh
+// pack of this checkout for standalone use. Version, help, exit codes, bin
+// linkage and the blocked import surface come from the shared helper; this file
+// adds the collector entry routes that need a real installed runtime.
 test("the installed package supports only the gh-glance executable", async () => {
   const root = await mkdtemp(join(tmpdir(), "gh-glance-package-test-"));
+  let installRoot = null;
   try {
-    const pack = await run(
-      "npm",
-      ["pack", "--ignore-scripts", "--json", "--pack-destination", root],
-      { cwd: process.cwd() },
-    );
-    const manifest = parsePackManifest(pack.stdout, "gh-glance");
-    const tarball = join(root, manifest.filename);
-    const paths = manifest.files.map(({ path }) => path);
-
-    assert.deepEqual(paths.toSorted(), [
-      "CHANGELOG.md", "LICENSE", "README.md", "index.mjs", "package.json",
-    ], "the package must contain only the executable and public documentation");
-
-    const installRoot = join(root, "installed");
-    await run(
-      "npm",
-      [
-        "install",
-        "--ignore-scripts",
-        "--no-audit",
-        "--no-fund",
-        "--no-package-lock",
-        "--prefix",
-        installRoot,
-        tarball,
-      ],
-      { cwd: root },
-    );
-
-    const installedPackage = JSON.parse(
-      await readFile(join(installRoot, "node_modules/gh-glance/package.json"), "utf8"),
-    );
-    assert.deepEqual(installedPackage.exports, {});
-    assert.deepEqual(installedPackage.bin, { "gh-glance": "./index.mjs" });
-    for (const script of [installedPackage.scripts.test, installedPackage.scripts["test:coverage"]]) {
-      assert.ok(script.includes("--test-skip-pattern='E2E-'"),
-        "ordinary test gates must exclude the dedicated E2E efficiency cases");
+    if (process.env.GH_GLANCE_PACKAGE_REQUIRE_TARBALL === "1" && !process.env.GH_GLANCE_PACKAGE_TARBALL) {
+      throw new Error("GH_GLANCE_PACKAGE_TARBALL is required here; a candidate check never repacks");
     }
-    assert.equal(installedPackage.scripts["test:efficiency"],
-      "node --test test/efficiency.test.mjs");
+    const tarball = process.env.GH_GLANCE_PACKAGE_TARBALL || await packCheckout(root);
+    const expectedVersion = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).version;
+    const inspected = inspectTarball(await readFile(tarball), { expectedVersion });
+    assert.deepEqual(inspected.problems, [], "the package must contain only the executable and public documentation");
+    assert.deepEqual(inspected.files, [...PACKAGE_FILES].sort());
 
-    const expectedVersion = installedPackage.version;
+    const installed = await exerciseInstalled(tarball, { expectedVersion, keep: true,
+      expectedFiles: inspected.fileSha256 });
+    installRoot = installed.installRoot;
+    assert.deepEqual(installed.problems, []);
+    assert.ok(installed.dependencies?.ink && installed.dependencies?.react,
+      `fresh consumer install must resolve its runtime dependencies: ${JSON.stringify(installed.dependencies)}`);
+
     const bin = join(installRoot, "node_modules/.bin/gh-glance");
-    assert.equal((await run(bin, ["--version"], { cwd: installRoot })).stdout.trim(), expectedVersion);
     assert.equal(
       (await run("npx", ["--no-install", "gh-glance", "--version"], { cwd: installRoot })).stdout.trim(),
       expectedVersion,
     );
-    const help = (await run(bin, ["--help"], { cwd: installRoot })).stdout;
+    const help = installed.runtimes[0].help.stdout;
     assert.match(help, /--serve --config (?:PATH|<path>)/);
     assert.match(help, /--connect local/);
     assert.match(help, /--connect ssh:<alias>/);
     assert.match(help, /--collector-stdio/);
-
-    await assert.rejects(
-      run(bin, [], { cwd: installRoot }),
-      (error) => {
-        assert.equal(error.code, 1);
-        assert.match(error.stderr, /stdout is not a terminal/);
-        return true;
-      },
-    );
-    await assert.rejects(
-      run(bin, ["--definitely-not-a-flag"], { cwd: installRoot }),
-      (error) => {
-        assert.equal(error.code, 2);
-        return true;
-      },
-    );
 
     // Exercise the installed artifact's three Phase 8 entry routes. This is
     // intentionally more than a manifest/help check: the foreground process
@@ -183,20 +132,8 @@ test("the installed package supports only the gh-glance executable", async () =>
       await rm(configHome, { recursive: true, force: true });
     }
 
-    for (const specifier of ["gh-glance", "gh-glance/index.mjs"]) {
-      await assert.rejects(
-        run(
-          process.execPath,
-          ["--input-type=module", "--eval", `import.meta.resolve(${JSON.stringify(specifier)})`],
-          { cwd: installRoot },
-        ),
-        (error) => {
-          assert.match(error.stderr, /ERR_PACKAGE_PATH_NOT_EXPORTED/);
-          return true;
-        },
-      );
-    }
   } finally {
     await rm(root, { recursive: true, force: true });
+    if (installRoot) await rm(installRoot, { recursive: true, force: true });
   }
 });

@@ -37,14 +37,32 @@ There's no build step -- it's plain ESM JavaScript, run directly by Node.
 ### Tests
 
 ```bash
-npm test          # node:test; excludes E2E-* cases owned by test:efficiency
-npm run lint      # eslint, fails on warnings
+npm test          # node:test; every unit file, excludes E2E-* cases owned by test:efficiency
+npm run test:fast       # npm test minus the 72-hour oracle and package install
+npm run test:recovery   # the 72-hour sustained recovery oracle only
+npm run test:package    # pack (or GH_GLANCE_PACKAGE_TARBALL) and exercise the install
+npm run lint      # eslint over index.mjs, eslint.config.js, scripts/ and test/
 node --check index.mjs
 npm run test:pty  # end-to-end, drives the real binary under a pty (slower)
+npm run test:pty:smoke  # startup, navigation, quit, cached age and recovery only
 npm run test:efficiency  # deterministic simulated-hour acceptance
 npm run measure:efficiency  # JSON and Markdown efficiency evidence
 npm run test:coverage:runtime  # informational PTY child-process function coverage
 ```
+
+The selections behind `test:fast`, `test:recovery`, `test:package` and
+`test:pty:smoke` are named file lists in `scripts/test-select.mjs`, which prints
+each selection's files, command, result and duration and exits non-zero if any
+named selection failed. Every test file must belong to a selection: a new
+`test/*.test.mjs` file joins `fast` automatically, and the selector's own tests
+fail if a file is left unowned. `npm test` stays the complete unit contract.
+`node scripts/package-check.mjs --tarball <file>` checks an already packed
+tarball's exact five files and its installed executable without repacking.
+
+When a terminal capture's test fails, its redacted terminal bytes, parsed
+frames, fixture `gh` calls and timing are kept under
+`GH_GLANCE_TEST_EVIDENCE_DIR` (default `$TMPDIR/gh-glance-test-evidence/run-<pid>`); the
+failing test's output names the path. Passing captures leave nothing behind.
 
 Tests live in `test/` and use Node's built-in runner, so they add no build step
 and no test-framework dependency. `index.mjs` guards its entry point behind a
@@ -315,8 +333,8 @@ this code.
 
 ## PTY suite timing
 
-`npm run test:pty` runs one file at a time with a **per-file** timeout of ten
-minutes. That ceiling is not arbitrary padding: `test/pty/status.test.mjs`
+`npm run test:pty` runs one file at a time with a **per-file** timeout of
+fifteen minutes (`--test-timeout=900000`). That ceiling is not arbitrary padding: `test/pty/status.test.mjs`
 takes around four minutes on a developer laptop, and a two-core CI runner is
 appreciably slower. It was 240s and CI began failing on that file alone --
 `testTimeoutFailure`, with every assertion in it passing -- because shared

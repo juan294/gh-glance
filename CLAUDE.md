@@ -32,6 +32,10 @@ Use /clear between tasks, /compact when context is heavy.
 npm run lint            # ESLint
 npm start               # node index.mjs
 npm test                # node:test unit suite; excludes the dedicated E2E efficiency gate
+npm run test:fast       # npm test minus the 72-hour oracle and package install
+npm run test:recovery   # 72-hour sustained recovery oracle
+npm run test:package    # exact-tarball pack/install exercise
+npm run test:pty:smoke  # short terminal smoke (full suite: test:pty)
 npm run test:pty        # end-to-end under a pseudo-terminal (slower; gates `main` only)
 npm run test:efficiency # deterministic simulated-hour acceptance
 npm run measure:efficiency # JSON and Markdown efficiency evidence

@@ -19,7 +19,7 @@
 
 - [ ] `npm run lint` passes
 - [ ] `node --check index.mjs` passes
-- [ ] `npm test` passes
+- [ ] `npm test` passes (`npm run test:fast` is the quick loop, not a substitute)
 - [ ] `npm run test:efficiency` passes (required for changes to acquisition,
       scheduling, collectors, or efficiency behavior)
 - [ ] `npm run test:pty` passes (required on `main`; run it for anything

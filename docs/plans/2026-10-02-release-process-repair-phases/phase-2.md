@@ -1,6 +1,6 @@
 # Phase 2: explicit test selections and reliable evidence
 
-Parent: [release process repair](../2026-10-02-release-process-repair.md). Entry: accepted Phase 1. Status: planned.
+Parent: [release process repair](../2026-10-02-release-process-repair.md). Entry: accepted Phase 1. Status: **locally complete** -- see [validation](phase-2-validation.md).
 
 ## Outcome and scope
 

@@ -15,3 +15,22 @@
 - Found: the native `rpi-release` SKILL.md copies are managed files; any reference adds local drift.
 - Chose: a four-line override preamble in both copies, pointing to the playbook and replacing the generic `e2e-pro-playbook.md` reference. Diagnostics now report six local-modified managed files (the four pre-existing rule files plus these two). Manifest hashes and baselines are unchanged.
 - Why: this is the documented expected-drift path in D1; rewriting the managed skill bodies would create larger drift on every upstream refresh.
+
+### Phase 2: fixture gh call timing is not recorded per call
+
+- Plan said: a failed capture retains "fixture gh call timings" (Phase 2 item 5).
+- Found: the fixture `gh` is a POSIX `sh` script (`test/pty/fixtures/gh`); macOS `/bin/sh` has no sub-second clock, so a per-call timestamp means one extra process per fixture call in every PTY test, several of which assert on millisecond-scale pacing.
+- Chose: retain the call log itself (order and arguments) plus capture-level start time, duration, timeout, runtime and platform; do not add a per-call clock.
+- Why: perturbing the timing-sensitive fixtures to collect timing evidence would weaken the evidence those fixtures produce. Revisit if a future failure needs per-call timing.
+
+### Phase 2: deferred and platform-limited items
+
+- R10 offline canary readiness is implemented in Phase 4, where the plan places the driver and canary preparation (phase-4.md "Local verification").
+- CI upload of retained failure evidence (seven-day, failure-only artifacts) is wired in Phase 3's workflows.
+- Linux GNU `script(1)` smoke is UNVERIFIED locally (no Linux environment on this host); the Phase 3 candidate workflow runs the smoke on `ubuntu-latest` and `macos-latest`. Native macOS BSD smoke ran locally.
+
+### Phase 2: CI-FIXTURE-02 is the coordination-blip test
+
+- Plan said: the terminal smoke reuses existing "recovery" scenarios and CI-FIXTURE-02 is `status.test.mjs:867` (Paused then Watching).
+- Found: line 867 is "a sub-threshold coordination blip stays silent", the Paused -> Watching case. An earlier smoke draft used the storage-pause test at line 720, which never returns to Watching.
+- Chose: the smoke runs the blip test. All six CI-FIXTURE regressions remain unchanged in their files.

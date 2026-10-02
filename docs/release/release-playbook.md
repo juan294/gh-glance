@@ -74,7 +74,9 @@ merge, tag or publish.
 3. Run the complete applicable local gate sequentially, keeping every exit
    status: `npm run lint`, `node --check index.mjs`, `npm test`, plus
    `npm run test:efficiency` and `npm run test:pty` when the change touches
-   their areas. A later pass never erases an earlier failure.
+   their areas. `npm run test:fast`, `test:recovery`, `test:package` and
+   `test:pty:smoke` are named subsets for quick feedback, not substitutes. A
+   later pass never erases an earlier failure.
 4. Get an independent review of the release diff. A routine release does
    **not** require a fresh broad pre-launch audit or exploratory charter; use
    independent review for substantial changes and keep useful charter
