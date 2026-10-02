@@ -117,23 +117,31 @@ full ref (`git push origin refs/tags/vX.Y.Z`; never `--tags`). Then
 `gh release create vX.Y.Z --verify-tag --title vX.Y.Z --notes-file <notes>`.
 That publication triggers the release workflow; observe it by run ID.
 
-Until the candidate-artifact repair is active, the publisher re-packs the tag
-and skips an existing version without comparing bytes (see
-[Transition](#transition-current-versus-planned-workflows)). A logged "already
-published" is therefore not proof of a match: compare the registry against the
-reviewed tag in step 5 and treat any difference as a collision.
+The release workflow publishes the tarball the release PR tested: it proves
+the tag names this release's protected merge, finds the one successful
+candidate run whose tested tree equals that merge's tree, verifies the
+artifact's archive digest, manifest and tarball digests, and publishes
+`./artifact.tgz` with pinned npm and `--ignore-scripts`. An existing identical
+version skips straight to delivery; different bytes, an unknown registry
+answer or an older-than-latest version stop it. A missing or expired candidate
+(artifacts last 30 days) means a new candidate gate, never a repack. Releases
+tagged before this repair used the older publisher (directory publish, with
+a `gitHead`); see
+[Transition](#transition-what-changed-and-what-still-needs-activation).
 
 ### 5. Delivery and readback
 
 Read the registry once: `npm view gh-glance@x.y.z version dist.integrity
-dist.shasum gitHead dist-tags --json`. `gitHead` must be the tagged `main`
-commit and `latest` the new version. `dist.shasum` must equal the full
-`npm notice shasum` line in the release workflow log (that log truncates the
-integrity, so record the full `dist.integrity` from `npm view`); once the
-repair is active, both must equal the accepted candidate's. Install the exact
-version once into an empty owned directory, run the installed binary's
-`--version` and `--help` with Node 22 and with Node 24, and run
-`npm audit signatures` there to verify provenance. Registry lag is normal:
+dist.shasum gitHead dist-tags --json`. `dist.integrity` must equal the
+accepted candidate's (the verify job logs it) and `latest` the new version.
+A tarball publish carries no `gitHead`, so an empty one is expected; the
+production commit is bound by the provenance statement instead, which the
+release workflow's delivery job checks: its subject digest, `release.yml` at
+`refs/tags/vX.Y.Z`, and the merge commit. That job also installs the version
+fresh on Node 22 and 24 and requires gh-glance's own verified attestation from
+`npm audit signatures`; its receipt is uploaded as `delivery-receipt-node-*`.
+Re-check by hand only when that job did not finish.
+Registry lag is normal:
 retry with capped backoff for at most five minutes, then report **published;
 delivery unverified** and resume read-only later. Never republish to "fix"
 lag.
@@ -149,17 +157,18 @@ next ordinary integration, not into the released candidate and not into an
 extra push. Then remove only paths, branches and worktrees this release
 created; preserve unrelated untracked files.
 
-## Transition: current versus planned workflows
+## Transition: what changed and what still needs activation
 
-The [repair plan](../plans/2026-10-02-release-process-repair.md) changes the
-hosted gates, including test selection, in two later steps; until each is
-activated, the current executable workflow is what controls.
+The [repair plan](../plans/2026-10-02-release-process-repair.md) replaced the
+workflows in this repository; they take effect with the first push that
+carries them. One step needs separate owner authority: branch protection.
 
-| Area | Current workflow | After activation |
-| --- | --- | --- |
-| Candidate CI | Full suites on every `develop` push, PR and `main` push; required contexts are the eight legacy names | Release PR owns one selection, packs once and uploads the tarball; an always-running `Release candidate` aggregate joins the required contexts before legacy ones retire |
-| Publisher | Re-tests, re-packs the tag, floating npm, skip-on-existing without byte comparison | Downloads the accepted tarball by run and artifact ID, verifies tree and digests, pinned npm, publishes `./artifact.tgz` with `--ignore-scripts`, and blocks on a byte mismatch |
-| Delivery | Manual readback (step 5) | Bounded registry, provenance and installed-binary verification in a separate unprivileged job |
+| Area | Before the repair | Now in the workflow files | Still to activate |
+| --- | --- | --- | --- |
+| Candidate CI | Full suites on every `develop` push, PR and `main` push | Release PR owns one selection, packs once and uploads the tarball; `develop` pushes are quick, and skipped while the release PR is open; `main` pushes check promotion identity only; an always-running `Release candidate` aggregate | Require `Release candidate` on `main`, observe it, then retire the legacy contexts (add before remove) |
+| Publisher | Re-tests, re-packs the tag, floating npm, skip-on-existing without byte comparison | Verifies and publishes the accepted tarball with pinned npm; collisions block | OIDC publication of a verified artifact is unproven until the first real release |
+| Delivery | Manual readback (step 5) | Bounded registry, provenance and fresh-install checks on Node 22 and 24 in an unprivileged job | First real release |
+| Coverage | Also on every `develop` push | Scheduled and manual only | None |
 
 ## Outcomes are separate
 
@@ -187,6 +196,10 @@ implicit prerequisite.
   run the complete local gate. Then use the corrective allowance if it was
   granted and the repair qualifies; otherwise present the repaired candidate
   for a decision.
+- A failed `npm publish` step is **publication unknown**: the job reads the
+  registry back and logs the state. Resume by reading, and re-run all release
+  jobs (or only the failed ones; they find the verified artifact by ID). The
+  registry check refuses to publish twice and passes an exact match through.
 - An interrupted step is resumed by reading GitHub and npm state first. Tag,
   release and version are immutable identities; a wrong target or a registry
   version with different bytes is a collision that blocks, never something to

@@ -1,6 +1,6 @@
 # Phase 3: candidate artifact and workflow repair
 
-Parent: [release process repair](../2026-10-02-release-process-repair.md). Entry: accepted Phase 2 selectors/helpers. Status: planned.
+Parent: [release process repair](../2026-10-02-release-process-repair.md). Entry: accepted Phase 2 selectors/helpers. Status: **locally complete** -- see [validation](phase-3-validation.md).
 
 ## Outcome and scope
 

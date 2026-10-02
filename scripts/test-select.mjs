@@ -26,6 +26,8 @@ export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const RECOVERY_FILES = ["test/sustained-recovery.test.mjs"];
 const PACKAGE_FILES = ["test/package-boundary.test.mjs"];
 const EFFICIENCY_FILES = ["test/efficiency.test.mjs"];
+const PTY_GOVERNOR = "test/pty/governor.test.mjs";
+const PTY_ARGS = ["--test-concurrency=1", "--test-timeout=900000"];
 
 // Terminal smoke: startup with real Actions rows, tab navigation, clean quit,
 // signal teardown, the cached secondary age and Paused -> Watching recovery. Each
@@ -92,7 +94,19 @@ export function selections(found = discoverTests()) {
     pty: {
       description: "full terminal suite, one file at a time",
       files: found.pty,
-      args: ["--test-concurrency=1", "--test-timeout=900000"],
+      args: PTY_ARGS,
+    },
+    // The two CI shards of the full suite, on separate runners: the governor
+    // file alone takes most of a shard.
+    "pty:governor": {
+      description: "full terminal suite shard: the governor file",
+      files: found.pty.filter((file) => file === PTY_GOVERNOR),
+      args: PTY_ARGS,
+    },
+    "pty:rest": {
+      description: "full terminal suite shard: every other terminal file",
+      files: found.pty.filter((file) => file !== PTY_GOVERNOR),
+      args: PTY_ARGS,
     },
     "pty:smoke": {
       description: "installed-or-source terminal smoke",
@@ -129,6 +143,10 @@ export function validateSelections(found = discoverTests(), all = selections(fou
   }
   for (const file of all["pty:smoke"].files) {
     if (!all.pty.files.includes(file)) problems.push(`smoke file outside full PTY: ${file}`);
+  }
+  const shards = [...all["pty:governor"].files, ...all["pty:rest"].files].sort();
+  if (JSON.stringify(shards) !== JSON.stringify([...all.pty.files].sort())) {
+    problems.push("the PTY shards do not partition the full PTY selection");
   }
   return problems;
 }
@@ -209,7 +227,7 @@ export function classifyChanges(paths, { reviewedOrdinary = null } = {}) {
   return { profile, reasons };
 }
 
-function changedPaths(base, head) {
+export function changedPaths(base, head) {
   const result = spawnSync("git", ["diff", "--name-only", `${base}...${head}`], {
     cwd: ROOT, encoding: "utf8",
   });
@@ -261,7 +279,7 @@ function runSelection(name, selection) {
   return { name, files: selection.files, exitCode, signal: result.signal ?? null, durationMs, counts };
 }
 
-function writeAtomic(path, text) {
+export function writeAtomic(path, text) {
   const temporary = `${path}.${process.pid}.tmp`;
   writeFileSync(temporary, text);
   renameSync(temporary, path);

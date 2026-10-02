@@ -258,11 +258,15 @@ export async function checkInstalled(root, { expectedVersion, nodes = [process.e
   else if (target !== entry) problems.push(`installed bin resolves to ${target}`);
   report.runtimes = await Promise.all(nodes.map((node) => probeRuntime(node, bin, root, expectedVersion, problems)));
   if (auditSignatures) {
-    const audit = await run("npm", ["audit", "signatures", "--prefix", root], { cwd: root });
-    report.signatures = audit.stdout.trim();
-    if (audit.code !== 0 || !/verified attestation/.test(audit.stdout)) {
-      problems.push(`npm audit signatures did not verify an attestation (${audit.code})`);
-    }
+    // gh-glance's own attestation must verify; a dependency's does not count.
+    const audit = await run("npm", ["audit", "signatures", "--json", "--include-attestations", "--prefix", root], { cwd: root });
+    let parsed;
+    try { parsed = JSON.parse(audit.stdout); } catch { parsed = null; }
+    report.signatures = parsed ? { verified: (parsed.verified ?? []).map((item) => item.name),
+      invalid: (parsed.invalid ?? []).map((item) => item.name), missing: (parsed.missing ?? []).map((item) => item.name) } : null;
+    if (audit.code !== 0 || !parsed) problems.push(`npm audit signatures failed (${audit.code})`);
+    else if (!report.signatures.verified.includes("gh-glance")) problems.push("gh-glance has no verified attestation");
+    else if (report.signatures.invalid.length > 0) problems.push(`invalid signatures: ${report.signatures.invalid.join(", ")}`);
   }
   return { ok: problems.length === 0, problems, ...report };
 }

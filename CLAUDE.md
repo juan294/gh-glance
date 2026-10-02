@@ -36,7 +36,7 @@ npm run test:fast       # npm test minus the 72-hour oracle and package install
 npm run test:recovery   # 72-hour sustained recovery oracle
 npm run test:package    # exact-tarball pack/install exercise
 npm run test:pty:smoke  # short terminal smoke (full suite: test:pty)
-npm run test:pty        # end-to-end under a pseudo-terminal (slower; gates `main` only)
+npm run test:pty        # end-to-end under a pseudo-terminal (slower; release candidates)
 npm run test:efficiency # deterministic simulated-hour acceptance
 npm run measure:efficiency # JSON and Markdown efficiency evidence
 node --check index.mjs  # syntax check (no build step to catch this otherwise)
@@ -49,8 +49,10 @@ suite, plus `test/pty/` which drives the real binary under a pseudo-terminal
 against a fixture `gh`, one file at a time. PTY files are serialized because the
 throttle coverage already creates real concurrent panes; parallel files can
 starve independent PTY deadlines. Individual cases still exercise their required
-process concurrency. CI also runs a smoke job (syntax check, CLI boot,
-exit-code assertions) across Node 22/24.
+process concurrency. CI routes by change (see `.github/workflows/ci.yml`): a
+`develop` -> `main` release PR packs one tarball, checks it on Node 22/24 and
+runs the selected suites once; `develop` pushes run quick checks; `main` pushes
+only prove the merge tree equals the tested one.
 
 ## Git Workflow
 

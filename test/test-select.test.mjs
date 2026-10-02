@@ -18,6 +18,9 @@ test("SELECT-01 every discovered test file has an owner and no selection is empt
   const unitUnion = new Set([...all.fast.files, ...all.recovery.files, ...all.package.files]);
   assert.deepEqual([...unitUnion].sort(), found.unit, "fast + recovery + package must equal the npm test file set");
   assert.deepEqual(all.pty.files, found.pty);
+  assert.deepEqual([...all["pty:governor"].files, ...all["pty:rest"].files].sort(), found.pty,
+    "the two CI shards together are exactly the full terminal selection");
+  assert.deepEqual(all["pty:governor"].files, ["test/pty/governor.test.mjs"]);
   assert.ok(!all.fast.files.includes("test/sustained-recovery.test.mjs"));
   assert.ok(!all.fast.files.includes("test/package-boundary.test.mjs"));
   assert.ok(all.fast.args.includes("--test-skip-pattern=E2E-"), "fast must not run E2E efficiency workloads");
@@ -105,6 +108,7 @@ function scratchProject(t) {
   writeFileSync(join(root, "test/efficiency.test.mjs"), body("efficiency", true));
   writeFileSync(join(root, "test/unit.test.mjs"), body("unit", true));
   for (const entry of PTY_SMOKE) writeFileSync(join(root, entry.file), body(entry.file, true));
+  writeFileSync(join(root, "test/pty/governor.test.mjs"), body("governor", true));
   return { root, marker };
 }
 

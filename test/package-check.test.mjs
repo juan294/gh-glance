@@ -133,3 +133,28 @@ test("PKG-07 --no-pack refuses to repack when the candidate tarball is missing",
   assert.equal(run.status, 2);
   assert.match(run.stderr, /--no-pack requires --tarball/);
 });
+
+// Delivery mode: a published spec installed fresh, with provenance checked by
+// `npm audit signatures`. The registry is outside this repository, so a thin
+// npm wrapper answers only the audit; install and ls are the real npm.
+test("PKG-08 --installed verifies a fresh install and requires a verified attestation", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-package-installed-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const tarballPath = join(root, "published.tgz");
+  writeFileSync(tarballPath, packageTarball({ version: VERSION }));
+  const realNpm = spawnSync("sh", ["-c", "command -v npm"], { encoding: "utf8" }).stdout.trim();
+  const runWith = (auditOutput) => {
+    const bin = mkdtempSync(join(root, "bin-"));
+    writeFileSync(join(bin, "npm"), `#!/bin/sh\nif [ "$1" = audit ]; then printf '%s\\n' ${JSON.stringify(auditOutput)}; exit 0; fi\nexec ${JSON.stringify(realNpm)} "$@"\n`, { mode: 0o755 });
+    return spawnSync(process.execPath, [SCRIPT, "--installed", tarballPath, "--expected-version", VERSION],
+      { encoding: "utf8", env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } });
+  };
+  const audit = (verified) => JSON.stringify({ invalid: [], missing: [], verified: verified.map((name) => ({ name })) });
+  const ok = runWith(audit(["gh-glance", "react"]));
+  assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+  assert.deepEqual(JSON.parse(ok.stdout).result.signatures.verified, ["gh-glance", "react"]);
+  // Dependencies with attestations do not stand in for gh-glance's own.
+  const onlyDependencies = runWith(audit(["react", "es-toolkit"]));
+  assert.equal(onlyDependencies.status, 1);
+  assert.match(onlyDependencies.stdout, /gh-glance has no verified attestation/);
+});
