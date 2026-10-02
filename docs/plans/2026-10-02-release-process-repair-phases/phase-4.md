@@ -1,6 +1,6 @@
 # Phase 4: resumable release driver and authorized activation
 
-Parent: [release process repair](../2026-10-02-release-process-repair.md). Entry: accepted Phases 1–3. Status: planned; external activation separately gated.
+Parent: [release process repair](../2026-10-02-release-process-repair.md). Entry: accepted Phases 1–3. Status: **local implementation complete** -- see [validation](phase-4-validation.md); external activation separately gated.
 
 ## Outcome and scope
 

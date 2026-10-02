@@ -97,3 +97,25 @@
 - Found (review): check runs from a develop push and from the release PR land on the same head commit under the same names (two `Lint` and two `PTY` on `73d23a2`, read-only). With the new routing a push run's checks can be skipped (`covered`) or quicker than the candidate's.
 - Chose: only `pull_request` runs carry the required names (`Lint`, `Test (Node N)`, `Smoke (Node N)`, `PTY`) and `Release candidate`; push runs render "(push)" names and "Push checks", and `PTY` does not run on push. WF-02 renders every job name for both events and fails if a push run could produce a required name (mutation-checked).
 - UNVERIFIED: how branch protection chooses between same-named check runs from different suites. The change removes the question rather than relying on an answer.
+
+### Phase 4: protection migration is planned by the driver, applied under activation authority
+
+- Plan said: the driver carries existing authority through ordinary steps; protection changes add before remove and wait for explicit activation authority.
+- Chose: `release.mjs protection` is read-only. It reads `main`'s required checks and the latest candidate runs and prints the single next `PATCH .../branches/main/protection/required_status_checks` body (add `Release candidate` once observed succeeding; then retire the six legacy contexts, keeping CodeQL, dependency review, strict and app bindings), or why to wait or stop. Applying a step is one `gh api` call made under the activation decision, then the command is run again for readback.
+- Why: settings changes are the one activation step outside the ordinary release sequence; keeping them out of `resume` means release authority can never imply a protection change. PROT-01..03 simulate the transition, interruption and drift from the captured eight-context shape.
+
+### Phase 4: R09 and R10 are proven against simulated boundaries
+
+- R09: every external side effect is followed by a simulated crash in DRV-03; resume reads back and never repeats push, PR creation, merge, tag or release. The lock tests inject process liveness rather than killing real processes.
+- R10: `planCanary` and `canaryMayAdmit` prepare and bound a canary offline (one running Actions pane, five minutes, 20 admissions per resource above max(40% of the limit, the product reserve), unknown charge stops, one-shot secondary checks) and validate the manifest with the monitor's own `validManifest`. No live canary runner exists or was run; none is needed for this process-only change. The monitor's schema is unchanged; G08 is addressed by declaring only continuously active Actions (README).
+- Real read-only use: `prepare 0.16.2`, `protection` and `status` ran against the live repository on 2026-10-02 (no mutation); `prepare` found the next release's real prerequisite (merge `origin/main`'s v0.16.1 commit back into `develop`).
+
+### Phase 4: what "no publication authority" permits
+
+- Plan said: R01, "absent publication authority performs no mutation".
+- Chose: the merge into `main` is a publication stage (`main` tracks released state), so without publication authority the driver stops before the merge, tag and release. Pushing the reviewed candidate to `develop` and opening the release PR are integration steps and need explicit `integration` authority; with neither, nothing moves (DRV-02).
+- Why: it keeps protected `main` and npm unchanged without publication authority, while letting an owner authorize the hosted candidate gate on its own.
+
+### Phase 4: the corrective allowance is test-only and reviewed
+
+- The playbook allows fixture/harness/workflow-wiring repairs that leave packaged behavior unchanged. The driver enforces the narrow, mechanically checkable subset: after failed required checks only, a new candidate that changes nothing outside `test/` (rename-proof `git diff --no-renames`), with `--correction-review` naming its independent review and local gate. Workflow, script, dependency and packaged-file repairs need a new decision even when the playbook would call them wiring, because the driver cannot verify that they leave release control unchanged.

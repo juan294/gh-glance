@@ -57,6 +57,61 @@ dependency change, new live or paid scope, or a materially different candidate
 needs a new owner decision. No delegated agent decides on its own to push,
 merge, tag or publish.
 
+## Release driver
+
+`scripts/release.mjs` runs the procedure below and shows where a release
+stands. Before every step it reads GitHub, npm and git, acts only when that
+readback shows the step has not happened, at most once per stage per run, and
+stops if the readback after an action still does not show it. An interrupted
+release therefore resumes by reading, never by repeating.
+
+- `node scripts/release.mjs prepare x.y.z` -- read-only preflight on the
+  candidate checkout (HEAD): clean tree, versions, changelog, `origin/main`
+  and `origin/develop` both ancestors of HEAD, notes file
+  `docs/release/notes-vx.y.z.md`, registry and tag absence, any open release
+  PR, required contexts and tool readiness (`gh` auth, git remote, registry).
+- `node scripts/release.mjs resume x.y.z --authority <file>` -- re-runs those
+  local gates, then pushes the candidate commit itself to `develop` (never
+  whatever local `develop` holds, never forced), opens the release PR, waits
+  for the required checks (40 minutes per wait), merges pinned to the approved
+  head, tags, creates the GitHub release, reads the publisher's job results
+  (publication and delivery are separate outcomes), reads the registry back
+  (five-minute bound) and removes owned paths. The authority file records the
+  owner's decision for one reviewed candidate:
+  `{"version":"x.y.z","candidate":"<full commit>","reference":"<where the owner said it>","integration":true,"publication":true,"correctiveAllowance":0}`.
+  It documents authority and never creates it: without `publication` the
+  driver stops before the merge (moving `main` is the release) and names that
+  missing decision. A granted correction is a new candidate commit that
+  changes only `test/`, after failed required checks, with
+  `--correction-review <reference>` naming its independent review and local
+  gate; the authority file keeps naming the approved candidate and the
+  receipt records the replacement. If the publisher's Delivery job failed (for
+  example on registry lag), the release stays "published; delivery
+  unverified" until a later read-only delivery receipt is passed with
+  `--delivery-receipt <file>`. Produce it with
+  `RELEASE_VERSION=x.y.z RELEASE_INTEGRITY=<integrity the Verify job accepted>
+  GITHUB_SHA=<production merge commit> DELIVERY_RECEIPT=<file>
+  node scripts/release-candidate.mjs deliver`; take the integrity from the
+  Verify job's `candidate-receipt.json` (the `verified-release-*` artifact),
+  never from the registry. The driver accepts it only if provenance passed for
+  that merge commit and its integrity is what the registry serves. `--own <path>`
+  registers a path for cleanup; only a path holding a
+  `.gh-glance-release-owned` file that names this release is ever removed.
+- `node scripts/release.mjs status x.y.z [--report docs/release/<file>.md]`
+  -- reads the receipt (no live readback): stage, blocker, next action,
+  remaining stages and every blocker raised so far; with `--report` it
+  rewrites only the marked current-status block of the tracked report.
+- `node scripts/release.mjs protection` -- read-only: the next protection
+  migration step as the exact request body, or why to wait or stop.
+- `--dry-run <fixture.json>` runs any command against a simulated world with
+  no external effect; a `--dry-run` without a readable fixture is refused.
+
+The private receipt and lock live under `.git/gh-glance-release/vx.y.z/`; the
+receipt is read only while holding the lock. A live driver's lock is never
+taken over, and a dead one's (process gone or its pid reused) is reclaimed
+atomically. The driver runs `git` and `gh` itself, so shell-level guard hooks
+do not see those commands: review the authority file before resuming.
+
 ## Procedure
 
 ### 1. Prepare (local)
@@ -162,6 +217,9 @@ created; preserve unrelated untracked files.
 The [repair plan](../plans/2026-10-02-release-process-repair.md) replaced the
 workflows in this repository; they take effect with the first push that
 carries them. One step needs separate owner authority: branch protection.
+
+See the [activation dossier](release-process-activation.md) for the exact
+decision and steps.
 
 | Area | Before the repair | Now in the workflow files | Still to activate |
 | --- | --- | --- | --- |

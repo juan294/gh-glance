@@ -1,6 +1,6 @@
 # Release process repair
 
-Date: 2026-10-02. Status: independently reviewed planning specification; Option A confirmed by owner; implementation and external activation have not started.
+Date: 2026-10-02. Status: Option A confirmed by owner; **all four phases implemented and verified locally** (see each phase's validation note and the [implementation notes](2026-10-02-release-process-repair-notes.md)); external activation waits for the owner decision in the [activation dossier](../release/release-process-activation.md).
 
 ## Objective and scope
 

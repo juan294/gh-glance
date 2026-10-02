@@ -946,6 +946,17 @@ SIGINT, or a sample gap over 15 seconds makes the report nonqualifying. A sleep
 gap requires a new uninterrupted window. A schema 1 manifest supports a
 diagnostic `--once` read only; it cannot qualify a run.
 
+Under the default `--background on-demand`, only the active Actions tab is
+watched continuously; Issues, Pull Requests and Security are fetched when
+opened or on `r`. Declare only those continuously active Actions panes in a
+monitored window, and check secondary views with separate one-shot assertions:
+a perpetual cadence oracle over an intentionally idle tab would report a false
+stall. A bounded release canary (one already running Actions pane, at most five
+minutes and 20 extra admissions per resource above the quota floor) is planned
+offline by `planCanary` in `scripts/release-policy.mjs`, which emits exactly
+such a schema 2 manifest and the stop rule; it cannot qualify the 24-hour
+windows.
+
 Provider-limit exclusions require `--external-evidence` pointing to an
 append-only JSON trace with `schema: 1` and an `events` array. Each `raw-http`
 event records the independently captured issue and finish timestamps, host,

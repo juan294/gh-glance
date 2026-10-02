@@ -477,7 +477,7 @@ function acceptCandidate({ repository, run, artifact, pullRequest, productionTre
 
 // The registry's view of the package, as { status, body } for classifyRegistry
 // and deliveryCheck. A network error throws; callers decide what that means.
-async function readRegistry() {
+export async function readRegistry() {
   const response = await fetch("https://registry.npmjs.org/gh-glance", { headers: { accept: "application/json" } });
   const retryAfter = Number(response.headers.get("retry-after"));
   return { status: response.status, body: response.status === 200 ? await response.json() : null,
