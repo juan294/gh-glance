@@ -84,10 +84,11 @@ current.
 - `lazygit`-style panel frame: the tab name sits in the top border, the
   visible-of-total row count in the bottom
 - A semantic footer for the active tab: **Watching** is settled or scheduled;
+  **Cached** shows a secondary view's source age until its next requested refresh;
   **Checking** means admitted work is live; **Paused** protects a held or
   unavailable budget; **Failed** names a normal fetch error; and **Limited**
   means Security visibility is incomplete. Startup and manual Checking can
-  animate. Adapted automatic checks, Watching, Paused, Failed, and Limited are
+  animate. Adapted automatic checks, Watching, Cached, Paused, Failed, and Limited are
   static. A pure shared-lane wait adds `sharing N` without moving the key hints
 - Row state icons are real GitHub Octicons (via the Nerd Font glyph set), not emoji
   -- with a plain-ASCII fallback for terminals without one
@@ -319,9 +320,9 @@ pane definition. Flags are there when you want them:
 | Flag | Effect |
 |---|---|
 | `-R`, `--repo [host/]owner/name` | Watch a specific repository instead of the current directory's. Works from anywhere -- you do not need a local clone. The optional host targets a GitHub Enterprise or EMU data-residency tenant, e.g. `tenant.ghe.com/acme/widget`. |
-| `--refresh <seconds>` | Minimum active-tab poll interval, 2-3600, default 5. A floor, never a ceiling: a tab whose content is unchanged twice in a row slows to 30 seconds (60 for Security), and Actions with a running or queued job is checked every 5. Safe shared grants can make any check later. |
+| `--refresh <seconds>` | Minimum automatic poll interval, 2-3600, default 5. A floor, never a ceiling: a tab whose content is unchanged twice in a row slows to 30 seconds (60 for Security), and Actions with a running or queued job is checked every 5. Safe shared grants can make any check later. |
 | `--tab <name>` | Start on `actions`, `issues`, `prs` or `security`. |
-| `--background <mode>` | `all` (default) or `off`. `off` never requests data for a tab you are not looking at. Its count keeps the last known value and ages visibly, and switching to the tab fetches it. |
+| `--background <mode>` | `on-demand` (default): active Actions updates automatically; Issues, PRs and Security use cached data and check when opened or refreshed with `r`. Unopened tabs make no data requests. `all` continuously polls active and inactive tabs; `off` continuously polls only the selected tab. |
 | `--verbose` | Log one line per dashboard `gh` call to stderr, with timing and outcome. Credential lookup and the account-identity proof are deliberately excluded, so that they cannot log anything derived from a token. stderr must be redirected: `gh-glance --verbose 2>gh-glance.log`. |
 | `--doctor` | Print a diagnostic report and exit. See [Diagnostics](#diagnostics). |
 | `--doctor --probe` | Add bounded, admitted GitHub capability probes to the local diagnostic report. |
@@ -721,6 +722,13 @@ secondary limits, disconnected acquisition, shared producer waits, and local
 coordination. Doctor checks acquisition metadata, referenced snapshot artifacts,
 and the lock path separately. A readable metadata file does not make an aged
 orphan lock or invalid snapshot healthy; plain doctor never repairs either.
+When one cached identity names the selected host, plain doctor also reads its
+quota ledger without changing it or contacting GitHub. It reports receipt and
+debt totals, observer age, the current recovery cause, and an actual retry time
+when one is known. If several cached identities match, it says the scope is
+unavailable instead of choosing an account. For a corrupt or unreadable quota
+file, it names the coordination directory and a `quota-[redacted].json` file
+pattern with the cause. The private quota fingerprint stays out of reports.
 
 Use `gh-glance --doctor --probe` when live capability evidence is needed. Probe
 mode uses an ephemeral governor lease and admits every quota-consuming endpoint
@@ -730,8 +738,9 @@ classification (`unavailable`, `rate-limited`, `auth-problem` or `other`). A
 probe whose safe slot is later, whose resource is held, or whose budget is
 unavailable is reported as `SKIPPED`; diagnostics do not bypass the reserve.
 The `API governor` section then reports its measured health and resource state.
-Neither mode prints scope hashes, account identity keys, state paths, lock
-owners, reservation IDs, response bodies, or credentials.
+Neither mode prints scope hashes, account identity keys, quota fingerprints,
+lock owners, reservation IDs, response bodies, or credentials. The redacted
+state-file location above is shown only when local recovery needs it.
 
 The `Repository access` probe shows whether the target resolves for the active
 `gh` credentials. A failed GitHub resolution response cannot distinguish a
@@ -761,7 +770,15 @@ The default five seconds is a healthy single-pane floor, not an unconditional
 request frequency. Each check first needs an atomic grant from the private
 governor shared by local panes using the same effective host and account
 namespace. Beyond that floor, the cadence follows what the repository is
-actually doing:
+actually doing. By default only active Actions polls automatically. Secondary
+views show Cached with source age after their requested observation; open the tab
+or press `r` to check again. Opening can reuse a fresh shared snapshot. An
+outstanding request continues through admission delays and transient failures.
+Cached tab counts are last known values, not live counts. `--background all`
+restores continuous polling of all tabs; `--background off` continuously polls
+only the selected tab.
+
+The following cadence table applies to automatically polled tabs:
 
 | State | Earliest normal check |
 |---|---|
@@ -844,6 +861,14 @@ rate-limiting, it loads the saved rows for that same target immediately. Their
 age remains explicit through the `stale` label, and the rate-limit banner still
 describes the current failed request; cached data never turns a failure into a
 false success.
+After a sustained hold, the notice names the Core or GraphQL cause, the next
+automatic retry or required action, and the age of the last complete source
+observation. A successful budget check, cache load, or heartbeat cannot make
+old rows fresh. A validated unchanged `304` response does count as a new source
+observation. Unknown older spend remains charged until owner/child quiescence
+and a later matching observer establish safe retirement. A verified new system
+boot can establish that boundary for otherwise unidentifiable older children;
+the app does not assume a restart or reset alone refunded the charge.
 
 The enforceable boundary is admission from fresh, conservatively debited
 evidence. Another program can spend after the probe, and standalone panes in a
@@ -886,29 +911,51 @@ fixture performance is not presented as live GitHub performance.
 ### Live freshness monitor
 
 The repository includes a read-only monitor for a declared set of live panes.
-Create its manifest independently of the acquisition store, after each pane has
-installed its subscription. Each entry fixes the pane ID, process ID, expected
-repository and tab, start time in Unix milliseconds, and effective cadence:
+For a qualifying run, create a schema 2 manifest independently of the
+acquisition store before sampling. Fix `candidateHash` to the SHA-256 of the
+exact executable, `requestedDurationMs` to the full observation window, and
+`sampleIntervalMs` to `5000`. Each expected pane needs its ID, live PID,
+repository, repository ID, tab, host, access-key fingerprint, start time in
+Unix milliseconds, and declared `cadenceMs`. The monitor checks the live PID
+and subscription against that fixed identity on every sample. It derives the
+source deadline from the declared cadence, not from the app's `nextDueAt`.
 
-```json
-{"schema":1,"panes":[{"id":"my-pane","pid":12345,"repository":"owner/repo","tab":"actions","startedAt":1800000000000,"cadenceMs":5000}]}
-```
-
-Use the same private config root as the panes and write a new report path:
+Use the panes' private config root and a new report path:
 
 ```sh
-node scripts/freshness-monitor.mjs --manifest panes.json \
+node scripts/freshness-monitor.mjs --manifest "$GH_GLANCE_QUALIFICATION_MANIFEST" \
   --store "$XDG_CONFIG_HOME/gh-glance/coordination-v2/acquisition.json" \
-  --report freshness.jsonl --interval-ms 5000 --duration-ms 86400000
+  --quota "$GH_GLANCE_MONITORED_QUOTA" \
+  --candidate "$(command -v gh-glance)" --report freshness.jsonl \
+  --interval-ms 5000 --duration-ms 86400000
 ```
 
-The JSONL contains hashed pane/target labels, validated source-success times,
-maximum eligible gaps, overdue time, lock status, and declared hold intervals.
-Missing or expired subscriptions and corrupt stores fail the run, even when no
-subscriber remains in the store. To close an expectation after an intentional
-pane exit, add its `exitedAt` timestamp to the manifest. Only a `holds` interval
-declared in that pane entry and confirmed by the runtime excludes time from
-the cadence check. No GitHub request is made by the monitor.
+Set `GH_GLANCE_MONITORED_QUOTA` to the quota file selected by the cached
+registry entry matching every declared host and access-key fingerprint; the
+monitor rejects an unrelated or ambiguous scope. Resolve the installed
+executable with `command -v gh-glance` only after confirming it is the exact
+candidate under observation. The JSONL records requested and actual
+elapsed time, sample gaps, source clocks, maximum eligible gaps, overdue time,
+observer/debt counts, and separate wall, external-outage, and eligible windows.
+Its `windowClass` is derived from requested duration: `short` below 30
+minutes, `initial` from 30 minutes to under 24 hours, and `full` from 24 hours.
+A successful short or initial report does not complete 24-hour acceptance;
+that requires a separate full window and its declared live transitions.
+Missing or expired subscriptions, a disappeared PID, corrupt stores, an early
+SIGINT, or a sample gap over 15 seconds makes the report nonqualifying. A sleep
+gap requires a new uninterrupted window. A schema 1 manifest supports a
+diagnostic `--once` read only; it cannot qualify a run.
+
+Provider-limit exclusions require `--external-evidence` pointing to an
+append-only JSON trace with `schema: 1` and an `events` array. Each `raw-http`
+event records the independently captured issue and finish timestamps, host,
+access-key fingerprint, Core or GraphQL resource, and raw HTTP status line and
+bounded headers. The monitor derives the interval from a matching 429 or
+rate-exhausted 403 response with `Retry-After`. It reloads the trace on every
+sample and rejects changed past records or future responses. App hold labels
+and synthetic request-oracle records grant no exclusion. Local coordination
+holds fail qualification even when brief. Keep this trace and the manifest private. The
+monitor makes no GitHub request or coordination write.
 
 ## Limitations
 
@@ -1022,9 +1069,13 @@ GH_GLANCE_ICONS=ascii gh-glance
 | It exits immediately when piped | Intentional. It is a full-screen dashboard, not a reporting command. |
 | `Restart required: close older gh-glance panes` | A pane from an older release still holds a live lease in the previous coordination format, which this version cannot join. Quit those panes; this one resumes on its own. Nothing is killed for you, and no state needs deleting. |
 | `Upgrade waiting for legacy quota reset` | The older panes are gone, but left spend that cannot be proven settled. It waits for the affected rate-limit window to reset rather than assume the quota is free. This one has a deadline and clears itself. |
-| `Upgrade blocked: older spend cannot be settled or waited out` | The same unsettled spend, but the older file records no reset to wait for, so there is no deadline and it will not clear on its own. Quit every pane, then delete the `rate-governor-v1-*.json` files in the configuration directory -- they are the leftover evidence, and with no reset recorded there is nothing further to learn from them. Coordination starts clean on the next launch. |
+| `Upgrade blocked: older spend cannot be settled or waited out` | Older spend has no reliable reset or child evidence. Verify old children ended and use `gh-glance --doctor` to inspect reserved units. An unidentifiable old child may require a verified system restart before a later observer can retire its charge. Keep the quota files as accounting evidence. |
 | `Coordination state unavailable; evidence preserved` | Coordination state could not be read and was deliberately not overwritten, so nothing is lost. Run `gh-glance --doctor` and check the config directory's permissions. |
-| `Shared HTTP request or cooldown in progress` | Panes share one outbound request slot and one cooldown. Another pane holds it, or a server-sent `Retry-After` is still running. Normal pacing, not an error. |
+| `Local coordination` corruption, overflow, full storage, or unsafe permissions | Run `gh-glance --doctor`; its read-only report gives the exact cause and redacted local file location when known. Repair storage or permissions, then let the app retry. Preserve corrupt and overflow evidence for diagnosis. |
+| `Saving request result` or `Recovering interrupted request` | The original request may have consumed quota. The app keeps its charge, retries settlement without repeating HTTP, and waits for safe observer evidence before retiring uncertain debt. |
+| `GitHub request limit` | A shared secondary hold preserves GitHub's retry deadline. Wait for the shown time; if the repeated-limit circuit explicitly asks, press `r` once to retry. Repeated refresh cannot bypass a hold. |
+| `Collector connection unavailable` or `GitHub App authorization unavailable` | Restore the selected collector connection or App authorization. The mode does not switch to independent requests. Cached rows remain labeled with their source age. |
+| `Shared HTTP request or cooldown in progress` | Panes share up to three admitted requests per host, FIFO starts with at least 250 ms spacing, and one cooldown. The pool is full, a queued request is ahead, or a server-sent `Retry-After` is still running. Normal pacing, not an error. |
 | `Verified identity unavailable; waiting to retry` | The account behind your credential has not been confirmed yet -- not signed in, a denied or malformed proof, or a slow credential helper. Check `gh auth status`. Retries are rate-limited, so this clears on its own rather than immediately. |
 | It stopped updating and you cannot tell why | Run `gh-glance --verbose 2>gh-glance.log`, reproduce, then read the log: one line per dashboard `gh` call with its duration and outcome. Credential lookup and the identity proof are excluded by design. It is redacted the same way `--doctor` is, so it is safe to attach to a bug report. `--doctor --verbose` logs the probes too. |
 | `--verbose` refuses to start | stderr is still your terminal, where the log would draw over the dashboard. Redirect it to a file. |

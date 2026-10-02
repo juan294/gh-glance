@@ -17,29 +17,43 @@
 // no-build-step stance rules out.
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { capture } from "./capture.mjs";
+import { capture, waitForAwk } from "./capture.mjs";
 
-// Derived from the app's own refresh interval rather than hard-coded, so
-// changing REFRESH_MS cannot silently make these racy. First paint lands well
-// inside one interval; a second gives the tab switch room to render.
+// Width-mode probes do not depend on data rows; keep their short input spacing.
 const REFRESH_SECONDS = 5;
 const SETTLE = Math.ceil(REFRESH_SECONDS * 0.6);
 
-// Assert only on the FINAL frame after all input. An intermediate frame depends
-// on when a poll tick landed relative to the keystroke, which is exactly the
-// kind of timing dependency that makes a suite flaky.
-const keyed = capture({
-  cols: 80,
-  rows: 24,
-  signal: "none",
-  settle: 20,
-  stdin: `sleep ${SETTLE}; printf '2'; sleep ${SETTLE}; printf 'q'; sleep 2`,
-});
+// Move is advertised only after rows arrive. Force slow provider responses and
+// wait for actual fixture rows before switching tabs and quitting.
+const keyed = (() => {
+  const configHome = mkdtempSync(join(tmpdir(), "gh-glance-pty-keys-"));
+  const statePath = join(configHome, "fixture.json");
+  const now = Date.now();
+  writeFileSync(statePath, JSON.stringify({
+    createdAt: now,
+    core: { limit: 5000, used: 0, remaining: 5000, resetMs: now + 3_600_000 },
+    graphql: { limit: 5000, used: 0, remaining: 5000, resetMs: now + 3_600_000 },
+    events: [],
+    delayByCommand: { actions: 8000, "graphql-data": 8000 },
+  }), { mode: 0o600 });
+  try {
+    return capture({
+      cols: 80, rows: 24, signal: "none", settle: 60, configHome,
+      stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "ci: pin actions") { ok=1 }', 250) +
+        "printf '2'; " +
+        waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "SIGTERM erases") { ok=1 }', 250) +
+        "printf 'q'; sleep 2",
+      env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1", GH_GLANCE_FIXTURE_STATE: statePath },
+    });
+  } finally {
+    rmSync(configHome, { recursive: true, force: true });
+  }
+})();
 
 // The same app, backgrounded, so stdin is not a tty. Used only to prove the
 // interactive gate works in both directions.
@@ -82,6 +96,8 @@ test("keys are advertised only when stdin is interactive", () => {
   // are checked. index.mjs shows the full hints when raw mode is supported and
   // only "Quit: ^C" when it is not -- advertising keys that cannot fire would be
   // telling the user something untrue about what the app can do.
+  assert.match(keyed.raw, /ci: pin actions/, "Actions rows must arrive before switching");
+  assert.match(keyed.finalFrame.lines.join("\n"), /SIGTERM erases/, "Issues rows must arrive before quitting");
   assert.ok(
     keyed.hasFullKeyHints,
     "expected the full key hints on a foreground run with an interactive stdin",
@@ -90,6 +106,8 @@ test("keys are advertised only when stdin is interactive", () => {
     !detached.hasFullKeyHints,
     "expected only the Ctrl+C hint when stdin is not a tty",
   );
+  assert.match(detached.finalFrame.lines.join("\n"), /Quit:\s+\^C/,
+    "noninteractive stdin must advertise Ctrl+C even before rows arrive");
 });
 
 test("a digit switches tabs", () => {

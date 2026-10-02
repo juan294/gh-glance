@@ -157,7 +157,7 @@ test("a split press stops resizing after an outside-header release", (t) => {
       env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
       stdin:
         waitForActionsCache + waitForActionsFrame + "printf 'w'; " + waitForWidthMode +
-        `printf '\\033[<0;${PRESS_X};'; sleep 0.005; printf '${PRESS_Y}M'; ` +
+        `printf '\\033[<0;${PRESS_X};'; sleep 0.001; printf '${PRESS_Y}M'; ` +
         `sleep 1; printf '\\033[<32;${DRAG_X};${PRESS_Y}M'; ` +
         `sleep 1; printf '\\033[<0;${DRAG_X};${OUTSIDE_Y}m'; ` +
         `sleep 1; printf '\\033[<32;${DRAG_X + 3};${OUTSIDE_Y}M'; ` +
@@ -172,6 +172,9 @@ test("a split press stops resizing after an outside-header release", (t) => {
       return [key, Number(polls)];
     }));
     t.diagnostic(`${readinessText.replaceAll("\n", "; ")} (50ms polls)`);
+    if (readiness.preference >= 200) {
+      t.diagnostic(`frame at timeout: ${dragged.finalFrame.lines.slice(0, 8).join(" | ")}`);
+    }
     assert.ok(readiness.dashboard < 600, "Actions cache readiness timed out");
     assert.ok(readiness.frame < 600, "Actions frame readiness timed out");
     assert.ok(readiness.width < 200, "width-mode frame readiness timed out");

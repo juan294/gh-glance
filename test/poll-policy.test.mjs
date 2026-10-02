@@ -380,3 +380,22 @@ test("REFRESH-02 a 304 with its entity present is the ordinary free case", async
   // Nothing was dropped: this validator is doing exactly its job.
   assert.equal(entities.size, 1);
 });
+
+
+test("on-demand keeps only active Actions automatic and honors one outstanding request", () => {
+  for (const tab of ["actions", "issues", "prs", "security"]) {
+    assert.equal(pollPolicyInterval({ tab, floorMs: FLOOR, demand: "inactive", background: "on-demand" }), Infinity);
+    assert.equal(pollPolicyInterval({ tab, floorMs: FLOOR, demand: "active", background: "on-demand" }),
+      tab === "actions" ? FLOOR : Infinity);
+    assert.equal(pollPolicyInterval({ tab, floorMs: FLOOR, demand: "active", background: "on-demand", requested: true }), FLOOR);
+  }
+  const scheduled = pollSchedule({ nowMs: NOW, floorMs: FLOOR, activeKey: "issues", background: "on-demand",
+    states: { issues: { requested: true } } });
+  assert.deepEqual(scheduled.due, [{ key: "issues", kind: "active" }]);
+  assert.deepEqual(pollSchedule({ nowMs: NOW + 60_000, floorMs: FLOOR, activeKey: "issues",
+    background: "on-demand", dueAt: scheduled.dueAt }).due, []);
+  const held = pollSchedule({ nowMs: NOW, floorMs: FLOOR, activeKey: "issues", background: "on-demand",
+    states: { issues: { requested: true } }, heldResources: { graphql: { held: true, retryAt: NOW + 1000 } } });
+  assert.deepEqual(held.due, []);
+  assert.equal(held.dueAt.issues, NOW + 1000);
+});

@@ -98,29 +98,35 @@ test("POLL-02 running CI is checked every five seconds, not at the two-second fl
 });
 
 test("POLL-02 a quiet list waits its 30s interval and is checked within two seconds of it", (t) => {
-  const box = fixture(t);
+  const box = fixture(t, { delayByCommand: { "graphql-data": 3000 } });
   capture({
     cols: 80,
     rows: 24,
     signal: "none",
-    settle: 45,
+    settle: 60,
     // Three observations at the 2s floor take the tab into quiet mode (two
     // unchanged), and the fourth is the one this asserts on.
     stdin: waitForIssuePages(4) + "sleep .3; printf q",
-    args: "--repo acme/widget --refresh 2 --tab issues",
+    args: "--repo acme/widget --refresh 2 --tab issues --background off",
     configHome: box.root,
     env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1", GH_GLANCE_FIXTURE_STATE: box.statePath },
   });
   const pages = graphqlEvents(box.read(), "issues.page");
   assert.ok(pages.length >= 4, `issue page calls: ${pages.length}`);
-  const observed = gaps(pages.slice(0, 4));
-  // The first two gaps are the floor: nothing is known to be quiet yet. Allow
-  // subprocess start overhead under CI load while distinguishing the 5s cadence.
+  const completed = new Map(box.read().events
+    .filter((event) => event.type === "end").map((event) => [event.sequence, event]));
+  // Production schedules from successful completion. Provider response time
+  // belongs to the preceding request, not to the next polling interval.
+  const observed = pages.slice(1, 4).map((event, index) => {
+    const previous = completed.get(pages[index].sequence);
+    assert.ok(previous && !previous.failed, "previous page must complete successfully");
+    assert.ok(previous.at >= pages[index].at, "completion cannot precede request start");
+    return event.at - previous.at;
+  });
   assert.ok(observed[0] <= 4_500, `first gap ${observed[0]}ms should be the 2s floor`);
   assert.ok(observed[1] <= 4_500, `second gap ${observed[1]}ms should be the 2s floor`);
-  // The third is the quiet cadence: 30 seconds, arriving within two of it.
   assert.ok(observed[2] >= 28_000 && observed[2] <= 32_000,
-    `quiet gap ${observed[2]}ms outside 30s +2s`);
+    `quiet completion gap ${observed[2]}ms outside 30s +2s`);
 });
 
 // ---------- POLL-01 ----------
@@ -324,4 +330,48 @@ test("PAGE-01 a list nobody scrolls never asks for a second page", (t) => {
   assert.ok(pages[0].endsWith("after=-"));
   // Fifty of 120, and the count says so rather than presenting 50 as the total.
   assert.match(result.finalFrame.lines.join("\n"), /Issues \(50\+\)/);
+});
+
+
+test("default on-demand tabs stop after opening and refresh again with r", (t) => {
+  const box = fixture(t, { apiEntities: { [RUNS_PATH]: { sequence: [{ etag: '"running"',
+    body: readFileSync(join(HERE, "fixtures", "actions-runs-running.json"), "utf8") }] } } });
+  const result = capture({
+    cols: 110, rows: 24, signal: "none", settle: 65,
+    stdin: waitForActionsRuns(3) + "printf 2; " + waitForIssuePages(1) +
+      "sleep 12; printf r; " + waitForIssuePages(2) + "sleep 4; printf q",
+    args: "--repo acme/widget --refresh 2", configHome: box.root,
+    env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1", GH_GLANCE_FIXTURE_STATE: box.statePath },
+  });
+  const state = box.read();
+  const issues = graphqlEvents(state, "issues.page");
+  assert.equal(issues.length, 2, "secondary data must only load on opening and explicit refresh");
+  assert.ok(issues[1].at - issues[0].at >= 11_000, "secondary tab polled before the key press");
+  assert.ok(pathEvents(state, RUNS_PATH).length >= 3, "active Actions must keep updating");
+  assert.equal(graphqlEvents(state, "pulls.page").length, 0, "unopened PRs must not fetch");
+  assert.equal(state.events.filter((event) => event.type === "start" &&
+    event.argv?.some((argument) => /alerts/.test(String(argument)))).length, 0,
+  "unopened Security must not fetch");
+  const frame = result.finalFrame.lines.join("\n");
+  assert.match(frame, /Cached/);
+  assert.doesNotMatch(frame, /Watching/);
+  assert.equal(result.exitCode, 0);
+});
+
+test("cached secondary age advances while no new observation is requested", (t) => {
+  const box = fixture(t);
+  const result = capture({
+    cols: 110, rows: 24, signal: "none", settle: 25,
+    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Cached") { ok=1 }') +
+      "sleep 5; printf q",
+    args: "--repo acme/widget --refresh 2 --tab issues", configHome: box.root,
+    env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1", GH_GLANCE_FIXTURE_STATE: box.statePath },
+  });
+  const frame = result.finalFrame.lines.join("\n");
+  const age = frame.match(/Cached\s+(\d+)s/);
+  assert.ok(age, `cached age missing: ${frame}`);
+  assert.ok(Number(age[1]) >= 4, `cached age froze at ${age[1]}s after five idle seconds`);
+  assert.equal(graphqlEvents(box.read(), "issues.page").length, 1,
+    "advancing displayed age must not fetch secondary data again");
+  assert.equal(result.exitCode, 0);
 });

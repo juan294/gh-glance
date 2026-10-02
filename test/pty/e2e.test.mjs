@@ -14,7 +14,10 @@
 // and asserted against repeatedly.
 
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, test } from "node:test";
 
 import { capture } from "./capture.mjs";
 import { MIN_TABLE_WIDTH } from "../../index.mjs";
@@ -25,12 +28,19 @@ const wide = capture({ cols: 80, rows: 24, settle: 7 });
 const narrow = capture({ cols: 45, rows: 20, settle: 7 });
 const repositoryResolutionFailure =
   "GraphQL: Could not resolve to a Repository with the name 'Nvteca/cashflor-forecast'. (repository)";
+const inaccessibleConfig = mkdtempSync(join(tmpdir(), "gh-glance-inaccessible-pty-"));
+after(() => rmSync(inaccessibleConfig, { recursive: true, force: true }));
 const inaccessibleRepository = capture({
   cols: 80,
   rows: 24,
-  settle: 7,
+  signal: "none",
+  settle: 20,
+  configHome: inaccessibleConfig,
+  stdin: 'i=0; while ! grep -aq "Failed" "$GH_GLANCE_CAPTURE_OUT" 2>/dev/null && [ "$i" -lt 200 ]; ' +
+    'do i=$((i + 1)); sleep .1; done; printf q',
   args: "--tab issues",
   env: {
+    GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
     GH_GLANCE_FIXTURE_FAIL: repositoryResolutionFailure,
     GH_GLANCE_FIXTURE_FAIL_ON: "graphql-data",
   },
@@ -61,7 +71,7 @@ test("the app reaches the data layer at all", () => {
 
 test("healthy startup does not probe optional failure context", () => {
   assert.ok(
-    !wide.fixtureCalls.some((call) => call.startsWith("repo view")),
+    !wide.fixtureCalls.some((call) => call.startsWith("graphql repository.identity")),
     "healthy startup unexpectedly probed repository context",
   );
   assert.ok(
@@ -70,19 +80,33 @@ test("healthy startup does not probe optional failure context", () => {
   );
 });
 
-test("an inaccessible repository uses cached auth context without crossing a paced repo slot", () => {
+test("an inaccessible repository uses cached auth context and respects paced repository slots", () => {
   const calls = inaccessibleRepository.fixtureCalls;
-  assert.ok(calls.some((call) => call.startsWith("graphql issues.page")), "Issues did not fail");
+  const frame = inaccessibleRepository.finalFrame.lines.join("\n");
+  const details = JSON.stringify({ calls, frame });
+  assert.ok(calls.some((call) => call.startsWith("graphql issues.page")), `Issues did not fail: ${details}`);
+  assert.match(frame, /Failed/, details);
   assert.equal(
     calls.filter((call) => call.startsWith("auth status")).length,
     0,
     "failure diagnosis made an unadmitted auth status request",
   );
-  assert.equal(
-    calls.filter((call) => call.startsWith("repo view")).length,
-    0,
-    "repository context crossed its future paced slot",
-  );
+  const directory = join(inaccessibleConfig, "gh-glance", "coordination-v2");
+  const quotaFile = readdirSync(directory).find((name) => /^quota-[a-f0-9]{64}\.json$/.test(name));
+  assert.ok(quotaFile, `missing quota evidence: ${details}`);
+  const governor = JSON.parse(readFileSync(join(directory, quotaFile), "utf8"));
+  const repositoryDispatches = Object.values(governor.reservations).flatMap((reservation) =>
+    (reservation.receipt?.dispatches ?? [])
+      .filter((dispatch) => dispatch.operation === "failure-context:repository" && !dispatch.neverStarted)
+      .map((dispatch) => ({ reservation, dispatch })));
+  const repositoryCalls = calls.filter((call) => call.startsWith("graphql repository.identity"));
+  // A child can be aborted after dispatch but before the fixture logs it. Every
+  // observed request must nevertheless have an admitted, started reservation.
+  assert.ok(repositoryCalls.length <= repositoryDispatches.length, `unadmitted repository request: ${details}`);
+  for (const { reservation, dispatch } of repositoryDispatches) {
+    assert.ok(reservation.startedAt >= reservation.notBefore, JSON.stringify(reservation));
+    assert.ok(dispatch.issuedAt >= reservation.notBefore, JSON.stringify({ reservation, dispatch }));
+  }
 });
 
 test("the failure frame preserves terminal geometry and clean teardown", () => {

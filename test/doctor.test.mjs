@@ -13,7 +13,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 
@@ -32,11 +32,14 @@ import {
   publishProbe,
   redact,
   registerLease,
+  recordRecoveryTransition,
+  recoveryCause,
   requestManualProbe,
   setRuntimeAcquisitionHold,
   crashDiagnostic,
   verboseLogLine,
 } from "../index.mjs";
+import { agedGovernorV6 } from "./fixtures/aged-governor-v6.mjs";
 
 const execFileAsync = promisify(execFile);
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -248,6 +251,133 @@ test("OBS-02: plain --doctor is local-only and invokes no GitHub API command", a
   assert.ok(calls.every((line) => !line.includes('"api"') && !line.includes('"auth"')), calls.join("\n"));
 });
 
+test("D6: plain doctor reads the sole cached quota scope without an API call or a state write", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-cached-quota-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = await seededDoctorScope(root);
+  const before = readFileSync(scope.path);
+  const registryPath = join(root, "gh-glance", "coordination-v2", "registry.json");
+  const registryBefore = readFileSync(registryPath);
+  const log = join(root, "gh.log");
+  const out = await doctor({ probe: false, args: ["--repo", "acme/widget"],
+    env: { XDG_CONFIG_HOME: root, GH_GLANCE_FIXTURE_LOG: log } });
+  assert.match(out, /API governor/);
+  assert.match(out, /cached scope/i);
+  assert.match(out, /core.*remaining/i);
+  assert.match(out, /^next retry\s+unavailable$/m);
+  assert.match(out, /^graphql observer age\s+unavailable$/m);
+  assert.deepEqual(readFileSync(scope.path), before);
+  assert.deepEqual(readFileSync(registryPath), registryBefore);
+  const calls = existsSync(log) ? readFileSync(log, "utf8") : "";
+  assert.doesNotMatch(calls, /"api"|"auth"/);
+  assert.doesNotMatch(out, new RegExp(scope.quotaKey));
+});
+
+test("D6: plain doctor discloses ambiguous cached identity instead of selecting a quota", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-ambiguous-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = await seededDoctorScope(root);
+  const registryPath = join(root, "gh-glance", "coordination-v2", "registry.json");
+  const registry = JSON.parse(readFileSync(registryPath, "utf8"));
+  const first = Object.values(registry.identities)[0];
+  registry.identities["b".repeat(64)] = { ...first, quotaKey: "c".repeat(64), accessKey: "d".repeat(64) };
+  writeFileSync(registryPath, JSON.stringify(registry));
+  const out = await doctor({ probe: false, args: ["--repo", "acme/widget"],
+    env: { XDG_CONFIG_HOME: root } });
+  assert.match(out, /cached scope.*unavailable.*ambiguous/i);
+  assert.doesNotMatch(out, new RegExp(scope.quotaKey));
+});
+
+test("D6: corrupt cached quota reports a usable redacted location and cause", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-corrupt-location-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = await seededDoctorScope(root);
+  writeFileSync(scope.path, "{corrupt\n");
+  const before = readFileSync(scope.path);
+  const out = await doctor({ probe: false, args: ["--repo", "acme/widget"],
+    env: { XDG_CONFIG_HOME: root } });
+  assert.match(out, /^cached scope\s+unavailable \(corrupt\)$/m);
+  assert.match(out, new RegExp(`${join(root, "gh-glance", "coordination-v2").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/quota-\\[redacted\\]\\.json`));
+  assert.doesNotMatch(out, new RegExp(scope.quotaKey));
+  assert.deepEqual(readFileSync(scope.path), before);
+});
+
+test("D6: failed observer retry time is separate from the quota reset", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-observer-retry-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = await seededDoctorScope(root);
+  const state = JSON.parse(readFileSync(scope.path, "utf8"));
+  const nextAt = Date.now() + 60_000;
+  state.observers.core = { ...state.observers.core, outcome: "failed", nextAt };
+  writeFileSync(scope.path, `${JSON.stringify(state)}\n`);
+  const out = await doctor({ probe: false, args: ["--repo", "acme/widget"],
+    env: { XDG_CONFIG_HOME: root } });
+  assert.match(out, new RegExp(`^next retry\\s+${new Date(nextAt).toISOString()}$`, "m"));
+  assert.doesNotMatch(out, new RegExp(`^next retry\\s+${new Date(state.budgets.core.resetMs).toISOString()}$`, "m"));
+});
+
+test("D6: doctor reports cached recovery debt and retry without changing any coordination artifact", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-recovery-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = await seededDoctorScope(root);
+  const at = Date.now();
+  assert.equal(recordRecoveryTransition(scope, recoveryCause({ reason: "unwritable", resource: "core",
+    at, retryAt: at + 60_000, sourceAt: at - 120_000, terminalizationBacklog: 2 })).ok, true);
+  const coordination = join(root, "gh-glance", "coordination-v2");
+  const before = Object.fromEntries(readdirSync(coordination).sort().map((name) => {
+    const path = join(coordination, name);
+    return [name, { data: readFileSync(path), mtimeMs: lstatSync(path).mtimeMs }];
+  }));
+  const out = await doctor({ probe: false, args: ["--repo", "acme/widget"],
+    env: { XDG_CONFIG_HOME: root } });
+  assert.match(out, /^recovery reason\s+core: unwritable$/m);
+  assert.match(out, /^last failed transition\s+unwritable$/m);
+  assert.match(out, /^core receipt units\s+0$/m);
+  assert.match(out, /^core debt units\s+0$/m);
+  assert.match(out, /^terminalization backlog\s+2 \(last recorded\)$/m);
+  assert.match(out, /^next retry\s+\d{4}-\d\d-\d\dT/m);
+  assert.deepEqual(readdirSync(coordination).sort(), Object.keys(before));
+  for (const [name, old] of Object.entries(before)) {
+    assert.deepEqual(readFileSync(join(coordination, name)), old.data, name);
+    assert.equal(lstatSync(join(coordination, name)).mtimeMs, old.mtimeMs, name);
+  }
+});
+
+test("D6: an unreadable recovery journal is reported as unavailable without changing it", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-recovery-unavailable-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = await seededDoctorScope(root);
+  const journalPath = `${scope.path}.recovery.json`;
+  writeFileSync(journalPath, "x".repeat(128 * 1024 + 1));
+  const before = readFileSync(journalPath);
+  const stamp = lstatSync(journalPath).mtimeMs;
+  const out = await doctor({ probe: false, args: ["--repo", "acme/widget"],
+    env: { XDG_CONFIG_HOME: root } });
+  assert.match(out, /^recovery reason\s+diagnostic journal unavailable$/m);
+  assert.doesNotMatch(out, /^recovery reason\s+none recorded$/m);
+  assert.deepEqual(readFileSync(journalPath), before);
+  assert.equal(lstatSync(journalPath).mtimeMs, stamp);
+});
+
+test("D6: plain doctor inspects aged v6 without backup, writes, or quota-fingerprint disclosure", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-v6-readonly-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = await seededDoctorScope(root);
+  const now = Date.now();
+  const old = agedGovernorV6(JSON.parse(readFileSync(scope.path, "utf8")), now);
+  writeFileSync(scope.path, `${JSON.stringify(old)}\n`);
+  const before = readFileSync(scope.path);
+  const stamp = lstatSync(scope.path).mtimeMs;
+  const out = await doctor({ probe: false, args: ["--repo", "acme/widget"],
+    env: { XDG_CONFIG_HOME: root } });
+  assert.match(out, /^core debt units\s+456$/m);
+  assert.match(out, /^graphql debt units\s+162$/m);
+  assert.deepEqual(readFileSync(scope.path), before);
+  assert.equal(lstatSync(scope.path).mtimeMs, stamp);
+  assert.equal(existsSync(`${scope.path}.pre-v7.backup`), false);
+  assert.doesNotMatch(out, new RegExp(scope.quotaKey));
+});
+
 test("COL-02/05: local collector doctor reports source and never probes GitHub", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-collector-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -447,7 +577,7 @@ test("OBS-03: indeterminate owner and recovery markers remain read-only blockers
   assert.equal(existsSync(markerPath), true);
 });
 
-test("OBS-03: doctor rejects malformed or unreconciled uncertainty metadata", async (t) => {
+test("OBS-03: doctor rejects malformed quota projections and legacy summaries", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-receipts-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const engine = createAcquisitionEngine({ pathOptions: { env: { XDG_CONFIG_HOME: root } } });
@@ -475,25 +605,23 @@ test("OBS-03: doctor rejects malformed or unreconciled uncertainty metadata", as
   } });
   const path = acquisitionStorePath({ env: { XDG_CONFIG_HOME: root } });
   const persisted = JSON.parse(readFileSync(path, "utf8"));
-  const receiptId = Object.keys(persisted.uncertainReceipts)[0];
+  const scopeHash = "a".repeat(64);
+  persisted.quotaProjections[scopeHash] = { revision: 1, units: { core: 1, graphql: 0 },
+    at: Date.now(), status: "current" };
 
   const malformed = structuredClone(persisted);
-  malformed.uncertainReceipts[receiptId].units = 0;
+  malformed.quotaProjections[scopeHash].units.core = -1;
   writeFileSync(path, JSON.stringify(malformed));
   assert.match(await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } }), /^status\s+corrupt$/m);
 
   const mismatched = structuredClone(persisted);
-  mismatched.metrics.uncertainCoreUnits += 1;
+  mismatched.legacyUnverified.coreUnits = -1;
   writeFileSync(path, JSON.stringify(mismatched));
   assert.match(await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } }), /^status\s+corrupt$/m);
 
   const numericClaimId = structuredClone(persisted);
-  const receipt = numericClaimId.uncertainReceipts[receiptId];
-  delete numericClaimId.uncertainReceipts[receiptId];
-  receipt.id = "0";
-  numericClaimId.uncertainReceipts["0"] = receipt;
-  const queryRecord = Object.values(numericClaimId.queries)[0];
-  queryRecord.claim.receiptIds = [0];
+  numericClaimId.quotaProjections["0"] = numericClaimId.quotaProjections[scopeHash];
+  delete numericClaimId.quotaProjections[scopeHash];
   writeFileSync(path, JSON.stringify(numericClaimId));
   assert.match(await doctor({ probe: false, env: { XDG_CONFIG_HOME: root } }), /^status\s+corrupt$/m);
 });
@@ -742,7 +870,7 @@ test("--doctor reports the host-qualified target it was given", async () => {
 // --refresh flag it cannot be reached by calling validateArgs directly. These
 // spawn a real child, which is the wiring under test.
 test("GH_GLANCE_REFRESH sets the interval and is reported by name", async () => {
-  const report = await doctor({ env: { GH_GLANCE_REFRESH: "30" } });
+  const report = await doctor({ env: { GH_GLANCE_REFRESH: "30" }, args: ["--background", "all"] });
   assert.match(report, /GH_GLANCE_REFRESH\s+30/);
   assert.match(report, /projected demand .*floor 30s/);
   // At a 30s floor every cadence in the table is the floor itself -- 30s is
@@ -754,7 +882,7 @@ test("GH_GLANCE_REFRESH sets the interval and is reported by name", async () => 
 });
 
 test("--refresh beats GH_GLANCE_REFRESH", async () => {
-  const report = await doctor({ env: { GH_GLANCE_REFRESH: "30" }, args: ["--refresh", "10"] });
+  const report = await doctor({ env: { GH_GLANCE_REFRESH: "30" }, args: ["--refresh", "10", "--background", "all"] });
   assert.match(report, /projected demand .*floor 10s/);
   // A 10s floor is slower than the 5s running-CI interval but faster than the
   // 30s quiet one, so Actions alone spans 360-720 REST per hour.

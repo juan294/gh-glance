@@ -69,7 +69,11 @@ function ghResponse(resource, body, now = Date.now(), resetMs = now + 3_600_000)
 
 function resolvedGhChild(stdout) {
   const pending = Promise.resolve({ stdout, stderr: "" });
-  pending.child = { stdin: { on() {}, end() {} } };
+  const child = new EventEmitter();
+  child.pid = process.pid;
+  child.stdin = { on() {}, end() {} };
+  pending.child = child;
+  queueMicrotask(() => child.emit("close", 0));
   return pending;
 }
 
@@ -430,7 +434,7 @@ test("APP-05: collector GraphQL 401 performs one controlled App remint", async (
   assert.equal(mints, 2);
   assert.equal(graphCalls, 2);
   assert.equal(new Set(accessKeys).size, 1);
-  assert.deepEqual(holds, ["disconnected"]);
+  assert.deepEqual(holds, ["app-auth"]);
   await runtime.close();
 });
 
@@ -681,11 +685,11 @@ test("APP-08: collector reuses the access-partition core validator after restart
   const pathOptions = privatePathOptions(t);
   const etags = [];
   const childEnvironments = [];
-  const executeGh = async (command, args, options) => {
+  const executeGh = (command, args, options) => {
     assert.equal(command, "gh");
     assert.deepEqual(args, ["--version"]);
     childEnvironments.push(options.env);
-    return { stdout: "gh version fixture" };
+    return resolvedGhChild("gh version fixture");
   };
   const readInstallationCore = async (signal, host, etag) => {
     assert.equal(host, "github.com");
@@ -736,7 +740,7 @@ test("APP-08: collector reuses the access-partition core validator after restart
       { readBudgets: context.readBudgets, onObserverPublished: context.onObserverPublished,
         now: () => now });
     assert.equal(refreshed.ok, true, refreshed.reason);
-    assert.equal(refreshed.value.resources.includes("core"), true);
+    assert.equal(refreshed.value.budgets.core?.remaining, 4_999);
   };
 
   const first = await start();

@@ -17,6 +17,7 @@ import {
   loadAcquisitionStore,
   resourceReserve,
   tabRequestCost,
+  COORDINATION_NOTICE_AFTER_MS,
 } from "../../index.mjs";
 import { capture, captureAsync, isStatusLine, waitForAwk } from "./capture.mjs";
 import { seedKnownHeldIdentity } from "./fixtures/known-identity.mjs";
@@ -144,7 +145,7 @@ test("four ample panes explain a shared lane without moving the hint group", asy
     settle: 65,
     stdin: `i=0; while [ ! -f "${releasePath}" ] && [ "$i" -lt 1200 ]; do ` +
       "sleep .05; i=$((i + 1)); done; printf q",
-    args: "--refresh 40 --tab security",
+    args: "--refresh 40 --tab security --background all",
     configHome: box.root,
     env: {
       GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
@@ -182,7 +183,7 @@ test("four ample panes explain a shared lane without moving the hint group", asy
         'index($0, "sharing 4") { ok=1 }',
         400,
       ) + "printf q",
-      args: "--refresh 40 --tab security",
+      args: "--refresh 40 --tab security --background all",
       configHome: box.root,
       env: {
         GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
@@ -332,6 +333,35 @@ test("cached rows with no connected identity say Disconnected, never Watching", 
   assert.match(disconnected.finalFrame.lines.join("\n"), /ci: pin actions to commit/);
 });
 
+test("D6: cached collector disconnect gives an action and source age in normal, narrow, NO_COLOR and reader output", (t) => {
+  const root = configRoot(t, "gh-glance-status-collector-recovery-");
+  capture({ cols: 80, rows: 20, signal: "none", settle: 15,
+    stdin: quitAfterCached("actions"), args: "--repo acme/widget", configHome: root });
+  const cachePath = join(root, "gh-glance", "dashboard-cache.json");
+  const cache = JSON.parse(readFileSync(cachePath, "utf8"));
+  cache.targets[dashboardCacheTarget({ repo: "acme/widget", host: "github.com", account: "unverified" })] =
+    Object.values(cache.targets)[0];
+  writeFileSync(cachePath, `${JSON.stringify(cache)}\n`, { mode: 0o600 });
+  for (const [name, cols, env, action] of [
+    ["normal", 80, {}, "Restore the selected collector connection"],
+    ["narrow", 24, {}, "Restore connection"],
+    ["no-color", 80, { NO_COLOR: "1" }, "Restore the selected collector connection"],
+    ["reader", 80, { INK_SCREEN_READER: "true" }, "Restore the selected collector connection"],
+  ]) {
+    const result = capture({ cols, rows: 20, signal: "none", settle: 14,
+      stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', `index($0, "${action}") { ok=1 }`, 200) +
+        "sleep .3; printf q",
+      args: "--connect local --repo acme/widget", configHome: root,
+      env: { ...env, GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
+    });
+    assert.match(result.raw, new RegExp(action), name);
+    assert.match(result.raw, /cached (?:\d+s|\d+m|\d+h)/, name);
+    if (cols >= 80) assert.match(result.finalFrame.lines.join("\n"), /ci: pin actions to commit/, name);
+    else assert.match(result.finalFrame.lines.join("\n"), /too narrow/, name);
+    assert.ok(result.finalFrame.widest <= cols, `${name}: frame wider than ${cols}`);
+  }
+});
+
 test("raw internal budget reasons never render in a PTY frame", (t) => {
   const result = capture({
     cols: 80,
@@ -352,6 +382,23 @@ test("raw internal budget reasons never render in a PTY frame", (t) => {
   });
   assert.match(result.raw, /GitHub checks are paused until the shared API budget allows them/);
   assert.doesNotMatch(result.raw, /API budget paused \(budget-reset\)/);
+});
+
+test("D6: a provider rate limit keeps its request-limit cause and action", (t) => {
+  const root = configRoot(t, "gh-glance-status-provider-limit-");
+  capture({ cols: 80, rows: 20, signal: "none", settle: 15,
+    stdin: quitAfterCached("actions"), configHome: root });
+  const result = capture({ cols: 80, rows: 20, signal: "none", settle: 20,
+    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"',
+      'index($0, "GitHub request limit") { ok=1 }', 180) + "sleep .2; printf q",
+    configHome: root,
+    env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+      GH_GLANCE_FIXTURE_FAIL: "HTTP 403: API rate limit exceeded",
+      GH_GLANCE_FIXTURE_FAIL_ON: "actions" },
+  });
+  assert.match(result.raw, /GitHub request limit/);
+  assert.match(result.raw, /Retry automatically after the shared hold/);
+  assert.doesNotMatch(result.raw, /Local coordination unavailable/);
 });
 
 test("Setup and NO_COLOR footers keep explicit semantic labels", (t) => {
@@ -721,7 +768,8 @@ test("corrupt, live-locked, and blocked storage pause with no data calls", (t) =
     env: { GH_GLANCE_FIXTURE_STATE: blocked.statePath, GH_GLANCE_FIXTURE_PANE: "blocked" },
   });
   assert.match(statusLine(unwritable) ?? "", /^‖ Paused/);
-  assert.match(unwritable.finalFrame.lines.join("\n"), translatedCoordinationNotice);
+  assert.match(unwritable.finalFrame.lines.join("\n"), /Local coordination cannot be written/);
+  assert.match(unwritable.finalFrame.lines.join("\n"), /Run gh-glance --doctor; check storage permissions/);
   assert.equal(dataStarts(box.read()).length, before);
   assert.equal(dataStarts(blocked.read()).length, 0);
 });
@@ -762,7 +810,7 @@ test("stale cached rows retain an acquisition cause through budget observation a
         '"$GH_GLANCE_CAPTURE_OUT"',
         cols === 80
           ? 'index($0, "Acquisition store is busy") { ok=1 }'
-          : 'index($0, "Shared lock busy") { ok=1 }',
+          : 'index($0, "Store lock") { ok=1 }',
         120,
       ) + "sleep .4; printf q",
       configHome: box.root,
@@ -773,9 +821,11 @@ test("stale cached rows retain an acquisition cause through budget observation a
     });
     rmSync(lockPath, { force: true });
     const blockedStatuses = blocked.liveScreen.statusHistory;
-    assert.match(blocked.raw, cols === 80
-      ? /Acquisition store is busy; checking the shared lock/
-      : /Shared lock busy/);
+    // Ink emits only changed cells: a later, more specific cause can replace
+    // its row without rewriting the action that remains visible beside it.
+    assert.match(blocked.finalFrame.lines.join("\n"), cols === 80
+      ? /Acquisition store is busy.*Check the shared lock; retry automatically/s
+      : /Store lock.*Retry automatically/s);
     assert.doesNotMatch(blocked.raw, /Stale stale/);
     const staleLine = blocked.finalFrame.lines.find((line) => /^\? Stale/.test(line));
     assert.ok(staleLine || blockedStatuses.some((line) => /^\? Stale/.test(line)),
@@ -816,6 +866,7 @@ test("stale cached rows retain an acquisition cause through budget observation a
 
 test("a sub-threshold coordination blip stays silent", (t) => {
   const root = configRoot(t, "gh-glance-status-notice-blip-");
+  const blipTimer = join(root, "blip-monotonic-ms");
   capture({
     cols: 80,
     rows: 12,
@@ -834,24 +885,40 @@ test("a sub-threshold coordination blip stays silent", (t) => {
       waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Watching") { ok=1 }') +
       'printf \'{"pid":%s,"nonce":"notice-blip-owner"}\\n\' "$$" > "$GH_GLANCE_NOTICE_LOCK"; ' +
       waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Paused") { ok=1 }', 200) +
+      'perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e \'print int(1000*clock_gettime(CLOCK_MONOTONIC)), qq(\\n)\' > "$GH_GLANCE_BLIP_TIMER"; ' +
       `watching=$(${captureCount("Watching")}); ` +
       'rm -f "$GH_GLANCE_NOTICE_LOCK"; ' +
+      'perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e \'print int(1000*clock_gettime(CLOCK_MONOTONIC)), qq(\\n)\' >> "$GH_GLANCE_BLIP_TIMER"; ' +
       'i=0; current=$watching; while [ "$current" -le "$watching" ] && [ $i -lt 200 ]; ' +
       `do i=$((i + 1)); sleep .1; current=$(${captureCount("Watching")}); ` +
-      'done; sleep .3; printf q',
+      'done; ' +
+      'perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e \'print int(1000*clock_gettime(CLOCK_MONOTONIC)), qq(\\n)\' >> "$GH_GLANCE_BLIP_TIMER"; ' +
+      'sleep .3; printf q',
     configHome: root,
     env: {
       GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       GH_GLANCE_NOTICE_LOCK: noticeLock,
+      GH_GLANCE_BLIP_TIMER: blipTimer,
     },
   });
 
-  assert.ok(result.liveScreen.statusHistory.some((line) => /^‖ Paused/.test(line)));
+  const [pausedAt, releasedAt, watchingAt] = readFileSync(blipTimer, "utf8").trim().split("\n").map(Number);
+  t.diagnostic(`blip visible Paused→release ${releasedAt - pausedAt}ms, Paused→Watching ${watchingAt - pausedAt}ms`);
+
+  const statuses = result.liveScreen.statusHistory;
+  const pausedIndex = statuses.findIndex((line) => /^‖ Paused/.test(line));
+  assert.ok(pausedIndex >= 0, "fixture must expose the temporary hold");
+  assert.ok(statuses.slice(pausedIndex + 1).some((line) => /^· Watching/.test(line)),
+    "the temporary hold must recover to Watching");
+  assert.ok([pausedAt, releasedAt, watchingAt].every(Number.isFinite));
+  assert.ok(pausedAt <= releasedAt && releasedAt <= watchingAt);
+  assert.ok(watchingAt - pausedAt < COORDINATION_NOTICE_AFTER_MS,
+    "fixture must recover before the sustained-notice threshold");
   assert.doesNotMatch(
     result.raw,
     /Confirming your GitHub login|Holding until|Coordinating with your other panes|Can't coordinate/,
   );
-  assert.match(statusLine(result) ?? "", /^· Watching/);
+  assert.equal(result.exitCode, 0);
 });
 
 test("a sustained coordination notice can appear and clear without overflowing the frame", (t) => {
@@ -865,6 +932,7 @@ test("a sustained coordination notice can appear and clear without overflowing t
     configHome: root,
   });
   const noticeLock = `${governorPath(root)}.lock`;
+  const noticeTimer = join(root, "notice-monotonic-ms");
   const result = capture({
     cols: 80,
     rows: 12,
@@ -873,24 +941,32 @@ test("a sustained coordination notice can appear and clear without overflowing t
     stdin:
       waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Watching") { ok=1 }') +
       'printf \'{"pid":%s,"nonce":"notice-transition-owner"}\\n\' "$$" > "$GH_GLANCE_NOTICE_LOCK"; ' +
+      waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Paused") { ok=1 }', 200) +
+      'perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e \'print int(1000*clock_gettime(CLOCK_MONOTONIC)), qq(\\n)\' > "$GH_GLANCE_NOTICE_TIMER"; ' +
       waitForAwk(
         '"$GH_GLANCE_CAPTURE_OUT"',
         'index($0, "Coordinating with your other panes") { ok=1 }',
         200,
       ) +
+      'perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e \'print int(1000*clock_gettime(CLOCK_MONOTONIC)), qq(\\n)\' >> "$GH_GLANCE_NOTICE_TIMER"; ' +
       `watching=$(${captureCount("Watching")}); ` +
       'rm -f "$GH_GLANCE_NOTICE_LOCK"; ' +
       'i=0; current=$watching; while [ "$current" -le "$watching" ] && [ $i -lt 200 ]; ' +
       `do i=$((i + 1)); sleep .1; current=$(${captureCount("Watching")}); ` +
-      'done; sleep .3; printf q',
+      'done; sleep 6; printf q',
     configHome: root,
     env: {
       GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       GH_GLANCE_NOTICE_LOCK: noticeLock,
+      GH_GLANCE_NOTICE_TIMER: noticeTimer,
     },
   });
 
   assert.match(result.raw, /Coordinating with your other panes/);
+  const [recognizedAt, renderedAt] = readFileSync(noticeTimer, "utf8").trim().split("\n").map(Number);
+  t.diagnostic(`notice cause/action latency ${renderedAt - recognizedAt}ms from visible Paused`);
+  assert.ok(renderedAt - recognizedAt <= 2_000,
+    `cause/action appeared ${renderedAt - recognizedAt}ms after the sustained Paused fault`);
   assert.doesNotMatch(result.raw, /Acquisition store is busy; checking the shared lock/);
   assert.doesNotMatch(result.finalFrame.lines.join("\n"), /Coordinating with your other panes/);
   assert.ok(result.liveScreen.statusHistory.some((line) => /^‖ Paused/.test(line)));

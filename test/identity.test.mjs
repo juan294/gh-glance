@@ -7,9 +7,13 @@ import { test } from "node:test";
 import {
   retryIdentityCompletion, createSettlementContext, registerLease, registerIntent, startReservation, settleReservationWithBudgetObservations,
   claimProbe, publishProbe, writeGovernorState, startIdentityControl, settleIdentityControl,
+  writeGovernorQuotaState,
   resolveEffectiveCredential, createIdentityCoordinator, inspectIdentityRegistry,
   identityRegistryRoot, claimIdentityBootstrap, finishIdentityBootstrap, createQuotaScope,
   inspectGovernor, acquireIdentityHttpPermit, releaseIdentityHttpPermit,
+  runAdmittedOperation, runGh, pauseOperation,
+  recoveryCause, presentRecovery,
+  GOVERNOR_PROBE_LEASE_MS,
 } from "../index.mjs";
 
 const NOW = 1_800_000_000_000;
@@ -46,8 +50,112 @@ test("ID-02 verified same-principal tokens share quota and retain separate acces
   assert.notEqual(first.current().accessKey, second.current().accessKey);
   const ledger = inspectGovernor(createQuotaScope(first.current(), { root: first.root, now: () => at }), at);
   assert.equal(ledger.ok, true);
-  assert.equal(Object.keys(ledger.value.reservations).length, 2);
+  assert.equal(Object.keys(ledger.value.reservations).length, 0);
+  assert.equal(ledger.value.debt.core.unresolvedUnits, 0,
+    "two proven identity requests do not leave uncertain quota debt");
   assert.equal(ledger.value.observers.core.etag, '"identity-v1"');
+});
+
+test("a core observer rejected before spawn releases its control receipt without HTTP", async (t) => {
+  const { pathOptions } = box(t);
+  let at = NOW;
+  const coordinator = createIdentityCoordinator({ host: "github.com", pathOptions,
+    env: { GH_TOKEN: "observer-pre-spawn" }, now: () => at,
+    requestIdentity: async () => proof() });
+  t.after(() => coordinator.close());
+  assert.equal((await coordinator.refresh()).ok, true);
+  at += 1_000;
+  const scope = { ...createQuotaScope(coordinator.current(), { root: coordinator.root, now: () => at }),
+    identityCoordinator: coordinator, accessKey: coordinator.current().accessKey };
+  const leaseId = randomUUID();
+  assert.equal(registerLease(scope, { id: leaseId, expiresAt: at + 60_000,
+    floorMs: 5_000, activeTab: "actions", phaseSeed: { seed: leaseId, registeredAt: at },
+    demand: { core: 1, graphql: 0 } }, at).ok, true);
+  const undoPause = pauseOperation("budget-core-observer", Date.now() + 10_000);
+  t.after(undoPause);
+  let http = 0;
+  const result = await runAdmittedOperation({
+    scope, leaseId, operation: "budget-core-observer", now: () => at,
+    waitMs: 5_000, wait: async (ms) => { at += ms + 1; return true; },
+    run: () => runGh(["api", "user"], { operation: "budget-core-observer",
+      execute: () => { http += 1; return Promise.resolve({ stdout: "{}" }); } }),
+  });
+  assert.equal(result.ok, false);
+  assert.equal(http, 0);
+  const ledger = inspectGovernor(scope, at).value;
+  assert.equal(ledger.controlReceipts.core, null);
+  assert.equal(ledger.debt.core.unresolvedUnits, 0);
+  assert.equal(ledger.reservations[result.reservationId].actualCosts.core, 0);
+  const attempts = Object.values(inspectIdentityRegistry(coordinator.root, { now: at }).value.attempts);
+  assert.ok(attempts.some((attempt) => attempt.status === "finished" && attempt.accounted));
+});
+
+test("a failed closed core observer keeps its cost and frees the retry slot", async (t) => {
+  const { pathOptions } = box(t);
+  const coordinator = createIdentityCoordinator({ host: "github.com", pathOptions,
+    env: { GH_TOKEN: "failed-core-control" }, now: () => NOW,
+    requestIdentity: async () => proof() });
+  t.after(() => coordinator.close());
+  assert.equal((await coordinator.refresh()).ok, true);
+  const firstAt = NOW + 1_000;
+  const first = startIdentityControl(coordinator, firstAt);
+  assert.equal(first.ok, true);
+  const scope = createQuotaScope(coordinator.current(), { root: coordinator.root });
+  const started = inspectGovernor(scope, firstAt).value;
+  started.controlReceipts.core.receipt.dispatches = [{ sequence: 1,
+    operation: "budget-core-observer", costs: { core: 1, graphql: 0 }, issuedAt: firstAt,
+    terminalAt: firstAt + 1, childPid: process.pid, childBirth: null, neverStarted: false }];
+  assert.equal(writeGovernorQuotaState(scope.path, started, firstAt + 1).ok, true);
+  const settled = settleIdentityControl(coordinator, first.value, "", firstAt + 1);
+  assert.equal(settled.ok, true);
+  const ledger = inspectGovernor(scope, firstAt + 1).value;
+  assert.equal(ledger.controlReceipts.core, null);
+  assert.equal(ledger.debt.core.unresolvedUnits + ledger.debt.core.quiescentUnits, 1);
+  const retry = startIdentityControl(coordinator, firstAt + 60_001);
+  assert.equal(retry.ok, true);
+});
+
+test("a crashed core observer retains its issued charge when a later claim starts", async (t) => {
+  const { pathOptions } = box(t);
+  const coordinator = createIdentityCoordinator({ host: "github.com", pathOptions,
+    env: { GH_TOKEN: "crashed-core-control" }, now: () => NOW,
+    requestIdentity: async () => proof() });
+  t.after(() => coordinator.close());
+  assert.equal((await coordinator.refresh()).ok, true);
+  const firstAt = NOW + 1_000;
+  const first = startIdentityControl(coordinator, firstAt);
+  assert.equal(first.ok, true);
+  const scope = createQuotaScope(coordinator.current(), { root: coordinator.root });
+  const issued = inspectGovernor(scope, firstAt).value;
+  issued.controlReceipts.core.receipt.dispatches = [{ sequence: 1,
+    operation: "budget-core-observer", costs: { core: 1, graphql: 0 }, issuedAt: firstAt,
+    terminalAt: null, childPid: process.pid, childBirth: null, neverStarted: false }];
+  assert.equal(writeGovernorQuotaState(scope.path, issued, firstAt).ok, true);
+  const takeoverAt = firstAt + GOVERNOR_PROBE_LEASE_MS + 1;
+  const second = startIdentityControl(coordinator, takeoverAt);
+  assert.equal(second.ok, true);
+  assert.notEqual(second.value.id, first.value.id);
+  const ledger = inspectGovernor(scope, takeoverAt).value;
+  assert.equal(ledger.debt.core.unresolvedUnits, 1);
+  assert.equal(ledger.controlReceipts.core.intentId, second.value.id);
+  assert.equal(settleIdentityControl(coordinator, first.value, "", takeoverAt).reason, "stale");
+});
+
+test("an invalid control ETag cannot replace a valid quota ledger", async (t) => {
+  const { pathOptions } = box(t);
+  const first = createIdentityCoordinator({ host: "github.com", pathOptions,
+    env: { GH_TOKEN: "valid-etag-credential" }, now: () => NOW,
+    requestIdentity: async () => proof() });
+  t.after(() => first.close());
+  assert.equal((await first.refresh()).ok, true);
+  const scope = createQuotaScope(first.current(), { root: first.root, now: () => NOW });
+  const before = readFileSync(scope.path);
+  const invalid = structuredClone(inspectGovernor(scope, NOW).value);
+  invalid.observers.core.etag = "x".repeat(600);
+  const rejected = writeGovernorQuotaState(scope.path, invalid, NOW);
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.reason, "corrupt");
+  assert.deepEqual(readFileSync(scope.path), before);
 });
 
 test("ID-07 malformed proof and restart retain rolling allowance and uncertain debt", async (t) => {
@@ -85,7 +193,7 @@ test("ID-03 configuration change invalidates the synchronous published identity 
   assert.equal(readFileSync(join(coordinator.root, "registry.json"), "utf8").includes("synthetic-"), false);
 });
 
-test("ID-08 shared transport permit is single-owner and retains start gap", async (t) => {
+test("ID-08 shared transport permit retains its nonce and start gap", async (t) => {
   const { pathOptions } = box(t);
   let at = NOW;
   const coordinator = createIdentityCoordinator({ host: "github.com", pathOptions, env: { GH_TOKEN: "synthetic-one" }, now: () => at, requestIdentity: async () => proof() });
@@ -94,10 +202,10 @@ test("ID-08 shared transport permit is single-owner and retains start gap", asyn
   const first = await acquireIdentityHttpPermit(coordinator, { now: () => at });
   assert.ok(first.nonce);
   const inspected = inspectIdentityRegistry(coordinator.root, { now: at }).value;
-  assert.equal(inspected.hosts["github.com"].permit.nonce, first.nonce);
+  assert.equal(inspected.hosts["github.com"].permits.at(-1).nonce, first.nonce);
   assert.equal(inspected.hosts["github.com"].lastStartedAt, at);
   assert.equal(releaseIdentityHttpPermit(coordinator, first).ok, true);
-  assert.equal(inspectIdentityRegistry(coordinator.root).value.hosts["github.com"].permit, null);
+  assert.equal(inspectIdentityRegistry(coordinator.root).value.hosts["github.com"].permits.length, 0);
 });
 
 test("local credential retrieval is cached until configuration revision changes and close fences delayed proof", async (t) => {
@@ -182,6 +290,17 @@ test("ID-05 pinned legacy v1 core cooldown survives migration inspection without
   const denied = claimIdentityBootstrap(coordinator.root, { credentialKey: "c".repeat(64), host: "github.com", now: NOW + 250 });
   assert.equal(denied.reason, "migration-hold");
   assert.equal(denied.retryAt, NOW + 120_000);
+  const waiting = createIdentityCoordinator({ host: "github.com", pathOptions,
+    env: { GH_TOKEN: "synthetic-other" }, now: () => NOW + 250,
+    requestIdentity: async () => proof() });
+  const waited = await waiting.refresh();
+  assert.equal(waited.reason, "migration-hold");
+  assert.equal(waiting.inspect().retryAt, denied.retryAt);
+  const visible = presentRecovery(recoveryCause({ reason: waited.reason, resource: "core",
+    at: NOW + 250, retryAt: waiting.inspect().retryAt }), { nowMs: NOW + 250, cols: 80 });
+  assert.match(visible.join(" "), /Wait for the older quota reset.*next/i);
+  assert.doesNotMatch(visible.join(" "), /Restart older/);
+  waiting.close();
   assert.equal(readFileSync(path, "utf8"), raw);
 });
 
@@ -209,7 +328,7 @@ test("ID-03 delayed completion settles original started charge while access publ
   assert.equal(inspectGovernor(current, at).value.reservations[grant.reservationId], undefined);
 });
 
-test("ID-07 uncertain bootstrap debt transfers once and survives until authoritative epoch recovery", async (t) => {
+test("ID-07 uncertain bootstrap debt transfers once and survives epoch refresh without quiescence", async (t) => {
   const { pathOptions } = box(t);
   const root = identityRegistryRoot(pathOptions);
   const credential = (await resolveEffectiveCredential({ host: "github.com", env: { GH_TOKEN: "synthetic-debt" } })).value;
@@ -221,8 +340,8 @@ test("ID-07 uncertain bootstrap debt transfers once and survives until authorita
   const scope = createQuotaScope(coordinator.current(), { root, now: () => at });
   at = NOW + 16 * 60_000;
   let ledger = inspectGovernor(scope, at).value;
-  assert.equal(ledger.reservations[`reservation:${failed.value.id}`].costs.core, 1);
-  assert.equal(ledger.reservations[`reservation:${failed.value.id}`].accountedCosts.core, 0);
+  assert.equal(ledger.debt.core.unresolvedUnits, 1);
+  assert.equal(ledger.debt.core.unresolvedCount, 1);
   at = NOW + 3_600_003;
   const leaseId = randomUUID();
   registerLease(scope, { id: leaseId, expiresAt: at + 90_000, floorMs: 5000, activeTab: "actions", phaseSeed: { seed: leaseId, registeredAt: at }, demand: { core: 1, graphql: 0 } });
@@ -233,10 +352,11 @@ test("ID-07 uncertain bootstrap debt transfers once and survives until authorita
     graphql: { source: "graphql-observer", budget: { limit: 5000, used: 0, remaining: 5000, resetMs: at + 3_600_000 } },
   }, at, "core").ok, true);
   ledger = inspectGovernor(scope, at).value;
-  assert.equal(ledger.reservations[`reservation:${failed.value.id}`], undefined);
+  assert.equal(ledger.debt.core.unresolvedUnits, 1,
+    "a fresh observer cannot prove that an old child is quiescent");
   assert.equal(inspectIdentityRegistry(root, { now: at }).value.attempts[failed.value.id], undefined);
   assert.equal((await coordinator.refresh()).ok, true);
-  assert.equal(inspectGovernor(scope, at).value.reservations[`reservation:${failed.value.id}`], undefined);
+  assert.equal(inspectGovernor(scope, at).value.debt.core.unresolvedUnits, 1);
   // Persisted application ledgers still use the existing strict validator.
   assert.equal(writeGovernorState(scope.path, ledger).ok, true);
 });
@@ -264,7 +384,7 @@ test("nonce-specific permit completion retries real lock contention without stea
   t.after(() => clearTimeout(release));
   const result = await retryIdentityCompletion(() => releaseIdentityHttpPermit(coordinator, permit));
   assert.equal(result.ok, true);
-  assert.equal(inspectIdentityRegistry(coordinator.root, { now: at }).value.hosts["github.com"].permit, null);
+  assert.equal(inspectIdentityRegistry(coordinator.root, { now: at }).value.hosts["github.com"].permits.length, 0);
 });
 
 test("identity changes during delayed proof cannot persist a mapping under the old credential", async (t) => {
@@ -282,7 +402,7 @@ test("identity changes during delayed proof cannot persist a mapping under the o
   const state = inspectIdentityRegistry(coordinator.root, { now: NOW }).value;
   assert.equal(state.identities[old.credentialKey], undefined);
   assert.equal(Object.values(state.attempts)[0].accounted, false);
-  assert.equal(state.hosts["github.com"].permit, null);
+  assert.equal(state.hosts["github.com"].permits.length, 0);
 });
 
 test("deferred malformed completion is terminal storage work and does not prevent later refresh", async (t) => {
@@ -315,7 +435,7 @@ test("proof completion rechecks configuration after waiting for the registry loc
   const state = inspectIdentityRegistry(coordinator.root, { now: NOW }).value;
   assert.equal(state.identities[old.credentialKey], undefined);
   assert.equal(Object.values(state.attempts)[0].accounted, false);
-  assert.equal(state.hosts["github.com"].permit, null);
+  assert.equal(state.hosts["github.com"].permits.length, 0);
 });
 
 test("known deleted quota ledgers cannot be recreated by control start or settlement", async (t) => {
@@ -376,7 +496,7 @@ test("a credential revision changed during bootstrap claim lock wait starts no o
   assert.equal(requests, 0);
   const registry = inspectIdentityRegistry(root, { now: NOW }).value;
   assert.equal(registry.identities[old.credentialKey], undefined);
-  assert.equal(registry.hosts["github.com"].permit, null);
+  assert.equal(registry.hosts["github.com"].permits.length, 0);
   assert.equal(Object.values(registry.attempts)[0].accounted, false);
 });
 
@@ -414,7 +534,7 @@ test("closing the identity coordinator aborts in-flight proof and preserves cons
   const registry = inspectIdentityRegistry(coordinator.root, { now: NOW }).value;
   assert.equal(Object.keys(registry.identities).length, 0);
   assert.equal(Object.values(registry.attempts)[0].accounted, false);
-  assert.equal(registry.hosts["github.com"].permit, null);
+  assert.equal(registry.hosts["github.com"].permits.length, 0);
 });
 
 
@@ -522,35 +642,44 @@ test("a permit outliving the request it guards is reclaimed from a live owner", 
   at += 35_001;
   const next = await acquireIdentityHttpPermit(coordinator, { now: () => at });
   assert.notEqual(next.nonce, held.nonce);
-  assert.equal(inspectIdentityRegistry(coordinator.root, { now: at }).value.hosts["github.com"].permit.nonce, next.nonce);
+  assert.equal(inspectIdentityRegistry(coordinator.root, { now: at }).value.hosts["github.com"].permits.at(-1).nonce, next.nonce);
 });
 
-test("a receipt orphaned by an interrupted mapping is reclaimed when the credential bootstraps again", async (t) => {
+test("a quota import marker prevents double charge when registry persistence is replayed", async (t) => {
   const { pathOptions } = box(t);
   let at = NOW;
   const first = createIdentityCoordinator({ host: "github.com", pathOptions, env: { GH_TOKEN: "synthetic-one" }, now: () => at, requestIdentity: async () => proof() });
   assert.equal((await first.refresh()).ok, true);
   const scope = createQuotaScope(first.current(), { root: first.root, now: () => at });
-  // Written straight to the ledger file, because this is a state no API can
-  // produce: exactly what importIdentityDebts leaves behind when a crash lands
-  // between its ledger write and the registry transaction recording the
-  // mapping -- a charged receipt whose attempt exists nowhere in the registry.
-  const disk = JSON.parse(readFileSync(scope.path, "utf8"));
-  const template = Object.values(disk.reservations)[0];
-  assert.ok(template, "the proof reservation should already be recorded");
-  const orphanId = randomUUID();
-  disk.reservations[`reservation:${orphanId}`] = {
-    ...template, leaseId: orphanId, intentId: orphanId,
-    notBefore: NOW - 7_200_000, startedAt: NOW - 7_200_000,
-  };
-  writeFileSync(scope.path, JSON.stringify(disk), { mode: 0o600 });
-  assert.ok(inspectGovernor(scope, at).value.reservations[`reservation:${orphanId}`], "orphan setup failed");
+  const secondCredential = (await resolveEffectiveCredential({ host: "github.com",
+    env: { GH_TOKEN: "synthetic-two" } })).value;
   at += 250;
-  const second = createIdentityCoordinator({ host: "github.com", pathOptions, env: { GH_TOKEN: "synthetic-two" }, now: () => at, requestIdentity: async () => proof() });
-  assert.equal((await second.refresh()).ok, true);
-  assert.equal(first.current().quotaKey, second.current().quotaKey);
-  // Otherwise it presents only as a permanently smaller budget, forever.
-  assert.equal(inspectGovernor(scope, at).value.reservations[`reservation:${orphanId}`], undefined);
+  const failed = claimIdentityBootstrap(first.root, { ...secondCredential, now: at });
+  assert.equal(failed.ok, true);
+  assert.equal(finishIdentityBootstrap(first.root, { credentialKey: secondCredential.credentialKey,
+    ...failed.value, now: at }).ok, false);
+  at += 120_000;
+  const successful = claimIdentityBootstrap(first.root, { ...secondCredential, now: at });
+  assert.equal(successful.ok, true);
+  assert.equal(finishIdentityBootstrap(first.root, { credentialKey: secondCredential.credentialKey,
+    ...successful.value, response: proof(), now: at }).ok, true);
+  const before = inspectGovernor(scope, at).value;
+  assert.equal(before.debt.core.unresolvedUnits, 1);
+  assert.equal(before.importMarkers[failed.value.id], true);
+
+  // Recreate the quota-write/registry-write crash boundary. The quota marker
+  // survived, while the registry attempt still appears unimported.
+  const registryPath = join(first.root, "registry.json");
+  const registry = JSON.parse(readFileSync(registryPath, "utf8"));
+  registry.attempts[failed.value.id].imported = false;
+  registry.attempts[failed.value.id].quotaKey = null;
+  writeFileSync(registryPath, `${JSON.stringify(registry)}\n`, { mode: 0o600 });
+  at += 1;
+  assert.equal(finishIdentityBootstrap(first.root, { credentialKey: secondCredential.credentialKey,
+    ...successful.value, response: proof(), now: at }).ok, true);
+  const after = inspectGovernor(scope, at).value;
+  assert.equal(after.debt.core.unresolvedUnits, 1, "replay cannot add a second charge");
+  assert.equal(inspectIdentityRegistry(first.root, { now: at }).value.attempts[failed.value.id].imported, true);
 });
 
 test("ID-02 the same verified principal on two hosts stays in separate quota and access scopes", (t) => {

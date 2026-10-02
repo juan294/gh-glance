@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdtempSync,
@@ -18,10 +19,21 @@ import { fileURLToPath } from "node:url";
 import {
   ACQUISITION_CLAIM_TTL_MS,
   ACQUISITION_STARTED_DEADLINE_MS,
+  BUDGET_RESET_GRACE_MS,
   BUDGET_SNAPSHOT_TTL_MS,
+  GOVERNOR_LEASE_TTL_MS,
   GOVERNOR_LOCK_ORPHAN_MS,
   acquisitionStorePath,
+  claimIdentityBootstrap,
+  claimProbe,
+  createQuotaScope,
+  finishIdentityBootstrap,
+  identityRegistryRoot,
+  inspectGovernor,
   loadAcquisitionStore,
+  publishProbe,
+  registerLease,
+  resolveEffectiveCredential,
   resourceReserve,
   tabRequestCost,
   withFileLock,
@@ -29,6 +41,7 @@ import {
 } from "../../index.mjs";
 import { captureAsync } from "./capture.mjs";
 import { seedKnownHeldIdentity } from "./fixtures/known-identity.mjs";
+import { agedGovernorV6, agedGovernorResiduals } from "../fixtures/aged-governor-v6.mjs";
 
 const STATE_HELPER = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "gh-state.mjs");
 const LIMIT = 10_000;
@@ -90,6 +103,36 @@ function probes(state) {
   return starts(state, (event) => event.graphqlOperation === "graphql.observer");
 }
 
+function observedReset(governor, previousEpoch, boundary) {
+  return governor?.epochs?.core !== previousEpoch &&
+    ["core", "graphql"].every((resource) =>
+      governor?.observers?.[resource]?.outcome === "healthy" &&
+      governor.observers[resource].at >= boundary);
+}
+
+function assertResetObservers(state, governor, previousEpoch, boundary) {
+  assert.ok(observedReset(governor, previousEpoch, boundary),
+    JSON.stringify({ epochs: governor.epochs, observers: governor.observers, boundary }));
+  // The first GraphQL publication can fall on either side of the core reset
+  // grace boundary. Only a publication before it needs another observation.
+  const observed = probes(state);
+  assert.ok(observed.length >= 1 && observed.length <= 2,
+    `expected one shared observer, with at most one earlier startup observation: ${JSON.stringify(observed)}`);
+  const sequences = new Set(observed.map((event) => event.sequence));
+  const active = new Set();
+  for (const event of state.events) {
+    if (!sequences.has(event.sequence)) continue;
+    if (event.type === "start") active.add(event.sequence);
+    if (event.type === "end") active.delete(event.sequence);
+    assert.ok(active.size <= 1, "GraphQL observers overlapped across panes");
+  }
+  assert.equal(active.size, 0, "reset observation did not complete");
+  assert.ok(state.events.some((event) => event.type === "end" &&
+    event.argv.includes("user") && [200, 304].includes(event.status) &&
+    event.at >= state.createdAt + state.resetSequence[0].offsetMs),
+  "core has no successful response after the fixture reset");
+}
+
 function dataStarts(state) {
   return starts(state, (event) =>
     ["run", "issue", "pr"].includes(event.argv[0]) ||
@@ -103,6 +146,18 @@ function dataStarts(state) {
 function isActionsEndpoint(event) {
   return event.argv[0] === "api" &&
     event.argv.some((argument) => argument.includes("/actions/"));
+}
+
+function isSecurityEndpoint(event) {
+  return event.argv[0] === "api" && event.argv.some((argument) =>
+    /\/(?:dependabot|code-scanning|secret-scanning)\/alerts(?:\?|$)/.test(argument));
+}
+
+function assertOtherTabData(events, label, details) {
+  assert.ok(events.every((event) =>
+    (event.cost.core === 0 && event.cost.graphql > 0) ||
+    (event.cost.core === 1 && event.cost.graphql === 0 && isSecurityEndpoint(event))),
+  `${label} admitted unclassified background data: ${details()}`);
 }
 
 function actionsRuns(state) {
@@ -176,6 +231,7 @@ function startPane(box, pane, {
   tab = "actions",
   repo = "acme/widget",
   refresh = 40,
+  background = "all",
   readyPath,
   readyAttempts = 1_000,
   readyDelay = 0,
@@ -190,7 +246,7 @@ function startPane(box, pane, {
     signal: "none",
     settle,
     stdin: stdin ?? (readyPath ? readyInput(readyPath, readyAttempts, readyDelay) : "sleep 120"),
-    args: `--repo ${repo} --refresh ${refresh} --tab ${tab}`,
+    args: `--repo ${repo} --refresh ${refresh} --tab ${tab} --background ${background}`,
     animation,
     configHome: box.root,
     env: {
@@ -200,6 +256,163 @@ function startPane(box, pane, {
     },
   });
 }
+
+async function seedAgedV6Quota(box, limit) {
+  const resetMs = box.read().core.resetMs;
+  const now = box.read().createdAt;
+  const root = identityRegistryRoot({ env: { XDG_CONFIG_HOME: box.root } });
+  const credential = await resolveEffectiveCredential({ host: "github.com",
+    env: { GH_TOKEN: "fixture-keyring-token" } });
+  assert.equal(credential.ok, true);
+  const claimed = claimIdentityBootstrap(root, { host: "github.com",
+    credentialKey: credential.value.credentialKey, now: now - 100_000 });
+  assert.equal(claimed.ok, true);
+  const finished = finishIdentityBootstrap(root, { credentialKey: credential.value.credentialKey,
+    ...claimed.value, now: now - 100_000,
+    response: { status: 200, body: { id: 1, login: "octocat" },
+      rateLimit: { resource: "core", limit, used: 0, remaining: limit,
+        resetMs }, etag: '"aged-core"' } });
+  assert.equal(finished.ok, true);
+  const scope = createQuotaScope(finished.value, { root });
+  const leaseId = randomUUID();
+  assert.equal(registerLease(scope, { id: leaseId, expiresAt: now + GOVERNOR_LEASE_TTL_MS,
+    floorMs: 5_000, activeTab: "actions", phaseSeed: { seed: leaseId, registeredAt: now },
+    demand: { core: 1, graphql: 0 } }, now).ok, true);
+  const graphClaim = claimProbe(scope, leaseId, now, "graphql");
+  assert.equal(graphClaim.value.status, "claimed");
+  assert.equal(publishProbe(scope, leaseId, graphClaim.value.nonce, {
+    graphql: { limit, used: 0, remaining: limit, resetMs },
+  }, now, "graphql").ok, true);
+  const aged = agedGovernorV6(inspectGovernor(scope, now).value, now);
+  aged.budgets.core.observedAt = now - BUDGET_SNAPSHOT_TTL_MS - 1_000;
+  aged.budgets.core.factorBaseline.observedAt = aged.budgets.core.observedAt;
+  const completedLegacy = Object.values(aged.reservations)
+    .find((reservation) => reservation.status === "completed");
+  completedLegacy.startedAt = aged.budgets.core.observedAt - 10_000;
+  completedLegacy.completedAt = aged.budgets.core.observedAt - 9_000;
+  assert.deepEqual(agedGovernorResiduals(aged), { core: 456, graphql: 162 });
+  assert.equal(writeGovernorState(scope.path, aged).ok, true);
+}
+
+test("aged v6 packed CLI renders queued, running, and completed Actions values", { timeout: 120_000 }, async (t) => {
+  const oldRows = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)),
+    "fixtures", "actions-runs.json"), "utf8"));
+  const stages = [
+    { status: "queued", conclusion: null, icon: "o" },
+    { status: "in_progress", conclusion: null, icon: "!" },
+    { status: "completed", conclusion: "success", icon: "+" },
+  ];
+  const stageBodies = stages.map((stage, index) => JSON.stringify([
+    { ...oldRows[0], displayTitle: "durable freshness new run", status: stage.status,
+      conclusion: stage.conclusion, updatedAt: new Date(Date.now() + index * 1_000).toISOString() },
+    ...oldRows.slice(1),
+  ]));
+  const endpoint = "repos/acme/widget/actions/runs?exclude_pull_requests=true&per_page=60";
+  const limit = 5_000;
+  const resetMs = Math.floor((Date.now() + WINDOW_MS) / 1000) * 1000;
+  const box = fixture(t, { core: { limit, used: 0, remaining: limit, resetMs },
+    graphql: { limit, used: 0, remaining: limit, resetMs },
+    apiEntities: { [endpoint]: { sequence: stageBodies.map((body, index) => ({
+      etag: `"durable-stage-${index}"`, body,
+    })) } } });
+  const packageRoot = join(box.root, "packed-cli");
+  mkdirSync(packageRoot);
+  const tarball = execFileSync("npm", ["pack", "--ignore-scripts", "--pack-destination", packageRoot], {
+    cwd: join(dirname(fileURLToPath(import.meta.url)), "../.."), encoding: "utf8",
+  }).trim().split("\n").at(-1);
+  execFileSync("tar", ["-xzf", join(packageRoot, tarball), "-C", packageRoot]);
+  const packedEntry = join(packageRoot, "package", "index.mjs");
+  assert.equal(existsSync(packedEntry), true);
+  execFileSync("npm", ["install", "--omit=dev", "--ignore-scripts", "--prefer-offline",
+    "--no-audit", "--no-fund"], { cwd: join(packageRoot, "package"), encoding: "utf8" });
+  const emptyCwd = join(box.root, "empty-cwd");
+  mkdirSync(emptyCwd);
+  await seedAgedV6Quota(box, limit);
+
+  const observed = [];
+  const startedAt = Date.now();
+  for (const [index, stage] of stages.entries()) {
+    const readyPath = join(box.root, `aged-ready-${index}`);
+    const pane = startPane(box, `aged-recovery-${index}`, { readyPath, refresh: 5,
+      settle: 70, env: { GH_GLANCE_CAPTURE_ENTRY: packedEntry,
+        GH_GLANCE_CAPTURE_CWD: emptyCwd, GH_GLANCE_ICONS: "unicode", NO_COLOR: "1" } });
+    let recovered;
+    let frame;
+    let failureDiagnostic = null;
+    try {
+      recovered = await observeUntil(() => ({ fixture: box.read(), shared: box.readAcquisition(),
+        governor: box.readGovernor() }), ({ fixture: state, shared }) =>
+        actionsRuns(state).length >= index + 1 && Object.values(shared.queries).some((record) =>
+          record.query.resource === "actions" && record.snapshot?.rows?.some((row) =>
+            row.displayTitle === "durable freshness new run" && row.status === stage.status)), 60_000);
+    } catch {
+      const governor = box.readGovernor();
+      const shared = box.readAcquisition();
+      failureDiagnostic = { core: governor.budgets.core, observer: governor.observers.core,
+        version: governor.version, control: governor.controlReceipts?.core,
+        debt: governor.debt?.core,
+        claims: Object.values(shared.queries).map((record) => ({ resource: record.query.resource,
+          hold: record.hold, claim: record.claim, lastSuccessAt: record.snapshot?.lastSuccessAt })),
+        starts: box.read().events.filter((event) => event.type === "start" || event.type === "end")
+          .map((event) => ({ type: event.type, argv: event.argv, status: event.status,
+            cost: event.cost })), stage };
+    } finally {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      [frame] = await releasePanes(readyPath, [pane]);
+    }
+    if (failureDiagnostic) assert.fail(JSON.stringify({ ...failureDiagnostic,
+      closeUnverified: frame.raw.includes("GitHub child close unverified"),
+      exitCode: frame.exitCode, frame: frame.finalFrame.lines.slice(-12) }));
+    assert.match(frame.finalFrame.lines.join("\n"),
+      new RegExp(`${stage.icon === "+" ? "\\+" : stage.icon}\\s+durable freshnes`),
+      `${stage.status} was published but not rendered`);
+    observed.push(recovered);
+  }
+  assert.ok(Date.now() - startedAt < 60_000);
+  assert.equal(observed.at(-1).governor.version, 7);
+  assert.equal(observed.at(-1).governor.debt.core.unresolvedUnits, 456);
+  assert.equal(observed.at(-1).governor.debt.graphql.unresolvedUnits, 162);
+  const sourceTimes = observed.map(({ shared }) => Object.values(shared.queries)
+    .find((record) => record.query.resource === "actions")?.snapshot?.lastSuccessAt);
+  assert.ok(sourceTimes[0] >= startedAt && sourceTimes[1] > sourceTimes[0] &&
+    sourceTimes[2] > sourceTimes[1], `source timestamps did not advance: ${sourceTimes}`);
+});
+
+test("unmodified 0.15.2 stays source-stale on the same valid aged v6 ledger", {
+  timeout: 45_000,
+}, async (t) => {
+  const entry = process.env.GH_GLANCE_BASELINE_ENTRY;
+  if (!entry) return t.skip("set GH_GLANCE_BASELINE_ENTRY for the installed 0.15.2 reproduction");
+  const manifest = JSON.parse(readFileSync(join(dirname(entry), "package.json"), "utf8"));
+  assert.equal(manifest.version, "0.15.2");
+  const limit = 5_000;
+  const resetMs = Math.floor((Date.now() + WINDOW_MS) / 1000) * 1000;
+  const oldBody = readFileSync(join(dirname(fileURLToPath(import.meta.url)),
+    "fixtures", "actions-runs.json"), "utf8");
+  const box = fixture(t, { core: { limit, used: 0, remaining: limit, resetMs },
+    graphql: { limit, used: 0, remaining: limit, resetMs },
+    apiEntities: { "repos/acme/widget/actions/runs?exclude_pull_requests=true&per_page=60": {
+      etag: '"durable-new"', body: oldBody.replace("ci: pin actions to commit SHAs",
+        "durable freshness new run"),
+    } } });
+  await seedAgedV6Quota(box, limit);
+  const emptyCwd = join(box.root, "baseline-empty-cwd");
+  mkdirSync(emptyCwd);
+  const readyPath = join(box.root, "baseline-ready");
+  const pane = startPane(box, "baseline-aged", { readyPath, refresh: 5, settle: 25,
+    env: { GH_GLANCE_CAPTURE_ENTRY: entry, GH_GLANCE_CAPTURE_CWD: emptyCwd } });
+  await new Promise((resolve) => setTimeout(resolve, 15_000));
+  const [frame] = await releasePanes(readyPath, [pane]);
+  const shared = box.readAcquisition();
+  assert.equal(box.readGovernor().version, 6, "the old CLI must read valid v6 evidence");
+  assert.ok(box.read().events.length > 0, "the old CLI never exercised the fixture");
+  assert.equal(actionsRuns(box.read()).length, 0, "the old CLI unexpectedly refreshed the source");
+  assert.ok(!Object.values(shared.queries).some((record) => record.query.resource === "actions" &&
+    record.snapshot?.rows?.some((row) => row.displayTitle === "durable freshness new run")));
+  assert.doesNotMatch(frame.finalFrame.lines.join("\n"), /durable freshnes/);
+  assert.doesNotMatch(frame.finalFrame.lines.join("\n"), /corrupt/i,
+    "baseline failure must be source staleness, not a schema mismatch");
+});
 
 async function releasePanes(readyPath, captures) {
   writeFileSync(readyPath, "ready\n", { mode: 0o600 });
@@ -773,6 +986,8 @@ test("a real reset resumes all panes, while atomic external burn limits the next
   let resetProgress;
   let resetSchedule;
   let firstEpoch;
+  let resetBoundary;
+  let resetObservedGovernor;
   try {
     const first = await observeUntil(
       () => ({ fixture: resetBox.read(), governor: resetBox.readGovernor() }),
@@ -780,6 +995,7 @@ test("a real reset resumes all panes, while atomic external burn limits the next
       15_000,
     );
     firstEpoch = first.governor.epochs.core;
+    resetBoundary = first.governor.budgets.core.resetMs + BUDGET_RESET_GRACE_MS;
     resetCaptures.push(...Array.from({ length: 11 }, (_, offset) =>
       startPane(resetBox, `reset-${offset + 1}`, {
         readyPath: resetReady,
@@ -795,23 +1011,31 @@ test("a real reset resumes all panes, while atomic external burn limits the next
       30_000,
     );
     resetSchedule = scheduled;
-    resetProgress = await observeUntil(
-      resetBox.read,
-      (state) => probes(state).length === 2 && actionsRuns(state).length === 1,
+    const observed = await observeUntil(
+      () => ({ fixture: resetBox.read(), governor: resetBox.readGovernor() }),
+      ({ fixture: state, governor }) => observedReset(governor, firstEpoch, resetBoundary) &&
+        actionsRuns(state).length === 1,
       reservationHorizon(scheduled, "core"),
     );
+    resetProgress = observed.fixture;
+    resetObservedGovernor = observed.governor;
   } finally {
     await releasePanes(resetReady, resetCaptures);
   }
   const resetGovernor = resetBox.readGovernor();
   assert.notEqual(resetGovernor.epochs.core, firstEpoch);
-  assert.equal(probes(resetProgress).length, 2);
+  assertResetObservers(resetProgress, resetObservedGovernor, firstEpoch, resetBoundary);
   const resetData = dataStarts(resetProgress);
   const resetRuns = actionsRuns(resetProgress);
+  const resetActionsData = resetData.filter(isActionsEndpoint);
+  const resetOtherData = resetData.filter((event) => !isActionsEndpoint(event));
+  const resetDetails = () => JSON.stringify(resetData.map(({ sequence, at, pane, argv, cost }) =>
+    ({ sequence, at, pane, argv, cost })));
   assert.equal(resetRuns.length, 1, "reset launched duplicate Actions batches");
-  assert.equal(resetData.length, STARTUP_DATA_STARTS,
-    "reset launched work outside the shared Actions batch");
-  assert.equal(new Set(resetData.map((event) => event.pane)).size, 1);
+  assert.equal(resetActionsData.length, STARTUP_DATA_STARTS,
+    `reset launched extra Actions work: ${resetDetails()}`);
+  assertOtherTabData(resetOtherData, "reset", resetDetails);
+  assert.equal(new Set(resetActionsData.map((event) => event.pane)).size, 1);
   assertDebitsStayOutsideReserve(resetData);
   assertPhasedStarts(resetSchedule, resetRuns, "core", 1, "reset");
 
@@ -831,8 +1055,14 @@ test("a real reset resumes all panes, while atomic external burn limits the next
   })];
 
   let burned;
+  let burnObservedGovernor;
+  let burnEpoch;
+  let burnBoundary;
   try {
     const anchored = await observeUntil(burnBox.read, (state) => Number.isFinite(state.createdAt), 10_000);
+    const initial = burnBox.readGovernor();
+    burnEpoch = initial.epochs.core;
+    burnBoundary = initial.budgets.core.resetMs + BUDGET_RESET_GRACE_MS;
     burnCaptures.push(...Array.from({ length: 11 }, (_, offset) =>
       startPane(burnBox, `burn-${offset + 1}`, { readyPath: burnReady, settle: 35 })));
     await new Promise((resolve) => setTimeout(
@@ -847,11 +1077,14 @@ test("a real reset resumes all panes, while atomic external burn limits the next
     ], {
       env: { GH_GLANCE_FIXTURE_STATE: burnBox.statePath },
     });
-    burned = await observeUntil(
-      burnBox.read,
-      (state) => probes(state).length === 2 && dataStarts(state).length >= 1,
+    const observed = await observeUntil(
+      () => ({ fixture: burnBox.read(), governor: burnBox.readGovernor() }),
+      ({ fixture: state, governor }) => observedReset(governor, burnEpoch, burnBoundary) &&
+        dataStarts(state).length >= 1,
       20_000,
     );
+    burned = observed.fixture;
+    burnObservedGovernor = observed.governor;
     await new Promise((resolve) => setTimeout(resolve, 11_000));
   } finally {
     await releasePanes(burnReady, burnCaptures);
@@ -861,13 +1094,23 @@ test("a real reset resumes all panes, while atomic external burn limits the next
   const burnEvent = finalBurn.events.find((event) => event.type === "external-burn");
   const burnData = dataStarts(finalBurn);
   const burnRuns = actionsRuns(finalBurn);
+  const burnActionsData = burnData.filter(isActionsEndpoint);
+  const burnOtherData = burnData.filter((event) => !isActionsEndpoint(event));
+  const burnDetails = () => JSON.stringify({
+    burnAt: burnEvent.at - finalBurn.createdAt,
+    data: burnData.map(({ sequence, at, pane, argv, cost, before, after }) => ({
+      sequence, at: at - finalBurn.createdAt, pane, argv, cost, before, after,
+      status: finalBurn.events.find((event) => event.type === "end" && event.sequence === sequence)?.status,
+    })),
+  });
   assert.equal(burnEvent.amount, LIMIT - resourceReserve(LIMIT) - BURN_HEADROOM);
   assert.equal(burnEvent.after.core.remaining, resourceReserve(LIMIT) + BURN_HEADROOM);
   assert.ok(burnRuns.length >= 1 && burnRuns.length <= 2,
     `burn admitted ${burnRuns.length} Actions batches`);
-  assert.equal(burnData.length, burnRuns.length * ACTIONS_CALLS,
-    `burn admitted incomplete Actions batches: ${burnData.length} calls`);
-  assert.equal(probes(burned).length, 2);
+  assert.equal(burnActionsData.length, burnRuns.length * ACTIONS_CALLS,
+    `burn admitted incomplete or extra Actions work: ${burnDetails()}`);
+  assertOtherTabData(burnOtherData, "burn", burnDetails);
+  assertResetObservers(burned, burnObservedGovernor, burnEpoch, burnBoundary);
   assertDebitsStayOutsideReserve(burnData);
 });
 

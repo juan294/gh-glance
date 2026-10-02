@@ -22,7 +22,7 @@
 // disarmDevBuildLeak() for how that path is kept survivable rather than fatal.
 process.env.NODE_ENV ??= "production";
 
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, createHmac, createPrivateKey, randomUUID, sign as cryptoSign, timingSafeEqual } from "node:crypto";
 import { EventEmitter } from "node:events";
@@ -207,7 +207,7 @@ const STALE_AFTER_MS = 30_000;
 // A coordination hold must persist long enough to be meaningful before it
 // takes the notice row. Short startup and lock-contention states recover on
 // their own and should not present themselves as user-visible failures.
-const COORDINATION_NOTICE_AFTER_MS = 2_000;
+const COORDINATION_NOTICE_AFTER_MS = 800;
 
 // Mutable because the fetchers below are defined before argv is parsed, and the
 // argv block is what fills this in. Everything here has a working default, so
@@ -221,7 +221,7 @@ const runtime = {
   host: null,
   repoExplicit: false,
   refreshMs: REFRESH_MS,
-  background: "all",
+  background: "on-demand",
   verbose: false,
   connect: null,
   initialTabIndex: 0,
@@ -734,7 +734,9 @@ const pausedOperations = new Map();
 
 function pauseOperation(operation, untilMs) {
   if (!Number.isFinite(untilMs)) return;
-  pausedOperations.set(operation, Math.max(pausedOperations.get(operation) ?? 0, untilMs));
+  const until = Math.max(pausedOperations.get(operation) ?? 0, untilMs);
+  pausedOperations.set(operation, until);
+  return () => { if (pausedOperations.get(operation) === until) pausedOperations.delete(operation); };
 }
 
 function operationPausedUntil(operation, now = Date.now()) {
@@ -744,7 +746,8 @@ function operationPausedUntil(operation, now = Date.now()) {
   return until;
 }
 
-async function runGh(args, { signal, operation, input = null, execute = null } = {}) {
+async function runGh(args, { signal, operation, input = null, execute = null,
+  closeWaitMs = 15_000 } = {}) {
   if (operationCost(operation) === null) {
     throw new Error(`undeclared gh operation: ${operation ?? "missing"}`);
   }
@@ -756,11 +759,32 @@ async function runGh(args, { signal, operation, input = null, execute = null } =
   const requestNow = typeof bound?.now === "function" ? bound.now : Date.now;
   const permit = identityCoordinator && !local
     ? await acquireIdentityHttpPermit(identityCoordinator, { signal, now: requestNow,
+        operationDeadline: CONTROL_OPERATIONS.includes(operation) ? undefined : bound?.receiptCapability?.deadline,
         ...(typeof bound?.httpWait === "function" ? { wait: bound.httpWait } : {}) }) : null;
   const startedAt = requestNow();
   let requestError = null;
   let requestStdout = null;
   let requestStarted = false;
+  let knownNeverStarted = false;
+  let requestSettled = false;
+  let successfulPromise = false;
+  let dispatchEvidence = null;
+  let dispatchCapability = null;
+  let childCloseProof = null;
+  let activeDispatchKey = null;
+  let activeDispatchReleased = false;
+  const releaseActiveDispatch = () => {
+    if (!activeDispatchKey || activeDispatchReleased) return;
+    activeDispatchReleased = true;
+    const remaining = (activeOwnerDispatches.get(activeDispatchKey) ?? 1) - 1;
+    if (remaining > 0) activeOwnerDispatches.set(activeDispatchKey, remaining);
+    else activeOwnerDispatches.delete(activeDispatchKey);
+    if (dispatchCapability && !dispatchCapability.controlResource) {
+      const sealed = inspectGovernor({ ...bound, identityProvider: null }, requestNow());
+      const nonce = sealed.ok && sealed.value.debtGroups[dispatchCapability.generation]?.nonce;
+      if (nonce) acknowledgeSealedGeneration(bound, dispatchCapability, nonce, requestNow());
+    }
+  };
   try {
     assertBoundCredential(bound);
     if (identityCoordinator && operation === "budget-core-observer") {
@@ -789,6 +813,23 @@ async function runGh(args, { signal, operation, input = null, execute = null } =
       }
     }
     assertBoundCredential(bound);
+    if (!local && RATE_RESOURCES.some((resource) => operationCost(operation)[resource] > 0)) {
+      dispatchCapability = operation === "budget-core-observer"
+        ? control?.value?.receiptCapability
+        : operation === "graphql-observer"
+          ? bound?.controlReceiptCapability : bound?.receiptCapability;
+      if (dispatchCapability) {
+        activeDispatchKey = ownerDispatchKey(bound, dispatchCapability);
+        activeOwnerDispatches.set(activeDispatchKey,
+          (activeOwnerDispatches.get(activeDispatchKey) ?? 0) + 1);
+      }
+      const issued = issueGovernorDispatch(bound, dispatchCapability, operation, requestNow());
+      if (!issued.ok) {
+        releaseActiveDispatch();
+        throw new Error(`API receipt paused (${issued.reason})`);
+      }
+      dispatchEvidence = issued.value;
+    }
     const executeChild = execute ?? bound?.executeGh ?? execFileAsync;
     const pending = executeChild("gh", args, {
       timeout: GH_TIMEOUT_MS,
@@ -798,6 +839,14 @@ async function runGh(args, { signal, operation, input = null, execute = null } =
       signal,
     });
     requestStarted = true;
+    if (Number.isSafeInteger(pending.child?.pid) &&
+        typeof pending.child.once === "function") {
+      childCloseProof = new Promise((resolve) => pending.child.once("close", resolve));
+    }
+    if (dispatchEvidence && Number.isSafeInteger(pending.child?.pid)) {
+      markGovernorDispatchChild(bound, dispatchCapability,
+        dispatchEvidence.sequence, pending.child.pid, requestNow());
+    }
     if (typeof input === "string") {
       // A child killed by the timeout or the abort signal closes stdin under
       // us; that EPIPE is the kill's consequence, not the failure worth
@@ -805,16 +854,73 @@ async function runGh(args, { signal, operation, input = null, execute = null } =
       pending.child.stdin?.on("error", () => {});
       pending.child.stdin?.end(input);
     }
-    const { stdout } = await pending;
+    let stdout;
+    try {
+      ({ stdout } = await pending);
+      requestSettled = true;
+      successfulPromise = true;
+    } catch (error) {
+      requestSettled = true;
+      throw error;
+    }
     requestStdout = stdout;
-    logGh(args, startedAt, `ok ${stdout.length}B`);
-    return stdout;
   } catch (err) {
     requestError = err;
+    if (!requestStarted && !dispatchEvidence) err.notStarted ??= true;
+    knownNeverStarted = !requestStarted && err?.notStarted === true;
     if (requestStarted && isRecord(err)) err.httpStarted = true;
     logGh(args, startedAt, `FAILED ${shortErr(err)}`);
     throw err;
   } finally {
+    let childClosed = !requestStarted;
+    if (requestSettled && childCloseProof) {
+      let timer;
+      childClosed = await Promise.race([
+        childCloseProof.then(() => true),
+        new Promise((resolve) => { timer = setTimeout(() => resolve(false), closeWaitMs); }),
+      ]);
+      clearTimeout(timer);
+    }
+    if (requestSettled && !childClosed) {
+      requestError ??= Object.assign(new Error("GitHub child close unverified"), { httpStarted: true });
+    }
+    if (successfulPromise) {
+      logGh(args, startedAt, childClosed
+        ? `ok ${requestStdout.length}B` : "FAILED GitHub child close unverified");
+    }
+    if (dispatchEvidence && (requestSettled && childClosed || knownNeverStarted)) {
+      const finishDispatch = () => {
+        const result = terminalGovernorDispatch(bound,
+          dispatchCapability, dispatchEvidence.sequence, requestNow(),
+          { neverStarted: knownNeverStarted });
+        if (result.ok || result.reason === "compacted") releaseActiveDispatch();
+        return result;
+      };
+      const terminal = await retryIdentityCompletion(finishDispatch, {
+        timeoutMs: 15_000, shouldRetry: () => true,
+      });
+      if (!terminal.ok && identityCoordinator?.deferCompletion) {
+        identityCoordinator.deferCompletion(
+          `dispatch:${dispatchCapability.reservationId}:${dispatchEvidence.sequence}`,
+          finishDispatch,
+        );
+      }
+    } else if (dispatchEvidence && requestSettled && childCloseProof) {
+      // A promise can settle before its subprocess closes. Keep the issued
+      // charge until close proves that no more HTTP can escape this child.
+      void childCloseProof.then(async () => {
+        const finishDispatch = () => terminalGovernorDispatch(bound,
+          dispatchCapability, dispatchEvidence.sequence, requestNow());
+        const terminal = await retryIdentityCompletion(finishDispatch, {
+          timeoutMs: 15_000, shouldRetry: () => true,
+        });
+        if (terminal.ok || terminal.reason === "compacted") releaseActiveDispatch();
+        else identityCoordinator?.deferCompletion?.(
+          `dispatch:${dispatchCapability.reservationId}:${dispatchEvidence.sequence}`,
+          finishDispatch,
+        );
+      });
+    }
     if (permit) {
       const release = () => releaseIdentityHttpPermit(identityCoordinator, permit, requestError, requestNow());
       const released = await retryIdentityCompletion(release, { timeoutMs: IDENTITY_RELEASE_WAIT_MS, shouldRetry: () => !identityCoordinator.isClosed() });
@@ -822,11 +928,14 @@ async function runGh(args, { signal, operation, input = null, execute = null } =
     }
     if (control?.ok) {
       const settle = () => settleIdentityControl(identityCoordinator, control.value,
-        requestStdout ?? requestError?.stdout, requestNow());
+        childClosed ? requestStdout ?? requestError?.stdout : null, requestNow(),
+        { neverStarted: !requestStarted && (!dispatchEvidence || knownNeverStarted) });
       const settled = await retryIdentityCompletion(settle, { timeoutMs: IDENTITY_RELEASE_WAIT_MS, shouldRetry: () => !identityCoordinator.isClosed() });
       if (!settled.ok) identityCoordinator.deferCompletion(`control:${control.value.id}`, settle);
     }
   }
+  if (successfulPromise && requestError) throw requestError;
+  return requestStdout;
 }
 
 function parseGhApiResponse(stdout) {
@@ -1638,7 +1747,6 @@ async function fetchActions(signal, {
   }
   const responses = [runsResponse];
   let requestMetrics = runsResponse.requestMetrics ?? restResponseRequestMetrics(runsResponse);
-  const uncertainReceipts = [];
   const runs = parseActionsRuns(runsResponse.body);
   const startedAt = Date.now();
   let nextCatalog = catalog;
@@ -1662,7 +1770,6 @@ async function fetchActions(signal, {
         request,
       }),
     });
-    uncertainReceipts.push(...(admitted.uncertainReceipts ?? []));
     if (admitted.ok && admitted.value) {
       responses.push(admitted.value);
       requestMetrics = mergeAcquisitionRequestMetrics(
@@ -1695,7 +1802,6 @@ async function fetchActions(signal, {
     failedRequests: requestMetrics.failedRequests ?? 0,
     coreUnitsTotal: requestMetrics.coreUnits ?? 0,
     requestMetrics,
-    uncertainReceipts,
     graphqlSpent: GRAPHQL_PER_FETCH.actions,
     stagedEntities: batch.stagedEntities,
     observations: batch.observations,
@@ -1896,7 +2002,6 @@ async function fetchGraphqlList(kind, mapRow, {
     throw error;
   }
   const observations = [...first.observations];
-  const uncertainReceipts = [];
   const repositoryIdentity = normalizeRepositoryIdentity(first.data?.repository);
   // Only the first page. Pages past it opened their own reservation inside
   // runAdmittedOperation and settle against it, so adding them here charges the
@@ -1934,7 +2039,6 @@ async function fetchGraphqlList(kind, mapRow, {
       waitMs: GOVERNOR_ADMISSION_WAIT_MS,
       run: (admittedSignal) => fetchPage(kind, { signal: admittedSignal, after: cursor, operation: `page:${kind}` }),
     });
-    uncertainReceipts.push(...(admitted.uncertainReceipts ?? []));
     // A later page that is denied, fails, or returns errors leaves the rows
     // already gathered exactly as they are. Losing page one because page two
     // was refused would turn a budget decision into data loss.
@@ -1988,7 +2092,6 @@ async function fetchGraphqlList(kind, mapRow, {
     httpRequests: requestMetrics.httpRequests ?? 0,
     failedRequests: requestMetrics.failedRequests ?? 0,
     requestMetrics,
-    uncertainReceipts,
     observations,
     incomplete,
     repositoryIdentity,
@@ -2265,6 +2368,41 @@ function reservationCost(reservation, resource, leases, nowMs) {
   return Number.isFinite(cost) && cost > 0 ? Math.max(0, cost - accounted) : 0;
 }
 
+function governorAccountingSafe(state, nowMs) {
+  return RATE_RESOURCES.every((resource) =>
+    Number.isSafeInteger(governorChargedCost(state, resource, nowMs)));
+}
+
+function governorChargedCost(state, resource, nowMs) {
+  if (!state || !RATE_RESOURCES.includes(resource)) return Number.NaN;
+  let total = state.debt?.[resource]?.unresolvedUnits +
+    state.debt?.[resource]?.quiescentUnits;
+  if (!Number.isSafeInteger(total) || total < 0) return Number.NaN;
+  for (const reservation of [state.controlReceipts?.[resource],
+    ...Object.values(state.reservations ?? {})]) {
+    total += reservationCost(reservation, resource, state.leases, nowMs);
+    if (!Number.isSafeInteger(total) || total < 0) return Number.NaN;
+  }
+  return total;
+}
+
+function governorAvailableForGrant(state, resource, nowMs) {
+  return availableForGrant({ budget: state?.budgets?.[resource], resource, nowMs,
+    chargedCost: governorChargedCost(state, resource, nowMs) });
+}
+
+function governorResourceDecision(state, resource, nowMs, cost) {
+  return resourceDecision({ budget: state?.budgets?.[resource], resource, nowMs, cost,
+    chargedCost: governorChargedCost(state, resource, nowMs) });
+}
+
+function governorResourceHeld(state, resource, nowMs, pendingBlock = false) {
+  const budget = state?.budgets?.[resource];
+  const decision = governorAvailableForGrant(state, resource, nowMs);
+  return pendingBlock || budget?.blockUntil > nowMs ||
+    decision.mode === "paused" || decision.mode === "open" && decision.spendable <= 0;
+}
+
 function availableForGrant({
   budget,
   resource = budget?.resource,
@@ -2517,6 +2655,7 @@ function scheduleIntents({
   leases = {},
   budgets = {},
   reservations = [],
+  debtCosts = { core: 0, graphql: 0 },
   lanes = {},
   cursors = {},
   nowMs,
@@ -2551,7 +2690,7 @@ function scheduleIntents({
 
   const chargedTotals = Object.fromEntries(RATE_RESOURCES.map((resource) => [
     resource,
-    reservations.reduce(
+    debtCosts[resource] + reservations.reduce(
       (total, reservation) => total + reservationCost(reservation, resource, leases, nowMs),
       0,
     ),
@@ -2694,17 +2833,17 @@ function scheduleIntents({
 }
 
 // ---------- Credential identities and restart-safe coordination ----------
-const IDENTITY_VERSION = 1;
+const IDENTITY_VERSION = 2;
 const IDENTITY_ATTEMPT_WINDOW_MS = 15 * 60_000;
 const IDENTITY_ATTEMPT_LIMIT = 3;
 const IDENTITY_HOST_ATTEMPT_LIMIT = 12;
 const IDENTITY_MAX_ATTEMPTS = 4096;
 const HTTP_START_GAP_MS = 250;
 const HTTP_MAX_WAITERS = 128;
-// A permit is reclaimable once it cannot still belong to a live request. The
-// owner-death check alone cannot see a process that is stopped, or one whose
-// release lost its lock, so a permit outliving the subprocess timeout it guards
-// is stale by construction rather than by guess.
+const HTTP_MAX_PERMITS = 3;
+// Retain the existing bounded permit lease for managed requests. This bounds
+// unexpired admissions, not surviving OS children after suspension or owner
+// death; quota receipts separately retain uncertain transport charges.
 const HTTP_PERMIT_MAX_MS = GH_TIMEOUT_MS + 5_000;
 // The longest a primary window can run. An attempt that never obtained reset
 // evidence is still covered once a full window has demonstrably elapsed since it
@@ -2738,11 +2877,15 @@ function retryableCoordination(reason) {
   return RETRYABLE_COORDINATION_REASONS.includes(reason);
 }
 
-// A dead owner releases its permit immediately; a live owner keeps it only for
-// as long as a request could still be running under it. Without the second
-// test a stopped process, or one whose release never won the lock, holds the
-// single machine-wide permit forever and every pane queues behind it.
+// Managed permit leases retain their existing age/dead-owner reclamation law.
+// Reclaiming a slot never retires its quota receipt or proves child quiescence.
 function staleHttpPermit(permit, now, kill = process.kill.bind(process)) {
+  // A dead v1 parent does not prove its untracked child ended. Reserve its
+  // one slot until a subsequent verified boot; two managed slots remain usable.
+  if (permit.kind === "legacy") {
+    const bootId = coordinationBootId();
+    return permit.bootId !== null && bootId !== null && permit.bootId !== bootId;
+  }
   if (pidIsDead(permit.pid, kill)) return true;
   return Number.isFinite(permit.startedAt) && now - permit.startedAt > HTTP_PERMIT_MAX_MS;
 }
@@ -2813,8 +2956,8 @@ function emptyIdentityRegistry() {
   return { version: IDENTITY_VERSION, migration: { activated: false, holdUntil: 0 }, identities: {}, attempts: {}, hosts: {} };
 }
 
-function normalizeIdentityRegistry(raw) {
-  if (!exactKeys(raw, ["version", "migration", "identities", "attempts", "hosts"]) || raw.version !== IDENTITY_VERSION ||
+function normalizeIdentityRegistry(raw, version = IDENTITY_VERSION) {
+  if (!exactKeys(raw, ["version", "migration", "identities", "attempts", "hosts"]) || raw.version !== version ||
       !exactKeys(raw.migration, ["activated", "holdUntil"]) || typeof raw.migration.activated !== "boolean" ||
       !Number.isFinite(raw.migration.holdUntil) || raw.migration.holdUntil < 0 ||
       !isRecord(raw.identities) || !isRecord(raw.attempts) || !isRecord(raw.hosts) ||
@@ -2837,13 +2980,20 @@ function normalizeIdentityRegistry(raw) {
   }
   for (const [host, transport] of Object.entries(raw.hosts)) {
     if (!isRecord(transport)) return null;
-    const keys = ["lastStartedAt", "cooldownUntil", "permit"];
+    const keys = ["lastStartedAt", "cooldownUntil", version === 1 ? "permit" : "permits"];
     if (Object.hasOwn(transport, "waiters")) keys.push("waiters");
     if (Object.hasOwn(transport, "throttle")) keys.push("throttle");
     if (!normalizeHost(host) || !exactKeys(transport, keys) ||
         !time(transport.lastStartedAt) || !time(transport.cooldownUntil)) return null;
-    if (transport.permit !== null && (!exactKeys(transport.permit, ["pid", "nonce", "startedAt"]) ||
-        !Number.isSafeInteger(transport.permit.pid) || transport.permit.pid < 1 || !validGovernorId(transport.permit.nonce) || !time(transport.permit.startedAt))) return null;
+    const permits = version === 1 ? (transport.permit === null ? [] : [transport.permit]) : transport.permits;
+    if (!Array.isArray(permits) || permits.length > HTTP_MAX_PERMITS ||
+        new Set(permits.map((permit) => permit?.nonce)).size !== permits.length ||
+        permits.filter((permit) => permit?.kind === "legacy").length > 1 ||
+        permits.some((permit) => !exactKeys(permit, version === 1
+          ? ["pid", "nonce", "startedAt"] : ["pid", "nonce", "startedAt", "kind", "bootId"]) ||
+          !Number.isSafeInteger(permit.pid) || permit.pid < 1 || !validGovernorId(permit.nonce) || !time(permit.startedAt) ||
+          version !== 1 && (!["request", "bootstrap", "legacy"].includes(permit.kind) ||
+            permit.bootId !== null && (typeof permit.bootId !== "string" || permit.bootId.length > 128)))) return null;
     if (!Object.hasOwn(transport, "throttle")) transport.throttle = emptyTransportThrottle();
     if (!isRecord(transport.throttle) || !exactKeys(transport.throttle, ["attempts", "lastAt", "paused"]) ||
         !Number.isSafeInteger(transport.throttle.attempts) || transport.throttle.attempts < 0 ||
@@ -2874,8 +3024,10 @@ function withIdentityRegistry(root, operation, { now = Date.now(), kill = proces
     let state;
     if (raw === null) state = emptyIdentityRegistry();
     else {
-      try { state = normalizeIdentityRegistry(JSON.parse(raw)); }
-      catch { return { ok: false, reason: "corrupt" }; }
+      try {
+        const parsed = JSON.parse(raw);
+        state = normalizeIdentityRegistry(parsed, parsed.version === 1 ? 1 : IDENTITY_VERSION);
+      } catch { return { ok: false, reason: "corrupt" }; }
     }
     if (!state) return { ok: false, reason: "corrupt" };
     // Captured before the prunes below so their deletions still count as a
@@ -2883,6 +3035,19 @@ function withIdentityRegistry(root, operation, { now = Date.now(), kill = proces
     // funnels through here, and each one used to serialize and rename the
     // registry while holding the one machine-wide lock.
     const before = JSON.stringify(state);
+    if (state.version === 1) {
+      // Keep v1 writable until a live owner commits its response and cooldown.
+      // Returning the shared transient reason preserves cached identity/leases.
+      if (Object.values(state.hosts).some((transport) =>
+        transport.permit && !pidIsDead(transport.permit.pid, kill))) return { ok: false, reason: "busy" };
+      for (const transport of Object.values(state.hosts)) {
+        transport.permits = transport.permit
+          ? [{ ...transport.permit, kind: "legacy", bootId: coordinationBootId() }] : [];
+        delete transport.permit;
+      }
+      state.version = IDENTITY_VERSION;
+    }
+
     for (const transport of Object.values(state.hosts)) {
       transport.waiters = transport.waiters.filter((waiter) => waiter.deadline > now && !pidIsDead(waiter.pid, kill));
     }
@@ -2913,9 +3078,10 @@ function withIdentityRegistry(root, operation, { now = Date.now(), kill = proces
           // stops the entry from being retained for the life of the install.
           : budget?.resetMs > attempt.startedAt + IDENTITY_UNCERTAIN_MAX_MS;
         if (!attempt.accounted && !resetCovered) return { ok: true, value: false };
-        delete ledger.value.reservations[`reservation:${id}`];
-        const write = writeGovernorState(scope.path, ledger.value);
-        return write.ok ? { ok: true, value: true } : write;
+        // Retiring registry attempt history never retires quota debt. A reset
+        // proves a counter window changed, not that a suspended child cannot
+        // dispatch after it resumes.
+        return { ok: true, value: true };
       });
       if (!retired.ok) return retired;
       if (retired.value) delete state.attempts[id];
@@ -3010,9 +3176,10 @@ function claimIdentityBootstrap(root, { credentialKey, host, resource = "core", 
   return withIdentityRegistry(root, (state) => {
     const migration = inspectLegacyMigration(root, state, now);
     if (!migration.ok) return migration;
-    const transport = state.hosts[host] ??= { lastStartedAt: 0, cooldownUntil: 0, permit: null };
-    if (transport.permit && staleHttpPermit(transport.permit, now, kill)) transport.permit = null;
-    if (transport.permit || transport.waiters?.length) return { ok: false, reason: "identity-busy", retryAt: now + 1000 };
+    const transport = state.hosts[host] ??= emptyIdentityTransport();
+    transport.permits = transport.permits.filter((permit) => !staleHttpPermit(permit, now, kill));
+    if (transport.throttle.paused) return { ok: false, reason: "throttle-paused", retryAt: transport.cooldownUntil };
+    if (transport.permits.some((permit) => permit.kind !== "legacy") || transport.waiters.length) return { ok: false, reason: "identity-busy", retryAt: now + 1000 };
     const attempts = Object.values(state.attempts);
     const recent = attempts.filter((attempt) => attempt.startedAt > now - IDENTITY_ATTEMPT_WINDOW_MS);
     const own = recent.filter((attempt) => attempt.credentialKey === credentialKey && attempt.resource === resource && attempt.exceptional);
@@ -3027,7 +3194,7 @@ function claimIdentityBootstrap(root, { credentialKey, host, resource = "core", 
     const nonce = governorId();
     state.attempts[id] = { credentialKey, host, resource, startedAt: now, retryAt: now + attemptRetryDelayMs(own.length),
       ownerPid: process.pid, nonce, status: "started", quotaKey: null, resetMs: null, accounted: false, imported: false, exceptional: true };
-    transport.permit = { pid: process.pid, nonce, startedAt: now };
+    transport.permits.push({ pid: process.pid, nonce, startedAt: now, kind: "bootstrap", bootId: null });
     transport.lastStartedAt = now;
     return { ok: true, value: { id, nonce } };
   }, { now, kill });
@@ -3045,32 +3212,31 @@ function importIdentityDebts(root, state, credentialKey, identity, now) {
   return withGovernorLock(scope, () => {
     const loaded = readIdentityQuotaState(state, scope, now);
     if (!loaded.ok) return loaded;
+    for (const id of Object.keys(loaded.value.importMarkers)) {
+      const attempt = state.attempts[id];
+      if (!attempt || attempt.imported && attempt.quotaKey === identity.quotaKey) {
+        delete loaded.value.importMarkers[id];
+      }
+    }
     const transferred = [];
     for (const [id, attempt] of Object.entries(state.attempts)) {
       if (attempt.credentialKey !== credentialKey || attempt.imported) continue;
-      const reservationId = `reservation:${id}`;
-      loaded.value.reservations[reservationId] ??= {
+      const legacyControl = {
         leaseId: id, intentId: id, costs: { core: 0, graphql: 0, [attempt.resource]: 1 }, actualCosts: null,
         accountedCosts: { core: 0, graphql: 0, [attempt.resource]: attempt.accounted ? 1 : 0 },
         notBefore: attempt.startedAt, status: "started", epochs: { core: null, graphql: null },
         startedAt: attempt.startedAt, completedAt: null, outcome: null,
       };
+      if (!loaded.value.importMarkers[id] &&
+          !transferReceiptToDebt(loaded.value, legacyControl, now, id)) {
+        return { ok: false, reason: "accounting-overflow" };
+      }
+      if (Object.keys(loaded.value.importMarkers).length >= IDENTITY_MAX_ATTEMPTS &&
+          !loaded.value.importMarkers[id]) return { ok: false, reason: "identity-capacity" };
+      loaded.value.importMarkers[id] = true;
       transferred.push(id);
     }
-    // importIdentityDebts writes this ledger before the registry transaction
-    // that records the mapping commits. A crash in between leaves a charged
-    // receipt here whose attempt is gone from the registry, and nothing else
-    // ever looks at it again -- it presents only as a permanently smaller
-    // budget. Re-bootstrapping the same credential is exactly when it can be
-    // recognised, and a full window since it started proves a reset covered it.
-    for (const key of Object.keys(loaded.value.reservations)) {
-      const attemptId = /^reservation:(.+)$/.exec(key)?.[1];
-      if (!attemptId || state.attempts[attemptId]) continue;
-      const reservation = loaded.value.reservations[key];
-      if (reservation.startedAt + IDENTITY_UNCERTAIN_MAX_MS > now) continue;
-      delete loaded.value.reservations[key];
-    }
-    const written = writeGovernorState(scope.path, loaded.value);
+    const written = writeGovernorQuotaState(scope.path, loaded.value, now);
     if (!written.ok) return written;
     // Marked transferred only once the receipts are durable. withIdentityRegistry
     // persists the registry whatever this returns, so setting these before the
@@ -3090,7 +3256,7 @@ function finishIdentityBootstrap(root, { credentialKey, id, nonce, response = nu
     const attempt = state.attempts[id];
     if (!attempt || attempt.nonce !== nonce || attempt.credentialKey !== credentialKey) return { ok: false, reason: "stale" };
     const transport = state.hosts[attempt.host];
-    if (transport.permit?.nonce === nonce) transport.permit = null;
+    transport.permits = transport.permits.filter((permit) => permit.nonce !== nonce);
     attempt.status = response ? "finished" : "uncertain";
     const parsed = response?.body;
     const evidence = response?.rateLimit;
@@ -3128,7 +3294,7 @@ function finishIdentityBootstrap(root, { credentialKey, id, nonce, response = nu
           ledger.value.epochs.core = observation.budget.epoch;
           ledger.value.observers.core = { etag: typeof response.etag === "string" ? response.etag : null, outcome: "healthy", at: now, nextAt: now + BUDGET_PROBE_MS };
         }
-        return writeGovernorState(scope.path, ledger.value);
+        return writeGovernorQuotaState(scope.path, ledger.value, now);
       });
       if (!seeded.ok) return seeded;
     }
@@ -3267,35 +3433,53 @@ function startIdentityControl(coordinator, now = Date.now()) {
       const exceptional = !budget || now >= budget.resetMs + BUDGET_RESET_GRACE_MS;
       if (budget && now >= budget.resetMs && !exceptional) return { ok: false, reason: "identity-backoff", retryAt: budget.resetMs + BUDGET_RESET_GRACE_MS };
       if (!exceptional) {
-        const reserved = Object.values(state.reservations).reduce((sum, reservation) => sum + reservationCost(reservation, "core", state.leases, now), 0);
+        const reserved = Object.values(state.reservations).reduce((sum, reservation) => sum + reservationCost(reservation, "core", state.leases, now),
+          state.debt.core.unresolvedUnits + state.debt.core.quiescentUnits +
+          reservationCost(state.controlReceipts.core, "core", state.leases, now));
         if (budget.remaining - resourceReserve(budget.limit) - reserved < 1) return { ok: false, reason: "identity-backoff", retryAt: budget.resetMs + BUDGET_RESET_GRACE_MS };
       }
       const recent = Object.values(registry.attempts).filter((attempt) => attempt.credentialKey === identity.credentialKey && attempt.resource === "core" && attempt.exceptional && attempt.startedAt > now - IDENTITY_ATTEMPT_WINDOW_MS);
       const retryAt = Math.max(0, ...recent.map((attempt) => attempt.retryAt), recent.length >= IDENTITY_ATTEMPT_LIMIT ? Math.min(...recent.map((attempt) => attempt.startedAt)) + IDENTITY_ATTEMPT_WINDOW_MS : 0);
       if (exceptional && retryAt > now) return { ok: false, reason: "identity-backoff", retryAt };
-      if (Object.keys(registry.attempts).length >= IDENTITY_MAX_ATTEMPTS || Object.keys(state.reservations).length >= GOVERNOR_MAX_RESERVATIONS) return { ok: false, reason: "identity-capacity" };
+      if (Object.keys(registry.attempts).length >= IDENTITY_MAX_ATTEMPTS) return { ok: false, reason: "identity-capacity" };
+      const priorControl = state.controlReceipts.core;
+      if (priorControl) {
+        if (!retireControlReceiptToDebt(state, "core", now)) return { ok: false, reason: "accounting-overflow" };
+      }
       const id = governorId();
       registry.attempts[id] = { credentialKey: identity.credentialKey, host: identity.host, resource: "core", startedAt: now,
         retryAt: exceptional ? now + attemptRetryDelayMs(recent.length) : now, ownerPid: process.pid, nonce: governorId(), status: "started",
         quotaKey: identity.quotaKey, resetMs: budget?.resetMs ?? null, accounted: false, imported: true, exceptional };
-      state.reservations[`reservation:${id}`] = { leaseId: id, intentId: id, costs: { core: 1, graphql: 0 }, actualCosts: null,
+      state.controlReceipts.core = { leaseId: id, intentId: id, costs: { core: 1, graphql: 0 }, actualCosts: null,
         accountedCosts: { core: 0, graphql: 0 }, notBefore: now, status: "started", epochs: { core: budget?.epoch ?? null, graphql: null },
-        startedAt: now, completedAt: null, outcome: null };
-      const written = writeGovernorState(scope.path, state);
-      return written.ok ? { ok: true, value: { id, identity } } : written;
+        startedAt: now, completedAt: null, outcome: null,
+        receipt: {
+          scopeHash: scope.hash, ownerNonce: governorId(), generation: governorId(),
+          ownerPid: process.pid, ownerBirth: coordinationProcessBirth(), bootId: coordinationBootId(),
+          deadline: now + ACQUISITION_STARTED_DEADLINE_MS,
+          allowance: { core: 1, graphql: 0 }, dispatches: [],
+        } };
+      const written = writeGovernorQuotaState(scope.path, state, now);
+      return written.ok ? { ok: true, value: { id, identity,
+        receiptCapability: { reservationId: `control:core`, controlResource: "core",
+          leaseId: id, scopeHash: scope.hash,
+          ownerNonce: state.controlReceipts.core.receipt.ownerNonce,
+          generation: state.controlReceipts.core.receipt.generation,
+          deadline: state.controlReceipts.core.receipt.deadline } } } : written;
     });
   }, { now });
 }
 
-function settleIdentityControl(coordinator, control, stdout, now = Date.now()) {
+function settleIdentityControl(coordinator, control, stdout, now = Date.now(),
+  { neverStarted = false } = {}) {
   return withIdentityRegistry(coordinator.root, (registry) => {
     const attempt = registry.attempts[control.id];
     if (!attempt) return { ok: false, reason: "stale" };
     const parsed = parseGhApiResponse(stdout ?? "");
     const evidence = pickRateLimit(parsed.headers);
     const proven = [200, 304].includes(parsed.status) && evidence?.resource === "core";
-    attempt.status = proven ? "finished" : "uncertain";
-    attempt.accounted = proven;
+    attempt.status = proven || neverStarted ? "finished" : "uncertain";
+    attempt.accounted = proven || neverStarted;
     if (evidence?.resource === "core") {
       attempt.resetMs = evidence.resetMs;
       if (evidence.remaining === 0) attempt.retryAt = Math.max(attempt.retryAt, evidence.resetMs + BUDGET_RESET_GRACE_MS);
@@ -3304,64 +3488,93 @@ function settleIdentityControl(coordinator, control, stdout, now = Date.now()) {
     return withGovernorLock(scope, () => {
       const loaded = readIdentityQuotaState(registry, scope, now);
       if (!loaded.ok) return loaded;
-      const reservation = loaded.value.reservations[`reservation:${control.id}`];
+      const reservation = loaded.value.controlReceipts.core?.intentId === control.id
+        ? loaded.value.controlReceipts.core : null;
       if (!reservation) return { ok: false, reason: "stale" };
-      if (proven) {
-        const cost = parsed.status === 304 ? 0 : 1;
+      if (proven || neverStarted) {
+        const cost = neverStarted || parsed.status === 304 ? 0 : 1;
         reservation.status = "completed";
         reservation.completedAt = now;
         reservation.outcome = "measured-success";
         reservation.actualCosts = { core: cost, graphql: 0 };
         reservation.accountedCosts = { core: cost, graphql: 0 };
+        loaded.value.controlReceipts.core = null;
+      } else if (!retireControlReceiptToDebt(loaded.value, "core", now)) {
+        return { ok: false, reason: "accounting-overflow" };
       }
-      return writeGovernorState(scope.path, loaded.value);
+      return writeGovernorQuotaState(scope.path, loaded.value, now);
     });
   }, { now });
+}
+
+const HTTP_PERMIT_FAILURE_HOLDS = Object.freeze({
+  "transport-busy": "coordination",
+  "throttle-paused": "secondary",
+});
+
+function httpPermitFailure(reason) {
+  const error = new Error(identityCoordinationMessage(reason));
+  if (Object.hasOwn(HTTP_PERMIT_FAILURE_HOLDS, reason)) error.coordinationReason = reason;
+  return error;
 }
 
 async function acquireIdentityHttpPermit(coordinator, {
   signal,
   now = Date.now,
   wait = (delay) => new Promise((resolve) => setTimeout(resolve, delay)),
+  operationDeadline,
 } = {}) {
   const flushed = await coordinator.flushCompletions?.();
-  if (flushed && !flushed.ok) throw new Error(identityCoordinationMessage(flushed.reason));
+  if (flushed && !flushed.ok) throw httpPermitFailure(flushed.reason);
   const identity = coordinator.current();
   if (!identity) throw new Error("Verified identity unavailable");
   const queuedAt = now();
-  const deadline = queuedAt + GH_TIMEOUT_MS;
+  const deadline = Number.isFinite(operationDeadline)
+    ? Math.min(operationDeadline, queuedAt + ACQUISITION_STARTED_DEADLINE_MS)
+    : queuedAt + GH_TIMEOUT_MS;
   const nonce = governorId();
   let acquired = false;
   try {
     for (;;) {
       if (signal?.aborted) throw new Error("Request cancelled");
       if (coordinator.current()?.accessKey !== identity.accessKey) throw new Error("Credential changed before request start");
-      if (now() >= deadline) throw new Error(identityCoordinationMessage("transport-busy"));
+      if (now() >= deadline) throw httpPermitFailure("transport-busy");
       const result = withIdentityRegistry(coordinator.root, (state) => {
         const migration = inspectLegacyMigration(coordinator.root, state, now());
         if (!migration.ok) return migration;
-        if (now() >= deadline) return { ok: false, reason: "transport-busy", retryAt: deadline };
-        const transport = state.hosts[identity.host] ??= { lastStartedAt: 0, cooldownUntil: 0, permit: null, waiters: [], throttle: emptyTransportThrottle() };
+        const permitAt = now();
+        if (permitAt >= deadline) return { ok: false, reason: "transport-busy", retryAt: deadline };
+        const transport = state.hosts[identity.host] ??= emptyIdentityTransport();
         // Five consecutive throttles means the ladder has stopped being useful.
         // Waiting out the deadline is what produced the last one, so the pause
         // holds until a person retries or a primary reset opens a recovery.
         if (transport.throttle?.paused) {
           return { ok: false, reason: "throttle-paused", retryAt: transport.cooldownUntil };
         }
-        if (transport.permit && staleHttpPermit(transport.permit, now())) transport.permit = null;
+        transport.permits = transport.permits.filter((permit) => !staleHttpPermit(permit, permitAt));
         // Admission can happen during the mandatory start gap. Persist call
         // order once so later polling cannot overtake an earlier caller.
-        if (!transport.waiters.some((waiter) => waiter.nonce === nonce)) {
+        let waiter = transport.waiters.find((item) => item.nonce === nonce);
+        if (!waiter) {
           if (transport.waiters.length >= HTTP_MAX_WAITERS) return { ok: false, reason: "identity-capacity" };
-          transport.waiters.push({ pid: process.pid, nonce, queuedAt, deadline });
+          waiter = { pid: process.pid, nonce, queuedAt: permitAt, deadline: Math.min(deadline, permitAt + GH_TIMEOUT_MS) };
+          transport.waiters.push(waiter);
+        } else if (waiter.deadline - permitAt <= GH_TIMEOUT_MS / 2 && waiter.deadline < deadline) {
+          // Keep the existing registry's short waiter lease and FIFO position.
+          // Renewing this lease cannot extend the admitted operation deadline
+          // above, or the separate timeout of a child that actually starts.
+          waiter.queuedAt = permitAt;
+          waiter.deadline = Math.min(deadline, waiter.queuedAt + GH_TIMEOUT_MS);
         }
         const retryAt = Math.max(transport.cooldownUntil, transport.lastStartedAt + HTTP_START_GAP_MS);
-        if (transport.permit || transport.waiters[0].nonce !== nonce || retryAt > now()) {
-          return { ok: false, reason: "transport-busy", retryAt: Math.max(retryAt, now() + 50) };
+        if (transport.permits.length >= HTTP_MAX_PERMITS ||
+            transport.permits.some((permit) => permit.kind === "bootstrap") ||
+            transport.waiters[0].nonce !== nonce || retryAt > permitAt) {
+          return { ok: false, reason: "transport-busy", retryAt: Math.max(retryAt, permitAt + 50) };
         }
         transport.waiters.shift();
-        transport.permit = { pid: process.pid, nonce, startedAt: now() };
-        transport.lastStartedAt = now();
+        transport.permits.push({ pid: process.pid, nonce, startedAt: permitAt, kind: "request", bootId: null });
+        transport.lastStartedAt = permitAt;
         return { ok: true, value: { nonce, host: identity.host } };
       }, { now: now() });
       if (result.ok) { acquired = true; return result.value; }
@@ -3370,7 +3583,7 @@ async function acquireIdentityHttpPermit(coordinator, {
       // retryAt, so give the rest the poll interval the loop already uses.
       const retryAt = result.retryAt ?? now() + 50;
       if ((result.reason !== "transport-busy" && !retryableCoordination(result.reason)) ||
-          now() >= deadline || retryAt >= deadline) throw new Error(identityCoordinationMessage(result.reason));
+          now() >= deadline || retryAt >= deadline) throw httpPermitFailure(result.reason);
       await wait(Math.max(1, Math.min(50, retryAt - now())));
     }
   } finally {
@@ -3454,6 +3667,10 @@ function transportCooldownDeadline({ retryAfter, status, secondary, at, attempts
   return status === 429 || secondary === true ? at + throttleLadderMs(attempts) : null;
 }
 
+function emptyIdentityTransport() {
+  return { lastStartedAt: 0, cooldownUntil: 0, permits: [], waiters: [], throttle: emptyTransportThrottle() };
+}
+
 function emptyTransportThrottle() {
   return { attempts: 0, lastAt: 0, paused: false };
 }
@@ -3481,10 +3698,21 @@ function clearTransportThrottle(transport) {
   }
 }
 
+// Completion retries keep their original response time and become no-ops
+// after a successful durable write. Weak keys do not accumulate tombstones.
+const identityPermitCompletions = new WeakMap();
 function releaseIdentityHttpPermit(coordinator, permit, error = null, now = Date.now()) {
-  return withIdentityRegistry(coordinator.root, (state) => {
+  let completion = identityPermitCompletions.get(permit);
+  if (!completion) {
+    completion = { at: now, done: false };
+    identityPermitCompletions.set(permit, completion);
+  }
+  if (completion.done) return { ok: true };
+  now = completion.at;
+  const result = withIdentityRegistry(coordinator.root, (state) => {
     const transport = state.hosts[permit.host];
-    if (transport?.permit?.nonce === permit.nonce) transport.permit = null;
+    const held = transport?.permits.find((item) => item.nonce === permit.nonce);
+    if (transport) transport.permits = transport.permits.filter((item) => item.nonce !== permit.nonce);
     if (transport && error) {
       const response = parseGhApiResponse(error.stdout ?? "");
       const verdict = classifyThrottle({
@@ -3503,11 +3731,14 @@ function releaseIdentityHttpPermit(coordinator, permit, error = null, now = Date
           at: now,
         });
       }
-    } else if (transport && !error) {
+    } else if (transport && !error && held && held.startedAt > transport.throttle.lastAt &&
+        held.startedAt >= transport.cooldownUntil) {
       clearTransportThrottle(transport);
     }
     return { ok: true };
   });
+  if (result.ok) completion.done = true;
+  return result;
 }
 
 // The explicit retry a paused transport waits for. Clears the ladder and the
@@ -3558,11 +3789,11 @@ const GOVERNOR_SCOPE_VERSION = 1;
 // 5: scheduling fairness is persisted, because the starvation it prevents
 // happens *between* planning passes -- each manual refresh is its own pass, so
 // a counter that lives only inside one cannot see a run of them.
-const GOVERNOR_STATE_VERSION = 6;
+const GOVERNOR_STATE_VERSION = 7;
 // Readable-as-evidence, never written: the shapes a still-running older pane
 // holds. Recognising that such a pane owns a live lease is what the restart
 // boundary depends on.
-const LEGACY_GOVERNOR_VERSIONS = [GOVERNOR_STATE_VERSION, 5, 4, 3, 2];
+const LEGACY_GOVERNOR_VERSIONS = [GOVERNOR_STATE_VERSION, 6, 5, 4, 3, 2];
 // The first version whose file is already in the per-resource observer shape.
 // Anything below it is adapted before it can be read; see readLegacyGovernorState.
 const GOVERNOR_OBSERVER_SPLIT_VERSION = 4;
@@ -3582,6 +3813,8 @@ const MANUAL_GRANT_STREAK_LIMIT = 3;
 const GOVERNOR_MAX_LEASES = 128;
 const GOVERNOR_MAX_INTENTS = 512;
 const GOVERNOR_MAX_RESERVATIONS = 512;
+const GOVERNOR_MAX_DEBT_GROUPS = 128;
+const GOVERNOR_MAX_LEDGER_BYTES = 2 * 1024 * 1024;
 const GOVERNOR_LOCK_WAIT_MS = 250;
 // How old an unreadable lock record may be before it counts as abandoned. A
 // creator owns the path from open("wx") until its owner record is written, a
@@ -3697,6 +3930,7 @@ function currentGovernorScope(scope) {
 function emptyGovernorState() {
   return {
     version: GOVERNOR_STATE_VERSION,
+    revision: 0,
     epochs: { core: null, graphql: null },
     budgets: {},
     fairness: { manualStreak: 0 },
@@ -3712,6 +3946,14 @@ function emptyGovernorState() {
     leases: {},
     intents: {},
     reservations: {},
+    controlReceipts: { core: null, graphql: null },
+    debt: Object.fromEntries(RATE_RESOURCES.map((resource) => [resource, {
+      unresolvedUnits: 0, unresolvedCount: 0, quiescentUnits: 0, quiescentCount: 0,
+      revision: 0,
+    }])),
+    debtGroups: {},
+    ownerGenerations: {},
+    importMarkers: {},
     manualProbe: null,
   };
 }
@@ -3804,10 +4046,11 @@ function normalizeGovernorIntent(raw, nowMs) {
   return { ...raw, costs };
 }
 
-function normalizeGovernorReservation(raw, nowMs) {
+function normalizeGovernorReservation(raw, nowMs, { legacy = false } = {}) {
   if (!exactKeys(raw, [
     "leaseId", "intentId", "costs", "actualCosts", "accountedCosts", "notBefore", "status", "epochs",
     "startedAt", "completedAt", "outcome",
+    ...(!legacy ? ["receipt"] : []),
   ])) return null;
   const costs = exactResourceCosts(raw.costs);
   const actualCosts = raw.actualCosts === null ? null : exactResourceCosts(raw.actualCosts);
@@ -3829,13 +4072,46 @@ function normalizeGovernorReservation(raw, nowMs) {
   ) return null;
   if (actualCosts && RATE_RESOURCES.some((resource) => actualCosts[resource] > costs[resource])) return null;
   if (RATE_RESOURCES.some((resource) => accountedCosts[resource] > (actualCosts?.[resource] ?? costs[resource]))) return null;
+  if (!legacy && raw.receipt !== null) {
+    const receipt = raw.receipt;
+    if (!exactKeys(receipt, [
+      "scopeHash", "ownerNonce", "generation", "ownerPid", "ownerBirth", "bootId",
+      "deadline", "allowance", "dispatches",
+    ]) || typeof receipt.scopeHash !== "string" || !/^[0-9a-f]{64}$/.test(receipt.scopeHash) ||
+        !validGovernorId(receipt.ownerNonce) || !validGovernorId(receipt.generation) ||
+        !Number.isSafeInteger(receipt.ownerPid) || receipt.ownerPid < 1 ||
+        receipt.ownerBirth !== null && (typeof receipt.ownerBirth !== "string" || receipt.ownerBirth.length > 128) ||
+        receipt.bootId !== null && (typeof receipt.bootId !== "string" || receipt.bootId.length > 128) ||
+        finiteTimestamp(receipt.deadline, nowMs) === undefined ||
+        !exactKeys(receipt.allowance, RATE_RESOURCES) ||
+        RATE_RESOURCES.some((resource) => receipt.allowance[resource] !== costs[resource]) ||
+        !Array.isArray(receipt.dispatches) || receipt.dispatches.length > 32) return null;
+    const issued = { core: 0, graphql: 0 };
+    for (const [index, dispatch] of receipt.dispatches.entries()) {
+      if (!exactKeys(dispatch, ["sequence", "operation", "costs", "issuedAt", "terminalAt", "childPid", "childBirth", "neverStarted"]) ||
+          dispatch.sequence !== index + 1 || !operationCost(dispatch.operation) ||
+          !exactKeys(dispatch.costs, RATE_RESOURCES) ||
+          RATE_RESOURCES.some((resource) => dispatch.costs[resource] !== operationCost(dispatch.operation)[resource]) ||
+          finiteTimestamp(dispatch.issuedAt, nowMs) === undefined ||
+          finiteTimestamp(dispatch.terminalAt, nowMs, { nullable: true }) === undefined ||
+          dispatch.childPid !== null && (!Number.isSafeInteger(dispatch.childPid) || dispatch.childPid < 1) ||
+          dispatch.childBirth !== null && (typeof dispatch.childBirth !== "string" || dispatch.childBirth.length > 128) ||
+          typeof dispatch.neverStarted !== "boolean" ||
+          dispatch.neverStarted && (dispatch.childPid !== null || dispatch.terminalAt === null)) return null;
+      for (const resource of RATE_RESOURCES) issued[resource] += dispatch.costs[resource];
+    }
+    if (RATE_RESOURCES.some((resource) => !Number.isSafeInteger(issued[resource]) ||
+        issued[resource] > receipt.allowance[resource])) return null;
+  } else if (!legacy && raw.status === "started") {
+    return null;
+  }
   return { ...raw, costs, actualCosts, accountedCosts, epochs };
 }
 
 function normalizeResourceObserver(raw, nowMs) {
   if (!exactKeys(raw, ["etag", "outcome", "at", "nextAt"])) return null;
   if (
-    raw.etag !== null && (typeof raw.etag !== "string" || raw.etag.length === 0) ||
+    raw.etag !== null && (typeof raw.etag !== "string" || raw.etag.length === 0 || raw.etag.length > 512) ||
     !GOVERNOR_PROBE_STATUSES.has(raw.outcome) ||
     finiteTimestamp(raw.at, nowMs) === undefined || raw.at > nowMs ||
     finiteTimestamp(raw.nextAt, nowMs) === undefined
@@ -3843,10 +4119,11 @@ function normalizeResourceObserver(raw, nowMs) {
   return { ...raw };
 }
 
-function normalizeProbeClaim(raw, nowMs) {
+function normalizeProbeClaim(raw, nowMs, { legacy = false } = {}) {
   if (raw === null) return null;
   if (!exactKeys(raw, [
     "ownerLeaseId", "nonce", "leaseUntil", "nextAt", "claimAt", "startedReservationIds",
+    ...(!legacy ? ["debtSnapshot"] : []),
   ])) {
     return undefined;
   }
@@ -3858,6 +4135,12 @@ function normalizeProbeClaim(raw, nowMs) {
     !Array.isArray(raw.startedReservationIds) || raw.startedReservationIds.length > GOVERNOR_MAX_RESERVATIONS ||
     raw.startedReservationIds.some((id) => !id.startsWith("reservation:") || !validGovernorId(id.slice(12)))
   ) return undefined;
+  const snapshot = raw.debtSnapshot;
+  if (!legacy && (!exactKeys(snapshot, ["units", "count", "barrierAt", "revision"]) ||
+      !Number.isSafeInteger(snapshot.units) || snapshot.units < 0 ||
+      !Number.isSafeInteger(snapshot.count) || snapshot.count < 0 ||
+      finiteTimestamp(snapshot.barrierAt, nowMs) === undefined ||
+      !Number.isSafeInteger(snapshot.revision) || snapshot.revision < 0)) return undefined;
   return { ...raw, startedReservationIds: [...new Set(raw.startedReservationIds)] };
 }
 
@@ -3878,9 +4161,11 @@ function normalizeManualProbe(raw, nowMs) {
 // never publishes what it reads. Every other caller takes the default, so a
 // version this build does not write is unreadable and fails closed.
 function normalizeGovernorState(raw, nowMs, { prune = true, acceptVersion = GOVERNOR_STATE_VERSION } = {}) {
+  const legacyShape = acceptVersion < 7;
   if (!exactKeys(raw, [
     "version", "epochs", "budgets", "fairness", "observers", "probeClaims", "leases",
     "intents", "reservations", "manualProbe",
+    ...(!legacyShape ? ["revision", "controlReceipts", "debt", "debtGroups", "ownerGenerations", "importMarkers"] : []),
   ]) || raw.version !== acceptVersion) return null;
   if (!exactKeys(raw.fairness, ["manualStreak"]) ||
       !Number.isSafeInteger(raw.fairness.manualStreak) || raw.fairness.manualStreak < 0) return null;
@@ -3894,6 +4179,75 @@ function normalizeGovernorState(raw, nowMs, { prune = true, acceptVersion = GOVE
   ) return null;
 
   const state = emptyGovernorState();
+  state.version = acceptVersion;
+  if (legacyShape) {
+    delete state.revision;
+    delete state.controlReceipts;
+    delete state.debt;
+    delete state.debtGroups;
+    delete state.ownerGenerations;
+    delete state.importMarkers;
+  } else {
+    if (!Number.isSafeInteger(raw.revision) || raw.revision < 0) return null;
+    state.revision = raw.revision;
+    if (!exactKeys(raw.controlReceipts, RATE_RESOURCES) || !exactKeys(raw.debt, RATE_RESOURCES) ||
+        !isRecord(raw.debtGroups) || Object.keys(raw.debtGroups).length > GOVERNOR_MAX_DEBT_GROUPS ||
+        !isRecord(raw.ownerGenerations) ||
+        Object.keys(raw.ownerGenerations).length > GOVERNOR_MAX_LEASES + GOVERNOR_MAX_RESERVATIONS ||
+        !isRecord(raw.importMarkers) || Object.keys(raw.importMarkers).length > IDENTITY_MAX_ATTEMPTS) return null;
+    for (const [id, marker] of Object.entries(raw.importMarkers)) {
+      if (!validGovernorId(id) || marker !== true) return null;
+      state.importMarkers[id] = true;
+    }
+    for (const [leaseId, generation] of Object.entries(raw.ownerGenerations)) {
+      if (!validGovernorId(leaseId) || !validGovernorId(generation)) return null;
+      state.ownerGenerations[leaseId] = generation;
+    }
+    for (const resource of RATE_RESOURCES) {
+      const debt = raw.debt[resource];
+      if (!exactKeys(debt, ["unresolvedUnits", "unresolvedCount", "quiescentUnits", "quiescentCount", "revision"]) ||
+          Object.values(debt).some((value) => !Number.isSafeInteger(value) || value < 0)) return null;
+      state.debt[resource] = { ...debt };
+      // Control receipts are normalized independently from the 512 data slots.
+      if (raw.controlReceipts[resource] !== null) {
+        const control = normalizeGovernorReservation(raw.controlReceipts[resource], nowMs);
+        if (!control) return null;
+        state.controlReceipts[resource] = control;
+      }
+    }
+    for (const [id, group] of Object.entries(raw.debtGroups)) {
+      if (!validGovernorId(id) || !exactKeys(group, [
+        "nonce", "ownerNonce", "ownerPid", "ownerBirth", "bootId", "unknownChild", "sealed",
+        "quiescent", "units", "counts", "at", "barrierAt", "barrierRevisions",
+      ]) || !validGovernorId(group.nonce) ||
+          group.ownerNonce !== null && !validGovernorId(group.ownerNonce) ||
+          group.ownerPid !== null && (!Number.isSafeInteger(group.ownerPid) || group.ownerPid < 1) ||
+          group.ownerBirth !== null && (typeof group.ownerBirth !== "string" || group.ownerBirth.length > 128) ||
+          group.bootId !== null && (typeof group.bootId !== "string" || group.bootId.length > 128) ||
+          typeof group.unknownChild !== "boolean" || typeof group.sealed !== "boolean" ||
+          typeof group.quiescent !== "boolean" || !exactKeys(group.units, RATE_RESOURCES) ||
+          !exactKeys(group.counts, RATE_RESOURCES) ||
+          [...Object.values(group.units), ...Object.values(group.counts)].some((value) =>
+            !Number.isSafeInteger(value) || value < 0) ||
+          finiteTimestamp(group.at, nowMs) === undefined ||
+          finiteTimestamp(group.barrierAt, nowMs, { nullable: true }) === undefined ||
+          !exactKeys(group.barrierRevisions, RATE_RESOURCES) ||
+          Object.values(group.barrierRevisions).some((value) =>
+            !Number.isSafeInteger(value) || value < 0)) return null;
+      state.debtGroups[id] = structuredClone(group);
+    }
+    for (const resource of RATE_RESOURCES) {
+      const totals = { unresolvedUnits: 0, unresolvedCount: 0,
+        quiescentUnits: 0, quiescentCount: 0 };
+      for (const group of Object.values(state.debtGroups)) {
+        const prefix = group.quiescent ? "quiescent" : "unresolved";
+        totals[`${prefix}Units`] += group.units[resource];
+        totals[`${prefix}Count`] += group.counts[resource];
+      }
+      if (Object.entries(totals).some(([field, amount]) =>
+        !Number.isSafeInteger(amount) || amount !== state.debt[resource][field])) return null;
+    }
+  }
   state.epochs = { ...raw.epochs };
   state.fairness = { ...raw.fairness };
   for (const resource of RATE_RESOURCES) {
@@ -3922,7 +4276,7 @@ function normalizeGovernorState(raw, nowMs, { prune = true, acceptVersion = GOVE
   if (Object.keys(state.intents).length > GOVERNOR_MAX_INTENTS) return null;
   for (const [id, rawReservation] of Object.entries(raw.reservations)) {
     if (!id.startsWith("reservation:") || !validGovernorId(id.slice(12))) return null;
-    const reservation = normalizeGovernorReservation(rawReservation, nowMs);
+    const reservation = normalizeGovernorReservation(rawReservation, nowMs, { legacy: legacyShape });
     if (!reservation || id !== `reservation:${reservation.intentId}`) return null;
     if (
       !prune || reservation.status === "started" || reservation.status === "completed" ||
@@ -3930,14 +4284,26 @@ function normalizeGovernorState(raw, nowMs, { prune = true, acceptVersion = GOVE
     ) state.reservations[id] = reservation;
   }
   if (Object.keys(state.reservations).length > GOVERNOR_MAX_RESERVATIONS) return null;
+  if (prune && !legacyShape) retireOwnerGenerations(state);
   for (const resource of RATE_RESOURCES) {
-    const claim = normalizeProbeClaim(raw.probeClaims[resource], nowMs);
+    const claim = normalizeProbeClaim(raw.probeClaims[resource], nowMs, { legacy: legacyShape });
     if (claim === undefined) return null;
     state.probeClaims[resource] = claim?.leaseUntil > nowMs ? claim : null;
   }
   state.manualProbe = normalizeManualProbe(raw.manualProbe, nowMs);
   if (state.manualProbe === undefined) return null;
   return state;
+}
+
+function retireOwnerGenerations(state) {
+  const detailedOwners = new Set(Object.values(state.reservations)
+    .filter((reservation) => reservation.receipt !== null)
+    .map((reservation) => reservation.leaseId));
+  for (const leaseId of Object.keys(state.ownerGenerations)) {
+    if (!state.leases[leaseId] && !detailedOwners.has(leaseId)) {
+      delete state.ownerGenerations[leaseId];
+    }
+  }
 }
 
 // Reads a still-running older pane's file as evidence. A version number alone
@@ -4048,8 +4414,288 @@ function migrateGovernorState(raw, nowMs) {
     : adaptPreSplitGovernorShape(raw);
   if (!shaped) return null;
   if (!isRecord(shaped.fairness)) shaped.fairness = { manualStreak: 0 };
-  shaped.version = GOVERNOR_STATE_VERSION;
-  return normalizeGovernorState(dropSupersededTabCosts(shaped), nowMs);
+  shaped.version = 6;
+  const legacy = normalizeGovernorState(dropSupersededTabCosts(shaped), nowMs, {
+    prune: false,
+    acceptVersion: 6,
+  });
+  return legacy ? migrateLegacyGovernorReceipts(legacy, nowMs) : null;
+}
+
+function migrateLegacyGovernorReceipts(legacy, nowMs) {
+  const state = { ...legacy, version: GOVERNOR_STATE_VERSION,
+    revision: 0,
+    controlReceipts: { core: null, graphql: null },
+    debt: emptyGovernorState().debt,
+    debtGroups: {},
+    ownerGenerations: {},
+    importMarkers: {},
+    reservations: {},
+  };
+  state.probeClaims = { core: null, graphql: null };
+  for (const resource of RATE_RESOURCES) {
+    if (legacy.probeClaims[resource]) {
+      state.observers[resource] = { ...state.observers[resource], outcome: "idle", nextAt: nowMs };
+    }
+  }
+  const units = { core: 0, graphql: 0 };
+  const counts = { core: 0, graphql: 0 };
+  for (const reservation of Object.values(legacy.reservations)) {
+    for (const resource of RATE_RESOURCES) {
+      const charge = reservationCost(reservation, resource, legacy.leases, nowMs);
+      if (!Number.isSafeInteger(charge) || !Number.isSafeInteger(units[resource] + charge)) return null;
+      units[resource] += charge;
+      if (charge > 0) counts[resource] += 1;
+    }
+  }
+  if (RATE_RESOURCES.some((resource) => units[resource] > 0)) {
+    const nonce = governorId();
+    state.debtGroups[nonce] = {
+      nonce, ownerNonce: null, ownerPid: null, ownerBirth: null, bootId: coordinationBootId(),
+      unknownChild: true, sealed: true, quiescent: false,
+      units, counts, at: nowMs, barrierAt: null,
+      barrierRevisions: { core: 0, graphql: 0 },
+    };
+    for (const resource of RATE_RESOURCES) {
+      state.debt[resource].unresolvedUnits = units[resource];
+      state.debt[resource].unresolvedCount = counts[resource];
+      state.debt[resource].revision = 1;
+    }
+  }
+  return normalizeGovernorState(state, nowMs);
+}
+
+const UNKNOWN_DEBT_GROUP_ID = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+
+let cachedCoordinationBootId;
+let cachedCoordinationProcessBirth;
+function coordinationBootId() {
+  if (cachedCoordinationBootId !== undefined) return cachedCoordinationBootId;
+  try {
+    const value = process.platform === "linux"
+      ? readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim()
+      : process.platform === "darwin"
+        ? execFileSync("/usr/sbin/sysctl", ["-n", "kern.boottime"], { encoding: "utf8", timeout: 1000 }).trim()
+        : "";
+    cachedCoordinationBootId = value.length > 0 && value.length <= 128 ? value : null;
+  } catch {
+    cachedCoordinationBootId = null;
+  }
+  return cachedCoordinationBootId;
+}
+
+function coordinationProcessBirth(pid = process.pid) {
+  if (pid === process.pid && cachedCoordinationProcessBirth !== undefined) {
+    return cachedCoordinationProcessBirth;
+  }
+  let value = null;
+  try {
+    if (process.platform === "linux") {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+      value = fields[19] ?? null; // starttime is field 22, after pid and comm.
+    } else if (process.platform === "darwin") {
+      value = execFileSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], {
+        encoding: "utf8", timeout: 1000,
+      }).trim() || null;
+    }
+  } catch { /* an unavailable birth identity is explicitly unknown */ }
+  if (value && value.length > 128) value = null;
+  if (pid === process.pid) cachedCoordinationProcessBirth = value;
+  return value;
+}
+
+function debtGroupTarget(state, receipt, groupId = null) {
+  const incomingBootId = receipt.receipt?.bootId ?? coordinationBootId();
+  const count = Object.keys(state.debtGroups).length;
+  const owned = groupId ? state.debtGroups[groupId] : null;
+  if (owned && !owned.quiescent && owned.bootId === incomingBootId &&
+      (!receipt.receipt || owned.ownerNonce === null ||
+        owned.ownerNonce === receipt.receipt.ownerNonce)) return groupId;
+  if (groupId && !owned && count < GOVERNOR_MAX_DEBT_GROUPS - 1) return groupId;
+  const shared = Object.entries(state.debtGroups).find(([, group]) =>
+    !group.quiescent && group.ownerNonce === null && group.unknownChild &&
+      group.bootId === incomingBootId);
+  if (shared) return shared[0];
+  if (count >= GOVERNOR_MAX_DEBT_GROUPS) return null;
+  return state.debtGroups[UNKNOWN_DEBT_GROUP_ID] ? governorId() : UNKNOWN_DEBT_GROUP_ID;
+}
+
+function transferReceiptToDebt(state, receipt, nowMs, groupId = null) {
+  const units = Object.fromEntries(RATE_RESOURCES.map((resource) => [resource,
+    reservationCost(receipt, resource, state.leases, nowMs)]));
+  if (RATE_RESOURCES.every((resource) => units[resource] === 0)) return true;
+  const id = debtGroupTarget(state, receipt, groupId);
+  if (id === null) return false;
+  const incomingBootId = receipt.receipt?.bootId ?? coordinationBootId();
+  const dedicated = id === groupId;
+  const group = state.debtGroups[id] ?? {
+    nonce: governorId(), ownerNonce: null, ownerPid: null, ownerBirth: null,
+    bootId: incomingBootId,
+    unknownChild: !dedicated || !receipt.receipt, sealed: true, quiescent: false,
+    units: { core: 0, graphql: 0 }, counts: { core: 0, graphql: 0 },
+    at: nowMs, barrierAt: null,
+    barrierRevisions: { core: 0, graphql: 0 },
+  };
+  if (group.quiescent) return false;
+  if (receipt.receipt && dedicated) {
+    if (group.ownerNonce !== null && group.ownerNonce !== receipt.receipt.ownerNonce) return false;
+    group.ownerNonce = receipt.receipt.ownerNonce;
+    group.ownerPid = receipt.receipt.ownerPid;
+    group.ownerBirth = receipt.receipt.ownerBirth;
+    group.bootId = receipt.receipt.bootId;
+    group.unknownChild ||= receipt.receipt.dispatches.some((dispatch) =>
+      dispatch.terminalAt === null);
+  }
+  for (const resource of RATE_RESOURCES) {
+    const amount = units[resource];
+    if (!Number.isSafeInteger(amount) || amount < 0 ||
+        !Number.isSafeInteger(state.debt[resource].unresolvedUnits + amount) ||
+        !Number.isSafeInteger(group.units[resource] + amount) ||
+        !Number.isSafeInteger(state.debt[resource].unresolvedCount + (amount > 0 ? 1 : 0)) ||
+        !Number.isSafeInteger(state.debt[resource].revision + 1) ||
+        !Number.isSafeInteger(group.counts[resource] + (amount > 0 ? 1 : 0))) return false;
+  }
+  for (const resource of RATE_RESOURCES) {
+    const amount = units[resource];
+    state.debt[resource].unresolvedUnits += amount;
+    state.debt[resource].unresolvedCount += amount > 0 ? 1 : 0;
+    state.debt[resource].revision += 1;
+    group.units[resource] += amount;
+    group.counts[resource] += amount > 0 ? 1 : 0;
+  }
+  state.debtGroups[id] = group;
+  return true;
+}
+
+function makeDebtGroupQuiescent(state, group, at) {
+  for (const resource of RATE_RESOURCES) {
+    const debt = state.debt[resource];
+    if (debt.unresolvedUnits < group.units[resource] || debt.unresolvedCount < group.counts[resource] ||
+        !Number.isSafeInteger(debt.quiescentUnits + group.units[resource]) ||
+        !Number.isSafeInteger(debt.quiescentCount + group.counts[resource]) ||
+        !Number.isSafeInteger(debt.revision + 1)) return false;
+  }
+  for (const resource of RATE_RESOURCES) {
+    const debt = state.debt[resource];
+    debt.unresolvedUnits -= group.units[resource];
+    debt.unresolvedCount -= group.counts[resource];
+    debt.quiescentUnits += group.units[resource];
+    debt.quiescentCount += group.counts[resource];
+    debt.revision += 1;
+  }
+  group.quiescent = true;
+  group.barrierAt = at;
+  group.barrierRevisions = Object.fromEntries(RATE_RESOURCES.map((resource) => [
+    resource, state.debt[resource].revision,
+  ]));
+  return true;
+}
+
+function retireControlReceiptToDebt(state, resource, at) {
+  const control = state.controlReceipts[resource];
+  if (!control) return true;
+  // A control receipt without an issued dispatch cannot have started HTTP.
+  // Removing it also fences a late owner before it can issue a child.
+  if (control.receipt.dispatches.length === 0) {
+    state.controlReceipts[resource] = null;
+    return true;
+  }
+  const generation = control.receipt.generation;
+  if (!transferReceiptToDebt(state, control, at, generation)) return false;
+  const group = state.debtGroups[generation];
+  if (group && !group.unknownChild && group.ownerPid !== null &&
+      group.ownerBirth !== null && group.bootId !== null &&
+      !makeDebtGroupQuiescent(state, group, at)) return false;
+  state.controlReceipts[resource] = null;
+  return true;
+}
+
+function reconcileBootDebt(state, at) {
+  const bootId = coordinationBootId();
+  if (bootId === null) return { ok: true, changed: false };
+  let changed = false;
+  for (const group of Object.values(state.debtGroups)) {
+    if (group.quiescent || group.bootId === null || group.bootId === bootId) continue;
+    if (!makeDebtGroupQuiescent(state, group, at)) {
+      return { ok: false, reason: "accounting-overflow" };
+    }
+    changed = true;
+  }
+  return { ok: true, changed };
+}
+
+function compactGovernorReceipts(state, nowMs) {
+  const sealed = new Set();
+  const full = Object.keys(state.reservations).length >= GOVERNOR_MAX_RESERVATIONS;
+  let changed = false;
+  const dueGenerations = new Set(Object.values(state.reservations)
+    .filter((reservation) => reservation.receipt && (
+      reservation.status === "started" && reservation.receipt.deadline <= nowMs ||
+      full && reservation.status === "completed"))
+    .map((reservation) => reservation.receipt.generation));
+  // A full debt journal must not prevent a claimed observer from retiring
+  // older quiescent groups. Keep the detailed receipts until space is proven.
+  const candidates = Object.values(state.reservations).filter((reservation) => {
+    const groupId = reservation.receipt?.generation ?? null;
+    return (full && reservation.status === "completed" && !reservation.receipt ||
+      groupId && dueGenerations.has(groupId) &&
+        !(reservation.status === "started" && reservation.receipt.dispatches.length === 0)) &&
+      RATE_RESOURCES.some((resource) =>
+        reservationCost(reservation, resource, state.leases, nowMs) > 0);
+  });
+  if (candidates.length > 0) {
+    const trial = structuredClone(state);
+    for (const reservation of candidates) {
+      const groupId = reservation.receipt?.generation ?? null;
+      if (debtGroupTarget(trial, reservation, groupId) === null) return { ok: true, changed: false };
+      if (!transferReceiptToDebt(trial, reservation, nowMs, groupId)) {
+        return { ok: false, reason: "accounting-overflow" };
+      }
+    }
+  }
+  if (full) {
+    for (const [id, reservation] of Object.entries(state.reservations)) {
+      if (reservation.status !== "completed" || reservation.receipt) continue;
+      if (!transferReceiptToDebt(state, reservation, nowMs)) {
+        return { ok: false, reason: "accounting-overflow" };
+      }
+      delete state.reservations[id];
+      changed = true;
+    }
+  }
+  for (const reservation of Object.values(state.reservations)) {
+    if (reservation.receipt && (
+      reservation.status === "started" && reservation.receipt.deadline <= nowMs ||
+      full && reservation.status === "completed")) {
+      sealed.add(reservation.receipt.generation);
+    }
+  }
+  if (sealed.size === 0) {
+    if (changed) retireOwnerGenerations(state);
+    return { ok: true, changed };
+  }
+  // Seal the complete owner generation. A late completion of one receipt cannot
+  // make another already-authorized child in that generation disappear.
+  for (const generation of sealed) {
+    for (const [id, reservation] of Object.entries(state.reservations)) {
+      if (reservation.receipt?.generation !== generation) continue;
+      if (!(reservation.status === "started" && reservation.receipt.dispatches.length === 0) &&
+          !transferReceiptToDebt(state, reservation, nowMs, generation)) {
+        return { ok: false, reason: "accounting-overflow" };
+      }
+      delete state.reservations[id];
+      state.ownerGenerations[reservation.leaseId] = governorId();
+    }
+    const group = state.debtGroups[generation];
+    if (group && !group.unknownChild && group.ownerPid !== null &&
+        group.ownerBirth !== null && group.bootId !== null &&
+        !makeDebtGroupQuiescent(state, group, nowMs)) {
+      return { ok: false, reason: "accounting-overflow" };
+    }
+  }
+  retireOwnerGenerations(state);
+  return { ok: true, changed: true };
 }
 
 function migrateV1GovernorState(raw, nowMs) {
@@ -4058,7 +4704,7 @@ function migrateV1GovernorState(raw, nowMs) {
     "intents", "reservations", "manualProbe",
   ]) || raw.version !== 1 || !isRecord(raw.budgets) || !isRecord(raw.reservations)) return null;
   const migrated = structuredClone(raw);
-  migrated.version = GOVERNOR_STATE_VERSION;
+  migrated.version = 6;
   migrated.observers = { core: { etag: null, outcome: "idle", at: 0, nextAt: 0 } };
   // The v1 core value came from /rate_limit, which is not authoritative. Do not
   // preserve it as bootstrap evidence. GraphQL remains valid.
@@ -4086,7 +4732,8 @@ function migrateV1GovernorState(raw, nowMs) {
   ]));
   migrated.probeClaims = Object.fromEntries(RATE_RESOURCES.map((resource) => [resource, null]));
   migrated.fairness = { manualStreak: 0 };
-  return normalizeGovernorState(migrated, nowMs);
+  const legacy = normalizeGovernorState(migrated, nowMs, { prune: false, acceptVersion: 6 });
+  return legacy ? migrateLegacyGovernorReceipts(legacy, nowMs) : null;
 }
 
 function readGovernorState(path, nowMs, { persistMigration = true } = {}) {
@@ -4099,11 +4746,21 @@ function readGovernorState(path, nowMs, { persistMigration = true } = {}) {
       : { ok: false, reason: "unwritable" };
   }
   try {
+    if (Buffer.byteLength(raw) > GOVERNOR_MAX_LEDGER_BYTES) return { ok: false, reason: "capacity" };
     const parsed = JSON.parse(raw);
     const normalized = normalizeGovernorState(parsed, nowMs);
     if (normalized) return { ok: true, value: normalized };
     const migrated = migrateGovernorState(parsed, nowMs);
     if (!migrated) return { ok: false, reason: "corrupt" };
+    if (persistMigration && parsed.version === 6) {
+      const backupPath = `${path}.pre-v7.backup`;
+      try {
+        writeFileSync(backupPath, raw, { encoding: "utf8", mode: 0o600, flag: "wx" });
+        chmodSync(backupPath, 0o600);
+      } catch (error) {
+        if (error?.code !== "EEXIST") return { ok: false, reason: "unwritable" };
+      }
+    }
     if (!persistMigration) return { ok: true, value: migrated, migrated: true };
     // Read-only callers persist the exact migration while they still hold the
     // scope lock. Mutating callers use this same value for their final write.
@@ -4118,13 +4775,25 @@ function writeGovernorState(path, state) {
   const parent = dirname(path);
   let tempPath = null;
   try {
+    if (state?.version === GOVERNOR_STATE_VERSION) {
+      if (!Number.isSafeInteger(state.revision) || state.revision === Number.MAX_SAFE_INTEGER) {
+        return { ok: false, reason: "accounting-overflow" };
+      }
+      state.revision += 1;
+    }
+    const serialized = serializeGovernorState(state);
+    if (state?.version === GOVERNOR_STATE_VERSION &&
+        Buffer.byteLength(serialized) > GOVERNOR_MAX_LEDGER_BYTES) {
+      return { ok: false, reason: "capacity" };
+    }
     mkdirSync(parent, { recursive: true, mode: 0o700 });
     chmodSync(parent, 0o700);
     tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
-    writeFileSync(tempPath, serializeGovernorState(state), { encoding: "utf8", mode: 0o600, flag: "wx" });
+    writeFileSync(tempPath, serialized, { encoding: "utf8", mode: 0o600, flag: "wx" });
     chmodSync(tempPath, 0o600);
+    // The private temporary inode already has mode 0600. Rename is the commit
+    // point: no fallible operation may report failure after state replacement.
     renameSync(tempPath, path);
-    chmodSync(path, 0o600);
     return { ok: true };
   } catch {
     if (tempPath !== null) {
@@ -4132,6 +4801,15 @@ function writeGovernorState(path, state) {
     }
     return { ok: false, reason: "unwritable" };
   }
+}
+
+function writeGovernorQuotaState(path, state, nowMs) {
+  const normalized = normalizeGovernorState(state, nowMs, { prune: false });
+  if (!normalized) return { ok: false, reason: "corrupt" };
+  if (!governorAccountingSafe(normalized, nowMs)) {
+    return { ok: false, reason: "accounting-overflow" };
+  }
+  return writeGovernorState(path, normalized);
 }
 
 function lockOwner(path) {
@@ -4443,9 +5121,18 @@ function mutateGovernor(scope, nowMs, mutate) {
     const loaded = readGovernorState(scope.path, at, { persistMigration: false });
     if (!loaded.ok) return loaded;
     const state = loaded.value;
+    if (!governorAccountingSafe(state, at)) return { ok: false, reason: "accounting-overflow" };
+    const oldBootReconciled = reconcileBootDebt(state, at);
+    if (!oldBootReconciled.ok) return oldBootReconciled;
+    const compacted = compactGovernorReceipts(state, at);
+    if (!compacted.ok) return compacted;
+    const bootReconciled = reconcileBootDebt(state, at);
+    if (!bootReconciled.ok) return bootReconciled;
     // A mutator can reject without writing. Keep an untouched migration so
     // that even that path upgrades the file once before releasing the lock.
-    const migration = loaded.migrated ? structuredClone(state) : null;
+    const migration = loaded.migrated || compacted.changed ||
+      oldBootReconciled.changed || bootReconciled.changed
+      ? structuredClone(state) : null;
     const returnAfterMigration = (result) => {
       if (migration === null) return result;
       const written = writeGovernorState(scope.path, migration);
@@ -4453,6 +5140,7 @@ function mutateGovernor(scope, nowMs, mutate) {
     };
     const value = mutate(state, at);
     if (value?.ok === false && value.write !== true) return returnAfterMigration(value);
+    if (!governorAccountingSafe(state, at)) return returnAfterMigration({ ok: false, reason: "accounting-overflow" });
     const normalized = normalizeGovernorState(state, at);
     if (!normalized) return returnAfterMigration({ ok: false, reason: "corrupt" });
     const written = writeGovernorState(scope.path, normalized);
@@ -4481,7 +5169,7 @@ const GOVERNOR_MAX_ATOMIC_COST = Math.max(...Object.values(OPERATION_COSTS)
 function returnPacingCredit(state, resource, unusedCost, nowMs) {
   const budget = state.budgets[resource];
   if (!budget || !(unusedCost > 0)) return;
-  const decision = resourceDecision({ budget, resource, nowMs, cost: 0, chargedCost: 0 });
+  const decision = governorResourceDecision(state, resource, nowMs, 0);
   const callsPerMs = decision?.callsPerMs;
   if (!Number.isFinite(callsPerMs) || callsPerMs <= 0) return;
   const credit = Math.min(unusedCost, GOVERNOR_MAX_ATOMIC_COST) / callsPerMs;
@@ -4544,6 +5232,10 @@ function scheduleGovernorState(state, nowMs) {
     leases: state.leases,
     budgets: state.budgets,
     reservations: Object.entries(state.reservations).map(([id, reservation]) => ({ id, ...reservation })),
+    debtCosts: Object.fromEntries(RATE_RESOURCES.map((resource) => [resource,
+      state.debt[resource].unresolvedUnits + state.debt[resource].quiescentUnits +
+      reservationCost(state.controlReceipts[resource], resource, state.leases, nowMs),
+    ])),
     lanes,
     cursors,
     nowMs,
@@ -4572,6 +5264,7 @@ function scheduleGovernorState(state, nowMs) {
       startedAt: null,
       completedAt: null,
       outcome: null,
+      receipt: null,
     };
     reservationCount += 1;
     delete state.intents[grant.intentId];
@@ -4676,6 +5369,13 @@ function claimProbe(scope, leaseId, nowMs, resource) {
       dueAtCoreReset,
     );
     if (nextAt > at) return { value: { status: "waiting", nextAt } };
+    if (resource === "graphql" && state.controlReceipts.graphql) {
+      // The old claim's lease has expired. Keep an issued child charged as
+      // debt, and fence the old capability so a new observer can make progress.
+      if (!retireControlReceiptToDebt(state, "graphql", at)) {
+        return { ok: false, reason: "accounting-overflow" };
+      }
+    }
     const nonce = randomUUID();
     const startedReservationIds = Object.entries(state.reservations)
       // An expired owner can no longer settle its request. Keep that uncertain
@@ -4686,6 +5386,36 @@ function claimProbe(scope, leaseId, nowMs, resource) {
         state.leases[reservation.leaseId]?.expiresAt > at &&
         reservationCost(reservation, resource, state.leases, at) > 0)
       .map(([id]) => id);
+    const quiescentGroups = Object.values(state.debtGroups).filter((group) =>
+      group.quiescent && group.barrierAt < at &&
+      (group.units[resource] > 0 || group.counts[resource] > 0));
+    const barrierAt = Math.max(0, ...quiescentGroups.map((group) => group.barrierAt));
+    const debtUnits = quiescentGroups.reduce((sum, group) => sum + group.units[resource], 0);
+    const debtCount = quiescentGroups.reduce((sum, group) => sum + group.counts[resource], 0);
+    if (!Number.isSafeInteger(debtUnits) || !Number.isSafeInteger(debtCount)) {
+      return { ok: false, reason: "accounting-overflow" };
+    }
+    const debtSnapshot = {
+      units: debtUnits,
+      count: debtCount,
+      barrierAt,
+      revision: state.debt[resource].revision,
+    };
+    if (resource === "graphql") {
+      state.controlReceipts.graphql = {
+        leaseId, intentId: nonce, costs: { core: 0, graphql: GRAPHQL_OBSERVER_POINTS },
+        actualCosts: null, accountedCosts: { core: 0, graphql: 0 },
+        notBefore: at, status: "started",
+        epochs: { core: null, graphql: state.epochs.graphql },
+        startedAt: at, completedAt: null, outcome: null,
+        receipt: {
+          scopeHash: scope.hash, ownerNonce: governorId(), generation: governorId(),
+          ownerPid: process.pid, ownerBirth: coordinationProcessBirth(), bootId: coordinationBootId(),
+          deadline: at + ACQUISITION_STARTED_DEADLINE_MS,
+          allowance: { core: 0, graphql: GRAPHQL_OBSERVER_POINTS }, dispatches: [],
+        },
+      };
+    }
     state.probeClaims[resource] = {
       ownerLeaseId: leaseId,
       nonce,
@@ -4693,6 +5423,7 @@ function claimProbe(scope, leaseId, nowMs, resource) {
       nextAt: at,
       claimAt: at,
       startedReservationIds,
+      debtSnapshot,
     };
     state.observers[resource].outcome = "waiting";
     state.observers[resource].at = at;
@@ -4704,6 +5435,13 @@ function claimProbe(scope, leaseId, nowMs, resource) {
       leaseUntil: state.probeClaims[resource].leaseUntil,
       startedReservationIds,
       coreEtag: state.observers[resource].etag,
+      ...(resource === "graphql" ? { receiptCapability: {
+        reservationId: "control:graphql", controlResource: "graphql", leaseId,
+        scopeHash: scope.hash,
+        ownerNonce: state.controlReceipts.graphql.receipt.ownerNonce,
+        generation: state.controlReceipts.graphql.receipt.generation,
+        deadline: state.controlReceipts.graphql.receipt.deadline,
+      } } : {}),
     } };
   });
 }
@@ -4785,6 +5523,34 @@ function budgetFromObservation(raw, previous, nowMs, {
   return { status: "accepted", budget: next, epochChanged };
 }
 
+function retireClaimedQuiescentDebt(state, resource, claim) {
+  const snapshot = claim.debtSnapshot;
+  if (snapshot.units === 0 && snapshot.count === 0) return true;
+  if (claim.claimAt <= snapshot.barrierAt) return true;
+  const eligible = Object.entries(state.debtGroups).filter(([, group]) =>
+    group.quiescent && group.barrierAt < claim.claimAt &&
+    group.barrierRevisions[resource] <= snapshot.revision &&
+    (group.units[resource] > 0 || group.counts[resource] > 0));
+  const units = eligible.reduce((total, [, group]) => total + group.units[resource], 0);
+  const count = eligible.reduce((total, [, group]) => total + group.counts[resource], 0);
+  const debt = state.debt[resource];
+  if (!Number.isSafeInteger(units) || !Number.isSafeInteger(count) ||
+      units !== snapshot.units || count !== snapshot.count ||
+      debt.quiescentUnits < units || debt.quiescentCount < count ||
+      !Number.isSafeInteger(debt.revision + 1)) return false;
+  debt.quiescentUnits -= units;
+  debt.quiescentCount -= count;
+  debt.revision += 1;
+  for (const [id, group] of eligible) {
+    group.units[resource] = 0;
+    group.counts[resource] = 0;
+    if (RATE_RESOURCES.every((name) => group.units[name] === 0 && group.counts[name] === 0)) {
+      delete state.debtGroups[id];
+    }
+  }
+  return true;
+}
+
 function publishProbe(scope, leaseId, nonce, budgets, nowMs, resource) {
   return mutateGovernor(scope, nowMs, (state, at) => {
     const claim = state.probeClaims[resource];
@@ -4833,6 +5599,9 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs, resource) {
       }
     }
     if (changedResources.length === 0) return { ok: false, reason: "corrupt" };
+    if (!retireClaimedQuiescentDebt(state, resource, claim)) {
+      return { ok: false, reason: "accounting-overflow" };
+    }
     const completedBeforeClaim = Object.entries(state.reservations)
       .filter(([, reservation]) =>
         reservation.status === "completed" && reservation.completedAt < claim.claimAt);
@@ -4884,6 +5653,9 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs, resource) {
     state.budgets = nextBudgets;
     state.epochs = nextEpochs;
     state.probeClaims[resource] = null;
+    if (resource === "graphql" && state.controlReceipts.graphql?.intentId === nonce) {
+      state.controlReceipts.graphql = null;
+    }
     {
       const published = nextBudgets[resource];
       state.observers[resource] = {
@@ -4944,6 +5716,15 @@ function failProbeClaim(scope, leaseId, nonce, nowMs, resource) {
     // also marked core failed would erase authority core had legitimately
     // established, and stall a lane with nothing wrong with it.
     state.probeClaims[resource] = null;
+    if (resource === "graphql" && state.controlReceipts.graphql?.intentId === nonce) {
+      const control = state.controlReceipts.graphql;
+      if (control.receipt.dispatches.length === 0) state.controlReceipts.graphql = null;
+      else if (control.receipt.dispatches.every((dispatch) => dispatch.terminalAt !== null)) {
+        if (!retireControlReceiptToDebt(state, "graphql", at)) {
+          return { ok: false, reason: "accounting-overflow" };
+        }
+      }
+    }
     state.observers[resource] = {
       ...state.observers[resource],
       outcome: "failed",
@@ -5118,7 +5899,8 @@ function startReservation(scope, reservationId, nowMs) {
       }
       const charged = Object.values(state.reservations).reduce(
         (total, item) => total + reservationCost(item, resource, state.leases, at),
-        0,
+        state.debt[resource].unresolvedUnits + state.debt[resource].quiescentUnits +
+          reservationCost(state.controlReceipts[resource], resource, state.leases, at),
       );
       if (budget.remaining - resourceReserve(budget.limit) - charged < 0) {
         reservation.status = "cancelled";
@@ -5127,41 +5909,202 @@ function startReservation(scope, reservationId, nowMs) {
     }
     reservation.status = "started";
     reservation.startedAt = at;
-    return { value: { status: "started", reservationId } };
+    const generation = state.ownerGenerations[reservation.leaseId] ?? governorId();
+    state.ownerGenerations[reservation.leaseId] = generation;
+    reservation.receipt = {
+      scopeHash: scope.hash,
+      ownerNonce: generation,
+      generation,
+      ownerPid: process.pid,
+      ownerBirth: coordinationProcessBirth(),
+      bootId: coordinationBootId(),
+      deadline: at + ACQUISITION_STARTED_DEADLINE_MS,
+      allowance: { ...reservation.costs },
+      dispatches: [],
+    };
+    return { value: { status: "started", reservationId,
+      receiptCapability: receiptCapabilityFromReservation(reservationId, reservation) } };
+  });
+}
+
+function mutateReceiptDispatch(scope, capability, nowMs, mutate) {
+  if (!capability || capability.scopeHash !== scope?.hash ||
+      !validGovernorId(capability.ownerNonce) || !validGovernorId(capability.generation) ||
+      !validGovernorId(capability.leaseId) ||
+      typeof capability.reservationId !== "string") return { ok: false, reason: "receipt-invalid" };
+  return mutateGovernor(scope, nowMs, (state, at) => {
+    const controlResource = capability.controlResource;
+    if (controlResource !== undefined && !RATE_RESOURCES.includes(controlResource)) {
+      return { ok: false, reason: "receipt-invalid" };
+    }
+    const reservation = controlResource
+      ? state.controlReceipts[controlResource] : state.reservations[capability.reservationId];
+    const receipt = reservation?.receipt;
+    if (!receipt || receipt.scopeHash !== capability.scopeHash ||
+        receipt.ownerNonce !== capability.ownerNonce || receipt.generation !== capability.generation ||
+        reservation.leaseId !== capability.leaseId || receipt.deadline !== capability.deadline) {
+      return { ok: false, reason: "compacted" };
+    }
+    return mutate(state, reservation, receipt, at);
+  });
+}
+
+function issueGovernorDispatch(scope, capability, operation, nowMs) {
+  const costs = operationCost(operation);
+  if (!costs) return { ok: false, reason: "undeclared" };
+  if ([...terminalizationBacklog.keys()].filter((key) =>
+    key.startsWith(`${scope?.hash}:`)).length >= GOVERNOR_MAX_RESERVATIONS) {
+    return { ok: false, reason: "completion-capacity" };
+  }
+  return mutateReceiptDispatch(scope, capability, nowMs, (state, reservation, receipt, at) => {
+    if (reservation.status !== "started" || receipt.deadline <= at ||
+        (!capability.controlResource && (
+          state.ownerGenerations[reservation.leaseId] !== receipt.generation ||
+          state.leases[reservation.leaseId]?.expiresAt <= at ||
+          !state.leases[reservation.leaseId]))) return { ok: false, reason: "receipt-expired" };
+    const issued = { core: 0, graphql: 0 };
+    for (const dispatch of receipt.dispatches) {
+      for (const resource of RATE_RESOURCES) issued[resource] += dispatch.costs[resource];
+    }
+    if (RATE_RESOURCES.some((resource) =>
+      !Number.isSafeInteger(issued[resource] + costs[resource]) ||
+      issued[resource] + costs[resource] > receipt.allowance[resource])) {
+      return { ok: false, reason: "receipt-allowance" };
+    }
+    const sequence = receipt.dispatches.length + 1;
+    if (sequence > 32) return { ok: false, reason: "receipt-allowance" };
+    receipt.dispatches.push({ sequence, operation, costs: { ...costs },
+      issuedAt: at, terminalAt: null, childPid: null, childBirth: null, neverStarted: false });
+    return { value: { sequence, deadline: receipt.deadline } };
+  });
+}
+
+function markGovernorDispatchChild(scope, capability, sequence, pid, nowMs) {
+  if (!Number.isSafeInteger(pid) || pid < 1) return { ok: false, reason: "child-unknown" };
+  return mutateReceiptDispatch({ ...scope, identityProvider: null }, capability, nowMs,
+    (_state, _reservation, receipt) => {
+      const dispatch = receipt.dispatches[sequence - 1];
+      if (!dispatch || dispatch.sequence !== sequence) return { ok: false, reason: "compacted" };
+      dispatch.childPid = pid;
+      dispatch.childBirth = coordinationProcessBirth(pid);
+      return { value: { status: "recorded" } };
+    });
+}
+
+function terminalGovernorDispatch(scope, capability, sequence, nowMs, { neverStarted = false } = {}) {
+  return mutateReceiptDispatch({ ...scope, identityProvider: null }, capability, nowMs,
+    (_state, _reservation, receipt, at) => {
+      const dispatch = receipt.dispatches[sequence - 1];
+      if (!dispatch || dispatch.sequence !== sequence) return { ok: false, reason: "compacted" };
+      if (neverStarted && dispatch.childPid !== null) return { ok: false, reason: "child-started" };
+      if (dispatch.terminalAt === null) {
+        dispatch.terminalAt = at;
+        dispatch.neverStarted = neverStarted;
+      }
+      return { value: { status: "terminal" } };
+    });
+}
+
+const activeOwnerDispatches = new Map();
+function ownerDispatchKey(scope, capability) {
+  return `${scope.hash}:${capability.generation}`;
+}
+
+function acknowledgeSealedGeneration(scope, capability, sealedNonce, nowMs) {
+  const key = ownerDispatchKey(scope, capability);
+  if ((activeOwnerDispatches.get(key) ?? 0) !== 0) return { ok: false, reason: "children-active" };
+  return mutateGovernor({ ...scope, identityProvider: null }, nowMs, (state, at) => {
+    const group = state.debtGroups[capability.generation];
+    if (!group) return { value: { status: "absent" } };
+    if (group.nonce !== sealedNonce) return { ok: false, reason: "stale" };
+    if (group.quiescent) return { value: { status: "acknowledged", nonce: group.nonce } };
+    if (!group.ownerNonce || group.ownerNonce !== capability.ownerNonce ||
+        !group.ownerBirth || !group.bootId ||
+        group.ownerPid !== process.pid || group.ownerBirth !== coordinationProcessBirth() ||
+        group.bootId !== coordinationBootId() ||
+        Object.values(state.reservations).some((reservation) =>
+          reservation.receipt?.generation === capability.generation)) {
+      return { ok: false, reason: "quiescence-unverified" };
+    }
+    if (!makeDebtGroupQuiescent(state, group, at)) return { ok: false, reason: "accounting-overflow" };
+    return { value: { status: "acknowledged", nonce: group.nonce } };
   });
 }
 
 function completeReservation(scope, reservationId, completion, nowMs) {
-  return mutateGovernor(scope, nowMs, (state, at) => {
-    const reservation = state.reservations[reservationId];
-    if (!reservation || reservation.status !== "started" || !GOVERNOR_OUTCOMES.has(completion?.outcome)) {
-      return { ok: false, reason: "stale" };
+  const reservation = inspectGovernor({ ...scope, identityProvider: null }, nowMs);
+  if (!reservation.ok) return reservation;
+  const leaseId = reservation.value.reservations[reservationId]?.leaseId;
+  if (!leaseId) return { ok: false, reason: "stale" };
+  return settleReservationWithBudgetObservations(scope, leaseId, reservationId, {
+    ...completion,
+    ...(completion.actualCost ? { actualCosts: completion.actualCost } : {}),
+    observations: [],
+  }, nowMs);
+}
+
+function terminalizeReservation(scope, capability, completion, nowMs) {
+  if (!capability?.reservationId || !capability.leaseId) {
+    return { ok: false, reason: "blocked", status: "blocked" };
+  }
+  const result = settleReservationWithBudgetObservations(
+    { ...scope, identityProvider: null }, capability.leaseId,
+    capability.reservationId, { ...completion, capability }, nowMs,
+  );
+  if (result.ok) return { ok: true, value: { ...result.value, status: "settled" } };
+  const status = ["busy", "unwritable"].includes(result.reason) ? "retryable"
+    : result.reason === "stale" ? "compacted" : "blocked";
+  return { ...result, status };
+}
+
+const terminalizationBacklog = new Map();
+function terminalizationBacklogForResource(backlog, scopeHash, resource) {
+  if (!scopeHash) return 0;
+  let count = 0;
+  for (const item of backlog.values()) {
+    if (item.scope.hash !== scopeHash) continue;
+    if (item.capability?.costs?.[resource] > 0 ||
+        !RATE_RESOURCES.some((name) => item.capability?.costs?.[name] > 0)) count += 1;
+  }
+  return count;
+}
+function receiptCapabilityFromReservation(reservationId, reservation) {
+  if (!reservation?.receipt || !reservation?.costs) return null;
+  return {
+    reservationId, leaseId: reservation.leaseId,
+    scopeHash: reservation.receipt.scopeHash,
+    ownerNonce: reservation.receipt.ownerNonce,
+    generation: reservation.receipt.generation,
+    deadline: reservation.receipt.deadline,
+    costs: { ...reservation.costs },
+  };
+}
+function queueTerminalization(scope, capability, completion, now = Date.now) {
+  const frozen = { ...scope, identityProvider: null };
+  const key = `${scope.hash}:${capability?.reservationId ?? "invalid"}`;
+  const first = terminalizeReservation(frozen, capability, completion, now());
+  if (first.ok || first.status !== "retryable") return first;
+  if (terminalizationBacklog.has(key)) return first;
+  if ([...terminalizationBacklog.keys()].filter((existing) =>
+    existing.startsWith(`${scope.hash}:`)).length >= GOVERNOR_MAX_RESERVATIONS) {
+    return { ok: false, reason: "completion-capacity", status: "blocked" };
+  }
+  const item = { scope: frozen, capability, completion, now, attempt: 0, timer: null };
+  const retry = () => {
+    const result = terminalizeReservation(item.scope, item.capability, item.completion, item.now());
+    if (result.ok || result.status !== "retryable") {
+      terminalizationBacklog.delete(key);
+      return;
     }
-    const suppliedActual = completion.actualCost === undefined
-      ? null : exactResourceCosts(completion.actualCost);
-    if (completion.actualCost !== undefined && !suppliedActual) return { ok: false, reason: "corrupt" };
-    const measured = completion.outcome === "measured-success"
-      ? suppliedActual
-      : reservation.costs;
-    if (!measured || RATE_RESOURCES.some((resource) => measured[resource] > reservation.costs[resource])) {
-      return { ok: false, reason: "corrupt" };
-    }
-    reservation.status = "completed";
-    reservation.completedAt = at;
-    reservation.outcome = completion.outcome;
-    reservation.actualCosts = { ...measured };
-    reservation.accountedCosts = { core: 0, graphql: 0 };
-    // The same rule as the observing settlement path: this one narrows the
-    // charge in exactly the same way, so it releases the pacing in exactly the
-    // same way. Wiring it into only one of the two settlement paths left every
-    // doctor probe and manual operation paying for capacity it did not use.
-    if (completion.outcome === "measured-success") {
-      for (const resource of RATE_RESOURCES) {
-        returnPacingCredit(state, resource, reservation.costs[resource] - measured[resource], at);
-      }
-    }
-    return { value: { status: "completed", actualCosts: reservation.actualCosts } };
-  });
+    const delays = [1000, 2000, 4000, 5000];
+    const delay = delays[Math.min(item.attempt++, delays.length - 1)];
+    item.timer = setTimeout(retry, delay + Math.floor(Math.random() * 100));
+    item.timer.unref?.();
+  };
+  terminalizationBacklog.set(key, item);
+  item.timer = setTimeout(retry, 1000);
+  item.timer.unref?.();
+  return first;
 }
 
 function settleReservationWithBudgetObservations(
@@ -5173,13 +6116,33 @@ function settleReservationWithBudgetObservations(
 ) {
   return mutateGovernor(scope, nowMs, (state, at) => {
     const reservation = state.reservations[reservationId];
-    const lease = state.leases[leaseId];
+    if (reservation?.status === "completed" && reservation.leaseId === leaseId &&
+        (!completion?.capability ||
+          completion.capability.ownerNonce === reservation.receipt?.ownerNonce &&
+          completion.capability.generation === reservation.receipt?.generation)) {
+      return { value: { status: "completed", actualCosts: reservation.actualCosts,
+        accountedCosts: reservation.accountedCosts } };
+    }
     if (
-      !lease || lease.expiresAt <= at || !reservation ||
+      !reservation ||
       reservation.leaseId !== leaseId || reservation.status !== "started" ||
       !GOVERNOR_OUTCOMES.has(completion?.outcome)
     ) return { ok: false, reason: "stale" };
-    const measured = completion.outcome === "measured-success"
+    if (completion.capability && (completion.capability.scopeHash !== scope.hash ||
+        completion.capability.reservationId !== reservationId ||
+        completion.capability.leaseId !== leaseId ||
+        completion.capability.ownerNonce !== reservation.receipt?.ownerNonce ||
+        completion.capability.generation !== reservation.receipt?.generation ||
+        completion.capability.deadline !== reservation.receipt?.deadline)) {
+      return { ok: false, reason: "receipt-invalid" };
+    }
+    const neverIssued = completion.capability && (
+      completion.neverStarted === true && reservation.receipt.dispatches.length === 0 ||
+      reservation.receipt.dispatches.length > 0 &&
+        reservation.receipt.dispatches.every((dispatch) => dispatch.neverStarted));
+    const outcome = neverIssued ? "measured-success" : completion.outcome;
+    const measured = neverIssued ? { core: 0, graphql: 0 }
+      : outcome === "measured-success"
       ? exactResourceCosts(completion.actualCosts ?? completion.actualCost)
       : reservation.costs;
     if (!measured || RATE_RESOURCES.some((resource) => measured[resource] > reservation.costs[resource])) {
@@ -5231,17 +6194,17 @@ function settleReservationWithBudgetObservations(
     }
     reservation.status = "completed";
     reservation.completedAt = at;
-    reservation.outcome = completion.outcome;
+    reservation.outcome = outcome;
     reservation.actualCosts = { ...measured };
     reservation.accountedCosts = Object.fromEntries(RATE_RESOURCES.map((resource) => [
       resource,
-      completion.outcome === "measured-success"
+      outcome === "measured-success"
         ? Math.min(measured[resource], acceptedCosts[resource])
         : 0,
     ]));
     for (const resource of RATE_RESOURCES) {
       const budget = state.budgets[resource];
-      if (!budget || completion.outcome !== "measured-success") continue;
+      if (!budget || outcome !== "measured-success") continue;
       // accountedCosts removes the portion already present in an authoritative
       // counter from the reservation residual. knownLocalUsed contains only
       // that same portion when it arrived after the factor baseline. Their sum
@@ -5255,7 +6218,7 @@ function settleReservationWithBudgetObservations(
     // loss proves nothing, so its worst case stays charged and its pacing stays
     // spent -- refunding there would let a run of timeouts pace as though
     // nothing had been sent.
-    if (completion.outcome === "measured-success") {
+    if (outcome === "measured-success") {
       for (const resource of RATE_RESOURCES) {
         returnPacingCredit(state, resource, reservation.costs[resource] - measured[resource], at);
       }
@@ -5339,6 +6302,40 @@ function governorHealth(result, nowMs = Date.now()) {
       }]] : [];
     })),
   };
+}
+
+// Plain doctor must not call the identity coordinator: even its inspection
+// path may retire old registry attempts and persist the resulting registry.
+// A cached identity is useful only when it identifies one quota account for
+// the requested host. Multiple accounts cannot be resolved without probing.
+function doctorCachedQuotaScope(host, { root = identityRegistryRoot(), nowMs = Date.now() } = {}) {
+  const registryPath = join(root, "registry.json");
+  let registry;
+  try {
+    const file = lstatSync(registryPath);
+    if (!file.isFile() || file.size > GOVERNOR_MAX_LEDGER_BYTES) return { ok: false, reason: "unsafe registry" };
+    const parsed = JSON.parse(readFileSync(registryPath, "utf8"));
+    registry = normalizeIdentityRegistry(parsed, parsed.version === 1 ? 1 : IDENTITY_VERSION);
+  } catch (error) {
+    return { ok: false, reason: error?.code === "ENOENT" ? "cached identity missing" : "cached registry unreadable" };
+  }
+  if (!registry) return { ok: false, reason: "cached registry corrupt" };
+  const quotas = new Set(Object.values(registry.identities)
+    .filter((identity) => identity.host === host)
+    .map((identity) => identity.quotaKey));
+  if (quotas.size === 0) return { ok: false, reason: "cached identity missing" };
+  if (quotas.size !== 1) return { ok: false, reason: "ambiguous cached identities" };
+  const quotaKey = quotas.values().next().value;
+  const path = join(root, `quota-${quotaKey}.json`);
+  try {
+    if (!lstatSync(path).isFile()) return { ok: false, reason: "unsafe quota path", path };
+  } catch (error) {
+    return { ok: false, reason: error?.code === "ENOENT" ? "cached quota missing" : "cached quota unreadable", path };
+  }
+  const result = readGovernorState(path, nowMs, { persistMigration: false });
+  return result.ok && !result.missing
+    ? { ok: true, result, path, quotaKey }
+    : { ok: false, reason: result.missing ? "cached quota missing" : result.reason, path };
 }
 
 async function retryGovernorMutation(run, { now, wait, deadline, signal }) {
@@ -5470,7 +6467,8 @@ async function refreshResourceBudget(scope, leaseId, signal, resource, {
   let budgets;
   try {
     try { onObserverCall?.(resource); } catch { /* diagnostics cannot block a budget observer */ }
-    budgets = await requestIdentityStorage.run(scope, () => readBudgets(signal, scope.host, {
+    budgets = await requestIdentityStorage.run({ ...scope,
+      controlReceiptCapability: claim.value.receiptCapability }, () => readBudgets(signal, scope.host, {
       resources: [resource],
       coreEtag,
       renewClaim: async () => {
@@ -6074,7 +7072,7 @@ const SSH_RECONNECT_STEPS_MS = Object.freeze([1_000, 2_000, 4_000, 8_000, 16_000
 const SSH_STDERR_MAX_BYTES = 4_096;
 const SSH_ALIAS_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/;
 const COLLECTOR_HOLD_REASONS = new Set([
-  "observer", "primary", "secondary", "disconnected", "coordination", "shared-wait", "cache-only",
+  "observer", "primary", "secondary", "disconnected", "app-auth", "coordination", "shared-wait", "cache-only",
 ]);
 const COLLECTOR_ROW_KEYS = Object.freeze({
   actions: ["databaseId", "displayTitle", "workflowName", "number", "headBranch", "status", "conclusion",
@@ -6592,7 +7590,7 @@ function persistGitHubAppIdentity(root, identity, now = Date.now()) {
     const initialized = withGovernorLock(scope, () => {
       const loaded = readIdentityQuotaState(state, scope, now);
       if (!loaded.ok) return loaded;
-      return loaded.missing ? writeGovernorState(scope.path, loaded.value) : { ok: true };
+      return loaded.missing ? writeGovernorQuotaState(scope.path, loaded.value, now) : { ok: true };
     });
     if (!initialized.ok) return initialized;
     state.identities[identity.credentialKey] = { host: identity.host, kind: identity.kind,
@@ -8403,7 +9401,6 @@ function collectorPublicationFromResult(resource, result, previous, demand, comp
   if (!["changed", "unchanged"].includes(transition.kind)) {
     const error = new Error("collector received unusable data");
     error.requestMetrics = acquisitionRequestMetrics(result);
-    error.uncertainReceipts = result.uncertainReceipts ?? [];
     throw error;
   }
   const rows = transition.kind === "changed" ? transition.data : previous?.rows;
@@ -8435,7 +9432,6 @@ function collectorPublicationFromResult(resource, result, previous, demand, comp
     hold: null,
     capabilities: result.capabilities ?? previous?.capabilities ?? {},
     requestMetrics: acquisitionRequestMetrics(result),
-    uncertainReceipts: result.uncertainReceipts ?? [],
     repositoryIdentity: result.repositoryIdentity,
     meta,
     securityNotes: resource === "security"
@@ -8616,6 +9612,7 @@ function createCollectorAcquisitionRuntime({
       },
     });
     const reservationId = admitted.reservationId;
+    const transportScope = { ...context.scope, receiptCapability: admitted.receiptCapability };
     const governor = inspectGovernor(context.scope, now());
     const started = await markStarted({
       reservationId,
@@ -8623,8 +9620,9 @@ function createCollectorAcquisitionRuntime({
       epochs: governor.ok ? governor.value.epochs : {},
     });
     if (!started.ok || started.value?.status !== "started") {
-      completeReservation({ ...context.scope, identityProvider: null }, reservationId,
-        { outcome: "rejected" }, now());
+      const terminal = queueTerminalization(context.scope, admitted.receiptCapability,
+        { outcome: "rejected", neverStarted: true }, now);
+      if (terminal.status === "blocked") throw new Error("collector receipt settlement blocked");
       throw new Error("collector acquisition start failed");
     }
     const descriptor = tabForKey(resource);
@@ -8636,20 +9634,18 @@ function createCollectorAcquisitionRuntime({
         signal,
         AbortSignal.timeout(ACQUISITION_STARTED_DEADLINE_MS),
       ]);
-      let result = await requestIdentityStorage.run(context.scope, () => descriptor.fetch({
+      let result = await requestIdentityStorage.run(transportScope, () => descriptor.fetch({
         signal: boundedSignal,
         entities,
         previousRaw: force ? null : snapshot?.raw ?? null,
         force,
         pages: demand.pages,
-        governor: { scope: context.scope, leaseId: context.leaseId },
+        governor: { scope: transportScope, leaseId: context.leaseId },
         ...(securityPolicy ? { sources: securityPolicy.sources } : {}),
       }));
       if (securityPolicy) result = applyGitHubAppSecurityPolicy(result, securityPolicy);
-      settleReservationWithBudgetObservations(
-        { ...context.scope, identityProvider: null },
-        context.leaseId,
-        reservationId,
+      const terminal = queueTerminalization(
+        context.scope, admitted.receiptCapability,
         result?.measuredSuccess === false
           ? { outcome: "rejected", observations: result.observations ?? [] }
           : {
@@ -8660,8 +9656,11 @@ function createCollectorAcquisitionRuntime({
               },
               observations: result.observations ?? [],
             },
-        now(),
+        now,
       );
+      if (terminal.status === "blocked" || terminal.status === "compacted") {
+        throw new Error(`collector receipt settlement ${terminal.status}`);
+      }
       const completedAt = now();
       const publication = collectorPublicationFromResult(
         resource, result, snapshot, demand, completedAt, claim.state,
@@ -8677,10 +9676,11 @@ function createCollectorAcquisitionRuntime({
       if (reconciliation !== null) publication.nextDueAt = completedAt + reconciliation;
       return publication;
     } catch (error) {
-      settleReservationWithBudgetObservations(
-        { ...context.scope, identityProvider: null }, context.leaseId, reservationId,
-        { outcome: governorOutcomeForError(error), observations: error.budgetObservations ?? [] }, now(),
-      );
+      const terminal = queueTerminalization(context.scope, admitted.receiptCapability,
+        { outcome: governorOutcomeForError(error), observations: error.budgetObservations ?? [] }, now);
+      if (terminal.status === "blocked" || terminal.status === "compacted") {
+        error.receiptSettlement = terminal.status;
+      }
       throw error;
     }
   }
@@ -8794,6 +9794,9 @@ function createCollectorAcquisitionRuntime({
     item.nextDueAt = snapshot.nextDueAt;
     if (Number.isSafeInteger(snapshot.generation)) item.lastDeliveredGeneration = snapshot.generation;
     if (Number.isFinite(snapshot.lastSuccessAt)) item.lastDeliveredSuccessAt = snapshot.lastSuccessAt;
+    if (publication && item.requestedAt !== null && snapshot.lastSuccessAt >= item.requestedAt) {
+      item.requestedAt = null;
+    }
     item.onSnapshot(snapshot);
     if (!publication || !Number.isSafeInteger(snapshot.generation)) return true;
     for (const waiter of item.invalidations) {
@@ -8809,11 +9812,17 @@ function createCollectorAcquisitionRuntime({
   }
 
   function startPoll(item, { manual = false, force = false } = {}) {
+    if (closed || item.closed) return null;
+    if (manual && !demandEnabled(item.demand)) item.requestedAt ??= now();
+    if (!item.id) {
+      if (manual) item.queuedRefresh = { force: force || item.queuedRefresh?.force === true };
+      return startInitialize(item);
+    }
     if (item.pollPromise) {
       if (manual) item.queuedRefresh = { force: force || item.queuedRefresh?.force === true };
       return item.pollPromise;
     }
-    if (closed || item.closed || !demandEnabled(item.demand)) return null;
+    if (!demandEnabled(item.demand) && item.requestedAt === null) return null;
     item.pollPromise = poll(item, { manual, force }).finally(() => {
       item.pollPromise = null;
       if (item.promotionGeneration !== null) {
@@ -8832,7 +9841,7 @@ function createCollectorAcquisitionRuntime({
   }
 
   function schedule(item, delay, operation = () => startPoll(item)) {
-    if (closed || item.closed || !demandEnabled(item.demand)) return;
+    if (closed || item.closed || (!demandEnabled(item.demand) && item.requestedAt === null)) return;
     if (item.timer !== null) clearTimeout_(item.timer);
     item.timer = setTimeout_(() => {
       item.timer = null;
@@ -8898,7 +9907,8 @@ function createCollectorAcquisitionRuntime({
           () => engine.currentClaim(subscriptionId, claim), () => producer({
           target: item.target,
           resource: item.resource,
-          demand: { ...ownership.value.demand, background: item.demand.background },
+          demand: { ...ownership.value.demand, background: item.demand.background,
+            active: ownership.value.demand?.active || item.requestedAt !== null },
           snapshot: ownership.value.snapshot,
           claim: { ...claim, state: item },
           provider: item.provider,
@@ -8919,12 +9929,11 @@ function createCollectorAcquisitionRuntime({
           engine.refresh(subscriptionId, { claim, failure: {
             hold: "disconnected",
             requestMetrics: produced.requestMetrics ?? {},
-            uncertainReceipts: produced.uncertainReceipts ?? [],
           } });
           engine.unsubscribe(subscriptionId);
           item.id = null;
           targetInitializations.delete(targetInitializationKey(item.target));
-          item.onHold?.("disconnected");
+          item.onHold?.("app-auth");
           retryIn = 1;
           return;
         }
@@ -8937,7 +9946,6 @@ function createCollectorAcquisitionRuntime({
           engine.refresh(subscriptionId, { claim, failure: {
             hold: "disconnected",
             requestMetrics: produced.requestMetrics ?? {},
-            uncertainReceipts: produced.uncertainReceipts ?? [],
           } });
           item.onHold?.("disconnected");
           retryIn = item.demand.floorMs;
@@ -8960,10 +9968,12 @@ function createCollectorAcquisitionRuntime({
         else if (claim) engine.refresh(subscriptionId, { claim, failure: {
           hold,
           requestMetrics: error?.requestMetrics ?? {},
-          uncertainReceipts: error?.uncertainReceipts ?? [],
         } });
         else engine.setHold(subscriptionId, hold, { resource: item.resource, accessKey: item.identity.accessKey });
-        item.onHold?.(hold);
+        item.onHold?.(item.provider?.definition?.type === "github-app" &&
+          (error?.apiResponse?.status === 401 || error?.message === "GitHub App token unavailable" ||
+            classify(error) === "auth-problem")
+          ? "app-auth" : hold);
         try { onDiagnostic({ stage: "acquire", reason: redact(shortErr(error)) }); } catch { /* diagnostics are isolated */ }
         retryIn = error?.notStarted && Number.isFinite(error.retryAt)
           ? Math.max(50, error.retryAt - now()) : Math.min(1_000, item.demand.floorMs);
@@ -8979,13 +9989,16 @@ function createCollectorAcquisitionRuntime({
       if (item.id && item.identity?.accessKey) {
         engine.setHold(item.id, hold, { resource: item.resource, accessKey: item.identity.accessKey });
       }
-      item.onHold?.(hold);
+      item.onHold?.(config.providers[item.target.provider]?.type === "github-app" &&
+        error?.message === "GitHub App token unavailable" ? "app-auth" : hold);
       try { onDiagnostic({ stage: "provider-refresh", reason: redact(shortErr(error)) }); } catch { /* isolated */ }
       retryIn = Math.min(1_000, item.demand.floorMs);
     } finally {
       item.polling = false;
       item.pollPhase = null;
-      schedule(item, retryIn, item.id ? () => startPoll(item) : () => startInitialize(item));
+      schedule(item, retryIn, item.id
+        ? () => startPoll(item, { manual: item.requestedAt !== null })
+        : () => startInitialize(item));
     }
   }
 
@@ -9018,12 +10031,16 @@ function createCollectorAcquisitionRuntime({
       if (subscription.value.snapshot && !accessReset) {
         deliverCollectorSnapshot(item, subscription.value.snapshot, bindingRevision);
       }
-      if (demandEnabled(item.demand)) {
-        await startPoll(item, { manual: item.invalidations.size > 0 });
+      if (demandEnabled(item.demand) || item.requestedAt !== null) {
+        const queued = item.queuedRefresh;
+        item.queuedRefresh = null;
+        await startPoll(item, { manual: item.invalidations.size > 0 || item.requestedAt !== null || Boolean(queued),
+          force: queued?.force === true });
       }
     } catch (error) {
       try { onDiagnostic({ stage: "initialize", reason: redact(shortErr(error)) }); } catch { /* diagnostics are isolated */ }
-      item.onHold?.("disconnected");
+      item.onHold?.(config.providers[item.target.provider]?.type === "github-app" &&
+        error?.message === "GitHub App token unavailable" ? "app-auth" : "disconnected");
       schedule(item, 1_000, () => startInitialize(item));
     }
   }
@@ -9040,7 +10057,7 @@ function createCollectorAcquisitionRuntime({
       if (!normalizedDemand) throw new Error("invalid collector demand");
       const item = { target, resource, demand: normalizedDemand, onSnapshot, onHold, id: null, identity: null,
         provider: null, polling: false, pollPhase: null, pollPromise: null, controller: null,
-        initializePromise: null, closed: false, timer: null, queuedRefresh: null,
+        initializePromise: null, closed: false, timer: null, queuedRefresh: null, requestedAt: null,
         bindingRevision: 0, invalidations: new Set(), lastDeliveredGeneration: null,
         lastDeliveredSuccessAt: null, promotionGeneration: null, promotionAt: null };
       items.add(item);
@@ -9349,7 +10366,14 @@ function createCollectorProtocolClient({ createTransport, onReady = () => {},
     },
   });
   const write = (message) => {
-    if (welcomed && socket?.writable) socket.write(encodeCollectorFrame(message));
+    if (!welcomed || !socket?.writable) return false;
+    socket.write(encodeCollectorFrame(message));
+    return true;
+  };
+  const flushRefresh = (item) => {
+    if (item.pendingRefresh !== null && write({ type: "refresh", id: item.id, force: item.pendingRefresh })) {
+      item.pendingRefresh = null;
+    }
   };
   const resubscribe = (resetGenerations) => {
     for (const item of subscriptions.values()) {
@@ -9359,6 +10383,7 @@ function createCollectorProtocolClient({ createTransport, onReady = () => {},
       }
       write({ type: "subscribe", id: item.id, host: item.host, repo: item.repo,
         resource: item.resource, demand: item.demand });
+      flushRefresh(item);
     }
   };
   const connect = () => {
@@ -9449,7 +10474,7 @@ function createCollectorProtocolClient({ createTransport, onReady = () => {},
         return { ok: false, reason: "invalid" };
       }
       const item = { ...subscription,
-        onSnapshot, onHold, onError, onDiagnostic, generation: -1, controlGeneration: -1,
+        onSnapshot, onHold, onError, onDiagnostic, generation: -1, controlGeneration: -1, pendingRefresh: null,
         sourceAge: createCollectorSourceAgeTracker({ now, monotonicNow, checkpoint: sourceCheckpoint }) };
       subscriptions.set(id, item);
       if (welcomed) write({ type: "subscribe", id: item.id, host: item.host, repo: item.repo,
@@ -9467,7 +10492,10 @@ function createCollectorProtocolClient({ createTransport, onReady = () => {},
           write({ type: "demand", id, demand: normalized });
           return { ok: true, changed: true };
         },
-        refresh(force = false) { write({ type: "refresh", id, force: force === true }); },
+        refresh(force = false) {
+          item.pendingRefresh = force === true || item.pendingRefresh === true;
+          flushRefresh(item);
+        },
         inspect() { write({ type: "inspect", id }); },
         close() { write({ type: "unsubscribe", id }); subscriptions.delete(id); assembler.cancel(id); },
       } };
@@ -9508,6 +10536,7 @@ function createSshCollectorClient({ alias, createTransport = null, random = Math
 }
 
 function collectorDisplayDecision({ connected, hasSnapshot, hold = null }) {
+  if (hold === "app-auth") return { disconnected: true, reason: "app-auth" };
   if (!connected || hold === "disconnected") return { disconnected: true };
   if (hold === "shared-wait") return { mode: "waiting", waitCause: "shared-lane" };
   if (["observer", "primary", "secondary", "coordination"].includes(hold)) {
@@ -9947,8 +10976,10 @@ const ACQUISITION_METRIC_KEYS = [
 const ACQUISITION_HOLD_REASONS = new Set([
   "observer", "primary", "secondary", "disconnected", "coordination",
 ]);
-const ACQUISITION_STORE_VERSION = 1;
+const ACQUISITION_STORE_VERSION = 2;
 const ACQUISITION_MAX_UNCERTAIN_RECEIPTS = 1024;
+const ACQUISITION_MAX_QUOTA_PROJECTIONS = 128;
+const ACQUISITION_QUOTA_PROJECTION_TTL_MS = 60_000;
 
 function normalizeAcquisitionDiagnosticMetadata(raw, path) {
   const normalized = normalizeAcquisitionStore(raw);
@@ -10098,16 +11129,23 @@ async function runDoctor({ probeEndpoints = false } = {}) {
         if (!admitted?.ok || admitted.value.status !== "started") {
           return { index, skipped: { ...skippedDoctorProbe(name, args, admitted), ...(document ? { document } : {}) } };
         }
-        return { index, name, args, operation, input, document, reservationId: admitted.value.reservationId };
+        return { index, name, args, operation, input, document,
+          reservationId: admitted.value.reservationId,
+          receiptCapability: admitted.value.receiptCapability };
       });
       results = admittedProbes.map((item) => item.skipped ?? null);
       const runnable = admittedProbes.filter((item) => !item.skipped);
       const settled = await mapAllSettledBounded(runnable, 4, async (item) => {
-        const result = await requestIdentityStorage.run(scope, () => probe(item.name, item.args, item.operation, item.input));
+        const result = await requestIdentityStorage.run({ ...scope,
+          receiptCapability: item.receiptCapability }, () => probe(item.name, item.args, item.operation, item.input));
         if (item.document) result.document = item.document;
-        completeReservation({ ...scope, identityProvider: null }, item.reservationId, result.failed
+        const terminal = queueTerminalization(scope, item.receiptCapability, result.failed
           ? { outcome: "rejected" }
-          : { outcome: "measured-success", actualCost: operationCost(item.operation) }, Date.now());
+          : { outcome: "measured-success", actualCosts: operationCost(item.operation) });
+        if (terminal.status === "blocked" || terminal.status === "compacted") {
+          result.failed = true;
+          result.stderr = `receipt settlement ${terminal.status}`;
+        }
         return result;
       });
       settled.forEach((outcome, index) => {
@@ -10128,9 +11166,32 @@ async function runDoctor({ probeEndpoints = false } = {}) {
       governorResult = inspectGovernor(cleanup, Date.now());
     }
   }
+  const cachedQuota = !probeEndpoints ? doctorCachedQuotaScope(effectiveHost) : null;
   const governor = probeEndpoints
     ? governorHealth(governorResult, Date.now())
-    : { status: "not inspected (--probe not requested)", leases: 0, resources: {} };
+    : cachedQuota?.ok ? governorHealth(cachedQuota.result, Date.now())
+      : { status: `unavailable (${cachedQuota?.reason ?? "cached scope unavailable"})`, leases: 0, resources: {} };
+  const diagnosticScope = probeEndpoints
+    ? scopeResult?.ok ? scopeResult.value : null
+    : cachedQuota?.ok ? { path: cachedQuota.path } : null;
+  const recoveryJournal = diagnosticScope ? readRecoveryTransitions(diagnosticScope) : null;
+  const recoveryDetails = Object.fromEntries(RATE_RESOURCES.map((resource) => [resource,
+    diagnosticScope ? recoveryLedgerSummary(diagnosticScope, resource) : null]));
+  const currentRecovery = RATE_RESOURCES.map((resource) => recoveryJournal?.current[resource])
+    .filter(Boolean).sort((left, right) => right.at - left.at)[0] ?? null;
+  const lastFailedRecovery = [...(recoveryJournal?.entries ?? [])].reverse()
+    .find((entry) => entry.code !== "clear") ?? null;
+  const retryDates = RATE_RESOURCES.flatMap((resource) => {
+    const active = recoveryJournal?.current[resource];
+    const observer = (probeEndpoints ? governorResult : cachedQuota?.result)?.value?.observers[resource];
+    return [active?.retryAt, observer?.outcome === "failed" ? observer.nextAt : null];
+  }).filter((value) => Number.isFinite(value) && value > Date.now());
+  const nextRecoveryAt = retryDates.length > 0 ? Math.min(...retryDates) : null;
+  let recoveryReason = "unavailable";
+  if (currentRecovery) recoveryReason = `${currentRecovery.resource}: ${currentRecovery.code}`;
+  else if (recoveryJournal?.status === "corrupt") recoveryReason = "diagnostic journal corrupt";
+  else if (recoveryJournal?.status === "unavailable") recoveryReason = "diagnostic journal unavailable";
+  else if (["healthy", "missing"].includes(recoveryJournal?.status)) recoveryReason = "none recorded";
   const diagnosticSource = runtime.connect === "local"
     ? "local collector"
     : runtime.connect?.startsWith("ssh:") ? "SSH collector" : "standalone";
@@ -10175,6 +11236,10 @@ async function runDoctor({ probeEndpoints = false } = {}) {
     ),
     "",
     ...section("API governor"),
+    field("cached scope", probeEndpoints ? "verified by probe" : cachedQuota?.ok ? "read-only cached identity" : `unavailable (${cachedQuota?.reason ?? "unknown"})`),
+    ...(cachedQuota?.path && !cachedQuota.ok
+      ? [field("state file", `${join(dirname(cachedQuota.path), "quota-[redacted].json")} (quota fingerprint withheld)`)]
+      : []),
     field("status", governor.status),
     field("live leases", governor.leases),
     ...RATE_RESOURCES.map((resource) => {
@@ -10186,6 +11251,21 @@ async function runDoctor({ probeEndpoints = false } = {}) {
           : "unavailable",
       );
     }),
+    field("recovery reason", recoveryReason),
+    field("last failed transition", lastFailedRecovery?.code ?? "unavailable"),
+    ...RATE_RESOURCES.flatMap((resource) => [
+      field(`${resource} receipt units`, recoveryDetails[resource]?.receiptUnits ?? "unavailable"),
+      field(`${resource} receipt count`, recoveryDetails[resource]?.receiptCount ?? "unavailable"),
+      field(`${resource} debt units`, recoveryDetails[resource]?.debtUnits ?? "unavailable"),
+      field(`${resource} debt count`, recoveryDetails[resource]?.debtCount ?? "unavailable"),
+      field(`${resource} oldest unresolved`, recoveryDetails[resource]?.oldestUnresolvedAt == null
+        ? "unavailable" : formatDuration(Math.max(0, Date.now() - recoveryDetails[resource].oldestUnresolvedAt))),
+      field(`${resource} observer age`, recoveryDetails[resource]?.observerAt == null
+        ? "unavailable" : formatDuration(Math.max(0, Date.now() - recoveryDetails[resource].observerAt))),
+    ]),
+    field("next retry", nextRecoveryAt == null ? "unavailable" : new Date(nextRecoveryAt).toISOString()),
+    field("terminalization backlog", currentRecovery?.terminalizationBacklog == null
+      ? "unavailable" : `${currentRecovery.terminalizationBacklog} (last recorded)`),
     "",
     ...section("Acquisition metrics"),
     field("source", acquisitionDiagnostic?.source ?? "standalone"),
@@ -10202,7 +11282,8 @@ async function runDoctor({ probeEndpoints = false } = {}) {
     field("failed requests", acquisitionDiagnostic?.metrics.failedRequests ?? 0),
     field("REST actual 200/304", `${acquisitionDiagnostic?.metrics.rest200 ?? 0}/${acquisitionDiagnostic?.metrics.rest304 ?? 0}`),
     field("proven actual units", `${acquisitionDiagnostic?.metrics.coreUnits ?? 0} core + ${acquisitionDiagnostic?.metrics.graphqlUnits ?? 0} GraphQL`),
-    field("conservative outstanding", `${acquisitionDiagnostic?.metrics.uncertainCoreUnits ?? 0} core + ${acquisitionDiagnostic?.metrics.uncertainGraphqlUnits ?? 0} GraphQL`),
+    field("conservative outstanding", acquisitionOutstandingText(acquisitionDiagnostic)),
+    field("legacy unverified", `${acquisitionDiagnostic?.legacyUnverified?.coreUnits ?? 0} core + ${acquisitionDiagnostic?.legacyUnverified?.graphqlUnits ?? 0} GraphQL (diagnostic only)`),
     field("observer calls", acquisitionDiagnostic?.metrics.observerCalls ?? 0),
     field("cache/followers", `${acquisitionDiagnostic?.metrics.cacheHits ?? 0}/${acquisitionDiagnostic?.metrics.joinedFollowers ?? 0}`),
     field("queue wait (measured)", `${acquisitionDiagnostic?.metrics.queueWaitMs ?? 0}ms`),
@@ -10321,7 +11402,7 @@ function parseRepoTarget(value) {
 // in-flight guard absorbs every other one and the effective rate is whatever
 // `gh` can sustain -- the requested interval silently stops being real. Clamping
 // with a stated minimum is honest where silently accepting it would not be.
-const BACKGROUND_MODES = ["all", "off"];
+const BACKGROUND_MODES = ["all", "off", "on-demand"];
 const MIN_REFRESH_SECONDS = 2;
 const MAX_REFRESH_SECONDS = 3600;
 
@@ -10551,7 +11632,11 @@ Options:
                            and running Actions are checked every ${POLL_ACTIVE_CI_MS / 1000}s.
                            Safe shared grants may run later.
   --tab <name>             Tab to start on: ${TAB_KEYS.join(", ")}.
-  --background <mode>      ${BACKGROUND_MODES.join(" or ")} (default all). \`off\` never requests data
+  --background <mode>      ${BACKGROUND_MODES.join(" or ")} (default on-demand).
+                           on-demand watches active Actions; other tabs refresh
+                           when opened or with r, then keep cached results.
+                           all polls every tab; off polls the selected tab.
+                           \`off\` never requests data
                            for a tab you are not looking at; its count stays at
                            the last known value and visibly ages.
   --verbose                Write one line per gh invocation to stderr. stderr
@@ -10579,9 +11664,11 @@ Run it from inside a locally cloned GitHub repository; the repo is inferred
 from the git remote, the same way \`gh\` does it. Requires the \`gh\` CLI
 (2.20 or newer), authenticated via \`gh auth login\`.
 
-On a healthy single pane, the active tab is considered every ${REFRESH_MS / 1000}s while its
+By default, active Actions is considered every ${REFRESH_MS / 1000}s while its
 content is changing, then every ${POLL_QUIET_MS.actions / 1000}s once two checks in a row come back
-unchanged; each background tab is considered about every ${Math.max(REFRESH_MS * BACKGROUND_EVERY, POLL_BACKGROUND_MS.actions) / 1000}s. Quota-consuming
+unchanged. Secondary tabs check on opening or r and retain cached results.
+With --background all, inactive tabs are considered about every
+${Math.max(REFRESH_MS * BACKGROUND_EVERY, POLL_BACKGROUND_MS.actions) / 1000}s (Security is slower). Quota-consuming
 calls still need a shared, resource-specific grant that preserves a hard reserve.
 Scheduled checks and manual refresh do not bypass that safety check: neither
 refresh key can spend past the reserve.
@@ -12326,6 +13413,8 @@ const ACQUISITION_MAX_ENTITY_BYTES = 1024 * 1024;
 const ACQUISITION_MAX_ENTITIES = 512;
 const ACQUISITION_MAX_LIVE_TARGETS = 32;
 const ACQUISITION_MAX_SUBSCRIPTIONS = 128;
+const ACQUISITION_READ_MAX_ATTEMPTS = 24;
+const ACQUISITION_READ_MAX_MS = 1_500;
 let acquisitionTempSequence = 0;
 
 function acquisitionStorePath(options = {}) {
@@ -12337,7 +13426,8 @@ function emptyAcquisitionStore() {
     version: ACQUISITION_STORE_VERSION,
     producerEpoch: governorId(),
     metrics: emptyAcquisitionMetrics(),
-    uncertainReceipts: {},
+    quotaProjections: {},
+    legacyUnverified: { coreUnits: 0, graphqlUnits: 0, receiptCount: 0 },
     subscriptions: {},
     queries: {},
     aliases: {},
@@ -12365,32 +13455,6 @@ function acquisitionMetricState(state) {
   return state.metrics;
 }
 
-function removeAcquisitionReceipt(state, id) {
-  const receipt = state.uncertainReceipts?.[id];
-  if (!receipt) return false;
-  const metrics = acquisitionMetricState(state);
-  const key = receipt.resource === "core" ? "uncertainCoreUnits" : "uncertainGraphqlUnits";
-  metrics[key] = Math.max(0, metrics[key] - receipt.units);
-  delete state.uncertainReceipts[id];
-  for (const record of Object.values(state.queries ?? {})) {
-    if (record.claim?.receiptIds?.includes(id)) {
-      record.claim.receiptIds = record.claim.receiptIds.filter((receiptId) => receiptId !== id);
-    }
-  }
-  return true;
-}
-
-function addAcquisitionReceipt(state, receipt) {
-  state.uncertainReceipts ??= {};
-  if (state.uncertainReceipts[receipt.id]) return true;
-  if (Object.keys(state.uncertainReceipts).length >= ACQUISITION_MAX_UNCERTAIN_RECEIPTS) return false;
-  state.uncertainReceipts[receipt.id] = receipt;
-  const metrics = acquisitionMetricState(state);
-  const key = receipt.resource === "core" ? "uncertainCoreUnits" : "uncertainGraphqlUnits";
-  metrics[key] += receipt.units;
-  return true;
-}
-
 function normalizeAcquisitionReceipt(raw, expectedId = raw?.id) {
   if (!isRecord(raw) || raw.id !== expectedId || typeof raw.id !== "string" || raw.id.length > 240 ||
       typeof raw.reservationId !== "string" || raw.reservationId.length < 1 ||
@@ -12415,63 +13479,6 @@ function addAcquisitionRequestMetrics(state, delta) {
   return addAcquisitionMetrics(state, observed);
 }
 
-function releaseAcquisitionUncertainty(state, record) {
-  if (!record?.claim?.started) return;
-  const receiptIds = record.claim.receiptIds ?? [];
-  if (Object.hasOwn(record.claim, "receiptIds")) {
-    for (const id of receiptIds) removeAcquisitionReceipt(state, id);
-    return;
-  }
-  const costs = tabRequestCost(record.query.resource);
-  const metrics = acquisitionMetricState(state);
-  metrics.uncertainCoreUnits = Math.max(0, metrics.uncertainCoreUnits - costs.core);
-  metrics.uncertainGraphqlUnits = Math.max(0, metrics.uncertainGraphqlUnits - costs.graphql);
-}
-
-function releaseKnownAcquisitionUncertainty(state, record, requestMetrics) {
-  if (!record?.claim?.started) return;
-  const receiptIds = record.claim.receiptIds ?? [];
-  if (Object.hasOwn(record.claim, "receiptIds")) {
-    for (const resource of RATE_RESOURCES) {
-      const metricKey = resource === "core" ? "coreUnits" : "graphqlUnits";
-      const uncertainKey = resource === "core" ? "uncertainCoreUnits" : "uncertainGraphqlUnits";
-      const resourceReceipts = receiptIds
-        .map((id) => state.uncertainReceipts?.[id])
-        .filter((receipt) => receipt?.resource === resource);
-      if (Object.hasOwn(requestMetrics, uncertainKey)) {
-        let remaining = requestMetrics[uncertainKey];
-        for (const receipt of resourceReceipts) {
-          const retained = Math.min(receipt.units, remaining);
-          const released = receipt.units - retained;
-          remaining -= retained;
-          if (retained === 0) removeAcquisitionReceipt(state, receipt.id);
-          else if (released > 0) {
-            receipt.units = retained;
-            acquisitionMetricState(state)[uncertainKey] -= released;
-          }
-        }
-        continue;
-      }
-      if (Object.hasOwn(requestMetrics, metricKey)) {
-        for (const receipt of resourceReceipts) removeAcquisitionReceipt(state, receipt.id);
-      }
-    }
-    return;
-  }
-  const declared = tabRequestCost(record.query.resource);
-  const metrics = acquisitionMetricState(state);
-  if (Object.hasOwn(requestMetrics, "uncertainCoreUnits")) {
-    metrics.uncertainCoreUnits = Math.min(declared.core, requestMetrics.uncertainCoreUnits);
-  } else if (Object.hasOwn(requestMetrics, "coreUnits")) {
-    metrics.uncertainCoreUnits = Math.max(0, metrics.uncertainCoreUnits - declared.core);
-  }
-  if (Object.hasOwn(requestMetrics, "uncertainGraphqlUnits")) {
-    metrics.uncertainGraphqlUnits = Math.min(declared.graphql, requestMetrics.uncertainGraphqlUnits);
-  } else if (Object.hasOwn(requestMetrics, "graphqlUnits")) {
-    metrics.uncertainGraphqlUnits = Math.max(0, metrics.uncertainGraphqlUnits - declared.graphql);
-  }
-}
-
 function settleAcquisitionWaiters(state, queryKey, generation, at) {
   let queueWaitMs = 0;
   for (const subscription of Object.values(state.subscriptions)) {
@@ -12490,8 +13497,6 @@ function settleInvalidAcquisitionPublication(state, record, claim, requestMetric
     ...normalized,
     failedRequests: Math.max(1, normalized.failedRequests ?? 0),
   });
-  releaseKnownAcquisitionUncertainty(state, record, normalized);
-  for (const receipt of receipts ?? []) addAcquisitionReceipt(state, receipt);
   settleAcquisitionWaiters(state, record.query.queryKey, claim.generation, at);
   record.claim = null;
   record.hold = { reason: "primary", at };
@@ -12528,9 +13533,18 @@ function acquisitionDiagnostics(state, { source = "standalone", nowMs = Date.now
     subscriptionsByQuery.set(subscription.queryKey, grouped);
   }
   const activeQueryKeys = new Set(subscriptions.map((subscription) => subscription.queryKey));
+  const outstandingQuota = Object.entries(state?.quotaProjections ?? {}).map(([scopeHash, projection]) => {
+    const current = projection.status === "current" && projection.at <= nowMs &&
+      nowMs - projection.at <= ACQUISITION_QUOTA_PROJECTION_TTL_MS;
+    return { scopeHash, revision: projection.revision,
+      status: current ? "current" : "unavailable", units: current ? projection.units : null,
+      at: projection.at, accessKeys: projection.accessKeys };
+  });
   const queries = Object.values(state?.queries ?? {}).map((record) => {
     const snapshot = record.snapshot;
     const consumers = subscriptionsByQuery.get(record.query.queryKey) ?? [];
+    const projection = outstandingQuota.find((item) =>
+      item.accessKeys.includes(record.query.accessKey) && item.status === "current");
     return {
       resource: record.query.resource,
       lastSuccessAt: snapshot?.lastSuccessAt ?? null,
@@ -12543,8 +13557,9 @@ function acquisitionDiagnostics(state, { source = "standalone", nowMs = Date.now
         graphql: state?.metrics?.graphqlUnits ?? 0,
       },
       uncertainCost: {
-        core: state?.metrics?.uncertainCoreUnits ?? 0,
-        graphql: state?.metrics?.uncertainGraphqlUnits ?? 0,
+        status: projection ? "current" : "unavailable",
+        core: projection?.units.core ?? null,
+        graphql: projection?.units.graphql ?? null,
       },
       coalescedConsumers: consumers.length,
     };
@@ -12556,12 +13571,31 @@ function acquisitionDiagnostics(state, { source = "standalone", nowMs = Date.now
     activeQueries: activeQueryKeys.size,
     activeSubscribers: subscriptions.length,
     metrics: normalizeAcquisitionMetrics(state?.metrics) ?? emptyAcquisitionMetrics(),
+    outstandingQuota: outstandingQuota.map(({ accessKeys: _accessKeys, ...projection }) => projection),
+    legacyUnverified: state?.legacyUnverified ?? { coreUnits: 0, graphqlUnits: 0, receiptCount: 0 },
     queries,
   };
 }
 
+function acquisitionOutstandingText(diagnostic) {
+  const scopes = diagnostic?.outstandingQuota ?? [];
+  if (scopes.length === 0 || scopes.some((scope) => scope.status !== "current")) {
+    return "unavailable (quota projection pending)";
+  }
+  const units = scopes.reduce((total, scope) => ({
+    core: total.core + scope.units.core,
+    graphql: total.graphql + scope.units.graphql,
+  }), { core: 0, graphql: 0 });
+  return Number.isSafeInteger(units.core) && Number.isSafeInteger(units.graphql)
+    ? `${units.core} core + ${units.graphql} GraphQL across ${scopes.length} quota scopes`
+    : "unavailable (accounting overflow)";
+}
+
 function acquisitionFailureHold(error) {
   if (typeof error?.providerCapability === "string") return "observer";
+  if (Object.hasOwn(HTTP_PERMIT_FAILURE_HOLDS, error?.coordinationReason)) {
+    return HTTP_PERMIT_FAILURE_HOLDS[error.coordinationReason];
+  }
   if (SECONDARY_LIMIT_PATTERN.test(errText(error))) return "secondary";
   if (isRateLimited(error) || /API budget paused/i.test(errText(error))) return "primary";
   const attemptedHttp = Number.isSafeInteger(error?.requestMetrics?.httpRequests) &&
@@ -12889,32 +13923,58 @@ function prepareAcquisitionSnapshot(queryKey, snapshot) {
 }
 
 function normalizeAcquisitionStore(raw) {
-  if (!isRecord(raw) || raw.version !== ACQUISITION_STORE_VERSION || !validGovernorId(raw.producerEpoch) ||
+  if (!isRecord(raw) || ![1, ACQUISITION_STORE_VERSION].includes(raw.version) || !validGovernorId(raw.producerEpoch) ||
       !isRecord(raw.subscriptions) || !isRecord(raw.queries) || !isRecord(raw.aliases)) return null;
+  const legacy = raw.version === 1;
   const state = {
     version: ACQUISITION_STORE_VERSION,
-    producerEpoch: raw.producerEpoch,
+    producerEpoch: legacy ? governorId() : raw.producerEpoch,
     metrics: normalizeAcquisitionMetrics(raw.metrics),
-    uncertainReceipts: {},
+    quotaProjections: {},
+    legacyUnverified: { coreUnits: 0, graphqlUnits: 0, receiptCount: 0 },
     subscriptions: {},
     queries: {},
     aliases: {},
   };
   if (state.metrics === null) return null;
-  const receipts = raw.uncertainReceipts ?? {};
-  if (!isRecord(receipts) || Object.keys(receipts).length > ACQUISITION_MAX_UNCERTAIN_RECEIPTS) return null;
-  for (const [id, receipt] of Object.entries(receipts)) {
-    const normalized = normalizeAcquisitionReceipt(receipt, id);
-    if (!normalized) return null;
-    state.uncertainReceipts[id] = normalized;
-  }
-  if (raw.uncertainReceipts !== undefined) {
-    const outstanding = Object.values(state.uncertainReceipts).reduce((total, receipt) => {
-      total[receipt.resource] += receipt.units;
-      return total;
-    }, { core: 0, graphql: 0 });
-    if (state.metrics.uncertainCoreUnits !== outstanding.core ||
-        state.metrics.uncertainGraphqlUnits !== outstanding.graphql) return null;
+  if (legacy) {
+    const receipts = raw.uncertainReceipts ?? {};
+    if (!isRecord(receipts) || Object.keys(receipts).length > ACQUISITION_MAX_UNCERTAIN_RECEIPTS) return null;
+    for (const [id, receipt] of Object.entries(receipts)) {
+      const normalized = normalizeAcquisitionReceipt(receipt, id);
+      if (!normalized) return null;
+      const key = receipt.resource === "core" ? "coreUnits" : "graphqlUnits";
+      const next = state.legacyUnverified[key] + receipt.units;
+      if (!Number.isSafeInteger(next)) return null;
+      state.legacyUnverified[key] = next;
+      state.legacyUnverified.receiptCount += 1;
+    }
+    if (raw.uncertainReceipts === undefined) {
+      state.legacyUnverified.coreUnits = state.metrics.uncertainCoreUnits;
+      state.legacyUnverified.graphqlUnits = state.metrics.uncertainGraphqlUnits;
+    } else if (state.metrics.uncertainCoreUnits !== state.legacyUnverified.coreUnits ||
+        state.metrics.uncertainGraphqlUnits !== state.legacyUnverified.graphqlUnits) return null;
+    state.metrics.uncertainCoreUnits = 0;
+    state.metrics.uncertainGraphqlUnits = 0;
+  } else {
+    if (!isRecord(raw.quotaProjections) || !isRecord(raw.legacyUnverified) ||
+        Object.keys(raw.quotaProjections).length > ACQUISITION_MAX_QUOTA_PROJECTIONS ||
+        !exactKeys(raw.legacyUnverified, ["coreUnits", "graphqlUnits", "receiptCount"]) ||
+        Object.values(raw.legacyUnverified).some((value) => !Number.isSafeInteger(value) || value < 0)) return null;
+    state.legacyUnverified = { ...raw.legacyUnverified };
+    for (const [scopeHash, projection] of Object.entries(raw.quotaProjections)) {
+      if (!/^[0-9a-f]{64}$/.test(scopeHash) || !exactKeys(projection, ["revision", "units", "at", "status", "accessKeys"]) ||
+          !Number.isSafeInteger(projection.revision) || projection.revision < 0 ||
+          !exactKeys(projection.units, RATE_RESOURCES) ||
+          Object.values(projection.units).some((value) => !Number.isSafeInteger(value) || value < 0) ||
+          !Number.isFinite(projection.at) || projection.at < 0 ||
+          !["current", "unavailable"].includes(projection.status) ||
+          !Array.isArray(projection.accessKeys) || projection.accessKeys.length > ACQUISITION_MAX_SUBSCRIPTIONS ||
+          new Set(projection.accessKeys).size !== projection.accessKeys.length ||
+          projection.accessKeys.some((key) => !/^[0-9a-f]{64}$/.test(key))) return null;
+      state.quotaProjections[scopeHash] = { ...projection, units: { ...projection.units },
+        accessKeys: [...projection.accessKeys] };
+    }
   }
   for (const [key, value] of Object.entries(raw.aliases)) {
     if (typeof key !== "string" || typeof value !== "string") return null;
@@ -12933,11 +13993,15 @@ function normalizeAcquisitionStore(raw) {
           candidate.generation !== value.generation + 1 || !Number.isFinite(candidate.claimedAt) ||
           !Number.isFinite(candidate.leaseUntil) || candidate.leaseUntil < candidate.claimedAt ||
           typeof candidate.started !== "boolean") return null;
-      const hasReceiptIds = Object.hasOwn(candidate, "receiptIds");
-      const receiptIds = candidate.receiptIds ?? [];
-      if (!Array.isArray(receiptIds) || receiptIds.some((id) => typeof id !== "string" ||
-          !state.uncertainReceipts[id])) return null;
-      claim = { ...candidate, ...(hasReceiptIds ? { receiptIds } : {}) };
+      if (legacy) {
+        const receipts = raw.uncertainReceipts ?? {};
+        const receiptIds = candidate.receiptIds ?? [];
+        if (!Array.isArray(receiptIds) || receiptIds.some((id) => typeof id !== "string" || !receipts[id])) return null;
+        claim = null; // v1 producer authority is fenced by the new epoch.
+      } else {
+        if (Object.hasOwn(candidate, "receiptIds")) return null;
+        claim = { ...candidate };
+      }
     }
     const snapshot = value.snapshot === null ? null
       : value.snapshot?.artifact
@@ -12990,37 +14054,63 @@ function loadAcquisitionMetadata(path) {
   }
 }
 
-function readAcquisitionSnapshot(path, record) {
-  if (!record?.snapshot) return { ok: true, value: null };
-  if (Array.isArray(record.snapshot.rows)) return { ok: true, value: record.snapshot };
-  try {
-    const raw = readFileSync(join(acquisitionSnapshotRoot(path), record.snapshot.artifact), "utf8");
-    if (Buffer.byteLength(raw) !== record.snapshot.bytes ||
-        createHash("sha256").update(raw).digest("hex") !== record.snapshot.digest) {
-      return { ok: false, reason: "corrupt" };
+function readAcquisitionSnapshot(path, record, { deadline = performance.now() + ACQUISITION_READ_MAX_MS } = {}) {
+  let current = record;
+  for (let attempt = 0; attempt < ACQUISITION_READ_MAX_ATTEMPTS &&
+      performance.now() < deadline; attempt += 1) {
+    if (!current?.snapshot) return current === record ? { ok: true, value: null }
+      : { ok: false, reason: "stale" };
+    if (Array.isArray(current.snapshot.rows)) {
+      return { ok: true, value: current.snapshot, replaced: current !== record };
     }
-    const parsed = JSON.parse(raw);
-    const snapshot = normalizeAcquisitionSnapshot(
-      parsed, record.query, record.generation, parsed.producerEpoch,
-    );
-    return snapshot ? { ok: true, value: snapshot } : { ok: false, reason: "corrupt" };
-  } catch (error) {
-    return { ok: false, reason: "corrupt", error };
+    try {
+      const raw = readFileSync(join(acquisitionSnapshotRoot(path), current.snapshot.artifact), "utf8");
+      if (Buffer.byteLength(raw) !== current.snapshot.bytes ||
+          createHash("sha256").update(raw).digest("hex") !== current.snapshot.digest) {
+        return { ok: false, reason: "corrupt" };
+      }
+      const parsed = JSON.parse(raw);
+      const snapshot = normalizeAcquisitionSnapshot(
+        parsed, current.query, current.generation, parsed.producerEpoch,
+      );
+      return snapshot ? { ok: true, value: snapshot, replaced: current !== record }
+        : { ok: false, reason: "corrupt" };
+    } catch (error) {
+      if (error?.code !== "ENOENT") return { ok: false, reason: "corrupt", error };
+      const latest = loadAcquisitionMetadata(path);
+      if (!latest.ok) return latest;
+      const replacement = latest.value.queries[current.query.queryKey];
+      if (!replacement) return { ok: false, reason: "stale" };
+      if (replacement.snapshot?.artifact === current.snapshot.artifact) {
+        return { ok: false, reason: "corrupt", error };
+      }
+      current = replacement;
+    }
   }
+  return { ok: false, reason: "busy" };
 }
 
-function hydrateAcquisitionStore(path, state) {
+function hydrateAcquisitionStore(path, state, deadline) {
   for (const record of Object.values(state.queries)) {
-    const loaded = readAcquisitionSnapshot(path, record);
+    const loaded = readAcquisitionSnapshot(path, record, { deadline });
     if (!loaded.ok) return loaded;
+    if (loaded.replaced) return { ok: false, reason: "stale" };
     record.snapshot = loaded.value;
   }
   return { ok: true, value: state };
 }
 
-function loadAcquisitionStore(path) {
-  const loaded = loadAcquisitionMetadata(path);
-  return loaded.ok ? hydrateAcquisitionStore(path, loaded.value) : loaded;
+function loadAcquisitionStore(path, { onMetadataLoaded = null } = {}) {
+  const deadline = performance.now() + ACQUISITION_READ_MAX_MS;
+  for (let attempt = 0; attempt < ACQUISITION_READ_MAX_ATTEMPTS &&
+      performance.now() < deadline; attempt += 1) {
+    const loaded = loadAcquisitionMetadata(path);
+    if (!loaded.ok) return loaded;
+    onMetadataLoaded?.();
+    const hydrated = hydrateAcquisitionStore(path, loaded.value, deadline);
+    if (hydrated.reason !== "stale") return hydrated;
+  }
+  return { ok: false, reason: "busy" };
 }
 
 function writeAcquisitionArtifact(root, artifact, payload) {
@@ -13193,8 +14283,8 @@ function trimAcquisitionStore(state, protectedQueryKey = null) {
 
 async function runStartedAcquisitionTransport(markStarted, transport) {
   const started = await markStarted();
-  if (!started.ok) return started;
-  if (started.value?.status !== "started") return { ok: false, reason: "already-started" };
+  if (!started.ok) return { ...started, notStarted: true };
+  if (started.value?.status !== "started") return { ok: false, reason: "already-started", notStarted: true };
   return { ok: true, value: await transport() };
 }
 
@@ -13244,7 +14334,7 @@ function createAcquisitionEngine({
     }
     const loaded = loadRecordSnapshot(record);
     if (!loaded.ok) return loaded;
-    item.generation = record.generation;
+    item.generation = loaded.value.generation;
     try { item.callback?.(loaded.value); } catch { /* subscriber callback is isolated */ }
     return { ok: true, value: true, snapshot: loaded.value };
   }
@@ -13277,7 +14367,8 @@ function createAcquisitionEngine({
     const record = loaded.value.queries[item.queryKey] ?? null;
     if (!record?.snapshot) return { ok: true, value: record };
     const snapshot = loadRecordSnapshot(record);
-    return snapshot.ok ? { ok: true, value: { ...record, snapshot: snapshot.value } } : snapshot;
+    return snapshot.ok ? { ok: true, value: { ...record,
+      generation: snapshot.value?.generation ?? record.generation, snapshot: snapshot.value } } : snapshot;
   }
 
   function heartbeat() {
@@ -13445,14 +14536,38 @@ function createAcquisitionEngine({
         aliasConflict: matching.length > 1 } };
     });
     if (!result.ok) return result;
-    const record = result.state.queries[result.value.queryKey];
-    const loadedSnapshot = loadRecordSnapshot(record);
-    if (!loadedSnapshot.ok) return loadedSnapshot;
-    result.value.snapshot = loadedSnapshot.value;
-    local.set(id, { nonce, queryKey: result.value.queryKey, callback, generation: record?.generation ?? 0,
+    // A publisher can canonicalize the query and remap this just-committed
+    // shared subscription before its snapshot is hydrated. Register locally
+    // first so every failure still has a cleanup owner, then follow the
+    // subscription ID in fresh metadata rather than the old query key.
+    local.set(id, { nonce, queryKey: result.value.queryKey, callback, generation: 0,
       claimNonce: null, pending: null });
     ensureTimer();
-    return result;
+    const deadline = performance.now() + ACQUISITION_READ_MAX_MS;
+    for (let attempt = 0; attempt < ACQUISITION_READ_MAX_ATTEMPTS &&
+        performance.now() < deadline; attempt += 1) {
+      const latest = load();
+      if (!latest.ok) { unsubscribe(id); return latest; }
+      const shared = latest.value.subscriptions[id];
+      if (!shared || shared.nonce !== nonce) { unsubscribe(id); return { ok: false, reason: "stale" }; }
+      const item = local.get(id);
+      item.queryKey = shared.queryKey;
+      const record = latest.value.queries[shared.queryKey];
+      if (!record) continue;
+      const loadedSnapshot = loadRecordSnapshot(record);
+      if (!loadedSnapshot.ok) {
+        if (["stale", "busy"].includes(loadedSnapshot.reason)) continue;
+        unsubscribe(id);
+        return loadedSnapshot;
+      }
+      if (loadedSnapshot.replaced) continue;
+      result.value.queryKey = shared.queryKey;
+      result.value.snapshot = loadedSnapshot.value;
+      item.generation = loadedSnapshot.value?.generation ?? record.generation;
+      return result;
+    }
+    unsubscribe(id);
+    return { ok: false, reason: "busy" };
   }
 
   function updateDemand(id, demandInput) {
@@ -13509,11 +14624,6 @@ function createAcquisitionEngine({
       const requestMetrics = produced?.requestMetrics === undefined
         ? {}
         : normalizeAcquisitionMetrics(produced.requestMetrics, { partial: true });
-      const receiptInputs = produced?.uncertainReceipts ?? [];
-      const receipts = Array.isArray(receiptInputs)
-        ? receiptInputs.map((receipt) => normalizeAcquisitionReceipt(receipt)) : null;
-      const receiptsValid = receipts && !receipts.includes(null) &&
-        receipts.every((receipt) => receipt.accessKey === record.query.accessKey);
       const loadedPrevious = loadRecordSnapshot(record);
       if (!loadedPrevious.ok) return loadedPrevious;
       if (loadedPrevious.value) record.snapshot = loadedPrevious.value;
@@ -13527,19 +14637,14 @@ function createAcquisitionEngine({
         snapshot = { ...snapshot, lastChangedAt: loadedPrevious.value.lastChangedAt };
       }
       if (!snapshot) {
-        settleInvalidAcquisitionPublication(state, record, effectiveClaim, requestMetrics, receiptsValid ? receipts : [], now());
+        settleInvalidAcquisitionPublication(state, record, effectiveClaim, requestMetrics, [], now());
         return { value: { ok: false, reason: "invalid" } };
       }
       const previous = record.snapshot;
       const previousClaim = record.claim;
-      if (requestMetrics === null || !receiptsValid) {
+      if (requestMetrics === null) {
         settleInvalidAcquisitionPublication(state, record, effectiveClaim, requestMetrics ?? {}, [], now());
         return { value: { ok: false, reason: "invalid" } };
-      }
-      const receiptIds = new Set(Object.keys(state.uncertainReceipts ?? {}));
-      const novelReceipts = receipts.filter((receipt) => !receiptIds.has(receipt.id));
-      if (receiptIds.size + novelReceipts.length > ACQUISITION_MAX_UNCERTAIN_RECEIPTS) {
-        return { value: { ok: false, reason: "capacity", retryClaim: effectiveClaim, remapped } };
       }
       record.generation = effectiveClaim.generation;
       record.snapshot = snapshot;
@@ -13552,14 +14657,7 @@ function createAcquisitionEngine({
         record.claim = previousClaim;
         return { value: { ok: false, reason: "capacity", retryClaim: effectiveClaim, remapped } };
       }
-      if (Object.hasOwn(requestMetrics, "uncertainCoreUnits") ||
-          Object.hasOwn(requestMetrics, "uncertainGraphqlUnits")) {
-        releaseKnownAcquisitionUncertainty(state, { ...record, claim: previousClaim }, requestMetrics);
-      } else {
-        releaseAcquisitionUncertainty(state, { ...record, claim: previousClaim });
-      }
       addAcquisitionRequestMetrics(state, requestMetrics);
-      for (const receipt of receipts) addAcquisitionReceipt(state, receipt);
       settleAcquisitionWaiters(state, record.query.queryKey, effectiveClaim.generation, now());
       return { value: { ok: true, value: { role: "producer", snapshot,
         queryKey: record.query.queryKey, remapped } } };
@@ -13613,10 +14711,8 @@ function createAcquisitionEngine({
   function settleFailure(id, claim, failure) {
     const item = local.get(id);
     const requestMetrics = normalizeAcquisitionMetrics(failure?.requestMetrics ?? {}, { partial: true });
-    const receipts = Array.isArray(failure?.uncertainReceipts ?? [])
-      ? (failure?.uncertainReceipts ?? []).map((receipt) => normalizeAcquisitionReceipt(receipt)) : null;
     const hold = failure?.hold ?? "primary";
-    if (!item || !isRecord(claim) || requestMetrics === null || !receipts || receipts.includes(null) ||
+    if (!item || !isRecord(claim) || requestMetrics === null ||
         !ACQUISITION_HOLD_REASONS.has(hold)) {
       return { ok: false, reason: "invalid" };
     }
@@ -13625,13 +14721,7 @@ function createAcquisitionEngine({
       if (!record || record.claim?.nonce !== claim.nonce || record.claim.generation !== claim.generation) {
         return { value: { ok: false, reason: "stale", definitive: true } };
       }
-      if (receipts.some((receipt) => receipt.accessKey !== record.query.accessKey) ||
-          Object.keys(state.uncertainReceipts ?? {}).length +
-            receipts.filter((receipt) => !state.uncertainReceipts?.[receipt.id]).length >
-              ACQUISITION_MAX_UNCERTAIN_RECEIPTS) return { ok: false, reason: "capacity" };
       addAcquisitionRequestMetrics(state, requestMetrics);
-      releaseKnownAcquisitionUncertainty(state, record, requestMetrics);
-      for (const receipt of receipts) addAcquisitionReceipt(state, receipt);
       settleAcquisitionWaiters(state, record.query.queryKey, claim.generation, now());
       record.claim = null;
       record.hold = { reason: hold, at: now() };
@@ -13654,7 +14744,11 @@ function createAcquisitionEngine({
     const item = local.get(id);
     if (!item || reason !== null && !ACQUISITION_HOLD_REASONS.has(reason) ||
         expected !== null && (!isRecord(expected) || !TAB_KEYS.includes(expected.resource) ||
-          typeof expected.accessKey !== "string" || expected.accessKey.length === 0)) {
+          typeof expected.accessKey !== "string" || expected.accessKey.length === 0 ||
+          expected.currentHold !== undefined &&
+            (!isRecord(expected.currentHold) ||
+              !ACQUISITION_HOLD_REASONS.has(expected.currentHold.reason) ||
+              !Number.isFinite(expected.currentHold.at)))) {
       return { ok: false, reason: "invalid" };
     }
     return transact((state) => {
@@ -13662,6 +14756,11 @@ function createAcquisitionEngine({
       if (!record) return { ok: false, reason: "stale" };
       if (expected && (record.query.resource !== expected.resource ||
           record.query.accessKey !== expected.accessKey)) return { ok: false, reason: "stale-access" };
+      if (expected?.currentHold !== undefined &&
+          (record.hold?.reason !== expected.currentHold.reason ||
+            record.hold?.at !== expected.currentHold.at)) {
+        return { ok: false, reason: "stale-hold" };
+      }
       if ((record.hold?.reason ?? null) === reason) return { changed: false, value: true };
       const next = reason === null ? null : { reason, at: now() };
       record.hold = next;
@@ -13693,28 +14792,10 @@ function createAcquisitionEngine({
       if (now() >= acquisitionClaimDeadline(record.claim)) {
         return { ok: false, reason: "stale" };
       }
-      const receiptIds = [];
-      for (const resource of RATE_RESOURCES) {
-        if (costs[resource] <= 0) continue;
-        const epoch = typeof supplied?.epochs?.[resource] === "string" && supplied.epochs[resource].length > 0
-          ? supplied.epochs[resource] : "unknown";
-        const receipt = {
-          id: `${reservationId}:${resource}`,
-          reservationId,
-          accessKey: record.query.accessKey,
-          resource,
-          epoch,
-          units: costs[resource],
-          startedAt: now(),
-        };
-        if (!addAcquisitionReceipt(state, receipt)) return { ok: false, reason: "capacity" };
-        receiptIds.push(receipt.id);
-      }
       record.claim.started = true;
       record.claim.startedAt = now();
       record.claim.reservationId = reservationId;
       record.claim.startReceipt = startReceipt;
-      record.claim.receiptIds = receiptIds;
       return { value: { status: "started", reservationId } };
     });
   }
@@ -13764,7 +14845,8 @@ function createAcquisitionEngine({
     const claimed = transact((state) => {
       const reaped = reapAcquisitionSubscriptions(state, now(), kill);
       const subscription = state.subscriptions[id];
-      const record = state.queries[item.queryKey];
+      const queryKey = subscription?.queryKey;
+      const record = state.queries[queryKey];
       if (!subscription || subscription.nonce !== item.nonce || !record) return { ok: false, reason: "stale" };
       const requestedGeneration = force
         ? Math.max(subscription.requestedGeneration,
@@ -13776,8 +14858,8 @@ function createAcquisitionEngine({
       }
       if (requestedGeneration <= record.generation && record.snapshot?.nextDueAt > now()) {
         return { changed: reaped > 0 || demandChanged,
-          value: { role: "follower", reason: "fresh", snapshot: record.snapshot,
-            sharingCount: acquisitionSharingCount(state, item.queryKey) } };
+          value: { role: "follower", reason: "fresh", queryKey, snapshot: record.snapshot,
+            sharingCount: acquisitionSharingCount(state, queryKey) } };
       }
       if (record.claim) {
         const absoluteDeadline = acquisitionClaimDeadline(record.claim);
@@ -13792,10 +14874,10 @@ function createAcquisitionEngine({
           }
           return { changed: reaped > 0 || demandChanged || joined,
             value: { role: "follower", reason: expired ? `owner-${owner}` : "claimed",
-            snapshot: record.snapshot, sharingCount: acquisitionSharingCount(state, item.queryKey) } };
+            queryKey, snapshot: record.snapshot, sharingCount: acquisitionSharingCount(state, queryKey) } };
         }
       }
-      const nonce = createId("acquisition-claim", item.queryKey, record.generation + 1);
+      const nonce = createId("acquisition-claim", queryKey, record.generation + 1);
       record.claim = {
         pid,
         nonce,
@@ -13809,11 +14891,13 @@ function createAcquisitionEngine({
       subscription.waitingSinceAt = null;
       record.lastUsedAt = now();
       return { value: { role: "producer", nonce, generation: record.claim.generation,
-        query: record.query, snapshot: record.snapshot, demand: aggregateAcquisitionDemand(state, item.queryKey),
-        sharingCount: acquisitionSharingCount(state, item.queryKey) } };
+        queryKey, query: record.query, snapshot: record.snapshot,
+        demand: aggregateAcquisitionDemand(state, queryKey),
+        sharingCount: acquisitionSharingCount(state, queryKey) } };
     });
+    if (claimed.ok && claimed.value?.queryKey) item.queryKey = claimed.value.queryKey;
     if (claimed.ok && claimed.value?.snapshot) {
-      const record = claimed.state.queries[item.queryKey];
+      const record = claimed.state.queries[claimed.value.queryKey];
       const loadedSnapshot = loadRecordSnapshot(record);
       if (!loadedSnapshot.ok) return loadedSnapshot;
       claimed.value.snapshot = loadedSnapshot.value;
@@ -13921,21 +15005,58 @@ function createAcquisitionEngine({
     });
   }
 
-  function reconcileUncertainty(accessKey, evidence) {
-    if (typeof accessKey !== "string" || accessKey.length === 0 || !isRecord(evidence)) {
+  function syncQuotaProjection(scope) {
+    if (!isRecord(scope) || !/^[0-9a-f]{64}$/.test(scope.hash ?? "")) {
       return { ok: false, reason: "invalid" };
     }
+    // Quota is read before the acquisition lock. This diagnostic copy never
+    // grants requests and a failed read cannot block source publication.
+    const observed = inspectGovernor(scope, now());
+    if (!observed.ok) {
+      return transact((state) => {
+        const previous = state.quotaProjections[scope.hash];
+        if (!previous || previous.status === "unavailable") return { changed: false, value: false };
+        previous.status = "unavailable";
+        return { value: false };
+      });
+    }
+    const ledger = observed.value;
+    const units = Object.fromEntries(RATE_RESOURCES.map((resource) => [resource,
+      Object.values(ledger.reservations).reduce((sum, reservation) =>
+        sum + reservationCost(reservation, resource, ledger.leases, now()),
+      ledger.debt[resource].unresolvedUnits + ledger.debt[resource].quiescentUnits +
+        reservationCost(ledger.controlReceipts[resource], resource, ledger.leases, now()))]));
+    if (Object.values(units).some((value) => !Number.isSafeInteger(value) || value < 0)) {
+      return { ok: false, reason: "accounting-overflow" };
+    }
     return transact((state) => {
-      let changed = false;
-      for (const [id, receipt] of Object.entries(state.uncertainReceipts ?? {})) {
-        const observed = evidence[receipt.resource];
-        if (receipt.accessKey !== accessKey || !isRecord(observed) ||
-            typeof observed.epoch !== "string" || !Number.isFinite(observed.observedAt)) continue;
-        const reset = receipt.epoch !== "unknown" && observed.epoch !== receipt.epoch;
-        if (!reset && observed.observedAt < receipt.startedAt) continue;
-        changed = removeAcquisitionReceipt(state, id) || changed;
+      const activeKeys = new Set(Object.values(state.subscriptions)
+        .map((subscription) => state.queries[subscription.queryKey]?.query.accessKey)
+        .filter(Boolean));
+      const currentAccessKey = /^[0-9a-f]{64}$/.test(scope.accessKey ?? "")
+        ? scope.accessKey : null;
+      if (currentAccessKey) {
+        for (const [hash, projection] of Object.entries(state.quotaProjections)) {
+          if (hash !== scope.hash) projection.accessKeys = projection.accessKeys.filter((key) =>
+            key !== currentAccessKey);
+        }
       }
-      return { changed, value: { ...state.metrics } };
+      const previous = state.quotaProjections[scope.hash];
+      if (previous && previous.revision > ledger.revision) return { changed: false, value: false };
+      if (!previous && Object.keys(state.quotaProjections).length >= ACQUISITION_MAX_QUOTA_PROJECTIONS) {
+        const oldest = Object.entries(state.quotaProjections)
+          .filter(([, projection]) => !projection.accessKeys.some((key) => activeKeys.has(key)))
+          .sort((a, b) => a[1].at - b[1].at)[0];
+        if (!oldest) return { changed: false, value: false };
+        delete state.quotaProjections[oldest[0]];
+      }
+      const accessKeys = previous?.accessKeys.filter((key) => activeKeys.has(key)) ?? [];
+      if (currentAccessKey && !accessKeys.includes(currentAccessKey) &&
+          accessKeys.length < ACQUISITION_MAX_SUBSCRIPTIONS) accessKeys.push(currentAccessKey);
+      state.quotaProjections[scope.hash] = {
+        revision: ledger.revision, units, at: now(), status: "current", accessKeys,
+      };
+      return { value: true };
     });
   }
 
@@ -13948,7 +15069,7 @@ function createAcquisitionEngine({
     inspect,
     diagnostics,
     recordMetrics,
-    reconcileUncertainty,
+    syncQuotaProjection,
     setHold,
     close,
     path,
@@ -13964,6 +15085,27 @@ function setRuntimeAcquisitionHold(engine, subscriptions, resource, reason, acce
   return engine.setHold(subscription.id, reason, { resource, accessKey });
 }
 
+function clearScheduledRuntimeControlHold(engine, subscriptions, resource, accessKey, observedAt) {
+  const subscription = subscriptions?.get(resource);
+  if (!subscription?.id) return { ok: false, reason: "stale" };
+  if (typeof accessKey !== "string" || !Number.isFinite(observedAt)) {
+    return { ok: false, reason: "stale-access" };
+  }
+  const inspected = engine.inspect(subscription.id);
+  if (!inspected.ok) return inspected;
+  const record = inspected.value;
+  if (record?.query?.resource !== resource || record.query.accessKey !== accessKey) {
+    return { ok: false, reason: "stale-access" };
+  }
+  const hold = record.hold;
+  if (!hold) return { ok: true, value: "already-clear" };
+  if (hold.reason !== "coordination") return { ok: true, value: "retained" };
+  if (hold.at >= observedAt) return { ok: false, reason: "newer-hold" };
+  const cleared = engine.setHold(subscription.id, null,
+    { resource, accessKey, currentHold: hold });
+  return cleared.ok ? { ok: true, value: "cleared" } : cleared;
+}
+
 // The one place the cadence table is decided. It used to be spread across a
 // fixed active floor, a fixed four-floor background slot, and a Security-only
 // unchanged rule -- three policies that could disagree, and did: Security
@@ -13977,7 +15119,10 @@ function pollPolicyInterval({
   unchangedCount = 0,
   inProgressCI = false,
   background = "all",
+  requested = false,
 }) {
+  if (background === "on-demand" &&
+      (demand !== "active" || (tab !== "actions" && !requested))) return Number.POSITIVE_INFINITY;
   if (demand === "none") return Number.POSITIVE_INFINITY;
   if (demand === "inactive") {
     if (background === "off") return Number.POSITIVE_INFINITY;
@@ -14105,6 +15250,7 @@ function pollSchedule({
       demand: isActive ? "active" : "inactive",
       unchangedCount: states[key]?.unchangedCount ?? 0,
       inProgressCI: states[key]?.inProgressCI === true,
+      requested: states[key]?.requested === true,
       background,
     });
     if (!Number.isFinite(step)) {
@@ -14249,7 +15395,7 @@ function governorDataReady(refreshResult, snapshot, activeKey, nowMs) {
   return RATE_RESOURCES.every((resource) => {
     if (costs[resource] <= 0) return true;
     const budget = snapshot.value.budgets[resource];
-    const available = availableForGrant({ budget, resource, nowMs });
+    const available = governorAvailableForGrant(snapshot.value, resource, nowMs);
     return budget && nowMs - budget.observedAt <= budgetSnapshotTtl(resource) &&
       budget.blockUntil <= nowMs && available.mode === "open" &&
       available.spendable >= costs[resource];
@@ -14456,6 +15602,333 @@ function coordinationNotice(reason) {
   return "Can't coordinate API use — retrying";
 }
 
+// Recovery diagnostics have no request payloads, credential identifiers or
+// owner capabilities. The journal is advisory: a failed write must never deny
+// an otherwise valid data operation. The quota ledger remains authoritative.
+const RECOVERY_JOURNAL_MAX_ENTRIES = 128;
+const RECOVERY_JOURNAL_MAX_BYTES = 128 * 1024;
+const RECOVERY_ENTRY_MAX_BYTES = 1024;
+const RECOVERY_COPY = Object.freeze({
+  busy: ["Coordinating with your other panes", "Retry automatically", "Other pane; retry"],
+  stale: ["Coordinating with your other panes", "Retry automatically", "Other pane; retry"],
+  "identity-busy": ["GitHub budget check is shared", "Retry automatically after the current check", "Budget check; retry"],
+  "transport-busy": ["Shared GitHub request is in progress", "Retry automatically", "Request; retry"],
+  unwritable: ["Local coordination cannot be written", "Run gh-glance --doctor; check storage permissions", "Store blocked; doctor"],
+  corrupt: ["Local coordination is corrupt", "Run gh-glance --doctor; preserve the reported state file", "State corrupt; doctor"],
+  capacity: ["Local coordination is full", "Run gh-glance --doctor; preserve the reported state file", "State full; doctor"],
+  "accounting-overflow": ["Local coordination accounting overflow", "Run gh-glance --doctor; preserve the reported state file", "Overflow; doctor"],
+  "reservations-invalid": ["Local coordination reservation invalid", "Run gh-glance --doctor; preserve the reported state file", "Reservation; doctor"],
+  "external-factor-invalid": ["Local coordination budget invalid", "Run gh-glance --doctor; preserve the reported state file", "Budget invalid; doctor"],
+  "pacing-invalid": ["Local coordination pacing invalid", "Run gh-glance --doctor; preserve the reported state file", "Pacing invalid; doctor"],
+  "budget-resource": ["Local coordination budget invalid", "Run gh-glance --doctor; preserve the reported state file", "Budget invalid; doctor"],
+  "legacy-unresolved": ["Older requests still reserve quota", "Verify old children ended; a verified system restart can resolve unknown ownership", "Old debt; restart"],
+  "legacy-corrupt": ["Older coordination evidence is corrupt", "Run gh-glance --doctor; preserve the reported state file", "Old state; doctor"],
+  "migration-hold": ["Older session still uses coordination", "Wait for the older quota reset; retry automatically at the shown time", "Old quota; wait"],
+  "restart-required": ["Older session still uses coordination", "Restart older gh-glance panes with this version", "Old pane; restart"],
+  "identity-backoff": ["GitHub budget check failed", "Retry automatically at the shown time", "Budget check; retry"],
+  "identity-capacity": ["GitHub budget check allowance is full", "Retry automatically when the rolling window renews", "Budget check; retry"],
+  "budget-unknown": ["GitHub budget check pending", "Retry automatically", "Budget check; retry"],
+  "budget-stale": ["GitHub budget evidence is old", "Retry the shared budget check automatically", "Budget old; retry"],
+  "budget-future": ["Clock changed; budget needs recheck", "Retry the shared budget check automatically", "Clock; retry"],
+  "probe-failed": ["GitHub budget check failed", "Retry automatically at the shown time", "Budget check; retry"],
+  "block-unpublished": ["Saving GitHub request limit", "Retry sharing the hold automatically", "Saving hold; retry"],
+  "budget-reset": ["GitHub quota pacing", "Retry automatically after reset", "Quota; retry"],
+  "rate-limit": ["GitHub quota pacing", "Retry automatically after reset", "Quota; retry"],
+  "rate-limited": ["GitHub request limit", "Retry automatically after the shared hold", "Limit; retry"],
+  "local-reserve": ["Local quota reserve pacing", "Retry automatically at the next grant", "Reserve; retry"],
+  reserve: ["Local quota reserve pacing", "Retry automatically at the next grant", "Reserve; retry"],
+  blocked: ["GitHub request hold", "Retry automatically when the hold ends", "Request hold; retry"],
+  secondary: ["GitHub request limit", "Retry after GitHub's hold; refresh only if the pause asks", "Limit; retry"],
+  "secondary-rate-limit": ["GitHub request limit", "Retry after GitHub's hold; refresh only if the pause asks", "Limit; retry"],
+  "abuse-limit": ["GitHub request limit", "Retry after GitHub's hold; refresh only if the pause asks", "Limit; retry"],
+  "throttle-paused": ["Repeated GitHub request limit", "Press r to retry after checking the hold", "Limit; press r"],
+  "network-outage": ["GitHub connection failed", "Retry automatically when the connection returns", "Network; retry"],
+  "credential-unavailable": ["GitHub login unavailable", "Run gh auth status, then restore login", "Login; gh auth status"],
+  "identity-unavailable": ["GitHub login unavailable", "Run gh auth status, then restore login", "Login; gh auth status"],
+  disconnected: ["Collector connection unavailable", "Restore the selected collector connection", "Collector; connection"],
+  "app-auth": ["GitHub App authorization unavailable", "Restore the selected App authorization", "App; restore auth"],
+  "security-incomplete": ["Security data incomplete", "Run gh-glance --doctor --probe for endpoint access", "Security; doctor"],
+  "receipt-retry": ["Saving request result", "Retry automatically without repeating the request", "Saving; retry"],
+  "interrupted-request": ["Recovering interrupted request", "Retry source observation when quota allows", "Interrupted; retry"],
+  "request-queue": ["Recovering local request queue", "Retry automatically after compaction", "Queue; retry"],
+  "acquisition-busy": ["Acquisition store is busy", "Check the shared lock; retry automatically", "Store lock; retry"],
+  "clock-recovery": ["Rechecking after sleep or clock change", "Retry source observation automatically", "Clock; retry"],
+  "auth-problem": ["GitHub authorization failed", "Run gh auth status, then restore authorization", "Auth; gh auth status"],
+  unavailable: ["Repository or endpoint unavailable", "Check the selected repository and permissions", "Repo; check access"],
+  "source-incomplete": ["GitHub response incomplete", "Retry source observation automatically", "Incomplete; retry"],
+  "unknown-scope": ["GitHub account scope unavailable", "Run gh auth status; retry when identity is verified", "Login; gh auth status"],
+  "version-mismatch": ["Older session cannot share coordination", "Restart older gh-glance panes with this version", "Old pane; restart"],
+  "unsafe-permissions": ["Local coordination permissions are unsafe", "Run gh-glance --doctor; repair directory permissions", "Permissions; doctor"],
+  "disk-full": ["Local coordination storage is full", "Run gh-glance --doctor; free local storage", "Disk full; doctor"],
+  coordination: ["Local coordination unavailable", "Run gh-glance --doctor; retry when storage works", "Coordination; doctor"],
+});
+
+function recoveryCause({ reason, resource = null, at = Date.now(), retryAt = null,
+  sourceAt = null, receiptUnits = null, debtUnits = null, oldestUnresolvedAt = null,
+  observerAt = null, terminalizationBacklog = null, lastFailedTransition = null,
+  origin = "coordination", tab = null } = {}) {
+  const code = typeof reason === "string" && Object.hasOwn(RECOVERY_COPY, reason)
+    ? reason : "coordination";
+  const copy = RECOVERY_COPY[code] ?? RECOVERY_COPY.coordination;
+  const time = (value) => Number.isFinite(value) && value >= 0 ? value : null;
+  const units = (value) => Number.isSafeInteger(value) && value >= 0 ? value : null;
+  return {
+    code, resource: RATE_RESOURCES.includes(resource) ? resource : null,
+    origin: origin === "source" ? "source" : "coordination",
+    tab: TAB_KEYS.includes(tab) ? tab : null,
+    at: time(at) ?? Date.now(), firstAt: time(at) ?? Date.now(),
+    retryAt: time(retryAt), sourceAt: time(sourceAt),
+    receiptUnits: units(receiptUnits), debtUnits: units(debtUnits),
+    oldestUnresolvedAt: time(oldestUnresolvedAt), observerAt: time(observerAt),
+    terminalizationBacklog: units(terminalizationBacklog),
+    lastFailedTransition: typeof lastFailedTransition === "string" && Object.hasOwn(RECOVERY_COPY, lastFailedTransition)
+      ? lastFailedTransition : code,
+    summary: copy[0], action: copy[1], short: copy[2],
+  };
+}
+
+function shouldClearRecoveryCause(cause, { sourceSuccess = false, tab = null, scheduledHold = null } = {}) {
+  if (!cause) return false;
+  if (scheduledHold !== null) {
+    return scheduledHold.ok === true && scheduledHold.value === "cleared" &&
+      cause.origin === "coordination" && ["busy", "stale", "acquisition-busy"].includes(cause.code);
+  }
+  return cause.origin !== "source" || sourceSuccess && cause.tab === tab;
+}
+
+function recoveryRetryAt(decision, budget, observer, nowMs) {
+  if (budget?.blockUntil > nowMs) return budget.blockUntil;
+  if (["reservations-invalid", "external-factor-invalid", "pacing-invalid", "budget-resource",
+    "accounting-overflow", "corrupt", "unwritable", "capacity"].includes(decision?.reason)) return null;
+  const resetHold = ["budget-reset", "reset", "rate-limit"].includes(decision?.reason);
+  if (decision?.mode === "probe" && !resetHold) {
+    return observer?.nextAt > nowMs ? observer.nextAt : null;
+  }
+  const deadline = decision?.retryAt ?? decision?.resetMs ?? budget?.resetMs;
+  return deadline > nowMs ? deadline : null;
+}
+
+function terminalizationRecoveryCode(terminal) {
+  if (terminal?.status === "retryable") return "receipt-retry";
+  if (terminal?.status === "compacted") return "interrupted-request";
+  if (terminal?.reason === "completion-capacity") return "capacity";
+  return terminal?.reason ?? terminal?.status ?? "coordination";
+}
+
+function requestFailureRecoveryCode(error, verdict) {
+  if (verdict === "rate-limited") return "rate-limited";
+  if (Object.hasOwn(HTTP_PERMIT_FAILURE_HOLDS, error?.coordinationReason)) return error.coordinationReason;
+  if (verdict === "other" && error?.httpStarted === true) return "interrupted-request";
+  return verdict === "other" ? "network-outage" : verdict;
+}
+
+function requestFailureRecovery(error, verdict) {
+  const reason = requestFailureRecoveryCode(error, verdict);
+  return { reason, origin: reason === "transport-busy" ? "coordination" : "source" };
+}
+
+function wallClockRecovery(previousAt, at, intervalMs) {
+  if (!Number.isFinite(previousAt) || !Number.isFinite(at)) return null;
+  return at < previousAt || at - previousAt > Math.max(30_000, 3 * intervalMs)
+    ? "clock-recovery" : null;
+}
+
+function collectorSourceAdvanced(previousAt, sourceAt) {
+  return Number.isFinite(previousAt) && Number.isFinite(sourceAt) && sourceAt > previousAt;
+}
+
+function cleanupQueueForResource(queue, resource) {
+  let count = 0;
+  for (const item of queue) if (tabRequestCost(item.cleanupKey)?.[resource] > 0) count += 1;
+  return count;
+}
+
+function presentRecovery(cause, { nowMs = Date.now(), cols = 80 } = {}) {
+  if (!cause) return [];
+  const width = Math.max(1, Number.isSafeInteger(cols) ? cols - 1 : 79);
+  const resource = cause.resource === "graphql" ? "GraphQL" : cause.resource === "core" ? "Core" : "GitHub";
+  const age = Number.isFinite(cause.sourceAt) && cause.sourceAt <= nowMs
+    ? `cached ${formatDuration(nowMs - cause.sourceAt)}` : "cached age unavailable";
+  const retry = Number.isFinite(cause.retryAt)
+    ? `; next ${statusInterval(cause.retryAt, nowMs)}` : "";
+  const summary = cause.code === "legacy-unresolved" && Number.isSafeInteger(cause.debtUnits)
+    ? `Older requests still reserve ${cause.debtUnits} units` : cause.summary;
+  if (width < 60) {
+    const action = cause.action.toLowerCase();
+    const narrowAction = cause.code === "legacy-unresolved" ? "Check children; restart"
+      : action.includes("gh-glance --doctor") ? "Run gh-glance --doctor"
+      : action.includes("gh auth") ? "Run gh auth status"
+        : action.includes("selected repository") ? "Check repository access"
+        : action.includes("connection") ? "Restore connection"
+          : action.includes("app authorization") ? "Restore App auth"
+            : action.includes("permissions") ? "Check permissions"
+              : action.includes("restart") ? "Restart and recheck"
+              : action.includes("press r") ? "Press r to retry"
+              : "Retry automatically";
+    const narrowDeadline = Number.isFinite(cause.retryAt)
+      ? statusInterval(cause.retryAt, nowMs) : null;
+    const timedAction = narrowDeadline && cause.code === "migration-hold"
+      ? `Wait; next ${narrowDeadline}`
+      : narrowDeadline && narrowAction === "Retry automatically"
+        ? `Retry; next ${narrowDeadline}`
+        : narrowDeadline && narrowAction === "Press r to retry"
+          ? `Press r after ${narrowDeadline}` : narrowAction;
+    const short = cause.code === "legacy-unresolved" && Number.isSafeInteger(cause.debtUnits)
+      ? `Debt ${cause.debtUnits} units` : cause.short.split(";")[0];
+    return [`${resource}: ${short}`.slice(0, width), timedAction.slice(0, width), age.slice(0, width)];
+  }
+  const full = `${resource}: ${summary}; ${cause.action}${retry}; ${age}`;
+  if (full.length <= width) return [full];
+  return [`${resource}: ${summary}`.slice(0, width),
+    `${cause.action}${retry}`.slice(0, width), age.slice(0, width)];
+}
+
+function recoveryJournalPath(scope) {
+  return `${scope.path}.recovery.json`;
+}
+
+function emptyRecoveryJournal() {
+  return { version: 1, current: { core: null, graphql: null }, entries: [] };
+}
+
+const RECOVERY_EVENT_KEYS = ["code", "resource", "at", "firstAt", "retryAt", "sourceAt",
+  "receiptUnits", "debtUnits", "oldestUnresolvedAt", "observerAt", "terminalizationBacklog",
+  "lastFailedTransition", "origin", "tab"];
+
+function recoveryEvent(entry) {
+  if (!isRecord(entry)) return null;
+  if (exactKeys(entry, ["code", "resource", "at"]) && entry.code === "clear" &&
+      RATE_RESOURCES.includes(entry.resource) && Number.isFinite(entry.at)) return entry;
+  // An earlier clock sample can arrive after a later one for the same cause.
+  // Repair only this bounded timestamp skew; every other field stays subject
+  // to the strict journal validation below.
+  const event = Number.isFinite(entry.at) && Number.isFinite(entry.firstAt) && entry.firstAt > entry.at
+    ? { ...entry, firstAt: entry.at } : entry;
+  if (!exactKeys(event, RECOVERY_EVENT_KEYS) || !RATE_RESOURCES.includes(event.resource) ||
+      typeof event.code !== "string" || !Object.hasOwn(RECOVERY_COPY, event.code) ||
+      !Number.isFinite(event.at) || !Number.isFinite(event.firstAt) ||
+      ["retryAt", "sourceAt", "oldestUnresolvedAt", "observerAt"].some((key) =>
+        event[key] !== null && (!Number.isFinite(event[key]) || event[key] < 0)) ||
+      ["receiptUnits", "debtUnits", "terminalizationBacklog"].some((key) =>
+        event[key] !== null && (!Number.isSafeInteger(event[key]) || event[key] < 0)) ||
+      typeof event.lastFailedTransition !== "string" ||
+      !Object.hasOwn(RECOVERY_COPY, event.lastFailedTransition) ||
+      !["source", "coordination"].includes(event.origin) ||
+      (event.tab !== null && !TAB_KEYS.includes(event.tab)) ||
+      Buffer.byteLength(JSON.stringify(event)) > RECOVERY_ENTRY_MAX_BYTES) return null;
+  return event;
+}
+
+function visibleRecoveryEvent(entry) {
+  if (!entry || entry.code === "clear") return entry;
+  const copy = RECOVERY_COPY[entry.code] ?? RECOVERY_COPY.coordination;
+  return { ...entry, summary: copy[0], action: copy[1], short: copy[2] };
+}
+
+function readRecoveryTransitions(scope) {
+  const path = recoveryJournalPath(scope);
+  let raw;
+  try {
+    const file = lstatSync(path);
+    if (!file.isFile() || file.size > RECOVERY_JOURNAL_MAX_BYTES) return { ...emptyRecoveryJournal(), status: "unavailable" };
+    raw = readFileSync(path, "utf8");
+    if (Buffer.byteLength(raw) > RECOVERY_JOURNAL_MAX_BYTES) return { ...emptyRecoveryJournal(), status: "unavailable" };
+  } catch (error) {
+    return { ...emptyRecoveryJournal(), status: error?.code === "ENOENT" ? "missing" : "unavailable" };
+  }
+  try {
+    const journal = JSON.parse(raw);
+    const entries = journal.entries?.map(recoveryEvent);
+    const current = journal.current && Object.fromEntries(RATE_RESOURCES.map((resource) => [
+      resource, journal.current[resource] === null ? null : recoveryEvent(journal.current[resource]),
+    ]));
+    if (!exactKeys(journal, ["version", "current", "entries"]) || journal.version !== 1 ||
+        !exactKeys(journal.current, RATE_RESOURCES) || !Array.isArray(journal.entries) ||
+        journal.entries.length > RECOVERY_JOURNAL_MAX_ENTRIES ||
+        entries.some((entry) => entry === null) ||
+        RATE_RESOURCES.some((resource) => journal.current[resource] !== null &&
+          (current[resource] === null || current[resource].code === "clear"))) {
+      return { ...emptyRecoveryJournal(), status: "corrupt" };
+    }
+    return { version: 1, current: Object.fromEntries(RATE_RESOURCES.map((resource) =>
+      [resource, visibleRecoveryEvent(current[resource])])),
+    entries: entries.map(visibleRecoveryEvent), status: "healthy" };
+  } catch {
+    return { ...emptyRecoveryJournal(), status: "corrupt" };
+  }
+}
+
+function recordRecoveryTransition(scope, event) {
+  if (!scope?.path || !RATE_RESOURCES.includes(event?.resource)) return { ok: false, reason: "invalid" };
+  const path = recoveryJournalPath(scope);
+  return withPersistenceLock(path, () => {
+    const previous = readRecoveryTransitions(scope);
+    if (!["healthy", "missing"].includes(previous.status)) return { ok: false, reason: previous.status };
+    const plain = (entry) => entry && Object.fromEntries(RECOVERY_EVENT_KEYS.map((key) => [key, entry[key]]));
+    const journal = { version: 1, current: Object.fromEntries(RATE_RESOURCES.map((resource) =>
+      [resource, plain(previous.current[resource])])),
+    entries: previous.entries.map((entry) => entry.code === "clear" ? entry : plain(entry)) };
+    const former = journal.current[event.resource];
+    const at = Number.isFinite(event.at) ? event.at : Date.now();
+    if (event.clear === true) {
+      if (!former) return { ok: true, changed: false };
+      journal.current[event.resource] = null;
+      journal.entries.push({ code: "clear", resource: event.resource, at });
+    } else {
+      const entry = plain(recoveryCause({ ...event, reason: event.reason ?? event.code, at }));
+      entry.firstAt = former?.code === entry.code && former?.origin === entry.origin &&
+        former?.tab === entry.tab ? Math.min(former.firstAt, at) : at;
+      if (Buffer.byteLength(JSON.stringify(entry)) > RECOVERY_ENTRY_MAX_BYTES) return { ok: false, reason: "capacity" };
+      journal.current[event.resource] = entry;
+      if (former?.code !== entry.code || former?.origin !== entry.origin || former?.tab !== entry.tab) {
+        journal.entries.push(entry);
+      }
+    }
+    journal.entries = journal.entries.slice(-RECOVERY_JOURNAL_MAX_ENTRIES);
+    while (Buffer.byteLength(JSON.stringify(journal)) + 1 > RECOVERY_JOURNAL_MAX_BYTES && journal.entries.length > 0) {
+      journal.entries.shift();
+    }
+    if (Buffer.byteLength(JSON.stringify(journal)) + 1 > RECOVERY_JOURNAL_MAX_BYTES) return { ok: false, reason: "capacity" };
+    const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temp, `${JSON.stringify(journal)}\n`, { mode: 0o600, flag: "wx" });
+      renameSync(temp, path);
+      return { ok: true, changed: true };
+    } catch (error) {
+      try { unlinkSync(temp); } catch { /* only our temporary file */ }
+      return { ok: false, reason: error?.code ?? "unwritable" };
+    }
+  });
+}
+
+function safeRecordRecoveryTransition(scope, event, write = recordRecoveryTransition) {
+  try { return write(scope, event); } catch { return { ok: false, reason: "unavailable" }; }
+}
+
+function recoveryLedgerSummary(scope, resource, nowMs = Date.now()) {
+  if (!scope?.path || !RATE_RESOURCES.includes(resource)) return null;
+  const loaded = readGovernorState(scope.path, nowMs, { persistMigration: false });
+  if (!loaded.ok) return null;
+  const state = loaded.value;
+  const debt = state.debt[resource];
+  const debtUnits = debt.unresolvedUnits + debt.quiescentUnits;
+  const charged = governorChargedCost(state, resource, nowMs);
+  const oldest = Object.values(state.debtGroups)
+    .filter((group) => !group.quiescent && group.units[resource] > 0)
+    .map((group) => group.at);
+  return {
+    receiptUnits: Number.isSafeInteger(charged) ? charged - debtUnits : null,
+    debtUnits,
+    oldestUnresolvedAt: oldest.length > 0 ? Math.min(...oldest) : null,
+    observerAt: state.observers[resource]?.at > 0 && state.observers[resource].at <= nowMs
+      ? state.observers[resource].at : null,
+    debtCount: debt.unresolvedCount + debt.quiescentCount,
+    receiptCount: Object.values(state.reservations).filter((reservation) =>
+      reservationCost(reservation, resource, state.leases, nowMs) > 0).length +
+      (reservationCost(state.controlReceipts[resource], resource, state.leases, nowMs) > 0 ? 1 : 0),
+  };
+}
+
 function acquisitionFailureCopy(reason) {
   if (reason === "busy") return { short: "lock busy", narrow: "Shared lock busy", full: "Acquisition store is busy; checking the shared lock" };
   if (reason === "unwritable") return { short: "store blocked", narrow: "Store blocked", full: "Acquisition store cannot be written; check config permissions" };
@@ -14555,25 +16028,6 @@ function measuredNestedOperationCost(operation, value) {
     actual.graphql = metrics.graphqlUnits;
   }
   return actual;
-}
-
-function uncertainReservationReceipts(scope, reservationId, nowMs) {
-  const snapshot = inspectGovernor(scope, nowMs);
-  const reservation = snapshot.ok ? snapshot.value.reservations?.[reservationId] : null;
-  const accessKey = scope.accessKey ?? scope.hash;
-  if (!reservation || typeof accessKey !== "string") return [];
-  return RATE_RESOURCES.flatMap((resource) => {
-    if (reservation.costs[resource] <= 0) return [];
-    return [{
-      id: `${reservationId}:${resource}`,
-      reservationId,
-      accessKey,
-      resource,
-      epoch: reservation.epochs[resource],
-      units: reservation.costs[resource],
-      startedAt: reservation.startedAt,
-    }];
-  });
 }
 
 function abortableDelay(ms, signal, {
@@ -14770,30 +16224,38 @@ async function runAdmittedOperation({
   }
   const reservationId = admitted.value.reservationId;
   const settlementScope = { ...scope, identityProvider: null };
-  const pendingReceipts = uncertainReservationReceipts(scope, reservationId, now());
+  const transportScope = { ...scope, receiptCapability: admitted.value.receiptCapability };
   try {
-    const value = await requestIdentityStorage.run(scope, () => run(signal));
+    const value = await requestIdentityStorage.run(transportScope, () => run(signal));
     const measured = measuredNestedOperationCost(operation, value);
     const costs = measured ?? operationCost(operation);
-    const outcome = value?.ok === false ? governorOutcomeForError(value.failure) : "measured-success";
-    completeReservation(settlementScope, reservationId, {
+    const outcome = value?.notStarted === true ? "measured-success" :
+      value?.ok === false ? governorOutcomeForError(value.failure) : "measured-success";
+    const terminal = queueTerminalization(settlementScope, admitted.value.receiptCapability, {
       outcome,
-      ...(measured || outcome === "measured-success" ? { actualCost: costs } : {}),
-    }, now());
+      ...(value?.notStarted === true ? { neverStarted: true } : {}),
+      ...(measured || outcome === "measured-success" ? { actualCosts: costs } : {}),
+    }, now);
+    if (terminal.status === "blocked" || terminal.status === "compacted") {
+      return { ok: false, error: new Error(`API receipt settlement ${terminal.status}`),
+        reservationId };
+    }
     const identityCoordinator = scope.identityCoordinator ?? runtimeIdentityCoordinator;
     if (scope.accessKey && scope.accessKey !== identityCoordinator?.current()?.accessKey) {
       return { ok: false, error: new Error("Credential changed"), reservationId };
     }
-    return { ok: true, value, reservationId,
-      uncertainReceipts: measured ? [] : pendingReceipts };
+    return { ok: true, value, reservationId };
   } catch (error) {
     const actualCost = measuredNestedOperationCost(operation, { requestMetrics: error?.requestMetrics });
-    const uncertainReceipts = actualCost ? [] : pendingReceipts;
-    completeReservation(settlementScope, reservationId, {
+    const terminal = queueTerminalization(settlementScope, admitted.value.receiptCapability, {
       outcome: governorOutcomeForError(error),
-      ...(actualCost ? { actualCost } : {}),
-    }, now());
-    return { ok: false, error, reservationId, uncertainReceipts };
+      ...(error?.notStarted === true ? { neverStarted: true } : {}),
+      ...(actualCost ? { actualCosts: actualCost } : {}),
+    }, now);
+    if (terminal.status === "blocked" || terminal.status === "compacted") {
+      error.receiptSettlement = terminal.status;
+    }
+    return { ok: false, error, reservationId };
   }
 }
 
@@ -15010,6 +16472,7 @@ function refreshStatus({
   stale = false,
   disconnected = false,
   screenReader = false,
+  onDemand = false,
 } = {}) {
   const status = (kind, glyphKind, label, tone, animate = false, detailKind = null) => ({
     kind,
@@ -15046,6 +16509,7 @@ function refreshStatus({
   // Keep the cause visible until a successful result clears it.
   if (activeError) return status("failed", "failed", "Failed", "attention");
   if (securityIncomplete) return status("limited", "limited", "Limited", "attention");
+  if (onDemand) return status("cached", "watching", "Cached", "inert");
   if (sharedData) return status("shared", "watching", "Shared", "inert", false, "sharing");
   if (["waiting", "pending", "probe"].includes(mode)) {
     const sharing = sharedLaneProvenance(governorDecision).waitCause === "shared-lane";
@@ -15535,6 +16999,8 @@ function App({ onCreateRemote = () => {} } = {}) {
   const [waiting, setWaiting] = useState({ actions: true, issues: true, prs: true, security: true });
   const [governorDecisions, setGovernorDecisions] = useState(probingGovernorDecisions);
   const [acquisitionFailures, setAcquisitionFailures] = useState({});
+  const [recoveryCauses, setRecoveryCauses] = useState({ core: null, graphql: null });
+  const recoveryRef = useRef(recoveryCauses);
   const [governorEpochs, setGovernorEpochs] = useState(null);
   const [requestStatuses, setRequestStatuses] = useState(() =>
     Object.fromEntries(TABS.map((candidate) => [candidate.key, null])),
@@ -15560,6 +17026,10 @@ function App({ onCreateRemote = () => {} } = {}) {
     ? { mode: "paused", reason: activeFailure, coordinationError: true,
       cause: acquisitionFailureCopy(activeFailure).short }
     : governorDecisions[tab.key];
+  const activeResource = RATE_RESOURCES.find((resource) => tabRequestCost(tab.key)[resource] > 0) ?? null;
+  const retainedRecovery = activeResource ? recoveryCauses[activeResource] : null;
+  const activeRecovery = retainedRecovery?.origin === "source" && retainedRecovery.tab !== tab.key
+    ? null : retainedRecovery;
   const activeRequestStatus = requestStatuses[tab.key];
   // Once any endpoint proves the folder has no remote, the whole dashboard is
   // in setup mode. Keeping this tab-local made a quick tab switch replace the
@@ -15590,7 +17060,10 @@ function App({ onCreateRemote = () => {} } = {}) {
   // Counts the lines actually rendered, not the notes collected -- getting this
   // wrong by one row is what makes ink repaint the whole frame.
   const extraLines =
-    NOTICE_ROWS +
+    (activeRecovery || tabError || activeGovernorDecision?.coordinationError ||
+      activeGovernorDecision?.mode === "paused" || activeGovernorDecision?.disconnected ||
+      data[tab.key] !== null && !runtimeIdentityCoordinator?.current()
+      ? 3 : NOTICE_ROWS) +
     (tab.key === "security" && !remoteSetup ? securityLines.length : 0);
   // Reserve lines for: the tab bar and the divider under it (2), the panel's
   // top and bottom edges (2), the column header and its separator (2), and
@@ -15640,6 +17113,14 @@ function App({ onCreateRemote = () => {} } = {}) {
     const cachedTab = cachedEntry?.tabs[candidate.key];
     const ageMs = collectorCachedSourceAge(cachedTab);
     return ageMs === null ? [] : [[candidate.key, { ageMs, measuredAt: performance.now() }]];
+  })));
+  // Keep server source timestamps separate from client-local age estimates.
+  // An SSH receipt's age is measured on the client and cannot prove a new
+  // source observation when a cached snapshot is delivered again.
+  const collectorSourceSuccessRef = useRef(Object.fromEntries(TABS.flatMap((candidate) => {
+    const cachedTab = cachedEntry?.tabs[candidate.key];
+    const sourceAt = cachedTab?.source?.lastSuccessAt ?? cachedTab?.lastOk;
+    return Number.isFinite(sourceAt) ? [[candidate.key, sourceAt]] : [];
   })));
   const fetchTabRef = useRef(null);
   const contextCoordinatorRef = useRef(null);
@@ -16106,6 +17587,53 @@ function App({ onCreateRemote = () => {} } = {}) {
         : { ...current, [key]: value });
     }
 
+    const scheduledControlAttempts = new Map();
+
+    function recordRuntimeRecovery(key, reason, { retryAt = null, origin = "coordination" } = {}) {
+      const resource = RATE_RESOURCES.find((candidate) => tabRequestCost(key)[candidate] > 0);
+      if (!resource) return;
+      const at = Date.now();
+      const previous = recoveryRef.current[resource];
+      const candidate = recoveryCause({
+        reason, resource, at, retryAt, sourceAt: lastOkRef.current[key] ?? null,
+        origin, tab: origin === "source" ? key : null,
+      });
+      const hardFailure = ["corrupt", "unwritable", "capacity", "accounting-overflow"].includes(candidate.code);
+      if (!hardFailure && previous?.code === "receipt-retry" &&
+          terminalizationBacklogForResource(terminalizationBacklog, scope?.hash, resource) > 0) return;
+      if (!hardFailure && previous?.code === "request-queue" &&
+          cleanupQueueForResource(cleanupQueue, resource) > 0) return;
+      if (previous?.origin === "source" && previous.tab === key && origin === "coordination" &&
+          !["corrupt", "unwritable", "capacity", "accounting-overflow",
+            "receipt-retry", "interrupted-request"].includes(candidate.code)) return;
+      if (previous?.code === candidate.code && previous?.retryAt === candidate.retryAt &&
+          previous?.origin === candidate.origin && previous?.tab === candidate.tab &&
+          at - previous.at < 60_000) return;
+      const cause = recoveryCause({ ...candidate, reason: candidate.code,
+        terminalizationBacklog: cleanupQueueForResource(cleanupQueue, resource) +
+          terminalizationBacklogForResource(terminalizationBacklog, scope?.hash, resource),
+        ...recoveryLedgerSummary(scope, resource, at) });
+      cause.firstAt = previous?.code === cause.code && previous?.origin === cause.origin &&
+        previous?.tab === cause.tab ? previous.firstAt : at;
+      recoveryRef.current = { ...recoveryRef.current, [resource]: cause };
+      setRecoveryCauses(recoveryRef.current);
+      if (scope) setTimeout(() => { safeRecordRecoveryTransition(scope, cause); }, 0).unref?.();
+    }
+
+    function clearRuntimeRecovery(resource, { sourceSuccess = false, tab = null, scheduledHold = null } = {}) {
+      const previous = recoveryRef.current[resource];
+      if (previous?.code === "receipt-retry" &&
+          terminalizationBacklogForResource(terminalizationBacklog, scope?.hash, resource) > 0) return;
+      if (previous?.code === "request-queue" &&
+          cleanupQueueForResource(cleanupQueue, resource) > 0) return;
+      if (!shouldClearRecoveryCause(previous, { sourceSuccess, tab, scheduledHold })) return;
+      recoveryRef.current = { ...recoveryRef.current, [resource]: null };
+      setRecoveryCauses(recoveryRef.current);
+      if (scope) setTimeout(() => {
+        safeRecordRecoveryTransition(scope, { resource, clear: true, at: Date.now() });
+      }, 0).unref?.();
+    }
+
     function publishGovernorEpochs(snapshot) {
       const epochs = snapshot?.value?.epochs;
       if (!isRecord(epochs)) return;
@@ -16135,7 +17663,9 @@ function App({ onCreateRemote = () => {} } = {}) {
       return null;
     }
 
-    function pauseCoordination(key, reason, diagnosticHold = null, acquisitionFailure = false) {
+    function pauseCoordination(key, reason, diagnosticHold = null, acquisitionFailure = false, retryAt = null) {
+      recordRuntimeRecovery(key, acquisitionFailure && reason === "busy" ? "acquisition-busy" : reason,
+        { retryAt });
       if (acquisitionFailure) setAcquisitionFailures((current) => current[key] === reason
         ? current : { ...current, [key]: reason ?? "unavailable" });
       const hold = diagnosticHold ?? (
@@ -16180,16 +17710,27 @@ function App({ onCreateRemote = () => {} } = {}) {
         return;
       }
       if (!snapshot?.ok) {
-        pauseCoordination(key, snapshot?.reason);
+        pauseCoordination(key, snapshot?.reason, null, false, snapshot?.retryAt);
         return;
       }
       const tabReady = governorTabControlReady(snapshot, key, nowMs);
       if (!refreshed?.ok && !tabReady) {
-        pauseCoordination(key, refreshed?.reason, "observer");
+        const resource = RATE_RESOURCES.find((candidate) => tabRequestCost(key)[candidate] > 0 &&
+          snapshot.value.observers[candidate]?.outcome !== "healthy");
+        pauseCoordination(key, refreshed?.reason, "observer", false,
+          resource ? snapshot.value.observers[resource]?.nextAt : null);
         return;
       }
       publishGovernorEpochs(snapshot);
       if (refreshed.value?.status === "waiting" && !tabReady) {
+        const resource = RATE_RESOURCES.find((candidate) => tabRequestCost(key)[candidate] > 0);
+        if (resource && !recoveryRef.current[resource] && scope) {
+          const shared = readRecoveryTransitions(scope).current[resource];
+          if (shared?.origin === "coordination") {
+            recoveryRef.current = { ...recoveryRef.current, [resource]: shared };
+            setRecoveryCauses(recoveryRef.current);
+          }
+        }
         setTabGovernorDecision(key, { mode: "waiting", probing: true });
         return;
       }
@@ -16198,32 +17739,45 @@ function App({ onCreateRemote = () => {} } = {}) {
       const reservation = pendingIntent
         ? snapshot.value.reservations[`reservation:${pendingIntent.intentId}`]
         : null;
+      const costs = tabRequestCost(key);
       if (reservation?.status === "scheduled" && reservation.notBefore > nowMs) {
+        const accessKey = pendingIntent.cleanupScope?.accessKey;
+        const reservationId = `reservation:${pendingIntent.intentId}`;
+        const lastAttempt = scheduledControlAttempts.get(key);
+        if (accessKey && pendingIntent.cleanupScope?.hash === scope?.hash &&
+            identity()?.accessKey === accessKey &&
+            (lastAttempt?.id !== reservationId || nowMs - lastAttempt.at >= 30_000)) {
+          scheduledControlAttempts.set(key, { id: reservationId, at: nowMs });
+          // A guarded hold write can retire an older transient notice. Merely
+          // reading a future grant or an absent hold cannot prove recovery.
+          const cleared = clearScheduledRuntimeControlHold(acquisitionEngine,
+            acquisitionSubscriptions, key, accessKey, nowMs);
+          for (const resource of RATE_RESOURCES) {
+            if (costs[resource] > 0) clearRuntimeRecovery(resource, { scheduledHold: cleared });
+          }
+        }
         setTabGovernorDecision(key, visibleGovernorDecision({
           status: "scheduled",
-          reservationId: `reservation:${pendingIntent.intentId}`,
+          reservationId,
           ...reservation,
           ...currentSharedLaneProvenance(pendingIntent, snapshot.value.leases, nowMs),
         }));
         return;
       }
-      const costs = tabRequestCost(key);
       for (const resource of RATE_RESOURCES) {
         if (costs[resource] <= 0) continue;
         const budget = snapshot.value.budgets[resource];
         const decision = budget
-          ? resourceDecision({
-              budget,
-              resource,
-              leases: snapshot.value.leases,
-              reservations: Object.values(snapshot.value.reservations),
-              nowMs,
-              cost: costs[resource],
-            })
+          ? governorResourceDecision(snapshot.value, resource, nowMs, costs[resource])
           : { mode: "probe", reason: "budget-unknown" };
         if (decision.mode === "open") continue;
         const resetHold = ["budget-reset", "reset", "rate-limit"].includes(decision.reason) ||
           budget?.blockUntil > nowMs;
+        const holdReason = budget?.blockUntil > nowMs
+          ? budget.blockReason ?? decision.reason : decision.reason;
+        recordRuntimeRecovery(key, holdReason, {
+          retryAt: recoveryRetryAt(decision, budget, snapshot.value.observers[resource], nowMs),
+        });
         setRuntimeAcquisitionHold(
           acquisitionEngine,
           acquisitionSubscriptions,
@@ -16235,7 +17789,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         );
         setTabGovernorDecision(key, {
           mode: resetHold || decision.mode === "paused" ? "paused" : "waiting",
-          reason: decision.reason,
+          reason: holdReason,
           resetMs: budget?.resetMs ?? decision.resetMs ?? null,
           probing: decision.mode === "probe" && !resetHold,
         });
@@ -16249,6 +17803,9 @@ function App({ onCreateRemote = () => {} } = {}) {
         identity()?.accessKey ?? null,
       );
       setTabGovernorDecision(key, null);
+      for (const resource of RATE_RESOURCES) {
+        if (costs[resource] > 0) clearRuntimeRecovery(resource);
+      }
     }
 
     async function refreshRuntimeBudget(currentScope) {
@@ -16260,15 +17817,9 @@ function App({ onCreateRemote = () => {} } = {}) {
       return refreshed;
     }
 
-    function reconcileRuntimeUncertainty(currentScope, snapshot) {
+    function syncRuntimeQuotaProjection(currentScope, snapshot) {
       if (!snapshot?.ok) return;
-      const evidence = Object.fromEntries(RATE_RESOURCES.flatMap((resource) => {
-        const observer = snapshot.value.observers?.[resource];
-        const epoch = snapshot.value.epochs?.[resource];
-        return observer?.outcome === "healthy" && typeof epoch === "string" && Number.isFinite(observer.at)
-          ? [[resource, { epoch, observedAt: observer.at }]] : [];
-      }));
-      acquisitionEngine.reconcileUncertainty(currentScope.accessKey, evidence);
+      acquisitionEngine.syncQuotaProjection(currentScope);
     }
 
     function commit(key, run, {
@@ -16320,7 +17871,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         : run;
       return requestIdentityStorage.run(scope, fencedRun)
         .then(async (result) => {
-          settleReservationWithBudgetObservations(settlementScope, leaseId, reservationId, result?.measuredSuccess === false
+          const terminal = queueTerminalization(settlementScope, scope.receiptCapability, result?.measuredSuccess === false
             ? { outcome: "rejected", observations: result?.observations ?? [] }
             : {
                 outcome: "measured-success",
@@ -16329,7 +17880,13 @@ function App({ onCreateRemote = () => {} } = {}) {
                   graphql: result?.graphqlSpent ?? GRAPHQL_PER_FETCH[key] ?? 0,
                 },
                 observations: result?.observations ?? [],
-              }, Date.now());
+              });
+          if (terminal.status === "retryable") recordRuntimeRecovery(key, "receipt-retry");
+          if (terminal.status === "blocked" || terminal.status === "compacted") {
+            failAcquisition(acquisition, { requestMetrics: acquisitionRequestMetrics(result), hold: "primary" });
+            pauseCoordination(key, terminalizationRecoveryCode(terminal), null, true);
+            return;
+          }
           if (!currentAccess()) {
             failAcquisition(acquisition, {
               requestMetrics: acquisitionRequestMetrics(result),
@@ -16352,7 +17909,6 @@ function App({ onCreateRemote = () => {} } = {}) {
             acquisition.capabilities = result.capabilities ?? {};
             acquisition.repositoryIdentity = result.repositoryIdentity;
             acquisition.requestMetrics = acquisitionRequestMetrics(result);
-            acquisition.uncertainReceipts = result.uncertainReceipts ?? [];
           }
           // Identical payload: skip the parse *and* the state update. Returning
           // the same state object makes React bail out of the re-render, so an
@@ -16387,9 +17943,9 @@ function App({ onCreateRemote = () => {} } = {}) {
           // so the next admitted tick parses its response instead of taking the
           // identical-output fast path.
           if (transition.kind === "unusable") {
+            recordRuntimeRecovery(key, "source-incomplete", { origin: "source" });
             failAcquisition(acquisition, {
               requestMetrics: acquisition?.requestMetrics ?? {},
-              uncertainReceipts: acquisition?.uncertainReceipts ?? [],
               hold: "primary",
             });
             rawRef.current[key] = transition.nextRaw;
@@ -16402,9 +17958,9 @@ function App({ onCreateRemote = () => {} } = {}) {
           // freshness. Do not retain its raw value either, so the next source
           // retry is parsed instead of taking the identical-payload fast path.
           if (transition.kind === "blind") {
+            recordRuntimeRecovery(key, "security-incomplete", { origin: "source" });
             failAcquisition(acquisition, {
               requestMetrics: acquisition?.requestMetrics ?? {},
-              uncertainReceipts: acquisition?.uncertainReceipts ?? [],
               hold: "primary",
             });
             rawRef.current[key] = transition.nextRaw;
@@ -16439,6 +17995,9 @@ function App({ onCreateRemote = () => {} } = {}) {
           publishStagedEntities(entityRef.current, stagedEntities, transition.kind);
           if (transition.kind === "unchanged") {
             lastOkRef.current[key] = completedAt;
+            for (const resource of RATE_RESOURCES) if (tabRequestCost(key)[resource] > 0) {
+              clearRuntimeRecovery(resource, { sourceSuccess: true, tab: key });
+            }
             clearBackoff(`tab:${key}`);
             setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
             const cachedTab = pick(
@@ -16455,6 +18014,9 @@ function App({ onCreateRemote = () => {} } = {}) {
           const tabData = transition.data;
           const tabMeta = transition.meta;
           lastOkRef.current[key] = completedAt;
+          for (const resource of RATE_RESOURCES) if (tabRequestCost(key)[resource] > 0) {
+            clearRuntimeRecovery(resource, { sourceSuccess: true, tab: key });
+          }
           clearBackoff(`tab:${key}`);
           rawRef.current[key] = transition.nextRaw;
           setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
@@ -16474,10 +18036,14 @@ function App({ onCreateRemote = () => {} } = {}) {
             requestMetrics: err?.requestMetrics ?? {},
             hold: acquisitionFailureHold(err),
           });
-          settleReservationWithBudgetObservations(settlementScope, leaseId, reservationId, {
+          const terminal = queueTerminalization(settlementScope, scope.receiptCapability, {
             outcome: governorOutcomeForError(err),
             observations: err?.budgetObservations ?? [],
-          }, Date.now());
+          });
+          if (terminal.status === "retryable") recordRuntimeRecovery(key, "receipt-retry");
+          if (terminal.status === "blocked" || terminal.status === "compacted") {
+            pauseCoordination(key, terminalizationRecoveryCode(terminal), null, true);
+          }
           if (cancelled || !currentAccess() || err?.name === "AbortError") return;
           // Preserve both the verdict and the bounded raw error in state. The
           // renderer translates recognized verdicts at draw time, which lets a
@@ -16494,6 +18060,13 @@ function App({ onCreateRemote = () => {} } = {}) {
           // recover on the very next tick once the network is back.
           const steps = verdict === "rate-limited" ? null : pick(FAILURE_LADDER, verdict, null);
           if (steps) recordFailure(`tab:${key}`, performance.now(), steps);
+          const backoffUntil = alertBackoff.get(backoffStorageKey(`tab:${key}`))?.until;
+          const retryAt = Number.isFinite(backoffUntil)
+            ? Date.now() + Math.max(0, backoffUntil - performance.now()) : null;
+          if (terminal.status !== "blocked" && terminal.status !== "compacted") {
+            const recovery = requestFailureRecovery(err, verdict);
+            recordRuntimeRecovery(key, recovery.reason, { origin: recovery.origin, retryAt });
+          }
           if (verdict === "rate-limited") {
             const snapshot = inspectGovernor(scope, Date.now());
             const costs = tabRequestCost(key);
@@ -16508,6 +18081,13 @@ function App({ onCreateRemote = () => {} } = {}) {
               });
             }
             handleRateLimitBlocks(key, blocks, Date.now());
+            const held = inspectGovernor(scope, Date.now());
+            const heldUntil = RATE_RESOURCES.filter((resource) => costs[resource] > 0)
+              .map((resource) => held.value?.budgets?.[resource]?.blockUntil)
+              .filter((deadline) => Number.isFinite(deadline) && deadline > Date.now());
+            if (heldUntil.length > 0) recordRuntimeRecovery(key, "rate-limited", {
+              origin: "source", retryAt: Math.min(...heldUntil),
+            });
           }
         })
         .finally(() => {
@@ -16541,6 +18121,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     const leaseId = governorId();
     const pending = new Map();
     const cleanupQueue = new Set();
+    let lastWallAt = Date.now();
     // One manual handoff per tab, carrying which key produced it. A keypress
     // during an automatic request must not be lost, but repeated keypresses
     // during the manual request itself must not create a trailing second batch.
@@ -16579,12 +18160,20 @@ function App({ onCreateRemote = () => {} } = {}) {
     const unchangedPolls = Object.fromEntries(TAB_KEYS.map((key) => [key, 0]));
     let pendingBlockPublications = new Map();
     const acquisitionSubscriptions = new Map();
+    // One-shot demand survives admission delays, but ends when an observation arrives.
+    const requestedTabs = new Map();
 
     function adoptAcquisitionSnapshot(key, snapshot, receipt = null) {
       if (!snapshot || cancelled) return;
+      if (requestedTabs.has(key) && !queuedManual.has(key) &&
+          snapshot.lastSuccessAt >= requestedTabs.get(key)) {
+        requestedTabs.delete(key);
+        if (runtime.background === "on-demand" && key !== "actions") pollDueAt[key] = Infinity;
+      }
       if (runtime.connect === null && Number.isFinite(snapshot.nextDueAt)) {
         sharedSnapshotDueAt = { ...sharedSnapshotDueAt, [key]: snapshot.nextDueAt };
-        if (pollDeadlinesOpen && key === TABS[activeIndexRef.current].key) {
+        if (pollDeadlinesOpen && key === TABS[activeIndexRef.current].key &&
+            Number.isFinite(pollIntervalFor(key, key))) {
           const at = Date.now();
           const due = sharedAcquisitionPollDeadline(pollDueAt[key], snapshot.nextDueAt, at, true);
           if (due < pollDueAt[key]) {
@@ -16657,6 +18246,14 @@ function App({ onCreateRemote = () => {} } = {}) {
       const host = effectiveRuntimeHost({ remoteUrls: runtimeRemoteUrls });
       const handles = new Map();
       const receivedSnapshots = new Set();
+      const initialKey = TABS[activeIndexRef.current].key;
+      const collectorDemand = (key) => ({
+        active: TABS[activeIndexRef.current].key === key &&
+          (runtime.background !== "on-demand" || key === "actions"),
+        background: runtime.background === "all",
+        floorMs: runtime.refreshMs,
+        pages: pageStateRef.current[key]?.pages ?? 1,
+      });
       let collectorReady = false;
       setGovernorDecisions(Object.fromEntries(TAB_KEYS.map((key) => [key, { disconnected: true }])));
       if (!repository || !host) {
@@ -16686,39 +18283,46 @@ function App({ onCreateRemote = () => {} } = {}) {
             },
           });
       for (const key of TAB_KEYS) {
-          const demand = {
-            active: TABS[activeIndexRef.current].key === key,
-            background: runtime.background !== "off",
-            floorMs: runtime.refreshMs,
-            pages: pageStateRef.current[key]?.pages ?? 1,
-          };
+          const demand = collectorDemand(key);
           const subscribed = client.subscribe({ host, repo: repository, resource: key, demand,
             sourceCheckpoint: cachedEntry?.tabs[key]?.source ?? null,
             onSnapshot: (snapshot, receipt) => {
               receivedSnapshots.add(key);
+              const sourceAdvanced = collectorSourceAdvanced(
+                collectorSourceSuccessRef.current[key], snapshot.lastSuccessAt);
               adoptAcquisitionSnapshot(key, snapshot, receipt);
+              if (Number.isFinite(snapshot.lastSuccessAt) &&
+                  (!Number.isFinite(collectorSourceSuccessRef.current[key]) ||
+                    snapshot.lastSuccessAt > collectorSourceSuccessRef.current[key])) {
+                collectorSourceSuccessRef.current[key] = snapshot.lastSuccessAt;
+              }
+              if (sourceAdvanced) {
+                for (const resource of RATE_RESOURCES) if (tabRequestCost(key)[resource] > 0) {
+                  clearRuntimeRecovery(resource, { sourceSuccess: true, tab: key });
+                }
+              }
               setErrors((current) => current[key] === null ? current : { ...current, [key]: null });
               setWaiting((current) => current[key] ? { ...current, [key]: false } : current);
               setGovernorDecisions((current) => ({ ...current, [key]:
                 collectorDisplayDecision({ connected: collectorReady, hasSnapshot: true }) }));
             },
-            onHold: (hold) => setGovernorDecisions((current) => ({ ...current, [key]:
-              collectorDisplayDecision({ connected: collectorReady,
-                hasSnapshot: receivedSnapshots.has(key), hold }) })),
+            onHold: (hold) => {
+              if (hold === "app-auth") recordRuntimeRecovery(key, "app-auth", { origin: "source" });
+              setGovernorDecisions((current) => ({ ...current, [key]:
+                collectorDisplayDecision({ connected: collectorReady,
+                  hasSnapshot: receivedSnapshots.has(key), hold }) }));
+            },
           });
           if (subscribed.ok) handles.set(key, subscribed.value);
+      }
+      if (runtime.background === "on-demand" && initialKey !== "actions") {
+        handles.get(initialKey)?.refresh();
       }
       fetchTabRef.current = (key, request = {}) => {
         const handle = handles.get(key);
         if (!handle) return;
-        if (request.kind === "tab-switch") {
-          for (const [candidate, candidateHandle] of handles) {
-            candidateHandle.updateDemand({ active: candidate === key, background: runtime.background !== "off",
-              floorMs: runtime.refreshMs, pages: pageStateRef.current[candidate]?.pages ?? 1 });
-          }
-        } else {
-          handle.updateDemand({ active: true, background: runtime.background !== "off",
-            floorMs: runtime.refreshMs, pages: pageStateRef.current[key]?.pages ?? 1 });
+        for (const [candidate, candidateHandle] of handles) {
+          candidateHandle.updateDemand(collectorDemand(candidate));
         }
         handle.refresh(request.force === true);
       };
@@ -16795,12 +18399,11 @@ function App({ onCreateRemote = () => {} } = {}) {
           demand: acquisition.demand?.active ? "active" : "inactive",
           unchangedCount: publicationView.unchangedCount,
           inProgressCI: key === "actions" && actionsInProgress(rows),
-          background: runtime.background,
+          background: runtime.background === "on-demand" ? "all" : runtime.background,
         }),
         hold: null,
         capabilities: acquisition.capabilities ?? {},
         requestMetrics: acquisition.requestMetrics ?? {},
-        uncertainReceipts: acquisition.uncertainReceipts ?? [],
         repositoryIdentity: acquisition.repositoryIdentity,
         meta,
         securityNotes: key === "security"
@@ -16841,10 +18444,17 @@ function App({ onCreateRemote = () => {} } = {}) {
       automaticStatusVisible) {
       const descriptor = tabForKey(key);
       let acquisitionStartAttempted = false;
+      let transportScope = null;
       const transported = await runStartedAcquisitionTransport(
         () => {
           const admitted = inspectGovernor(currentScope, nowMs);
           if (!admitted.ok) return admitted;
+          const admittedReservation = admitted.value.reservations[reservationId];
+          if (!admittedReservation?.receipt || admittedReservation.status !== "started") {
+            return { ok: false, reason: "compacted" };
+          }
+          transportScope = { ...currentScope,
+            receiptCapability: receiptCapabilityFromReservation(reservationId, admittedReservation) };
           acquisitionStartAttempted = true;
           const receipt = {
             reservationId,
@@ -16875,13 +18485,13 @@ function App({ onCreateRemote = () => {} } = {}) {
               force: item.force,
               catalog: workflowCatalogRef.current,
               pages: item.acquisition.demand?.pages ?? pageStateRef.current[key]?.pages ?? 1,
-              governor: { scope: currentScope, leaseId },
+              governor: { scope: transportScope, leaseId },
               previousRaw: rawRef.current[key] ?? null,
             }),
             {
               force: item.force,
               manual: item.manual === true,
-              scope: currentScope,
+              scope: transportScope,
               reservationId,
               admittedAt: nowMs,
               automaticStatusVisible,
@@ -16892,6 +18502,13 @@ function App({ onCreateRemote = () => {} } = {}) {
         },
       );
       if (transported.ok) return transported;
+      if (transportScope?.receiptCapability) {
+        const terminal = queueTerminalization(currentScope,
+          transportScope.receiptCapability, { outcome: "rejected", neverStarted: true });
+        if (terminal.status === "blocked" || terminal.status === "compacted") {
+          pauseCoordination(key, terminal.reason ?? terminal.status, null, true);
+        }
+      }
       pauseCoordination(key, transported.reason, null, acquisitionStartAttempted);
       // The governor reservation is already started. Even a transient failed
       // claim write cannot safely rebind it; retain its charge and get a fresh
@@ -16915,6 +18532,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         demand: key === activeKey ? "active" : "inactive",
         unchangedCount: unchangedPolls[key],
         inProgressCI: key === "actions" && actionsInProgress(actionRows),
+        requested: requestedTabs.has(key),
         background: runtime.background,
       });
     }
@@ -16925,7 +18543,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       const localDueAt = Number.isFinite(step) ? at + step : Number.POSITIVE_INFINITY;
       pollDueAt = {
         ...pollDueAt,
-        [key]: sharedAcquisitionPollDeadline(localDueAt, sharedSnapshotDueAt[key], at, active),
+        [key]: sharedAcquisitionPollDeadline(localDueAt, sharedSnapshotDueAt[key], at, active && Number.isFinite(step)),
       };
     }
 
@@ -16937,6 +18555,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     function openPollDeadlines(at) {
       const activeKey = TABS[activeIndexRef.current].key;
       const opened = { ...NEVER_DUE };
+      if (runtime.background === "on-demand") requestedTabs.set(activeKey, at);
       opened[activeKey] = at + 1;
       let slot = 1;
       for (const key of TAB_KEYS) {
@@ -17038,6 +18657,8 @@ function App({ onCreateRemote = () => {} } = {}) {
       coordinator.invalidate();
       setFailureContext(null);
       if (discardData) {
+        recoveryRef.current = { core: null, graphql: null };
+        setRecoveryCauses(recoveryRef.current);
         rawRef.current = {};
         entityRef.current.clear();
         lastOkRef.current = {};
@@ -17115,6 +18736,10 @@ function App({ onCreateRemote = () => {} } = {}) {
         }
         scope = createQuotaScope(current, { root: runtimeIdentityCoordinator.root, identityProvider: identity });
         cleanupScope = { ...scope, identityProvider: null };
+        const savedRecovery = readRecoveryTransitions(scope);
+        recoveryRef.current = savedRecovery.status === "healthy"
+          ? { ...savedRecovery.current } : { core: null, graphql: null };
+        setRecoveryCauses(recoveryRef.current);
         const nextTarget = dashboardCacheTarget({ repo: runtime.repo, ghRepo: process.env.GH_REPO, host: current.host, account: current.accessKey });
         // The mount-time target had to guess the account, and guesses
         // "unverified" whenever the bounded warm resolution above did not land
@@ -17176,6 +18801,11 @@ function App({ onCreateRemote = () => {} } = {}) {
     function finishPendingCleanup(key, item) {
       if (pending.get(key) === item) pending.delete(key);
       cleanupQueue.delete(item);
+      const resource = RATE_RESOURCES.find((candidate) => tabRequestCost(key)[candidate] > 0);
+      if (resource && cleanupQueueForResource(cleanupQueue, resource) === 0 &&
+          recoveryRef.current[resource]?.code === "request-queue") {
+        clearRuntimeRecovery(resource);
+      }
       setAcquisitionFailures((current) => {
         if (!Object.hasOwn(current, key)) return current;
         const next = { ...current };
@@ -17204,7 +18834,10 @@ function App({ onCreateRemote = () => {} } = {}) {
     }
 
     function retryPendingCleanup(key, item, at = Date.now()) {
-      if (item.cleanupInFlight) return false;
+      if (item.cleanupInFlight) {
+        recordRuntimeRecovery(key, "request-queue");
+        return false;
+      }
       item.cleanupPending = true;
       item.cleanupKey = key;
       cleanupQueue.add(item);
@@ -17230,6 +18863,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         finishPendingCleanup(key, item);
       }
       if (!item.governorClean) armWake("data", governorControlRetryAt(at, runtime.refreshMs), dataWake);
+      if (pending.has(key)) recordRuntimeRecovery(key, "request-queue");
       return !pending.has(key);
     }
 
@@ -17252,7 +18886,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     // the tab's failure ladder. `force` is the separate, stronger request that
     // also drops validators -- the `R` key. `r` is manual and not forced, which
     // is what makes a quiet refresh cost nothing.
-    async function requestTab(key, kind = "active", { force = false } = {}) {
+    async function requestTab(key, kind = "active", { force = false, detachTransport = false } = {}) {
       const manual = kind === "manual";
       const signal = controller.signal;
       const monotonicNow = performance.now();
@@ -17333,7 +18967,10 @@ function App({ onCreateRemote = () => {} } = {}) {
         currentScope.accessKey,
       );
       if (ownership.value.role !== "producer") {
-        if (ownership.value.snapshot) adoptAcquisitionSnapshot(key, ownership.value.snapshot);
+        if (ownership.value.snapshot) {
+          if (ownership.value.reason === "fresh") requestedTabs.delete(key);
+          adoptAcquisitionSnapshot(key, ownership.value.snapshot);
+        }
         if (ownership.value.sharingCount > 1) {
           setTabGovernorDecision(key, {
             mode: "waiting",
@@ -17457,9 +19094,19 @@ function App({ onCreateRemote = () => {} } = {}) {
       setTabWaiting(key, false);
       const item = pending.get(key);
       if (!item) return { persisted: false, retry: false, kind, key };
-      await startPendingAcquisitionTransport(
+      const transport = startPendingAcquisitionTransport(
         key, item, currentScope, decision.reservationId, nowMs, signal, false,
       );
+      if (detachTransport) {
+        // The scheduling single-flight owns admission, not the HTTP lifetime.
+        // A background response must not block the next active-tab wake.
+        void transport.catch((error) => {
+          if (cancelled || pending.get(key) !== item) return;
+          item.retryOnCleanup = true;
+          cancelPending(key, currentScope);
+          pauseCoordination(key, error?.reason ?? "stale");
+        });
+      } else await transport;
       return { persisted: true, retry: false, kind, key };
     }
     fetchTabRef.current = (key, { force = false, kind = force ? "manual" : "active" } = {}) => {
@@ -17470,6 +19117,10 @@ function App({ onCreateRemote = () => {} } = {}) {
         unchangedPolls[key] = advanceUnchangedCount(unchangedPolls[key], "subscribed");
       }
       const requestedAt = Date.now();
+      if (runtime.background === "on-demand") {
+        if (kind === "tab-switch") requestedTabs.clear();
+        requestedTabs.set(key, requestedAt);
+      }
       // Manual work replaces the active poll that would otherwise be due. Move
       // that deadline before touching the governor so a data wake already in
       // this event-loop turn cannot start a second batch as soon as the forced
@@ -17583,11 +19234,10 @@ function App({ onCreateRemote = () => {} } = {}) {
         const budget = snapshot.value.budgets[resource];
         const observer = snapshot.value.observers[resource];
         const decision = budget
-          ? availableForGrant({ budget, resource, nowMs })
+          ? governorAvailableForGrant(snapshot.value, resource, nowMs)
           : { mode: "paused" };
-        const held = pendingBlockPublications.has(resource) ||
-          budget?.blockUntil > nowMs ||
-          decision.mode === "paused" && decision.reason === "budget-exhausted";
+        const held = governorResourceHeld(snapshot.value, resource, nowMs,
+          pendingBlockPublications.has(resource));
         const retryAt = budget?.blockUntil > nowMs
           ? budget.blockUntil
           : observer?.nextAt ?? decision.retryAt ?? wakes.controlAt;
@@ -17607,13 +19257,14 @@ function App({ onCreateRemote = () => {} } = {}) {
         states: Object.fromEntries(TAB_KEYS.map((key) => [key, {
           unchangedCount: unchangedPolls[key],
           inProgressCI: key === "actions" && actionsInProgress(),
+          requested: requestedTabs.has(key),
         }])),
       });
       scheduledWakePolls = planned.due;
       pollDueAt = planned.dueAt;
       backgroundIndex = planned.backgroundIndex;
       const outcomes = await Promise.allSettled(
-        planned.due.map(({ key, kind }) => requestTab(key, kind)),
+        planned.due.map(({ key, kind }) => requestTab(key, kind, { detachTransport: true })),
       );
       const retryAt = governorControlRetryAt(Date.now(), runtime.refreshMs);
       const retried = retryFailedPollBatch({ due: planned.due, outcomes,
@@ -17666,6 +19317,13 @@ function App({ onCreateRemote = () => {} } = {}) {
 
     async function runControlWake() {
       if (cancelled) return;
+      const controlAt = Date.now();
+      const clockCause = wallClockRecovery(lastWallAt, controlAt, Math.min(runtime.refreshMs, 5_000));
+      lastWallAt = controlAt;
+      if (clockCause) {
+        recordRuntimeRecovery(TABS[activeIndexRef.current].key, clockCause, { origin: "source" });
+        setNow(new Date(controlAt));
+      }
       for (const item of [...cleanupQueue]) retryPendingCleanup(item.cleanupKey, item);
       await runtimeIdentityCoordinator.refresh();
       if (cancelled) return;
@@ -17684,11 +19342,11 @@ function App({ onCreateRemote = () => {} } = {}) {
       }
       const refreshed = currentScope
         ? await refreshRuntimeBudget(currentScope)
-        : { ok: false, reason: runtimeIdentityCoordinator?.inspect()?.reason ?? "stale" };
+        : { ok: false, ...(runtimeIdentityCoordinator?.inspect() ?? { reason: "stale" }) };
       if (cancelled) return;
       const checkedAt = Date.now();
       const snapshot = currentScope ? inspectGovernor(currentScope, checkedAt) : refreshed;
-      if (currentScope) reconcileRuntimeUncertainty(currentScope, snapshot);
+      if (currentScope) syncRuntimeQuotaProjection(currentScope, snapshot);
       if (currentScope && snapshot.ok && pendingBlockPublications.size > 0) {
         attemptPendingBlockPublications(currentScope, checkedAt, snapshot.value);
       }
@@ -17750,14 +19408,27 @@ function App({ onCreateRemote = () => {} } = {}) {
     const livenessWake = createRecurringWake({
       scheduler: wakeScheduler,
       intervalMs: Math.min(runtime.refreshMs, 5000),
-      run: async () => {
+      run: () => {
         if (cancelled || remoteSetupRef.current) return;
         const at = Date.now();
+        const clockCause = wallClockRecovery(lastWallAt, at, Math.min(runtime.refreshMs, 5_000));
+        lastWallAt = at;
+        for (const resource of RATE_RESOURCES) {
+          if (["receipt-retry", "request-queue"].includes(recoveryRef.current[resource]?.code)) {
+            clearRuntimeRecovery(resource);
+          }
+        }
+        if (clockCause) {
+          recordRuntimeRecovery(TABS[activeIndexRef.current].key, clockCause, { origin: "source" });
+          setNow(new Date(at));
+          void controlWake();
+          return;
+        }
         if (wakeScheduler.at("control") <= at ||
-          !Number.isFinite(wakeScheduler.at("control"))) await controlWake();
+          !Number.isFinite(wakeScheduler.at("control"))) void controlWake();
         if (pending.size > 0 || cleanupQueue.size > 0 ||
           wakeScheduler.at("data") <= Date.now() ||
-          Object.values(pollDueAt).some((due) => due <= Date.now())) await dataWake();
+          Object.values(pollDueAt).some((due) => due <= Date.now())) void dataWake();
       },
       onError: (error) => {
         if (!cancelled) pauseCoordination(TABS[activeIndexRef.current].key, error?.reason ?? "stale");
@@ -17773,7 +19444,9 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (cancelled) return;
       const currentScope = ensureScope(Date.now());
       if (!currentScope) {
-        pauseCoordination(TABS[activeIndexRef.current].key, runtimeIdentityCoordinator?.inspect()?.reason ?? "unknown-scope");
+        const identityFailure = runtimeIdentityCoordinator?.inspect();
+        pauseCoordination(TABS[activeIndexRef.current].key,
+          identityFailure?.reason ?? "unknown-scope", null, false, identityFailure?.retryAt);
         armWake("control", governorControlRetryAt(Date.now(), runtime.refreshMs), controlWake);
         return;
       }
@@ -17783,7 +19456,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (cancelled) return;
       const checkedAt = Date.now();
       const snapshot = inspectGovernor(currentScope, checkedAt);
-      reconcileRuntimeUncertainty(currentScope, snapshot);
+      syncRuntimeQuotaProjection(currentScope, snapshot);
       publishControlStatus(activeKey, refreshed, snapshot, checkedAt);
       if (snapshot.ok) {
         controlEpochs = { ...snapshot.value.epochs };
@@ -17907,7 +19580,14 @@ function App({ onCreateRemote = () => {} } = {}) {
   const displayError = formatTabErrorForWidth(tabError, failureContext, Math.max(1, cols - 5));
   const coordinationError = activeGovernorDecision?.coordinationError && !remoteSetup;
   const coordinationReason = activeFailure ?? activeGovernorDecision?.reason ?? "unavailable";
-  const coordinationCondition = coordinationError ? `${tab.key}\0${coordinationReason}` : null;
+  const noticeReason = activeRecovery?.code ??
+    (tabError?.kind === "fetch" ? tabError.verdict : null) ??
+    (coordinationError || activeGovernorDecision?.mode === "paused" ? coordinationReason : null) ??
+    (statusDisconnected ? runtime.connect === null ? "identity-unavailable"
+      : activeGovernorDecision?.reason === "app-auth" ? "app-auth" : "disconnected" : null);
+  // A continuous fault stays sustained when its explanation becomes more
+  // specific. Only losing the fault (or switching tabs) restarts the debounce.
+  const coordinationCondition = !remoteSetup && noticeReason ? tab.key : null;
   useEffect(() => {
     setVisibleCoordinationCondition(null);
     if (coordinationCondition === null) return;
@@ -17919,10 +19599,21 @@ function App({ onCreateRemote = () => {} } = {}) {
   }, [coordinationCondition]);
   const showCoordinationNotice = coordinationCondition !== null &&
     visibleCoordinationCondition === coordinationCondition;
-  const noticeLine = showCoordinationNotice
-    ? activeFailure ? acquisitionFailureCopy(activeFailure)[cols < 40 ? "narrow" : "full"]
-      : coordinationNotice(coordinationReason)
-    : !remoteSetup && displayError ? displayError : "";
+  const noticeResource = activeResource;
+  const noticeSourceAt = collectorSourceAgeRef.current[tab.key]
+    ? now.getTime() - collectorSourceAgeRef.current[tab.key].ageMs -
+      Math.max(0, performance.now() - collectorSourceAgeRef.current[tab.key].measuredAt)
+    : lastOkRef.current[tab.key] ?? null;
+  const noticeCause = activeRecovery ?? (noticeReason ? recoveryCause({
+    reason: noticeReason === "other" ? "network-outage" : noticeReason,
+    resource: noticeResource, sourceAt: noticeSourceAt,
+    retryAt: activeGovernorDecision?.retryAt ?? activeGovernorDecision?.resetMs ??
+      activeGovernorDecision?.notBefore ?? null,
+    origin: tabError ? "source" : "coordination", tab: tabError ? tab.key : null,
+  }) : null);
+  const noticeLines = showCoordinationNotice && noticeCause
+    ? presentRecovery(noticeCause, { nowMs: now.getTime(), cols })
+    : [!remoteSetup && displayError ? displayError : ""];
   const noticeTone = showCoordinationNotice ? ATTENTION : displayError ? ERROR_TEXT : undefined;
   const spin = SPINNER[frame % SPINNER.length];
 
@@ -17998,6 +19689,22 @@ function App({ onCreateRemote = () => {} } = {}) {
       disconnected: data[tab.key] !== null && !runtimeIdentityCoordinator?.current(),
     });
   }
+
+  if (runtime.background === "on-demand" && tab.key !== "actions" && data[tab.key] !== null &&
+      ["watching", "shared", "stale"].includes(semanticStatus.kind) && !tabError &&
+      !activeFailure && !(tab.key === "security" && securityBlind)) {
+    semanticStatus = refreshStatus({ onDemand: true });
+  }
+
+  // A settled on-demand view has no data wake to advance its visible age.
+  // Tick only its display clock; source timestamps and acquisition stay idle.
+  const showCachedAge = semanticStatus.kind === "cached" && staleFor !== null;
+  useEffect(() => {
+    if (!showCachedAge) return;
+    setNow(new Date());
+    const timer = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, [showCachedAge]);
 
   const allItems = items ?? [];
   const tabOffsetRaw = offset[tab.key] ?? 0;
@@ -18199,7 +19906,8 @@ function App({ onCreateRemote = () => {} } = {}) {
       !showHelp &&
         tooNarrow &&
         e(Text, { dimColor: true, wrap: "truncate-end" }, "too narrow"),
-      e(Text, { color: noticeTone, wrap: "truncate-end" }, noticeLine),
+      ...noticeLines.map((line, index) =>
+        e(Text, { key: `recovery:${index}`, color: noticeTone, wrap: "truncate-end" }, line)),
       !showHelp &&
         !tooNarrow &&
         !remoteSetup &&
@@ -18294,7 +20002,8 @@ function App({ onCreateRemote = () => {} } = {}) {
       status: semanticStatus,
       detail: activeGovernorDecision,
       spin: showSpinner ? spin : null,
-      stale: staleLabel,
+      stale: semanticStatus.kind === "cached" && staleFor != null
+        ? formatDuration(Math.max(0, staleFor)) : staleLabel,
       nowMs: now.getTime(),
       interactive,
       cols: frameCols,
@@ -18589,6 +20298,7 @@ export {
   resolveEffectiveCredential,
   identityRegistryRoot,
   inspectIdentityRegistry,
+  doctorCachedQuotaScope,
   claimIdentityBootstrap,
   finishIdentityBootstrap,
   createIdentityCoordinator,
@@ -18633,6 +20343,10 @@ export {
   budgetEpoch,
   resourceReserve,
   availableForGrant,
+  governorChargedCost,
+  governorAvailableForGrant,
+  governorResourceDecision,
+  governorResourceHeld,
   nextExternalFactor,
   resourceDecision,
   governorPhaseOffset,
@@ -18658,6 +20372,7 @@ export {
   serializeGovernorState,
   readGovernorState,
   writeGovernorState,
+  writeGovernorQuotaState,
   pidIsDead,
   claimGovernorLock,
   releaseGovernorLock,
@@ -18685,6 +20400,9 @@ export {
   readIntentDecision,
   cancelIntent,
   startReservation,
+  issueGovernorDispatch,
+  terminalGovernorDispatch,
+  acknowledgeSealedGeneration,
   completeReservation,
   settleReservationWithBudgetObservations,
   recordResourceBlock,
@@ -18846,7 +20564,9 @@ export {
   acquisitionRequestMetrics,
   acquisitionFailureHold,
   setRuntimeAcquisitionHold,
+  clearScheduledRuntimeControlHold,
   loadAcquisitionStore,
+  readAcquisitionSnapshot,
   createAcquisitionEngine,
   pollPolicyInterval,
   advanceUnchangedCount,
@@ -18882,11 +20602,27 @@ export {
   runtimeIntentGate,
   rateLimitBlockDecision,
   coordinationNotice,
+  recoveryCause,
+  shouldClearRecoveryCause,
+  recoveryRetryAt,
+  terminalizationRecoveryCode,
+  terminalizationBacklogForResource,
+  receiptCapabilityFromReservation,
+  requestFailureRecoveryCode,
+  requestFailureRecovery,
+  wallClockRecovery,
+  collectorSourceAdvanced,
+  cleanupQueueForResource,
+  presentRecovery,
+  recordRecoveryTransition,
+  safeRecordRecoveryTransition,
+  readRecoveryTransitions,
   mergeRateLimitBlockPublications,
   hydrateRateLimitBlockPublication,
   retryRateLimitBlockPublication,
   rateLimitBlockProbeRecovered,
   admitGovernorOperation,
+  queueTerminalization,
   runAdmittedOperation,
   abortableDelay,
   awaitCollectorReservation,
@@ -18912,6 +20648,7 @@ export {
   demandedPageCount,
   mergeDemandedPages,
   operationPausedUntil,
+  pauseOperation,
   LIST_LIMIT,
   readGraphqlObserver,
   GRAPHQL_QUERIES,

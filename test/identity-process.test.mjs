@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -132,5 +132,75 @@ test("ID-05: reappearing legacy leases pause an already active identity", async 
   assert.equal(readFileSync(legacyPath, "utf8"), serialized);
   const after = inspectIdentityRegistry(coordinator.root).value;
   assert.equal(after.hosts["github.com"].lastStartedAt, before.hosts["github.com"].lastStartedAt);
-  assert.equal(after.hosts["github.com"].permit, null);
+  assert.equal(after.hosts["github.com"].permits.length, 0);
+});
+
+test("independent processes share three HTTP slots and the host start gap", { timeout: 70_000 }, async (t) => {
+  const box = fixture(t);
+  await box.run(COORDINATE);
+  const lockPath = join(identityRegistryRoot(box.pathOptions), "registry.json.lock");
+  writeFileSync(lockPath, JSON.stringify({ pid: process.pid, nonce: randomUUID() }), { flag: "wx", mode: 0o600 });
+  const readinessPath = join(box.root, "readiness.ndjson");
+  const script = `
+    const { createIdentityCoordinator, acquireIdentityHttpPermit, releaseIdentityHttpPermit,
+      inspectIdentityRegistry, retryIdentityCompletion } = await import(process.env.TEST_MODULE_URL);
+    const { appendFileSync } = await import('node:fs');
+    const coordinator = createIdentityCoordinator({ host: 'github.com',
+      pathOptions: { env: { XDG_CONFIG_HOME: process.env.TEST_ROOT } } });
+    const refreshed = await coordinator.refresh({ allowBootstrap: false });
+    appendFileSync(process.env.TEST_READINESS, JSON.stringify({ pid: process.pid, reason: refreshed.reason }) + '\\n');
+    let identity = refreshed;
+    const deadline = Date.now() + 5000;
+    while (!identity.ok && ['busy', 'unwritable'].includes(identity.reason) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      identity = await coordinator.refresh({ allowBootstrap: false });
+    }
+    if (!identity.ok) throw new Error('missing identity: ' + identity.reason);
+    const permit = await acquireIdentityHttpPermit(coordinator);
+    const inspected = await retryIdentityCompletion(() => inspectIdentityRegistry(coordinator.root), { timeoutMs: 5000 });
+    if (!inspected.ok) throw new Error('inspection failed: ' + inspected.reason);
+    const held = inspected.value.hosts['github.com'].permits
+      .find(item => item.nonce === permit.nonce);
+    appendFileSync(process.env.TEST_JOURNAL, JSON.stringify({ type: 'start', nonce: permit.nonce,
+      at: Date.now(), grantedAt: held.startedAt }) + '\\n');
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    appendFileSync(process.env.TEST_JOURNAL, JSON.stringify({ type: 'end', nonce: permit.nonce,
+      at: Date.now() }) + '\\n');
+    const released = await retryIdentityCompletion(() => releaseIdentityHttpPermit(coordinator, permit), { timeoutMs: 5000 });
+    if (!released.ok) throw new Error('release failed: ' + released.reason);
+    coordinator.close();
+    process.stdout.write(JSON.stringify({ nonce: permit.nonce }));
+  `;
+  const children = Promise.allSettled(Array.from({ length: 8 }, () => box.run(script, { TEST_READINESS: readinessPath })));
+  let results;
+  try {
+    const deadline = Date.now() + 5_000;
+    while ((!existsSync(readinessPath) || readFileSync(readinessPath, "utf8").trim().split("\n").length < 8) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const readiness = readFileSync(readinessPath, "utf8").trim().split("\n").map(JSON.parse);
+    assert.equal(readiness.length, 8, "all children must encounter the live registry owner");
+    assert.equal(new Set(readiness.map((item) => item.pid)).size, 8);
+    assert.ok(readiness.every((item) => item.reason === "busy"));
+  } finally {
+    unlinkSync(lockPath);
+    results = await children;
+  }
+  assert.deepEqual(results.filter((result) => result.status === "rejected").map((result) => result.reason.message), []);
+  const events = readFileSync(box.env.TEST_JOURNAL, "utf8").trim().split("\n").map(JSON.parse)
+    .filter((event) => event.type);
+  let active = 0;
+  let peak = 0;
+  for (const event of events) {
+    active += event.type === "start" ? 1 : -1;
+    peak = Math.max(peak, active);
+    assert.ok(active >= 0 && active <= 3, "shared capacity exceeded across processes");
+  }
+  assert.equal(active, 0);
+  assert.equal(peak, 3, "independent requests remained serialized");
+  const starts = events.filter((event) => event.type === "start").sort((a, b) => a.grantedAt - b.grantedAt);
+  assert.equal(starts.length, 8);
+  for (let index = 1; index < starts.length; index += 1) {
+    assert.ok(starts[index].grantedAt - starts[index - 1].grantedAt >= 250);
+  }
 });

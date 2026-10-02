@@ -157,6 +157,7 @@ test("manual refresh bursts create one unchanged held-sample probe demand", asyn
   const startupReadyPath = join(box.root, "manual-startup-ready");
   const secondBurstReadyPath = join(box.root, "manual-second-burst-ready");
   const resultPromise = captureAsync({
+    args: "--background all",
     cols: 80,
     rows: 24,
     signal: "none",

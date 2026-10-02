@@ -1,0 +1,361 @@
+{
+  "schema": 1,
+  "kind": "sustained-recovery",
+  "seed": 539363624,
+  "durationMs": 259200000,
+  "cohorts": [
+    {
+      "id": "single",
+      "panes": 1,
+      "plannedOperations": 200,
+      "limit": 5000,
+      "declaredCadenceMs": 1800000,
+      "sleepMs": 30000,
+      "duplicateRepositories": false,
+      "tabs": [
+        "actions"
+      ],
+      "admitted": 200,
+      "interrupted": 21,
+      "resets": 132,
+      "identityChanges": 0,
+      "admissionDenials": 0,
+      "completionFaults": [
+        {
+          "index": 12,
+          "cost": {
+            "core": 1,
+            "graphql": 0
+          },
+          "retainedBeforeRetry": true,
+          "settledAfterRetry": true,
+          "requestCount": 1
+        }
+      ],
+      "unterminalizedCharge": {
+        "core": 11,
+        "graphql": 0
+      },
+      "outstandingCharge": {
+        "core": 11,
+        "graphql": 0
+      },
+      "aggregateDebt": {
+        "core": 11,
+        "graphql": 0
+      },
+      "detailedStartedUnits": {
+        "core": 0,
+        "graphql": 0
+      },
+      "unterminalizedReceipts": 11,
+      "detailedUnterminalizedReceipts": 0,
+      "detailedUnterminalizedDispatches": 0,
+      "firstSuccessDelayMs": 4607,
+      "resumeDelayMs": 1991,
+      "maximumRawSourceGapMs": 2621600,
+      "maximumSourceGapMs": 2621600,
+      "allowedSourceGapMs": 5400000,
+      "sleepSpanningGaps": [
+        {
+          "queryIndex": 0,
+          "rawGapMs": 1300461,
+          "eligibleGapMs": 1270461,
+          "excludedSleepMs": 30000
+        }
+      ],
+      "sourceCadenceMet": true,
+      "paneCoverage": [
+        {
+          "pane": 0,
+          "successes": 179,
+          "maximumGapMs": 2621600
+        }
+      ],
+      "peakSampling": {
+        "operationStride": 100,
+        "includesFinal": true
+      },
+      "maximumSampledLedgerBytes": 7959,
+      "maximumSampledDetailedReceipts": 1,
+      "maximumSampledDebtGroups": 11,
+      "sourceSuccesses": 179,
+      "externalRequests": 600,
+      "reconciliation": {
+        "ok": true,
+        "failures": []
+      }
+    },
+    {
+      "id": "mixed",
+      "panes": 6,
+      "plannedOperations": 900,
+      "limit": 5000,
+      "declaredCadenceMs": 1800000,
+      "sleepMs": 3600000,
+      "duplicateRepositories": true,
+      "tabs": [
+        "actions",
+        "issues",
+        "prs",
+        "security"
+      ],
+      "admitted": 900,
+      "interrupted": 99,
+      "resets": 136,
+      "identityChanges": 0,
+      "admissionDenials": 0,
+      "completionFaults": [
+        {
+          "index": 16,
+          "cost": {
+            "core": 0,
+            "graphql": 2
+          },
+          "retainedBeforeRetry": true,
+          "settledAfterRetry": true,
+          "requestCount": 1
+        }
+      ],
+      "unterminalizedCharge": {
+        "core": 79,
+        "graphql": 40
+      },
+      "outstandingCharge": {
+        "core": 79,
+        "graphql": 40
+      },
+      "aggregateDebt": {
+        "core": 79,
+        "graphql": 40
+      },
+      "detailedStartedUnits": {
+        "core": 0,
+        "graphql": 0
+      },
+      "unterminalizedReceipts": 49,
+      "detailedUnterminalizedReceipts": 0,
+      "detailedUnterminalizedDispatches": 0,
+      "firstSuccessDelayMs": 22443,
+      "resumeDelayMs": 23082,
+      "maximumRawSourceGapMs": 5911746,
+      "maximumSourceGapMs": 2902399,
+      "allowedSourceGapMs": 5400000,
+      "sleepSpanningGaps": [
+        {
+          "queryIndex": 1,
+          "rawGapMs": 5030256,
+          "eligibleGapMs": 1430256,
+          "excludedSleepMs": 3600000
+        },
+        {
+          "queryIndex": 2,
+          "rawGapMs": 4745037,
+          "eligibleGapMs": 1145037,
+          "excludedSleepMs": 3600000
+        },
+        {
+          "queryIndex": 3,
+          "rawGapMs": 5911746,
+          "eligibleGapMs": 2311746,
+          "excludedSleepMs": 3600000
+        },
+        {
+          "queryIndex": 4,
+          "rawGapMs": 4178890.4604492188,
+          "eligibleGapMs": 578890.4604492188,
+          "excludedSleepMs": 3600000
+        },
+        {
+          "queryIndex": 0,
+          "rawGapMs": 3889076,
+          "eligibleGapMs": 289076,
+          "excludedSleepMs": 3600000
+        }
+      ],
+      "sourceCadenceMet": true,
+      "paneCoverage": [
+        {
+          "pane": 0,
+          "successes": 160,
+          "maximumGapMs": 3889076
+        },
+        {
+          "pane": 1,
+          "successes": 160,
+          "maximumGapMs": 3889076
+        },
+        {
+          "pane": 2,
+          "successes": 160,
+          "maximumGapMs": 5030256
+        },
+        {
+          "pane": 3,
+          "successes": 160,
+          "maximumGapMs": 4745037
+        },
+        {
+          "pane": 4,
+          "successes": 160,
+          "maximumGapMs": 5911746
+        },
+        {
+          "pane": 5,
+          "successes": 161,
+          "maximumGapMs": 4178890.4604492188
+        }
+      ],
+      "peakSampling": {
+        "operationStride": 100,
+        "includesFinal": true
+      },
+      "maximumSampledLedgerBytes": 25553,
+      "maximumSampledDetailedReceipts": 4,
+      "maximumSampledDebtGroups": 49,
+      "sourceSuccesses": 801,
+      "externalRequests": 3518,
+      "reconciliation": {
+        "ok": true,
+        "failures": []
+      }
+    },
+    {
+      "id": "distinct",
+      "panes": 10,
+      "plannedOperations": 11000,
+      "limit": 15000,
+      "declaredCadenceMs": 300000,
+      "sleepMs": 0,
+      "duplicateRepositories": false,
+      "tabs": [
+        "actions",
+        "issues",
+        "prs",
+        "security"
+      ],
+      "admitted": 11000,
+      "interrupted": 1220,
+      "resets": 140,
+      "identityChanges": 1,
+      "admissionDenials": 0,
+      "completionFaults": [
+        {
+          "index": 21,
+          "cost": {
+            "core": 0,
+            "graphql": 2
+          },
+          "retainedBeforeRetry": true,
+          "settledAfterRetry": true,
+          "requestCount": 1
+        }
+      ],
+      "unterminalizedCharge": {
+        "core": 366,
+        "graphql": 488
+      },
+      "outstandingCharge": {
+        "core": 366,
+        "graphql": 488
+      },
+      "aggregateDebt": {
+        "core": 365,
+        "graphql": 488
+      },
+      "detailedStartedUnits": {
+        "core": 1,
+        "graphql": 0
+      },
+      "unterminalizedReceipts": 610,
+      "detailedUnterminalizedReceipts": 1,
+      "detailedUnterminalizedDispatches": 1,
+      "firstSuccessDelayMs": 49451,
+      "resumeDelayMs": null,
+      "maximumRawSourceGapMs": 476399,
+      "maximumSourceGapMs": 476399,
+      "allowedSourceGapMs": 900000,
+      "sleepSpanningGaps": [],
+      "sourceCadenceMet": true,
+      "paneCoverage": [
+        {
+          "pane": 0,
+          "successes": 978,
+          "maximumGapMs": 476217
+        },
+        {
+          "pane": 1,
+          "successes": 978,
+          "maximumGapMs": 476169
+        },
+        {
+          "pane": 2,
+          "successes": 978,
+          "maximumGapMs": 476256
+        },
+        {
+          "pane": 3,
+          "successes": 978,
+          "maximumGapMs": 475893
+        },
+        {
+          "pane": 4,
+          "successes": 978,
+          "maximumGapMs": 476239
+        },
+        {
+          "pane": 5,
+          "successes": 978,
+          "maximumGapMs": 476399
+        },
+        {
+          "pane": 6,
+          "successes": 978,
+          "maximumGapMs": 476161
+        },
+        {
+          "pane": 7,
+          "successes": 978,
+          "maximumGapMs": 476339
+        },
+        {
+          "pane": 8,
+          "successes": 978,
+          "maximumGapMs": 476095
+        },
+        {
+          "pane": 9,
+          "successes": 978,
+          "maximumGapMs": 476391
+        }
+      ],
+      "peakSampling": {
+        "operationStride": 100,
+        "includesFinal": true
+      },
+      "maximumSampledLedgerBytes": 66171,
+      "maximumSampledDetailedReceipts": 4,
+      "maximumSampledDebtGroups": 128,
+      "sourceSuccesses": 9780,
+      "externalRequests": 29328,
+      "reconciliation": {
+        "ok": true,
+        "failures": []
+      }
+    }
+  ],
+  "admitted": 12100,
+  "interrupted": 1340,
+  "resets": 408,
+  "peakSampling": {
+    "operationStride": 100,
+    "includesFinal": true
+  },
+  "maximumSampledLedgerBytes": 66171,
+  "maximumSampledDetailedReceipts": 4,
+  "maximumSampledDebtGroups": 128,
+  "reconciliation": {
+    "ok": true,
+    "failures": []
+  }
+}

@@ -128,3 +128,6 @@ Go directly to these paths -- never search for them.
 | Plans | `docs/plans/YYYY-MM-DD-*.md` | `-phases/` |
 | ADRs | `docs/decisions/` | |
 | App source | `index.mjs` | single file, keep it that way |
+<!-- rpi:claude-import:start -->
+@AGENTS.md
+<!-- rpi:claude-import:end -->

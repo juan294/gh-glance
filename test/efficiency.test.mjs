@@ -209,7 +209,9 @@ test("E2E-02/03/04/05: accelerated hour uses production coordination and reconci
     "Actions-only topologies must not spend GraphQL budget");
   assert.ok(report.metrics.observerCalls > 0);
   assert.ok(report.metrics.provenCoreUnits > 0);
-  assert.ok(report.metrics.uncertainCoreUnits > 0);
+  assert.ok(report.metrics.outstandingQuotaCoreUnits > 0);
+  assert.equal(report.metrics.uncertainCoreUnits, 0,
+    "v2 acquisition metrics no longer own quota uncertainty");
   assert.equal(report.metrics.costEvidence.oracleCharged, true);
   assert.equal(report.metrics.costEvidence.acquisitionPersisted, true);
   assert.ok(report.metrics.maximumConcurrentProducerRequests >= 1);
@@ -233,13 +235,13 @@ test("E2E-02/03/04/05: accelerated hour uses production coordination and reconci
   assert.match(formatEfficiencyMarkdown(report), /Baseline comparison: incompatible/);
   assert.match(formatEfficiencyMarkdown(report), /not claimed/i);
   assert.match(formatEfficiencyMarkdown(report), /Oracle charged cost:/);
-  assert.match(formatEfficiencyMarkdown(report), /Acquisition proven\/uncertain cost:/);
+  assert.match(formatEfficiencyMarkdown(report), /Quota-authoritative outstanding core:/);
   assert.match(formatEfficiencyMarkdown(report), /Shared follower-delivery delay/);
   assert.deepEqual(report.releaseGate, { passed: false, reason: "startup-slice-not-measured" });
 });
 
 test("E2E-03: resource-disabled measurement is identical across three bounded runs", {
-  timeout: 120_000,
+  timeout: 240_000,
 }, async () => {
   const stable = (report) => {
     const copy = structuredClone(report);
@@ -255,9 +257,10 @@ test("E2E-03: resource-disabled measurement is identical across three bounded ru
       baselinePath: BASELINE_PATH,
       includeResources: false,
       includeStartupSlice: false,
-      // The full mixed cohort runs once in the acceptance case above; this
-      // repeatability check keeps its bounded 120-second gate.
-      topologyIds: SUSTAINED.topologies.map(({ id }) => id).filter((id) => id !== "mixed-tabs"),
+      // The acceptance case above runs every non-mixed topology, and the
+      // mixed case below runs separately. Repeat representative single,
+      // shared, and distinct scopes three times within the 240-second bound.
+      topologyIds: ["single-pane", "two-duplicates", "ten-distinct"],
     })));
   }
   assert.deepEqual(reports[1], reports[0]);

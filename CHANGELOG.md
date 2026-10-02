@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-01
+
+### Changed
+
+- Default to `--background on-demand`: automatically update active Actions,
+  check secondary tabs when opened or refreshed, and retain cached results with
+  visible source age. Keep `all` and `off` for continuous polling.
+
+### Added
+
+- Add a strict 24-hour freshness monitor with a fixed candidate hash, declared
+  pane cohort and cadence, source-clock checks, process-liveness checks, and
+  independently captured provider-hold evidence. Earlier monitor manifests
+  remain available for diagnostics but cannot qualify a run.
+- Add a deterministic 72-hour request and governor oracle with repeated quota
+  resets, persistent pane cohorts, interrupted requests, and a completion-write
+  retry that reconciles charges without repeating HTTP requests.
+
+### Fixed
+
+- Recover automatically from full or aged quota receipt stores and acquisition
+  uncertainty while preserving retained charges and cached data.
+- Allow up to three admitted HTTP requests per host while retaining FIFO starts,
+  shared pacing, quota reserves and provider backoff. Renew queued lease ownership
+  within the original request deadline.
+- Keep active Actions progressing while a slower secondary response is in flight.
+- Read shared acquisition snapshots consistently during concurrent publication.
+- Retain requested collector refreshes through connection setup and welcome.
+- Advance the displayed cached source age while secondary views are idle,
+  without requesting another observation.
+- Preserve diagnostic recovery notices until a matching guarded write proves
+  recovery, and tolerate event-clock rollback without discarding journal evidence.
+- Preserve bounded Core and GraphQL recovery causes across observer handoffs and
+  show the next action and truthful cached source age in normal, narrow,
+  no-color, and screen-reader output.
+- Let plain `--doctor` inspect a unique cached quota scope without GitHub calls
+  or state writes. Report bounded receipt/debt and recovery diagnostics while
+  withholding credential and quota fingerprints.
+- Keep legacy and interrupted request charges until causal observer evidence
+  can retire them; the diagnostic journal does not grant or refund quota.
+
+### Migration
+
+- Restart every pane sharing coordination state with the upgraded binary;
+  mixed-version coordination is unsupported.
+  An older live transport request must drain before registry migration, and older
+  writers are fenced afterward. Retained quota charges are preserved.
+- Rolling back to v0.15.2 cannot restore operation against the newer ledger.
+  Use a compatible repaired version and retain the current accounting state.
+
 ## [0.15.2] - 2026-09-24
 
 ### Fixed
@@ -1166,7 +1216,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.15.2...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/juan294/gh-glance/compare/v0.15.2...v0.16.0
 [0.15.2]: https://github.com/juan294/gh-glance/compare/v0.15.1...v0.15.2
 [0.15.1]: https://github.com/juan294/gh-glance/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/juan294/gh-glance/compare/v0.14.1...v0.15.0

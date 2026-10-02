@@ -82,6 +82,8 @@ test("COL-05: Shared is earned by a full snapshot and never masks holds or disco
   assert.deepEqual(collectorDisplayDecision({ connected: true, hasSnapshot: true, hold: "shared-wait" }),
     { mode: "waiting", waitCause: "shared-lane" });
   assert.deepEqual(collectorDisplayDecision({ connected: false, hasSnapshot: true }), { disconnected: true });
+  assert.deepEqual(collectorDisplayDecision({ connected: true, hasSnapshot: true, hold: "app-auth" }),
+    { disconnected: true, reason: "app-auth" });
 });
 
 test("COL-08: large snapshots assemble only after bounded digest validation", () => {
@@ -415,5 +417,31 @@ test("COL-02: unknown snapshot IDs are rejected before assembly", () => {
   socket.emit("data", Buffer.from(encodeCollectorFrame({ type: "snapshot", id: "unknown",
     serverEpoch: "11111111-1111-4111-8111-111111111111", generation: 1, snapshot })));
   assert.equal(socket.destroyed, true);
+  client.close();
+});
+
+
+test("COL on-demand refresh waits for welcome and coalesces force before subscribing", () => {
+  class FakeSocket extends EventEmitter {
+    writable = true;
+    writes = [];
+    write(value) { this.writes.push(JSON.parse(String(value))); return true; }
+    destroy() { this.writable = false; this.emit("close"); }
+  }
+  const socket = new FakeSocket();
+  const client = createLocalCollectorClient({
+    pathOptions: { env: { XDG_CONFIG_HOME: "/tmp/unused" }, platform: "linux" },
+    createConnection_() { return socket; },
+    setTimeout() { return { unref() {} }; }, clearTimeout() {},
+  });
+  const handle = client.subscribe({ id: "one", host: "github.com", repo: "acme/widget", resource: "issues",
+    demand: { active: false, background: false, floorMs: 5000, pages: 1 }, onSnapshot() {} }).value;
+  handle.refresh(); handle.refresh(true); handle.refresh();
+  assert.deepEqual(socket.writes, []);
+  socket.emit("connect");
+  socket.emit("data", Buffer.from(encodeCollectorFrame({ type: "welcome", protocolVersion: 1,
+    serverEpoch: "11111111-1111-4111-8111-111111111111", capabilities: { chunks: true, maxSubscriptions: 64 } })));
+  assert.deepEqual(socket.writes.map((frame) => frame.type), ["hello", "subscribe", "refresh"]);
+  assert.equal(socket.writes[2].force, true);
   client.close();
 });

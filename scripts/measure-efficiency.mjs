@@ -1,5 +1,6 @@
 import { createHash, createHmac, generateKeyPairSync } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync,
   readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
@@ -20,6 +21,7 @@ import {
   createCollectorService,
   createCollectorSourceAgeTracker,
   createGovernorScope,
+  GOVERNOR_LEASE_TTL_MS,
   createIdentityCoordinator,
   createQuotaScope,
   createSshCollectorClient,
@@ -29,6 +31,9 @@ import {
   maintainControlLease,
   normalizeCollectorConfig,
   publishProbe,
+  registerIntent,
+  registerLease,
+  startReservation,
   projectCollectorSnapshot,
   webhookQueuePath,
 } from "../index.mjs";
@@ -431,6 +436,8 @@ function createOracleTransport(oracle, clock, credential, observations, response
   const executeGh = (_command, argv) => {
     let input = null;
     let run;
+    const child = new EventEmitter();
+    child.pid = process.pid;
     const pending = new Promise((resolve, reject) => {
       run = () => {
         active += 1;
@@ -466,19 +473,22 @@ function createOracleTransport(oracle, clock, credential, observations, response
             } finally {
               finishObservation?.();
               active -= 1;
+              child.emit("close", 0);
             }
           };
           complete();
         } catch (error) {
           active -= 1;
           reject(error);
+          child.emit("close", 1);
         }
       };
     });
-    pending.child = { stdin: {
+    child.stdin = {
       on() {},
       end(value = "") { input = String(value); queueMicrotask(run); },
-    } };
+    };
+    pending.child = child;
     if (!argv.includes("--input")) queueMicrotask(run);
     return pending;
   };
@@ -1140,8 +1150,37 @@ async function runCombinedSafetyEvidence(root) {
     publish: actionPublication("acme/widget", 1, now) });
   if (!initialPublished.ok) throw new Error(`safety initial publish failed: ${initialPublished.reason}`);
   const abandonedClaim = await claimAndStart(old, first.value.id, "abandoned");
-  const retainedUncertainCoreUnits = old.diagnostics().value.metrics.uncertainCoreUnits;
-  const retainedUncertainty = retainedUncertainCoreUnits >= 1;
+  // The acquisition store no longer owns request uncertainty. Seed one real
+  // started quota receipt and project its charge through the v7 ledger.
+  const scope = { ...createGovernorScope({ effectiveHost: "github.com",
+    authIdentity: "efficiency-safety", env: pathOptions.env, now: () => now }).value,
+  accessKey: ACCESS_FULL };
+  const leaseId = deterministicUuid("efficiency-safety-lease");
+  const lease = { id: leaseId, expiresAt: now + GOVERNOR_LEASE_TTL_MS,
+    floorMs: 5_000, activeTab: "actions",
+    phaseSeed: { seed: leaseId, registeredAt: now },
+    demand: { core: 1, graphql: 0 } };
+  if (!registerLease(scope, lease, now).ok) throw new Error("safety quota lease unavailable");
+  const probe = claimProbe(scope, leaseId, now, "core");
+  if (!probe.ok || probe.value.status !== "claimed" || !publishProbe(scope, leaseId,
+    probe.value.nonce, { core: { limit: 5000, used: 0, remaining: 5000,
+      resetMs: now + 3_600_000 } }, now, "core").ok) {
+    throw new Error("safety quota budget unavailable");
+  }
+  const intentId = deterministicUuid("efficiency-safety-intent");
+  const grant = registerIntent(scope, { id: intentId, leaseId, tab: "actions",
+    priority: "active", costs: { core: 1, graphql: 0 }, requestedAt: now,
+    expiresAt: now + GOVERNOR_LEASE_TTL_MS }, now);
+  if (!grant.ok || grant.value.status !== "scheduled") throw new Error("safety quota grant unavailable");
+  now = grant.value.notBefore;
+  const startedQuota = startReservation(scope, grant.value.reservationId, now);
+  if (!startedQuota.ok || startedQuota.value.status !== "started") {
+    throw new Error("safety quota receipt unavailable");
+  }
+  if (!old.syncQuotaProjection(scope).ok) throw new Error("safety quota projection unavailable");
+  const retainedQuotaCoreUnits = old.diagnostics().value.outstandingQuota
+    .find((projection) => projection.scopeHash === scope.hash)?.units?.core ?? 0;
+  const retainedQuotaCharge = retainedQuotaCoreUnits >= 1;
 
   now += ACQUISITION_CLAIM_TTL_MS + 1;
   const deadOwner = (pid) => {
@@ -1191,8 +1230,8 @@ async function runCombinedSafetyEvidence(root) {
       projected?.securityNotes[0] === note && projected?.capabilities.dependabot?.verdict === "unavailable",
     restartRetention: resumed.ok && resumed.value.snapshot?.rows[0]?.databaseId === 2,
     reconnectAgeNonRegressing: reconnectAge >= firstAge + 1_000,
-    producerLossRetainedUncertainty: retainedUncertainty,
-    uncertainCoreUnits: retainedUncertainCoreUnits,
+    producerLossRetainedUncertainty: retainedQuotaCharge,
+    outstandingQuotaCoreUnits: retainedQuotaCoreUnits,
     producerLossRecovered: retained.rows[0].databaseId === 2,
   };
   old.close();
@@ -1366,8 +1405,9 @@ function aggregateEvents(topologies) {
       oracleCharged: true,
       acquisitionPersisted: true,
       oracleFields: ["coreUnits", "graphqlUnits", "observerCalls", "observerCost"],
-      acquisitionFields: ["provenCoreUnits", "provenGraphqlUnits", "uncertainCoreUnits",
-        "uncertainGraphqlUnits"],
+      acquisitionFields: ["provenCoreUnits", "provenGraphqlUnits"],
+      quotaFields: ["outstandingQuotaCoreUnits"],
+      legacyUncertaintyFields: ["uncertainCoreUnits", "uncertainGraphqlUnits"],
     },
     perOperation: Object.fromEntries([...new Set(events.map(({ operation }) => operation))].sort().map((operation) => {
       const selected = events.filter((event) => event.operation === operation);
@@ -1547,7 +1587,9 @@ export async function runEfficiencyMeasurement({
     const safety = await runCombinedSafetyEvidence(join(root, "combined-safety"));
     const appWebhook = await runAppWebhookEvidence(join(root, "app-webhook"));
     const reserveBoundary = runReserveBoundaryEvidence(join(root, "reserve-boundary"));
-    metrics.uncertainCoreUnits += safety.uncertainCoreUnits;
+    // Keep the legacy acquisition metrics for report readers, but give quota
+    // projections their own field; v2 acquisition uncertainty is always zero.
+    metrics.outstandingQuotaCoreUnits = safety.outstandingQuotaCoreUnits;
     const reportTopologies = topologies.map(({ oracleEvents: _oracleEvents, acknowledgments: _acknowledgments,
       queueDelays: _queueDelays, metrics: _metrics, ...sample }) => sample);
     const startupSlice = includeStartupSlice ? await captureStartupSlice(root) : null;
@@ -1653,7 +1695,8 @@ export function formatEfficiencyMarkdown(report) {
     `- Oracle requests: ${report.metrics.httpRequests} (${report.metrics.dataHttpRequests} data, ${report.metrics.observerCalls} observer)`,
     `- Actions REST data responses: ${report.metrics.rest200} 200, ${report.metrics.rest304} 304`,
     `- Oracle charged cost: ${report.metrics.coreUnits} core, ${report.metrics.graphqlUnits} GraphQL`,
-    `- Acquisition proven/uncertain cost: ${report.metrics.provenCoreUnits}/${report.metrics.uncertainCoreUnits} core, ${report.metrics.provenGraphqlUnits}/${report.metrics.uncertainGraphqlUnits} GraphQL`,
+    `- Acquisition proven cost: ${report.metrics.provenCoreUnits} core, ${report.metrics.provenGraphqlUnits} GraphQL`,
+    `- Quota-authoritative outstanding core: ${report.metrics.outstandingQuotaCoreUnits}`,
     `- Observer calls/combined charged units: ${report.metrics.observerCalls}/${report.metrics.observerCost}`,
     `- Source-to-display p50/p95: ${freshness.p50 ?? "unavailable"}/${freshness.p95 ?? "unavailable"} ms`,
     `- Eligible query maximum overdue: ${report.freshness.eligibleQueryGaps.maxOverdueMs} ms (${report.freshness.eligibleQueryGaps.passed ? "pass" : "fail"})`,

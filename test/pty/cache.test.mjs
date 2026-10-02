@@ -123,7 +123,8 @@ test("a healthy process writes dashboard state for restart", () => {
 test("same-target restart keeps cached Actions rows under a live rate-limit error", () => {
   const screen = screenOf(recovered);
   assert.ok(recovered.fixtureCalls.some((call) => call.includes("/actions/runs?")));
-  assert.match(screen, /GitHub rate limit reached -- backing off/);
+  assert.match(screen, /Core: GitHub request limit/);
+  assert.match(screen, /Retry automatically after the shared hold/);
   assert.match(screen, /Paused 2m0s/);
   assert.match(screen, /ci: pin actions to commit/);
   assert.match(screen, /4 of 4/);

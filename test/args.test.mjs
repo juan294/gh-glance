@@ -289,11 +289,12 @@ test("--tab accepts exactly the four tab keys", () => {
   assert.throws(() => parse(["--tab", "nope"]), /--tab must be one of/);
 });
 
-test("--background accepts exactly all and off, and defaults to neither", () => {
+test("--background accepts all, off and on-demand without overriding the runtime default", () => {
   // null rather than "all" so the entry block can tell "the user asked for the
   // default" from "the user said nothing", the same way --refresh does.
   assert.equal(parse([]).background, null);
   assert.equal(parse(["--background", "all"]).background, "all");
+  assert.equal(parse(["--background", "on-demand"]).background, "on-demand");
   assert.equal(parse(["--background=off"]).background, "off");
   assert.throws(() => parse(["--background", "none"]), /--background must be one of all, off/);
   assert.throws(() => parse(["--background", "Off"]), /--background must be one of/, "case sensitive");
@@ -325,7 +326,7 @@ test("--help describes refresh as a shared-governor floor", () => {
   // The two manual intentions are separate keys, and --help is the one place
   // that has to say so: `r` is a conditional check, `R` throws the cache away.
   assert.match(help, /^[ \t]*R[ \t]+Resynchronize the current tab, ignoring cached validators and backoff$/m);
-  assert.match(help, /--background <mode>\s+all or off \(default all\)/);
+  assert.match(help, /--background <mode>\s+all or off or on-demand \(default on-demand\)/);
   assert.match(help, /never requests data\n\s+for a tab you are not looking at/);
   assert.match(help, /--doctor --probe\s+Run bounded, admitted GitHub capability probes/);
   assert.match(help, /a quiet tab slows to 30s \(60s for Security\),\n\s+and running Actions are checked every 5s/);

@@ -143,7 +143,7 @@ const waitForStalledRow =
   // with an unrelated automatic poll.
   "tries=$((tries + 1)); sleep .1; done; ";
 const waitForStalledRender =
-  "tries=0; while ! grep -q 'ci: pin actions to commit SHAs' \"$GH_GLANCE_CAPTURE_OUT\" " +
+  "tries=0; while ! grep -q 'ci: pin' \"$GH_GLANCE_CAPTURE_OUT\" " +
   "2>/dev/null && [ $tries -lt 150 ]; do tries=$((tries + 1)); sleep .1; done; ";
 const waitForStalledLane =
   "tries=0; governor_dir=\"$XDG_CONFIG_HOME/gh-glance/coordination-v2\"; " +
@@ -153,10 +153,11 @@ const waitForStalledLane =
   "\"$governor_dir\" 2>/dev/null && [ $tries -lt 100 ]; do " +
   "tries=$((tries + 1)); sleep .05; done; ";
 const waitForStalledOpen =
-  "tries=0; while ! grep -q '^run view ' \"$GH_GLANCE_CAPTURE_OUT.calls\" " +
+  "tries=0; while ! grep -q '^open ' \"$GH_GLANCE_CAPTURE_OUT.calls\" " +
   "2>/dev/null && [ $tries -lt 100 ]; do tries=$((tries + 1)); sleep .1; done; ";
 const stalledRoot = mkdtempSync(join(tmpdir(), "gh-glance-stalled-open-"));
 const stalledMarker = join(stalledRoot, "opened-at");
+const stalledStages = join(stalledRoot, "stages");
 let stalledOpen;
 let stalledElapsedMs;
 try {
@@ -166,17 +167,33 @@ try {
     signal: "none",
     settle: 15,
     args: "--refresh 40",
-    stdin: waitForStalledRow + waitForStalledRender + waitForStalledLane +
+    stdin: "printf 'start:%s\\n' \"$(date +%s)\" >> \"$GH_GLANCE_STALLED_STAGES\"; " +
+      waitForStalledRow + "printf 'row:%s:%s\\n' \"$tries\" \"$(date +%s)\" >> \"$GH_GLANCE_STALLED_STAGES\"; " +
+      waitForStalledRender + "printf 'render:%s:%s\\n' \"$tries\" \"$(date +%s)\" >> \"$GH_GLANCE_STALLED_STAGES\"; " +
+      waitForStalledLane + "printf 'lane:%s:%s\\n' \"$tries\" \"$(date +%s)\" >> \"$GH_GLANCE_STALLED_STAGES\"; " +
       "printf 'j'; sleep 1; printf '\\r'; " + waitForStalledOpen +
+      "printf 'open:%s:%s\\n' \"$tries\" \"$(date +%s)\" >> \"$GH_GLANCE_STALLED_STAGES\"; " +
       "node -e 'require(\"fs\").writeFileSync(process.argv[1],String(Date.now()))' " +
       "\"$GH_GLANCE_OPEN_MARKER\"; printf 'q'; sleep 2",
     env: {
       GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       GH_GLANCE_FIXTURE_STALL_VIEW: "1",
       GH_GLANCE_OPEN_MARKER: stalledMarker,
+      GH_GLANCE_STALLED_STAGES: stalledStages,
     },
   });
   stalledElapsedMs = Date.now() - Number(readFileSync(stalledMarker, "utf8"));
+  const stageLines = readFileSync(stalledStages, "utf8").trim().split("\n");
+  const stageTries = Object.fromEntries(stageLines.slice(1).map((line) => {
+    const [stage, tries] = line.split(":");
+    return [stage, Number(tries)];
+  }));
+  assert.ok(stageTries.row < 150 && stageTries.render < 150 &&
+    stageTries.lane < 100 && stageTries.open < 100,
+  `stalled opener synchronization failed: ${stageLines.join(", ")}; frame: ${stalledOpen.finalFrame.lines.join(" | ")}`);
+} catch (error) {
+  try { error.message += `; stages: ${readFileSync(stalledStages, "utf8")}`; } catch { error.message += "; stages: none"; }
+  throw error;
 } finally {
   rmSync(stalledRoot, { recursive: true, force: true });
 }
@@ -372,7 +389,7 @@ test("NO_COLOR retains an ASCII failure marker in the tab bar", () => {
 });
 
 test("a narrow auth failure starts with the recovery action", () => {
-  assert.match(narrowAuthFailure.finalFrame.lines.join("\n"), /Run: gh auth status/);
+  assert.match(narrowAuthFailure.finalFrame.lines.join("\n"), /Run gh auth status/);
 });
 
 test("a cache-hydrated adapted check is static and settles before routine polls", () => {
