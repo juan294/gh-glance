@@ -11,6 +11,7 @@ import {
   createGovernorScope, GOVERNOR_LEASE_TTL_MS, graphqlArgs, graphqlInput,
   inspectGovernor, issueGovernorDispatch, publishProbe, registerLease,
   releaseGovernorLock, runAdmittedOperation, runGh, startReservation, tabRequestCost,
+  IDENTITY_UNCERTAIN_MAX_MS,
 } from "../index.mjs";
 import { createOracleState, handleOracleRequest } from "../test/fixtures/request-oracle.mjs";
 
@@ -381,9 +382,7 @@ async function runCohort(definition, seed) {
         observeReservation(scope, admittedUnterminalized.value.reservationId, cost, "interrupted",
           sourceArgs(query.tab, query.repo).length);
         unterminalizedReceipts.push({ scopeHash: scope.hash,
-          id: admittedUnterminalized.value.reservationId });
-        trace.expectedUnterminalizedCharge.core += cost.core;
-        trace.expectedUnterminalizedCharge.graphql += cost.graphql;
+          id: admittedUnterminalized.value.reservationId, at: clock, cost });
         continue;
       }
       let reservationId = null;
@@ -509,6 +508,14 @@ async function runCohort(definition, seed) {
             item.terminalAt === null).length;
         }
       }
+    }
+    // An uncertain charge may be released one window after its debt group's
+    // newest charge, which is never earlier than the charge itself. Only the
+    // charges issued within the final window must therefore still be held.
+    for (const receipt of unterminalizedReceipts) {
+      if (clock - receipt.at >= IDENTITY_UNCERTAIN_MAX_MS) continue;
+      trace.expectedUnterminalizedCharge.core += receipt.cost.core;
+      trace.expectedUnterminalizedCharge.graphql += receipt.cost.graphql;
     }
     const outstandingUnits = { core: unresolvedUnits.core + detailedStartedUnits.core,
       graphql: unresolvedUnits.graphql + detailedStartedUnits.graphql };

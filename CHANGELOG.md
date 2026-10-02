@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-10-02
+
+### Fixed
+
+- When external API use pushes every pane's next request slot past the quota
+  reset, panes now show "GitHub quota pacing; retry automatically after reset"
+  instead of "Local coordination unavailable ... retry when storage works".
+  Deferred background refreshes also get their own notice.
+- Heavy API use by other tools on the same account no longer starves every
+  pane until the quota resets. Pacing now divides by at most 4 times the
+  measured external pressure, while the reserve still stops gh-glance before
+  the account runs out.
+- Uncertain charges left by dead panes are released one quota window after
+  their newest charge, instead of reducing every hour's budget until the next
+  reboot.
+
 ## [0.16.0] - 2026-10-01
 
 ### Changed
@@ -1216,7 +1232,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.16.1...HEAD
+[0.16.1]: https://github.com/juan294/gh-glance/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/juan294/gh-glance/compare/v0.15.2...v0.16.0
 [0.15.2]: https://github.com/juan294/gh-glance/compare/v0.15.1...v0.15.2
 [0.15.1]: https://github.com/juan294/gh-glance/compare/v0.15.0...v0.15.1

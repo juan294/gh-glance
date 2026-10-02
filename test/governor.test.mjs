@@ -107,6 +107,7 @@ import {
   withGovernorLock,
   writeGovernorState,
   readGovernorState,
+  IDENTITY_UNCERTAIN_MAX_MS,
 } from "../index.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -248,8 +249,8 @@ function retainedDebtPacing(t, authIdentity) {
   registerLease(scope, lease(leaseId));
   publishInitial(scope, leaseId, NOW, budgets(NOW, { remaining: 2056 }));
   const initial = inspectGovernor(scope, NOW).value;
-  initial.debtGroups[randomUUID()] = testDebtGroup({ units: 462, at: NOW - 1, quiescent: false });
-  initial.debt.core.unresolvedUnits = 462;
+  initial.debtGroups[randomUUID()] = testDebtGroup({ units: 1040, at: NOW - 1, quiescent: false });
+  initial.debt.core.unresolvedUnits = 1040;
   initial.debt.core.unresolvedCount = 1;
   initial.budgets.core.lastExternalFactor = 177;
   assert.equal(writeGovernorState(scope.path, initial).ok, true);
@@ -3224,7 +3225,9 @@ test("more than 128 sequential lease owners retire generation metadata without l
     assert.equal(writeGovernorState(box.scope.path, state).ok, true);
     assert.equal(registerLease(box.scope, lease(leaseId, box.now()), box.now()).ok, true);
     const persisted = inspectGovernor(box.scope, box.now()).value;
-    assert.equal(persisted.debt.core.unresolvedUnits, index + 1);
+    // Groups older than a window quiesce, but nothing retires them without an
+    // observer, so every charge stays accounted as unresolved or quiescent.
+    assert.equal(persisted.debt.core.unresolvedUnits + persisted.debt.core.quiescentUnits, index + 1);
     assert.ok(Object.keys(persisted.ownerGenerations).length <= GOVERNOR_MAX_LEASES);
   }
 });
@@ -3541,6 +3544,71 @@ test("unknown legacy debt waits through one boot and retires only after a later-
   assert.equal(afterObserver.debt.core.quiescentUnits, 0);
   assert.equal(afterObserver.debt.graphql.quiescentUnits, 162,
     "the core observer cannot retire GraphQL debt");
+});
+
+test("unknown same-boot debt older than one quota window quiesces and retires after an observer", (t) => {
+  const box = sandbox(t, { authIdentity: "legacy-window-quiescence" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const legacy = agedGovernorV6(inspectGovernor(box.scope, NOW).value, NOW);
+  assert.equal(writeGovernorState(box.scope.path, legacy).ok, true);
+  assert.equal(registerLease(box.scope, lease(leaseId), NOW).ok, true);
+  const sameBoot = inspectGovernor(box.scope, NOW).value;
+  const [groupId] = Object.keys(sameBoot.debtGroups);
+  assert.equal(sameBoot.debt.core.unresolvedUnits, 456, "a young unknown group stays charged");
+
+  // Every request a sealed group could cover was sent before it was sealed, so
+  // once a full window has elapsed GitHub has charged or forgotten all of it.
+  const aged = structuredClone(sameBoot);
+  aged.debtGroups[groupId].at = NOW - IDENTITY_UNCERTAIN_MAX_MS;
+  assert.equal(writeGovernorState(box.scope.path, aged).ok, true);
+  assert.equal(registerLease(box.scope, lease(leaseId, NOW + 1), NOW + 1).ok, true);
+  const quiesced = inspectGovernor(box.scope, NOW + 1).value;
+  assert.equal(quiesced.debtGroups[groupId].bootId, sameBoot.debtGroups[groupId].bootId,
+    "the group is still from the current boot");
+  assert.equal(quiesced.debt.core.unresolvedUnits, 0);
+  assert.equal(quiesced.debt.core.quiescentUnits, 456);
+
+  const claimAt = NOW + 2;
+  const claim = claimNow(box.scope, leaseId, claimAt);
+  assert.equal(publishProbe(box.scope, leaseId, claim.value.nonce,
+    { core: { limit: 5000, used: 1, remaining: 4999, resetMs: NOW + 3_600_000 } },
+    claimAt + 1, "core").ok, true);
+  assert.equal(inspectGovernor(box.scope, claimAt + 1).value.debt.core.quiescentUnits, 0);
+});
+
+test("a late charge restarts its debt group's window so age cannot retire it early", (t) => {
+  const box = sandbox(t, { authIdentity: "debt-window-late-charge" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const granted = registerIntent(box.scope, intent(randomUUID(), leaseId)).value;
+  const startedAt = granted.notBefore;
+  assert.equal(startReservation(box.scope, granted.reservationId, startedAt).value.status, "started");
+  const state = inspectGovernor(box.scope, startedAt).value;
+  const receipt = state.reservations[granted.reservationId].receipt;
+  state.debtGroups[receipt.generation] = {
+    ...testDebtGroup({ at: startedAt - IDENTITY_UNCERTAIN_MAX_MS + 10_000, quiescent: false }),
+    bootId: receipt.bootId,
+  };
+  state.debt.core.unresolvedUnits = 1;
+  state.debt.core.unresolvedCount = 1;
+  state.debt.core.revision = 1;
+  receipt.deadline = startedAt + 1;
+  receipt.dispatches = [{ sequence: 1, operation: "tab:actions-runs",
+    costs: { core: 1, graphql: 0 }, issuedAt: startedAt,
+    terminalAt: null, childPid: null, childBirth: null, neverStarted: false }];
+  assert.equal(writeGovernorState(box.scope.path, state).ok, true);
+  const compactAt = startedAt + 1;
+  assert.equal(registerLease(box.scope, lease(leaseId, compactAt), compactAt).ok, true);
+  assert.equal(inspectGovernor(box.scope, compactAt).value.debtGroups[receipt.generation].units.core, 2);
+
+  const laterAt = startedAt + 20_000;
+  assert.equal(registerLease(box.scope, lease(leaseId, laterAt), laterAt).ok, true);
+  const later = inspectGovernor(box.scope, laterAt).value;
+  assert.equal(later.debt.core.unresolvedUnits, 2,
+    "the group was created a window ago, but its newest charge is seconds old");
 });
 
 test("an expired prior-boot detailed receipt quiesces during compaction before a later claim", (t) => {

@@ -394,3 +394,30 @@ canonical path under the quota lock. Their reservation residuals become one
 unknown-owner debt group, and a private pre-v7 backup preserves the original
 document. An older writer rejects the new schema, so mixed-version execution
 requires the controlled restart boundary described above.
+
+## Amendment: bounded external pressure and windowed debt (2026-10-02)
+
+On 2026-10-02 nine local CI runners on the same token spent about 6,000 core
+units an hour. The measured external factor reached 156.8 because most
+gh-glance polls are free conditional requests, so its own paid spend, the
+denominator of the ratio, was tiny. Dividing pacing by that factor pushed
+every lane past the quota reset, and all panes were denied with `reset` while
+half the window's spendable quota sat unused. Two rules change.
+
+Pacing now divides by at most `MAX_PACING_EXTERNAL_FACTOR` (4). The measured
+factor is still recorded unchanged for diagnostics and for later samples. The
+cap affects only when admitted work runs. Admission still requires spendable
+quota above the reserve, so external load can stop gh-glance at the reserve
+but can no longer starve it while quota remains.
+
+The earlier rule that unknown-owner debt "cannot be retired merely because
+time passed" is narrowed. A debt group's `at` now records its newest charge,
+and a sealed group whose newest charge is more than one window plus grace old
+(`IDENTITY_UNCERTAIN_MAX_MS`) becomes quiescent as if a reboot had been
+observed. Every request it covers was sent before that charge, so GitHub has
+already billed each one to a window that has ended. Retirement still waits for
+a claimed observer publication after the quiescence barrier. Without this
+rule, residuals left by dead panes reduced spendable quota in every window
+until the next reboot. The remaining risk is an orphaned `gh` child that sends
+a request more than an hour after its last recorded charge, which is accepted
+as negligible.

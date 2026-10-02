@@ -20,6 +20,7 @@ import {
   wallClockRecovery,
   collectorSourceAdvanced,
   cleanupQueueForResource,
+  scheduleIntents,
 } from "../index.mjs";
 import { agedGovernorV6 } from "./fixtures/aged-governor-v6.mjs";
 
@@ -94,6 +95,8 @@ test("D6: recovery cause maps resource, action, retry and cached age without raw
     ["probe-failed", "graphql", /budget check/i, /retry/i],
     ["identity-capacity", "graphql", /budget check/i, /retry/i],
     ["rate-limit", "core", /quota/i, /retry/i],
+    ["reset", "core", /quota/i, /retry/i],
+    ["priority", "core", /background/i, /retry/i],
     ["rate-limited", "core", /request limit/i, /retry/i],
     ["local-reserve", "core", /reserve/i, /retry/i],
     ["secondary", "graphql", /request limit/i, /retry/i],
@@ -132,6 +135,27 @@ test("D6: recovery cause maps resource, action, retry and cached age without raw
     if (reason === "legacy-unresolved") assert.match(narrow.join(" "), /Check children; restart/);
     if (reason === "migration-hold") assert.doesNotMatch(narrow.join(" "), /restart/i);
     if (reason === "migration-hold") assert.match(narrow.join(" "), /next \d+[smh]/i);
+  }
+});
+
+test("D6: planner denials name their own cause instead of the coordination fallback", () => {
+  const now = 1_000_000;
+  const resetMs = now + 300_000;
+  const budget = { limit: 5000, remaining: 2000, used: 3000, resetMs, observedAt: now };
+  const leases = { lease: { expiresAt: now + 90_000, phaseSeed: { seed: "lease", registeredAt: now } } };
+  const intent = (priority) => ({ id: priority, leaseId: "lease", tab: "actions", priority,
+    expiresAt: resetMs + 90_000 });
+  // An external drain pushes the shared lane past the quota reset, the 0.16.0
+  // incident in which every new pane read "retry when storage works".
+  const reset = scheduleIntents({ intents: [intent("active")], leases, budgets: { core: budget },
+    lanes: { core: { nextAt: resetMs + 60_000 } }, nowMs: now }).denied[0];
+  const priority = scheduleIntents({ intents: [intent("background")], leases, budgets: { core: budget },
+    lanes: { core: { nextAt: now + 7_000 } }, nowMs: now, deferFutureBackground: true }).denied[0];
+  for (const [denial, causePattern] of [[reset, /quota/i], [priority, /background/i]]) {
+    const cause = recoveryCause({ reason: denial.reason, resource: "core", retryAt: denial.retryAt });
+    assert.equal(cause.code, denial.reason);
+    assert.match(cause.summary, causePattern);
+    assert.doesNotMatch(presentRecovery(cause, { nowMs: now, cols: 80 }).join(" "), /storage|doctor/i);
   }
 });
 
