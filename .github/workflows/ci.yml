@@ -98,7 +98,7 @@ jobs:
         with:
           node-version: 22.22.2
           cache: npm
-      - run: npm install -g npm@11.21.0 && npm --version
+      - run: npx -y npm@11.21.0 install -g npm@11.21.0 && npm --version
       - run: npm ci
       - run: node scripts/release-candidate.mjs pack candidate
       - id: manifest
@@ -195,8 +195,6 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(needs.plan.outputs.terminal-os) }}
-    env:
-      GH_GLANCE_TEST_EVIDENCE_DIR: ${{ github.workspace }}/../evidence
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -214,12 +212,14 @@ jobs:
         env:
           EXPECTED_SHA256: ${{ needs.pack.outputs.tarball-sha256 }}
         run: node scripts/release-candidate.mjs use-candidate candidate --install
-      - run: node scripts/test-select.mjs run pty:smoke
+      - env:
+          GH_GLANCE_TEST_EVIDENCE_DIR: ${{ runner.temp }}/evidence
+        run: node scripts/test-select.mjs run pty:smoke
       - if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: terminal-smoke-evidence-${{ matrix.os }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/../evidence
+          path: ${{ runner.temp }}/evidence
           retention-days: 7
           if-no-files-found: ignore
 
@@ -253,8 +253,6 @@ jobs:
     if: contains(fromJSON(needs.plan.outputs.jobs), 'pty-governor')
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      GH_GLANCE_TEST_EVIDENCE_DIR: ${{ github.workspace }}/../evidence
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -262,12 +260,14 @@ jobs:
           node-version: 22.22.2
           cache: npm
       - run: npm ci
-      - run: node scripts/test-select.mjs run pty:governor
+      - env:
+          GH_GLANCE_TEST_EVIDENCE_DIR: ${{ runner.temp }}/evidence
+        run: node scripts/test-select.mjs run pty:governor
       - if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: pty-governor-evidence-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/../evidence
+          path: ${{ runner.temp }}/evidence
           retention-days: 7
           if-no-files-found: ignore
 
@@ -277,8 +277,6 @@ jobs:
     if: contains(fromJSON(needs.plan.outputs.jobs), 'pty-rest')
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    env:
-      GH_GLANCE_TEST_EVIDENCE_DIR: ${{ github.workspace }}/../evidence
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -286,12 +284,14 @@ jobs:
           node-version: 22.22.2
           cache: npm
       - run: npm ci
-      - run: node scripts/test-select.mjs run pty:rest
+      - env:
+          GH_GLANCE_TEST_EVIDENCE_DIR: ${{ runner.temp }}/evidence
+        run: node scripts/test-select.mjs run pty:rest
       - if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: pty-rest-evidence-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/../evidence
+          path: ${{ runner.temp }}/evidence
           retention-days: 7
           if-no-files-found: ignore
 

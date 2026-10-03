@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { CANDIDATE_JOBS, CI_JOBS, PINS, REPOSITORY, planCi } from "../scripts/release-candidate.mjs";
+import { CANDIDATE_JOBS, CI_JOBS, NPM_UPGRADE, PINS, REPOSITORY, planCi } from "../scripts/release-candidate.mjs";
 import { readWorkflow, renderJobName } from "./fixtures/workflow.mjs";
 
 const REPO = REPOSITORY;
@@ -66,13 +66,37 @@ test("WF-03 one pack per candidate, consumed by ID and hard-checked, never repac
   assert.match(ci.jobs.pack.body, /release-candidate\.mjs pack candidate/);
   assert.match(ci.jobs.pack.body, /overwrite: false/);
   assert.match(ci.jobs.pack.body, /retention-days: 30/);
-  assert.match(ci.jobs.pack.body, /npm install -g npm@11\.21\.0/);
+  assert.ok(ci.jobs.pack.body.includes(NPM_UPGRADE), "the pack job runs the pinned npm");
   for (const id of ["smoke", "terminal-smoke"]) {
     assert.match(ci.jobs[id].body, /artifact-ids: \$\{\{ needs\.pack\.outputs\.artifact-id \}\}/);
     assert.match(ci.jobs[id].body, /digest-mismatch: error/);
     assert.match(ci.jobs[id].body, /EXPECTED_SHA256: \$\{\{ needs\.pack\.outputs\.tarball-sha256 \}\}\n\s+run: node scripts\/release-candidate\.mjs use-candidate candidate/);
   }
   assert.doesNotMatch(ci.text, /pull_request_target/);
+});
+
+test("WF-12 the pinned npm installs itself, and artifact paths are absolute", () => {
+  // Node 22's bundled npm 10.9 cannot replace itself with npm 11: it deletes
+  // its own modules mid-install (MODULE_NOT_FOUND promise-retry). Only the
+  // pinned npm, run through npx, may install the pin.
+  assert.equal(NPM_UPGRADE, `npx -y npm@${PINS.npm} install -g npm@${PINS.npm}`);
+  for (const file of ["ci.yml", "release.yml"]) {
+    const { text } = readWorkflow(file);
+    const installs = text.match(/[^\n]*install -g npm@[^\n]*/g) ?? [];
+    assert.ok(installs.length > 0, `${file} installs the pinned npm`);
+    for (const line of installs) assert.ok(line.includes(NPM_UPGRADE), `${file}: ${line.trim()}`);
+    // actions/upload-artifact rejects any path with a '..' segment. Command
+    // arguments such as `verify-candidate ../verified` are not upload paths.
+    const paths = text.match(/^\s*path:.*$/gm) ?? [];
+    for (const line of paths) assert.doesNotMatch(line, /(^|[\s/:])\.\.(\/|\s|$)/, `${file}: ${line.trim()}`);
+    assert.doesNotMatch(text, /\/\.\.\//, `${file} builds a path through '..'`);
+  }
+  const ci = readWorkflow("ci.yml");
+  for (const id of ["terminal-smoke", "pty-governor", "pty-rest"]) {
+    const { body } = ci.jobs[id];
+    assert.match(body, /GH_GLANCE_TEST_EVIDENCE_DIR: \$\{\{ runner\.temp \}\}\/evidence/, `${id} writes evidence`);
+    assert.match(body, /path: \$\{\{ runner\.temp \}\}\/evidence/, `${id} uploads that evidence`);
+  }
 });
 
 // Count full-suite invocations per event by combining the real routing code

@@ -59,6 +59,12 @@ test("DRV-01 full authority runs the whole ordinary sequence once without asking
   assert.match(renderReport(receipt), /Stage \| complete/);
 });
 
+test("DRV-19 report cells escape backslashes before table pipes", () => {
+  const receipt = { ...newReceipt({ version: VERSION, candidate: CANDIDATE, authority: FULL, now: "t0" }),
+    blocker: "path C:\\x | y" };
+  assert.match(renderReport(receipt), /\| Blocker \| path C:\\\\x \\\| y \|/);
+});
+
 test("DRV-02 without publication authority nothing reaches main; without integration nothing moves", options, async () => {
   const sim = simulatedWorld(world());
   const { receipt } = await drive(sim, { ...FULL, publication: false });

@@ -22,7 +22,7 @@ import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { inspectTarball, installPackage, integrityOf, packCheckout } from "./package-check.mjs";
-import { PROFILE_SELECTIONS, ROOT, changedPaths, classifyChanges, writeAtomic } from "./test-select.mjs";
+import { PROFILE_SELECTIONS, ROOT, changedPaths, classifyChanges, escapeRegExp, writeAtomic } from "./test-select.mjs";
 
 export const REPOSITORY = "juan294/gh-glance";
 export const CI_WORKFLOW = ".github/workflows/ci.yml";
@@ -30,6 +30,9 @@ const RELEASE_WORKFLOW = ".github/workflows/release.yml";
 export const MANIFEST_SCHEMA = 1;
 // The reviewed runtime pins; a workflow test holds every literal to these.
 export const PINS = { node22: "22.22.2", node24: "24.21.0", npm: "11.21.0" };
+// Node 22's bundled npm 10.9 deletes its own modules while replacing itself
+// with npm 11, so the pinned npm installs itself.
+export const NPM_UPGRADE = `npx -y npm@${PINS.npm} install -g npm@${PINS.npm}`;
 const NODE_MAJORS = [22, 24];
 
 const SHA = /^[0-9a-f]{40}$/;
@@ -219,7 +222,7 @@ export function verifyPromotion({ pullRequest, mergeCommit, productionTree, tag 
     if (!VERSION.test(version ?? "")) return { ok: false, problems: [...problems, `invalid version ${version}`] };
     if (tag.commit !== mergeCommit) problems.push(`tag ${tag.name} points at ${tag.commit}, not ${mergeCommit}`);
     if (tag.name !== `v${version}`) problems.push(`tag ${tag.name} does not name version ${version}`);
-    if (changelog !== null && !new RegExp(`^## \\[${version.replace(/\./g, "\\.")}\\]`, "m").test(changelog)) {
+    if (changelog !== null && !new RegExp(`^## \\[${escapeRegExp(version)}\\]`, "m").test(changelog)) {
       problems.push(`CHANGELOG.md has no ${version} section`);
     }
   }

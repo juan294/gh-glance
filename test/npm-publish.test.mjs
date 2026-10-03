@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { integrityOf } from "../scripts/package-check.mjs";
-import { PINS } from "../scripts/release-candidate.mjs";
+import { NPM_UPGRADE, PINS } from "../scripts/release-candidate.mjs";
 import { packageTarball } from "./fixtures/tarball.mjs";
 
 const NPM = process.env.GH_GLANCE_PINNED_NPM || "npm";
@@ -71,7 +71,7 @@ test("NPM-01 the release workflow publishes the verified tarball path with lifec
   assert.ok(workflow.includes(PUBLISH_LINE), "publish command changed");
   assert.equal((workflow.match(/npm publish/g) ?? []).length, 1);
   assert.doesNotMatch(workflow, /npm@latest/);
-  assert.equal((workflow.match(new RegExp(`npm install -g npm@${PINS.npm.replace(/\./g, "\\.")}`, "g")) ?? []).length, 2);
+  assert.equal(workflow.split(NPM_UPGRADE).length - 1, 2, "publish and delivery run the pinned npm");
 });
 
 test("NPM-02 real npm sends exactly the verified bytes and runs no lifecycle script", async (t) => {

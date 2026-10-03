@@ -52,7 +52,7 @@ export const PTY_SMOKE = [
   ] },
 ];
 
-function escapeRegExp(text) {
+export function escapeRegExp(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 

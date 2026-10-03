@@ -28,7 +28,7 @@ import { parseArgs } from "node:util";
 
 import { REPOSITORY, readRegistry } from "./release-candidate.mjs";
 import { AGGREGATE_CONTEXT, planProtectionStep } from "./release-policy.mjs";
-import { ROOT } from "./test-select.mjs";
+import { ROOT, escapeRegExp } from "./test-select.mjs";
 export const RECEIPT_SCHEMA = 2;
 export const STAGES = ["push", "pull-request", "checks", "merge", "tag", "release", "publish", "delivery", "cleanup"];
 // Moving main is the release: `main` tracks released state, so merging needs
@@ -502,7 +502,7 @@ export function renderReport(receipt) {
   const remaining = receipt.stage === "complete" ? [] : STAGES.slice(STAGES.indexOf(receipt.stage));
   const history = receipt.history.map((item) => `- ${item.at} ${item.stage} (${item.kind}): ${item.text}`);
   return [`## Current status: ${receipt.tag}`, "", "| Fact | Value |", "| --- | --- |",
-    ...rows.map(([key, value]) => `| ${key} | ${String(value).replace(/\|/g, "\\|")} |`), "",
+    ...rows.map(([key, value]) => `| ${key} | ${String(value).replace(/\\/g, "\\\\").replace(/\|/g, "\\|")} |`), "",
     `Remaining stages: ${remaining.length > 0 ? remaining.join(" -> ") : "none"}.`, "",
     ...(history.length > 0 ? ["Blockers so far (kept after they are resolved):", "", ...history, ""] : [])].join("\n");
 }
@@ -795,7 +795,7 @@ function localFacts(version, world, { full = false } = {}) {
     dirty: status.split("\n").filter(Boolean).map((line) => line.slice(3)),
     packageVersion: readJson("package.json").version,
     lockVersion: readJson("package-lock.json").version,
-    changelogHasVersion: new RegExp(`^## \\[${version.replace(/\./g, "\\.")}\\]`, "m").test(readFileSync(join(ROOT, "CHANGELOG.md"), "utf8")),
+    changelogHasVersion: new RegExp(`^## \\[${escapeRegExp(version)}\\]`, "m").test(readFileSync(join(ROOT, "CHANGELOG.md"), "utf8")),
     mainIsAncestor: ancestor("origin/main"),
     developIsAncestor: ancestor("origin/develop"),
     notesPresent: existsSync(join(ROOT, "docs/release", `notes-v${version}.md`)),
