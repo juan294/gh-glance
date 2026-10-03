@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2] - 2026-10-03
+
+No change to the dashboard itself: `index.mjs` is identical to 0.16.1. This
+release changes how gh-glance is tested and published.
+
+### Changed
+
+- The published npm package is now the exact tarball the release pull request
+  tested: CI packs it once, the package and terminal smoke checks run those
+  bytes, and the release workflow verifies the tested tree, run, archive digest and
+  tarball digests before publishing it with lifecycle scripts disabled and
+  pinned Node 22.22.2 / npm 11.21.0. A version collision or an unclear
+  registry answer stops publication instead of skipping it.
+- Release delivery is checked automatically: registry integrity, npm
+  provenance bound to this release workflow, tag and merge commit, and a fresh
+  install run on Node 22 and 24.
+- CI runs the full suites once, on the release pull request; pushes to
+  `develop` and `main` run quick checks or a promotion identity check, and
+  coverage runs on a schedule instead of on every push.
+- README: the live freshness monitor section explains how to observe the
+  default on-demand mode (continuously active Actions only).
+
 ## [0.16.1] - 2026-10-02
 
 ### Fixed
@@ -1232,7 +1254,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.16.1...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.16.2...HEAD
+[0.16.2]: https://github.com/juan294/gh-glance/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/juan294/gh-glance/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/juan294/gh-glance/compare/v0.15.2...v0.16.0
 [0.15.2]: https://github.com/juan294/gh-glance/compare/v0.15.1...v0.15.2

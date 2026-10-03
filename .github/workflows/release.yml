@@ -11,8 +11,9 @@ name: Release
 #             archive digest GitHub recorded at upload, the manifest, and the
 #             tarball's sha256/sha512. Missing, expired, ambiguous or unequal
 #             evidence stops here; there is no repack fallback.
-#   publish   the only job with id-token. Runs pinned npm and the verifier from
-#             protected main, never candidate code. Publishes ./artifact.tgz
+#   publish   the only job with id-token. Runs pinned npm and this repository's
+#             scripts at the tag, which the verify job has already proved is the
+#             protected release merge; never candidate artifact code. Publishes ./artifact.tgz
 #             with --ignore-scripts only when the registry proves the version
 #             absent; exact bytes already present skip to delivery; different
 #             bytes, an unknown registry answer or a dist-tag regression block.
