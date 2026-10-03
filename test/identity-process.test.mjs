@@ -43,18 +43,40 @@ const CLAIM_AND_EXIT = `
   // Deliberately leave the persisted started receipt and HTTP permit behind.
 `;
 
-function fixture(t) {
+// Each case gets one absolute outer budget. A child receives only what is left
+// of it minus a shutdown margin, so a slow child is terminated while the test
+// still has time to report. Teardown waits for every owned child to settle
+// before removing the shared state they write to.
+const SHUTDOWN_MARGIN_MS = 2_000;
+
+// One number per case: the test timeout, from which the fixture budget is
+// derived, so the two cannot drift apart.
+const HARNESS_MARGIN_MS = 3_000;
+function identityTest(name, timeoutMs, body) {
+  test(name, { timeout: timeoutMs }, (t) => body(t, fixture(t, { budgetMs: timeoutMs - HARNESS_MARGIN_MS })));
+}
+
+function fixture(t, { budgetMs }) {
+  const deadline = Date.now() + budgetMs;
   const root = mkdtempSync(join(tmpdir(), "glance-identity-process-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const children = new Set();
+  t.after(async () => {
+    await Promise.allSettled(children);
+    rmSync(root, { recursive: true, force: true });
+  });
   const pathOptions = { env: { XDG_CONFIG_HOME: root } };
   const env = {
     PATH: process.env.PATH, HOME: root, TEST_ROOT: root, TEST_MODULE_URL: MODULE_URL,
     TEST_JOURNAL: join(root, "proofs.ndjson"), GH_TOKEN: "identity-process-private-fixture",
   };
   const run = async (script, extra = {}) => {
-    const result = await execute(process.execPath, ["--input-type=module", "--eval", script], {
-      env: { ...env, ...extra }, timeout: 30_000, maxBuffer: 1024 * 1024,
+    const remaining = deadline - SHUTDOWN_MARGIN_MS - Date.now();
+    if (remaining <= 0) throw new Error(`outer budget exhausted before a child could start (${budgetMs} ms)`);
+    const child = execute(process.execPath, ["--input-type=module", "--eval", script], {
+      env: { ...env, ...extra }, timeout: remaining, killSignal: "SIGKILL", maxBuffer: 1024 * 1024,
     });
+    children.add(child.then(() => {}, () => {}));
+    const result = await child;
     assert.equal(result.stderr, "");
     assert.equal(result.stdout.includes(env.GH_TOKEN), false);
     return JSON.parse(result.stdout);
@@ -62,9 +84,22 @@ function fixture(t) {
   return { root, pathOptions, env, run };
 }
 
-test("ID-04: twelve independent processes publish one identity proof and mapping", { timeout: 40_000 }, async (t) => {
-  const box = fixture(t);
-  const identities = await Promise.all(Array.from({ length: 12 }, (_, index) => box.run(COORDINATE, {
+// Like Promise.all, but waits for every sibling and reports the first failure
+// with the count and messages of the others, instead of abandoning siblings
+// that are still writing into shared state.
+async function allSiblings(promises) {
+  const results = await Promise.allSettled(promises);
+  const failures = results.filter((result) => result.status === "rejected").map((result) => result.reason);
+  if (failures.length === 0) return results.map((result) => result.value);
+  const [first, ...others] = failures;
+  if (others.length > 0) {
+    first.message += `\n(${others.length} sibling failure(s): ${others.map((error) => error.message.split("\n")[0]).join("; ")})`;
+  }
+  throw first;
+}
+
+identityTest("ID-04: twelve independent processes publish one identity proof and mapping", 40_000, async (t, box) => {
+  const identities = await allSiblings(Array.from({ length: 12 }, (_, index) => box.run(COORDINATE, {
     ...(index % 2 ? { GH_TOKEN: undefined, GITHUB_TOKEN: box.env.GH_TOKEN } : {}),
     GH_ENTERPRISE_TOKEN: `unused-enterprise-fixture-${index}`,
   })));
@@ -79,8 +114,7 @@ test("ID-04: twelve independent processes publish one identity proof and mapping
   assert.equal(readFileSync(join(registryRoot, "registry.json"), "utf8").includes(box.env.GH_TOKEN), false);
 });
 
-test("ID-07: dead process owners cannot replenish the host bootstrap allowance", { timeout: 40_000 }, async (t) => {
-  const box = fixture(t);
+identityTest("ID-07: dead process owners cannot replenish the host bootstrap allowance", 40_000, async (t, box) => {
   const now = Date.now();
   for (let index = 0; index < 13; index += 1) {
     const claim = await box.run(CLAIM_AND_EXIT, {
@@ -95,8 +129,7 @@ test("ID-07: dead process owners cannot replenish the host bootstrap allowance",
   assert.equal(JSON.stringify(registry).includes("identity-process-private-"), false);
 });
 
-test("ID-07: fresh processes using one credential retain its three-attempt allowance", { timeout: 20_000 }, async (t) => {
-  const box = fixture(t);
+identityTest("ID-07: fresh processes using one credential retain its three-attempt allowance", 20_000, async (t, box) => {
   const now = Date.now();
   for (const [index, offset] of [0, 60_000, 180_000, 420_000].entries()) {
     const claim = await box.run(CLAIM_AND_EXIT, { TEST_NOW: String(now + offset) });
@@ -108,8 +141,7 @@ test("ID-07: fresh processes using one credential retain its three-attempt allow
   assert.ok(Object.values(registry.attempts).every((attempt) => !attempt.accounted && !attempt.imported));
 });
 
-test("ID-05: reappearing legacy leases pause an already active identity", async (t) => {
-  const box = fixture(t);
+identityTest("ID-05: reappearing legacy leases pause an already active identity", 10_000, async (t, box) => {
   let now = Date.now();
   const coordinator = createIdentityCoordinator({
     host: "github.com", pathOptions: box.pathOptions, env: box.env, now: () => now,
@@ -135,8 +167,7 @@ test("ID-05: reappearing legacy leases pause an already active identity", async 
   assert.equal(after.hosts["github.com"].permits.length, 0);
 });
 
-test("independent processes share three HTTP slots and the host start gap", { timeout: 70_000 }, async (t) => {
-  const box = fixture(t);
+identityTest("independent processes share three HTTP slots and the host start gap", 70_000, async (t, box) => {
   await box.run(COORDINATE);
   const lockPath = join(identityRegistryRoot(box.pathOptions), "registry.json.lock");
   writeFileSync(lockPath, JSON.stringify({ pid: process.pid, nonce: randomUUID() }), { flag: "wx", mode: 0o600 });
@@ -203,4 +234,49 @@ test("independent processes share three HTTP slots and the host start gap", { ti
   for (let index = 1; index < starts.length; index += 1) {
     assert.ok(starts[index].grantedAt - starts[index - 1].grantedAt >= 250);
   }
+});
+
+// Fixture ownership (G05). A fake context collects the teardown so each case
+// can observe ordering between child completion and state removal.
+function ownedContext() {
+  const hooks = [];
+  return { after: (fn) => hooks.push(fn), teardown: async () => { for (const fn of hooks) await fn(); } };
+}
+
+const SLOW_WRITER = `
+  const { writeFileSync } = await import('node:fs');
+  await new Promise(resolve => setTimeout(resolve, 800));
+  writeFileSync(process.env.TEST_ROOT + '/sibling-finished', 'yes');
+  process.stdout.write('{}');
+`;
+
+test("FIXTURE-G05: an early sibling failure still waits for every child before removing state", { timeout: 20_000 }, async () => {
+  const context = ownedContext();
+  const box = fixture(context, { budgetMs: 15_000 });
+  const outcome = allSiblings([box.run("throw new Error('planted early failure')"), box.run(SLOW_WRITER)]);
+  await assert.rejects(outcome, /planted early failure/);
+  const finishedBeforeTeardown = existsSync(join(box.root, "sibling-finished"));
+  await context.teardown();
+  assert.equal(finishedBeforeTeardown, true, "allSiblings must not reject before the slow sibling settles");
+  assert.equal(existsSync(box.root), false, "teardown removes owned state after the children");
+});
+
+test("FIXTURE-G05: a child longer than the remaining budget is stopped inside the case budget", { timeout: 20_000 }, async () => {
+  const context = ownedContext();
+  const box = fixture(context, { budgetMs: 2_500 });
+  const started = Date.now();
+  await assert.rejects(box.run("await new Promise(resolve => setTimeout(resolve, 30000));"),
+    (error) => error.killed === true);
+  assert.ok(Date.now() - started < 2_500, `child outlived the outer budget: ${Date.now() - started} ms`);
+  await context.teardown();
+  await assert.rejects(box.run("process.stdout.write('{}')"), /outer budget exhausted/);
+});
+
+test("FIXTURE-G05: sibling failures are reported with the first failure", { timeout: 20_000 }, async () => {
+  const context = ownedContext();
+  const box = fixture(context, { budgetMs: 15_000 });
+  await assert.rejects(allSiblings([box.run("throw new Error('first')"),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("second")), 200))]),
+  (error) => /first/.test(error.message) && /1 sibling failure\(s\): second/.test(error.message));
+  await context.teardown();
 });

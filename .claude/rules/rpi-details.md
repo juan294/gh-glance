@@ -34,30 +34,19 @@ description: RPI workflow details -- phase rules, pre-release sequence, implemen
   implement -> review -> fix -> approve -> `/simplify` -> verify.
   `/simplify` catches code reuse, quality, and efficiency issues
   that the plan-compliance reviewer does not check.
-- Check for `[batch-eligible]` phases --
-  use `/batch` to execute independent phases in parallel.
-  `[batch-eligible]` is decided during `/plan` by identifying phases
-  with no file overlap; `/batch` then runs them in parallel, one
-  worktree per phase, each opening a PR.
-- Use `/batch` for bulk changes outside RPI too --
-  migrations, multi-issue sprints, repetitive refactors. Don't
-  manually iterate through 20 files when `/batch` can parallelize.
+- Check for `[batch-eligible]` units -- independent units in the current
+  phase may run in parallel local worktrees with one integration owner.
+  Never use a batch mode that pushes branches or opens PRs.
 - Run ALL automated verification after each phase.
 - STOP after each phase and wait for human confirmation.
 - If the plan doesn't match reality, STOP and explain.
 
 ## Pre-Release Workflow
 
-`/pre-launch` -> `/remediate` -> `/update-docs` -> `/release`
-
-After `/pre-launch`, run `/simplify` first -- it fixes dead code,
-duplicates, and inefficiencies in one pass. Then address security
-and infrastructure findings manually.
-
-Fix everything, always: categorize findings by severity, but fix
-100%. With AI agents, fix cost is near-zero. Exception: `/remediate`
-Wave 3 (Later/strategic) items get issues filed but no fix agents --
-those require human architectural judgment.
+Releases follow [`docs/release/release-playbook.md`](../../docs/release/release-playbook.md),
+including when a full `/pre-launch` audit applies. When an audit does run, fix
+every confirmed finding; strategic items that need human architectural judgment
+get an explicit disposition instead of a fix agent.
 
 ## Testing Philosophy
 

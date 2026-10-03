@@ -17,6 +17,10 @@ import { fileURLToPath } from "node:url";
 import { dirname, isAbsolute, join } from "node:path";
 import { tmpdir } from "node:os";
 
+import { withEvidence } from "./evidence.mjs";
+
+export { lazyCapture } from "./evidence.mjs";
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RUN = join(HERE, "run.sh");
 
@@ -58,12 +62,6 @@ function readCaptureResult(out, dimensions) {
     ? readFileSync(logPath, "utf8").split("\n").filter(Boolean)
     : [];
   return parsed;
-}
-
-function removeCaptureArtifacts(out) {
-  for (const path of [out, `${out}.calls`]) {
-    if (existsSync(path)) rmSync(path, { force: true });
-  }
 }
 
 function stripEscapes(text) {
@@ -460,13 +458,13 @@ export function parseCapture(raw, dimensions = null) {
   };
 }
 
-let captureSeq = 0;
-
 function captureEnvironment(env, configHome, animation, icons) {
   return {
     // Only runtime instrumentation/locale are inherited. Real gh credentials,
     // host selection and config never enter an offline dashboard capture.
-    ...Object.fromEntries(["NODE_V8_COVERAGE", "LANG", "LC_ALL", "TZ"]
+    // GH_GLANCE_CAPTURE_ENTRY points run.sh at an installed candidate's
+    // index.mjs instead of the checkout (the terminal smoke selection).
+    ...Object.fromEntries(["NODE_V8_COVERAGE", "LANG", "LC_ALL", "TZ", "GH_GLANCE_CAPTURE_ENTRY"]
       .filter((key) => process.env[key] !== undefined)
       .map((key) => [key, process.env[key]])),
     PATH: `${dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`,
@@ -513,28 +511,29 @@ export function capture({
     throw new TypeError("configHome must be an absolute path");
   }
 
-  captureSeq += 1;
-  const out = join(tmpdir(), `gh-glance-pty-${process.pid}-${captureSeq}.txt`);
   const ownsConfigHome = configHome == null;
   const effectiveConfigHome = ownsConfigHome
     ? mkdtempSync(join(tmpdir(), "gh-glance-pty-config-"))
     : configHome;
+  const timeoutMs = (settle + 25) * 1000;
   try {
-    execFileSync(
-      "/bin/sh",
-      [RUN, String(cols), String(rows), out, signal, String(settle), stdin, args],
-      {
-        stdio: "ignore",
-        timeout: (settle + 25) * 1000,
-        // Isolation wins over caller-supplied environment overrides: every PTY
-        // run must be unable to observe the developer's real preferences. A
-        // caller that needs restart persistence supplies configHome explicitly.
-        env: captureEnvironment(env, effectiveConfigHome, animation, icons),
-      },
-    );
-    return readCaptureResult(out, { cols, rows });
+    return withEvidence({ kind: "capture", cols, rows, signal, settle, args, timeoutMs, envKeys: Object.keys(env) }, env,
+      (bundle) => {
+        execFileSync(
+          "/bin/sh",
+          [RUN, String(cols), String(rows), bundle.out, signal, String(settle), stdin, args],
+          {
+            stdio: "ignore",
+            timeout: timeoutMs,
+            // Isolation wins over caller-supplied environment overrides: every PTY
+            // run must be unable to observe the developer's real preferences. A
+            // caller that needs restart persistence supplies configHome explicitly.
+            env: captureEnvironment(env, effectiveConfigHome, animation, icons),
+          },
+        );
+        return readCaptureResult(bundle.out, { cols, rows });
+      });
   } finally {
-    removeCaptureArtifacts(out);
     if (ownsConfigHome) rmSync(effectiveConfigHome, { recursive: true, force: true });
   }
 }
@@ -555,22 +554,20 @@ export async function captureAsync(options) {
   if (configHome == null || !isAbsolute(configHome) || configHome.length === 0) {
     throw new TypeError("captureAsync requires a shared absolute configHome");
   }
-  captureSeq += 1;
-  const out = join(tmpdir(), `gh-glance-pty-${process.pid}-${captureSeq}.txt`);
-  try {
-    await new Promise((resolve, reject) => {
-      execFile(
-        "/bin/sh",
-        [RUN, String(cols), String(rows), out, signal, String(settle), stdin, args],
-        {
-          timeout: (settle + 25) * 1000,
-          env: captureEnvironment(env, configHome, animation, icons),
-        },
-        (error) => error ? reject(error) : resolve(),
-      );
+  const timeoutMs = (settle + 25) * 1000;
+  return withEvidence({ kind: "captureAsync", cols, rows, signal, settle, args, timeoutMs, envKeys: Object.keys(env) }, env,
+    async (bundle) => {
+      await new Promise((resolve, reject) => {
+        execFile(
+          "/bin/sh",
+          [RUN, String(cols), String(rows), bundle.out, signal, String(settle), stdin, args],
+          {
+            timeout: timeoutMs,
+            env: captureEnvironment(env, configHome, animation, icons),
+          },
+          (error) => error ? reject(error) : resolve(),
+        );
+      });
+      return readCaptureResult(bundle.out, { cols, rows });
     });
-    return readCaptureResult(out, { cols, rows });
-  } finally {
-    removeCaptureArtifacts(out);
-  }
 }

@@ -1,0 +1,275 @@
+# gh-glance release playbook
+
+This is the one project procedure for a gh-glance release; every release
+command, skill and rule routes here, and it replaces the generic cc-rpi release
+playbook for this repository.
+
+History only, not required reading for a release: the
+[v0.16.0 postmortem](../research/2026-10-02-v0.16.0-release-postmortem-assessment.md)
+and the [repair plan](../plans/2026-10-02-release-process-repair.md).
+
+## Topology
+
+- `develop` is the unprotected integration branch. `main` is protected (strict
+  up-to-date checks, admins included, PR-only) and is the released state.
+- A release is one `develop` -> `main` pull request merged with a **merge
+  commit** (never squash, never `--delete-branch`), then an annotated tag on
+  the resulting `main` commit and a published GitHub release.
+- Publishing the GitHub release triggers `.github/workflows/release.yml`
+  (environment `npm`), which publishes through **OIDC trusted publishing**.
+  There is no npm token and there must never be one. Never run `npm publish`
+  from a workstation.
+- Repository auto-merge is disabled. Merge the release PR explicitly once
+  every required check on its exact head is green.
+
+## Authority
+
+One owner decision covers one named release. It states the version, the
+reviewed scope or candidate, accepted limitations, the publication
+destination (npm via the release workflow) and whether the optional
+corrective allowance below applies. With that decision, the whole ordinary
+sequence below is covered: the single integration push, the release PR, the
+protected merge, the tag, the GitHub release, delivery verification and owned
+cleanup. Do not ask again for a
+step the decision already covers.
+
+Here, publishing the GitHub release **is** npm publication: without npm
+publication authority, stop before the tag and release.
+
+Ask only for a genuinely missing decision, and name it exactly: for example
+"publication to npm was not authorized" or "the corrective allowance is
+exhausted". Plan acceptance, implementation approval, a receipt field or a
+command-line flag never creates release authority.
+
+**Optional corrective allowance.** When a release's decision grants it, it
+permits **one** corrective push after a hosted candidate failure, and only when
+the repair:
+
+- is confined to test fixtures, the test harness or workflow wiring;
+- leaves the five packaged files, dependencies, version and release scope
+  unchanged;
+- changes no workflow permission, trigger, environment or trust binding
+  (those are release-control changes that need their own review and decision);
+- was independently reviewed and passed the complete applicable local gate.
+
+There are **zero** blind hosted reruns. A second failure, a product or
+dependency change, new live or paid scope, or a materially different candidate
+needs a new owner decision. No delegated agent decides on its own to push,
+merge, tag or publish.
+
+## Release driver
+
+`scripts/release.mjs` runs the procedure below and shows where a release
+stands. Before every step it reads GitHub, npm and git, acts only when that
+readback shows the step has not happened, at most once per stage per run, and
+stops if the readback after an action still does not show it. An interrupted
+release therefore resumes by reading, never by repeating.
+
+- `node scripts/release.mjs prepare x.y.z` -- read-only preflight on the
+  candidate checkout (HEAD): clean tree, versions, changelog, `origin/main`
+  and `origin/develop` both ancestors of HEAD, notes file
+  `docs/release/notes-vx.y.z.md`, registry and tag absence, any open release
+  PR, required contexts and tool readiness (`gh` auth, git remote, registry).
+- `node scripts/release.mjs resume x.y.z --authority <file>` -- re-runs those
+  local gates, then pushes the candidate commit itself to `develop` (never
+  whatever local `develop` holds, never forced), opens the release PR, waits
+  for the required checks (40 minutes per wait), merges pinned to the approved
+  head, tags, creates the GitHub release, reads the publisher's job results
+  (publication and delivery are separate outcomes), reads the registry back
+  (five-minute bound) and removes owned paths. The authority file records the
+  owner's decision for one reviewed candidate:
+  `{"version":"x.y.z","candidate":"<full commit>","reference":"<where the owner said it>","integration":true,"publication":true,"correctiveAllowance":0}`.
+  It documents authority and never creates it: without `publication` the
+  driver stops before the merge (moving `main` is the release) and names that
+  missing decision. A granted correction is a new candidate commit that
+  changes only `test/`, after failed required checks, with
+  `--correction-review <reference>` naming its independent review and local
+  gate; the authority file keeps naming the approved candidate and the
+  receipt records the replacement. If the publisher's Delivery job failed (for
+  example on registry lag), the release stays "published; delivery
+  unverified" until a later read-only delivery receipt is passed with
+  `--delivery-receipt <file>`. Produce it with
+  `RELEASE_VERSION=x.y.z RELEASE_INTEGRITY=<integrity the Verify job accepted>
+  GITHUB_SHA=<production merge commit> DELIVERY_RECEIPT=<file>
+  node scripts/release-candidate.mjs deliver`; take the integrity from the
+  Verify job's `candidate-receipt.json` (the `verified-release-*` artifact),
+  never from the registry. The driver accepts it only if provenance passed for
+  that merge commit and its integrity is what the registry serves. `--own <path>`
+  registers a path for cleanup; only a path holding a
+  `.gh-glance-release-owned` file that names this release is ever removed.
+- `node scripts/release.mjs status x.y.z [--report docs/release/<file>.md]`
+  -- reads the receipt (no live readback): stage, blocker, next action,
+  remaining stages and every blocker raised so far; with `--report` it
+  rewrites only the marked current-status block of the tracked report.
+- `node scripts/release.mjs protection` -- read-only: the next protection
+  migration step as the exact request body, or why to wait or stop.
+- `--dry-run <fixture.json>` runs any command against a simulated world with
+  no external effect; a `--dry-run` without a readable fixture is refused.
+
+The private receipt and lock live under `.git/gh-glance-release/vx.y.z/`; the
+receipt is read only while holding the lock. A live driver's lock is never
+taken over, and a dead one's (process gone or its pid reused) is reclaimed
+atomically. The driver runs `git` and `gh` itself, so shell-level guard hooks
+do not see those commands: review the authority file before resuming.
+
+## Procedure
+
+### 1. Prepare (local)
+
+1. Work in an owned worktree from current `develop`; never pull through a
+   dirty shared checkout. Fetch, then confirm `origin/main` is an ancestor of
+   `develop`. If it is not (every previous release leaves its merge commit only
+   on `main`), merge `origin/main` into `develop` **locally**. It ships in the
+   single `develop` push of stage 2, pushed plainly: `git pull --rebase` would
+   flatten the merge and leave the release PR BEHIND.
+2. Bump with `npm version <x.y.z> --no-git-tag-version`; add the
+   `## [x.y.z] - YYYY-MM-DD` changelog section. Diff `CHANGELOG.md` against the
+   previous tag so in-flight entries do not land under an already published
+   heading. Grep the old version across tracked files.
+3. Run the complete applicable local gate sequentially, keeping every exit
+   status: `npm run lint`, `node --check index.mjs`, `npm test`, plus
+   `npm run test:efficiency` and `npm run test:pty` when the change touches
+   their areas. `npm run test:fast`, `test:recovery`, `test:package` and
+   `test:pty:smoke` are named subsets for quick feedback, not substitutes. A
+   later pass never erases an earlier failure.
+4. Get an independent review of the release diff. A routine release does
+   **not** require a fresh broad pre-launch audit or exploratory charter; use
+   independent review for substantial changes and keep useful charter
+   scenarios as regressions.
+5. Confirm tool readiness before the first remote action: `gh auth status` and
+   the workflow triggers. CLI is the first route; permitted browser automation
+   is the fallback only for a genuine CLI failure. A tool or policy denial is
+   reported as that restriction, never routed around and never turned into
+   another request to approve the same release.
+
+### 2. Verify the candidate (hosted)
+
+1. Push `develop` once. Open the release PR if none exists
+   (`gh pr list --base main --head develop` first).
+2. Observe what gates the merge with
+   `gh pr checks <number> --required --watch`, and confirm every context `main`
+   protection requires appears in it (a context that never reports is missing,
+   not passing). Missing, skipped, canceled or failed required checks block.
+   For a failure, find its run with
+   `gh run list --commit <full-sha> --event pull_request` (a short SHA silently
+   matches nothing) and read `gh run view <id> --log-failed`; diagnose and fix
+   locally. Never rerun a hosted job to collect evidence.
+3. Sutura and the coverage workflow (push and scheduled) are optional observers.
+   They never block a release and are never waited for. Correlate a Sutura run
+   through its triggering run ID, not its own default-branch SHA, and report its
+   actual repair result; never merge its output automatically.
+
+### 3. Promote (protected)
+
+Merge with `gh pr merge <number> --merge` once all required checks are green.
+Read back the merge commit on `main` and confirm its tree matches the tested
+candidate and that the merged PR head is the approved candidate.
+
+### 4. Publish
+
+Create the annotated tag on the verified `main` merge commit and push it by
+full ref (`git push origin refs/tags/vX.Y.Z`; never `--tags`). Then
+`gh release create vX.Y.Z --verify-tag --title vX.Y.Z --notes-file <notes>`.
+That publication triggers the release workflow; observe it by run ID.
+
+The release workflow publishes the tarball the release PR tested: it proves
+the tag names this release's protected merge, finds the one successful
+candidate run whose tested tree equals that merge's tree, verifies the
+artifact's archive digest, manifest and tarball digests, and publishes
+`./artifact.tgz` with pinned npm and `--ignore-scripts`. An existing identical
+version skips straight to delivery; different bytes, an unknown registry
+answer or an older-than-latest version stop it. A missing or expired candidate
+(artifacts last 30 days) means a new candidate gate, never a repack. Releases
+tagged before this repair used the older publisher (directory publish, with
+a `gitHead`); see
+[Transition](#transition-what-changed-and-what-still-needs-activation).
+
+### 5. Delivery and readback
+
+Read the registry once: `npm view gh-glance@x.y.z version dist.integrity
+dist.shasum gitHead dist-tags --json`. `dist.integrity` must equal the
+accepted candidate's (the verify job logs it) and `latest` the new version.
+A tarball publish carries no `gitHead`, so an empty one is expected; the
+production commit is bound by the provenance statement instead, which the
+release workflow's delivery job checks: its subject digest, `release.yml` at
+`refs/tags/vX.Y.Z`, and the merge commit. That job also installs the version
+fresh on Node 22 and 24 and requires gh-glance's own verified attestation from
+`npm audit signatures`; its receipt is uploaded as `delivery-receipt-node-*`.
+Re-check by hand only when that job did not finish.
+Registry lag is normal:
+retry with capped backoff for at most five minutes, then report **published;
+delivery unverified** and resume read-only later. Never republish to "fix"
+lag.
+
+### 6. Receipt and owned cleanup
+
+Write the current status at the top of the release report under
+`docs/release/`: version, integration and production SHAs, tag, release and
+publisher run URLs, artifact integrity, provenance and installed smoke
+results, and every accepted limitation. Keep earlier failure history beneath
+it, labeled as dated history. A receipt-only follow-up commit goes into the
+next ordinary integration, not into the released candidate and not into an
+extra push. Then remove only paths, branches and worktrees this release
+created; preserve unrelated untracked files.
+
+## Transition: what changed and what still needs activation
+
+The [repair plan](../plans/2026-10-02-release-process-repair.md) replaced the
+workflows in this repository; they take effect with the first push that
+carries them. One step needs separate owner authority: branch protection.
+
+See the [activation dossier](release-process-activation.md) for the exact
+decision and steps.
+
+| Area | Before the repair | Now in the workflow files | Still to activate |
+| --- | --- | --- | --- |
+| Candidate CI | Full suites on every `develop` push, PR and `main` push | Release PR owns one selection, packs once and uploads the tarball; `develop` pushes are quick, and skipped while the release PR is open; `main` pushes check promotion identity only; an always-running `Release candidate` aggregate | Require `Release candidate` on `main`, observe it, then retire the legacy contexts (add before remove) |
+| Publisher | Re-tests, re-packs the tag, floating npm, skip-on-existing without byte comparison | Verifies and publishes the accepted tarball with pinned npm; collisions block | OIDC publication of a verified artifact is unproven until the first real release |
+| Delivery | Manual readback (step 5) | Bounded registry, provenance and fresh-install checks on Node 22 and 24 in an unprivileged job | First real release |
+| Coverage | Also on every `develop` push | Scheduled and manual only | None |
+
+## Outcomes are separate
+
+A release outcome (published and delivered), a canary outcome (a named live
+risk observed under a finite budget) and an incident outcome (F12 personal
+and work EMU qualification) are independent. A successful publication never
+closes F12 or the original freshness incident, and a missing live window never
+blocks an otherwise verified release unless the release decision says so.
+
+Routine releases have **no live soak**. If a change carries a named live risk,
+declare it and the exact environment first, then use at most one already
+running Actions pane, five minutes, no new panes or restarts, and no more than
+20 extra admitted calls per resource while keeping
+max(40% of the observed limit, the product reserve) remaining. Unknown cost
+stops new requests. Never pause other fleet tools or migrate credentials as an
+implicit prerequisite.
+
+## Failure handling
+
+- A failed or canceled check stays failed in the record, even after a later
+  local repair passes.
+- Repair proven fixture assumptions; never delete or weaken a meaningful
+  assertion to obtain a pass.
+- After a hosted failure, follow stage 2 step 2, reproduce and fix locally and
+  run the complete local gate. Then use the corrective allowance if it was
+  granted and the repair qualifies; otherwise present the repaired candidate
+  for a decision.
+- A failed `npm publish` step is **publication unknown**: the job reads the
+  registry back and logs the state. Resume by reading, and re-run all release
+  jobs (or only the failed ones; they find the verified artifact by ID). The
+  registry check refuses to publish twice and passes an exact match through.
+- An interrupted step is resumed by reading GitHub and npm state first. Tag,
+  release and version are immutable identities; a wrong target or a registry
+  version with different bytes is a collision that blocks, never something to
+  overwrite.
+
+## Project-local customization of managed files
+
+The native `rpi-release` skill copies carry a short project preamble pointing
+here. These and the four pre-existing customized rule files
+(`.claude/rules/{testing,deployment-safety}.md`,
+`.rpi/rules/{testing,deployment-safety}.md`) are expected local drift reported
+by `.rpi/scripts/rpi-diagnostics.py`; upstream baselines and manifest hashes
+are left untouched. The retained `/release` and `/fix-ci` commands and their
+migrated Codex skills are project-owned and are thin routes to this page and to
+the native `rpi-fix-ci` skill.

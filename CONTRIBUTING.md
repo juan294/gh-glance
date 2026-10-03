@@ -37,14 +37,32 @@ There's no build step -- it's plain ESM JavaScript, run directly by Node.
 ### Tests
 
 ```bash
-npm test          # node:test; excludes E2E-* cases owned by test:efficiency
-npm run lint      # eslint, fails on warnings
+npm test          # node:test; every unit file, excludes E2E-* cases owned by test:efficiency
+npm run test:fast       # npm test minus the 72-hour oracle and package install
+npm run test:recovery   # the 72-hour sustained recovery oracle only
+npm run test:package    # pack (or GH_GLANCE_PACKAGE_TARBALL) and exercise the install
+npm run lint      # eslint over index.mjs, eslint.config.js, scripts/ and test/
 node --check index.mjs
 npm run test:pty  # end-to-end, drives the real binary under a pty (slower)
+npm run test:pty:smoke  # startup, navigation, quit, cached age and recovery only
 npm run test:efficiency  # deterministic simulated-hour acceptance
 npm run measure:efficiency  # JSON and Markdown efficiency evidence
 npm run test:coverage:runtime  # informational PTY child-process function coverage
 ```
+
+The selections behind `test:fast`, `test:recovery`, `test:package` and
+`test:pty:smoke` are named file lists in `scripts/test-select.mjs`, which prints
+each selection's files, command, result and duration and exits non-zero if any
+named selection failed. Every test file must belong to a selection: a new
+`test/*.test.mjs` file joins `fast` automatically, and the selector's own tests
+fail if a file is left unowned. `npm test` stays the complete unit contract.
+`node scripts/package-check.mjs --tarball <file>` checks an already packed
+tarball's exact five files and its installed executable without repacking.
+
+When a terminal capture's test fails, its redacted terminal bytes, parsed
+frames, fixture `gh` calls and timing are kept under
+`GH_GLANCE_TEST_EVIDENCE_DIR` (default `$TMPDIR/gh-glance-test-evidence/run-<pid>`); the
+failing test's output names the path. Passing captures leave nothing behind.
 
 Tests live in `test/` and use Node's built-in runner, so they add no build step
 and no test-framework dependency. `index.mjs` guards its entry point behind a
@@ -65,17 +83,28 @@ screen into a bounded terminal grid, so it can detect a transient duplicate
 status line even when a later repaint is clean. It found the scrollback bug
 fixed in `0.3.0`.
 
-It is a separate script from `npm test` on purpose. The unit run is fast and is
-required everywhere; the pty run is slow and timing-sensitive, so it reports on
-every pull request but is **required only on `main`** -- which in practice means
-it gates the release and nothing else. It was advisory until 2026-08-04 and was
-promoted after 38 consecutive runs without a failure. If you make it flake, the
-right response is to delete the offending assertion, not to add retries.
+It is a separate script from `npm test` on purpose. The unit run is fast; the
+pty run is slow and timing-sensitive. CI routes them by the change
+(`scripts/release-candidate.mjs` `planCi`): `develop` pushes (unless the release
+PR is open, whose run already covers the same head) and ordinary PRs run the
+fast unit selection and the terminal smoke, and a `develop` -> `main`
+release PR whose change can affect coordination or terminal behavior runs the
+full PTY suite once, plus the recovery and efficiency selections. The required
+`PTY` context reports whichever terminal work the run selected. The full suite
+was advisory until 2026-08-04 and was promoted after 38 consecutive runs
+without a failure. If it flakes, find the
+cause: repair a proven fixture assumption (readiness, deadline, cleanup or
+platform behavior) or fix the product. Keep every meaningful assertion -- never
+delete or weaken one to get a pass -- and do not add blind retries.
+
+Validate with fixtures by default; the
+[release playbook](docs/release/release-playbook.md#outcomes-are-separate) sets
+when a live check is justified and its limits.
 
 `npm run test:coverage:runtime` repeats the PTY suite under V8 coverage and
 summarizes observed `index.mjs` functions. It is an informational scheduled or
-manual signal, not a threshold or release gate, and is skipped by the coverage
-workflow on ordinary `develop` pushes because CI already runs the PTY suite.
+manual signal, not a threshold or release gate. The coverage workflow runs on a
+schedule or by hand, never on push, and no release waits for it.
 
 `npm run test:efficiency` advances an injected clock through the versioned
 60-minute workload while exercising the production acquisition and governor
@@ -309,8 +338,8 @@ this code.
 
 ## PTY suite timing
 
-`npm run test:pty` runs one file at a time with a **per-file** timeout of ten
-minutes. That ceiling is not arbitrary padding: `test/pty/status.test.mjs`
+`npm run test:pty` runs one file at a time with a **per-file** timeout of
+fifteen minutes (`--test-timeout=900000`). That ceiling is not arbitrary padding: `test/pty/status.test.mjs`
 takes around four minutes on a developer laptop, and a two-core CI runner is
 appreciably slower. It was 240s and CI began failing on that file alone --
 `testTimeoutFailure`, with every assertion in it passing -- because shared

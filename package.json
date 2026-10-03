@@ -1,6 +1,6 @@
 {
   "name": "gh-glance",
-  "version": "0.16.1",
+  "version": "0.16.2",
   "description": "A live-refreshing GitHub dashboard for your terminal: Actions, Issues, Pull Requests, and Security alerts in one narrow pane",
   "type": "module",
   "bin": {
@@ -14,16 +14,20 @@
     "LICENSE"
   ],
   "scripts": {
-    "lint": "eslint . --max-warnings 0",
+    "lint": "eslint --max-warnings 0 index.mjs eslint.config.js scripts test",
     "prepare": "node -e \"process.exit(require('fs').existsSync('.git')?0:1)\" && husky || true",
     "prepublishOnly": "npm run lint && node --check index.mjs && npm test",
     "start": "node index.mjs",
     "test": "node --test --test-skip-pattern='E2E-' test/*.test.mjs",
+    "test:fast": "node scripts/test-select.mjs run fast",
+    "test:recovery": "node scripts/test-select.mjs run recovery",
+    "test:package": "node scripts/test-select.mjs run package",
     "test:coverage": "node --test --test-concurrency=1 --test-skip-pattern='E2E-' --experimental-test-coverage --test-coverage-include=index.mjs test/*.test.mjs",
     "test:coverage:runtime": "node test/runtime-coverage.mjs",
-    "test:efficiency": "node --test test/efficiency.test.mjs",
+    "test:efficiency": "node scripts/test-select.mjs run efficiency",
     "measure:efficiency": "node scripts/measure-efficiency.mjs",
-    "test:pty": "node --test --test-concurrency=1 --test-timeout=900000 test/pty/*.test.mjs"
+    "test:pty": "node scripts/test-select.mjs run pty",
+    "test:pty:smoke": "node scripts/test-select.mjs run pty:smoke"
   },
   "keywords": [
     "github",
