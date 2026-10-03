@@ -261,8 +261,10 @@ git checkout -b feat/your-feature
 Open your pull request against `develop`, never against `main`.
 
 Publishing a `main` commit to npm is automatic: publishing a GitHub release
-triggers `.github/workflows/release.yml`, which republishes from the tagged
-commit. Nothing is ever published from a maintainer's machine, because
+triggers `.github/workflows/release.yml`, which proves the tag is the release
+pull request's merge commit, finds the candidate tarball that pull request's CI
+tested, and publishes those exact bytes -- it never rebuilds or repacks.
+Nothing is ever published from a maintainer's machine, because
 `npm pack` reads the working tree rather than the tag and would happily ship
 uncommitted edits.
 

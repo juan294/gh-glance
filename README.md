@@ -134,10 +134,11 @@ The installed package is a CLI, not a JavaScript library. The `gh-glance`
 executable is supported; package-root and deep imports are intentionally
 blocked so an internal test seam cannot become an accidental public API.
 
-Every published version is built and signed by GitHub Actions from a tagged
-commit on `main`, never from a maintainer's laptop, and carries [npm
+Every published version is the exact tarball GitHub Actions packed and tested
+for the release pull request, published by GitHub Actions from a tagged commit
+on `main`, never from a maintainer's laptop, and carries [npm
 provenance](https://docs.npmjs.com/generating-provenance-statements) linking
-the tarball back to the workflow run and commit that produced it. The
+the tarball back to the workflow run and commit that published it. The
 "Provenance" section on the [package
 page](https://www.npmjs.com/package/gh-glance) shows the exact source.
 

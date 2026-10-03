@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- README: the provenance note now says the published package is the exact
+  tarball tested for the release pull request.
+
 ## [0.16.2] - 2026-10-03
 
 No change to the dashboard itself: `index.mjs` is identical to 0.16.1. This
