@@ -106,7 +106,7 @@ jobs:
           CI_PLAN: ${{ needs.plan.outputs.plan }}
         run: node scripts/release-candidate.mjs manifest candidate/artifact.tgz candidate/manifest.json
       - id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.manifest.outputs.artifact-name }}
           path: |
@@ -216,7 +216,7 @@ jobs:
           GH_GLANCE_TEST_EVIDENCE_DIR: ${{ runner.temp }}/evidence
         run: node scripts/test-select.mjs run pty:smoke
       - if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: terminal-smoke-evidence-${{ matrix.os }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/evidence
@@ -264,7 +264,7 @@ jobs:
           GH_GLANCE_TEST_EVIDENCE_DIR: ${{ runner.temp }}/evidence
         run: node scripts/test-select.mjs run pty:governor
       - if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pty-governor-evidence-${{ github.run_attempt }}
           path: ${{ runner.temp }}/evidence
@@ -288,7 +288,7 @@ jobs:
           GH_GLANCE_TEST_EVIDENCE_DIR: ${{ runner.temp }}/evidence
         run: node scripts/test-select.mjs run pty:rest
       - if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pty-rest-evidence-${{ github.run_attempt }}
           path: ${{ runner.temp }}/evidence
