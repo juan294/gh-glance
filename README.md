@@ -25,14 +25,14 @@ without switching to the browser.
 ╭─ Actions · owner/repo ──────────────────────────────────────────────────╮
 │     TITLE                  │WORKFLOW  │BRANCH        │TIME   │UPDATED   │
 │ ─────────────────────────────────────────────────────────────────────── │
-│ >+  ci: pin actions to com… #443 CI    develop        1m20s   44d ago   │
-│  x  fix: restore the prima… #442 Code… develop        1m28s   44d ago   │
-│  +  chore: bump dependenci… #441 CI    dependa…int-10 30s     44d ago   │
-│  -  docs: update the readme #440 CI    develop        15s     45d ago   │
+│ >+  ci: pin actions to com… #443 CI    develop        1m20s   85d ago   │
+│  x  fix: restore the prima… #442 Code… develop        1m28s   85d ago   │
+│  +  chore: bump dependenci… #441 CI    dependa…int-10 30s     85d ago   │
+│  -  docs: update the readme #440 CI    develop        15s     86d ago   │
 │                                                                         │
 │                                                                         │
 ╰──────────────────────────────────────────────────────────────── 4 of 4 ─╯
-· Watching               Refresh: r Quit: q Move: ↑↓ Open: Ent Width: w
+· Watching               Refresh: r Quit: q Help: ? Move: ↑↓ Open: Ent w
 ```
 
 > Generated from this candidate's real binary under the repository PTY harness
@@ -143,6 +143,10 @@ the tarball back to the workflow run and commit that published it. The
 page](https://www.npmjs.com/package/gh-glance) shows the exact source.
 
 ### First run
+
+The footer keeps `?` available for contextual help, even in a narrow pane.
+Help explains the selected repository and host, the current observation, and
+what to do next; its pages keep long targets and recovery details reachable.
 
 The default standalone dashboard uses the credentials and active account
 already selected by your local `gh` CLI. It does not persist or display the
@@ -269,7 +273,7 @@ stdout isn't a terminal rather than streaming redraw frames into a pipe.
 | `r` | Request a current-tab refresh. It sends the cached validators, so an unchanged tab answers `304` and spends nothing. A safe grant is still required. |
 | `R` | Resynchronize the current tab: one generation without validators, and the only key that clears a negative capability backoff. Still subject to the budget and the secondary cooldown. |
 | `w` | Adjust table column widths |
-| `?` | Show the keys without leaving the dashboard (any key closes it) |
+| `?` | Open or close contextual help; `n` / `p` moves through its pages |
 | `q` / `Esc` / `Ctrl+C` | Quit (`Esc` leaves width mode) |
 
 ### Adjusting column widths
@@ -321,9 +325,16 @@ switch `gh` into non-interactive mode and require choosing a visibility in
 advance. Press `q` or `Esc` to decline. To watch an existing repository without
 attaching this folder, restart with `gh-glance --repo owner/name`.
 
-When the repository was chosen explicitly, with `--repo` or `GH_REPO`, the panel
-says so: `╭─ Actions · acme/widget ─`. That is what tells two side-by-side panes
-apart. It is dropped before the tab name when the pane is too narrow for both.
+The panel names the selected repository, including targets inferred from Git
+remotes: `╭─ Actions · acme/widget ─`. Non-default hosts are included in the
+target. Selection does not prove that the active account can access it. When
+the pane is too narrow for the target, press `?` to read its complete name and
+host, the current check state, source time, recovery action, and key reference.
+
+Help wraps long text and uses `n` / `p` for next / previous page. `?` closes it;
+any other ordinary key closes help without performing that key's usual action.
+`q`, `Esc`, and `Ctrl+C` still quit. Width mode keeps its own keys: leave it
+before opening help.
 
 If `gh-glance` is started without an interactive stdin (for example with stdin
 redirected), the key handlers cannot run and the status bar shows only `Quit: ^C`

@@ -51,3 +51,12 @@ Inspect wide and narrow captures for recognizable target and help affordance. Na
 ## Stuck states, work units and gate
 
 Unresolved target, hidden overflow, uncertain identity and short help pages are covered by NAV-02/03/07 and parent recovery table. One sequential unit; no batch eligibility due to shared App/input/layout ownership. Independent review checks key fall-through and target truth. Record exact candidate/check evidence and stop for phase acceptance.
+
+## Completion evidence
+
+- [x] NAV-01 through NAV-07 implemented and reviewed, with lifecycle evidence supplied by unchanged identity/collector regressions.
+- [x] Required visual captures inspected and README sample regenerated.
+- [x] Review findings and simplify corrections resolved.
+- [x] Required sequential lint, syntax, unit and PTY commands exited 0 on fingerprint `8ae37264e0da450f61f2995f5caa4bdc5882263b51fc171b41d3f874a0c17334`.
+
+Unit: 825 passed. PTY: 190 passed, 0 failed, 1 historical-baseline skip. Runtime SHA256: `7f69512f51313573e05cfd2f81ed0373a50973a53b4dd97b0b767282d79f264b`. See [implementation notes](../2026-10-25-first-run-experience-notes.md). Phase 3 may proceed under the owner's all-phases authorization.

@@ -11572,7 +11572,7 @@ const KEY_TABLE = [
   ["r", "Refresh the current tab when a safe grant is available"],
   ["R", "Resynchronize the current tab, ignoring cached validators and backoff"],
   ["w", "Adjust table column widths"],
-  ["?", "Show the keys (any key closes it)"],
+  ["?", "Open / close contextual help; n / p changes page"],
   ["q / Esc / Ctrl+C", "Quit (Esc leaves width mode)"],
 ];
 const KEY_COL = Math.max(...KEY_TABLE.map(([k]) => k.length)) + 3;
@@ -15917,6 +15917,74 @@ function contextualPanelLayout(view, { cols, rows } = {}) {
   return lines.slice(0, capacity);
 }
 
+// Selection is already resolved for acquisition. Displaying it must not ask gh
+// to resolve it again, or imply that the selected account can access it.
+function dashboardTarget({ repository = effectiveRuntimeRepository(), host = effectiveRuntimeHost() } = {}) {
+  // These identifiers have a strict ASCII grammar. Validate the entire value
+  // instead of applying the shorter retention limit for remote display fields.
+  const slug = typeof repository === "string" && REPO_PATTERN.exec(repository)?.[0] === repository
+    ? repository : null;
+  const selectedHost = normalizeHost(host);
+  return { repository: slug, host: selectedHost,
+    label: slug ? selectedHost && selectedHost !== "github.com" ? `${selectedHost}/${slug}` : slug
+      : "Repository unresolved" };
+}
+
+function clampHelpPage(index, count) {
+  return Math.max(0, Math.min(Number.isSafeInteger(index) ? index : 0, Math.max(0, count - 1)));
+}
+
+function contextHelpPages({ view, target, tab, remoteSetup = false }, keys = keyTableLines(), width = 75, height = 18) {
+  const cols = Math.max(1, Math.trunc(width));
+  const rows = Math.max(1, Math.trunc(height));
+  const controlRows = cols >= 48 ? 1 : 2;
+  const capacity = rows - controlRows;
+  if (capacity < 1) return [[...wrapPanelText("q Quit", cols)].slice(0, rows)];
+  const meaning = {
+    actions: "Actions shows automated jobs. A push starts a run only when a workflow has a matching trigger.",
+    issues: "Issues shows open issues in the selected repository.",
+    prs: "Pull requests shows open requests to merge changes into the selected repository.",
+    security: "Security shows alerts returned by the checked sources; unavailable sources can hide alerts.",
+  };
+  const title = remoteSetup ? "No GitHub remote found" : view.title;
+  const action = remoteSetup ? "Close help with ?, then Enter to start gh repo create; or restart with gh-glance --repo owner/name."
+    : view.action;
+  // Wrap validated identity in bounded chunks so the remote-field sanitizer
+  // cannot clip a long accepted target or consume its tail with a label prefix.
+  const targetLines = [["Target", target.repository ?? target.label], ["Host", target.host ?? "unresolved"]]
+    .flatMap(([label, value]) => {
+      const text = `${label}: ${value}`;
+      const wrapped = [];
+      for (let offset = 0; offset < text.length; offset += MAX_FIELD_LENGTH) {
+        wrapped.push(...wrapPanelText(text.slice(offset, offset + MAX_FIELD_LENGTH), cols));
+      }
+      return wrapped;
+    });
+  const context = [title, action, view.sourceCheck,
+    ...targetLines,
+    "Target selection does not confirm access.",
+    ...(!target.repository ? ["Restart with gh-glance --repo owner/name."] : []),
+    meaning[tab] === view.explanation ? null : meaning[tab], view.explanation, ...view.notes,
+    "Other keys close help without performing their usual action.",
+    "Keys (after closing help)", ...keys].filter(Boolean);
+  const lines = context.flatMap((line) => wrapPanelText(line, cols));
+  const chunks = [];
+  // Narrow pages need room for navigation and quit. A compact first page keeps
+  // the immediate state/remedy visible; all complete text follows unabridged.
+  const priority = [title, action].flatMap((line) => wrapPanelText(line, cols));
+  if (priority.length > capacity && capacity >= 2) {
+    const shortAction = /gh-glance --doctor/.test(action) ? "gh-glance --doctor"
+      : /gh auth/.test(action) ? "gh auth status" : remoteSetup ? "? then Enter"
+        : /^Press r/.test(action) ? "Close ?, then r" : action;
+    chunks.push([wrapPanelText(title, cols)[0], wrapPanelText(shortAction, cols)[0]]);
+  }
+  for (let offset = 0; offset < lines.length; offset += capacity) chunks.push(lines.slice(offset, offset + capacity));
+  return chunks.map((chunk, index) => [...chunk,
+    ...(controlRows === 1
+      ? [`${index + 1}/${chunks.length} n next p prev ? close q/Esc/^C quit`]
+      : [`${index + 1}/${chunks.length} n/p ?close`, "q/Esc/^C quit"])]);
+}
+
 function recoveryJournalPath(scope) {
   return `${scope.path}.recovery.json`;
 }
@@ -16523,6 +16591,7 @@ const KEY_HINTS = [
   { label: "Refresh", keys: "r" },
   { label: "Width", keys: "w" },
   { label: "Quit", keys: "q" },
+  { label: "Help", keys: "?" },
 ];
 
 function activeKeyHints({
@@ -16545,6 +16614,7 @@ function activeKeyHints({
 const REMOTE_SETUP_HINTS = [
   { label: "Create remote", keys: "Ent" },
   { label: "Quit", keys: "q" },
+  { label: "Help", keys: "?" },
 ];
 
 const REMOTE_SETUP_LINES = [
@@ -16589,7 +16659,7 @@ const REFRESH_STATUS_GLYPHS = Object.freeze({
 });
 
 function isMandatoryHint(hint) {
-  return hint?.label === "Refresh" || hint?.label === "Quit";
+  return hint?.label === "Refresh" || hint?.label === "Quit" || hint?.label === "Help";
 }
 
 function refreshStatus({
@@ -16713,7 +16783,7 @@ function statusBarLayout({
   for (const [index, hint] of mandatory.entries()) {
     // A full label is optional; every essential key is not. Reserve one
     // separator and the key itself for each action still to come before taking
-    // the current action's long form. This keeps both r and q at the 24-column
+    // the current action's long form. This keeps r, q and ? at the 24-column
     // terminal minimum, whose drawable frame is 23 cells wide.
     const remainingMinimum = mandatory.slice(index + 1).reduce(
       (total, candidate) => total + 1 + [...candidate.keys].length,
@@ -17122,6 +17192,7 @@ function App({ onCreateRemote = () => {} } = {}) {
   // The `?` overlay. Renders only on a keypress, so consecutive idle frames are
   // still byte-identical and the redraw suppression is untouched.
   const [showHelp, setShowHelp] = useState(false);
+  const [helpPage, setHelpPage] = useState(0);
   // Set once, ICON_HINT_AFTER_MS into a first load that is still running. Never
   // reset: it only gates a line that a resolved tab stops rendering anyway, and
   // clearing it would cost a second state write for no visible difference.
@@ -17283,6 +17354,7 @@ function App({ onCreateRemote = () => {} } = {}) {
   // A quiet dashboard's display clock can precede a newly completed request.
   // Compare source clocks with actual render time, without adding a timer.
   const presentationNow = Date.now();
+  const selectedTarget = dashboardTarget();
   const presentation = dashboardPresentation({
     tab: tab.key, rows: items, hasSnapshot: items !== null,
     sourceAt: sourceAgeMs === null ? lastOk : presentationNow - sourceAgeMs,
@@ -17293,6 +17365,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       : items === null && waiting[tab.key] ? "waiting" : "idle",
     error: tabError || activeFailure, recovery: noticeCause, diagnostic: displayError,
     disconnected: statusDisconnected, securityNotes: securityLines, securityAllUnavailable,
+    target: selectedTarget.label,
   });
   if (USING_NERD_ICONS && iconHintDue && items === null && !tabError) {
     presentation.notes.push("Icons blank? GH_GLANCE_ICONS=unicode");
@@ -17319,7 +17392,23 @@ function App({ onCreateRemote = () => {} } = {}) {
     ? noticeLines.length + visibleSecurityLines.length : 0;
   // Tab strip, divider, frame edges, footer and terminal guard use six rows.
   // Table headers alone need two more. The same budget drives navigation.
-  const bodyRows = Math.max(1, rows - 6 - (tableVisible ? 2 : 0) - extraLines);
+  const bodyRows = Math.max(1, rows - 6 - (tableVisible && !showHelp ? 2 : 0) - extraLines);
+  let helpPages = [];
+  if (showHelp) {
+    const fullDiagnostic = formatTabError(tabError, failureContext);
+    const helpView = { ...presentation, notes: [
+      ...(fullDiagnostic ? [fullDiagnostic] : []),
+      ...presentation.notes.filter((note) => note !== displayError),
+    ] };
+    helpPages = contextHelpPages({ view: helpView, target: selectedTarget,
+      tab: tab.key, remoteSetup }, keyTableLines(), cols - 5, bodyRows);
+  }
+  const visibleHelpPage = clampHelpPage(helpPage, helpPages.length);
+  const helpPageRef = useRef({ index: 0, count: 0 });
+  helpPageRef.current = { index: visibleHelpPage, count: helpPages.length };
+  useEffect(() => {
+    if (helpPage !== visibleHelpPage) setHelpPage(visibleHelpPage);
+  }, [helpPage, visibleHelpPage]);
 
   // Read at fetch time rather than being a hook dependency, so dragging the
   // pane wider doesn't cancel and restart in-flight requests -- the next tick
@@ -17693,12 +17782,14 @@ function App({ onCreateRemote = () => {} } = {}) {
         flushWidthPreferences();
         exit();
       } else if (showHelpRef.current) {
-        // Any key dismisses -- except quit, handled above, which must never be
-        // swallowed by a modal in a full-screen app. Deliberately does not fall
-        // through to the binding the key would normally trigger: closing the
-        // overlay is the whole intent of that press.
-        setShowHelp(false);
+        // Paging belongs to the modal. Every other ordinary key closes it and
+        // is consumed; quit remains global and width mode retains its ownership.
+        if (input === "n" || input === "p") {
+          setHelpPage(clampHelpPage(helpPageRef.current.index + (input === "n" ? 1 : -1),
+            helpPageRef.current.count));
+        } else setShowHelp(false);
       } else if (input === "?") {
+        setHelpPage(0);
         setShowHelp(true);
       } else if (input === "w") {
         enterWidthMode();
@@ -19924,22 +20015,9 @@ function App({ onCreateRemote = () => {} } = {}) {
   // terminal is doing the clipping.
   const frameCols = Math.max(1, cols - 1);
 
-  // Name the repository in the top edge when it was chosen explicitly, because
-  // then it is not the one you would guess from the working directory. Nothing
-  // on screen said which repo a pane was watching, and the documented workflow is
-  // several panes side by side plus `--repo` from anywhere -- so telling them
-  // apart meant quitting and running --doctor. Only the explicit cases are shown:
-  // resolving the *inferred* repo would cost a subprocess call at startup for a
-  // label that, by definition, names the directory you are already sitting in.
-  //
-  // GH_REPO is read straight from the environment and never went through
-  // parseRepoTarget, so unlike runtime.repo it is unvalidated -- safe() before it
-  // is drawn, on the same rule as every other string this app does not own.
-  // Dropped before the tab name rather than with it: PanelEdge drops its whole
-  // label when it cannot seat one, so a single concatenated string would take the
-  // tab name down with the target at ordinary widths.
-  const target = runtime.repo ?? safe(process.env.GH_REPO ?? "");
-  const withTarget = target ? `${tab.label} · ${target}` : tab.label;
+  // The existing resolver also supplies inferred targets without another lookup.
+  // Complete target and host remain reachable in help when this edge is short.
+  const withTarget = `${tab.label} · ${selectedTarget.label}`;
   const topLabel = frameCols - 3 - withTarget.length >= 0 ? withTarget : tab.label;
 
   // Fixed columns deliberately do not shrink, so BRANCH and TIME stay readable
@@ -20060,12 +20138,10 @@ function App({ onCreateRemote = () => {} } = {}) {
       // recovers immediately -- this is a render-time branch and touches no state.
       // Short enough to survive at the widths it actually appears at -- a message
       // about the pane being too narrow that is itself truncated would be a joke.
-      // Clamped to bodyRows so it can never push the frame past `rows` and
-      // trigger the full repaint the height reservation exists to prevent, and
-      // truncate-end so it degrades rather than wraps in a narrow pane. Every
-      // glyph in KEY_TABLE is plain ASCII, which is what keeps it safe here.
+      // Help is cell-wrapped and paginated within bodyRows, with navigation
+      // and quit reserved on every page. Rendering never adds another wrap.
       showHelp &&
-        helpLines(bodyRows)
+        (helpPages[visibleHelpPage] ?? [])
           .map((line, i) => e(Text, { key: `help${i}`, wrap: "truncate-end" }, line)),
       !showHelp &&
         tooNarrow &&
@@ -20137,7 +20213,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       // tab that only has a handful of rows.
       e(Box, { flexGrow: 1 }),
     ),
-    e(PanelEdge, { width: frameCols, top: false, label: countLabel, labelColor: BORDER_COLOR }),
+    e(PanelEdge, { width: frameCols, top: false, label: showHelp ? null : countLabel, labelColor: BORDER_COLOR }),
     e(StatusBar, {
       status: semanticStatus,
       detail: activeGovernorDecision,
@@ -20758,6 +20834,9 @@ export {
   presentRecovery,
   dashboardPresentation,
   contextualPanelLayout,
+  dashboardTarget,
+  contextHelpPages,
+  clampHelpPage,
   wrapPanelText,
   recordRecoveryTransition,
   safeRecordRecoveryTransition,

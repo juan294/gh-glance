@@ -420,13 +420,13 @@ test("status hints advertise only controls that work in the current state", () =
     activeKeyHints({ interactive: true, canMove: false, canOpen: false, canResize: false }).map(
       ({ label }) => label,
     ),
-    ["Refresh", "Quit"],
+    ["Refresh", "Quit", "Help"],
   );
   assert.deepEqual(
     activeKeyHints({ interactive: true, canMove: true, canOpen: true, canResize: true }).map(
       ({ label }) => label,
     ),
-    ["Move", "Open", "Refresh", "Width", "Quit"],
+    ["Move", "Open", "Refresh", "Width", "Quit", "Help"],
   );
 });
 

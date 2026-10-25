@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 
-import { capture } from "./capture.mjs";
+import { capture, waitForAwk } from "./capture.mjs";
 import { AUTH_RETRY_MS, GOVERNOR_PHASE_WINDOW_MS, resourceReserve, tabRequestCost } from "../../index.mjs";
 
 const ESC = String.fromCharCode(27);
@@ -259,7 +259,8 @@ const shortHelp = capture({
   rows: 13,
   signal: "none",
   settle: 12,
-  stdin: "sleep 3; printf '?'; sleep 2; printf 'q'; sleep 2",
+  stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "ci: pin actions") { ok=1 }', 200) +
+    "printf '?'; " + waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "n/p ?close") { ok=1 }') + "printf q",
 });
 
 test("Checking colour state tolerates combined and split SGR sequences", () => {
@@ -409,11 +410,11 @@ test("a cache-hydrated adapted check is static and settles before routine polls"
   );
 });
 
-test("short help keeps essential actions and points to the full reference", () => {
+test("short contextual help keeps source context and explicit paging and exit", () => {
   const frame = shortHelp.finalFrame.lines.join("\n");
-  assert.match(frame, /Quit/);
-  assert.match(frame, /Refresh/);
-  assert.match(frame, /Open the selected/);
-  assert.match(frame, /Move the cursor/);
-  assert.match(frame, /gh-glance --help/);
+  assert.match(frame, /quit/i);
+  assert.match(frame, /[Rr]efresh/);
+  assert.match(frame, /Checked/);
+  assert.match(frame, /n\/p \?close/);
+  assert.match(frame, /q\/Esc\/\^C quit/);
 });
