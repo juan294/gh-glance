@@ -24,3 +24,6 @@ CLAUDE.local.md
 
 # Agent audit reports (public repo -- kept local, Rule #70)
 docs/agents/
+
+# Generated local Supabase CLI metadata
+supabase/.temp/
