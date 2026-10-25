@@ -239,7 +239,8 @@ export function identifyOracleRequest(argv, { input = null } = {}) {
   const params = new URLSearchParams(match[3]);
   const pageSize = Number(params.get("per_page") ?? 30);
   if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 100) throw new Error("unbounded fixture REST page");
-  return { ...base, repository: match[1], operation: operations[match[2]], resource: "core", cost: 1, pageSize, cursor: params.get("page") };
+  return { ...base, repository: match[1], operation: match[2] === "actions/workflows" && fields["--jq"]?.includes("total_count")
+    ? "actions.setup" : operations[match[2]], resource: "core", cost: 1, pageSize, cursor: params.get("page") };
 }
 
 export function oracleEntityKey(request) {
@@ -294,6 +295,7 @@ function defaultPayload(request, identity) {
   switch (request.operation) {
     case "actions.runs": return fixture("actions-runs");
     case "actions.workflows": return fixture("actions-workflows");
+    case "actions.setup": return fixture("actions-setup");
     case "issues.legacy": return fixture("issues");
     case "pulls.legacy": return fixture("prs");
     case "repository.identity": return { id: fixtureId("R", request.host, request.repository), nameWithOwner: request.repository, url: `https://${request.host}/${request.repository}`, viewerPermission: "READ" };

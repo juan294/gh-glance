@@ -187,6 +187,17 @@ with matching triggers. Issues and Pull requests report open items. Security
 reports only the sources it could check and keeps unavailable-source notes visible.
 An empty result is not a repository-wide health or security clearance.
 
+On Actions, press `s` for an optional read-only setup check or `g` to open the
+selected repository's Actions page. The setup check lists at most 100 workflows
+in one request. It reports partial coverage and unfamiliar states explicitly;
+zero workflows or an access error does not prove that Actions is disabled.
+Setup results have their own check time and do not change the run list or its
+freshness. A successful or partial result is reused for five minutes. Failures
+keep the prior dated result and require `s` to retry after at least 30 seconds
+and any shared API hold. There is no automatic setup retry. Setup checks are
+available only in standalone mode; connected collector and SSH views offer `g`
+instead. Neither key creates, enables, edits, or dispatches a workflow.
+
 “Checking” and “Waiting to check” mean no successful result is available yet.
 A failed load shows the actual recovery action. A failed refresh keeps the prior
 result and its original check time. “Needs an update” describes overdue data;
@@ -272,6 +283,8 @@ stdout isn't a terminal rather than streaming redraw frames into a pipe.
 | `Enter` | Open the selected item, or accept an onboarding prompt |
 | `r` | Request a current-tab refresh. It sends the cached validators, so an unchanged tab answers `304` and spends nothing. A safe grant is still required. |
 | `R` | Resynchronize the current tab: one generation without validators, and the only key that clears a negative capability backoff. Still subject to the budget and the secondary cooldown. |
+| `s` | On Actions, request or reuse a read-only setup check (standalone only) |
+| `g` | On Actions, open the selected repository’s Actions page |
 | `w` | Adjust table column widths |
 | `?` | Open or close contextual help; `n` / `p` moves through its pages |
 | `q` / `Esc` / `Ctrl+C` | Quit (`Esc` leaves width mode) |

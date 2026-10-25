@@ -1005,7 +1005,7 @@ function ghApiArgs(args, etag = null) {
   ];
 }
 
-async function ghApi(args, { operation, signal, etag = null, run = runGh } = {}) {
+async function ghApi(args, { operation, signal, etag = null, run = runGh, includeHeaders = false } = {}) {
   const argv = ghApiArgs(args, etag);
   try {
     const parsed = parseGhApiResponse(await run(argv, { operation, signal }));
@@ -1014,6 +1014,7 @@ async function ghApi(args, { operation, signal, etag = null, run = runGh } = {})
       etag: parsed.headers.etag ?? null,
       rateLimit: pickRateLimit(parsed.headers),
       body: parsed.body,
+      ...(includeHeaders ? { headers: parsed.headers } : {}),
     };
   } catch (error) {
     const parsed = parseGhApiResponse(error?.stdout);
@@ -1488,6 +1489,72 @@ function actionsWorkflowsArgs() {
     "--jq",
     "[.workflows[] | {id, name}]",
   ];
+}
+
+const ACTIONS_SETUP_TTL_MS = 5 * 60_000;
+
+function actionsSetupArgs({ host, repository }) {
+  return [`repos/${repository}/actions/workflows?per_page=100&page=1`, "--hostname", host,
+    "--jq", "{total_count, workflows: [.workflows[] | {id, name, state}]}"];
+}
+
+function parseActionsSetup(body, headers = {}) {
+  const unusable = () => { throw new Error("Actions setup response is unusable"); };
+  let value;
+  try { value = JSON.parse(body); } catch { return unusable(); }
+  if (!isRecord(value) || !Number.isSafeInteger(value.total_count) || value.total_count < 0 ||
+      !Array.isArray(value.workflows) || value.workflows.length > 100 ||
+      value.total_count < value.workflows.length || (value.total_count > 0 && value.workflows.length === 0)) return unusable();
+  const ids = new Set();
+  const workflows = value.workflows.map((entry) => {
+    if (!isRecord(entry) || !Number.isSafeInteger(entry.id) || entry.id <= 0 || ids.has(entry.id) ||
+        typeof entry.name !== "string" || !safe(entry.name).trim() ||
+        typeof entry.state !== "string" || !entry.state.trim()) return unusable();
+    ids.add(entry.id);
+    return { id: entry.id, name: safe(entry.name), state: entry.state };
+  });
+  const hasNextPage = /rel=["']?next\b/i.test(headers.link ?? "");
+  if (value.total_count === 0 && hasNextPage) return unusable();
+  const complete = value.total_count === workflows.length && !hasNextPage;
+  const disabled = workflows.filter(({ state }) => ["disabled_manually", "disabled_inactivity"].includes(state)).length;
+  const active = workflows.filter(({ state }) => state === "active").length;
+  const title = !complete ? "Workflows found; setup check incomplete"
+    : workflows.length === 0 ? "No workflows found"
+      : disabled === workflows.length ? "All listed workflows are disabled" : "Workflows found";
+  return { total: value.total_count, workflows, complete, disabled, active,
+    other: workflows.length - disabled - active, title };
+}
+
+function actionsSetupFresh(result, nowMs) {
+  return result != null && nowMs >= result.checkedAt && nowMs - result.checkedAt < ACTIONS_SETUP_TTL_MS;
+}
+
+function actionsSetupRetryAt(nowMs, holdUntil = 0) {
+  return Math.max(nowMs + 30_000, Number.isFinite(holdUntil) ? holdUntil : 0);
+}
+
+function actionsPageUrl(target = dashboardTarget()) {
+  const validated = dashboardTarget(target);
+  return validated.host && validated.repository
+    ? `https://${validated.host}/${validated.repository}/actions` : null;
+}
+
+function actionsSetupPresentation(state, nowMs) {
+  const result = state.result;
+  const notes = [];
+  if (result) {
+    notes.push(`${state.saved ? "Saved setup check" : "Setup checked"}: ${new Date(result.checkedAt).toISOString()}`,
+      `${result.workflows.length} of ${result.total} workflows listed: ${result.active} active, ${result.disabled} disabled, ${result.other} other state.`,
+      actionsSetupFresh(result, nowMs)
+        ? `Press s to check again after ${new Date(result.checkedAt + ACTIONS_SETUP_TTL_MS).toISOString()}.`
+        : "Setup check expired; press s to check again.");
+  }
+  if (state.error) notes.push(state.error,
+    `Press s to retry${state.retryAt ? ` after ${new Date(state.retryAt).toISOString()}` : ""}.`);
+  if (state.message) notes.push(state.message);
+  return { title: state.busy ? "Checking Actions setup" : state.error ? "Setup check unavailable"
+    : state.message ? state.title ?? "Actions setup" : result?.title,
+  action: state.action ?? (state.error ? "s Retry; g Actions; ? Details" : "s Setup; g Actions; ? Details"), notes };
 }
 
 function parseActionsRuns(runsBody) {
@@ -2214,6 +2281,7 @@ const OPERATION_COSTS = Object.freeze({
   // Separately admitted, like a later list page: only fetched when a run has
   // no name of its own, and settled against its own reservation.
   "catalog:actions-workflows": { core: 1, graphql: 0 },
+  "setup:actions-workflows": { core: 1, graphql: 0 },
   "tab:security-endpoint": { core: 1, graphql: 0 },
   "failure-context:repository": { core: 0, graphql: GRAPHQL_OBSERVER_POINTS },
   // Each page past the first reserves its own envelope, so a denial there is a
@@ -6977,6 +7045,10 @@ async function openInBrowser(tabKey, item, signal, _governor = null, { run = nul
   // Returning quietly here is how a dead Enter key looks: the row has no usable
   // page, and the user is entitled to know that rather than press it again.
   if (!url) throw new Error("This row has no page to open yet; refresh and try again");
+  return openBrowserUrl(url, signal, { run });
+}
+
+async function openBrowserUrl(url, signal, { run = null } = {}) {
   const opener = pick(BROWSER_OPENERS, process.platform, null);
   if (!opener) throw new Error(`Opening a browser is not supported on ${process.platform}`);
   const [command, ...prefix] = opener;
@@ -11571,6 +11643,8 @@ const KEY_TABLE = [
   ["Enter", "Open the selected item or accept a prompt"],
   ["r", "Refresh the current tab when a safe grant is available"],
   ["R", "Resynchronize the current tab, ignoring cached validators and backoff"],
+  ["s", "Actions: read-only setup check (standalone only; saved for five minutes)"],
+  ["g", "Actions: open the selected repository Actions page"],
   ["w", "Adjust table column widths"],
   ["?", "Open / close contextual help; n / p changes page"],
   ["q / Esc / Ctrl+C", "Quit (Esc leaves width mode)"],
@@ -11594,6 +11668,8 @@ const HELP_PRIORITY = [
   "Tab / Shift+Tab",
   "PgUp / PgDn",
   "R",
+  "s",
+  "g",
 ];
 
 function helpLines(maxRows) {
@@ -17197,6 +17273,8 @@ function App({ onCreateRemote = () => {} } = {}) {
   // reset: it only gates a line that a resolved tab stops rendering anyway, and
   // clearing it would cost a second state write for no visible difference.
   const [iconHintDue, setIconHintDue] = useState(false);
+  const [actionsSetup, setActionsSetup] = useState({});
+  const actionsSetupRef = useRef(null);
   const [errors, setErrors] = useState({ actions: null, issues: null, prs: null, security: null });
   const [failureContext, setFailureContext] = useState(null);
   const [loading, setLoading] = useState({ actions: false, issues: false, prs: false, security: false });
@@ -17367,6 +17445,26 @@ function App({ onCreateRemote = () => {} } = {}) {
     disconnected: statusDisconnected, securityNotes: securityLines, securityAllUnavailable,
     target: selectedTarget.label,
   });
+  const setupView = tab.key === "actions" ? actionsSetupPresentation(actionsSetup, presentationNow) : null;
+  if (tab.key === "actions") {
+    const url = actionsPageUrl(selectedTarget);
+    if (runtime.connect !== null && setupView.title && (statusDisconnected || noticeCause || tabError)) {
+      setupView.action = `${statusDisconnected ? "Restore connection;" : presentation.action} g Actions; ? Help`;
+    }
+    const showSetupPanel = !presentation.showTable && !remoteSetup &&
+      ((presentation.state === "ready" && !showCoordinationNotice) || runtime.connect !== null);
+    presentation.notes.push(...(setupView.title && !showSetupPanel ? [setupView.title] : []), ...setupView.notes,
+      "Close help with ?, then press s for a read-only setup check or g to open Actions.",
+      ...(url ? [url] : ["Restart with gh-glance --repo owner/name."]));
+    if (showSetupPanel) {
+      if (setupView.title) {
+        presentation.notes.push(`Runs: ${presentation.title}`, presentation.action);
+        presentation.title = setupView.title;
+      }
+      if (setupView.title) presentation.sourceCheck = `Runs: ${presentation.sourceCheck}`;
+      if (setupView.title || presentation.state === "ready") presentation.action = setupView.action;
+    }
+  }
   if (USING_NERD_ICONS && iconHintDue && items === null && !tabError) {
     presentation.notes.push("Icons blank? GH_GLANCE_ICONS=unicode");
   }
@@ -17385,7 +17483,9 @@ function App({ onCreateRemote = () => {} } = {}) {
           : [shortAction, presentation.sourceCheck, presentation.title]
       : [presentation.title, presentation.sourceCheck, ...recoveryLines.filter(Boolean)]
     : recoveryLines;
-  const noticeLines = tableNotices.slice(0, tableNoticeCapacity);
+  const noticeLines = [...new Set([...(showCoordinationNotice ? tableNotices : []),
+    ...(setupView?.title ? [setupView.title, setupView.action, ...setupView.notes] : []),
+    ...tableNotices])].slice(0, tableNoticeCapacity);
   const visibleSecurityLines = tab.key === "security"
     ? securityLines.slice(0, Math.max(0, tableNoticeCapacity - noticeLines.length)) : [];
   const extraLines = !showHelp && !remoteSetup && tableVisible
@@ -17728,6 +17828,25 @@ function App({ onCreateRemote = () => {} } = {}) {
   const [openRequests] = useState(() => createOpenRequestRegistry());
   useEffect(() => () => openRequests.abortAll(), [openRequests]);
 
+  function openActionsPage() {
+    const target = dashboardTarget();
+    const url = actionsPageUrl(target);
+    if (!url) {
+      setActionsSetup((state) => ({ ...state, message: "Restart with gh-glance --repo owner/name." }));
+      return;
+    }
+    const accessKey = runtimeIdentityCoordinator?.current()?.accessKey;
+    openRequests.start(`actions-page:${url}`, ({ signal }) => openBrowserUrl(url, signal))?.then(() => {
+      if (actionsPageUrl() === url && runtimeIdentityCoordinator?.current()?.accessKey === accessKey) {
+        setActionsSetup((state) => ({ ...state, message: null, title: null, action: null }));
+      }
+    }).catch((err) => {
+      if (err?.name === "AbortError" || actionsPageUrl() !== url ||
+          runtimeIdentityCoordinator?.current()?.accessKey !== accessKey) return;
+      setActionsSetup((state) => ({ ...state, title: "Actions page unavailable", action: "g Retry; ? Details", message: `Could not open Actions: ${shortErr(err)}. Press g to retry.` }));
+    });
+  }
+
   function openSelected() {
     const { items, key: currentKey, tabKey } = navRef.current;
     const item = items.find((i) => itemKey(i) === currentKey);
@@ -17791,6 +17910,10 @@ function App({ onCreateRemote = () => {} } = {}) {
       } else if (input === "?") {
         setHelpPage(0);
         setShowHelp(true);
+      } else if (input === "s" && TABS[activeIndexRef.current].key === "actions") {
+        void actionsSetupRef.current?.();
+      } else if (input === "g" && TABS[activeIndexRef.current].key === "actions") {
+        openActionsPage();
       } else if (input === "w") {
         enterWidthMode();
       } else if (key.downArrow || input === "j") {
@@ -18019,6 +18142,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     // scheduler out, and the Enter hint hands off to `gh repo create`.
     function enterRemoteSetup() {
       if (!runtimeHasNoRepositoryTarget()) return false;
+      retireSetup();
       const failure = toTabError(new Error(NO_REMOTE_ERROR_TEXT));
       setErrors(Object.fromEntries(TABS.map((t) => [t.key, failure])));
       return true;
@@ -18414,7 +18538,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         .finally(() => {
           inFlightRef.current[key] = false;
           delete inFlightStartedAt[key];
-          if (!currentAccess() && !Object.values(inFlightRef.current).some(Boolean) && runtimeIdentityCoordinator?.current()?.quotaKey !== settlementScope.quotaKey) releaseLease(settlementScope, leaseId);
+          if (!currentAccess() && !setupFlight && !Object.values(inFlightRef.current).some(Boolean) && runtimeIdentityCoordinator?.current()?.quotaKey !== settlementScope.quotaKey) releaseLease(settlementScope, leaseId);
           manualInFlight.delete(key);
           onSettled?.();
           if (!cancelled) {
@@ -18440,6 +18564,23 @@ function App({ onCreateRemote = () => {} } = {}) {
     }
 
     const leaseId = governorId();
+    let setupFlight = null;
+    let setupGeneration = 0;
+    let setupPartition = null;
+    let setupState = {};
+    function publishSetup(next) {
+      setupState = next;
+      if (!cancelled) setActionsSetup(next);
+    }
+    function retireSetup() {
+      setupGeneration += 1;
+      if (setupFlight) {
+        setupFlight.retired = true;
+        setupFlight.controller.abort();
+      }
+      setupPartition = null;
+      publishSetup({});
+    }
     const pending = new Map();
     const cleanupQueue = new Set();
     let lastWallAt = Date.now();
@@ -18562,6 +18703,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       }
     }
 
+    actionsSetupRef.current = () => publishSetup({ title: "Standalone only", action: "g Actions; ? Help", message: "Setup checks are available in standalone mode. Press g to open Actions." });
     if (runtime.connect !== null) {
       const repository = effectiveRuntimeRepository({ remoteUrls: runtimeRemoteUrls });
       const host = effectiveRuntimeHost({ remoteUrls: runtimeRemoteUrls });
@@ -18955,13 +19097,14 @@ function App({ onCreateRemote = () => {} } = {}) {
     }
 
     function retireCurrentScope() {
+      retireSetup();
       if (!cleanupScope || !registeredScopeHash) return;
       for (const key of [...pending.keys()]) cancelPending(key, cleanupScope);
       for (const subscription of acquisitionSubscriptions.values()) {
         acquisitionEngine.unsubscribe(subscription.id);
       }
       acquisitionSubscriptions.clear();
-      if (!Object.values(inFlightRef.current).some(Boolean)) releaseLease(cleanupScope, leaseId);
+      if (!setupFlight && !Object.values(inFlightRef.current).some(Boolean)) releaseLease(cleanupScope, leaseId);
     }
 
     // discardData separates the two reasons this runs. An account *change* must
@@ -19037,6 +19180,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         const activeTab = TABS[activeIndexRef.current].key;
         const kept = maintainControlLease(scope, leaseId, runtime.refreshMs, activeTab, nowMs);
         if (kept.ok) return scope;
+        retireSetup();
         registeredScopeHash = null;
         if (governorRef.current?.leaseId === leaseId) governorRef.current = null;
         return null;
@@ -19430,6 +19574,85 @@ function App({ onCreateRemote = () => {} } = {}) {
       } else await transport;
       return { persisted: true, retry: false, kind, key };
     }
+    actionsSetupRef.current = async () => {
+      if (cancelled || setupFlight) return;
+      const nowMs = Date.now();
+      const target = dashboardTarget();
+      if (remoteSetupRef.current || !actionsPageUrl(target)) {
+        publishSetup({ message: "Restart with gh-glance --repo owner/name." });
+        return;
+      }
+      const capturedScope = ensureScope(nowMs);
+      if (!capturedScope) {
+        publishSetup({ ...setupState, error: "Setup check unavailable while account coordination recovers.",
+          retryAt: actionsSetupRetryAt(nowMs) });
+        return;
+      }
+      const partition = JSON.stringify(["standalone", target.host, target.repository, capturedScope.accessKey]);
+      if (setupPartition !== partition) { retireSetup(); setupPartition = partition; }
+      if (setupState.retryAt > nowMs) { publishSetup({ ...setupState }); return; }
+      if (actionsSetupFresh(setupState.result, nowMs)) {
+        publishSetup({ ...setupState, saved: true, error: null, message: null });
+        return;
+      }
+      const generation = setupGeneration;
+      const flight = { controller: new AbortController(), scope: { ...capturedScope, identityProvider: null }, retired: false };
+      setupFlight = flight;
+      const setupSignal = AbortSignal.any([controller.signal, flight.controller.signal]);
+      const current = () => !cancelled && !setupSignal.aborted && generation === setupGeneration &&
+        setupPartition === partition && identity()?.accessKey === capturedScope.accessKey &&
+        actionsPageUrl() === actionsPageUrl(target) && !remoteSetupRef.current;
+      publishSetup({ ...setupState, busy: true, error: null, saved: false, message: null });
+      try {
+        const admitted = await runAdmittedOperation({ scope: capturedScope, leaseId,
+          operation: "setup:actions-workflows", priority: "manual", signal: setupSignal,
+          waitMs: GOVERNOR_ADMISSION_WAIT_MS,
+          run: async (signal) => {
+            const response = await ghApi(actionsSetupArgs(target), {
+              operation: "setup:actions-workflows", signal, includeHeaders: true,
+            });
+            return { ...response, observation: parseActionsSetup(response.body, response.headers), checkedAt: Date.now() };
+          },
+        });
+        if (!current()) return;
+        if (!admitted.ok) {
+          const error = admitted.error;
+          const failedAt = Date.now();
+          let snapshot = inspectGovernor(capturedScope, failedAt);
+          const throttle = classifyThrottle({ ...error?.apiResponse, stderr: errText(error) });
+          let holdUntil = 0;
+          if (classify(error) === "rate-limited" || throttle.kind !== "none") {
+            const budget = snapshot.value?.budgets?.core;
+            const resetMs = throttle.kind === "primary" ? throttle.resetMs
+              : throttle.kind === "secondary" ? transportCooldownDeadline({ ...throttle, at: failedAt })
+                : budget?.resetMs ?? null;
+            holdUntil = resetMs ?? 0;
+            handleRateLimitBlocks("actions", [{ resource: "core", resetMs,
+              epoch: budget?.epoch ?? null }], failedAt);
+            snapshot = inspectGovernor(capturedScope, failedAt);
+          }
+          const retryAt = actionsSetupRetryAt(failedAt, Math.max(
+            holdUntil, snapshot.value?.budgets?.core?.blockUntil ?? 0, admitted.decision?.retryAt ?? 0,
+            admitted.decision?.value?.retryAt ?? 0, admitted.decision?.value?.notBefore ?? 0,
+            admitted.decision?.value?.resetMs ?? 0,
+            error?.retryAt ?? 0, failedAt + githubAppResponseRetryAfter(error?.apiResponse, failedAt)));
+          publishSetup({ ...setupState, busy: false, error: shortErr(error), retryAt });
+          return;
+        }
+        publishSetup({ result: { ...admitted.value.observation, checkedAt: admitted.value.checkedAt }, busy: false });
+        if (terminalizationBacklogForResource(terminalizationBacklog, capturedScope.hash, "core") > 0) {
+          recordRuntimeRecovery("actions", "receipt-retry");
+        }
+      } finally {
+        if (setupFlight === flight) setupFlight = null;
+        if ((cancelled || (flight.retired && flight.scope.hash !== scope?.hash)) &&
+            !Object.values(inFlightRef.current).some(Boolean)) {
+          releaseLease(flight.scope, leaseId);
+        }
+        if (current() && setupState.busy) publishSetup({ ...setupState, busy: false });
+      }
+    };
+
     fetchTabRef.current = (key, { force = false, kind = force ? "manual" : "active" } = {}) => {
       if (kind === "tab-switch") {
         // A newly active subscription is not evidence of quiet: the tab you
@@ -19817,7 +20040,9 @@ function App({ onCreateRemote = () => {} } = {}) {
         acquisitionEngine.unsubscribe(subscription.id);
       }
       acquisitionSubscriptions.clear();
-      if (cleanupScope && registeredScopeHash) releaseLease(cleanupScope, leaseId);
+      retireSetup();
+      actionsSetupRef.current = null;
+      if (cleanupScope && registeredScopeHash && !setupFlight) releaseLease(cleanupScope, leaseId);
       if (governorRef.current?.leaseId === leaseId) governorRef.current = null;
       if (contextCoordinatorRef.current === coordinator) contextCoordinatorRef.current = null;
       // `cancelled` stops state updates from a promise that already resolved;
@@ -20664,6 +20889,12 @@ export {
   ghApi,
   actionsRunsArgs,
   actionsWorkflowsArgs,
+  actionsSetupArgs,
+  parseActionsSetup,
+  actionsSetupFresh,
+  actionsSetupRetryAt,
+  actionsPageUrl,
+  openBrowserUrl,
   parseActionsBodies,
   parseActionsRuns,
   parseWorkflowCatalog,

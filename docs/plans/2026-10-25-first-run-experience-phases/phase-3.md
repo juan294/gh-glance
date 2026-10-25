@@ -71,3 +71,11 @@ Inspect empty Actions, successful setup, denied setup and connected-mode capture
 ## Stuck states, work units and gate
 
 Parent SET recovery rows are binding: every failed/disabled path has either an observable retry transition or visible actionable disclosure, including unsupported provider and browser failure. One sequential implementation unit due to shared App/admission/input/fixture ownership. Independent review must check request accounting, identity fencing, limits and browser error separation; simplify and verify after repairs. Record all outcomes and exact candidate, then stop for acceptance. Publication remains separately authorized.
+
+## Completion
+
+- [x] SET-01 through SET-12 implemented and reviewed.
+- [x] Simplify and required local gates completed; the sole terminal failure was repaired and its four affected regressions passed.
+- [x] Final evidence, limitations and retained failure history recorded in [implementation notes](../2026-10-25-first-run-experience-notes.md).
+
+Accepted under the owner's all-phases continuation; local integration and task-worktree cleanup are authorized. No publication is authorized.

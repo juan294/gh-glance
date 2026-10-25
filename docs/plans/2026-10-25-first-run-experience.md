@@ -1,6 +1,6 @@
 # First-run experience implementation plan
 
-Date: 2026-10-25. Status: Phases 1 and 2 accepted locally; Phase 3 pending. See [implementation notes](2026-10-25-first-run-experience-notes.md).
+Date: 2026-10-25. Status: All three phases accepted locally. See [implementation notes](2026-10-25-first-run-experience-notes.md).
 
 ## Objective and baseline
 

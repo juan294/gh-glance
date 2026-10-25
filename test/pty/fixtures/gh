@@ -19,6 +19,7 @@ FIXTURE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 gh_command=${1:-}
 api_path=
 api_include=0
+api_jq=
 api_if_none_match=
 
 parse_api_args() {
@@ -40,13 +41,15 @@ parse_api_args() {
             ;;
         esac
       fi
+      if [ "$expect" = "jq" ]; then api_jq=$argument; fi
       expect=
       continue
     fi
     case "$argument" in
       -i|--include) api_include=1 ;;
       -H|--header) expect=header ;;
-      --hostname|--jq|-X|--method|-f|--raw-field|-F|--field|--input) expect=value ;;
+      --jq) expect=jq ;;
+      --hostname|-X|--method|-f|--raw-field|-F|--field|--input) expect=value ;;
       -H*)
         header=${argument#-H}
         case "$header" in
@@ -319,7 +322,10 @@ case "$gh_command" in
         exit 0
         ;;
       *'/actions/workflows?'*)
-        emit_api_file "$FIXTURE_DIR/actions-workflows.json" '"fixture-workflows-v1"'
+        case "$api_jq" in
+          *total_count*) emit_api_file "$FIXTURE_DIR/actions-setup.json" '"fixture-setup-v1"' ;;
+          *) emit_api_file "$FIXTURE_DIR/actions-workflows.json" '"fixture-workflows-v1"' ;;
+        esac
         exit 0
         ;;
     esac
