@@ -207,14 +207,34 @@ send("s"); await until(()=>screen().includes("No workflows found"));
 const registry=JSON.parse(readFileSync(root+"/gh-glance/coordination-v2/registry.json","utf8"));
 const identity=Object.values(registry.identities).find(i=>i.id===1);
 const ledgerPath=root+"/gh-glance/coordination-v2/quota-"+identity.quotaKey+".json";
+const fs=await import("node:fs");
+const ledgerLock=ledgerPath+".lock";
+const registryLock=root+"/gh-glance/coordination-v2/registry.json.lock";
+const owner=JSON.stringify({pid:process.pid,nonce:"setup-storage-recovery"});
+const lock=async path=>until(()=>{try{writeFileSync(path,owner,{flag:"wx"});return true;}catch{return false;}});
+await lock(ledgerLock);
 const original=readFileSync(ledgerPath,"utf8");
+writeFileSync(ledgerPath,"fixture corrupt storage"); fs.unlinkSync(ledgerLock);
+let registryHeld=false;
 try {
- writeFileSync(ledgerPath,"fixture corrupt storage"); send("R");
- await until(()=>screen().includes("--doctor"));
- send("s"); await pause(200);
+ send("R"); await until(()=>screen().includes("--doctor"));
+ if (dimensions.cols===45) {
+  // Force a later busy observation while the proven ledger fault persists.
+  await lock(registryLock); registryHeld=true;
+  send("s");
+  await until(()=>!screen().includes("Setup checked:")&&!screen().includes("Saved setup check:"));
+  send("s"); await until(()=>screen().includes("Setup check unavailable"));
+ } else { send("s"); await pause(200); }
+ assert.equal(readFileSync(ledgerPath,"utf8"),"fixture corrupt storage");
  assert.ok(screen().includes("--doctor")); save("denied");
  assert.equal(setupCalls().length,1);
-} finally { writeFileSync(ledgerPath,original); }
+} finally {
+ await lock(ledgerLock); writeFileSync(ledgerPath,original); fs.unlinkSync(ledgerLock);
+ if(registryHeld)fs.unlinkSync(registryLock);
+}
+send("R"); await until(()=>screen().includes("Watching")&&!screen().includes("--doctor"));
+assert.ok(JSON.parse(readFileSync(ledgerPath,"utf8")).budgets.core);
+assert.equal(setupCalls().length,1);
 `, { cols, rows });
   });
 }

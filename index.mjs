@@ -18042,7 +18042,11 @@ function App({ onCreateRemote = () => {} } = {}) {
         reason, resource, at, retryAt, sourceAt: lastOkRef.current[key] ?? null,
         origin, tab: origin === "source" ? key : null,
       });
-      const hardFailure = ["corrupt", "unwritable", "capacity", "accounting-overflow"].includes(candidate.code);
+      const storageFailures = ["corrupt", "unwritable", "capacity", "accounting-overflow"];
+      const hardFailure = storageFailures.includes(candidate.code);
+      // Contention does not prove that previously unreadable storage recovered.
+      // The existing healthy-control/source-success paths clear that remedy.
+      if (!hardFailure && storageFailures.includes(previous?.code)) return;
       if (!hardFailure && previous?.code === "receipt-retry" &&
           terminalizationBacklogForResource(terminalizationBacklog, scope?.hash, resource) > 0) return;
       if (!hardFailure && previous?.code === "request-queue" &&
