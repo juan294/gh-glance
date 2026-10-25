@@ -15760,12 +15760,14 @@ function cleanupQueueForResource(queue, resource) {
   return count;
 }
 
-function presentRecovery(cause, { nowMs = Date.now(), cols = 80 } = {}) {
+function presentRecovery(cause, { nowMs = Date.now(), cols = 80, hasSnapshot } = {}) {
   if (!cause) return [];
   const width = Math.max(1, Number.isSafeInteger(cols) ? cols - 1 : 79);
   const resource = cause.resource === "graphql" ? "GraphQL" : cause.resource === "core" ? "Core" : "GitHub";
-  const age = Number.isFinite(cause.sourceAt) && cause.sourceAt <= nowMs
-    ? `cached ${formatDuration(nowMs - cause.sourceAt)}` : "cached age unavailable";
+  const age = hasSnapshot === false ? "Not checked yet"
+    : Number.isFinite(cause.sourceAt) && cause.sourceAt <= nowMs
+      ? `cached ${formatDuration(nowMs - cause.sourceAt)}`
+      : hasSnapshot === true ? "Last-check time unavailable" : "cached age unavailable";
   const retry = Number.isFinite(cause.retryAt)
     ? `; next ${statusInterval(cause.retryAt, nowMs)}` : "";
   const summary = cause.code === "legacy-unresolved" && Number.isSafeInteger(cause.debtUnits)
@@ -15798,6 +15800,121 @@ function presentRecovery(cause, { nowMs = Date.now(), cols = 80 } = {}) {
   if (full.length <= width) return [full];
   return [`${resource}: ${summary}`.slice(0, width),
     `${cause.action}${retry}`.slice(0, width), age.slice(0, width)];
+}
+
+// Presentation consumes source observations, never receipt or cache-load clocks.
+function dashboardPresentation({ tab, rows = null, hasSnapshot = rows !== null,
+  sourceAt = null, nowMs = Date.now(), overdue = false, onDemand = false,
+  requestState = "idle", error = false, recovery = null, disconnected = false,
+  securityNotes = [], securityAllUnavailable = false, target = null, diagnostic = null } = {}) {
+  const label = TABS.find((candidate) => candidate.key === tab)?.label ?? "Repository";
+  const empty = { actions: "No workflow runs found", issues: "No open issues",
+    prs: "No open pull requests", security: "No alerts returned by the checked sources" };
+  const lastEmpty = { actions: "Last check found no workflow runs.", issues: "Last check found no open issues.",
+    prs: "Last check found no open pull requests.", security: "Last check returned no alerts from the checked sources." };
+  const sourceCheck = !hasSnapshot ? "Not checked yet"
+    : !Number.isFinite(sourceAt) || sourceAt > nowMs ? "Last-check time unavailable"
+      : (() => {
+        const date = new Date(sourceAt);
+        const today = new Date(nowMs);
+        const day = date.toDateString() === today.toDateString() ? ""
+          : `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")} `;
+        return `Checked ${day}${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+      })();
+  const showTable = Array.isArray(rows) && rows.length > 0;
+  const failed = Boolean(error || disconnected);
+  const held = Boolean(recovery) || requestState === "waiting";
+  let state = "ready";
+  let title = showTable ? label : empty[tab] ?? label;
+  let explanation = tab === "actions"
+    ? "Actions shows automated jobs. A push starts a run only when a workflow has a matching trigger."
+    : "GitHub returned this result for the selected repository.";
+  let action = "Press r to refresh.";
+  if (failed) {
+    state = "failed";
+    title = `Could not ${hasSnapshot ? "refresh" : "load"} ${label}`;
+  } else if (held) {
+    state = "waiting";
+    title = hasSnapshot ? `Waiting to update ${label}` : `Waiting to check ${label}`;
+  } else if (!hasSnapshot) {
+    state = requestState === "loading" ? "loading" : "waiting";
+    title = state === "loading" ? `Checking ${label}…` : `Waiting to check ${label}`;
+    explanation = `Fetching this repository's ${tab === "actions" ? "workflow runs" : label.toLowerCase()}.`;
+  } else if (overdue && !onDemand) {
+    state = "overdue";
+    title = `${label} needs an update`;
+  } else if (onDemand) {
+    state = "saved";
+    title = `Saved ${label} view`;
+    action = "Press r to check again. This view checks when opened or refreshed.";
+  }
+  if ((failed || held || state === "overdue" || state === "saved") && hasSnapshot && !showTable) {
+    explanation = lastEmpty[tab] ?? "Showing the last checked result.";
+  } else if ((failed || held) && !hasSnapshot) {
+    explanation = "No successful check is available yet.";
+  }
+  if (recovery) {
+    explanation = `${recovery.summary}. ${explanation}`;
+    action = recovery.action + (Number.isFinite(recovery.retryAt)
+      ? `; next ${statusInterval(recovery.retryAt, nowMs)}` : "");
+  }
+  if (tab === "security" && securityAllUnavailable) {
+    if (!failed && !held) title = "No alert sources available";
+    explanation = `${recovery ? `${recovery.summary}. ` : ""}No alert source returned data for this check.`;
+  }
+  return { state, title, explanation, sourceCheck, action, showTable, target,
+    notes: [...(diagnostic ? [diagnostic] : []), ...(tab === "security" ? securityNotes : [])] };
+}
+
+// Panels contain sanitized display text. Width follows terminal cells, including
+// wide Unicode characters; combining marks stay with the preceding character.
+function panelCellWidth(char) {
+  const code = char.codePointAt(0);
+  return /\p{Mark}/u.test(char) || code === 0x200d || code === 0xfe0f ? 0
+      : code >= 0x1100 && (code <= 0x115f || code === 0x2329 || code === 0x232a ||
+        code >= 0x2e80 && code <= 0xa4cf || code >= 0xac00 && code <= 0xd7a3 ||
+        code >= 0xf900 && code <= 0xfaff || code >= 0xfe10 && code <= 0xfe6f ||
+        code >= 0xff00 && code <= 0xff60 || code >= 0xffe0 && code <= 0xffe6 || code >= 0x1f300) ? 2 : 1;
+}
+
+function wrapPanelText(text, width) {
+  const limit = Math.max(1, width);
+  const lines = [];
+  let line = "";
+  let cells = 0;
+  for (const char of safe(text)) {
+    const size = panelCellWidth(char);
+    if (cells + size > limit && line) {
+      const space = line.lastIndexOf(" ");
+      if (space > 0 && char !== " ") {
+        lines.push(line.slice(0, space));
+        line = line.slice(space + 1);
+        // The retained word contains the same glyphs already measured above.
+        cells = [...line].reduce((sum, glyph) => sum + panelCellWidth(glyph), 0);
+      } else { lines.push(line.trimEnd()); line = ""; cells = 0; }
+    }
+    if (!line && char === " ") continue;
+    line += char;
+    cells += size;
+  }
+  if (line) lines.push(line.trimEnd());
+  return lines;
+}
+
+function contextualPanelLayout(view, { cols, rows } = {}) {
+  const width = Math.max(1, cols - 5);
+  const capacity = Math.max(1, rows - 6);
+  const title = wrapPanelText(view.title, width);
+  // Keep a short required remedy before explanation when the body is cramped.
+  const action = capacity < 8 && /gh-glance --doctor/.test(view.action)
+    ? "gh-glance --doctor" : view.action;
+  const lines = [view.title, action, view.sourceCheck, ...view.notes, view.explanation]
+    .flatMap((line) => wrapPanelText(line, width));
+  // A long title cannot consume the only row available for the recovery action.
+  if (title.length >= capacity && capacity > 1) {
+    return [...title.slice(0, capacity - 1), ...wrapPanelText(action, width).slice(0, 1)];
+  }
+  return lines.slice(0, capacity);
 }
 
 function recoveryJournalPath(scope) {
@@ -16451,7 +16568,6 @@ const WIDE_STATE_WIDTH = REFRESH_STATUS_WIDTH + 1 + 12;
 // StatusBar receives the drawable frame width, which is one column narrower
 // than the terminal. A 44-cell threshold preserves the 45-column contract.
 const WIDE_STATE_MIN_COLS = 44;
-const NOTICE_ROWS = 1;
 
 const REFRESH_STATUS_GLYPHS = Object.freeze({
   unicode: Object.freeze({
@@ -17064,6 +17180,9 @@ function App({ onCreateRemote = () => {} } = {}) {
   // transient, and they are the ones worth the space. Derived here at render
   // time rather than cached alongside the notes, because the unchanged-payload
   // short-circuit can skip parse() entirely and a cached string would go stale.
+  // Each unsuccessful source contributes one note; successful sources contribute
+  // none (truncation is separate). Count before collapsing disabled-source notes.
+  const securityAllUnavailable = securityNotes.length === ALERT_SOURCES.length;
   const NOT_ENABLED = /not enabled/i;
   const disabledNotes = securityNotes.filter((n) => NOT_ENABLED.test(n));
   const otherNotes = securityNotes.filter((n) => !NOT_ENABLED.test(n));
@@ -17074,19 +17193,133 @@ function App({ onCreateRemote = () => {} } = {}) {
           ...otherNotes,
         ]
       : securityNotes;
-  // Counts the lines actually rendered, not the notes collected -- getting this
-  // wrong by one row is what makes ink repaint the whole frame.
-  const extraLines =
-    (activeRecovery || tabError || activeGovernorDecision?.coordinationError ||
-      activeGovernorDecision?.mode === "paused" || activeGovernorDecision?.disconnected ||
-      data[tab.key] !== null && !runtimeIdentityCoordinator?.current()
-      ? 3 : NOTICE_ROWS) +
-    (tab.key === "security" && !remoteSetup ? securityLines.length : 0);
-  // Reserve lines for: the tab bar and the divider under it (2), the panel's
-  // top and bottom edges (2), the column header and its separator (2), and
-  // the status line (1), plus a 1-line safety margin. Slack is absorbed by
-  // the spacer in the tree below.
-  const bodyRows = Math.max(1, rows - 8 - extraLines);
+  const admittedCadenceRef = useRef({});
+  // Last *successful* poll per tab, wall-clock. Wall-clock on purpose: a laptop
+  // sleeping is exactly the gap this is meant to report, and a monotonic clock
+  // does not advance across suspend. Never written on the failure path, or a
+  // persistently failing tab would report itself fresh forever.
+  const lastOkRef = useRef(
+    Object.fromEntries(
+      TABS.flatMap((candidate) => {
+        const cachedTab = cachedEntry?.tabs[candidate.key];
+        const cachedAge = collectorCachedSourceAge(cachedTab);
+        const lastOk = cachedAge === null ? cachedTab?.lastOk : Date.now() - cachedAge;
+        return lastOk == null ? [] : [[candidate.key, lastOk]];
+      }),
+    ),
+  );
+  const collectorSourceAgeRef = useRef(Object.fromEntries(TABS.flatMap((candidate) => {
+    const cachedTab = cachedEntry?.tabs[candidate.key];
+    const ageMs = collectorCachedSourceAge(cachedTab);
+    return ageMs === null ? [] : [[candidate.key, { ageMs, measuredAt: performance.now() }]];
+  })));
+  const statusDisconnected = runtime.connect !== null
+    ? activeGovernorDecision?.disconnected === true
+    : data[tab.key] !== null && !runtimeIdentityCoordinator?.current();
+  const items = data[tab.key];
+  const displayError = formatTabErrorForWidth(tabError, failureContext, Math.max(1, cols - 5));
+  const coordinationError = activeGovernorDecision?.coordinationError && !remoteSetup;
+  const coordinationReason = activeFailure ?? activeGovernorDecision?.reason ?? "unavailable";
+  const noticeReason = activeRecovery?.code ??
+    (tabError?.kind === "fetch" ? tabError.verdict : null) ??
+    (coordinationError || activeGovernorDecision?.mode === "paused" ? coordinationReason : null) ??
+    (statusDisconnected ? runtime.connect === null ? "identity-unavailable"
+      : activeGovernorDecision?.reason === "app-auth" ? "app-auth" : "disconnected" : null);
+  // A continuous fault stays sustained when its explanation becomes more
+  // specific. Only losing the fault (or switching tabs) restarts the debounce.
+  const coordinationCondition = !remoteSetup && noticeReason ? tab.key : null;
+  useEffect(() => {
+    setVisibleCoordinationCondition(null);
+    if (coordinationCondition === null) return;
+    const timer = setTimeout(
+      () => setVisibleCoordinationCondition(coordinationCondition),
+      COORDINATION_NOTICE_AFTER_MS,
+    );
+    return () => clearTimeout(timer);
+  }, [coordinationCondition]);
+  const showCoordinationNotice = coordinationCondition !== null &&
+    visibleCoordinationCondition === coordinationCondition;
+  const noticeResource = activeResource;
+  const noticeSourceAt = collectorSourceAgeRef.current[tab.key]
+    ? now.getTime() - collectorSourceAgeRef.current[tab.key].ageMs -
+      Math.max(0, performance.now() - collectorSourceAgeRef.current[tab.key].measuredAt)
+    : lastOkRef.current[tab.key] ?? null;
+  const noticeCause = activeRecovery ?? (noticeReason ? recoveryCause({
+    reason: noticeReason === "other" ? "network-outage" : noticeReason,
+    resource: noticeResource, sourceAt: noticeSourceAt,
+    retryAt: activeGovernorDecision?.retryAt ?? activeGovernorDecision?.resetMs ??
+      activeGovernorDecision?.notBefore ?? null,
+    origin: tabError ? "source" : "coordination", tab: tabError ? tab.key : null,
+  }) : null);
+  const recoveryLines = showCoordinationNotice && noticeCause
+    ? presentRecovery(noticeCause, { nowMs: now.getTime(), cols, hasSnapshot: items !== null })
+    : [!remoteSetup && displayError ? displayError : ""];
+  const noticeTone = showCoordinationNotice ? ATTENTION : displayError ? ERROR_TEXT : undefined;
+  // Data can be arbitrarily old without anything on screen saying so: a failing
+  // poll only surfaces on the tab you have selected, and after a laptop sleep
+  // every pane is plausible and wrong. Threshold-gated and minute-granular on
+  // purpose -- see STALE_AFTER_MS.
+  // Read from the ref written on every successful poll, not from meta.at, which
+  // only moves when the *payload* changes -- see lastOkRef. Reading a ref during
+  // render lags by one render, which is harmless here because `now` advances on
+  // its own and the label is minute-granular by design.
+  const collectorAge = collectorSourceAgeRef.current[tab.key];
+  const sourceAgeMs = collectorAge
+    ? collectorAge.ageMs + Math.max(0, performance.now() - collectorAge.measuredAt)
+    : null;
+  const lastOk = sourceAgeMs === null ? lastOkRef.current[tab.key] : now.getTime() - sourceAgeMs;
+  const staleFor = sourceAgeMs ?? (lastOk == null ? null : now.getTime() - lastOk);
+  const staleAt = freshnessDeadline({
+    lastOk,
+    refreshMs: runtime.refreshMs,
+    grantedMs: admittedCadenceRef.current[tab.key]?.grantedMs,
+    governorDecision: activeGovernorDecision,
+    currentEpochs: governorEpochs,
+  });
+  const staleLabel =
+    staleFor != null && staleAt != null && now.getTime() > staleAt
+      ? formatDuration(staleFor)
+      : null;
+  // A quiet dashboard's display clock can precede a newly completed request.
+  // Compare source clocks with actual render time, without adding a timer.
+  const presentationNow = Date.now();
+  const presentation = dashboardPresentation({
+    tab: tab.key, rows: items, hasSnapshot: items !== null,
+    sourceAt: sourceAgeMs === null ? lastOk : presentationNow - sourceAgeMs,
+    nowMs: presentationNow, overdue: Boolean(staleLabel),
+    onDemand: runtime.background === "on-demand" && tab.key !== "actions" &&
+      items !== null && !loading[tab.key] && !activeRequestStatus,
+    requestState: loading[tab.key] || activeRequestStatus ? "loading"
+      : items === null && waiting[tab.key] ? "waiting" : "idle",
+    error: tabError || activeFailure, recovery: noticeCause, diagnostic: displayError,
+    disconnected: statusDisconnected, securityNotes: securityLines, securityAllUnavailable,
+  });
+  if (USING_NERD_ICONS && iconHintDue && items === null && !tabError) {
+    presentation.notes.push("Icons blank? GH_GLANCE_ICONS=unicode");
+  }
+  const panelLines = presentation.showTable ? [] : contextualPanelLayout(presentation, { cols, rows });
+
+  const tableVisible = Array.isArray(items) && items.length > 0;
+  const tableNoticeCapacity = Math.max(0, rows - 9);
+  const needsTableContext = ["failed", "overdue", "waiting"].includes(presentation.state);
+  const shortAction = /gh-glance --doctor/.test(presentation.action) ? "gh-glance --doctor"
+    : /gh auth/.test(presentation.action) ? "Run gh auth status" : presentation.action;
+  const tableNotices = needsTableContext
+    ? tableNoticeCapacity < 4
+      ? tableNoticeCapacity === 1 ? [shortAction]
+        : showCoordinationNotice && noticeCause
+          ? [noticeCause.summary, shortAction, presentation.sourceCheck]
+          : [shortAction, presentation.sourceCheck, presentation.title]
+      : [presentation.title, presentation.sourceCheck, ...recoveryLines.filter(Boolean)]
+    : recoveryLines;
+  const noticeLines = tableNotices.slice(0, tableNoticeCapacity);
+  const visibleSecurityLines = tab.key === "security"
+    ? securityLines.slice(0, Math.max(0, tableNoticeCapacity - noticeLines.length)) : [];
+  const extraLines = !showHelp && !remoteSetup && tableVisible
+    ? noticeLines.length + visibleSecurityLines.length : 0;
+  // Tab strip, divider, frame edges, footer and terminal guard use six rows.
+  // Table headers alone need two more. The same budget drives navigation.
+  const bodyRows = Math.max(1, rows - 6 - (tableVisible ? 2 : 0) - extraLines);
 
   // Read at fetch time rather than being a hook dependency, so dragging the
   // pane wider doesn't cancel and restart in-flight requests -- the next tick
@@ -17109,28 +17342,8 @@ function App({ onCreateRemote = () => {} } = {}) {
     ANIMATE && tab.key === "actions" && (data.actions ?? []).some((r) => r.status === "in_progress");
 
   const inFlightRef = useRef({});
-  const admittedCadenceRef = useRef({});
   const rawRef = useRef({});
   const entityRef = useRef(new Map());
-  // Last *successful* poll per tab, wall-clock. Wall-clock on purpose: a laptop
-  // sleeping is exactly the gap this is meant to report, and a monotonic clock
-  // does not advance across suspend. Never written on the failure path, or a
-  // persistently failing tab would report itself fresh forever.
-  const lastOkRef = useRef(
-    Object.fromEntries(
-      TABS.flatMap((candidate) => {
-        const cachedTab = cachedEntry?.tabs[candidate.key];
-        const cachedAge = collectorCachedSourceAge(cachedTab);
-        const lastOk = cachedAge === null ? cachedTab?.lastOk : Date.now() - cachedAge;
-        return lastOk == null ? [] : [[candidate.key, lastOk]];
-      }),
-    ),
-  );
-  const collectorSourceAgeRef = useRef(Object.fromEntries(TABS.flatMap((candidate) => {
-    const cachedTab = cachedEntry?.tabs[candidate.key];
-    const ageMs = collectorCachedSourceAge(cachedTab);
-    return ageMs === null ? [] : [[candidate.key, { ageMs, measuredAt: performance.now() }]];
-  })));
   // Keep server source timestamps separate from client-local age estimates.
   // An SSH receipt's age is measured on the client and cannot prove a new
   // source observation when a cached snapshot is delivered again.
@@ -19551,9 +19764,6 @@ function App({ onCreateRemote = () => {} } = {}) {
     TABS.map((t) => [t.key, data[t.key] == null && !errors[t.key] && loading[t.key]]),
   );
   const anyFirstLoad = Object.values(firstLoad).some(Boolean);
-  const statusDisconnected = runtime.connect !== null
-    ? activeGovernorDecision?.disconnected === true
-    : data[tab.key] !== null && !runtimeIdentityCoordinator?.current();
   let semanticStatus = refreshStatus({
     widthMode: resizeRef.current.active,
     remoteSetup,
@@ -19593,45 +19803,6 @@ function App({ onCreateRemote = () => {} } = {}) {
     return () => clearTimeout(timer);
   }, [anyFirstLoad, iconHintDue]);
 
-  const items = data[tab.key];
-  const displayError = formatTabErrorForWidth(tabError, failureContext, Math.max(1, cols - 5));
-  const coordinationError = activeGovernorDecision?.coordinationError && !remoteSetup;
-  const coordinationReason = activeFailure ?? activeGovernorDecision?.reason ?? "unavailable";
-  const noticeReason = activeRecovery?.code ??
-    (tabError?.kind === "fetch" ? tabError.verdict : null) ??
-    (coordinationError || activeGovernorDecision?.mode === "paused" ? coordinationReason : null) ??
-    (statusDisconnected ? runtime.connect === null ? "identity-unavailable"
-      : activeGovernorDecision?.reason === "app-auth" ? "app-auth" : "disconnected" : null);
-  // A continuous fault stays sustained when its explanation becomes more
-  // specific. Only losing the fault (or switching tabs) restarts the debounce.
-  const coordinationCondition = !remoteSetup && noticeReason ? tab.key : null;
-  useEffect(() => {
-    setVisibleCoordinationCondition(null);
-    if (coordinationCondition === null) return;
-    const timer = setTimeout(
-      () => setVisibleCoordinationCondition(coordinationCondition),
-      COORDINATION_NOTICE_AFTER_MS,
-    );
-    return () => clearTimeout(timer);
-  }, [coordinationCondition]);
-  const showCoordinationNotice = coordinationCondition !== null &&
-    visibleCoordinationCondition === coordinationCondition;
-  const noticeResource = activeResource;
-  const noticeSourceAt = collectorSourceAgeRef.current[tab.key]
-    ? now.getTime() - collectorSourceAgeRef.current[tab.key].ageMs -
-      Math.max(0, performance.now() - collectorSourceAgeRef.current[tab.key].measuredAt)
-    : lastOkRef.current[tab.key] ?? null;
-  const noticeCause = activeRecovery ?? (noticeReason ? recoveryCause({
-    reason: noticeReason === "other" ? "network-outage" : noticeReason,
-    resource: noticeResource, sourceAt: noticeSourceAt,
-    retryAt: activeGovernorDecision?.retryAt ?? activeGovernorDecision?.resetMs ??
-      activeGovernorDecision?.notBefore ?? null,
-    origin: tabError ? "source" : "coordination", tab: tabError ? tab.key : null,
-  }) : null);
-  const noticeLines = showCoordinationNotice && noticeCause
-    ? presentRecovery(noticeCause, { nowMs: now.getTime(), cols })
-    : [!remoteSetup && displayError ? displayError : ""];
-  const noticeTone = showCoordinationNotice ? ATTENTION : displayError ? ERROR_TEXT : undefined;
   const spin = SPINNER[frame % SPINNER.length];
 
   const counts = Object.fromEntries(
@@ -19673,31 +19844,6 @@ function App({ onCreateRemote = () => {} } = {}) {
     TABS.map((t) => [t.key, Boolean(errors[t.key]) && errors[t.key]?.verdict !== "no-remote"]),
   );
 
-  // Data can be arbitrarily old without anything on screen saying so: a failing
-  // poll only surfaces on the tab you have selected, and after a laptop sleep
-  // every pane is plausible and wrong. Threshold-gated and minute-granular on
-  // purpose -- see STALE_AFTER_MS.
-  // Read from the ref written on every successful poll, not from meta.at, which
-  // only moves when the *payload* changes -- see lastOkRef. Reading a ref during
-  // render lags by one render, which is harmless here because `now` advances on
-  // its own and the label is minute-granular by design.
-  const collectorAge = collectorSourceAgeRef.current[tab.key];
-  const sourceAgeMs = collectorAge
-    ? collectorAge.ageMs + Math.max(0, performance.now() - collectorAge.measuredAt)
-    : null;
-  const lastOk = sourceAgeMs === null ? lastOkRef.current[tab.key] : now.getTime() - sourceAgeMs;
-  const staleFor = sourceAgeMs ?? (lastOk == null ? null : now.getTime() - lastOk);
-  const staleAt = freshnessDeadline({
-    lastOk,
-    refreshMs: runtime.refreshMs,
-    grantedMs: admittedCadenceRef.current[tab.key]?.grantedMs,
-    governorDecision: activeGovernorDecision,
-    currentEpochs: governorEpochs,
-  });
-  const staleLabel =
-    staleFor != null && staleAt != null && now.getTime() > staleAt
-      ? formatDuration(staleFor)
-      : null;
   if (staleLabel && (["watching", "shared"].includes(semanticStatus.kind) ||
       activeFailure && semanticStatus.kind === "paused" &&
       activeGovernorDecision?.cause)) {
@@ -19712,6 +19858,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       !activeFailure && !(tab.key === "security" && securityBlind)) {
     semanticStatus = refreshStatus({ onDemand: true });
   }
+
 
   // A settled on-demand view has no data wake to advance its visible age.
   // Tick only its display clock; source timestamps and acquisition stay idle.
@@ -19763,7 +19910,7 @@ function App({ onCreateRemote = () => {} } = {}) {
   // Bottom-right of the frame, lazygit style: how much of the tab you can
   // currently see out of how much there is.
   const countLabel =
-    items == null
+    !tableVisible
       ? null
       : tabOffset > 0
         ? `${tabOffset + 1}-${tabOffset + visibleItems.length} of ${counts[tab.key]}`
@@ -19822,8 +19969,8 @@ function App({ onCreateRemote = () => {} } = {}) {
   // avoid, and it was reachable simply by dragging a sidebar narrow. The guard
   // sits after usableSize(), which substitutes DEFAULT_COLS for a 0 reported
   // mid-resize, so a transient zero cannot be mistaken for a genuinely tiny pane.
-  const tooNarrow = frameCols < MIN_COMPACT_WIDTH;
-  const fullHeaderVisible = !compact && !showHelp && !tooNarrow && !remoteSetup;
+  const tooNarrow = tableVisible && frameCols < MIN_COMPACT_WIDTH;
+  const fullHeaderVisible = tableVisible && !compact && !showHelp && !tooNarrow && !remoteSetup;
   const selectedWidthKey = selectedWidthKeyByTab[tab.key] ?? null;
   const selectedWidthColumn = effectiveHeader?.find(
     (column) => column.key === selectedWidthKey,
@@ -19923,13 +20070,14 @@ function App({ onCreateRemote = () => {} } = {}) {
       !showHelp &&
         tooNarrow &&
         e(Text, { dimColor: true, wrap: "truncate-end" }, "too narrow"),
-      ...noticeLines.map((line, index) =>
+      ...(showHelp || !tableVisible ? [] : noticeLines).map((line, index) =>
         e(Text, { key: `recovery:${index}`, color: noticeTone, wrap: "truncate-end" }, line)),
       !showHelp &&
         !tooNarrow &&
         !remoteSetup &&
+        tableVisible &&
         tab.key === "security" &&
-        securityLines.map((note, i) =>
+        visibleSecurityLines.map((note, i) =>
           e(Text, { key: i, dimColor: true, wrap: "truncate-end" }, note),
         ),
       !showHelp &&
@@ -19952,6 +20100,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       !showHelp &&
         !tooNarrow &&
         !remoteSetup &&
+        tableVisible &&
         e(MemoHeaderCells, {
           cells: header,
           selectedWidthKey: resizeRef.current.active ? selectedWidthKey : null,
@@ -19978,37 +20127,11 @@ function App({ onCreateRemote = () => {} } = {}) {
           }),
         );
       }),
-      // Distinguishes "still fetching" from "resolved and empty" in the body,
-      // which is the difference between a dashboard that looks hung and one
-      // that looks correct. Driven by "never resolved" rather than by the
-      // loading flag, which also covers a manual refresh and made a
-      // settled-empty tab swap its message. Suppressed entirely when a tab has
-      // an error and has never resolved: the error line directly above already
-      // says what happened, and "no runs" underneath it reads as a fact about the
-      // repository rather than the absence of an answer.
-      !showHelp &&
-        !tooNarrow &&
-        !remoteSetup &&
-        visibleItems.length === 0 &&
-        !(tabError && items == null) &&
-        e(
-          Text,
-          { dimColor: true },
-          firstLoad[tab.key]
-            ? `${showSpinner ? spin : SPINNER[0]} loading ${tab.label.toLowerCase()}…` +
-              // Appended only once a first fetch has been running for
-              // ICON_HINT_AFTER_MS, so an ordinary start never shows it: the
-              // remedy is for someone looking at a pane of blank boxes, and by
-              // then they have been looking long enough to want an explanation.
-              // Suppressed once icons are already ASCII, since then there is
-              // nothing to fix.
-              (USING_NERD_ICONS && iconHintDue ? "   (icons blank? GH_GLANCE_ICONS=unicode)" : "")
-            : semanticStatus.kind === "paused" || waiting[tab.key]
-              ? "waiting for API budget…"
-            : tab.key === "security" && securityNotes.length === ALERT_SOURCES.length
-              ? "no alert sources available"
-              : `no ${tab.countLabel}`,
-        ),
+      !showHelp && !remoteSetup && !tableVisible &&
+        panelLines.map((line, index) => e(Text, {
+          key: `context:${index}`, wrap: "truncate-end",
+          bold: index === 0, color: index === 0 ? TITLE_COLOR : undefined,
+        }, line)),
       // Pushes the panel's bottom edge down to the foot of the pane, so the
       // frame stays put instead of closing up under the column headers on a
       // tab that only has a handful of rows.
@@ -20019,8 +20142,8 @@ function App({ onCreateRemote = () => {} } = {}) {
       status: semanticStatus,
       detail: activeGovernorDecision,
       spin: showSpinner ? spin : null,
-      stale: semanticStatus.kind === "cached" && staleFor != null
-        ? formatDuration(Math.max(0, staleFor)) : staleLabel,
+      stale: semanticStatus.kind === "cached" && Number.isFinite(staleFor) && staleFor >= 0
+        ? formatDuration(staleFor) : staleLabel,
       nowMs: now.getTime(),
       interactive,
       cols: frameCols,
@@ -20633,6 +20756,9 @@ export {
   collectorSourceAdvanced,
   cleanupQueueForResource,
   presentRecovery,
+  dashboardPresentation,
+  contextualPanelLayout,
+  wrapPanelText,
   recordRecoveryTransition,
   safeRecordRecoveryTransition,
   readRecoveryTransitions,

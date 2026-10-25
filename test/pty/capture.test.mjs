@@ -204,3 +204,12 @@ test("capture termination reaps the full stdin producer and script trees", async
   assert.ok(Date.now() - terminatedAt < 5_000, "capture cleanup must stay below five seconds");
   assert.ok(tracked.every((pid) => !processIsAlive(pid)));
 });
+
+test("terminal replay excludes contextual Checking panels from footer counts", () => {
+  const raw = ALT_ENTER + SYNC_START +
+    "[1:Actions]\r\n│ Checking Actions… │\r\n⣾ Checking\r\n" + SYNC_END + ALT_EXIT;
+  const parsed = parseCapture(raw, { cols: 24, rows: 5 });
+  assert.equal(parsed.liveScreen.statusLines, 1);
+  assert.equal(parsed.liveScreen.maxStatusLines, 1);
+  assert.deepEqual(parsed.liveScreen.statusHistory, ["⣾ Checking"]);
+});

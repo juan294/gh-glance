@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { TABS, dividerHandles } from "../../index.mjs";
-import { capture, parseCapture } from "./capture.mjs";
+import { capture, parseCapture, waitForAwk } from "./capture.mjs";
 
 const ESC = String.fromCharCode(27);
 const actionsHeader = TABS.find(({ key }) => key === "actions").header;
@@ -194,15 +194,24 @@ test("SIGTERM disables active mouse reporting before restoring the screen", () =
     "gh-glance-pty-mouse-sigterm-",
     `const path = require("node:path");
 if (path.basename(process.argv[1] || "") === "index.mjs") {
-  setTimeout(() => process.kill(process.pid, "SIGTERM"), 2500);
+  const fs = require("node:fs");
+  const trigger = path.join(process.env.XDG_CONFIG_HOME, "mouse-lifecycle-ready");
+  const timer = setInterval(() => {
+    if (!fs.existsSync(trigger)) return;
+    clearInterval(timer);
+    process.kill(process.pid, "SIGTERM");
+  }, 50);
+  timer.unref();
 }
 `,
     {
       cols: 80,
       rows: 24,
       signal: "none",
-      settle: 10,
-      stdin: "sleep 1; printf 'w'; sleep 3",
+      settle: 45,
+      env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
+      stdin: waitForActionsCache + waitForActionsFrame + "printf w; " + waitForWidthMode +
+        ': > "$XDG_CONFIG_HOME/mouse-lifecycle-ready"; sleep 2',
     },
   );
 
@@ -217,15 +226,24 @@ test("an uncaught crash disables mouse reporting before printing its primary-buf
     "gh-glance-pty-mouse-crash-",
     `const path = require("node:path");
 if (path.basename(process.argv[1] || "") === "index.mjs") {
-  setTimeout(() => { throw new Error("phase4 lifecycle test crash"); }, 2500);
+  const fs = require("node:fs");
+  const trigger = path.join(process.env.XDG_CONFIG_HOME, "mouse-lifecycle-ready");
+  const timer = setInterval(() => {
+    if (!fs.existsSync(trigger)) return;
+    clearInterval(timer);
+    throw new Error("phase4 lifecycle test crash");
+  }, 50);
+  timer.unref();
 }
 `,
     {
       cols: 80,
       rows: 24,
       signal: "none",
-      settle: 10,
-      stdin: "sleep 1; printf 'w'; sleep 3",
+      settle: 45,
+      env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
+      stdin: waitForActionsCache + waitForActionsFrame + "printf w; " + waitForWidthMode +
+        ': > "$XDG_CONFIG_HOME/mouse-lifecycle-ready"; sleep 2',
     },
   );
 
@@ -289,10 +307,12 @@ test("outside, wheel, non-left, and move-without-press reports do not persist wi
       cols: 80,
       rows: 24,
       signal: "none",
-      settle: 14,
+      settle: 45,
       configHome,
+      env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
       stdin:
-        `sleep 2; printf 'w'; sleep 1; printf '\\033[<32;${DRAG_X};${PRESS_Y}M'; ` +
+        waitForActionsCache + waitForActionsFrame + "printf w; " + waitForWidthMode +
+        `printf '\\033[<32;${DRAG_X};${PRESS_Y}M'; ` +
         `sleep 0.5; printf '\\033[<0;10;${PRESS_Y}M'; ` +
         `sleep 0.5; printf '\\033[<0;10;${PRESS_Y}m'; ` +
         `sleep 0.5; printf '\\033[<64;${PRESS_X};${PRESS_Y}M'; ` +
@@ -320,15 +340,19 @@ test("otherwise valid mouse drags are a compact-layout persistence no-op", () =>
       cols: 45,
       rows: 20,
       signal: "none",
-      settle: 12,
+      settle: 30,
       configHome,
+      env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
       stdin:
-        `sleep 3; printf '\\033[<0;${PRESS_X};${PRESS_Y}M'; ` +
+        waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "ci: pin actions") { ok=1 }', 250) +
+        `printf '\\033[<0;${PRESS_X};${PRESS_Y}M'; ` +
         `sleep 1; printf '\\033[<32;${DRAG_X};${PRESS_Y}M'; ` +
         `sleep 1; printf '\\033[<0;${DRAG_X};${PRESS_Y}m'; ` +
         "sleep 1; printf 'q'; sleep 2",
     });
 
+    assert.match(compact.finalFrame.lines.join("\n"), /ci: pin actions/,
+      "compact mouse no-op must be exercised with populated data");
     assertCleanMouseCapture(compact, {
       cols: 45,
       rows: 20,

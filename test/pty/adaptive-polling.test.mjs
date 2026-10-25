@@ -244,13 +244,17 @@ test("REFRESH-03 Width mode keeps both width resets and starts no refresh", (t) 
     settle: 25,
     // Enter width mode, widen a column, then use both reset keys. Neither may
     // produce a data request while the mode is active.
-    stdin: waitForActionsRuns(1) +
-      "printf w; sleep .4; printf '\\033[C\\033[C'; sleep .4; printf r; sleep .4; printf R; sleep .8; " +
+    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"',
+      'index($0, "WORKFLOW") { header=1 } index($0, "ci: pin actions") { row=1 } header && row { ok=1 }', 250) +
+      "printf w; " + waitForAwk('"$GH_GLANCE_CAPTURE_OUT"',
+        'index($0, "Width: WORKFLOW 10") { ok=1 }', 100) +
+      "printf '\\033[C'; sleep .4; printf '\\033[C'; sleep .4; printf r; sleep .4; printf R; sleep .8; " +
       "printf w; sleep .4; printf q",
     args: "--repo acme/widget --refresh 60 --tab actions",
     configHome: box.root,
-    env: { GH_GLANCE_FIXTURE_STATE: box.statePath },
+    env: { GH_GLANCE_FIXTURE_STATE: box.statePath, GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
   });
+  assert.match(result.raw, /Width: WORKFLOW 10/, "reset keys never entered Actions width mode");
   const state = box.read();
   const runs = pathEvents(state, RUNS_PATH);
   // A 60s floor means the only automatic checks are the startup ones; the two

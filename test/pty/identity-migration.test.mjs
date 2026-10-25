@@ -112,8 +112,9 @@ test("ID-05: expired legacy leases do not forgive started uncertainty or a futur
   const dataCalls = box.read().events.filter((event) => event.type === "start" &&
     (["issue", "pr", "run"].includes(event.argv[0]) || event.argv.some((arg) => arg.includes("/actions/") || arg.includes("/alerts"))));
   assert.equal(dataCalls.length, 0, "legacy uncertainty permitted new data");
-  assert.match(result.finalFrame.lines.join("\n"), /Older session still uses coordination.*Wait for the older quota reset/is,
+  assert.match(result.finalFrame.lines.join("\n"), /Older session still uses coordination/,
     "valid legacy uncertainty was mistaken for corrupt state");
+  assert.match(result.finalFrame.lines.join("\n"), /Wait for the older quota reset/);
   const registry = JSON.parse(readFileSync(join(box.directory, "coordination-v2", "registry.json"), "utf8"));
   assert.equal(registry.migration.activated, false);
   assert.ok(registry.migration.holdUntil >= legacy.budgets.core.blockUntil,
@@ -129,7 +130,8 @@ test("ID-05: corrupt legacy protocol fails closed without replacing its evidence
   const result = runPane(box);
   assertRestored(result);
   assert.equal(box.read().events.filter(isHttpStart).length, 0);
-  assert.match(result.finalFrame.lines.join("\n"), /Older coordination evidence is corrupt.*Run gh-glance --doctor; preserve the reported state file/is);
+  assert.match(result.finalFrame.lines.join("\n"), /Older coordination evidence is corrupt/);
+  assert.match(result.finalFrame.lines.join("\n"), /Run gh-glance --doctor; preserve the reported state file/);
   assert.equal(readFileSync(box.legacyPath, "utf8"), original);
 });
 
@@ -144,7 +146,7 @@ function exerciseAllTabs() {
   return waitForRow("ci: pin actions") + barrier("actions") + "printf 2; " +
     waitForRow("SIGTERM erases") + barrier("issues") + "printf 3; " +
     waitForRow("release: v0.2.0") + barrier("pulls") + "printf 4; " +
-    waitForRow("no alerts") + barrier("security") + "printf q";
+    waitForRow("No alerts returned") + barrier("security") + "printf q";
 }
 
 test("ID-08: two real panes share all four tabs and control requests through the bounded pool", async (t) => {
@@ -170,7 +172,7 @@ test("ID-08: two real panes share all four tabs and control requests through the
   })));
   for (const result of results) {
     assertRestored(result);
-    for (const row of ["ci: pin actions", "SIGTERM erases", "release: v0.2.0", "no alerts"]) {
+    for (const row of ["ci: pin actions", "SIGTERM erases", "release: v0.2.0", "No alerts returned"]) {
       assert.match(result.raw, new RegExp(row), `follower never rendered ${row}`);
     }
     assert.equal(result.fixtureCalls.filter((call) => call.startsWith("auth status")).length, 0);

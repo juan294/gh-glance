@@ -125,15 +125,25 @@ ENV_PREFIX="export PATH=\"$HERE/fixtures:\$PATH\";
 # slack for the glued text to hide in. Guaranteeing the newline here makes the
 # marker always land on its own line, on both platforms, regardless of how
 # close to the edge the app's own content gets.
+RESIZE_COMMAND=""
+if [ -n "${GH_GLANCE_CAPTURE_RESIZE_COLS:-}" ]; then
+  # Values are validated by capture.mjs; reject unsafe direct shell callers too.
+  case "$GH_GLANCE_CAPTURE_RESIZE_COLS:$GH_GLANCE_CAPTURE_RESIZE_ROWS:$GH_GLANCE_CAPTURE_RESIZE_AFTER" in
+    *[!0-9:]*|:*|*::*|*:) echo "invalid resize dimensions" >&2; exit 2 ;;
+  esac
+  RESIZE_COMMAND="(sleep $GH_GLANCE_CAPTURE_RESIZE_AFTER; stty cols $GH_GLANCE_CAPTURE_RESIZE_COLS rows $GH_GLANCE_CAPTURE_RESIZE_ROWS <&1) &"
+fi
 if [ "$SIGNAL" = "none" ]; then
   INNER="$ENV_PREFIX
     stty cols $COLS rows $ROWS;
+    $RESIZE_COMMAND
     cd \"$APP_CWD\";
     env -u CI -u CONTINUOUS_INTEGRATION node \"$APP_ENTRY\" $APP_ARGS;
     printf '\nEXITCODE=%s\n' \"\$?\""
 else
   INNER="$ENV_PREFIX
     stty cols $COLS rows $ROWS;
+    $RESIZE_COMMAND
     cd \"$APP_CWD\";
     env -u CI -u CONTINUOUS_INTEGRATION node \"$APP_ENTRY\" $APP_ARGS &
     p=\$!;

@@ -44,7 +44,7 @@ const TAB_BAR = /1:(?:Actions|Act)/;
 // StatusBar always starts at column zero with one width-1 state marker. Panel
 // rows start with a border, so remote titles containing these words cannot be
 // mistaken for accumulated footers.
-const STATUS_LINE = /^\S (?:Setup|Checking|Paused|Failed|Limited|Watching|Shared|Cached|Stale|Disconnected)(?:\s|$)/;
+const STATUS_LINE = /^[^\s│] (?:Setup|Checking|Paused|Failed|Limited|Watching|Shared|Cached|Stale|Disconnected)(?:\s|$)/;
 
 export function isStatusLine(line) {
   return typeof line === "string" && STATUS_LINE.test(line);
@@ -506,11 +506,21 @@ export function capture({
   animation = false,
   icons = "unicode",
   configHome,
+  resize = null,
 }) {
   if (configHome != null && (!isAbsolute(configHome) || configHome.length === 0)) {
     throw new TypeError("configHome must be an absolute path");
   }
 
+  if (resize && (![resize.cols, resize.rows, resize.afterSeconds].every(Number.isSafeInteger) ||
+      resize.cols < 1 || resize.rows < 1 || resize.afterSeconds < 1 || resize.afterSeconds >= settle)) {
+    throw new TypeError("resize requires positive integer dimensions and a time before settle");
+  }
+  const resizeEnv = resize ? {
+    GH_GLANCE_CAPTURE_RESIZE_COLS: String(resize.cols),
+    GH_GLANCE_CAPTURE_RESIZE_ROWS: String(resize.rows),
+    GH_GLANCE_CAPTURE_RESIZE_AFTER: String(resize.afterSeconds),
+  } : {};
   const ownsConfigHome = configHome == null;
   const effectiveConfigHome = ownsConfigHome
     ? mkdtempSync(join(tmpdir(), "gh-glance-pty-config-"))
@@ -528,10 +538,10 @@ export function capture({
             // Isolation wins over caller-supplied environment overrides: every PTY
             // run must be unable to observe the developer's real preferences. A
             // caller that needs restart persistence supplies configHome explicitly.
-            env: captureEnvironment(env, effectiveConfigHome, animation, icons),
+            env: captureEnvironment({ ...env, ...resizeEnv }, effectiveConfigHome, animation, icons),
           },
         );
-        return readCaptureResult(bundle.out, { cols, rows });
+        return readCaptureResult(bundle.out, resize ? { cols: resize.cols, rows: resize.rows } : { cols, rows });
       });
   } finally {
     if (ownsConfigHome) rmSync(effectiveConfigHome, { recursive: true, force: true });

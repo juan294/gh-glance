@@ -177,6 +177,22 @@ the core gh-glance minimum remains unchanged. To keep simultaneous panes on
 different accounts, use separate `GH_CONFIG_DIR` values as described under
 [No account pinning](#limitations).
 
+A successful empty result is different from a check that has not succeeded.
+Actions says “No workflow runs found” and explains that runs come from workflows
+with matching triggers. Issues and Pull requests report open items. Security
+reports only the sources it could check and keeps unavailable-source notes visible.
+An empty result is not a repository-wide health or security clearance.
+
+“Checking” and “Waiting to check” mean no successful result is available yet.
+A failed load shows the actual recovery action. A failed refresh keeps the prior
+result and its original check time. “Needs an update” describes overdue data;
+it does not by itself mean a network request failed. Unknown or future source
+clocks show “Last-check time unavailable”.
+
+With the default on-demand policy, Issues, Pull requests and Security show a
+saved view between checks. Press `r` to check again; opening the tab also follows
+the normal refresh policy. These tabs do not promise continuous polling.
+
 ### From a clone
 
 For hacking on it, or to run an unreleased revision:
