@@ -292,7 +292,7 @@ const ANIMATE = !process.env.GH_GLANCE_NO_ANIMATION;
 // legitimate mixed-direction Arabic and Hebrew titles render correctly, and
 // preserving real RTL text is a stated property of this function.
 // eslint-disable-next-line no-control-regex -- matching control characters is the entire purpose
-const CONTROL_CHARS = /[ --]+/g;
+const CONTROL_CHARS = /[\x00-\x1f\x7f-\x9f]+/g;
 const BIDI_OVERRIDES = /[‪-‮⁦-⁩]/g;
 
 // Titles are rendered at whatever length GitHub returns, and ink memoizes
@@ -307,7 +307,7 @@ const MAX_FIELD_LENGTH = 300;
 function safe(value) {
   // Coerce first, sanitize always. Returning a non-string early skipped both the
   // control-character strip and the length clamp, so an array or an object with a
-  // toString() came through untouched -- `safe(["[2Jx"])` returned the escape
+  // toString() came through untouched -- `safe(["\x1b[2Jx"])` returned the escape
   // verbatim. GitHub returns strings for every field this is called on today, so
   // the guarantee was being provided by the upstream schema rather than by the
   // function that claims to provide it.
@@ -20267,7 +20267,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       activeGovernorDecision?.cause)) {
     semanticStatus = refreshStatus({
       stale: true,
-      disconnected: data[tab.key] !== null && !runtimeIdentityCoordinator?.current(),
+      disconnected: statusDisconnected,
     });
   }
 

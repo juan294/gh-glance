@@ -192,3 +192,54 @@ test("COL on-demand: real collector refreshes secondary data exactly on request"
   service.kill("SIGTERM");
   await waitForExit(service);
 });
+
+for (const [background, label, failure] of [["all", "Stale", "disconnect"], ["on-demand", "Cached", "app-auth"]]) {
+  test(`FE-M1: repeated old collector snapshots stay ${label} until ${failure}`, async (t) => {
+    const root = mkdtempSync("/tmp/ggc-stale-");
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const sourceAt = Date.now() - 20 * 60_000;
+    const rows = [{ number: 41, title: "SIGTERM erases the terminal scrollback",
+      author: "juan294", label: "bug", updatedAt: new Date(sourceAt).toISOString(), url: "" }];
+    let deliveries = 0;
+    let service;
+    const runtime = {
+      subscribe({ resource, onSnapshot, onHold }) {
+        const snapshot = { generation: 1, rows: resource === "issues" ? rows : [],
+          pageInfo: { loadedPages: 1, hasNextPage: false },
+          lastSuccessAt: sourceAt, lastChangedAt: sourceAt, nextDueAt: sourceAt + 60_000,
+          hold: null, meta: { at: sourceAt, truncated: false }, securityNotes: [],
+          securityBlind: false, capabilities: {} };
+        const deliver = () => { if (resource === "issues") deliveries += 1; onSnapshot(snapshot); };
+        queueMicrotask(deliver);
+        const timer = setInterval(deliver, 250);
+        return { updateDemand() {}, inspect() {}, close() { clearInterval(timer); },
+          refresh() {
+            if (!existsSync(join(root, "fail"))) return;
+            clearInterval(timer);
+            if (failure === "disconnect") void service.close();
+            else onHold("app-auth");
+          } };
+      },
+      close() {},
+    };
+    service = await createCollectorService({ config: normalizeCollectorConfig(CONFIG),
+      pathOptions: { env: { XDG_CONFIG_HOME: root }, platform: process.platform }, runtime });
+    t.after(() => service.close());
+    const result = await captureAsync({ cols: 80, rows: 20, signal: "none", settle: 20,
+      configHome: root, args: `--connect local --repo acme/widget --tab issues --background ${background}`,
+      env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
+      stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', `index($0, "${label}") && index($0, "20m") { ok=1 }`) +
+        `sleep 1; touch '${root}/fail'; printf r; ` +
+        waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Disconnected") && index($0, "20m") { ok=1 }') +
+        "sleep .3; printf q",
+    });
+    const statuses = result.liveScreen.statusHistory;
+    assert.ok(statuses.some((line) => line.includes(label) && line.includes("20m")), statuses.join(" -> "));
+    assert.ok(deliveries >= 2, "repeated deliveries keep the original source age");
+    const final = result.finalFrame.lines.join("\n");
+    assert.match(final, /Disconnected/);
+    assert.match(final, /20m/);
+    assert.match(final, /SIGTERM erases/);
+    assert.equal(result.exitCode, 0);
+  });
+}
