@@ -201,6 +201,22 @@ retry with capped backoff for at most five minutes, then report **published;
 delivery unverified** and resume read-only later. Never republish to "fix"
 lag.
 
+### Homebrew distribution
+
+The public [juan294/homebrew-tap](https://github.com/juan294/homebrew-tap)
+checks npm's published `latest` version every 15 minutes and updates its formula
+with the exact registry tarball URL and verified checksum. GitHub can delay
+scheduled runs. This uses only the tap's own `GITHUB_TOKEN`; the npm publisher,
+its OIDC trust and release gates are unchanged. The tap maintains its schedule
+with a monthly maintenance commit if no release has changed the repository.
+
+Homebrew delivery is separate from npm delivery. After a release, inspect the
+tap's `Update published formula` workflow and formula version when confirming
+Homebrew availability. If it fails, preserve that result and diagnose locally;
+do not republish npm or rerun the publisher. Installation and migration details
+live in the tap README. No new package release is needed to introduce the tap
+for an already published npm version.
+
 ### 6. Receipt and owned cleanup
 
 Write the current status at the top of the release report under

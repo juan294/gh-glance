@@ -121,9 +121,27 @@ current.
 
 ## Install
 
+With Homebrew on macOS or Linux:
+
+```bash
+brew install juan294/tap/gh-glance
+```
+
+Future updates use your normal `brew upgrade`. The
+[Homebrew tap](https://github.com/juan294/homebrew-tap) follows published npm
+releases automatically and supplies its own Node runtime. If moving from npm,
+remove existing npm copies first; the tap README includes migration commands.
+Restart running dashboard panes after upgrading.
+
+Alternatively, install with npm (Node.js 22 or newer):
+
 ```bash
 npm install -g gh-glance
 ```
+
+Use one installation method. NVM keeps global npm packages separate for each
+Node installation, so an npm update may not affect a copy launched from another
+prefix.
 
 That is the whole install for the default standalone dashboard. `gh-glance`
 ships as a single `index.mjs` with no build step, so there is nothing to
