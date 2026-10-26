@@ -224,3 +224,26 @@ test("a workflows fixture completes independently when it owns the only HTTP slo
   assert.equal(state.events.filter((event) => event.type === "start").length, 1);
   assert.equal(state.events.filter((event) => event.type === "end").length, 1);
 });
+
+test("setup workflow envelopes are independent of name catalog projections in every fixture", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-fixture-setup-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const statePath = join(root, "state.json");
+  const now = Date.now();
+  writeFileSync(statePath, JSON.stringify({ createdAt: now,
+    core: { limit: 5000, used: 0, remaining: 5000, resetMs: now + 3_600_000 },
+    graphql: { limit: 5000, used: 0, remaining: 5000, resetMs: now + 3_600_000 }, events: [] }));
+  const oraclePath = join(root, "oracle.json");
+  writeFileSync(oraclePath, JSON.stringify(createOracleState({ now })));
+  for (const env of [{}, { GH_GLANCE_FIXTURE_STATE: statePath }, oracleEnvironment({ root, statePath: oraclePath })]) {
+    const path = "repos/acme/widget/actions/workflows?per_page=100&page=1";
+    const setup = invoke(["api", path, "--jq", "{total_count, workflows: [.workflows[] | {id, name, state}]}"], env);
+    assert.equal(setup.status, 0, setup.stderr);
+    const observed = JSON.parse(setup.stdout);
+    assert.equal(observed.total_count, 1);
+    assert.equal(observed.workflows[0].state, "active");
+    const catalog = invoke(["api", path, "--jq", "[.workflows[] | {id, name}]"], env);
+    assert.equal(catalog.status, 0, catalog.stderr);
+    assert.ok(Array.isArray(JSON.parse(catalog.stdout)));
+  }
+});

@@ -3656,6 +3656,7 @@ test("the status bar hints are a subset of the documented key table", () => {
     { label: "Refresh", keys: "r" },
     { label: "Width", keys: "w" },
     { label: "Quit", keys: "q" },
+    { label: "Help", keys: "?" },
   ]);
   assert.ok(
     KEY_TABLE.some(([keys]) => keys === "?"),
@@ -3663,10 +3664,11 @@ test("the status bar hints are a subset of the documented key table", () => {
   );
 });
 
-test("the missing-remote prompt exposes only explicit setup and exit actions", () => {
+test("the missing-remote prompt exposes explicit setup, help and exit actions", () => {
   assert.deepEqual(REMOTE_SETUP_HINTS, [
     { label: "Create remote", keys: "Ent" },
     { label: "Quit", keys: "q" },
+    { label: "Help", keys: "?" },
   ]);
   assert.ok(REMOTE_SETUP_LINES.some((line) => line.includes("gh repo create")));
   assert.ok(REMOTE_SETUP_LINES.some((line) => line.includes("Push an existing local repository")));

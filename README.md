@@ -25,14 +25,14 @@ without switching to the browser.
 ╭─ Actions · owner/repo ──────────────────────────────────────────────────╮
 │     TITLE                  │WORKFLOW  │BRANCH        │TIME   │UPDATED   │
 │ ─────────────────────────────────────────────────────────────────────── │
-│ >+  ci: pin actions to com… #443 CI    develop        1m20s   44d ago   │
-│  x  fix: restore the prima… #442 Code… develop        1m28s   44d ago   │
-│  +  chore: bump dependenci… #441 CI    dependa…int-10 30s     44d ago   │
-│  -  docs: update the readme #440 CI    develop        15s     45d ago   │
+│ >+  ci: pin actions to com… #443 CI    develop        1m20s   85d ago   │
+│  x  fix: restore the prima… #442 Code… develop        1m28s   85d ago   │
+│  +  chore: bump dependenci… #441 CI    dependa…int-10 30s     85d ago   │
+│  -  docs: update the readme #440 CI    develop        15s     86d ago   │
 │                                                                         │
 │                                                                         │
 ╰──────────────────────────────────────────────────────────────── 4 of 4 ─╯
-· Watching               Refresh: r Quit: q Move: ↑↓ Open: Ent Width: w
+· Watching               Refresh: r Quit: q Help: ? Move: ↑↓ Open: Ent w
 ```
 
 > Generated from this candidate's real binary under the repository PTY harness
@@ -134,14 +134,19 @@ The installed package is a CLI, not a JavaScript library. The `gh-glance`
 executable is supported; package-root and deep imports are intentionally
 blocked so an internal test seam cannot become an accidental public API.
 
-Every published version is built and signed by GitHub Actions from a tagged
-commit on `main`, never from a maintainer's laptop, and carries [npm
+Every published version is the exact tarball GitHub Actions packed and tested
+for the release pull request, published by GitHub Actions from a tagged commit
+on `main`, never from a maintainer's laptop, and carries [npm
 provenance](https://docs.npmjs.com/generating-provenance-statements) linking
-the tarball back to the workflow run and commit that produced it. The
+the tarball back to the workflow run and commit that published it. The
 "Provenance" section on the [package
 page](https://www.npmjs.com/package/gh-glance) shows the exact source.
 
 ### First run
+
+The footer keeps `?` available for contextual help, even in a narrow pane.
+Help explains the selected repository and host, the current observation, and
+what to do next; its pages keep long targets and recovery details reachable.
 
 The default standalone dashboard uses the credentials and active account
 already selected by your local `gh` CLI. It does not persist or display the
@@ -175,6 +180,33 @@ the active account globally for that `gh` configuration. If `gh auth switch
 the core gh-glance minimum remains unchanged. To keep simultaneous panes on
 different accounts, use separate `GH_CONFIG_DIR` values as described under
 [No account pinning](#limitations).
+
+A successful empty result is different from a check that has not succeeded.
+Actions says “No workflow runs found” and explains that runs come from workflows
+with matching triggers. Issues and Pull requests report open items. Security
+reports only the sources it could check and keeps unavailable-source notes visible.
+An empty result is not a repository-wide health or security clearance.
+
+On Actions, press `s` for an optional read-only setup check or `g` to open the
+selected repository's Actions page. The setup check lists at most 100 workflows
+in one request. It reports partial coverage and unfamiliar states explicitly;
+zero workflows or an access error does not prove that Actions is disabled.
+Setup results have their own check time and do not change the run list or its
+freshness. A successful or partial result is reused for five minutes. Failures
+keep the prior dated result and require `s` to retry after at least 30 seconds
+and any shared API hold. There is no automatic setup retry. Setup checks are
+available only in standalone mode; connected collector and SSH views offer `g`
+instead. Neither key creates, enables, edits, or dispatches a workflow.
+
+“Checking” and “Waiting to check” mean no successful result is available yet.
+A failed load shows the actual recovery action. A failed refresh keeps the prior
+result and its original check time. “Needs an update” describes overdue data;
+it does not by itself mean a network request failed. Unknown or future source
+clocks show “Last-check time unavailable”.
+
+With the default on-demand policy, Issues, Pull requests and Security show a
+saved view between checks. Press `r` to check again; opening the tab also follows
+the normal refresh policy. These tabs do not promise continuous polling.
 
 ### From a clone
 
@@ -251,8 +283,10 @@ stdout isn't a terminal rather than streaming redraw frames into a pipe.
 | `Enter` | Open the selected item, or accept an onboarding prompt |
 | `r` | Request a current-tab refresh. It sends the cached validators, so an unchanged tab answers `304` and spends nothing. A safe grant is still required. |
 | `R` | Resynchronize the current tab: one generation without validators, and the only key that clears a negative capability backoff. Still subject to the budget and the secondary cooldown. |
+| `s` | On Actions, request or reuse a read-only setup check (standalone only) |
+| `g` | On Actions, open the selected repository’s Actions page |
 | `w` | Adjust table column widths |
-| `?` | Show the keys without leaving the dashboard (any key closes it) |
+| `?` | Open or close contextual help; `n` / `p` moves through its pages |
 | `q` / `Esc` / `Ctrl+C` | Quit (`Esc` leaves width mode) |
 
 ### Adjusting column widths
@@ -304,9 +338,16 @@ switch `gh` into non-interactive mode and require choosing a visibility in
 advance. Press `q` or `Esc` to decline. To watch an existing repository without
 attaching this folder, restart with `gh-glance --repo owner/name`.
 
-When the repository was chosen explicitly, with `--repo` or `GH_REPO`, the panel
-says so: `╭─ Actions · acme/widget ─`. That is what tells two side-by-side panes
-apart. It is dropped before the tab name when the pane is too narrow for both.
+The panel names the selected repository, including targets inferred from Git
+remotes: `╭─ Actions · acme/widget ─`. Non-default hosts are included in the
+target. Selection does not prove that the active account can access it. When
+the pane is too narrow for the target, press `?` to read its complete name and
+host, the current check state, source time, recovery action, and key reference.
+
+Help wraps long text and uses `n` / `p` for next / previous page. `?` closes it;
+any other ordinary key closes help without performing that key's usual action.
+`q`, `Esc`, and `Ctrl+C` still quit. Width mode keeps its own keys: leave it
+before opening help.
 
 If `gh-glance` is started without an interactive stdin (for example with stdin
 redirected), the key handlers cannot run and the status bar shows only `Quit: ^C`

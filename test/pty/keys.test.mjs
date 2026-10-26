@@ -24,9 +24,11 @@ import { test } from "node:test";
 
 import { capture, lazyCapture, waitForAwk } from "./capture.mjs";
 
-// Width-mode probes do not depend on data rows; keep their short input spacing.
-const REFRESH_SECONDS = 5;
-const SETTLE = Math.ceil(REFRESH_SECONDS * 0.6);
+// Width mode becomes available only after the populated table is visible.
+const waitForActionsRows = waitForAwk('"$GH_GLANCE_CAPTURE_OUT"',
+  'index($0, "ci: pin actions") { ok=1 }', 250);
+const waitForWidthMode = (width) => waitForAwk('"$GH_GLANCE_CAPTURE_OUT"',
+  `index($0, "Width: WORKFLOW ${width}") { ok=1 }`, 100);
 
 // Move is advertised only after rows arrive. Force slow provider responses and
 // wait for actual fixture rows before switching tabs and quitting.
@@ -151,15 +153,17 @@ test("keyboard width changes persist across processes and defaults remove deviat
       cols: 80,
       rows: 24,
       signal: "none",
-      settle: 12,
+      settle: 30,
       configHome,
+      env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
       // Every logical key is a separate write. Combined escape/key strings can
       // be delivered as one useInput event and do not model a user's keypresses.
       stdin:
-        `sleep ${SETTLE}; printf 'w'; sleep 1; printf '\\033[C'; ` +
+        waitForActionsRows + "printf w; " + waitForWidthMode(10) + "printf '\\033[C'; " +
         "sleep 1; printf '\\r'; sleep 1; printf 'q'; sleep 2",
     });
 
+    assert.match(widened.raw, /Width: WORKFLOW 10/);
     assertCleanInteractiveCapture(widened, { cols: 80, rows: 24, label: "widen" });
     assert.deepEqual(JSON.parse(readFileSync(preferencePath, "utf8")), {
       version: 1,
@@ -170,13 +174,15 @@ test("keyboard width changes persist across processes and defaults remove deviat
       cols: 80,
       rows: 24,
       signal: "none",
-      settle: 12,
+      settle: 30,
       configHome,
+      env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
       stdin:
-        `sleep ${SETTLE}; printf 'w'; sleep 1; printf '\\033[D'; ` +
+        waitForActionsRows + "printf w; " + waitForWidthMode(11) + "printf '\\033[D'; " +
         "sleep 1; printf '\\r'; sleep 1; printf 'q'; sleep 2",
     });
 
+    assert.match(restoredThenReset.raw, /Width: WORKFLOW 11/);
     assertCleanInteractiveCapture(restoredThenReset, {
       cols: 80,
       rows: 24,
@@ -200,13 +206,17 @@ test("compact width-mode input is a persistence no-op", () => {
       cols: 45,
       rows: 20,
       signal: "none",
-      settle: 12,
+      settle: 30,
       configHome,
+      env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
       stdin:
-        `sleep ${SETTLE}; printf 'w'; sleep 1; printf '\\033[C'; ` +
+        waitForActionsRows + "printf w; sleep 1; printf '\\033[C'; " +
         "sleep 1; printf '\\033[D'; sleep 1; printf 'q'; sleep 2",
     });
 
+    assert.match(compact.finalFrame.lines.join("\n"), /ci: pin actions/,
+      "compact width no-op must be exercised with populated data");
+    assert.doesNotMatch(compact.raw, /Width: WORKFLOW/);
     assertCleanInteractiveCapture(compact, { cols: 45, rows: 20, label: "compact" });
     assert.equal(
       existsSync(preferencePath),

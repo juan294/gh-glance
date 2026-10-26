@@ -97,6 +97,8 @@ import {
   retryRateLimitBlockPublication,
   runtimeIntentGate,
   runAdmittedOperation,
+  ghApi,
+  parseActionsSetup,
   runGh,
   GOVERNOR_ADMISSION_WAIT_MS,
   resolveFailureContext,
@@ -4415,4 +4417,59 @@ test("a queued HTTP call rechecks a newly shared resource block without changing
   assert.equal(reservation.actualCosts, null);
   assert.equal(completeReservation(box.scope, grant.reservationId, { outcome: "rejected" }, at).ok, true);
   assert.deepEqual(inspectGovernor(box.scope, at).value.reservations[grant.reservationId].actualCosts, { core: 1, graphql: 0 });
+});
+
+
+test("SET-06 setup admission and receipt outcomes preserve one declared request and its observation", async (t) => {
+  for (const mode of ["denied", "retryable", "blocked"]) {
+    const at = Date.now();
+    const box = sandbox(t, { authIdentity: `setup-${mode}`, now: at });
+    const leaseId = randomUUID();
+    registerLease(box.scope, lease(leaseId, at));
+    publishInitial(box.scope, leaseId, at, budgets(at, { remaining: mode === "denied" ? 0 : 5000 }));
+    const lockPath = `${box.scope.path}.lock`;
+    const nonce = randomUUID();
+    let calls = 0;
+    const result = await runAdmittedOperation({
+      scope: box.scope, leaseId, operation: "setup:actions-workflows", now: box.now,
+      waitMs: GOVERNOR_PHASE_WINDOW_MS + 2_000,
+      wait: async (ms) => box.setNow(box.now() + ms + 1),
+      run: async () => {
+        const response = await ghApi(["repos/acme/widget/actions/workflows?per_page=100&page=1"], {
+          operation: "setup:actions-workflows", includeHeaders: true,
+          run: (args, options) => runGh(args, { ...options,
+            execute: () => { calls += 1; return closedGh('HTTP/2 200 OK\r\n\r\n{"total_count":0,"workflows":[]}'); } }),
+        });
+        const observation = parseActionsSetup(response.body, response.headers);
+        const checkedAt = box.now();
+        if (mode === "retryable") writeFileSync(lockPath, JSON.stringify({ pid: process.pid, nonce }));
+        if (mode === "blocked") writeFileSync(box.scope.path, "corrupt ledger");
+        return { ...response, observation, checkedAt };
+      },
+    });
+    if (mode === "denied") {
+      assert.equal(result.ok, false); assert.equal(calls, 0); continue;
+    }
+    assert.equal(calls, 1);
+    if (mode === "blocked") {
+      assert.equal(result.ok, false);
+      assert.match(result.error.message, /receipt settlement blocked/);
+      continue;
+    }
+    assert.equal(result.ok, true, result.error?.message);
+    assert.equal(result.value.observation.title, "No workflows found");
+    assert.equal(result.value.checkedAt, box.now());
+    const charged = JSON.parse(readFileSync(box.scope.path, "utf8")).reservations[result.reservationId];
+    assert.equal(charged.status, "started");
+    assert.equal(charged.costs.core, 1);
+    assert.equal(releaseGovernorLock(lockPath, nonce), true);
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline && inspectGovernor(box.scope, box.now()).value.reservations[result.reservationId].status !== "completed") {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    const settled = inspectGovernor(box.scope, box.now()).value.reservations[result.reservationId];
+    assert.equal(settled.status, "completed");
+    assert.equal(settled.actualCosts.core, 1);
+    assert.equal(calls, 1);
+  }
 });

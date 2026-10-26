@@ -215,17 +215,18 @@ created; preserve unrelated untracked files.
 ## Transition: what changed and what still needs activation
 
 The [repair plan](../plans/2026-10-02-release-process-repair.md) replaced the
-workflows in this repository; they take effect with the first push that
-carries them. One step needs separate owner authority: branch protection.
+workflows in this repository; they took effect with v0.16.2 (release PR #149,
+merge `d9c3414`, published 2026-10-03). One step still needs separate owner
+authority: branch protection.
 
 See the [activation dossier](release-process-activation.md) for the exact
 decision and steps.
 
 | Area | Before the repair | Now in the workflow files | Still to activate |
 | --- | --- | --- | --- |
-| Candidate CI | Full suites on every `develop` push, PR and `main` push | Release PR owns one selection, packs once and uploads the tarball; `develop` pushes are quick, and skipped while the release PR is open; `main` pushes check promotion identity only; an always-running `Release candidate` aggregate | Require `Release candidate` on `main`, observe it, then retire the legacy contexts (add before remove) |
-| Publisher | Re-tests, re-packs the tag, floating npm, skip-on-existing without byte comparison | Verifies and publishes the accepted tarball with pinned npm; collisions block | OIDC publication of a verified artifact is unproven until the first real release |
-| Delivery | Manual readback (step 5) | Bounded registry, provenance and fresh-install checks on Node 22 and 24 in an unprivileged job | First real release |
+| Candidate CI | Full suites on every `develop` push, PR and `main` push | Release PR owns one selection, packs once and uploads the tarball; `develop` pushes are quick, and skipped while the release PR is open; `main` pushes check promotion identity only; an always-running `Release candidate` aggregate | Require `Release candidate` on `main`, observe it, then retire the legacy contexts (add before remove); `main` still requires the eight legacy contexts (read 2026-10-03) |
+| Publisher | Re-tests, re-packs the tag, floating npm, skip-on-existing without byte comparison | Verifies and publishes the accepted tarball with pinned npm; collisions block | None: v0.16.2 exercised OIDC publication of a verified artifact (publisher run 37112912694) |
+| Delivery | Manual readback (step 5) | Bounded registry, provenance and fresh-install checks on Node 22 and 24 in an unprivileged job | None: the v0.16.2 Delivery job passed |
 | Coverage | Also on every `develop` push | Scheduled and manual only | None |
 
 ## Outcomes are separate

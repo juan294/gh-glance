@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-25
+
+### Added
+
+- Contextual, paginated help with the selected GitHub host and repository,
+  complete diagnostics and recovery actions, including in narrow terminals.
+- Optional Actions setup checks with `s` in standalone mode: one read-only
+  request lists up to 100 workflows, reports incomplete coverage and keeps a
+  separate result for five minutes. Press `g` to open the repository's Actions
+  page, including from collector and SSH views.
+
+### Changed
+
+- Empty tabs explain what was checked, what the result means and what to do
+  next. Saved views, waiting, overdue data and failed refreshes retain their
+  actual source-check context.
+- README: the provenance note now says the published package is the exact
+  tarball tested for the release pull request.
+- Development CI monitoring uses Sutura v0.3.9 with a repository-scoped App token.
+
+### Fixed
+
+- Preserve actionable login and local-storage remedies in short terminal panes.
+- Distinguish partial or disabled Security coverage from an all-clear result,
+  and disclose uncertain check times without inventing freshness.
+- Keep setup and browser failures separate from workflow-run results, with
+  bounded retries, shared rate-limit accounting and account-change fencing.
+
 ## [0.16.2] - 2026-10-03
 
 No change to the dashboard itself: `index.mjs` is identical to 0.16.1. This
@@ -1254,7 +1282,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.16.2...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/juan294/gh-glance/compare/v0.16.2...v0.17.0
 [0.16.2]: https://github.com/juan294/gh-glance/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/juan294/gh-glance/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/juan294/gh-glance/compare/v0.15.2...v0.16.0

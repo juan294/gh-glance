@@ -114,7 +114,8 @@ function defaultApiBody(path) {
     return readFileSync(join(fixtures, "actions-runs.json"), "utf8");
   }
   if (path?.includes("/actions/workflows?")) {
-    return readFileSync(join(fixtures, "actions-workflows.json"), "utf8");
+    return readFileSync(join(fixtures, args.some((arg) => arg.includes("total_count"))
+      ? "actions-setup.json" : "actions-workflows.json"), "utf8");
   }
   return "[]\n";
 }
@@ -138,7 +139,8 @@ function apiEntity(state, path, fallback) {
     ? entity.etag
     : configuredBody ? bodyEtag(body) : fallback.etag;
   return {
-    status: apiInvocation?.ifNoneMatch === etag ? 304 : 200,
+    status: apiInvocation?.ifNoneMatch === etag ? 304 : entity?.status ?? 200,
+    headers: entity?.headers ?? {},
     etag,
     body,
   };
@@ -318,6 +320,7 @@ function selector() {
   if (args[0] === "api" && apiInvocation?.path === "graphql") {
     return graphqlAnswer?.operation === "graphql.observer" ? "graphql-observer" : "graphql-data";
   }
+  if (apiInvocation?.path?.includes("/actions/workflows?") && args.some((arg) => arg.includes("total_count"))) return "setup";
   if (args[0] === "api" && apiInvocation?.path?.includes("/actions/")) return "actions";
   if (args[0] === "api") return "security";
   if (["run", "repo", "auth"].includes(args[0])) return args[0];
@@ -603,11 +606,12 @@ switch (selector()) {
           `x-ratelimit-used: ${started.budgets.core.used}\r\n` +
           `x-ratelimit-remaining: ${started.budgets.core.remaining}\r\n` +
           `x-ratelimit-reset: ${Math.floor(started.budgets.core.resetMs / 1000)}\r\n` +
-          "x-ratelimit-resource: core\r\n\r\n",
+          "x-ratelimit-resource: core\r\n" +
+          Object.entries(started.apiResponse.headers ?? {}).map(([key, value]) => `${key}: ${value}\r\n`).join("") + "\r\n",
         );
       }
-      if (started.apiResponse.status === 200) process.stdout.write(started.apiResponse.body);
-      else process.exitCode = 1;
+      if (started.apiResponse.status !== 304) process.stdout.write(started.apiResponse.body);
+      if (started.apiResponse.status !== 200) process.exitCode = 1;
     } else {
       process.stdout.write("[]\n");
     }

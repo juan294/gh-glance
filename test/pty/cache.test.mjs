@@ -155,7 +155,7 @@ test("a blind Security refresh preserves cached alerts", () => {
 
 test("a different repository target never receives cached rows", () => {
   const screen = screenOf(isolated);
-  assert.match(screen, /waiting for API budget/);
+  assert.match(screen, /Waiting to check Actions/);
   assert.doesNotMatch(screen, /ci: pin actions to commit/);
   assert.doesNotMatch(screen, /4 of 4/);
   assertTerminalContract(isolated);

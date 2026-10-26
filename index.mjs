@@ -1005,7 +1005,7 @@ function ghApiArgs(args, etag = null) {
   ];
 }
 
-async function ghApi(args, { operation, signal, etag = null, run = runGh } = {}) {
+async function ghApi(args, { operation, signal, etag = null, run = runGh, includeHeaders = false } = {}) {
   const argv = ghApiArgs(args, etag);
   try {
     const parsed = parseGhApiResponse(await run(argv, { operation, signal }));
@@ -1014,6 +1014,7 @@ async function ghApi(args, { operation, signal, etag = null, run = runGh } = {})
       etag: parsed.headers.etag ?? null,
       rateLimit: pickRateLimit(parsed.headers),
       body: parsed.body,
+      ...(includeHeaders ? { headers: parsed.headers } : {}),
     };
   } catch (error) {
     const parsed = parseGhApiResponse(error?.stdout);
@@ -1488,6 +1489,72 @@ function actionsWorkflowsArgs() {
     "--jq",
     "[.workflows[] | {id, name}]",
   ];
+}
+
+const ACTIONS_SETUP_TTL_MS = 5 * 60_000;
+
+function actionsSetupArgs({ host, repository }) {
+  return [`repos/${repository}/actions/workflows?per_page=100&page=1`, "--hostname", host,
+    "--jq", "{total_count, workflows: [.workflows[] | {id, name, state}]}"];
+}
+
+function parseActionsSetup(body, headers = {}) {
+  const unusable = () => { throw new Error("Actions setup response is unusable"); };
+  let value;
+  try { value = JSON.parse(body); } catch { return unusable(); }
+  if (!isRecord(value) || !Number.isSafeInteger(value.total_count) || value.total_count < 0 ||
+      !Array.isArray(value.workflows) || value.workflows.length > 100 ||
+      value.total_count < value.workflows.length || (value.total_count > 0 && value.workflows.length === 0)) return unusable();
+  const ids = new Set();
+  const workflows = value.workflows.map((entry) => {
+    if (!isRecord(entry) || !Number.isSafeInteger(entry.id) || entry.id <= 0 || ids.has(entry.id) ||
+        typeof entry.name !== "string" || !safe(entry.name).trim() ||
+        typeof entry.state !== "string" || !entry.state.trim()) return unusable();
+    ids.add(entry.id);
+    return { id: entry.id, name: safe(entry.name), state: entry.state };
+  });
+  const hasNextPage = /rel=["']?next\b/i.test(headers.link ?? "");
+  if (value.total_count === 0 && hasNextPage) return unusable();
+  const complete = value.total_count === workflows.length && !hasNextPage;
+  const disabled = workflows.filter(({ state }) => ["disabled_manually", "disabled_inactivity"].includes(state)).length;
+  const active = workflows.filter(({ state }) => state === "active").length;
+  const title = !complete ? "Workflows found; setup check incomplete"
+    : workflows.length === 0 ? "No workflows found"
+      : disabled === workflows.length ? "All listed workflows are disabled" : "Workflows found";
+  return { total: value.total_count, workflows, complete, disabled, active,
+    other: workflows.length - disabled - active, title };
+}
+
+function actionsSetupFresh(result, nowMs) {
+  return result != null && nowMs >= result.checkedAt && nowMs - result.checkedAt < ACTIONS_SETUP_TTL_MS;
+}
+
+function actionsSetupRetryAt(nowMs, holdUntil = 0) {
+  return Math.max(nowMs + 30_000, Number.isFinite(holdUntil) ? holdUntil : 0);
+}
+
+function actionsPageUrl(target = dashboardTarget()) {
+  const validated = dashboardTarget(target);
+  return validated.host && validated.repository
+    ? `https://${validated.host}/${validated.repository}/actions` : null;
+}
+
+function actionsSetupPresentation(state, nowMs) {
+  const result = state.result;
+  const notes = [];
+  if (result) {
+    notes.push(`${state.saved ? "Saved setup check" : "Setup checked"}: ${new Date(result.checkedAt).toISOString()}`,
+      `${result.workflows.length} of ${result.total} workflows listed: ${result.active} active, ${result.disabled} disabled, ${result.other} other state.`,
+      actionsSetupFresh(result, nowMs)
+        ? `Press s to check again after ${new Date(result.checkedAt + ACTIONS_SETUP_TTL_MS).toISOString()}.`
+        : "Setup check expired; press s to check again.");
+  }
+  if (state.error) notes.push(state.error,
+    `Press s to retry${state.retryAt ? ` after ${new Date(state.retryAt).toISOString()}` : ""}.`);
+  if (state.message) notes.push(state.message);
+  return { title: state.busy ? "Checking Actions setup" : state.error ? "Setup check unavailable"
+    : state.message ? state.title ?? "Actions setup" : result?.title,
+  action: state.action ?? (state.error ? "s Retry; g Actions; ? Details" : "s Setup; g Actions; ? Details"), notes };
 }
 
 function parseActionsRuns(runsBody) {
@@ -2214,6 +2281,7 @@ const OPERATION_COSTS = Object.freeze({
   // Separately admitted, like a later list page: only fetched when a run has
   // no name of its own, and settled against its own reservation.
   "catalog:actions-workflows": { core: 1, graphql: 0 },
+  "setup:actions-workflows": { core: 1, graphql: 0 },
   "tab:security-endpoint": { core: 1, graphql: 0 },
   "failure-context:repository": { core: 0, graphql: GRAPHQL_OBSERVER_POINTS },
   // Each page past the first reserves its own envelope, so a denial there is a
@@ -6977,6 +7045,10 @@ async function openInBrowser(tabKey, item, signal, _governor = null, { run = nul
   // Returning quietly here is how a dead Enter key looks: the row has no usable
   // page, and the user is entitled to know that rather than press it again.
   if (!url) throw new Error("This row has no page to open yet; refresh and try again");
+  return openBrowserUrl(url, signal, { run });
+}
+
+async function openBrowserUrl(url, signal, { run = null } = {}) {
   const opener = pick(BROWSER_OPENERS, process.platform, null);
   if (!opener) throw new Error(`Opening a browser is not supported on ${process.platform}`);
   const [command, ...prefix] = opener;
@@ -11571,8 +11643,10 @@ const KEY_TABLE = [
   ["Enter", "Open the selected item or accept a prompt"],
   ["r", "Refresh the current tab when a safe grant is available"],
   ["R", "Resynchronize the current tab, ignoring cached validators and backoff"],
+  ["s", "Actions: read-only setup check (standalone only; saved for five minutes)"],
+  ["g", "Actions: open the selected repository Actions page"],
   ["w", "Adjust table column widths"],
-  ["?", "Show the keys (any key closes it)"],
+  ["?", "Open / close contextual help; n / p changes page"],
   ["q / Esc / Ctrl+C", "Quit (Esc leaves width mode)"],
 ];
 const KEY_COL = Math.max(...KEY_TABLE.map(([k]) => k.length)) + 3;
@@ -11594,6 +11668,8 @@ const HELP_PRIORITY = [
   "Tab / Shift+Tab",
   "PgUp / PgDn",
   "R",
+  "s",
+  "g",
 ];
 
 function helpLines(maxRows) {
@@ -15760,12 +15836,14 @@ function cleanupQueueForResource(queue, resource) {
   return count;
 }
 
-function presentRecovery(cause, { nowMs = Date.now(), cols = 80 } = {}) {
+function presentRecovery(cause, { nowMs = Date.now(), cols = 80, hasSnapshot } = {}) {
   if (!cause) return [];
   const width = Math.max(1, Number.isSafeInteger(cols) ? cols - 1 : 79);
   const resource = cause.resource === "graphql" ? "GraphQL" : cause.resource === "core" ? "Core" : "GitHub";
-  const age = Number.isFinite(cause.sourceAt) && cause.sourceAt <= nowMs
-    ? `cached ${formatDuration(nowMs - cause.sourceAt)}` : "cached age unavailable";
+  const age = hasSnapshot === false ? "Not checked yet"
+    : Number.isFinite(cause.sourceAt) && cause.sourceAt <= nowMs
+      ? `cached ${formatDuration(nowMs - cause.sourceAt)}`
+      : hasSnapshot === true ? "Last-check time unavailable" : "cached age unavailable";
   const retry = Number.isFinite(cause.retryAt)
     ? `; next ${statusInterval(cause.retryAt, nowMs)}` : "";
   const summary = cause.code === "legacy-unresolved" && Number.isSafeInteger(cause.debtUnits)
@@ -15798,6 +15876,189 @@ function presentRecovery(cause, { nowMs = Date.now(), cols = 80 } = {}) {
   if (full.length <= width) return [full];
   return [`${resource}: ${summary}`.slice(0, width),
     `${cause.action}${retry}`.slice(0, width), age.slice(0, width)];
+}
+
+// Presentation consumes source observations, never receipt or cache-load clocks.
+function dashboardPresentation({ tab, rows = null, hasSnapshot = rows !== null,
+  sourceAt = null, nowMs = Date.now(), overdue = false, onDemand = false,
+  requestState = "idle", error = false, recovery = null, disconnected = false,
+  securityNotes = [], securityAllUnavailable = false, target = null, diagnostic = null } = {}) {
+  const label = TABS.find((candidate) => candidate.key === tab)?.label ?? "Repository";
+  const empty = { actions: "No workflow runs found", issues: "No open issues",
+    prs: "No open pull requests", security: "No alerts returned by the checked sources" };
+  const lastEmpty = { actions: "Last check found no workflow runs.", issues: "Last check found no open issues.",
+    prs: "Last check found no open pull requests.", security: "Last check returned no alerts from the checked sources." };
+  const sourceCheck = !hasSnapshot ? "Not checked yet"
+    : !Number.isFinite(sourceAt) || sourceAt > nowMs ? "Last-check time unavailable"
+      : (() => {
+        const date = new Date(sourceAt);
+        const today = new Date(nowMs);
+        const day = date.toDateString() === today.toDateString() ? ""
+          : `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")} `;
+        return `Checked ${day}${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+      })();
+  const showTable = Array.isArray(rows) && rows.length > 0;
+  const failed = Boolean(error || disconnected);
+  const held = Boolean(recovery) || requestState === "waiting";
+  let state = "ready";
+  let title = showTable ? label : empty[tab] ?? label;
+  let explanation = tab === "actions"
+    ? "Actions shows automated jobs. A push starts a run only when a workflow has a matching trigger."
+    : "GitHub returned this result for the selected repository.";
+  let action = "Press r to refresh.";
+  if (failed) {
+    state = "failed";
+    title = `Could not ${hasSnapshot ? "refresh" : "load"} ${label}`;
+  } else if (held) {
+    state = "waiting";
+    title = hasSnapshot ? `Waiting to update ${label}` : `Waiting to check ${label}`;
+  } else if (!hasSnapshot) {
+    state = requestState === "loading" ? "loading" : "waiting";
+    title = state === "loading" ? `Checking ${label}…` : `Waiting to check ${label}`;
+    explanation = `Fetching this repository's ${tab === "actions" ? "workflow runs" : label.toLowerCase()}.`;
+  } else if (overdue && !onDemand) {
+    state = "overdue";
+    title = `${label} needs an update`;
+  } else if (onDemand) {
+    state = "saved";
+    title = `Saved ${label} view`;
+    action = "Press r to check again. This view checks when opened or refreshed.";
+  }
+  if ((failed || held || state === "overdue" || state === "saved") && hasSnapshot && !showTable) {
+    explanation = lastEmpty[tab] ?? "Showing the last checked result.";
+  } else if ((failed || held) && !hasSnapshot) {
+    explanation = "No successful check is available yet.";
+  }
+  if (recovery) {
+    explanation = `${recovery.summary}. ${explanation}`;
+    action = recovery.action + (Number.isFinite(recovery.retryAt)
+      ? `; next ${statusInterval(recovery.retryAt, nowMs)}` : "");
+  }
+  if (tab === "security" && securityAllUnavailable) {
+    if (!failed && !held) title = "No alert sources available";
+    explanation = `${recovery ? `${recovery.summary}. ` : ""}No alert source returned data for this check.`;
+  }
+  return { state, title, explanation, sourceCheck, action, showTable, target,
+    notes: [...(diagnostic ? [diagnostic] : []), ...(tab === "security" ? securityNotes : [])] };
+}
+
+// Panels contain sanitized display text. Width follows terminal cells, including
+// wide Unicode characters; combining marks stay with the preceding character.
+function panelCellWidth(char) {
+  const code = char.codePointAt(0);
+  return /\p{Mark}/u.test(char) || code === 0x200d || code === 0xfe0f ? 0
+      : code >= 0x1100 && (code <= 0x115f || code === 0x2329 || code === 0x232a ||
+        code >= 0x2e80 && code <= 0xa4cf || code >= 0xac00 && code <= 0xd7a3 ||
+        code >= 0xf900 && code <= 0xfaff || code >= 0xfe10 && code <= 0xfe6f ||
+        code >= 0xff00 && code <= 0xff60 || code >= 0xffe0 && code <= 0xffe6 || code >= 0x1f300) ? 2 : 1;
+}
+
+function wrapPanelText(text, width) {
+  const limit = Math.max(1, width);
+  const lines = [];
+  let line = "";
+  let cells = 0;
+  for (const char of safe(text)) {
+    const size = panelCellWidth(char);
+    if (cells + size > limit && line) {
+      const space = line.lastIndexOf(" ");
+      if (space > 0 && char !== " ") {
+        lines.push(line.slice(0, space));
+        line = line.slice(space + 1);
+        // The retained word contains the same glyphs already measured above.
+        cells = [...line].reduce((sum, glyph) => sum + panelCellWidth(glyph), 0);
+      } else { lines.push(line.trimEnd()); line = ""; cells = 0; }
+    }
+    if (!line && char === " ") continue;
+    line += char;
+    cells += size;
+  }
+  if (line) lines.push(line.trimEnd());
+  return lines;
+}
+
+function contextualPanelLayout(view, { cols, rows } = {}) {
+  const width = Math.max(1, cols - 5);
+  const capacity = Math.max(1, rows - 6);
+  const title = wrapPanelText(view.title, width);
+  // Keep a short required remedy before explanation when the body is cramped.
+  const action = capacity < 8 && /gh-glance --doctor/.test(view.action)
+    ? "gh-glance --doctor" : view.action;
+  const lines = [view.title, action, view.sourceCheck, ...view.notes, view.explanation]
+    .flatMap((line) => wrapPanelText(line, width));
+  // A long title cannot consume the only row available for the recovery action.
+  if (title.length >= capacity && capacity > 1) {
+    return [...title.slice(0, capacity - 1), ...wrapPanelText(action, width).slice(0, 1)];
+  }
+  return lines.slice(0, capacity);
+}
+
+// Selection is already resolved for acquisition. Displaying it must not ask gh
+// to resolve it again, or imply that the selected account can access it.
+function dashboardTarget({ repository = effectiveRuntimeRepository(), host = effectiveRuntimeHost() } = {}) {
+  // These identifiers have a strict ASCII grammar. Validate the entire value
+  // instead of applying the shorter retention limit for remote display fields.
+  const slug = typeof repository === "string" && REPO_PATTERN.exec(repository)?.[0] === repository
+    ? repository : null;
+  const selectedHost = normalizeHost(host);
+  return { repository: slug, host: selectedHost,
+    label: slug ? selectedHost && selectedHost !== "github.com" ? `${selectedHost}/${slug}` : slug
+      : "Repository unresolved" };
+}
+
+function clampHelpPage(index, count) {
+  return Math.max(0, Math.min(Number.isSafeInteger(index) ? index : 0, Math.max(0, count - 1)));
+}
+
+function contextHelpPages({ view, target, tab, remoteSetup = false }, keys = keyTableLines(), width = 75, height = 18) {
+  const cols = Math.max(1, Math.trunc(width));
+  const rows = Math.max(1, Math.trunc(height));
+  const controlRows = cols >= 48 ? 1 : 2;
+  const capacity = rows - controlRows;
+  if (capacity < 1) return [[...wrapPanelText("q Quit", cols)].slice(0, rows)];
+  const meaning = {
+    actions: "Actions shows automated jobs. A push starts a run only when a workflow has a matching trigger.",
+    issues: "Issues shows open issues in the selected repository.",
+    prs: "Pull requests shows open requests to merge changes into the selected repository.",
+    security: "Security shows alerts returned by the checked sources; unavailable sources can hide alerts.",
+  };
+  const title = remoteSetup ? "No GitHub remote found" : view.title;
+  const action = remoteSetup ? "Close help with ?, then Enter to start gh repo create; or restart with gh-glance --repo owner/name."
+    : view.action;
+  // Wrap validated identity in bounded chunks so the remote-field sanitizer
+  // cannot clip a long accepted target or consume its tail with a label prefix.
+  const targetLines = [["Target", target.repository ?? target.label], ["Host", target.host ?? "unresolved"]]
+    .flatMap(([label, value]) => {
+      const text = `${label}: ${value}`;
+      const wrapped = [];
+      for (let offset = 0; offset < text.length; offset += MAX_FIELD_LENGTH) {
+        wrapped.push(...wrapPanelText(text.slice(offset, offset + MAX_FIELD_LENGTH), cols));
+      }
+      return wrapped;
+    });
+  const context = [title, action, view.sourceCheck,
+    ...targetLines,
+    "Target selection does not confirm access.",
+    ...(!target.repository ? ["Restart with gh-glance --repo owner/name."] : []),
+    meaning[tab] === view.explanation ? null : meaning[tab], view.explanation, ...view.notes,
+    "Other keys close help without performing their usual action.",
+    "Keys (after closing help)", ...keys].filter(Boolean);
+  const lines = context.flatMap((line) => wrapPanelText(line, cols));
+  const chunks = [];
+  // Narrow pages need room for navigation and quit. A compact first page keeps
+  // the immediate state/remedy visible; all complete text follows unabridged.
+  const priority = [title, action].flatMap((line) => wrapPanelText(line, cols));
+  if (priority.length > capacity && capacity >= 2) {
+    const shortAction = /gh-glance --doctor/.test(action) ? "gh-glance --doctor"
+      : /gh auth/.test(action) ? "gh auth status" : remoteSetup ? "? then Enter"
+        : /^Press r/.test(action) ? "Close ?, then r" : action;
+    chunks.push([wrapPanelText(title, cols)[0], wrapPanelText(shortAction, cols)[0]]);
+  }
+  for (let offset = 0; offset < lines.length; offset += capacity) chunks.push(lines.slice(offset, offset + capacity));
+  return chunks.map((chunk, index) => [...chunk,
+    ...(controlRows === 1
+      ? [`${index + 1}/${chunks.length} n next p prev ? close q/Esc/^C quit`]
+      : [`${index + 1}/${chunks.length} n/p ?close`, "q/Esc/^C quit"])]);
 }
 
 function recoveryJournalPath(scope) {
@@ -16406,6 +16667,7 @@ const KEY_HINTS = [
   { label: "Refresh", keys: "r" },
   { label: "Width", keys: "w" },
   { label: "Quit", keys: "q" },
+  { label: "Help", keys: "?" },
 ];
 
 function activeKeyHints({
@@ -16428,6 +16690,7 @@ function activeKeyHints({
 const REMOTE_SETUP_HINTS = [
   { label: "Create remote", keys: "Ent" },
   { label: "Quit", keys: "q" },
+  { label: "Help", keys: "?" },
 ];
 
 const REMOTE_SETUP_LINES = [
@@ -16451,7 +16714,6 @@ const WIDE_STATE_WIDTH = REFRESH_STATUS_WIDTH + 1 + 12;
 // StatusBar receives the drawable frame width, which is one column narrower
 // than the terminal. A 44-cell threshold preserves the 45-column contract.
 const WIDE_STATE_MIN_COLS = 44;
-const NOTICE_ROWS = 1;
 
 const REFRESH_STATUS_GLYPHS = Object.freeze({
   unicode: Object.freeze({
@@ -16473,7 +16735,7 @@ const REFRESH_STATUS_GLYPHS = Object.freeze({
 });
 
 function isMandatoryHint(hint) {
-  return hint?.label === "Refresh" || hint?.label === "Quit";
+  return hint?.label === "Refresh" || hint?.label === "Quit" || hint?.label === "Help";
 }
 
 function refreshStatus({
@@ -16597,7 +16859,7 @@ function statusBarLayout({
   for (const [index, hint] of mandatory.entries()) {
     // A full label is optional; every essential key is not. Reserve one
     // separator and the key itself for each action still to come before taking
-    // the current action's long form. This keeps both r and q at the 24-column
+    // the current action's long form. This keeps r, q and ? at the 24-column
     // terminal minimum, whose drawable frame is 23 cells wide.
     const remainingMinimum = mandatory.slice(index + 1).reduce(
       (total, candidate) => total + 1 + [...candidate.keys].length,
@@ -17006,10 +17268,13 @@ function App({ onCreateRemote = () => {} } = {}) {
   // The `?` overlay. Renders only on a keypress, so consecutive idle frames are
   // still byte-identical and the redraw suppression is untouched.
   const [showHelp, setShowHelp] = useState(false);
+  const [helpPage, setHelpPage] = useState(0);
   // Set once, ICON_HINT_AFTER_MS into a first load that is still running. Never
   // reset: it only gates a line that a resolved tab stops rendering anyway, and
   // clearing it would cost a second state write for no visible difference.
   const [iconHintDue, setIconHintDue] = useState(false);
+  const [actionsSetup, setActionsSetup] = useState({});
+  const actionsSetupRef = useRef(null);
   const [errors, setErrors] = useState({ actions: null, issues: null, prs: null, security: null });
   const [failureContext, setFailureContext] = useState(null);
   const [loading, setLoading] = useState({ actions: false, issues: false, prs: false, security: false });
@@ -17064,6 +17329,9 @@ function App({ onCreateRemote = () => {} } = {}) {
   // transient, and they are the ones worth the space. Derived here at render
   // time rather than cached alongside the notes, because the unchanged-payload
   // short-circuit can skip parse() entirely and a cached string would go stale.
+  // Each unsuccessful source contributes one note; successful sources contribute
+  // none (truncation is separate). Count before collapsing disabled-source notes.
+  const securityAllUnavailable = securityNotes.length === ALERT_SOURCES.length;
   const NOT_ENABLED = /not enabled/i;
   const disabledNotes = securityNotes.filter((n) => NOT_ENABLED.test(n));
   const otherNotes = securityNotes.filter((n) => !NOT_ENABLED.test(n));
@@ -17074,19 +17342,173 @@ function App({ onCreateRemote = () => {} } = {}) {
           ...otherNotes,
         ]
       : securityNotes;
-  // Counts the lines actually rendered, not the notes collected -- getting this
-  // wrong by one row is what makes ink repaint the whole frame.
-  const extraLines =
-    (activeRecovery || tabError || activeGovernorDecision?.coordinationError ||
-      activeGovernorDecision?.mode === "paused" || activeGovernorDecision?.disconnected ||
-      data[tab.key] !== null && !runtimeIdentityCoordinator?.current()
-      ? 3 : NOTICE_ROWS) +
-    (tab.key === "security" && !remoteSetup ? securityLines.length : 0);
-  // Reserve lines for: the tab bar and the divider under it (2), the panel's
-  // top and bottom edges (2), the column header and its separator (2), and
-  // the status line (1), plus a 1-line safety margin. Slack is absorbed by
-  // the spacer in the tree below.
-  const bodyRows = Math.max(1, rows - 8 - extraLines);
+  const admittedCadenceRef = useRef({});
+  // Last *successful* poll per tab, wall-clock. Wall-clock on purpose: a laptop
+  // sleeping is exactly the gap this is meant to report, and a monotonic clock
+  // does not advance across suspend. Never written on the failure path, or a
+  // persistently failing tab would report itself fresh forever.
+  const lastOkRef = useRef(
+    Object.fromEntries(
+      TABS.flatMap((candidate) => {
+        const cachedTab = cachedEntry?.tabs[candidate.key];
+        const cachedAge = collectorCachedSourceAge(cachedTab);
+        const lastOk = cachedAge === null ? cachedTab?.lastOk : Date.now() - cachedAge;
+        return lastOk == null ? [] : [[candidate.key, lastOk]];
+      }),
+    ),
+  );
+  const collectorSourceAgeRef = useRef(Object.fromEntries(TABS.flatMap((candidate) => {
+    const cachedTab = cachedEntry?.tabs[candidate.key];
+    const ageMs = collectorCachedSourceAge(cachedTab);
+    return ageMs === null ? [] : [[candidate.key, { ageMs, measuredAt: performance.now() }]];
+  })));
+  const statusDisconnected = runtime.connect !== null
+    ? activeGovernorDecision?.disconnected === true
+    : data[tab.key] !== null && !runtimeIdentityCoordinator?.current();
+  const items = data[tab.key];
+  const displayError = formatTabErrorForWidth(tabError, failureContext, Math.max(1, cols - 5));
+  const coordinationError = activeGovernorDecision?.coordinationError && !remoteSetup;
+  const coordinationReason = activeFailure ?? activeGovernorDecision?.reason ?? "unavailable";
+  const noticeReason = activeRecovery?.code ??
+    (tabError?.kind === "fetch" ? tabError.verdict : null) ??
+    (coordinationError || activeGovernorDecision?.mode === "paused" ? coordinationReason : null) ??
+    (statusDisconnected ? runtime.connect === null ? "identity-unavailable"
+      : activeGovernorDecision?.reason === "app-auth" ? "app-auth" : "disconnected" : null);
+  // A continuous fault stays sustained when its explanation becomes more
+  // specific. Only losing the fault (or switching tabs) restarts the debounce.
+  const coordinationCondition = !remoteSetup && noticeReason ? tab.key : null;
+  useEffect(() => {
+    setVisibleCoordinationCondition(null);
+    if (coordinationCondition === null) return;
+    const timer = setTimeout(
+      () => setVisibleCoordinationCondition(coordinationCondition),
+      COORDINATION_NOTICE_AFTER_MS,
+    );
+    return () => clearTimeout(timer);
+  }, [coordinationCondition]);
+  const showCoordinationNotice = coordinationCondition !== null &&
+    visibleCoordinationCondition === coordinationCondition;
+  const noticeResource = activeResource;
+  const noticeSourceAt = collectorSourceAgeRef.current[tab.key]
+    ? now.getTime() - collectorSourceAgeRef.current[tab.key].ageMs -
+      Math.max(0, performance.now() - collectorSourceAgeRef.current[tab.key].measuredAt)
+    : lastOkRef.current[tab.key] ?? null;
+  const noticeCause = activeRecovery ?? (noticeReason ? recoveryCause({
+    reason: noticeReason === "other" ? "network-outage" : noticeReason,
+    resource: noticeResource, sourceAt: noticeSourceAt,
+    retryAt: activeGovernorDecision?.retryAt ?? activeGovernorDecision?.resetMs ??
+      activeGovernorDecision?.notBefore ?? null,
+    origin: tabError ? "source" : "coordination", tab: tabError ? tab.key : null,
+  }) : null);
+  const recoveryLines = showCoordinationNotice && noticeCause
+    ? presentRecovery(noticeCause, { nowMs: now.getTime(), cols, hasSnapshot: items !== null })
+    : [!remoteSetup && displayError ? displayError : ""];
+  const noticeTone = showCoordinationNotice ? ATTENTION : displayError ? ERROR_TEXT : undefined;
+  // Data can be arbitrarily old without anything on screen saying so: a failing
+  // poll only surfaces on the tab you have selected, and after a laptop sleep
+  // every pane is plausible and wrong. Threshold-gated and minute-granular on
+  // purpose -- see STALE_AFTER_MS.
+  // Read from the ref written on every successful poll, not from meta.at, which
+  // only moves when the *payload* changes -- see lastOkRef. Reading a ref during
+  // render lags by one render, which is harmless here because `now` advances on
+  // its own and the label is minute-granular by design.
+  const collectorAge = collectorSourceAgeRef.current[tab.key];
+  const sourceAgeMs = collectorAge
+    ? collectorAge.ageMs + Math.max(0, performance.now() - collectorAge.measuredAt)
+    : null;
+  const lastOk = sourceAgeMs === null ? lastOkRef.current[tab.key] : now.getTime() - sourceAgeMs;
+  const staleFor = sourceAgeMs ?? (lastOk == null ? null : now.getTime() - lastOk);
+  const staleAt = freshnessDeadline({
+    lastOk,
+    refreshMs: runtime.refreshMs,
+    grantedMs: admittedCadenceRef.current[tab.key]?.grantedMs,
+    governorDecision: activeGovernorDecision,
+    currentEpochs: governorEpochs,
+  });
+  const staleLabel =
+    staleFor != null && staleAt != null && now.getTime() > staleAt
+      ? formatDuration(staleFor)
+      : null;
+  // A quiet dashboard's display clock can precede a newly completed request.
+  // Compare source clocks with actual render time, without adding a timer.
+  const presentationNow = Date.now();
+  const selectedTarget = dashboardTarget();
+  const presentation = dashboardPresentation({
+    tab: tab.key, rows: items, hasSnapshot: items !== null,
+    sourceAt: sourceAgeMs === null ? lastOk : presentationNow - sourceAgeMs,
+    nowMs: presentationNow, overdue: Boolean(staleLabel),
+    onDemand: runtime.background === "on-demand" && tab.key !== "actions" &&
+      items !== null && !loading[tab.key] && !activeRequestStatus,
+    requestState: loading[tab.key] || activeRequestStatus ? "loading"
+      : items === null && waiting[tab.key] ? "waiting" : "idle",
+    error: tabError || activeFailure, recovery: noticeCause, diagnostic: displayError,
+    disconnected: statusDisconnected, securityNotes: securityLines, securityAllUnavailable,
+    target: selectedTarget.label,
+  });
+  const setupView = tab.key === "actions" ? actionsSetupPresentation(actionsSetup, presentationNow) : null;
+  if (tab.key === "actions") {
+    const url = actionsPageUrl(selectedTarget);
+    if (runtime.connect !== null && setupView.title && (statusDisconnected || noticeCause || tabError)) {
+      setupView.action = `${statusDisconnected ? "Restore connection;" : presentation.action} g Actions; ? Help`;
+    }
+    const showSetupPanel = !presentation.showTable && !remoteSetup &&
+      ((presentation.state === "ready" && !showCoordinationNotice) || runtime.connect !== null);
+    presentation.notes.push(...(setupView.title && !showSetupPanel ? [setupView.title] : []), ...setupView.notes,
+      "Close help with ?, then press s for a read-only setup check or g to open Actions.",
+      ...(url ? [url] : ["Restart with gh-glance --repo owner/name."]));
+    if (showSetupPanel) {
+      if (setupView.title) {
+        presentation.notes.push(`Runs: ${presentation.title}`, presentation.action);
+        presentation.title = setupView.title;
+      }
+      if (setupView.title) presentation.sourceCheck = `Runs: ${presentation.sourceCheck}`;
+      if (setupView.title || presentation.state === "ready") presentation.action = setupView.action;
+    }
+  }
+  if (USING_NERD_ICONS && iconHintDue && items === null && !tabError) {
+    presentation.notes.push("Icons blank? GH_GLANCE_ICONS=unicode");
+  }
+  const panelLines = presentation.showTable ? [] : contextualPanelLayout(presentation, { cols, rows });
+
+  const tableVisible = Array.isArray(items) && items.length > 0;
+  const tableNoticeCapacity = Math.max(0, rows - 9);
+  const needsTableContext = ["failed", "overdue", "waiting"].includes(presentation.state);
+  const shortAction = /gh-glance --doctor/.test(presentation.action) ? "gh-glance --doctor"
+    : /gh auth/.test(presentation.action) ? "Run gh auth status" : presentation.action;
+  const tableNotices = needsTableContext
+    ? tableNoticeCapacity < 4
+      ? tableNoticeCapacity === 1 ? [shortAction]
+        : showCoordinationNotice && noticeCause
+          ? [noticeCause.summary, shortAction, presentation.sourceCheck]
+          : [shortAction, presentation.sourceCheck, presentation.title]
+      : [presentation.title, presentation.sourceCheck, ...recoveryLines.filter(Boolean)]
+    : recoveryLines;
+  const noticeLines = [...new Set([...(showCoordinationNotice ? tableNotices : []),
+    ...(setupView?.title ? [setupView.title, setupView.action, ...setupView.notes] : []),
+    ...tableNotices])].slice(0, tableNoticeCapacity);
+  const visibleSecurityLines = tab.key === "security"
+    ? securityLines.slice(0, Math.max(0, tableNoticeCapacity - noticeLines.length)) : [];
+  const extraLines = !showHelp && !remoteSetup && tableVisible
+    ? noticeLines.length + visibleSecurityLines.length : 0;
+  // Tab strip, divider, frame edges, footer and terminal guard use six rows.
+  // Table headers alone need two more. The same budget drives navigation.
+  const bodyRows = Math.max(1, rows - 6 - (tableVisible && !showHelp ? 2 : 0) - extraLines);
+  let helpPages = [];
+  if (showHelp) {
+    const fullDiagnostic = formatTabError(tabError, failureContext);
+    const helpView = { ...presentation, notes: [
+      ...(fullDiagnostic ? [fullDiagnostic] : []),
+      ...presentation.notes.filter((note) => note !== displayError),
+    ] };
+    helpPages = contextHelpPages({ view: helpView, target: selectedTarget,
+      tab: tab.key, remoteSetup }, keyTableLines(), cols - 5, bodyRows);
+  }
+  const visibleHelpPage = clampHelpPage(helpPage, helpPages.length);
+  const helpPageRef = useRef({ index: 0, count: 0 });
+  helpPageRef.current = { index: visibleHelpPage, count: helpPages.length };
+  useEffect(() => {
+    if (helpPage !== visibleHelpPage) setHelpPage(visibleHelpPage);
+  }, [helpPage, visibleHelpPage]);
 
   // Read at fetch time rather than being a hook dependency, so dragging the
   // pane wider doesn't cancel and restart in-flight requests -- the next tick
@@ -17109,28 +17531,8 @@ function App({ onCreateRemote = () => {} } = {}) {
     ANIMATE && tab.key === "actions" && (data.actions ?? []).some((r) => r.status === "in_progress");
 
   const inFlightRef = useRef({});
-  const admittedCadenceRef = useRef({});
   const rawRef = useRef({});
   const entityRef = useRef(new Map());
-  // Last *successful* poll per tab, wall-clock. Wall-clock on purpose: a laptop
-  // sleeping is exactly the gap this is meant to report, and a monotonic clock
-  // does not advance across suspend. Never written on the failure path, or a
-  // persistently failing tab would report itself fresh forever.
-  const lastOkRef = useRef(
-    Object.fromEntries(
-      TABS.flatMap((candidate) => {
-        const cachedTab = cachedEntry?.tabs[candidate.key];
-        const cachedAge = collectorCachedSourceAge(cachedTab);
-        const lastOk = cachedAge === null ? cachedTab?.lastOk : Date.now() - cachedAge;
-        return lastOk == null ? [] : [[candidate.key, lastOk]];
-      }),
-    ),
-  );
-  const collectorSourceAgeRef = useRef(Object.fromEntries(TABS.flatMap((candidate) => {
-    const cachedTab = cachedEntry?.tabs[candidate.key];
-    const ageMs = collectorCachedSourceAge(cachedTab);
-    return ageMs === null ? [] : [[candidate.key, { ageMs, measuredAt: performance.now() }]];
-  })));
   // Keep server source timestamps separate from client-local age estimates.
   // An SSH receipt's age is measured on the client and cannot prove a new
   // source observation when a cached snapshot is delivered again.
@@ -17426,6 +17828,25 @@ function App({ onCreateRemote = () => {} } = {}) {
   const [openRequests] = useState(() => createOpenRequestRegistry());
   useEffect(() => () => openRequests.abortAll(), [openRequests]);
 
+  function openActionsPage() {
+    const target = dashboardTarget();
+    const url = actionsPageUrl(target);
+    if (!url) {
+      setActionsSetup((state) => ({ ...state, message: "Restart with gh-glance --repo owner/name." }));
+      return;
+    }
+    const accessKey = runtimeIdentityCoordinator?.current()?.accessKey;
+    openRequests.start(`actions-page:${url}`, ({ signal }) => openBrowserUrl(url, signal))?.then(() => {
+      if (actionsPageUrl() === url && runtimeIdentityCoordinator?.current()?.accessKey === accessKey) {
+        setActionsSetup((state) => ({ ...state, message: null, title: null, action: null }));
+      }
+    }).catch((err) => {
+      if (err?.name === "AbortError" || actionsPageUrl() !== url ||
+          runtimeIdentityCoordinator?.current()?.accessKey !== accessKey) return;
+      setActionsSetup((state) => ({ ...state, title: "Actions page unavailable", action: "g Retry; ? Details", message: `Could not open Actions: ${shortErr(err)}. Press g to retry.` }));
+    });
+  }
+
   function openSelected() {
     const { items, key: currentKey, tabKey } = navRef.current;
     const item = items.find((i) => itemKey(i) === currentKey);
@@ -17480,13 +17901,19 @@ function App({ onCreateRemote = () => {} } = {}) {
         flushWidthPreferences();
         exit();
       } else if (showHelpRef.current) {
-        // Any key dismisses -- except quit, handled above, which must never be
-        // swallowed by a modal in a full-screen app. Deliberately does not fall
-        // through to the binding the key would normally trigger: closing the
-        // overlay is the whole intent of that press.
-        setShowHelp(false);
+        // Paging belongs to the modal. Every other ordinary key closes it and
+        // is consumed; quit remains global and width mode retains its ownership.
+        if (input === "n" || input === "p") {
+          setHelpPage(clampHelpPage(helpPageRef.current.index + (input === "n" ? 1 : -1),
+            helpPageRef.current.count));
+        } else setShowHelp(false);
       } else if (input === "?") {
+        setHelpPage(0);
         setShowHelp(true);
+      } else if (input === "s" && TABS[activeIndexRef.current].key === "actions") {
+        void actionsSetupRef.current?.();
+      } else if (input === "g" && TABS[activeIndexRef.current].key === "actions") {
+        openActionsPage();
       } else if (input === "w") {
         enterWidthMode();
       } else if (key.downArrow || input === "j") {
@@ -17615,7 +18042,11 @@ function App({ onCreateRemote = () => {} } = {}) {
         reason, resource, at, retryAt, sourceAt: lastOkRef.current[key] ?? null,
         origin, tab: origin === "source" ? key : null,
       });
-      const hardFailure = ["corrupt", "unwritable", "capacity", "accounting-overflow"].includes(candidate.code);
+      const storageFailures = ["corrupt", "unwritable", "capacity", "accounting-overflow"];
+      const hardFailure = storageFailures.includes(candidate.code);
+      // Contention does not prove that previously unreadable storage recovered.
+      // The existing healthy-control/source-success paths clear that remedy.
+      if (!hardFailure && storageFailures.includes(previous?.code)) return;
       if (!hardFailure && previous?.code === "receipt-retry" &&
           terminalizationBacklogForResource(terminalizationBacklog, scope?.hash, resource) > 0) return;
       if (!hardFailure && previous?.code === "request-queue" &&
@@ -17715,6 +18146,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     // scheduler out, and the Enter hint hands off to `gh repo create`.
     function enterRemoteSetup() {
       if (!runtimeHasNoRepositoryTarget()) return false;
+      retireSetup();
       const failure = toTabError(new Error(NO_REMOTE_ERROR_TEXT));
       setErrors(Object.fromEntries(TABS.map((t) => [t.key, failure])));
       return true;
@@ -18110,7 +18542,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         .finally(() => {
           inFlightRef.current[key] = false;
           delete inFlightStartedAt[key];
-          if (!currentAccess() && !Object.values(inFlightRef.current).some(Boolean) && runtimeIdentityCoordinator?.current()?.quotaKey !== settlementScope.quotaKey) releaseLease(settlementScope, leaseId);
+          if (!currentAccess() && !setupFlight && !Object.values(inFlightRef.current).some(Boolean) && runtimeIdentityCoordinator?.current()?.quotaKey !== settlementScope.quotaKey) releaseLease(settlementScope, leaseId);
           manualInFlight.delete(key);
           onSettled?.();
           if (!cancelled) {
@@ -18136,6 +18568,23 @@ function App({ onCreateRemote = () => {} } = {}) {
     }
 
     const leaseId = governorId();
+    let setupFlight = null;
+    let setupGeneration = 0;
+    let setupPartition = null;
+    let setupState = {};
+    function publishSetup(next) {
+      setupState = next;
+      if (!cancelled) setActionsSetup(next);
+    }
+    function retireSetup() {
+      setupGeneration += 1;
+      if (setupFlight) {
+        setupFlight.retired = true;
+        setupFlight.controller.abort();
+      }
+      setupPartition = null;
+      publishSetup({});
+    }
     const pending = new Map();
     const cleanupQueue = new Set();
     let lastWallAt = Date.now();
@@ -18258,6 +18707,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       }
     }
 
+    actionsSetupRef.current = () => publishSetup({ title: "Standalone only", action: "g Actions; ? Help", message: "Setup checks are available in standalone mode. Press g to open Actions." });
     if (runtime.connect !== null) {
       const repository = effectiveRuntimeRepository({ remoteUrls: runtimeRemoteUrls });
       const host = effectiveRuntimeHost({ remoteUrls: runtimeRemoteUrls });
@@ -18651,13 +19101,14 @@ function App({ onCreateRemote = () => {} } = {}) {
     }
 
     function retireCurrentScope() {
+      retireSetup();
       if (!cleanupScope || !registeredScopeHash) return;
       for (const key of [...pending.keys()]) cancelPending(key, cleanupScope);
       for (const subscription of acquisitionSubscriptions.values()) {
         acquisitionEngine.unsubscribe(subscription.id);
       }
       acquisitionSubscriptions.clear();
-      if (!Object.values(inFlightRef.current).some(Boolean)) releaseLease(cleanupScope, leaseId);
+      if (!setupFlight && !Object.values(inFlightRef.current).some(Boolean)) releaseLease(cleanupScope, leaseId);
     }
 
     // discardData separates the two reasons this runs. An account *change* must
@@ -18733,6 +19184,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         const activeTab = TABS[activeIndexRef.current].key;
         const kept = maintainControlLease(scope, leaseId, runtime.refreshMs, activeTab, nowMs);
         if (kept.ok) return scope;
+        retireSetup();
         registeredScopeHash = null;
         if (governorRef.current?.leaseId === leaseId) governorRef.current = null;
         return null;
@@ -19126,6 +19578,85 @@ function App({ onCreateRemote = () => {} } = {}) {
       } else await transport;
       return { persisted: true, retry: false, kind, key };
     }
+    actionsSetupRef.current = async () => {
+      if (cancelled || setupFlight) return;
+      const nowMs = Date.now();
+      const target = dashboardTarget();
+      if (remoteSetupRef.current || !actionsPageUrl(target)) {
+        publishSetup({ message: "Restart with gh-glance --repo owner/name." });
+        return;
+      }
+      const capturedScope = ensureScope(nowMs);
+      if (!capturedScope) {
+        publishSetup({ ...setupState, error: "Setup check unavailable while account coordination recovers.",
+          retryAt: actionsSetupRetryAt(nowMs) });
+        return;
+      }
+      const partition = JSON.stringify(["standalone", target.host, target.repository, capturedScope.accessKey]);
+      if (setupPartition !== partition) { retireSetup(); setupPartition = partition; }
+      if (setupState.retryAt > nowMs) { publishSetup({ ...setupState }); return; }
+      if (actionsSetupFresh(setupState.result, nowMs)) {
+        publishSetup({ ...setupState, saved: true, error: null, message: null });
+        return;
+      }
+      const generation = setupGeneration;
+      const flight = { controller: new AbortController(), scope: { ...capturedScope, identityProvider: null }, retired: false };
+      setupFlight = flight;
+      const setupSignal = AbortSignal.any([controller.signal, flight.controller.signal]);
+      const current = () => !cancelled && !setupSignal.aborted && generation === setupGeneration &&
+        setupPartition === partition && identity()?.accessKey === capturedScope.accessKey &&
+        actionsPageUrl() === actionsPageUrl(target) && !remoteSetupRef.current;
+      publishSetup({ ...setupState, busy: true, error: null, saved: false, message: null });
+      try {
+        const admitted = await runAdmittedOperation({ scope: capturedScope, leaseId,
+          operation: "setup:actions-workflows", priority: "manual", signal: setupSignal,
+          waitMs: GOVERNOR_ADMISSION_WAIT_MS,
+          run: async (signal) => {
+            const response = await ghApi(actionsSetupArgs(target), {
+              operation: "setup:actions-workflows", signal, includeHeaders: true,
+            });
+            return { ...response, observation: parseActionsSetup(response.body, response.headers), checkedAt: Date.now() };
+          },
+        });
+        if (!current()) return;
+        if (!admitted.ok) {
+          const error = admitted.error;
+          const failedAt = Date.now();
+          let snapshot = inspectGovernor(capturedScope, failedAt);
+          const throttle = classifyThrottle({ ...error?.apiResponse, stderr: errText(error) });
+          let holdUntil = 0;
+          if (classify(error) === "rate-limited" || throttle.kind !== "none") {
+            const budget = snapshot.value?.budgets?.core;
+            const resetMs = throttle.kind === "primary" ? throttle.resetMs
+              : throttle.kind === "secondary" ? transportCooldownDeadline({ ...throttle, at: failedAt })
+                : budget?.resetMs ?? null;
+            holdUntil = resetMs ?? 0;
+            handleRateLimitBlocks("actions", [{ resource: "core", resetMs,
+              epoch: budget?.epoch ?? null }], failedAt);
+            snapshot = inspectGovernor(capturedScope, failedAt);
+          }
+          const retryAt = actionsSetupRetryAt(failedAt, Math.max(
+            holdUntil, snapshot.value?.budgets?.core?.blockUntil ?? 0, admitted.decision?.retryAt ?? 0,
+            admitted.decision?.value?.retryAt ?? 0, admitted.decision?.value?.notBefore ?? 0,
+            admitted.decision?.value?.resetMs ?? 0,
+            error?.retryAt ?? 0, failedAt + githubAppResponseRetryAfter(error?.apiResponse, failedAt)));
+          publishSetup({ ...setupState, busy: false, error: shortErr(error), retryAt });
+          return;
+        }
+        publishSetup({ result: { ...admitted.value.observation, checkedAt: admitted.value.checkedAt }, busy: false });
+        if (terminalizationBacklogForResource(terminalizationBacklog, capturedScope.hash, "core") > 0) {
+          recordRuntimeRecovery("actions", "receipt-retry");
+        }
+      } finally {
+        if (setupFlight === flight) setupFlight = null;
+        if ((cancelled || (flight.retired && flight.scope.hash !== scope?.hash)) &&
+            !Object.values(inFlightRef.current).some(Boolean)) {
+          releaseLease(flight.scope, leaseId);
+        }
+        if (current() && setupState.busy) publishSetup({ ...setupState, busy: false });
+      }
+    };
+
     fetchTabRef.current = (key, { force = false, kind = force ? "manual" : "active" } = {}) => {
       if (kind === "tab-switch") {
         // A newly active subscription is not evidence of quiet: the tab you
@@ -19513,7 +20044,9 @@ function App({ onCreateRemote = () => {} } = {}) {
         acquisitionEngine.unsubscribe(subscription.id);
       }
       acquisitionSubscriptions.clear();
-      if (cleanupScope && registeredScopeHash) releaseLease(cleanupScope, leaseId);
+      retireSetup();
+      actionsSetupRef.current = null;
+      if (cleanupScope && registeredScopeHash && !setupFlight) releaseLease(cleanupScope, leaseId);
       if (governorRef.current?.leaseId === leaseId) governorRef.current = null;
       if (contextCoordinatorRef.current === coordinator) contextCoordinatorRef.current = null;
       // `cancelled` stops state updates from a promise that already resolved;
@@ -19551,9 +20084,6 @@ function App({ onCreateRemote = () => {} } = {}) {
     TABS.map((t) => [t.key, data[t.key] == null && !errors[t.key] && loading[t.key]]),
   );
   const anyFirstLoad = Object.values(firstLoad).some(Boolean);
-  const statusDisconnected = runtime.connect !== null
-    ? activeGovernorDecision?.disconnected === true
-    : data[tab.key] !== null && !runtimeIdentityCoordinator?.current();
   let semanticStatus = refreshStatus({
     widthMode: resizeRef.current.active,
     remoteSetup,
@@ -19593,45 +20123,6 @@ function App({ onCreateRemote = () => {} } = {}) {
     return () => clearTimeout(timer);
   }, [anyFirstLoad, iconHintDue]);
 
-  const items = data[tab.key];
-  const displayError = formatTabErrorForWidth(tabError, failureContext, Math.max(1, cols - 5));
-  const coordinationError = activeGovernorDecision?.coordinationError && !remoteSetup;
-  const coordinationReason = activeFailure ?? activeGovernorDecision?.reason ?? "unavailable";
-  const noticeReason = activeRecovery?.code ??
-    (tabError?.kind === "fetch" ? tabError.verdict : null) ??
-    (coordinationError || activeGovernorDecision?.mode === "paused" ? coordinationReason : null) ??
-    (statusDisconnected ? runtime.connect === null ? "identity-unavailable"
-      : activeGovernorDecision?.reason === "app-auth" ? "app-auth" : "disconnected" : null);
-  // A continuous fault stays sustained when its explanation becomes more
-  // specific. Only losing the fault (or switching tabs) restarts the debounce.
-  const coordinationCondition = !remoteSetup && noticeReason ? tab.key : null;
-  useEffect(() => {
-    setVisibleCoordinationCondition(null);
-    if (coordinationCondition === null) return;
-    const timer = setTimeout(
-      () => setVisibleCoordinationCondition(coordinationCondition),
-      COORDINATION_NOTICE_AFTER_MS,
-    );
-    return () => clearTimeout(timer);
-  }, [coordinationCondition]);
-  const showCoordinationNotice = coordinationCondition !== null &&
-    visibleCoordinationCondition === coordinationCondition;
-  const noticeResource = activeResource;
-  const noticeSourceAt = collectorSourceAgeRef.current[tab.key]
-    ? now.getTime() - collectorSourceAgeRef.current[tab.key].ageMs -
-      Math.max(0, performance.now() - collectorSourceAgeRef.current[tab.key].measuredAt)
-    : lastOkRef.current[tab.key] ?? null;
-  const noticeCause = activeRecovery ?? (noticeReason ? recoveryCause({
-    reason: noticeReason === "other" ? "network-outage" : noticeReason,
-    resource: noticeResource, sourceAt: noticeSourceAt,
-    retryAt: activeGovernorDecision?.retryAt ?? activeGovernorDecision?.resetMs ??
-      activeGovernorDecision?.notBefore ?? null,
-    origin: tabError ? "source" : "coordination", tab: tabError ? tab.key : null,
-  }) : null);
-  const noticeLines = showCoordinationNotice && noticeCause
-    ? presentRecovery(noticeCause, { nowMs: now.getTime(), cols })
-    : [!remoteSetup && displayError ? displayError : ""];
-  const noticeTone = showCoordinationNotice ? ATTENTION : displayError ? ERROR_TEXT : undefined;
   const spin = SPINNER[frame % SPINNER.length];
 
   const counts = Object.fromEntries(
@@ -19673,31 +20164,6 @@ function App({ onCreateRemote = () => {} } = {}) {
     TABS.map((t) => [t.key, Boolean(errors[t.key]) && errors[t.key]?.verdict !== "no-remote"]),
   );
 
-  // Data can be arbitrarily old without anything on screen saying so: a failing
-  // poll only surfaces on the tab you have selected, and after a laptop sleep
-  // every pane is plausible and wrong. Threshold-gated and minute-granular on
-  // purpose -- see STALE_AFTER_MS.
-  // Read from the ref written on every successful poll, not from meta.at, which
-  // only moves when the *payload* changes -- see lastOkRef. Reading a ref during
-  // render lags by one render, which is harmless here because `now` advances on
-  // its own and the label is minute-granular by design.
-  const collectorAge = collectorSourceAgeRef.current[tab.key];
-  const sourceAgeMs = collectorAge
-    ? collectorAge.ageMs + Math.max(0, performance.now() - collectorAge.measuredAt)
-    : null;
-  const lastOk = sourceAgeMs === null ? lastOkRef.current[tab.key] : now.getTime() - sourceAgeMs;
-  const staleFor = sourceAgeMs ?? (lastOk == null ? null : now.getTime() - lastOk);
-  const staleAt = freshnessDeadline({
-    lastOk,
-    refreshMs: runtime.refreshMs,
-    grantedMs: admittedCadenceRef.current[tab.key]?.grantedMs,
-    governorDecision: activeGovernorDecision,
-    currentEpochs: governorEpochs,
-  });
-  const staleLabel =
-    staleFor != null && staleAt != null && now.getTime() > staleAt
-      ? formatDuration(staleFor)
-      : null;
   if (staleLabel && (["watching", "shared"].includes(semanticStatus.kind) ||
       activeFailure && semanticStatus.kind === "paused" &&
       activeGovernorDecision?.cause)) {
@@ -19712,6 +20178,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       !activeFailure && !(tab.key === "security" && securityBlind)) {
     semanticStatus = refreshStatus({ onDemand: true });
   }
+
 
   // A settled on-demand view has no data wake to advance its visible age.
   // Tick only its display clock; source timestamps and acquisition stay idle.
@@ -19763,7 +20230,7 @@ function App({ onCreateRemote = () => {} } = {}) {
   // Bottom-right of the frame, lazygit style: how much of the tab you can
   // currently see out of how much there is.
   const countLabel =
-    items == null
+    !tableVisible
       ? null
       : tabOffset > 0
         ? `${tabOffset + 1}-${tabOffset + visibleItems.length} of ${counts[tab.key]}`
@@ -19777,22 +20244,9 @@ function App({ onCreateRemote = () => {} } = {}) {
   // terminal is doing the clipping.
   const frameCols = Math.max(1, cols - 1);
 
-  // Name the repository in the top edge when it was chosen explicitly, because
-  // then it is not the one you would guess from the working directory. Nothing
-  // on screen said which repo a pane was watching, and the documented workflow is
-  // several panes side by side plus `--repo` from anywhere -- so telling them
-  // apart meant quitting and running --doctor. Only the explicit cases are shown:
-  // resolving the *inferred* repo would cost a subprocess call at startup for a
-  // label that, by definition, names the directory you are already sitting in.
-  //
-  // GH_REPO is read straight from the environment and never went through
-  // parseRepoTarget, so unlike runtime.repo it is unvalidated -- safe() before it
-  // is drawn, on the same rule as every other string this app does not own.
-  // Dropped before the tab name rather than with it: PanelEdge drops its whole
-  // label when it cannot seat one, so a single concatenated string would take the
-  // tab name down with the target at ordinary widths.
-  const target = runtime.repo ?? safe(process.env.GH_REPO ?? "");
-  const withTarget = target ? `${tab.label} · ${target}` : tab.label;
+  // The existing resolver also supplies inferred targets without another lookup.
+  // Complete target and host remain reachable in help when this edge is short.
+  const withTarget = `${tab.label} · ${selectedTarget.label}`;
   const topLabel = frameCols - 3 - withTarget.length >= 0 ? withTarget : tab.label;
 
   // Fixed columns deliberately do not shrink, so BRANCH and TIME stay readable
@@ -19822,8 +20276,8 @@ function App({ onCreateRemote = () => {} } = {}) {
   // avoid, and it was reachable simply by dragging a sidebar narrow. The guard
   // sits after usableSize(), which substitutes DEFAULT_COLS for a 0 reported
   // mid-resize, so a transient zero cannot be mistaken for a genuinely tiny pane.
-  const tooNarrow = frameCols < MIN_COMPACT_WIDTH;
-  const fullHeaderVisible = !compact && !showHelp && !tooNarrow && !remoteSetup;
+  const tooNarrow = tableVisible && frameCols < MIN_COMPACT_WIDTH;
+  const fullHeaderVisible = tableVisible && !compact && !showHelp && !tooNarrow && !remoteSetup;
   const selectedWidthKey = selectedWidthKeyByTab[tab.key] ?? null;
   const selectedWidthColumn = effectiveHeader?.find(
     (column) => column.key === selectedWidthKey,
@@ -19913,23 +20367,22 @@ function App({ onCreateRemote = () => {} } = {}) {
       // recovers immediately -- this is a render-time branch and touches no state.
       // Short enough to survive at the widths it actually appears at -- a message
       // about the pane being too narrow that is itself truncated would be a joke.
-      // Clamped to bodyRows so it can never push the frame past `rows` and
-      // trigger the full repaint the height reservation exists to prevent, and
-      // truncate-end so it degrades rather than wraps in a narrow pane. Every
-      // glyph in KEY_TABLE is plain ASCII, which is what keeps it safe here.
+      // Help is cell-wrapped and paginated within bodyRows, with navigation
+      // and quit reserved on every page. Rendering never adds another wrap.
       showHelp &&
-        helpLines(bodyRows)
+        (helpPages[visibleHelpPage] ?? [])
           .map((line, i) => e(Text, { key: `help${i}`, wrap: "truncate-end" }, line)),
       !showHelp &&
         tooNarrow &&
         e(Text, { dimColor: true, wrap: "truncate-end" }, "too narrow"),
-      ...noticeLines.map((line, index) =>
+      ...(showHelp || !tableVisible ? [] : noticeLines).map((line, index) =>
         e(Text, { key: `recovery:${index}`, color: noticeTone, wrap: "truncate-end" }, line)),
       !showHelp &&
         !tooNarrow &&
         !remoteSetup &&
+        tableVisible &&
         tab.key === "security" &&
-        securityLines.map((note, i) =>
+        visibleSecurityLines.map((note, i) =>
           e(Text, { key: i, dimColor: true, wrap: "truncate-end" }, note),
         ),
       !showHelp &&
@@ -19952,6 +20405,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       !showHelp &&
         !tooNarrow &&
         !remoteSetup &&
+        tableVisible &&
         e(MemoHeaderCells, {
           cells: header,
           selectedWidthKey: resizeRef.current.active ? selectedWidthKey : null,
@@ -19978,49 +20432,23 @@ function App({ onCreateRemote = () => {} } = {}) {
           }),
         );
       }),
-      // Distinguishes "still fetching" from "resolved and empty" in the body,
-      // which is the difference between a dashboard that looks hung and one
-      // that looks correct. Driven by "never resolved" rather than by the
-      // loading flag, which also covers a manual refresh and made a
-      // settled-empty tab swap its message. Suppressed entirely when a tab has
-      // an error and has never resolved: the error line directly above already
-      // says what happened, and "no runs" underneath it reads as a fact about the
-      // repository rather than the absence of an answer.
-      !showHelp &&
-        !tooNarrow &&
-        !remoteSetup &&
-        visibleItems.length === 0 &&
-        !(tabError && items == null) &&
-        e(
-          Text,
-          { dimColor: true },
-          firstLoad[tab.key]
-            ? `${showSpinner ? spin : SPINNER[0]} loading ${tab.label.toLowerCase()}…` +
-              // Appended only once a first fetch has been running for
-              // ICON_HINT_AFTER_MS, so an ordinary start never shows it: the
-              // remedy is for someone looking at a pane of blank boxes, and by
-              // then they have been looking long enough to want an explanation.
-              // Suppressed once icons are already ASCII, since then there is
-              // nothing to fix.
-              (USING_NERD_ICONS && iconHintDue ? "   (icons blank? GH_GLANCE_ICONS=unicode)" : "")
-            : semanticStatus.kind === "paused" || waiting[tab.key]
-              ? "waiting for API budget…"
-            : tab.key === "security" && securityNotes.length === ALERT_SOURCES.length
-              ? "no alert sources available"
-              : `no ${tab.countLabel}`,
-        ),
+      !showHelp && !remoteSetup && !tableVisible &&
+        panelLines.map((line, index) => e(Text, {
+          key: `context:${index}`, wrap: "truncate-end",
+          bold: index === 0, color: index === 0 ? TITLE_COLOR : undefined,
+        }, line)),
       // Pushes the panel's bottom edge down to the foot of the pane, so the
       // frame stays put instead of closing up under the column headers on a
       // tab that only has a handful of rows.
       e(Box, { flexGrow: 1 }),
     ),
-    e(PanelEdge, { width: frameCols, top: false, label: countLabel, labelColor: BORDER_COLOR }),
+    e(PanelEdge, { width: frameCols, top: false, label: showHelp ? null : countLabel, labelColor: BORDER_COLOR }),
     e(StatusBar, {
       status: semanticStatus,
       detail: activeGovernorDecision,
       spin: showSpinner ? spin : null,
-      stale: semanticStatus.kind === "cached" && staleFor != null
-        ? formatDuration(Math.max(0, staleFor)) : staleLabel,
+      stale: semanticStatus.kind === "cached" && Number.isFinite(staleFor) && staleFor >= 0
+        ? formatDuration(staleFor) : staleLabel,
       nowMs: now.getTime(),
       interactive,
       cols: frameCols,
@@ -20465,6 +20893,12 @@ export {
   ghApi,
   actionsRunsArgs,
   actionsWorkflowsArgs,
+  actionsSetupArgs,
+  parseActionsSetup,
+  actionsSetupFresh,
+  actionsSetupRetryAt,
+  actionsPageUrl,
+  openBrowserUrl,
   parseActionsBodies,
   parseActionsRuns,
   parseWorkflowCatalog,
@@ -20633,6 +21067,12 @@ export {
   collectorSourceAdvanced,
   cleanupQueueForResource,
   presentRecovery,
+  dashboardPresentation,
+  contextualPanelLayout,
+  dashboardTarget,
+  contextHelpPages,
+  clampHelpPage,
+  wrapPanelText,
   recordRecoveryTransition,
   safeRecordRecoveryTransition,
   readRecoveryTransitions,
