@@ -14,9 +14,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   journal is half full, so retiring a control receipt never waits on the probe
   publication that a full journal itself blocked. Ledgers already wedged in
   this state recover on their first refresh after upgrading.
+- Pasted or multi-character input such as `12` is ignored instead of being read
+  as a tab number. Single-digit tab keys are unchanged.
+- Webhook events now match configured targets whose repository name differs in
+  case from the name GitHub sends, including access-removal events that fence
+  cached data. Ambiguity across hosts is still rejected.
+- A collector view with an old snapshot shows `Stale` or `Cached` with its
+  source age. It shows `Disconnected`, still with that age, only when the
+  collector connection or its app authorization is lost.
 
 ### Changed
 
+- README: Homebrew installation (`brew install juan294/tap/gh-glance`) is
+  documented, with a note to use one installation method.
+- Development CI monitoring uses Sutura v0.4.0.
 - A journal that is genuinely full of unsettled requests reports "Local
   coordination journal is full" with an automatic retry instead of the hard
   accounting-overflow notice.
