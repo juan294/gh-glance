@@ -7,13 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-10-26
+
 ### Fixed
 
 - A full debt-group journal no longer pins every pane of an account behind
   "Local coordination accounting overflow". Quiescent groups now merge once the
-  journal is half full, so retiring a control receipt never waits on the probe
-  publication that a full journal itself blocked. Ledgers already wedged in
-  this state recover on their first refresh after upgrading.
+  journal is half full, after any active probe finishes or expires, so the
+  journal can free space for retiring a control receipt. Ledgers already wedged
+  in this state recover automatically after upgrading.
 - Pasted or multi-character input such as `12` is ignored instead of being read
   as a tab number. Single-digit tab keys are unchanged.
 - Webhook events now match configured targets whose repository name differs in
@@ -25,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Updated React to 19.3.0 and refreshed existing tooling/action versions.
+  Patched the development-only brace-expansion and Zod vulnerabilities.
 - README: Homebrew installation (`brew install juan294/tap/gh-glance`) is
   documented, with a note to use one installation method.
 - Development CI monitoring uses Sutura v0.4.0.
@@ -1311,7 +1315,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.17.1...HEAD
+[0.17.1]: https://github.com/juan294/gh-glance/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/juan294/gh-glance/compare/v0.16.2...v0.17.0
 [0.16.2]: https://github.com/juan294/gh-glance/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/juan294/gh-glance/compare/v0.16.0...v0.16.1
