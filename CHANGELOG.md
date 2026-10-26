@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A full debt-group journal no longer pins every pane of an account behind
+  "Local coordination accounting overflow". Quiescent groups now merge once the
+  journal is half full, so retiring a control receipt never waits on the probe
+  publication that a full journal itself blocked. Ledgers already wedged in
+  this state recover on their first refresh after upgrading.
+
+### Changed
+
+- A journal that is genuinely full of unsettled requests reports "Local
+  coordination journal is full" with an automatic retry instead of the hard
+  accounting-overflow notice.
+- `gh-glance --doctor` reports debt-journal occupancy as `debt groups`, and
+  for a hard coordination failure, including a ledger that is missing or
+  unreadable, names the state file and the `repair`: quit every pane, move the
+  ledger, its recovery journal and `registry.json` aside, relaunch.
+
 ## [0.17.0] - 2026-10-25
 
 ### Added
