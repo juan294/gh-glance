@@ -8075,7 +8075,7 @@ function mapWebhookInvalidations({ event, payload, config, enterpriseHost = null
     ? config.targets.map((target) => ({ ...target, resources: TAB_KEYS }))
     : config.webhook.targets;
   let targets = mappedTargets.filter((target) =>
-    (!selectedHost || target.host === selectedHost) && (event === "installation" || names.has(target.repo)));
+    (!selectedHost || target.host === selectedHost) && (event === "installation" || names.has(target.repo.toLowerCase())));
   if (["installation", "installation_repositories"].includes(event)) {
     targets = targets.filter((target) => {
       const provider = config.providers[target.provider];
@@ -8085,7 +8085,10 @@ function mapWebhookInvalidations({ event, payload, config, enterpriseHost = null
   }
   if (!selectedHost && event !== "installation") {
     const hostsByRepo = new Map();
-    for (const target of targets) hostsByRepo.set(target.repo, (hostsByRepo.get(target.repo) ?? new Set()).add(target.host));
+    for (const target of targets) {
+      const repo = target.repo.toLowerCase();
+      hostsByRepo.set(repo, (hostsByRepo.get(repo) ?? new Set()).add(target.host));
+    }
     if ([...hostsByRepo.values()].some((hosts) => hosts.size !== 1)) return { ok: false, reason: "target" };
   }
   if (targets.length === 0) return ["installation", "installation_repositories"].includes(event)
@@ -17937,7 +17940,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         // which is exactly when the key is most likely to be pressed.
         const request = manualRefreshRequest(refreshIntent(input));
         if (request) fetchTabRef.current?.(TABS[activeIndexRef.current].key, request);
-      } else if (input >= "1" && input <= String(TABS.length)) {
+      } else if (input.length === 1 && input >= "1" && input <= String(TABS.length)) {
         setActiveIndex(Number(input) - 1);
       } else if (key.tab && key.shift) {
         setActiveIndex((i) => (i - 1 + TABS.length) % TABS.length);

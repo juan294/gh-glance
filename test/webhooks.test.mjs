@@ -512,6 +512,58 @@ test("HOOK-01/06: event mapping is allowlisted, resource-specific, and access re
   ["actions", "issues", "prs", "security"], "access removal must fence uncovered subscriptions too");
 });
 
+test("HOOK-06: mixed-case access events retain resource, provider and installation boundaries", () => {
+  const target = { ...TARGET, repo: "Acme/Widget" };
+  const config = normalizeCollectorConfig({ ...CONFIG, targets: [target],
+    webhook: { ...CONFIG.webhook, targets: [{ ...target, resources: ["issues"] }] } });
+  const resources = ["actions", "issues", "prs", "security"];
+  for (const full_name of ["acme/widget", "ACME/Widget"]) {
+    const payload = { action: "privatized", repository: { full_name } };
+    const access = mapWebhookInvalidations({ event: "repository", payload, config });
+    assert.equal(access.ok, true);
+    assert.deepEqual(access.invalidations, resources.map((resource) => ({
+      host: target.host, repo: target.repo, provider: target.provider, resource, accessRemoved: true,
+    })), "access removal fences even resources outside webhook coverage without rewriting display names");
+    const ordinary = mapWebhookInvalidations({ event: "issues", payload, config });
+    assert.deepEqual(ordinary.invalidations.map((item) => [item.resource, item.accessRemoved]), [["issues", false]]);
+  }
+  const appTarget = { ...target, provider: "app" };
+  const appProvider = { type: "github-app", host: "github.com", clientId: "Iv1.fixture",
+    installationId: 123, privateKeyFile: "/private/app.pem", repositoryIds: [101],
+    permissions: { metadata: "read", actions: "read", issues: "read", pull_requests: "read" } };
+  const appConfig = normalizeCollectorConfig({ ...CONFIG, providers: { app: appProvider }, targets: [appTarget],
+    webhook: { ...CONFIG.webhook, targets: [{ ...appTarget, resources: ["issues"] }] } });
+  const payload = { action: "removed", installation: { id: 123 },
+    repositories_removed: [{ full_name: "aCME/wIDGET" }] };
+  const event = "installation_repositories";
+  const removal = mapWebhookInvalidations({ event, payload, config: appConfig });
+  assert.deepEqual(removal.invalidations, resources.map((resource) => ({
+    host: appTarget.host, repo: appTarget.repo, provider: "app", resource, accessRemoved: true,
+  })));
+  assert.deepEqual(mapWebhookInvalidations({ event, payload, config }).invalidations, [],
+    "an installation event cannot fence a personal provider");
+  assert.deepEqual(mapWebhookInvalidations({ event, config: appConfig,
+    payload: { ...payload, installation: { id: 456 } } }).invalidations, [],
+  "a different installation cannot fence this provider");
+});
+
+test("HOOK-06: mixed-case access targets retain cross-host ambiguity rejection", () => {
+  const targets = [{ ...TARGET, repo: "Acme/Widget" },
+    { host: "git.example.com", repo: "acme/WIDGET", provider: "enterprise" }];
+  const config = normalizeCollectorConfig({ ...CONFIG,
+    providers: { ...CONFIG.providers, enterprise: { type: "gh", host: "git.example.com" } },
+    targets, webhook: { ...CONFIG.webhook, targets: targets.map((target) => ({ ...target, resources: ["issues"] })) },
+  });
+  const event = "repository";
+  const payload = { action: "privatized", repository: { full_name: "ACME/widget" } };
+  assert.deepEqual(mapWebhookInvalidations({ event, payload, config }), { ok: false, reason: "target" });
+  const scoped = mapWebhookInvalidations({ event, payload, config, enterpriseHost: "git.example.com" });
+  assert.equal(scoped.ok, true);
+  assert.equal(scoped.invalidations.length, 4);
+  assert.ok(scoped.invalidations.every((item) => item.host === "git.example.com" &&
+    item.provider === "enterprise" && item.repo === "acme/WIDGET" && item.accessRemoved));
+});
+
 test("HOOK-05/06: only explicitly covered quiet resources receive five-minute reconciliation", () => {
   assert.equal(webhookReconciliationInterval({ covered: true, resource: "issues", floorMs: 5_000,
     rows: [], unchangedCount: 0 }), null);

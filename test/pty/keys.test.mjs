@@ -125,6 +125,22 @@ test("a digit switches tabs", () => {
   );
 });
 
+test("pasted numeric chunks are ignored while single-digit navigation still works", () => {
+  const result = capture({
+    cols: 80, rows: 24, signal: "none", settle: 30,
+    env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
+    // Each paste is one input chunk. In particular, 2q must not replay q as quit.
+    stdin: waitForActionsRows +
+      "printf '12'; sleep .3; printf '2foo'; sleep .3; printf '2q'; sleep .3; " +
+      "printf '2'; " +
+      waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "SIGTERM erases") { ok=1 }', 100) +
+      "printf 'q'; sleep 1",
+  });
+  assertCleanInteractiveCapture(result, { cols: 80, rows: 24, label: "pasted input" });
+  assert.match(result.finalFrame.lines.join("\n"), /SIGTERM erases/,
+    "the later single digit must still select and display Issues");
+});
+
 test("q quits cleanly and leaves nothing on the primary buffer", () => {
   // The clean-quit counterpart to the SIGTERM assertion in e2e.test.mjs.
   // Together they are the pair that distinguishes #41: this path was always
