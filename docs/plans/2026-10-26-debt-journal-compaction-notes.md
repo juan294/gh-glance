@@ -91,3 +91,5 @@ Phase 2 final gate on the simplified candidate (`290d8ed` plus index.mjs, test/d
 Both phases are committed on `fix/debt-journal-compaction` and merged into `develop` locally. No push, release or publication was authorized or performed; `develop` is ahead of `origin/develop` by these commits. The task worktree was removed after integration; the plan, phase files, research and these notes are tracked in the repository.
 
 Remaining manual acceptance (owner's work machine): after the next release that carries this change, `gh-glance --doctor` should show `debt groups` and the three avolta-ag panes should refresh. The owner already recovered that machine on 2026-10-26 by moving the ledger, its journal and `registry.json` aside. Open research item, unchanged: why probes failed in sub-second bursts on 2026-10-19.
+
+Integration gate on merged `develop` (`2a74385`, which also carries another session's `461474b`), log `integration-gate.log` in the session scratchpad: `npm run lint` pass, `node --check index.mjs` pass, `npm test` 841/841 pass, `npm run test:efficiency` 9/9 pass, `npm run test:pty:smoke` 7/7 pass. Worktree and branch removed after this record.
