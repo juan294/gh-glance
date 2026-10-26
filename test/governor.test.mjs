@@ -35,6 +35,9 @@ import {
   GOVERNOR_MAX_LEASES,
   GOVERNOR_MAX_INTENTS,
   GOVERNOR_MAX_RESERVATIONS,
+  GOVERNOR_MAX_DEBT_GROUPS,
+  DEBT_JOURNAL_COMPACT_AT,
+  UNKNOWN_DEBT_GROUP_ID,
   GOVERNOR_PROBE_DRAIN_MS,
   GOVERNOR_PROBE_LEASE_MS,
   claimProbe,
@@ -109,6 +112,8 @@ import {
   withGovernorLock,
   writeGovernorState,
   readGovernorState,
+  normalizeGovernorState,
+  serializeGovernorState,
   IDENTITY_UNCERTAIN_MAX_MS,
 } from "../index.mjs";
 
@@ -235,13 +240,15 @@ function intent(id, leaseId, now = NOW, overrides = {}) {
   };
 }
 
-function testDebtGroup({ units = 1, at, revision = 1, quiescent = true } = {}) {
+function testDebtGroup({ units = 1, at, revision = 1, quiescent = true, resource = "core",
+  ownerNonce = null, bootId = null } = {}) {
   return {
-    nonce: randomUUID(), ownerNonce: null, ownerPid: null, ownerBirth: null, bootId: null,
-    unknownChild: true, sealed: true, quiescent,
-    units: { core: units, graphql: 0 }, counts: { core: 1, graphql: 0 }, at,
+    nonce: randomUUID(), ownerNonce,
+    ownerPid: ownerNonce ? process.pid : null, ownerBirth: ownerNonce ? "owner-birth" : null, bootId,
+    unknownChild: ownerNonce === null, sealed: true, quiescent,
+    units: { core: 0, graphql: 0, [resource]: units }, counts: { core: 0, graphql: 0, [resource]: 1 }, at,
     barrierAt: quiescent ? at : null,
-    barrierRevisions: { core: quiescent ? revision : 0, graphql: 0 },
+    barrierRevisions: { core: 0, graphql: 0, [resource]: quiescent ? revision : 0 },
   };
 }
 
@@ -3719,9 +3726,16 @@ test("a full debt journal defers compaction so an old-boot observer can free spa
     { core: { limit: 5000, used: 1, remaining: 4999, resetMs: NOW + 3_600_000 } },
     claimAt + 1, "core").ok, true);
   const released = inspectGovernor(box.scope, claimAt + 1).value;
+  // Journal compaction merged the 127 same-boot quiescent groups at compactAt
+  // (the prior-boot group keeps its own bucket), so the claim already had a
+  // slot to seal the expired child. Its dispatch never reported terminal, so
+  // that group stays unresolved; the publication retires the 128 snapshot
+  // units and leaves exactly the child's unit behind.
   assert.equal(released.debt.core.quiescentUnits, 0);
-  assert.equal(released.debt.core.unresolvedUnits, 0);
-  assert.ok(released.reservations[granted.reservationId]);
+  assert.equal(released.debt.core.unresolvedUnits, 1);
+  assert.equal(released.reservations[granted.reservationId], undefined,
+    "the expired child was sealed once compaction freed a slot");
+  assert.equal(Object.keys(released.debtGroups).length, 1);
   assert.equal(registerLease(box.scope, lease(leaseId, claimAt + 2), claimAt + 2).ok, true);
   assert.equal(inspectGovernor(box.scope, claimAt + 2).value.debt.core.unresolvedUnits, 1);
 });
@@ -4472,4 +4486,177 @@ test("SET-06 setup admission and receipt outcomes preserve one declared request 
     assert.equal(settled.actualCosts.core, 1);
     assert.equal(calls, 1);
   }
+});
+
+// ---------- Debt-journal compaction (2026-10-26 plan) ----------
+
+function journalControlReceipt(scope, resource, at, bootId) {
+  const costs = { core: 0, graphql: 0, [resource]: 1 };
+  return {
+    leaseId: randomUUID(), intentId: randomUUID(), costs, actualCosts: null,
+    accountedCosts: { core: 0, graphql: 0 }, notBefore: at, status: "started",
+    epochs: { core: null, graphql: null }, startedAt: at, completedAt: null, outcome: null,
+    receipt: {
+      scopeHash: scope.hash, ownerNonce: randomUUID(), generation: randomUUID(),
+      ownerPid: process.pid, ownerBirth: "owner-birth", bootId,
+      deadline: at + 60_000, allowance: { ...costs },
+      dispatches: [{ sequence: 1, operation: "graphql-observer", costs: { ...costs },
+        issuedAt: at, terminalAt: at, childPid: null, childBirth: null, neverStarted: false }],
+    },
+  };
+}
+
+// Fills the journal to its cap with single-unit groups that have known owners,
+// except the last one, which is the owner-less shared group, and sets the debt
+// totals the loader checks against the groups.
+function fillJournal(state, { quiescent, at, resources = () => "graphql", bootId = () => null }) {
+  const totals = { core: 0, graphql: 0 };
+  for (let index = 0; index < GOVERNOR_MAX_DEBT_GROUPS; index += 1) {
+    const resource = resources(index);
+    const id = index === GOVERNOR_MAX_DEBT_GROUPS - 1 ? UNKNOWN_DEBT_GROUP_ID : randomUUID();
+    state.debtGroups[id] = testDebtGroup({ resource, at, quiescent,
+      ownerNonce: id === UNKNOWN_DEBT_GROUP_ID ? null : randomUUID(), bootId: bootId(index) });
+    totals[resource] += 1;
+  }
+  for (const resource of RATE_RESOURCES) {
+    state.debt[resource] = quiescent
+      ? { unresolvedUnits: 0, unresolvedCount: 0, quiescentUnits: totals[resource], quiescentCount: totals[resource], revision: 1 }
+      : { unresolvedUnits: totals[resource], unresolvedCount: totals[resource], quiescentUnits: 0, quiescentCount: 0, revision: 1 };
+  }
+}
+
+test("a full quiescent debt journal compacts before a claim retires its control receipt", (t) => {
+  // The researched 2026-10-19 ledger: 128 quiescent single-unit groups (120 GraphQL,
+  // 8 core, one of them owner-less), one started GraphQL control receipt with a
+  // terminal dispatch whose generation has no group, and no live probe claim.
+  const box = sandbox(t, { authIdentity: "full-quiescent-journal" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const state = inspectGovernor(box.scope, NOW).value;
+  const at = NOW - 1;
+  fillJournal(state, { quiescent: true, at,
+    resources: (index) => (index < 120 ? "graphql" : "core"),
+    bootId: (index) => `boot-${index % 2}` });
+  state.controlReceipts.graphql = journalControlReceipt(box.scope, "graphql", at, "boot-0");
+  state.observers.graphql.nextAt = NOW;
+  assert.equal(writeGovernorState(box.scope.path, state).ok, true);
+  assert.equal(Object.keys(inspectGovernor(box.scope, NOW).value.debtGroups).length, GOVERNOR_MAX_DEBT_GROUPS);
+
+  const claimAt = NOW + 1;
+  const claim = claimProbe(box.scope, leaseId, claimAt, "graphql");
+  assert.equal(claim.ok, true, JSON.stringify(claim));
+  assert.equal(claim.value.status, "claimed");
+  const compacted = inspectGovernor(box.scope, claimAt);
+  assert.equal(compacted.ok, true, "the compacted ledger must load");
+  const groups = Object.values(compacted.value.debtGroups);
+  assert.equal(groups.length, 3, "one merged group per boot plus the retired receipt's own group");
+  // The loader rejects a ledger whose group sums differ from its debt totals,
+  // so a successful round trip also proves the merged groups add up.
+  const reloaded = normalizeGovernorState(JSON.parse(serializeGovernorState(compacted.value)), claimAt);
+  assert.ok(reloaded, "the compacted ledger round-trips through serialization");
+  assert.deepEqual(reloaded.debt, compacted.value.debt);
+  const debt = compacted.value.debt;
+  assert.equal(debt.graphql.unresolvedUnits + debt.graphql.quiescentUnits, 121);
+  assert.equal(debt.core.unresolvedUnits + debt.core.quiescentUnits, 8);
+  for (const group of groups) {
+    assert.equal(group.sealed, true);
+    if (group.ownerNonce === null) assert.equal(group.unknownChild, true);
+  }
+  assert.equal(acknowledgeSealedGeneration(box.scope,
+    { generation: UNKNOWN_DEBT_GROUP_ID, ownerNonce: randomUUID() }, randomUUID(), claimAt).value.status,
+  "absent", "a merged-away generation is already the acknowledged outcome");
+
+  const published = publishProbe(box.scope, leaseId, claim.value.nonce, budgets(claimAt), claimAt, "graphql");
+  assert.equal(published.ok, true, JSON.stringify(published));
+  const retired = inspectGovernor(box.scope, claimAt).value;
+  assert.equal(retired.debt.graphql.quiescentUnits + retired.debt.graphql.unresolvedUnits, 1,
+    "publishing retires the merged quiescent GraphQL debt and keeps the receipt retired this claim");
+  assert.equal(retired.debt.core.quiescentUnits, 8, "a GraphQL publication leaves core debt alone");
+  assert.equal(Object.values(retired.debtGroups).some((group) => group.units.graphql > 1), false);
+});
+
+test("a full journal of unsettled owner generations reports debt-journal-full and settles by itself", (t) => {
+  const box = sandbox(t, { authIdentity: "full-unsettled-journal" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const state = inspectGovernor(box.scope, NOW).value;
+  fillJournal(state, { quiescent: false, at: NOW - 1 });
+  // An explicit boot id keeps the shared-group lookup from matching the
+  // owner-less group whatever coordinationBootId() returns on the test host.
+  state.controlReceipts.graphql = journalControlReceipt(box.scope, "graphql", NOW - 1, "boot-live");
+  state.observers.graphql.nextAt = NOW;
+  assert.equal(writeGovernorState(box.scope.path, state).ok, true);
+  const before = readFileSync(box.scope.path);
+
+  const claim = claimProbe(box.scope, leaseId, NOW + 1, "graphql");
+  assert.equal(claim.ok, false);
+  assert.equal(claim.reason, "debt-journal-full");
+  assert.ok(Number.isFinite(claim.retryAt) && claim.retryAt > NOW + 1, "a full journal names when to retry");
+  assert.ok(claim.retryAt <= NOW + 1 + BUDGET_PROBE_MS, "retry is bounded by the probe interval");
+  assert.deepEqual(readFileSync(box.scope.path), before, "a rejected claim writes nothing");
+  assert.equal(inspectGovernor(box.scope, NOW + 1).value.debt.graphql.unresolvedUnits, GOVERNOR_MAX_DEBT_GROUPS);
+
+  const settledAt = NOW + IDENTITY_UNCERTAIN_MAX_MS + 1;
+  assert.equal(registerLease(box.scope, lease(leaseId, settledAt), settledAt).ok, true);
+  const settled = inspectGovernor(box.scope, settledAt).value;
+  assert.ok(Object.keys(settled.debtGroups).length < GOVERNOR_MAX_DEBT_GROUPS,
+    "outliving the uncertainty window quiesces the generations and compaction merges them");
+  assert.equal(settled.debt.graphql.quiescentUnits, GOVERNOR_MAX_DEBT_GROUPS);
+  assert.equal(settled.debt.graphql.unresolvedUnits, 0);
+  const later = claimProbe(box.scope, leaseId, settledAt + 1, "graphql");
+  assert.equal(later.ok, true, JSON.stringify(later));
+  assert.equal(later.value.status, "claimed");
+});
+
+test("compaction waits for a live probe claim and the merged group retires on the next publication", (t) => {
+  const box = sandbox(t, { authIdentity: "compaction-live-claim" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const claimAt = NOW + 1;
+  const live = claimNow(box.scope, leaseId, claimAt, "core");
+  assert.ok(live.value.leaseUntil > claimAt);
+  const state = inspectGovernor(box.scope, claimAt).value;
+  fillJournal(state, { quiescent: true, at: NOW - 1, resources: () => "core" });
+  assert.equal(writeGovernorState(box.scope.path, state).ok, true);
+
+  assert.equal(heartbeatLease(box.scope, leaseId, { core: 1, graphql: 0 }, claimAt + 1, "actions").ok, true);
+  assert.equal(Object.keys(inspectGovernor(box.scope, claimAt + 1).value.debtGroups).length,
+    GOVERNOR_MAX_DEBT_GROUPS, "a live claim's snapshot keeps every group intact");
+
+  const expiredAt = live.value.leaseUntil + 1;
+  assert.equal(heartbeatLease(box.scope, leaseId, { core: 1, graphql: 0 }, expiredAt, "actions").ok, true);
+  const merged = inspectGovernor(box.scope, expiredAt).value;
+  assert.equal(Object.keys(merged.debtGroups).length, 1, "one boot, one merged quiescent group");
+  const [group] = Object.values(merged.debtGroups);
+  assert.equal(group.units.core, GOVERNOR_MAX_DEBT_GROUPS);
+  assert.equal(group.counts.core, GOVERNOR_MAX_DEBT_GROUPS);
+  assert.equal(group.quiescent, true);
+  assert.equal(group.barrierAt, NOW - 1);
+  assert.equal(merged.debt.core.quiescentUnits, GOVERNOR_MAX_DEBT_GROUPS);
+
+  const next = claimNow(box.scope, leaseId, expiredAt + 1, "core");
+  assert.equal(publishProbe(box.scope, leaseId, next.value.nonce, budgets(expiredAt + 1), expiredAt + 1, "core").ok, true);
+  const retired = inspectGovernor(box.scope, expiredAt + 1).value;
+  assert.equal(retired.debt.core.quiescentUnits, 0);
+  assert.equal(retired.debt.core.quiescentCount, 0);
+  assert.deepEqual(retired.debtGroups, {});
+});
+
+test("journals below the compaction threshold keep their per-generation groups", (t) => {
+  const box = sandbox(t, { authIdentity: "small-journal-untouched" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const state = inspectGovernor(box.scope, NOW).value;
+  const count = DEBT_JOURNAL_COMPACT_AT - 1;
+  for (let index = 0; index < count; index += 1) {
+    state.debtGroups[randomUUID()] = testDebtGroup({ at: NOW - 1 });
+  }
+  state.debt.core = { unresolvedUnits: 0, unresolvedCount: 0, quiescentUnits: count, quiescentCount: count, revision: 1 };
+  assert.equal(writeGovernorState(box.scope.path, state).ok, true);
+  assert.equal(heartbeatLease(box.scope, leaseId, { core: 1, graphql: 0 }, NOW + 1, "actions").ok, true);
+  assert.equal(Object.keys(inspectGovernor(box.scope, NOW + 1).value.debtGroups).length, count);
 });
