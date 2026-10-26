@@ -288,6 +288,8 @@ test("COL-01/02/03: twelve clients share one query and invalid input starts no w
   t.after(() => rmSync(root, { recursive: true, force: true }));
   let starts = 0;
   const refreshes = [];
+  let resolveRefreshes;
+  const receivedRefreshes = new Promise((resolve) => { resolveRefreshes = resolve; });
   const subscribers = new Map();
   const runtime = {
     subscribe({ target, resource, demand: _demand, onSnapshot }) {
@@ -302,7 +304,10 @@ test("COL-01/02/03: twelve clients share one query and invalid input starts no w
       entry.listeners.add(onSnapshot);
       queueMicrotask(() => onSnapshot({ resource, generation: 1, rows: [], pageInfo: null,
         lastSuccessAt: 10, lastChangedAt: 10, nextDueAt: 20, hold: null }));
-      return { updateDemand() {}, refresh(force) { refreshes.push(force); }, inspect() {}, close() {
+      return { updateDemand() {}, refresh(force) {
+        refreshes.push(force);
+        if (refreshes.length === 2) resolveRefreshes();
+      }, inspect() {}, close() {
         entry.listeners.delete(onSnapshot);
         entry.refs -= 1;
       } };
@@ -337,7 +342,7 @@ test("COL-01/02/03: twelve clients share one query and invalid input starts no w
   assert.equal(new Set(received.map((frame) => frame.snapshot.lastSuccessAt)).size, 1);
   sockets[0].write(encodeCollectorFrame({ type: "refresh", id: "client-0", force: false }));
   sockets[0].write(encodeCollectorFrame({ type: "refresh", id: "client-0", force: true }));
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await within(receivedRefreshes);
   assert.deepEqual(refreshes, [false, true]);
 
   const hostile = await connect(service.socketPath);
