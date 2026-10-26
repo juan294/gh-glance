@@ -21,6 +21,7 @@ import {
   BUDGET_SNAPSHOT_TTL_MS,
   GOVERNOR_LOCK_ORPHAN_MS,
   GOVERNOR_LEASE_TTL_MS,
+  GOVERNOR_MAX_DEBT_GROUPS,
   acquisitionStorePath,
   claimProbe,
   classify,
@@ -30,6 +31,7 @@ import {
   doctorAcquisitionLockDiagnostic,
   inspectGovernor,
   publishProbe,
+  readIdentityQuotaState,
   redact,
   registerLease,
   recordRecoveryTransition,
@@ -40,6 +42,7 @@ import {
   verboseLogLine,
 } from "../index.mjs";
 import { agedGovernorV6 } from "./fixtures/aged-governor-v6.mjs";
+import { testDebtGroup } from "./fixtures/debt-group.mjs";
 
 const execFileAsync = promisify(execFile);
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -297,7 +300,7 @@ test("D6: corrupt cached quota reports a usable redacted location and cause", as
   const out = await doctor({ probe: false, args: ["--repo", "acme/widget"],
     env: { XDG_CONFIG_HOME: root } });
   assert.match(out, /^cached scope\s+unavailable \(corrupt\)$/m);
-  assert.match(out, new RegExp(`${join(root, "gh-glance", "coordination-v2").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/quota-\\[redacted\\]\\.json`));
+  assert.match(out, redactedStateFile(root));
   assert.doesNotMatch(out, new RegExp(scope.quotaKey));
   assert.deepEqual(readFileSync(scope.path), before);
 });
@@ -904,4 +907,83 @@ test("an out-of-range GH_GLANCE_REFRESH exits 2 naming the variable", async () =
     () => doctor({ env: { GH_GLANCE_REFRESH: "1" } }),
     (err) => err.code === 2 && /GH_GLANCE_REFRESH must be between/.test(err.stderr),
   );
+});
+
+// The `state file` doctor line for a configuration root: the directory is
+// shown, the quota fingerprint is withheld.
+function redactedStateFile(root) {
+  const coordination = join(root, "gh-glance", "coordination-v2").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^state file\\s+${coordination}/quota-\\[redacted\\]\\.json`, "m");
+}
+
+const REPAIR_LINE = /^repair\s+quit every gh-glance pane, then move the state file, its \.recovery\.json and registry\.json/m;
+
+test("D6: doctor reports debt-journal occupancy from the cached ledger without writing it", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-journal-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = await seededDoctorScope(root);
+  const empty = await doctor({ probe: false, args: ["--repo", "acme/widget"], env: { XDG_CONFIG_HOME: root } });
+  assert.match(empty, new RegExp(`^debt groups\\s+0/${GOVERNOR_MAX_DEBT_GROUPS} \\(0 quiescent\\)$`, "m"));
+  const state = JSON.parse(readFileSync(scope.path, "utf8"));
+  const at = Date.now() - 1000;
+  for (let index = 0; index < GOVERNOR_MAX_DEBT_GROUPS; index += 1) {
+    state.debtGroups[randomUUID()] = testDebtGroup({ at });
+  }
+  state.debt.core = { unresolvedUnits: 0, unresolvedCount: 0, quiescentUnits: GOVERNOR_MAX_DEBT_GROUPS,
+    quiescentCount: GOVERNOR_MAX_DEBT_GROUPS, revision: 1 };
+  writeFileSync(scope.path, `${JSON.stringify(state)}\n`);
+  const before = readFileSync(scope.path);
+  const stamp = lstatSync(scope.path).mtimeMs;
+  const out = await doctor({ probe: false, args: ["--repo", "acme/widget"], env: { XDG_CONFIG_HOME: root } });
+  assert.match(out, new RegExp(`^debt groups\\s+${GOVERNOR_MAX_DEBT_GROUPS}/${GOVERNOR_MAX_DEBT_GROUPS} \\(${GOVERNOR_MAX_DEBT_GROUPS} quiescent\\)$`, "m"));
+  assert.match(out, new RegExp(`^core debt units\\s+${GOVERNOR_MAX_DEBT_GROUPS}$`, "m"));
+  assert.doesNotMatch(out, /^repair\s/m, "occupancy alone is not a hard failure");
+  assert.deepEqual(readFileSync(scope.path), before);
+  assert.equal(lstatSync(scope.path).mtimeMs, stamp);
+});
+
+test("D6: doctor names the state file and the three-file remedy only for hard storage reasons", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-repair-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = await seededDoctorScope(root);
+  const at = Date.now();
+  const redacted = redactedStateFile(root);
+
+  assert.equal(recordRecoveryTransition(scope, recoveryCause({ reason: "debt-journal-full", resource: "core",
+    at, retryAt: at + 60_000 })).ok, true);
+  const transient = await doctor({ probe: false, args: ["--repo", "acme/widget"], env: { XDG_CONFIG_HOME: root } });
+  assert.match(transient, /^recovery reason\s+core: debt-journal-full$/m);
+  assert.doesNotMatch(transient, /^repair\s/m);
+  assert.doesNotMatch(transient, redacted);
+
+  assert.equal(recordRecoveryTransition(scope, recoveryCause({ reason: "accounting-overflow", resource: "core",
+    at: at + 1 })).ok, true);
+  const journalBefore = readFileSync(`${scope.path}.recovery.json`, "utf8");
+  const hard = await doctor({ probe: false, args: ["--repo", "acme/widget"], env: { XDG_CONFIG_HOME: root } });
+  assert.match(hard, /^recovery reason\s+core: accounting-overflow$/m);
+  assert.match(hard, redacted);
+  assert.match(hard, REPAIR_LINE);
+  assert.doesNotMatch(hard, new RegExp(scope.quotaKey));
+  assert.equal(readFileSync(`${scope.path}.recovery.json`, "utf8"), journalBefore, "doctor never writes the journal");
+});
+
+test("D6: a known identity with a missing ledger is corrupt; no registry means a fresh ledger", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-registry-guard-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = await seededDoctorScope(root);
+  const now = Date.now();
+  rmSync(scope.path);
+  const known = { identities: { octocat: { quotaKey: scope.quotaKey } }, attempts: {} };
+  assert.equal(readIdentityQuotaState(known, scope, now).reason, "corrupt",
+    "a registry that still lists the quota key refuses to treat the missing ledger as new");
+  const fresh = readIdentityQuotaState({ identities: {}, attempts: {} }, scope, now);
+  assert.equal(fresh.ok, true);
+  assert.equal(fresh.missing, true);
+  // The registry on disk still lists the identity, so doctor must show the
+  // remedy that names registry.json even though no journal can name a reason.
+  const out = await doctor({ probe: false, args: ["--repo", "acme/widget"], env: { XDG_CONFIG_HOME: root } });
+  assert.match(out, /^cached scope\s+unavailable \(corrupt\)$/m, "doctor reports the reason the panes act on");
+  assert.match(out, redactedStateFile(root));
+  assert.match(out, REPAIR_LINE);
+  assert.match(out, /^debt groups\s+unavailable$/m);
 });

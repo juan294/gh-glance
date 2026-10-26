@@ -3275,8 +3275,8 @@ function claimIdentityBootstrap(root, { credentialKey, host, resource = "core", 
   }, { now, kill });
 }
 
-function readIdentityQuotaState(registry, scope, now) {
-  const loaded = readGovernorState(scope.path, now);
+function readIdentityQuotaState(registry, scope, now, options = {}) {
+  const loaded = readGovernorState(scope.path, now, options);
   const known = Object.values(registry.identities).some((identity) => identity.quotaKey === scope.quotaKey) ||
     Object.values(registry.attempts).some((attempt) => attempt.imported && attempt.quotaKey === scope.quotaKey);
   return loaded.ok && loaded.missing && known ? { ok: false, reason: "corrupt" } : loaded;
@@ -6441,9 +6441,12 @@ function governorHealth(result, nowMs = Date.now()) {
   else if (RATE_RESOURCES.some((resource) => !state.budgets[resource] ||
     nowMs - state.budgets[resource].observedAt > budgetSnapshotTtl(resource))) status = "stale";
   else if (RATE_RESOURCES.some((resource) => state.budgets[resource].blockUntil > nowMs)) status = "blocked";
+  const groups = Object.values(state.debtGroups);
   return {
     status,
     leases: Object.keys(state.leases).length,
+    debtGroups: groups.length,
+    quiescentGroups: groups.filter((group) => group.quiescent).length,
     resources: Object.fromEntries(RATE_RESOURCES.flatMap((resource) => {
       const budget = state.budgets[resource];
       return budget ? [[resource, {
@@ -6482,12 +6485,15 @@ function doctorCachedQuotaScope(host, { root = identityRegistryRoot(), nowMs = D
   try {
     if (!lstatSync(path).isFile()) return { ok: false, reason: "unsafe quota path", path };
   } catch (error) {
-    return { ok: false, reason: error?.code === "ENOENT" ? "cached quota missing" : "cached quota unreadable", path };
+    if (error?.code !== "ENOENT") return { ok: false, reason: "cached quota unreadable", path };
   }
-  const result = readGovernorState(path, nowMs, { persistMigration: false });
+  // The runtime's own guard classifies the file: a missing ledger for a quota
+  // key the registry still lists is corrupt, never a fresh start, so doctor
+  // reports the same reason the panes act on.
+  const result = readIdentityQuotaState(registry, { path, quotaKey }, nowMs, { persistMigration: false });
   return result.ok && !result.missing
     ? { ok: true, result, path, quotaKey }
-    : { ok: false, reason: result.missing ? "cached quota missing" : result.reason, path };
+    : { ok: false, reason: result.ok ? "cached quota missing" : result.reason, path };
 }
 
 async function retryGovernorMutation(run, { now, wait, deadline, signal }) {
@@ -11337,6 +11343,11 @@ async function runDoctor({ probeEndpoints = false } = {}) {
     .filter(Boolean).sort((left, right) => right.at - left.at)[0] ?? null;
   const lastFailedRecovery = [...(recoveryJournal?.entries ?? [])].reverse()
     .find((entry) => entry.code !== "clear") ?? null;
+  const ledgerPath = cachedQuota?.path ?? diagnosticScope?.path ?? null;
+  // The journal cannot speak for a ledger that cannot be read, so the cached
+  // read's own reason counts too; both use the governor's reason vocabulary.
+  const hardRecovery = Boolean(ledgerPath) &&
+    [currentRecovery?.code, cachedQuota?.reason].some((reason) => HARD_STORAGE_REASONS.includes(reason));
   const retryDates = RATE_RESOURCES.flatMap((resource) => {
     const active = recoveryJournal?.current[resource];
     const observer = (probeEndpoints ? governorResult : cachedQuota?.result)?.value?.observers[resource];
@@ -11393,11 +11404,16 @@ async function runDoctor({ probeEndpoints = false } = {}) {
     "",
     ...section("API governor"),
     field("cached scope", probeEndpoints ? "verified by probe" : cachedQuota?.ok ? "read-only cached identity" : `unavailable (${cachedQuota?.reason ?? "unknown"})`),
-    ...(cachedQuota?.path && !cachedQuota.ok
-      ? [field("state file", `${join(dirname(cachedQuota.path), "quota-[redacted].json")} (quota fingerprint withheld)`)]
+    // The user has to find the file to move it.
+    ...(ledgerPath && cachedQuota?.ok === false || hardRecovery
+      ? [field("state file", `${join(dirname(ledgerPath), "quota-[redacted].json")} (quota fingerprint withheld)`)]
       : []),
+    ...(hardRecovery ? [field("repair", LEDGER_REPAIR_ADVICE)] : []),
     field("status", governor.status),
     field("live leases", governor.leases),
+    field("debt groups", governor.debtGroups == null
+      ? "unavailable"
+      : `${governor.debtGroups}/${GOVERNOR_MAX_DEBT_GROUPS} (${governor.quiescentGroups} quiescent)`),
     ...RATE_RESOURCES.map((resource) => {
       const detail = governor.resources[resource];
       return field(
@@ -15768,6 +15784,14 @@ function coordinationNotice(reason) {
 const RECOVERY_JOURNAL_MAX_ENTRIES = 128;
 const RECOVERY_JOURNAL_MAX_BYTES = 128 * 1024;
 const RECOVERY_ENTRY_MAX_BYTES = 1024;
+// Reasons that no retry can clear: the ledger itself must be repaired. The
+// runtime keeps them sticky and doctor names the manual remedy for them.
+const HARD_STORAGE_REASONS = Object.freeze(["corrupt", "unwritable", "capacity", "accounting-overflow"]);
+// A source failure on a tab may be superseded by these coordination causes.
+const STICKY_OVER_SOURCE_REASONS = Object.freeze([...HARD_STORAGE_REASONS, "receipt-retry", "interrupted-request"]);
+const LEDGER_REPAIR_ADVICE = "quit every gh-glance pane, then move the state file, its .recovery.json and " +
+  "registry.json out of that directory and relaunch; a fresh ledger starts, and at most the receipt and " +
+  "debt units below (when shown) may be spent twice this hour";
 const RECOVERY_COPY = Object.freeze({
   busy: ["Coordinating with your other panes", "Retry automatically", "Other pane; retry"],
   stale: ["Coordinating with your other panes", "Retry automatically", "Other pane; retry"],
@@ -15861,8 +15885,8 @@ function shouldClearRecoveryCause(cause, { sourceSuccess = false, tab = null, sc
 
 function recoveryRetryAt(decision, budget, observer, nowMs) {
   if (budget?.blockUntil > nowMs) return budget.blockUntil;
-  if (["reservations-invalid", "external-factor-invalid", "pacing-invalid", "budget-resource",
-    "accounting-overflow", "corrupt", "unwritable", "capacity"].includes(decision?.reason)) return null;
+  if ([...HARD_STORAGE_REASONS, "reservations-invalid", "external-factor-invalid", "pacing-invalid",
+    "budget-resource"].includes(decision?.reason)) return null;
   const resetHold = ["budget-reset", "reset", "rate-limit"].includes(decision?.reason);
   if (decision?.mode === "probe" && !resetHold) {
     return observer?.nextAt > nowMs ? observer.nextAt : null;
@@ -18112,18 +18136,16 @@ function App({ onCreateRemote = () => {} } = {}) {
         reason, resource, at, retryAt, sourceAt: lastOkRef.current[key] ?? null,
         origin, tab: origin === "source" ? key : null,
       });
-      const storageFailures = ["corrupt", "unwritable", "capacity", "accounting-overflow"];
-      const hardFailure = storageFailures.includes(candidate.code);
+      const hardFailure = HARD_STORAGE_REASONS.includes(candidate.code);
       // Contention does not prove that previously unreadable storage recovered.
       // The existing healthy-control/source-success paths clear that remedy.
-      if (!hardFailure && storageFailures.includes(previous?.code)) return;
+      if (!hardFailure && HARD_STORAGE_REASONS.includes(previous?.code)) return;
       if (!hardFailure && previous?.code === "receipt-retry" &&
           terminalizationBacklogForResource(terminalizationBacklog, scope?.hash, resource) > 0) return;
       if (!hardFailure && previous?.code === "request-queue" &&
           cleanupQueueForResource(cleanupQueue, resource) > 0) return;
       if (previous?.origin === "source" && previous.tab === key && origin === "coordination" &&
-          !["corrupt", "unwritable", "capacity", "accounting-overflow",
-            "receipt-retry", "interrupted-request"].includes(candidate.code)) return;
+          !STICKY_OVER_SOURCE_REASONS.includes(candidate.code)) return;
       if (previous?.code === candidate.code && previous?.retryAt === candidate.retryAt &&
           previous?.origin === candidate.origin && previous?.tab === candidate.tab &&
           at - previous.at < 60_000) return;
@@ -20894,6 +20916,7 @@ export {
   normalizeGovernorState,
   serializeGovernorState,
   readGovernorState,
+  readIdentityQuotaState,
   writeGovernorState,
   writeGovernorQuotaState,
   pidIsDead,

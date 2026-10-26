@@ -49,3 +49,45 @@ Skipped with reasons: converting `makeDebtGroupQuiescent` to the `null | failure
 Targeted tests (10), lint and `node --check` pass on the simplified candidate; the full gate is recorded below.
 
 Phase 1 final gate on the simplified candidate (`d46132e` plus the uncommitted diff: index.mjs, test/governor.test.mjs, test/recovery.test.mjs, CHANGELOG.md; 355 insertions, 66 deletions), log `phase1-gate3.log` in the session scratchpad: `npm run lint` pass, `node --check index.mjs` pass, `npm test` 836/836 pass, `npm run test:efficiency` 9/9 pass. Phase 1 accepted locally and committed on `fix/debt-journal-compaction`.
+
+## Phase 2
+
+Baseline for this phase: `290d8ed` (Phase 1 committed). Tests were added before the runtime change was evaluated against them: on the Phase 1 runtime with only the `readIdentityQuotaState` export added, "doctor reports debt-journal occupancy" fails (no `debt groups` line) and "doctor names the state file and the three-file remedy" fails (no `repair` line); "a known identity with a missing ledger is corrupt" passes on both because it documents the pre-existing guard that made the owner's first quarantine attempt show `corrupt`.
+
+One pre-existing test, "--doctor reports governor health without a raw scope identifier", failed on the first Phase 2 candidate because the `state file` line was shown whenever the cached read was not `ok`, which in probe mode (no cached read at all) printed the `coordination-v2` directory. The condition now matches the original (`cachedQuota.ok === false`) or a hard recovery reason. The full doctor suite (41) passes.
+
+Deviation: plan step 1 asked for a governor-level test that a scope with no registry file yields a fresh ledger through the identity refresh. Found: identity refresh succeeds in both cases (verified with a scratch probe); the `corrupt` outcome arises later in `startIdentityControl`, which is not reachable from the unit tests. Chose: export `readIdentityQuotaState` and test the guard directly with a registry object that knows the quota key versus an empty one. Why: it is the exact function that produced the observed notice, and the test states the contract the repair text depends on.
+
+### Phase 2 independent review
+
+Reviewer (fresh-context agent, read-only) verdict on the first Phase 2 candidate: request changes, no blockers. It ran the doctor suite (41 pass) and the doctor binary against four scratch configuration roots. Findings and dispositions:
+
+- Finding 1 (should-fix): the `repair` line only printed when a readable ledger's journal held a hard reason, so the two cases the remedy exists for (ledger missing with the registry still listing it, which is the owner's observed `corrupt` case, and an unparseable ledger) showed no remedy. Fixed: a failed cached read whose reason is hard, or is `cached quota missing` with a path (the `readIdentityQuotaState` guard case), now also triggers the `state file` and `repair` lines. The registry-guard test now runs the binary against that state and asserts both lines. This closes the plan's stuck-state row for a ledger moved aside while `registry.json` still lists its identity.
+- Finding 2 (should-fix): the overspend bound named only debt units; receipts stay charged too. Reworded to "receipt and debt units below (when shown)".
+- Finding 3 (test): the exact-key journal assertion now records a cause carrying `debtGroups`/`quiescentGroups` so the projection is exercised.
+- Finding 5 (nit): `storageFailures` alias removed; the source-origin list spreads `HARD_STORAGE_REASONS`.
+- Finding 11 (nit): CHANGELOG names the `debt groups` field and the missing/unreadable case.
+- Findings 4, 6 to 10: no issue (TDZ, probe-mode redaction, `recoveryDetails.core` sufficiency, file names, test determinism, export precedent).
+
+### Phase 2 simplify pass
+
+Four read-only cleanup reviewers (reuse, simplification, efficiency, altitude) read the approved diff. Efficiency: nothing material. Altitude raised two structural points, both applied:
+
+- Doctor classifies a missing or unreadable ledger through the runtime's own guard. `doctorCachedQuotaScope` now calls `readIdentityQuotaState` (with a new `options` passthrough so the doctor read never persists a migration) instead of re-deriving the missing-but-registered case from a doctor-only string. A missing ledger for a registry-listed key reports `unavailable (corrupt)`, the same reason the pane shows, and an unreadable ledger reports `unwritable`, which is hard; both now get the `repair` line.
+- Journal occupancy (`debtGroups`, `quiescentGroups`) lives on `governorHealth`, the resource-independent projection doctor already prints, and `recoveryLedgerSummary` is back to its original shape. The journal-key assertion and the explicit occupancy arguments in the doctor test went away with the carrier.
+
+Also applied: `LEDGER_REPAIR_ADVICE` and `STICKY_OVER_SOURCE_REASONS` constants beside `HARD_STORAGE_REASONS`; `recoveryRetryAt` spreads the hard list; the `ledgerPath`/`cachedFailure`/`hardRecovery` triple collapsed to one predicate; the paraphrasing comments trimmed; `test/fixtures/debt-group.mjs` exports `testDebtGroup` for both test files; `redactedStateFile(root)` and `REPAIR_LINE` replace three hand-built regexes in the doctor tests. The governor health key-set test now lists the two count fields.
+
+Skipped with reasons: dropping the direct `readIdentityQuotaState` unit assertions (they state the fresh-registry branch the binary run cannot show); folding the empty-journal doctor spawn into another test (it documents the baseline line on its own); a `snapshotFile` helper for the "doctor never writes" pattern (three sites, each two lines).
+
+The Phase 2 reviewer was asked to re-check the structural change; its verdict and the final gate are recorded below.
+
+Post-simplify review verdict: approve (179 targeted tests re-run by the reviewer; four read-only doctor runs covering missing, unparseable, permission-denied and hard-journal ledgers, directory unchanged in each, no quota key printed). Two no-change nits: the `state file` condition relies on `&&` binding tighter than `||`, and the move-files advice is less apt for `unwritable`, which the plan included deliberately.
+
+Phase 2 final gate on the simplified candidate (`290d8ed` plus index.mjs, test/doctor.test.mjs, test/governor.test.mjs, test/fixtures/debt-group.mjs, CHANGELOG.md), log `phase2-gate3.log` in the session scratchpad: `npm run lint` pass, `node --check index.mjs` pass, `npm test` 839/839 pass, `npm run test:pty:smoke` 7/7 pass. Phase 2 accepted locally.
+
+## Integration and handoff
+
+Both phases are committed on `fix/debt-journal-compaction` and merged into `develop` locally. No push, release or publication was authorized or performed; `develop` is ahead of `origin/develop` by these commits. The task worktree was removed after integration; the plan, phase files, research and these notes are tracked in the repository.
+
+Remaining manual acceptance (owner's work machine): after the next release that carries this change, `gh-glance --doctor` should show `debt groups` and the three avolta-ag panes should refresh. The owner already recovered that machine on 2026-10-26 by moving the ledger, its journal and `registry.json` aside. Open research item, unchanged: why probes failed in sub-second bursts on 2026-10-19.

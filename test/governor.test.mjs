@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { test } from "node:test";
 import { agedGovernorV6, agedGovernorResiduals } from "./fixtures/aged-governor-v6.mjs";
+import { testDebtGroup } from "./fixtures/debt-group.mjs";
 
 import {
   BUDGET_SNAPSHOT_TTL_MS,
@@ -237,18 +238,6 @@ function intent(id, leaseId, now = NOW, overrides = {}) {
     requestedAt: now,
     expiresAt: now + GOVERNOR_LEASE_TTL_MS,
     ...overrides,
-  };
-}
-
-function testDebtGroup({ units = 1, at, revision = 1, quiescent = true, resource = "core",
-  ownerNonce = null, bootId = null } = {}) {
-  return {
-    nonce: randomUUID(), ownerNonce,
-    ownerPid: ownerNonce ? process.pid : null, ownerBirth: ownerNonce ? "owner-birth" : null, bootId,
-    unknownChild: ownerNonce === null, sealed: true, quiescent,
-    units: { core: 0, graphql: 0, [resource]: units }, counts: { core: 0, graphql: 0, [resource]: 1 }, at,
-    barrierAt: quiescent ? at : null,
-    barrierRevisions: { core: 0, graphql: 0, [resource]: quiescent ? revision : 0 },
   };
 }
 
@@ -4400,7 +4389,9 @@ test("governor health is redacted and discriminates stale, waiting, blocked, and
   recordResourceBlock(scope, "core", NOW + 60_000, "rate-limit");
   const health = governorHealth(inspectGovernor(scope, NOW), NOW);
   assert.equal(health.status, "blocked");
-  assert.deepEqual(Object.keys(health).sort(), ["leases", "resources", "status"]);
+  assert.deepEqual(Object.keys(health).sort(), ["debtGroups", "leases", "quiescentGroups", "resources", "status"]);
+  assert.equal(health.debtGroups, 0);
+  assert.equal(health.quiescentGroups, 0);
 });
 
 

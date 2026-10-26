@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A journal that is genuinely full of unsettled requests reports "Local
   coordination journal is full" with an automatic retry instead of the hard
   accounting-overflow notice.
+- `gh-glance --doctor` reports debt-journal occupancy as `debt groups`, and
+  for a hard coordination failure, including a ledger that is missing or
+  unreadable, names the state file and the `repair`: quit every pane, move the
+  ledger, its recovery journal and `registry.json` aside, relaunch.
 
 ## [0.17.0] - 2026-10-25
 
