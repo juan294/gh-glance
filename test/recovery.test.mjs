@@ -352,3 +352,15 @@ test("D6: capacity-blocking unknown debt displays its exact reserved units", () 
     assert.match(lines.join(" "), /units/);
   }
 });
+
+test("D6: a full debt journal is a transient coordination cause with its own copy and retry", () => {
+  const at = Date.now();
+  const cause = recoveryCause({ reason: "debt-journal-full", resource: "core", at, retryAt: at + 5000 });
+  assert.equal(cause.code, "debt-journal-full");
+  assert.match(cause.summary, /journal/i);
+  assert.match(cause.action, /retry/i);
+  assert.doesNotMatch(cause.action, /doctor/i);
+  assert.equal(recoveryRetryAt({ mode: "paused", reason: "debt-journal-full", retryAt: at + 5000 },
+    { resetMs: at + 3_600_000, blockUntil: 0 }, { nextAt: at + 60_000 }, at), at + 5000);
+  assert.equal(shouldClearRecoveryCause(cause, { scheduledHold: { ok: true, value: "cleared" } }), false);
+});

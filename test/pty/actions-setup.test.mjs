@@ -203,10 +203,19 @@ for (const [cols, rows] of [[24,10],[45,24]]) {
   test(`SET-06 existing storage recovery keeps priority over a saved setup result at ${cols}x${rows}`, (t) => {
     run(t, `
 await until(()=>screen().includes("No workflow runs")&&screen().includes("Watching"));
-send("s"); await until(()=>screen().includes("No workflows found"));
 const registry=JSON.parse(readFileSync(root+"/gh-glance/coordination-v2/registry.json","utf8"));
 const identity=Object.values(registry.identities).find(i=>i.id===1);
 const ledgerPath=root+"/gh-glance/coordination-v2/quota-"+identity.quotaKey+".json";
+// A rendered source result can precede settlement of its admission slot.
+await until(()=>{
+ const ledger=JSON.parse(readFileSync(ledgerPath,"utf8"));
+ const at=Date.now();
+ return ledger.observers.core.outcome==="healthy"&&ledger.budgets.core.laneNextAt<=at&&
+  Object.values(ledger.probeClaims).every(claim=>!claim||claim.leaseUntil<=at)&&
+  Object.values(ledger.reservations).every(item=>!["started","scheduled"].includes(item.status))&&
+  Object.values(ledger.controlReceipts).every(item=>item===null);
+});
+send("s"); await until(()=>screen().includes("No workflows found"));
 const fs=await import("node:fs");
 const ledgerLock=ledgerPath+".lock";
 const registryLock=root+"/gh-glance/coordination-v2/registry.json.lock";
@@ -221,20 +230,25 @@ try {
  if (dimensions.cols===45) {
   // Force a later busy observation while the proven ledger fault persists.
   await lock(registryLock); registryHeld=true;
+  // Let the control wake retire the saved result before testing a new press.
+  await until(()=>!screen().includes("Setup checked:")&&!screen().includes("Saved setup check:")&&
+    !screen().includes("Setup check unavailable"));
   send("s");
-  await until(()=>!screen().includes("Setup checked:")&&!screen().includes("Saved setup check:"));
-  send("s"); await until(()=>screen().includes("Setup check unavailable"));
+  // Acknowledge this press before restoring storage; no queued press may
+  // escape the corrupt-state assertion and run after the lock is released.
+  await until(()=>screen().includes("Setup check unavailable")&&
+    !screen().includes("Setup checked:")&&!screen().includes("Saved setup check:"));
  } else { send("s"); await pause(200); }
  assert.equal(readFileSync(ledgerPath,"utf8"),"fixture corrupt storage");
  assert.ok(screen().includes("--doctor")); save("denied");
- assert.equal(setupCalls().length,1);
+ assert.equal(setupCalls().length,1,"no setup dispatch while storage is corrupt");
 } finally {
  await lock(ledgerLock); writeFileSync(ledgerPath,original); fs.unlinkSync(ledgerLock);
  if(registryHeld)fs.unlinkSync(registryLock);
 }
 send("R"); await until(()=>screen().includes("Watching")&&!screen().includes("--doctor"));
 assert.ok(JSON.parse(readFileSync(ledgerPath,"utf8")).budgets.core);
-assert.equal(setupCalls().length,1);
+assert.equal(setupCalls().length,1,"restoring storage must not replay a setup request");
 `, { cols, rows });
   });
 }

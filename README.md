@@ -121,9 +121,27 @@ current.
 
 ## Install
 
+With Homebrew on macOS or Linux:
+
+```bash
+brew install juan294/tap/gh-glance
+```
+
+Future updates use your normal `brew upgrade`. The
+[Homebrew tap](https://github.com/juan294/homebrew-tap) follows published npm
+releases automatically and supplies its own Node runtime. If moving from npm,
+remove existing npm copies first; the tap README includes migration commands.
+Restart running dashboard panes after upgrading.
+
+Alternatively, install with npm (Node.js 22 or newer):
+
 ```bash
 npm install -g gh-glance
 ```
+
+Use one installation method. NVM keeps global npm packages separate for each
+Node installation, so an npm update may not affect a copy launched from another
+prefix.
 
 That is the whole install for the default standalone dashboard. `gh-glance`
 ships as a single `index.mjs` with no build step, so there is nothing to
@@ -765,11 +783,14 @@ and the lock path separately. A readable metadata file does not make an aged
 orphan lock or invalid snapshot healthy; plain doctor never repairs either.
 When one cached identity names the selected host, plain doctor also reads its
 quota ledger without changing it or contacting GitHub. It reports receipt and
-debt totals, observer age, the current recovery cause, and an actual retry time
-when one is known. If several cached identities match, it says the scope is
-unavailable instead of choosing an account. For a corrupt or unreadable quota
+debt totals, debt-group occupancy (`debt groups`), observer age, the current
+recovery cause, and an actual retry time when one is known. If several cached
+identities match, it says the scope is unavailable instead of choosing an
+account. For a corrupt or unreadable quota
 file, it names the coordination directory and a `quota-[redacted].json` file
-pattern with the cause. The private quota fingerprint stays out of reports.
+pattern with the cause. For a hard coordination failure it also prints a
+`repair` line with the manual steps. The private quota fingerprint stays out of
+reports.
 
 Use `gh-glance --doctor --probe` when live capability evidence is needed. Probe
 mode uses an ephemeral governor lease and admits every quota-consuming endpoint
@@ -1123,7 +1144,8 @@ GH_GLANCE_ICONS=ascii gh-glance
 | `Upgrade waiting for legacy quota reset` | The older panes are gone, but left spend that cannot be proven settled. It waits for the affected rate-limit window to reset rather than assume the quota is free. This one has a deadline and clears itself. |
 | `Upgrade blocked: older spend cannot be settled or waited out` | Older spend has no reliable reset or child evidence. Verify old children ended and use `gh-glance --doctor` to inspect reserved units. An unidentifiable old child may require a verified system restart before a later observer can retire its charge. Keep the quota files as accounting evidence. |
 | `Coordination state unavailable; evidence preserved` | Coordination state could not be read and was deliberately not overwritten, so nothing is lost. Run `gh-glance --doctor` and check the config directory's permissions. |
-| `Local coordination` corruption, overflow, full storage, or unsafe permissions | Run `gh-glance --doctor`; its read-only report gives the exact cause and redacted local file location when known. Repair storage or permissions, then let the app retry. Preserve corrupt and overflow evidence for diagnosis. |
+| `Local coordination journal is full` | Every slot for unsettled or recently settled requests is in use. The app retries by itself, and older requests settle after about an hour. Nothing needs repair. `gh-glance --doctor` shows the occupancy as `debt groups`. |
+| `Local coordination` corruption, overflow, full storage, or unsafe permissions | Run `gh-glance --doctor`; its read-only report gives the exact cause and redacted local file location when known. For a hard failure it also prints a `repair` line: quit every pane, move the state file, its `.recovery.json` and `registry.json` aside, then relaunch. Otherwise repair storage or permissions and let the app retry. Preserve corrupt and overflow evidence for diagnosis. |
 | `Saving request result` or `Recovering interrupted request` | The original request may have consumed quota. The app keeps its charge, retries settlement without repeating HTTP, and waits for safe observer evidence before retiring uncertain debt. |
 | `GitHub request limit` | A shared secondary hold preserves GitHub's retry deadline. Wait for the shown time; if the repeated-limit circuit explicitly asks, press `r` once to retry. Repeated refresh cannot bypass a hold. |
 | `Collector connection unavailable` or `GitHub App authorization unavailable` | Restore the selected collector connection or App authorization. The mode does not switch to independent requests. Cached rows remain labeled with their source age. |

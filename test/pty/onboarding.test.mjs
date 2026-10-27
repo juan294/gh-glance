@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -259,21 +260,42 @@ for (const [name, selector, message, expected, forbidden] of [
 
 test("P1-F09: a future source clock renders Cached without a fabricated footer age", (t) => {
   const box = fixture(t);
-  const preload = join(box.root, "backward-clock.cjs");
-  writeFileSync(preload, `const { existsSync } = require("node:fs");
-const OriginalDate = Date;
-const shiftedNow = () => OriginalDate.now() - (existsSync(process.env.XDG_CONFIG_HOME + "/clock-shift") ? 3600000 : 0);
-global.Date = class extends OriginalDate {
-  constructor(...args) { super(...(args.length ? args : [shiftedNow()])); }
-  static now() { return shiftedNow(); }
-};
-`);
-  const result = capture({ cols: 100, rows: 24, signal: "none", settle: 30,
-    stdin: waitFor("Cached") + 'touch "$XDG_CONFIG_HOME/clock-shift"; ' +
-      waitFor("Last-check time unavailable") + "sleep .2; printf q",
+  const options = { cols: 100, rows: 24, signal: "none", settle: 30,
     args: "--repo acme/widget --tab security", configHome: box.root,
-    env: { GH_GLANCE_FIXTURE_STATE: box.statePath, GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
-      NO_COLOR: "1", NODE_OPTIONS: `--require=${preload}` } });
+    env: { GH_GLANCE_FIXTURE_STATE: box.statePath, GH_GLANCE_CAPTURE_LIVE_FLUSH: "1", NO_COLOR: "1" } };
+  const warm = capture({ ...options, stdin: waitFor("Cached") +
+    waitForAwk('"$XDG_CONFIG_HOME/gh-glance/dashboard-cache.json"', '/"security"/ { ok=1 }', 180) + "printf q" });
+  assert.equal(warm.exitCode, 0);
+
+  // Advance only the saved source clocks. Moving the whole process clock
+  // backward correctly triggers Paused recovery, which is a different case.
+  const future = Date.now() + 3_600_000;
+  const storePath = join(box.root, "gh-glance/coordination-v2/acquisition.json");
+  const store = JSON.parse(readFileSync(storePath, "utf8"));
+  const record = Object.values(store.queries).find((entry) => entry.query.resource === "security");
+  assert.ok(record?.snapshot, "warm Security observation did not persist a snapshot");
+  const snapshotRoot = `${storePath}.snapshots`;
+  const snapshot = JSON.parse(readFileSync(join(snapshotRoot, record.snapshot.artifact), "utf8"));
+  snapshot.lastSuccessAt = snapshot.lastChangedAt = snapshot.meta.at = future;
+  snapshot.nextDueAt = future + 300_000;
+  const raw = JSON.stringify(snapshot);
+  const digest = createHash("sha256").update(raw).digest("hex");
+  const artifact = `${record.query.queryKey}.${record.generation}.${digest}.json`;
+  writeFileSync(join(snapshotRoot, artifact), raw);
+  record.snapshot = { ...record.snapshot, artifact, digest, bytes: Buffer.byteLength(raw),
+    lastSuccessAt: future, lastChangedAt: future, nextDueAt: snapshot.nextDueAt };
+  writeFileSync(storePath, JSON.stringify(store));
+  const cachePath = join(box.root, "gh-glance/dashboard-cache.json");
+  const cache = JSON.parse(readFileSync(cachePath, "utf8"));
+  for (const entry of Object.values(cache.targets)) {
+    if (entry.tabs.security) entry.tabs.security.lastOk = entry.tabs.security.meta.at = future;
+  }
+  writeFileSync(cachePath, JSON.stringify(cache));
+  const result = capture({ ...options,
+    stdin: waitFor("Last-check time unavailable") + waitFor("Cached") + "printf q" });
+  assert.equal(JSON.parse(readFileSync(storePath, "utf8"))
+    .queries[record.query.queryKey]?.snapshot?.lastSuccessAt, future,
+  "restart replaced the future source observation");
   const screen = result.finalFrame.lines.join("\n");
   assert.match(screen, /Last-check time unavailable/);
   const footer = result.finalFrame.lines.find((line) => /^[^\s│] Cached/.test(line));

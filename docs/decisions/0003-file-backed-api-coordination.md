@@ -421,3 +421,34 @@ rule, residuals left by dead panes reduced spendable quota in every window
 until the next reboot. The remaining risk is an orphaned `gh` child that sends
 a request more than an hour after its last recorded charge, which is accepted
 as negligible.
+
+## Amendment: debt-journal compaction (2026-10-26)
+
+A work machine's ledger held 128 quiescent debt groups, the cap, and every pane
+of that account showed "Local coordination accounting overflow". Only a claimed
+observer publication retires quiescent groups. A claim first charges its control
+receipt to a group, and with no free slot that charge failed, so the one
+operation that could drain the journal was the one the full journal blocked.
+
+Two rules change. The state version and the debt totals do not.
+
+Once the journal holds `DEBT_JOURNAL_COMPACT_AT` (64, half the cap) groups, each
+mutation merges its quiescent groups into one aggregate per boot identity. The
+merged group sums units and counts, takes the newest charge time and the highest
+barrier revisions, and stays quiescent with unknown ownership. Non-quiescent
+groups are never merged. Compaction runs only while no probe claim is live,
+because a claim compares the snapshot it took with the groups it finds at
+publication. A sealed owner generation that was merged away is already the
+acknowledged outcome, so the acknowledgement path treats it as absent.
+
+A journal with no free slot is a capacity condition, not an arithmetic one. It
+now fails with the transient reason `debt-journal-full` instead of
+`accounting-overflow`. The pane shows "Local coordination journal is full" and
+retries at the earliest moment a sealed group can settle
+(`IDENTITY_UNCERTAIN_MAX_MS` after its newest charge) or a live claim ends,
+capped at one probe interval. Arithmetic overflow and inconsistent group state
+keep the hard reason. `--doctor` reports the occupancy as `debt groups` and, for a hard
+failure, prints the manual remedy: quit every pane, then move the quota ledger,
+its `.recovery.json` and `registry.json` aside. All three are needed because the
+registry still names a ledger that was moved alone, and a missing ledger for a
+known identity stays `corrupt` so that deleting it cannot silently drop debt.

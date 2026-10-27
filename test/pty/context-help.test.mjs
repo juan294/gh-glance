@@ -204,7 +204,11 @@ for (const [name, quit] of [["Escape", "\\033"], ["Ctrl+C", "\\003"]]) {
   test(`NAV-05: ${name} still quits from contextual help`, () => {
     const result = capture({ cols: 80, rows: 24, signal: "none", settle: 25,
       args: "--repo acme/widget --refresh 300 --background off", env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
-      stdin: waitFor("ci: pin actions") + "printf '?'; " + waitFor("n next p prev") + `printf '${quit}'` });
+      // Keep the input pipe open until the app exits. GNU script injects EOF
+      // when it closes; that byte can combine with a pending Escape key.
+      stdin: waitFor("ci: pin actions") + "printf '?'; " + waitFor("n next p prev") +
+        `printf '${quit}'; ` +
+        waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', '/^EXITCODE=[0-9]+[[:space:]]*$/ { ok=1 }', 200) });
     assert.equal(result.exitCode, 0);
     assert.equal(result.afterRestore.visible, "");
     assert.match(result.finalFrame.lines.join("\n"), /n next p prev/);

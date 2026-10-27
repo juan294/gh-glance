@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-10-26
+
+### Fixed
+
+- A full debt-group journal no longer pins every pane of an account behind
+  "Local coordination accounting overflow". Quiescent groups now merge once the
+  journal is half full, after any active probe finishes or expires, so the
+  journal can free space for retiring a control receipt. Ledgers already wedged
+  in this state recover automatically after upgrading.
+- Pasted or multi-character input such as `12` is ignored instead of being read
+  as a tab number. Single-digit tab keys are unchanged.
+- Webhook events now match configured targets whose repository name differs in
+  case from the name GitHub sends, including access-removal events that fence
+  cached data. Ambiguity across hosts is still rejected.
+- A collector view with an old snapshot shows `Stale` or `Cached` with its
+  source age. It shows `Disconnected`, still with that age, only when the
+  collector connection or its app authorization is lost.
+
+### Changed
+
+- Updated React to 19.3.0 and refreshed existing tooling/action versions.
+  Patched the development-only brace-expansion and Zod vulnerabilities.
+- README: Homebrew installation (`brew install juan294/tap/gh-glance`) is
+  documented, with a note to use one installation method.
+- Development CI monitoring uses Sutura v0.4.0.
+- A journal that is genuinely full of unsettled requests reports "Local
+  coordination journal is full" with an automatic retry instead of the hard
+  accounting-overflow notice.
+- `gh-glance --doctor` reports debt-journal occupancy as `debt groups`, and
+  for a hard coordination failure, including a ledger that is missing or
+  unreadable, names the state file and the `repair`: quit every pane, move the
+  ledger, its recovery journal and `registry.json` aside, relaunch.
+
 ## [0.17.0] - 2026-10-25
 
 ### Added
@@ -1282,7 +1315,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.17.1...HEAD
+[0.17.1]: https://github.com/juan294/gh-glance/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/juan294/gh-glance/compare/v0.16.2...v0.17.0
 [0.16.2]: https://github.com/juan294/gh-glance/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/juan294/gh-glance/compare/v0.16.0...v0.16.1

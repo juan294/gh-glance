@@ -292,7 +292,7 @@ const ANIMATE = !process.env.GH_GLANCE_NO_ANIMATION;
 // legitimate mixed-direction Arabic and Hebrew titles render correctly, and
 // preserving real RTL text is a stated property of this function.
 // eslint-disable-next-line no-control-regex -- matching control characters is the entire purpose
-const CONTROL_CHARS = /[ --]+/g;
+const CONTROL_CHARS = /[\x00-\x1f\x7f-\x9f]+/g;
 const BIDI_OVERRIDES = /[‪-‮⁦-⁩]/g;
 
 // Titles are rendered at whatever length GitHub returns, and ink memoizes
@@ -307,7 +307,7 @@ const MAX_FIELD_LENGTH = 300;
 function safe(value) {
   // Coerce first, sanitize always. Returning a non-string early skipped both the
   // control-character strip and the length clamp, so an array or an object with a
-  // toString() came through untouched -- `safe(["[2Jx"])` returned the escape
+  // toString() came through untouched -- `safe(["\x1b[2Jx"])` returned the escape
   // verbatim. GitHub returns strings for every field this is called on today, so
   // the guarantee was being provided by the upstream schema rather than by the
   // function that claims to provide it.
@@ -3275,8 +3275,8 @@ function claimIdentityBootstrap(root, { credentialKey, host, resource = "core", 
   }, { now, kill });
 }
 
-function readIdentityQuotaState(registry, scope, now) {
-  const loaded = readGovernorState(scope.path, now);
+function readIdentityQuotaState(registry, scope, now, options = {}) {
+  const loaded = readGovernorState(scope.path, now, options);
   const known = Object.values(registry.identities).some((identity) => identity.quotaKey === scope.quotaKey) ||
     Object.values(registry.attempts).some((attempt) => attempt.imported && attempt.quotaKey === scope.quotaKey);
   return loaded.ok && loaded.missing && known ? { ok: false, reason: "corrupt" } : loaded;
@@ -3302,9 +3302,9 @@ function importIdentityDebts(root, state, credentialKey, identity, now) {
         notBefore: attempt.startedAt, status: "started", epochs: { core: null, graphql: null },
         startedAt: attempt.startedAt, completedAt: null, outcome: null,
       };
-      if (!loaded.value.importMarkers[id] &&
-          !transferReceiptToDebt(loaded.value, legacyControl, now, id)) {
-        return { ok: false, reason: "accounting-overflow" };
+      if (!loaded.value.importMarkers[id]) {
+        const failure = transferReceiptToDebt(loaded.value, legacyControl, now, id);
+        if (failure) return failure;
       }
       if (Object.keys(loaded.value.importMarkers).length >= IDENTITY_MAX_ATTEMPTS &&
           !loaded.value.importMarkers[id]) return { ok: false, reason: "identity-capacity" };
@@ -3519,7 +3519,8 @@ function startIdentityControl(coordinator, now = Date.now()) {
       if (Object.keys(registry.attempts).length >= IDENTITY_MAX_ATTEMPTS) return { ok: false, reason: "identity-capacity" };
       const priorControl = state.controlReceipts.core;
       if (priorControl) {
-        if (!retireControlReceiptToDebt(state, "core", now)) return { ok: false, reason: "accounting-overflow" };
+        const failure = retireControlReceiptToDebt(state, "core", now);
+        if (failure) return failure;
       }
       const id = governorId();
       registry.attempts[id] = { credentialKey: identity.credentialKey, host: identity.host, resource: "core", startedAt: now,
@@ -3574,8 +3575,9 @@ function settleIdentityControl(coordinator, control, stdout, now = Date.now(),
         reservation.actualCosts = { core: cost, graphql: 0 };
         reservation.accountedCosts = { core: cost, graphql: 0 };
         loaded.value.controlReceipts.core = null;
-      } else if (!retireControlReceiptToDebt(loaded.value, "core", now)) {
-        return { ok: false, reason: "accounting-overflow" };
+      } else {
+        const failure = retireControlReceiptToDebt(loaded.value, "core", now);
+        if (failure) return failure;
       }
       return writeGovernorQuotaState(scope.path, loaded.value, now);
     });
@@ -3844,6 +3846,7 @@ function identityCoordinationMessage(reason) {
   if (reason === "throttle-paused") return "Paused after repeated rate limits; refresh to retry";
   if (retryableCoordination(reason)) return "Coordinating with your other panes";
   if (reason === "identity-capacity") return "Coordination state full; retrying after the current window";
+  if (reason === "debt-journal-full") return "Coordination journal full; retrying after older requests settle";
   return "Verified identity unavailable; waiting to retry";
 }
 
@@ -3889,6 +3892,9 @@ const GOVERNOR_MAX_LEASES = 128;
 const GOVERNOR_MAX_INTENTS = 512;
 const GOVERNOR_MAX_RESERVATIONS = 512;
 const GOVERNOR_MAX_DEBT_GROUPS = 128;
+// Quiescent groups merge once the journal is this full, so retirement never
+// waits on a probe publication that a full journal would itself block.
+const DEBT_JOURNAL_COMPACT_AT = GOVERNOR_MAX_DEBT_GROUPS / 2;
 const GOVERNOR_MAX_LEDGER_BYTES = 2 * 1024 * 1024;
 const GOVERNOR_LOCK_WAIT_MS = 250;
 // How old an unreadable lock record may be before it counts as abandoned. A
@@ -4526,10 +4532,8 @@ function migrateLegacyGovernorReceipts(legacy, nowMs) {
   if (RATE_RESOURCES.some((resource) => units[resource] > 0)) {
     const nonce = governorId();
     state.debtGroups[nonce] = {
-      nonce, ownerNonce: null, ownerPid: null, ownerBirth: null, bootId: coordinationBootId(),
-      unknownChild: true, sealed: true, quiescent: false,
-      units, counts, at: nowMs, barrierAt: null,
-      barrierRevisions: { core: 0, graphql: 0 },
+      ...newDebtGroup({ nonce, bootId: coordinationBootId(), unknownChild: true, at: nowMs }),
+      units, counts,
     };
     for (const resource of RATE_RESOURCES) {
       state.debt[resource].unresolvedUnits = units[resource];
@@ -4596,25 +4600,57 @@ function debtGroupTarget(state, receipt, groupId = null) {
   return state.debtGroups[UNKNOWN_DEBT_GROUP_ID] ? governorId() : UNKNOWN_DEBT_GROUP_ID;
 }
 
+const ACCOUNTING_OVERFLOW = Object.freeze({ ok: false, reason: "accounting-overflow" });
+
+// The one shape normalizeGovernorState accepts for a group; every site that
+// creates a group starts from it so a new field cannot be missed in one copy.
+function newDebtGroup({ nonce = governorId(), bootId, unknownChild, at, quiescent = false, barrierAt = null }) {
+  return {
+    nonce, ownerNonce: null, ownerPid: null, ownerBirth: null, bootId,
+    unknownChild, sealed: true, quiescent,
+    units: { core: 0, graphql: 0 }, counts: { core: 0, graphql: 0 },
+    at, barrierAt, barrierRevisions: { core: 0, graphql: 0 },
+  };
+}
+
+// When age alone settles an unresolved group. Only a sealed group ages out;
+// an owner acknowledgement can settle either kind earlier.
+function debtGroupSettlesAt(group) {
+  return group.sealed ? group.at + IDENTITY_UNCERTAIN_MAX_MS : Number.POSITIVE_INFINITY;
+}
+
+function hasLiveProbeClaim(state, at) {
+  return RATE_RESOURCES.some((resource) => state.probeClaims[resource]?.leaseUntil > at);
+}
+
+// A journal with no free slot is a capacity condition, not an arithmetic one.
+// A retry can succeed once an unresolved group ages out or a live claim ends
+// and lets compaction run; the probe interval bounds the wait so a pane never
+// shows a retry hours away.
+function debtJournalFullFailure(state, nowMs) {
+  const unblockAt = Math.min(
+    ...Object.values(state.debtGroups).filter((group) => !group.quiescent).map(debtGroupSettlesAt),
+    ...RATE_RESOURCES.map((resource) => state.probeClaims[resource]?.leaseUntil ?? Number.POSITIVE_INFINITY),
+    nowMs + BUDGET_PROBE_MS,
+  );
+  return { ok: false, reason: "debt-journal-full", retryAt: Math.max(unblockAt, nowMs + 1000) };
+}
+
+// Returns null when the charge is recorded, otherwise the failure to report.
 function transferReceiptToDebt(state, receipt, nowMs, groupId = null) {
   const units = Object.fromEntries(RATE_RESOURCES.map((resource) => [resource,
     reservationCost(receipt, resource, state.leases, nowMs)]));
-  if (RATE_RESOURCES.every((resource) => units[resource] === 0)) return true;
+  if (RATE_RESOURCES.every((resource) => units[resource] === 0)) return null;
   const id = debtGroupTarget(state, receipt, groupId);
-  if (id === null) return false;
+  if (id === null) return debtJournalFullFailure(state, nowMs);
   const incomingBootId = receipt.receipt?.bootId ?? coordinationBootId();
   const dedicated = id === groupId;
-  const group = state.debtGroups[id] ?? {
-    nonce: governorId(), ownerNonce: null, ownerPid: null, ownerBirth: null,
-    bootId: incomingBootId,
-    unknownChild: !dedicated || !receipt.receipt, sealed: true, quiescent: false,
-    units: { core: 0, graphql: 0 }, counts: { core: 0, graphql: 0 },
-    at: nowMs, barrierAt: null,
-    barrierRevisions: { core: 0, graphql: 0 },
-  };
-  if (group.quiescent) return false;
+  const group = state.debtGroups[id] ?? newDebtGroup({
+    bootId: incomingBootId, unknownChild: !dedicated || !receipt.receipt, at: nowMs,
+  });
+  if (group.quiescent) return ACCOUNTING_OVERFLOW;
   if (receipt.receipt && dedicated) {
-    if (group.ownerNonce !== null && group.ownerNonce !== receipt.receipt.ownerNonce) return false;
+    if (group.ownerNonce !== null && group.ownerNonce !== receipt.receipt.ownerNonce) return ACCOUNTING_OVERFLOW;
     group.ownerNonce = receipt.receipt.ownerNonce;
     group.ownerPid = receipt.receipt.ownerPid;
     group.ownerBirth = receipt.receipt.ownerBirth;
@@ -4629,7 +4665,7 @@ function transferReceiptToDebt(state, receipt, nowMs, groupId = null) {
         !Number.isSafeInteger(group.units[resource] + amount) ||
         !Number.isSafeInteger(state.debt[resource].unresolvedCount + (amount > 0 ? 1 : 0)) ||
         !Number.isSafeInteger(state.debt[resource].revision + 1) ||
-        !Number.isSafeInteger(group.counts[resource] + (amount > 0 ? 1 : 0))) return false;
+        !Number.isSafeInteger(group.counts[resource] + (amount > 0 ? 1 : 0))) return ACCOUNTING_OVERFLOW;
   }
   for (const resource of RATE_RESOURCES) {
     const amount = units[resource];
@@ -4643,7 +4679,7 @@ function transferReceiptToDebt(state, receipt, nowMs, groupId = null) {
   // which reconcileBootDebt may treat the group as settled.
   group.at = Math.max(group.at, nowMs);
   state.debtGroups[id] = group;
-  return true;
+  return null;
 }
 
 function makeDebtGroupQuiescent(state, group, at) {
@@ -4670,23 +4706,25 @@ function makeDebtGroupQuiescent(state, group, at) {
   return true;
 }
 
+// Returns null when the receipt is retired, otherwise the failure to report.
 function retireControlReceiptToDebt(state, resource, at) {
   const control = state.controlReceipts[resource];
-  if (!control) return true;
+  if (!control) return null;
   // A control receipt without an issued dispatch cannot have started HTTP.
   // Removing it also fences a late owner before it can issue a child.
   if (control.receipt.dispatches.length === 0) {
     state.controlReceipts[resource] = null;
-    return true;
+    return null;
   }
   const generation = control.receipt.generation;
-  if (!transferReceiptToDebt(state, control, at, generation)) return false;
+  const failure = transferReceiptToDebt(state, control, at, generation);
+  if (failure) return failure;
   const group = state.debtGroups[generation];
   if (group && !group.unknownChild && group.ownerPid !== null &&
       group.ownerBirth !== null && group.bootId !== null &&
-      !makeDebtGroupQuiescent(state, group, at)) return false;
+      !makeDebtGroupQuiescent(state, group, at)) return ACCOUNTING_OVERFLOW;
   state.controlReceipts[resource] = null;
-  return true;
+  return null;
 }
 
 // A reboot proves an unknown owner's children are gone. So does age: a group's
@@ -4698,11 +4736,44 @@ function reconcileBootDebt(state, at) {
   for (const group of Object.values(state.debtGroups)) {
     if (group.quiescent) continue;
     const priorBoot = bootId !== null && group.bootId !== null && group.bootId !== bootId;
-    const outlivedWindow = group.sealed && at - group.at >= IDENTITY_UNCERTAIN_MAX_MS;
+    const outlivedWindow = at >= debtGroupSettlesAt(group);
     if (!priorBoot && !outlivedWindow) continue;
     if (!makeDebtGroupQuiescent(state, group, at)) {
-      return { ok: false, reason: "accounting-overflow" };
+      return ACCOUNTING_OVERFLOW;
     }
+    changed = true;
+  }
+  return { ok: true, changed };
+}
+
+// Quiescent groups are frozen until a probe publication retires them, and a
+// publication needs a claim that first charges its control receipt to a group.
+// With the journal full of quiescent groups that charge has nowhere to go, so
+// the only operation that drains the journal is the one it blocks. Merging the
+// frozen groups keeps the totals and frees the slots. A claim compares the
+// snapshot it took against the groups it finds at publication, so the shape may
+// only change while no claim is live.
+function compactQuiescentDebtGroups(state, at) {
+  if (Object.keys(state.debtGroups).length < DEBT_JOURNAL_COMPACT_AT || hasLiveProbeClaim(state, at)) {
+    return { ok: true, changed: false };
+  }
+  const quiescent = Object.entries(state.debtGroups).filter(([, group]) => group.quiescent);
+  let changed = false;
+  for (const [bootId, entries] of Map.groupBy(quiescent, ([, group]) => group.bootId)) {
+    if (entries.length < 2) continue;
+    const groups = entries.map(([, group]) => group);
+    const merged = newDebtGroup({ bootId, unknownChild: true, quiescent: true,
+      at: Math.max(...groups.map((group) => group.at)),
+      barrierAt: Math.max(0, ...groups.map((group) => group.barrierAt ?? 0)) });
+    for (const resource of RATE_RESOURCES) {
+      merged.units[resource] = groups.reduce((sum, group) => sum + group.units[resource], 0);
+      merged.counts[resource] = groups.reduce((sum, group) => sum + group.counts[resource], 0);
+      if (!Number.isSafeInteger(merged.units[resource]) ||
+          !Number.isSafeInteger(merged.counts[resource])) return ACCOUNTING_OVERFLOW;
+      merged.barrierRevisions[resource] = Math.max(...groups.map((group) => group.barrierRevisions[resource]));
+    }
+    for (const [id] of entries) delete state.debtGroups[id];
+    state.debtGroups[merged.nonce] = merged;
     changed = true;
   }
   return { ok: true, changed };
@@ -4731,18 +4802,16 @@ function compactGovernorReceipts(state, nowMs) {
     const trial = structuredClone(state);
     for (const reservation of candidates) {
       const groupId = reservation.receipt?.generation ?? null;
-      if (debtGroupTarget(trial, reservation, groupId) === null) return { ok: true, changed: false };
-      if (!transferReceiptToDebt(trial, reservation, nowMs, groupId)) {
-        return { ok: false, reason: "accounting-overflow" };
-      }
+      const failure = transferReceiptToDebt(trial, reservation, nowMs, groupId);
+      if (failure?.reason === "debt-journal-full") return { ok: true, changed: false };
+      if (failure) return failure;
     }
   }
   if (full) {
     for (const [id, reservation] of Object.entries(state.reservations)) {
       if (reservation.status !== "completed" || reservation.receipt) continue;
-      if (!transferReceiptToDebt(state, reservation, nowMs)) {
-        return { ok: false, reason: "accounting-overflow" };
-      }
+      const failure = transferReceiptToDebt(state, reservation, nowMs);
+      if (failure) return failure;
       delete state.reservations[id];
       changed = true;
     }
@@ -4763,9 +4832,9 @@ function compactGovernorReceipts(state, nowMs) {
   for (const generation of sealed) {
     for (const [id, reservation] of Object.entries(state.reservations)) {
       if (reservation.receipt?.generation !== generation) continue;
-      if (!(reservation.status === "started" && reservation.receipt.dispatches.length === 0) &&
-          !transferReceiptToDebt(state, reservation, nowMs, generation)) {
-        return { ok: false, reason: "accounting-overflow" };
+      if (!(reservation.status === "started" && reservation.receipt.dispatches.length === 0)) {
+        const failure = transferReceiptToDebt(state, reservation, nowMs, generation);
+        if (failure) return failure;
       }
       delete state.reservations[id];
       state.ownerGenerations[reservation.leaseId] = governorId();
@@ -4774,7 +4843,7 @@ function compactGovernorReceipts(state, nowMs) {
     if (group && !group.unknownChild && group.ownerPid !== null &&
         group.ownerBirth !== null && group.bootId !== null &&
         !makeDebtGroupQuiescent(state, group, nowMs)) {
-      return { ok: false, reason: "accounting-overflow" };
+      return ACCOUNTING_OVERFLOW;
     }
   }
   retireOwnerGenerations(state);
@@ -4860,7 +4929,7 @@ function writeGovernorState(path, state) {
   try {
     if (state?.version === GOVERNOR_STATE_VERSION) {
       if (!Number.isSafeInteger(state.revision) || state.revision === Number.MAX_SAFE_INTEGER) {
-        return { ok: false, reason: "accounting-overflow" };
+        return ACCOUNTING_OVERFLOW;
       }
       state.revision += 1;
     }
@@ -4890,7 +4959,7 @@ function writeGovernorQuotaState(path, state, nowMs) {
   const normalized = normalizeGovernorState(state, nowMs, { prune: false });
   if (!normalized) return { ok: false, reason: "corrupt" };
   if (!governorAccountingSafe(normalized, nowMs)) {
-    return { ok: false, reason: "accounting-overflow" };
+    return ACCOUNTING_OVERFLOW;
   }
   return writeGovernorState(path, normalized);
 }
@@ -5204,17 +5273,19 @@ function mutateGovernor(scope, nowMs, mutate) {
     const loaded = readGovernorState(scope.path, at, { persistMigration: false });
     if (!loaded.ok) return loaded;
     const state = loaded.value;
-    if (!governorAccountingSafe(state, at)) return { ok: false, reason: "accounting-overflow" };
+    if (!governorAccountingSafe(state, at)) return ACCOUNTING_OVERFLOW;
     const oldBootReconciled = reconcileBootDebt(state, at);
     if (!oldBootReconciled.ok) return oldBootReconciled;
     const compacted = compactGovernorReceipts(state, at);
     if (!compacted.ok) return compacted;
     const bootReconciled = reconcileBootDebt(state, at);
     if (!bootReconciled.ok) return bootReconciled;
+    const journal = compactQuiescentDebtGroups(state, at);
+    if (!journal.ok) return journal;
     // A mutator can reject without writing. Keep an untouched migration so
     // that even that path upgrades the file once before releasing the lock.
     const migration = loaded.migrated || compacted.changed ||
-      oldBootReconciled.changed || bootReconciled.changed
+      oldBootReconciled.changed || bootReconciled.changed || journal.changed
       ? structuredClone(state) : null;
     const returnAfterMigration = (result) => {
       if (migration === null) return result;
@@ -5223,7 +5294,7 @@ function mutateGovernor(scope, nowMs, mutate) {
     };
     const value = mutate(state, at);
     if (value?.ok === false && value.write !== true) return returnAfterMigration(value);
-    if (!governorAccountingSafe(state, at)) return returnAfterMigration({ ok: false, reason: "accounting-overflow" });
+    if (!governorAccountingSafe(state, at)) return returnAfterMigration(ACCOUNTING_OVERFLOW);
     const normalized = normalizeGovernorState(state, at);
     if (!normalized) return returnAfterMigration({ ok: false, reason: "corrupt" });
     const written = writeGovernorState(scope.path, normalized);
@@ -5455,9 +5526,8 @@ function claimProbe(scope, leaseId, nowMs, resource) {
     if (resource === "graphql" && state.controlReceipts.graphql) {
       // The old claim's lease has expired. Keep an issued child charged as
       // debt, and fence the old capability so a new observer can make progress.
-      if (!retireControlReceiptToDebt(state, "graphql", at)) {
-        return { ok: false, reason: "accounting-overflow" };
-      }
+      const failure = retireControlReceiptToDebt(state, "graphql", at);
+      if (failure) return failure;
     }
     const nonce = randomUUID();
     const startedReservationIds = Object.entries(state.reservations)
@@ -5476,7 +5546,7 @@ function claimProbe(scope, leaseId, nowMs, resource) {
     const debtUnits = quiescentGroups.reduce((sum, group) => sum + group.units[resource], 0);
     const debtCount = quiescentGroups.reduce((sum, group) => sum + group.counts[resource], 0);
     if (!Number.isSafeInteger(debtUnits) || !Number.isSafeInteger(debtCount)) {
-      return { ok: false, reason: "accounting-overflow" };
+      return ACCOUNTING_OVERFLOW;
     }
     const debtSnapshot = {
       units: debtUnits,
@@ -5683,7 +5753,7 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs, resource) {
     }
     if (changedResources.length === 0) return { ok: false, reason: "corrupt" };
     if (!retireClaimedQuiescentDebt(state, resource, claim)) {
-      return { ok: false, reason: "accounting-overflow" };
+      return ACCOUNTING_OVERFLOW;
     }
     const completedBeforeClaim = Object.entries(state.reservations)
       .filter(([, reservation]) =>
@@ -5803,9 +5873,8 @@ function failProbeClaim(scope, leaseId, nonce, nowMs, resource) {
       const control = state.controlReceipts.graphql;
       if (control.receipt.dispatches.length === 0) state.controlReceipts.graphql = null;
       else if (control.receipt.dispatches.every((dispatch) => dispatch.terminalAt !== null)) {
-        if (!retireControlReceiptToDebt(state, "graphql", at)) {
-          return { ok: false, reason: "accounting-overflow" };
-        }
+        const failure = retireControlReceiptToDebt(state, "graphql", at);
+        if (failure) return failure;
       }
     }
     state.observers[resource] = {
@@ -6109,7 +6178,7 @@ function acknowledgeSealedGeneration(scope, capability, sealedNonce, nowMs) {
           reservation.receipt?.generation === capability.generation)) {
       return { ok: false, reason: "quiescence-unverified" };
     }
-    if (!makeDebtGroupQuiescent(state, group, at)) return { ok: false, reason: "accounting-overflow" };
+    if (!makeDebtGroupQuiescent(state, group, at)) return ACCOUNTING_OVERFLOW;
     return { value: { status: "acknowledged", nonce: group.nonce } };
   });
 }
@@ -6368,13 +6437,16 @@ function governorHealth(result, nowMs = Date.now()) {
   if (!result?.ok) return { status: `unavailable (${result?.reason ?? "unknown"})`, leases: 0, resources: {} };
   const state = result.value;
   let status = "healthy";
-  if (RATE_RESOURCES.some((resource) => state.probeClaims[resource]?.leaseUntil > nowMs)) status = "waiting for probe";
+  if (hasLiveProbeClaim(state, nowMs)) status = "waiting for probe";
   else if (RATE_RESOURCES.some((resource) => !state.budgets[resource] ||
     nowMs - state.budgets[resource].observedAt > budgetSnapshotTtl(resource))) status = "stale";
   else if (RATE_RESOURCES.some((resource) => state.budgets[resource].blockUntil > nowMs)) status = "blocked";
+  const groups = Object.values(state.debtGroups);
   return {
     status,
     leases: Object.keys(state.leases).length,
+    debtGroups: groups.length,
+    quiescentGroups: groups.filter((group) => group.quiescent).length,
     resources: Object.fromEntries(RATE_RESOURCES.flatMap((resource) => {
       const budget = state.budgets[resource];
       return budget ? [[resource, {
@@ -6413,12 +6485,15 @@ function doctorCachedQuotaScope(host, { root = identityRegistryRoot(), nowMs = D
   try {
     if (!lstatSync(path).isFile()) return { ok: false, reason: "unsafe quota path", path };
   } catch (error) {
-    return { ok: false, reason: error?.code === "ENOENT" ? "cached quota missing" : "cached quota unreadable", path };
+    if (error?.code !== "ENOENT") return { ok: false, reason: "cached quota unreadable", path };
   }
-  const result = readGovernorState(path, nowMs, { persistMigration: false });
+  // The runtime's own guard classifies the file: a missing ledger for a quota
+  // key the registry still lists is corrupt, never a fresh start, so doctor
+  // reports the same reason the panes act on.
+  const result = readIdentityQuotaState(registry, { path, quotaKey }, nowMs, { persistMigration: false });
   return result.ok && !result.missing
     ? { ok: true, result, path, quotaKey }
-    : { ok: false, reason: result.missing ? "cached quota missing" : result.reason, path };
+    : { ok: false, reason: result.ok ? "cached quota missing" : result.reason, path };
 }
 
 async function retryGovernorMutation(run, { now, wait, deadline, signal }) {
@@ -8075,7 +8150,7 @@ function mapWebhookInvalidations({ event, payload, config, enterpriseHost = null
     ? config.targets.map((target) => ({ ...target, resources: TAB_KEYS }))
     : config.webhook.targets;
   let targets = mappedTargets.filter((target) =>
-    (!selectedHost || target.host === selectedHost) && (event === "installation" || names.has(target.repo)));
+    (!selectedHost || target.host === selectedHost) && (event === "installation" || names.has(target.repo.toLowerCase())));
   if (["installation", "installation_repositories"].includes(event)) {
     targets = targets.filter((target) => {
       const provider = config.providers[target.provider];
@@ -8085,7 +8160,10 @@ function mapWebhookInvalidations({ event, payload, config, enterpriseHost = null
   }
   if (!selectedHost && event !== "installation") {
     const hostsByRepo = new Map();
-    for (const target of targets) hostsByRepo.set(target.repo, (hostsByRepo.get(target.repo) ?? new Set()).add(target.host));
+    for (const target of targets) {
+      const repo = target.repo.toLowerCase();
+      hostsByRepo.set(repo, (hostsByRepo.get(repo) ?? new Set()).add(target.host));
+    }
     if ([...hostsByRepo.values()].some((hosts) => hosts.size !== 1)) return { ok: false, reason: "target" };
   }
   if (targets.length === 0) return ["installation", "installation_repositories"].includes(event)
@@ -11268,6 +11346,11 @@ async function runDoctor({ probeEndpoints = false } = {}) {
     .filter(Boolean).sort((left, right) => right.at - left.at)[0] ?? null;
   const lastFailedRecovery = [...(recoveryJournal?.entries ?? [])].reverse()
     .find((entry) => entry.code !== "clear") ?? null;
+  const ledgerPath = cachedQuota?.path ?? diagnosticScope?.path ?? null;
+  // The journal cannot speak for a ledger that cannot be read, so the cached
+  // read's own reason counts too; both use the governor's reason vocabulary.
+  const hardRecovery = Boolean(ledgerPath) &&
+    [currentRecovery?.code, cachedQuota?.reason].some((reason) => HARD_STORAGE_REASONS.includes(reason));
   const retryDates = RATE_RESOURCES.flatMap((resource) => {
     const active = recoveryJournal?.current[resource];
     const observer = (probeEndpoints ? governorResult : cachedQuota?.result)?.value?.observers[resource];
@@ -11324,11 +11407,16 @@ async function runDoctor({ probeEndpoints = false } = {}) {
     "",
     ...section("API governor"),
     field("cached scope", probeEndpoints ? "verified by probe" : cachedQuota?.ok ? "read-only cached identity" : `unavailable (${cachedQuota?.reason ?? "unknown"})`),
-    ...(cachedQuota?.path && !cachedQuota.ok
-      ? [field("state file", `${join(dirname(cachedQuota.path), "quota-[redacted].json")} (quota fingerprint withheld)`)]
+    // The user has to find the file to move it.
+    ...(ledgerPath && cachedQuota?.ok === false || hardRecovery
+      ? [field("state file", `${join(dirname(ledgerPath), "quota-[redacted].json")} (quota fingerprint withheld)`)]
       : []),
+    ...(hardRecovery ? [field("repair", LEDGER_REPAIR_ADVICE)] : []),
     field("status", governor.status),
     field("live leases", governor.leases),
+    field("debt groups", governor.debtGroups == null
+      ? "unavailable"
+      : `${governor.debtGroups}/${GOVERNOR_MAX_DEBT_GROUPS} (${governor.quiescentGroups} quiescent)`),
     ...RATE_RESOURCES.map((resource) => {
       const detail = governor.resources[resource];
       return field(
@@ -15118,7 +15206,7 @@ function createAcquisitionEngine({
       ledger.debt[resource].unresolvedUnits + ledger.debt[resource].quiescentUnits +
         reservationCost(ledger.controlReceipts[resource], resource, ledger.leases, now()))]));
     if (Object.values(units).some((value) => !Number.isSafeInteger(value) || value < 0)) {
-      return { ok: false, reason: "accounting-overflow" };
+      return ACCOUNTING_OVERFLOW;
     }
     return transact((state) => {
       const activeKeys = new Set(Object.values(state.subscriptions)
@@ -15699,6 +15787,14 @@ function coordinationNotice(reason) {
 const RECOVERY_JOURNAL_MAX_ENTRIES = 128;
 const RECOVERY_JOURNAL_MAX_BYTES = 128 * 1024;
 const RECOVERY_ENTRY_MAX_BYTES = 1024;
+// Reasons that no retry can clear: the ledger itself must be repaired. The
+// runtime keeps them sticky and doctor names the manual remedy for them.
+const HARD_STORAGE_REASONS = Object.freeze(["corrupt", "unwritable", "capacity", "accounting-overflow"]);
+// A source failure on a tab may be superseded by these coordination causes.
+const STICKY_OVER_SOURCE_REASONS = Object.freeze([...HARD_STORAGE_REASONS, "receipt-retry", "interrupted-request"]);
+const LEDGER_REPAIR_ADVICE = "quit every gh-glance pane, then move the state file, its .recovery.json and " +
+  "registry.json out of that directory and relaunch; a fresh ledger starts, and at most the receipt and " +
+  "debt units below (when shown) may be spent twice this hour";
 const RECOVERY_COPY = Object.freeze({
   busy: ["Coordinating with your other panes", "Retry automatically", "Other pane; retry"],
   stale: ["Coordinating with your other panes", "Retry automatically", "Other pane; retry"],
@@ -15708,6 +15804,7 @@ const RECOVERY_COPY = Object.freeze({
   corrupt: ["Local coordination is corrupt", "Run gh-glance --doctor; preserve the reported state file", "State corrupt; doctor"],
   capacity: ["Local coordination is full", "Run gh-glance --doctor; preserve the reported state file", "State full; doctor"],
   "accounting-overflow": ["Local coordination accounting overflow", "Run gh-glance --doctor; preserve the reported state file", "Overflow; doctor"],
+  "debt-journal-full": ["Local coordination journal is full", "Retry automatically; older requests settle within an hour", "Journal full; retry"],
   "reservations-invalid": ["Local coordination reservation invalid", "Run gh-glance --doctor; preserve the reported state file", "Reservation; doctor"],
   "external-factor-invalid": ["Local coordination budget invalid", "Run gh-glance --doctor; preserve the reported state file", "Budget invalid; doctor"],
   "pacing-invalid": ["Local coordination pacing invalid", "Run gh-glance --doctor; preserve the reported state file", "Pacing invalid; doctor"],
@@ -15791,8 +15888,8 @@ function shouldClearRecoveryCause(cause, { sourceSuccess = false, tab = null, sc
 
 function recoveryRetryAt(decision, budget, observer, nowMs) {
   if (budget?.blockUntil > nowMs) return budget.blockUntil;
-  if (["reservations-invalid", "external-factor-invalid", "pacing-invalid", "budget-resource",
-    "accounting-overflow", "corrupt", "unwritable", "capacity"].includes(decision?.reason)) return null;
+  if ([...HARD_STORAGE_REASONS, "reservations-invalid", "external-factor-invalid", "pacing-invalid",
+    "budget-resource"].includes(decision?.reason)) return null;
   const resetHold = ["budget-reset", "reset", "rate-limit"].includes(decision?.reason);
   if (decision?.mode === "probe" && !resetHold) {
     return observer?.nextAt > nowMs ? observer.nextAt : null;
@@ -17937,7 +18034,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         // which is exactly when the key is most likely to be pressed.
         const request = manualRefreshRequest(refreshIntent(input));
         if (request) fetchTabRef.current?.(TABS[activeIndexRef.current].key, request);
-      } else if (input >= "1" && input <= String(TABS.length)) {
+      } else if (input.length === 1 && input >= "1" && input <= String(TABS.length)) {
         setActiveIndex(Number(input) - 1);
       } else if (key.tab && key.shift) {
         setActiveIndex((i) => (i - 1 + TABS.length) % TABS.length);
@@ -18042,18 +18139,16 @@ function App({ onCreateRemote = () => {} } = {}) {
         reason, resource, at, retryAt, sourceAt: lastOkRef.current[key] ?? null,
         origin, tab: origin === "source" ? key : null,
       });
-      const storageFailures = ["corrupt", "unwritable", "capacity", "accounting-overflow"];
-      const hardFailure = storageFailures.includes(candidate.code);
+      const hardFailure = HARD_STORAGE_REASONS.includes(candidate.code);
       // Contention does not prove that previously unreadable storage recovered.
       // The existing healthy-control/source-success paths clear that remedy.
-      if (!hardFailure && storageFailures.includes(previous?.code)) return;
+      if (!hardFailure && HARD_STORAGE_REASONS.includes(previous?.code)) return;
       if (!hardFailure && previous?.code === "receipt-retry" &&
           terminalizationBacklogForResource(terminalizationBacklog, scope?.hash, resource) > 0) return;
       if (!hardFailure && previous?.code === "request-queue" &&
           cleanupQueueForResource(cleanupQueue, resource) > 0) return;
       if (previous?.origin === "source" && previous.tab === key && origin === "coordination" &&
-          !["corrupt", "unwritable", "capacity", "accounting-overflow",
-            "receipt-retry", "interrupted-request"].includes(candidate.code)) return;
+          !STICKY_OVER_SOURCE_REASONS.includes(candidate.code)) return;
       if (previous?.code === candidate.code && previous?.retryAt === candidate.retryAt &&
           previous?.origin === candidate.origin && previous?.tab === candidate.tab &&
           at - previous.at < 60_000) return;
@@ -18166,8 +18261,11 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (!refreshed?.ok && !tabReady) {
         const resource = RATE_RESOURCES.find((candidate) => tabRequestCost(key)[candidate] > 0 &&
           snapshot.value.observers[candidate]?.outcome !== "healthy");
+        // A rejected mutation writes nothing, so the observer's stored nextAt
+        // predates the failure; a failure that names its own retry time wins.
         pauseCoordination(key, refreshed?.reason, "observer", false,
-          resource ? snapshot.value.observers[resource]?.nextAt : null);
+          Number.isFinite(refreshed?.retryAt) ? refreshed.retryAt
+            : resource ? snapshot.value.observers[resource]?.nextAt : null);
         return;
       }
       publishGovernorEpochs(snapshot);
@@ -20169,7 +20267,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       activeGovernorDecision?.cause)) {
     semanticStatus = refreshStatus({
       stale: true,
-      disconnected: data[tab.key] !== null && !runtimeIdentityCoordinator?.current(),
+      disconnected: statusDisconnected,
     });
   }
 
@@ -20803,6 +20901,9 @@ export {
   GOVERNOR_MAX_LEASES,
   GOVERNOR_MAX_INTENTS,
   GOVERNOR_MAX_RESERVATIONS,
+  GOVERNOR_MAX_DEBT_GROUPS,
+  DEBT_JOURNAL_COMPACT_AT,
+  UNKNOWN_DEBT_GROUP_ID,
   GOVERNOR_LOCK_ORPHAN_MS,
   GOVERNOR_LOCK_WAIT_MS,
   GOVERNOR_PROBE_DRAIN_MS,
@@ -20818,6 +20919,7 @@ export {
   normalizeGovernorState,
   serializeGovernorState,
   readGovernorState,
+  readIdentityQuotaState,
   writeGovernorState,
   writeGovernorQuotaState,
   pidIsDead,
