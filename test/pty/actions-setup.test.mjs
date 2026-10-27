@@ -203,10 +203,19 @@ for (const [cols, rows] of [[24,10],[45,24]]) {
   test(`SET-06 existing storage recovery keeps priority over a saved setup result at ${cols}x${rows}`, (t) => {
     run(t, `
 await until(()=>screen().includes("No workflow runs")&&screen().includes("Watching"));
-send("s"); await until(()=>screen().includes("No workflows found"));
 const registry=JSON.parse(readFileSync(root+"/gh-glance/coordination-v2/registry.json","utf8"));
 const identity=Object.values(registry.identities).find(i=>i.id===1);
 const ledgerPath=root+"/gh-glance/coordination-v2/quota-"+identity.quotaKey+".json";
+// A rendered source result can precede settlement of its admission slot.
+await until(()=>{
+ const ledger=JSON.parse(readFileSync(ledgerPath,"utf8"));
+ const at=Date.now();
+ return ledger.observers.core.outcome==="healthy"&&ledger.budgets.core.laneNextAt<=at&&
+  Object.values(ledger.probeClaims).every(claim=>!claim||claim.leaseUntil<=at)&&
+  Object.values(ledger.reservations).every(item=>!["started","scheduled"].includes(item.status))&&
+  Object.values(ledger.controlReceipts).every(item=>item===null);
+});
+send("s"); await until(()=>screen().includes("No workflows found"));
 const fs=await import("node:fs");
 const ledgerLock=ledgerPath+".lock";
 const registryLock=root+"/gh-glance/coordination-v2/registry.json.lock";
