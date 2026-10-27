@@ -221,20 +221,25 @@ try {
  if (dimensions.cols===45) {
   // Force a later busy observation while the proven ledger fault persists.
   await lock(registryLock); registryHeld=true;
+  // Let the control wake retire the saved result before testing a new press.
+  await until(()=>!screen().includes("Setup checked:")&&!screen().includes("Saved setup check:")&&
+    !screen().includes("Setup check unavailable"));
   send("s");
-  await until(()=>!screen().includes("Setup checked:")&&!screen().includes("Saved setup check:"));
-  send("s"); await until(()=>screen().includes("Setup check unavailable"));
+  // Acknowledge this press before restoring storage; no queued press may
+  // escape the corrupt-state assertion and run after the lock is released.
+  await until(()=>screen().includes("Setup check unavailable")&&
+    !screen().includes("Setup checked:")&&!screen().includes("Saved setup check:"));
  } else { send("s"); await pause(200); }
  assert.equal(readFileSync(ledgerPath,"utf8"),"fixture corrupt storage");
  assert.ok(screen().includes("--doctor")); save("denied");
- assert.equal(setupCalls().length,1);
+ assert.equal(setupCalls().length,1,"no setup dispatch while storage is corrupt");
 } finally {
  await lock(ledgerLock); writeFileSync(ledgerPath,original); fs.unlinkSync(ledgerLock);
  if(registryHeld)fs.unlinkSync(registryLock);
 }
 send("R"); await until(()=>screen().includes("Watching")&&!screen().includes("--doctor"));
 assert.ok(JSON.parse(readFileSync(ledgerPath,"utf8")).budgets.core);
-assert.equal(setupCalls().length,1);
+assert.equal(setupCalls().length,1,"restoring storage must not replay a setup request");
 `, { cols, rows });
   });
 }
