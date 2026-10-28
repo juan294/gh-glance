@@ -11733,6 +11733,7 @@ const KEY_TABLE = [
   ["R", "Resynchronize the current tab, ignoring cached validators and backoff"],
   ["s", "Actions: read-only setup check (standalone only; saved for five minutes)"],
   ["g", "Actions: open the selected repository Actions page"],
+  ["/", "Focus: search loaded Issues or Pull requests"],
   ["w", "Adjust table column widths"],
   ["?", "Open / close contextual help; n / p changes page"],
   ["q / Esc / Ctrl+C", "Quit (Esc leaves width mode)"],
@@ -16770,12 +16771,18 @@ const KEY_HINTS = [
 function activeKeyHints({
   interactive,
   remoteSetup = false,
+  feature = null,
   canMove = false,
   canOpen = false,
   canResize = false,
 }) {
   if (!interactive) return [{ label: "Quit", keys: "^C" }];
   if (remoteSetup) return REMOTE_SETUP_HINTS;
+  if (feature?.mode === 'focus') return feature.editing
+    ? [{label:'Search',keys:'Ent'},{label:'Cancel',keys:'Esc'},{label:'Quit',keys:'^C'}]
+    : [{label:'Edit',keys:'/'}, ...(canMove?[{label:'Move',keys:'↑↓'}]:[]),
+      ...(canOpen?[{label:'Open',keys:'Ent'}]:[]), {label:'Refresh',keys:'r'},
+      {label:'Back',keys:'Esc'},{label:'Quit',keys:'q'},{label:'Help',keys:'?'}];
   return KEY_HINTS.filter((hint) => {
     if (hint.label === "Move") return canMove;
     if (hint.label === "Open") return canOpen;
@@ -17117,6 +17124,7 @@ function StatusBar({
   cols,
   remoteSetup = false,
   widthMode = false,
+  feature = null,
   widthColumn = null,
   widthSaveError = null,
   canMove = false,
@@ -17145,7 +17153,7 @@ function StatusBar({
   // Without raw mode none of the key handlers run, so advertising them would be
   // telling the user something untrue about what the app can do. Ctrl+C still
   // works there, because the tty delivers a real SIGINT.
-  const hints = activeKeyHints({ interactive, remoteSetup, canMove, canOpen, canResize });
+  const hints = activeKeyHints({ interactive, remoteSetup, feature, canMove, canOpen, canResize });
   const semanticStatus = status ?? refreshStatus({ remoteSetup });
   const layout = statusBarLayout({
     cols,
@@ -17244,6 +17252,107 @@ function useTerminalSize(stdout) {
   }, [stdout]);
 
   return size;
+}
+
+// ---------- Session feature views (never persisted as source data) ----------
+const FOCUS_QUERY_BYTES = 256;
+const normalizeTopic = (text) => String(text ?? '').normalize('NFKC').toLowerCase();
+const topicTokens = (text) => normalizeTopic(text).match(/[\p{L}\p{N}_]+/gu) ?? [];
+function parseFocusQuery(text) {
+  if (typeof text !== 'string' || Buffer.byteLength(text) > FOCUS_QUERY_BYTES) {
+    throw new Error('Query limit: 256 UTF-8 bytes; shorten the query.');
+  }
+  const filters = [], topic = [];
+  for (const token of text.trim().split(/\s+/u).filter(Boolean)) {
+    let match;
+    if ((match = token.match(/^#([1-9]\d*)$/u)) && Number.isSafeInteger(Number(match[1]))) {
+      filters.push({ type: 'number', value: Number(match[1]) });
+    } else if ((match = token.match(/^(author|branch):(.+)$/u))) {
+      filters.push({ type: match[1], value: match[1] === 'author' ? normalizeTopic(match[2]) : match[2] });
+    } else if ((match = token.match(/^updated:>=(\d{4}-\d{2}-\d{2})$/u))) {
+      const ms = Date.parse(`${match[1]}T00:00:00.000Z`);
+      if (!Number.isFinite(ms) || new Date(ms).toISOString().slice(0,10) !== match[1]) {
+        throw new Error('updated filter needs a valid UTC calendar date: updated:>=YYYY-MM-DD.');
+      }
+      filters.push({ type:'updated', value:ms });
+    } else if (/^(#|author:|branch:|updated:)/u.test(token)) {
+      throw new Error('Invalid filter; use #123, author:alice, branch:ref or updated:>=YYYY-MM-DD.');
+    } else topic.push(token);
+  }
+  return { filters, topic:topic.join(' '), tokens:topicTokens(topic.join(' ')) };
+}
+function focusEligible(parsed, item, kind) {
+  return parsed.filters.every(({ type, value }) => {
+    if (type === 'number') return item.number === value;
+    if (type === 'author') return normalizeTopic(item.author) === value;
+    if (type === 'branch') return (kind === 'prs' || item.kind === 'pr') && (item.headRefName ?? item.branch) === value;
+    return Number.isFinite(Date.parse(item.updatedAt)) && Date.parse(item.updatedAt) >= value;
+  });
+}
+function oneTopicEdit(a, b) {
+  const x = [...a], y = [...b];
+  if (Math.abs(x.length-y.length)>1) return false;
+  let i=0,j=0,edits=0;
+  while (i<x.length && j<y.length) {
+    if (x[i]===y[j]) { i++; j++; continue; }
+    if (++edits>1) return false;
+    if (x.length>=y.length) i++;
+    if (y.length>=x.length) j++;
+  }
+  return edits+(i<x.length || j<y.length ? 1 : 0)<=1;
+}
+function rankLocalFocus(parsed, rows, kind = 'issues') {
+  const scored = [];
+  for (const [index,item] of (rows ?? []).entries()) {
+    if (!focusEligible(parsed,item,kind)) continue;
+    const text = normalizeTopic([item.title,item.label,...(Array.isArray(item.labels)?item.labels:[]),item.headRefName ?? item.branch].filter(Boolean).join(' '));
+    const words = topicTokens(text), counts = [0,0,0];
+    let matches = true;
+    for (const token of parsed.tokens) {
+      const hit = words.includes(token) ? 0 : words.some(word=>word.startsWith(token)) ? 1
+        : [...token].length>=5 && !/^\d+$/u.test(token) && words.some(word=>oneTopicEdit(token,word)) ? 2 : -1;
+      if (hit<0) { matches=false; break; }
+      counts[hit]++;
+    }
+    if (matches) scored.push({item,index,score:[parsed.topic && text.includes(normalizeTopic(parsed.topic))?1:0,...counts]});
+  }
+  scored.sort((a,b)=>{
+    for(let i=0;i<a.score.length;i++) if(a.score[i]!==b.score[i]) return b.score[i]-a.score[i];
+    return a.index-b.index;
+  });
+  return scored.map(({item})=>item);
+}
+function reduceFeatureMode(state, event) {
+  if (event.type==='focus') return { mode:'focus',tab:event.tab,editing:true,submitted:false,draft:'',query:'',error:null,selection:event.selection??null };
+  if (!state) return null;
+  if (event.type==='escape') return state.editing && state.submitted
+    ? {...state,editing:false,draft:state.query,error:null} : null;
+  if (event.type==='edit') return {...state,editing:true,draft:state.query,error:null};
+  if (event.type==='submit') {
+    try { parseFocusQuery(state.draft); return {...state,editing:false,submitted:true,query:state.draft,error:null}; }
+    catch(error) { return {...state,error:error.message}; }
+  }
+  if (event.type==='backspace') return {...state,draft:[...state.draft].slice(0,-1).join(''),error:null};
+  if (event.type==='text') {
+    // Unknown CSI tokens and pasted controls are never query characters.
+    if (/\p{Cc}/u.test(event.text) || /^\[(?:[0-9;?]*[A-Za-z~]|<.*)$/u.test(event.text)) return state;
+    const draft=state.draft+event.text;
+    if(Buffer.byteLength(draft)>FOCUS_QUERY_BYTES) return {...state,error:'Query limit: 256 UTF-8 bytes; shorten the query.'};
+    return {...state,draft,error:null};
+  }
+  return state;
+}
+function focusCoverage({rows,matches,sourceAt=null,nowMs=Date.now(),hasNextPage=false}) {
+  if (rows===null) return 'Source not loaded; r Refresh. Esc returns to the ordinary list.';
+  const count=`${matches.length}/${rows.length} matches among loaded title/metadata`;
+  const age=sourceAt===null?'Source age unknown':`Source ${formatDuration(Math.max(0,nowMs-sourceAt))} old`;
+  return `${matches.length===0 && rows.length>0?'No local match; ':''}${count}. ${age}.${hasNextPage?' More source pages not searched.':''}`;
+}
+function featureKeyLines(feature) {
+  if(feature?.mode==='focus') return feature.editing
+    ? ['Focus editor: type query (q is text)', 'Enter Search loaded rows; Backspace Edit', 'Esc Cancel edit; Ctrl+C Quit']
+    : ['/ Edit query; Enter Open selected result', 'Up/Down or j/k Move; r Refresh source', 'Esc Ordinary list; q/Ctrl+C Quit'];
+  return keyTableLines();
 }
 
 // ---------- App ----------
@@ -17364,6 +17473,10 @@ function App({ onCreateRemote = () => {} } = {}) {
   securityBlindRef.current = securityBlind;
   // The `?` overlay. Renders only on a keypress, so consecutive idle frames are
   // still byte-identical and the redraw suppression is untouched.
+  const [feature, setFeature] = useState(null);
+  const featureRef = useRef(null);
+  featureRef.current = feature;
+  const [featureNotice, setFeatureNotice] = useState(null);
   const [showHelp, setShowHelp] = useState(false);
   const [helpPage, setHelpPage] = useState(0);
   // Set once, ICON_HINT_AFTER_MS into a first load that is still running. Never
@@ -17462,7 +17575,13 @@ function App({ onCreateRemote = () => {} } = {}) {
   const statusDisconnected = runtime.connect !== null
     ? activeGovernorDecision?.disconnected === true
     : data[tab.key] !== null && !runtimeIdentityCoordinator?.current();
-  const items = data[tab.key];
+  const focus = feature?.mode === "focus" && feature.tab === tab.key ? feature : null;
+  const focusQuery = focus?.query ?? null;
+  const focusSource = data[tab.key];
+  const focusItems = useMemo(() => focusQuery !== null
+    ? rankLocalFocus(parseFocusQuery(focusQuery), focusSource, tab.key) : null,
+  [focusQuery, focusSource, tab.key]);
+  const items = focus ? (data[tab.key] === null ? null : focusItems) : data[tab.key];
   const displayError = formatTabErrorForWidth(tabError, failureContext, Math.max(1, cols - 5));
   const coordinationError = activeGovernorDecision?.coordinationError && !remoteSetup;
   const coordinationReason = activeFailure ?? activeGovernorDecision?.reason ?? "unavailable";
@@ -17531,7 +17650,7 @@ function App({ onCreateRemote = () => {} } = {}) {
   const presentationNow = Date.now();
   const selectedTarget = dashboardTarget();
   const presentation = dashboardPresentation({
-    tab: tab.key, rows: items, hasSnapshot: items !== null,
+    tab: tab.key, rows: focus ? focusSource : items, hasSnapshot: items !== null,
     sourceAt: sourceAgeMs === null ? lastOk : presentationNow - sourceAgeMs,
     nowMs: presentationNow, overdue: Boolean(staleLabel),
     onDemand: runtime.background === "on-demand" && tab.key !== "actions" &&
@@ -17565,6 +17684,20 @@ function App({ onCreateRemote = () => {} } = {}) {
   if (USING_NERD_ICONS && iconHintDue && items === null && !tabError) {
     presentation.notes.push("Icons blank? GH_GLANCE_ICONS=unicode");
   }
+  const focusMessage = focus ? focusCoverage({rows:data[tab.key], matches:focusItems,
+    sourceAt:lastOk, nowMs:presentationNow, hasNextPage:meta[tab.key]?.hasNextPage || meta[tab.key]?.truncated || meta[tab.key]?.incomplete}) : featureNotice;
+  if (focus) {
+    presentation.showTable = focusItems.length > 0;
+    presentation.explanation = "Matches among loaded title/metadata only; ordinary source rows remain available with Esc.";
+    const queryDisplay = wrapPanelText(focus.editing ? focus.draft : focus.query || "all loaded rows", Math.max(1,cols-14)).at(-1) ?? "";
+    presentation.title = focus.editing ? `Focus > ${queryDisplay}` : `Focus: ${queryDisplay}`;
+    presentation.action = focus.error ?? focusMessage;
+    presentation.notes = [...featureKeyLines(focus), `Full query: ${focus.editing ? focus.draft : focus.query}`];
+  }
+  if (!focus && featureNotice) {
+    presentation.action = featureNotice;
+    presentation.notes.push(featureNotice);
+  }
   const panelLines = presentation.showTable ? [] : contextualPanelLayout(presentation, { cols, rows });
 
   const tableVisible = Array.isArray(items) && items.length > 0;
@@ -17580,9 +17713,12 @@ function App({ onCreateRemote = () => {} } = {}) {
           : [shortAction, presentation.sourceCheck, presentation.title]
       : [presentation.title, presentation.sourceCheck, ...recoveryLines.filter(Boolean)]
     : recoveryLines;
-  const noticeLines = [...new Set([...(showCoordinationNotice ? tableNotices : []),
+  const featureLines = focus ? [presentation.title, ...(focus.error ? [focus.error] : []),
+    ...focusMessage.split(/(?<=\.) /u), ...featureKeyLines(focus)]
+    .flatMap(line=>wrapPanelText(line, Math.max(1,cols-5))) : [];
+  const noticeLines = [...new Set([...(focus ? featureLines : []), ...(showCoordinationNotice ? tableNotices : []),
     ...(setupView?.title ? [setupView.title, setupView.action, ...setupView.notes] : []),
-    ...tableNotices])].slice(0, tableNoticeCapacity);
+    ...tableNotices, ...(!focus && featureNotice ? [featureNotice] : [])])].filter(Boolean).slice(0, tableNoticeCapacity);
   const visibleSecurityLines = tab.key === "security"
     ? securityLines.slice(0, Math.max(0, tableNoticeCapacity - noticeLines.length)) : [];
   const extraLines = !showHelp && !remoteSetup && tableVisible
@@ -17598,7 +17734,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       ...presentation.notes.filter((note) => note !== displayError),
     ] };
     helpPages = contextHelpPages({ view: helpView, target: selectedTarget,
-      tab: tab.key, remoteSetup }, keyTableLines(), cols - 5, bodyRows);
+      tab: tab.key, remoteSetup }, featureKeyLines(focus), cols - 5, bodyRows);
   }
   const visibleHelpPage = clampHelpPage(helpPage, helpPages.length);
   const helpPageRef = useRef({ index: 0, count: 0 });
@@ -17650,13 +17786,17 @@ function App({ onCreateRemote = () => {} } = {}) {
   // the closure must see current values without being rebuilt on every change.
   const navRef = useRef({ items: [], key: null, bodyRows: 1, tabKey: "actions", offset: 0 });
   navRef.current = {
-    items: data[tab.key] ?? [],
+    items: items ?? [],
     key: selected[tab.key] ?? null,
     bodyRows,
     tabKey: tab.key,
     offset: offset[tab.key] ?? 0,
   };
   const pageStep = Math.max(1, bodyRows - 1);
+  useEffect(() => {
+    if (featureRef.current && featureRef.current.tab !== tab.key) setFeature(null);
+    setFeatureNotice(null);
+  }, [tab.key]);
 
   // Read through a ref for the same reason the poll loop does: the useInput
   // closure must see the current value without being rebuilt on every toggle.
@@ -17868,7 +18008,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           : Math.min(items.length - 1, start + rows_ - 1)
         : Math.min(items.length - 1, Math.max(0, current + delta));
     setSelected((s) => ({ ...s, [tabKey]: itemKey(items[next]) }));
-    demandPages(tabKey, next, items.length);
+    if (!featureRef.current) demandPages(tabKey, next, items.length);
     // Keep the cursor on screen. Only the offset needed to reveal it changes,
     // so scrolling never jumps further than it has to.
     setOffset((o) => {
@@ -17970,6 +18110,19 @@ function App({ onCreateRemote = () => {} } = {}) {
         if (mouse) handleSgrMouse(mouse);
         return;
       }
+      if (featureRef.current?.editing && !(input === "c" && key.ctrl)) {
+        const event = key.escape ? {type:"escape"} : key.return ? {type:"submit"}
+          : key.backspace || key.delete ? {type:"backspace"}
+            : !key.ctrl && !key.meta && !key.upArrow && !key.downArrow && !key.leftArrow && !key.rightArrow && !key.tab
+              ? {type:"text",text:input} : null;
+        if(event) {
+          const previous=featureRef.current;
+          const next=reduceFeatureMode(previous,event);
+          setFeature(next);
+          if(next===null) setSelected(current=>({...current,[previous.tab]:previous.selection}));
+        }
+        return;
+      }
       if (input === "q" || (input === "c" && key.ctrl)) {
         openRequests.abortAll();
         flushWidthPreferences();
@@ -17993,6 +18146,12 @@ function App({ onCreateRemote = () => {} } = {}) {
         }
         // Width mode owns every other key. In particular, digits, arrows, Tab,
         // Enter and r must never fall through to their ordinary meanings.
+      } else if (key.escape && showHelpRef.current && featureRef.current) {
+        setShowHelp(false);
+      } else if (key.escape && featureRef.current) {
+        const old=featureRef.current;
+        setFeature(null);
+        setSelected(current=>({...current,[old.tab]:old.selection}));
       } else if (key.escape) {
         openRequests.abortAll();
         flushWidthPreferences();
@@ -18007,6 +18166,13 @@ function App({ onCreateRemote = () => {} } = {}) {
       } else if (input === "?") {
         setHelpPage(0);
         setShowHelp(true);
+      } else if (input === "/") {
+        const tabKey=TABS[activeIndexRef.current].key;
+        if (["issues","prs"].includes(tabKey)) {
+          setFeature(current=> current?.mode==="focus" ? reduceFeatureMode(current,{type:"edit"})
+            : reduceFeatureMode(null,{type:"focus",tab:tabKey,selection:navRef.current.key}));
+          setFeatureNotice(null);
+        } else setFeatureNotice("Focus applies to Issues or Pull requests; press 2 or 3, then /.");
       } else if (input === "s" && TABS[activeIndexRef.current].key === "actions") {
         void actionsSetupRef.current?.();
       } else if (input === "g" && TABS[activeIndexRef.current].key === "actions") {
@@ -19199,6 +19365,8 @@ function App({ onCreateRemote = () => {} } = {}) {
     }
 
     function retireCurrentScope() {
+      setFeature(null);
+      setFeatureNotice(null);
       retireSetup();
       if (!cleanupScope || !registeredScopeHash) return;
       for (const key of [...pending.keys()]) cancelPending(key, cleanupScope);
@@ -19215,6 +19383,8 @@ function App({ onCreateRemote = () => {} } = {}) {
     // for a moment must not: the rows are still ours, and throwing away the
     // ETags with them makes the recovery round cost full price.
     function resetVisibleScope(nowMs, { immediate = false, discardData = true } = {}) {
+      setFeature(null);
+      setFeatureNotice(null);
       for (const item of pending.values()) {
         if (item.cleanupPending) cleanupQueue.add(item);
       }
@@ -20551,6 +20721,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       interactive,
       cols: frameCols,
       remoteSetup,
+      feature: focus,
       widthMode: resizeRef.current.active,
       widthColumn: selectedWidthColumn,
       widthSaveError,
@@ -20833,6 +21004,7 @@ if (IS_MAIN && !runtime.headlessMode) {
 // Exported for unit tests. The dashboard itself is still one file; these are
 // the pure functions worth pinning, and nothing here is part of the public API.
 export {
+  parseFocusQuery, rankLocalFocus, reduceFeatureMode, focusCoverage, focusEligible,
   runGh,
   retryIdentityCompletion,
   createSettlementContext,

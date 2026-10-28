@@ -361,3 +361,5 @@ Two consequences worth knowing before adding PTY coverage:
 
 If you discover a security vulnerability, please follow the [Security
 Policy](SECURITY.md) instead of opening a public issue.
+
+Focus fixtures live in `test/fixtures/jev/focus.json`. Keep related source groups in a single frozen development or held-out partition. `node scripts/measure-focus.mjs` reports the local ranking baseline with corpus identity and matching/no-match denominators. `node scripts/measure-feature-interaction.mjs [baseline-index.mjs]` uses offline real-terminal fixtures to measure paired first paint and keypress-to-paint; the optional baseline must have its package and dependencies resolvable. These commands make no model requests. Model benefit and process-tree CPU/RSS remain unmeasured until their corresponding evaluations run.

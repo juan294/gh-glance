@@ -1165,3 +1165,7 @@ See [SECURITY.md](./SECURITY.md).
 ## License
 
 [MIT](./LICENSE)
+
+### Focus loaded work
+
+On Issues or Pull requests, press `/`, type a query, and press Enter. Focus searches loaded titles, available labels and PR branches locally. Exact filters are `#123`, `author:alice`, `branch:fix/session` (case sensitive), and `updated:>=2026-10-01`. Filters and topic words are combined. Prefixes and a single edit in words of five or more characters can match; no additional GitHub request is made. Counts and source age describe only loaded metadata. Press `/` to edit, Escape to cancel an edit or return to the ordinary list, and Enter on a selected result to open GitHub. While editing, `q` is text; Ctrl-C quits.
