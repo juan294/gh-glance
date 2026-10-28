@@ -113,8 +113,8 @@ describe what exists; do not suggest improvements unless asked.
 - Keep verification sequential unless the workflow explicitly says work
   can be parallelized
 - Preserve the project's git workflow exactly as described in
-  `CLAUDE.md`: `develop` is integration and is unprotected, so work is
-  committed directly to it; `main` is production and moves only via a
+  `CLAUDE.md`: `develop` is integration and permits direct pushes under
+  minimal force-push/deletion protection, so work is committed directly to it; `main` is production and moves only via a
   `develop` -> `main` pull request
 - Keep implementation work in isolated worktrees or temporary branches
 - Releases follow `docs/release/release-playbook.md`, which also decides

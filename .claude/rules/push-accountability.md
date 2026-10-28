@@ -6,8 +6,9 @@ description: Push accountability -- commit before pull, local gates before one a
 
 Always commit before `git pull --rebase` -- hook enforced.
 
-`develop` is unprotected (removed 2026-08-04 -- solo project, PR-per-change was
-pure overhead): direct pushes land immediately, and CI on `develop` is
+`develop` permits direct pushes without a required PR, review or CI gate.
+Owner decision, 2026-10-28: minimal protection blocks force-pushes and deletion,
+including for admins, while preserving this solo-project workflow. CI on `develop` is
 observed *after* the fact rather than gating it. Run the complete applicable
 local gate before committing, since a green local run is the only thing
 standing between a bad commit and a red `develop`. Working branches and

@@ -3,7 +3,8 @@ name: CI
 # One authoritative candidate selection per release. The `plan` job decides the
 # role of this run (scripts/release-candidate.mjs planCi):
 #
-#   push to develop        quick integration checks, or nothing while the
+#   push to develop        full checks only for an authenticated exact Sutura repair
+#                          merge; otherwise quick integration checks, or nothing while the
 #                          develop -> main release PR is open (its run covers it)
 #   PR develop -> main     the release candidate: selected suites plus ONE packed
 #                          tarball that every package job and the publisher reuse
@@ -55,6 +56,27 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+      # Immutable checkout proof is uploaded before any candidate-owned command.
+      - name: Record native checkout before verification
+        env:
+          SUTURA_NATIVE_JOB_KEY: Plan
+          SUTURA_NATIVE_RECORD: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+        run: |
+          node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const cp = require('node:child_process');
+          const testedSha = cp.execFileSync('git', ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          if (!/^[a-f0-9]{40}$/.test(testedSha)) throw new Error('Exact native checkout unavailable');
+          fs.writeFileSync(process.env.SUTURA_NATIVE_RECORD, JSON.stringify({ schemaVersion: 'sutura-native-checkout-v1', runId: Number(process.env.GITHUB_RUN_ID), attempt: Number(process.env.GITHUB_RUN_ATTEMPT), jobKey: process.env.SUTURA_NATIVE_JOB_KEY, testedSha }) + '\n', { flag: 'wx', mode: 0o600 });
+          NODE
+      - name: Retain immutable pre-verification checkout
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sutura-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22.22.2
@@ -72,6 +94,27 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Immutable checkout proof is uploaded before any candidate-owned command.
+      - name: Record native checkout before verification
+        env:
+          SUTURA_NATIVE_JOB_KEY: ${{ github.event_name == 'pull_request' && 'Lint' || 'Lint (push)' }}
+          SUTURA_NATIVE_RECORD: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+        run: |
+          node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const cp = require('node:child_process');
+          const testedSha = cp.execFileSync('git', ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          if (!/^[a-f0-9]{40}$/.test(testedSha)) throw new Error('Exact native checkout unavailable');
+          fs.writeFileSync(process.env.SUTURA_NATIVE_RECORD, JSON.stringify({ schemaVersion: 'sutura-native-checkout-v1', runId: Number(process.env.GITHUB_RUN_ID), attempt: Number(process.env.GITHUB_RUN_ATTEMPT), jobKey: process.env.SUTURA_NATIVE_JOB_KEY, testedSha }) + '\n', { flag: 'wx', mode: 0o600 });
+          NODE
+      - name: Retain immutable pre-verification checkout
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sutura-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22.22.2
@@ -94,6 +137,27 @@ jobs:
       tarball-sha256: ${{ steps.manifest.outputs.tarball-sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Immutable checkout proof is uploaded before any candidate-owned command.
+      - name: Record native checkout before verification
+        env:
+          SUTURA_NATIVE_JOB_KEY: Pack candidate
+          SUTURA_NATIVE_RECORD: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+        run: |
+          node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const cp = require('node:child_process');
+          const testedSha = cp.execFileSync('git', ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          if (!/^[a-f0-9]{40}$/.test(testedSha)) throw new Error('Exact native checkout unavailable');
+          fs.writeFileSync(process.env.SUTURA_NATIVE_RECORD, JSON.stringify({ schemaVersion: 'sutura-native-checkout-v1', runId: Number(process.env.GITHUB_RUN_ID), attempt: Number(process.env.GITHUB_RUN_ATTEMPT), jobKey: process.env.SUTURA_NATIVE_JOB_KEY, testedSha }) + '\n', { flag: 'wx', mode: 0o600 });
+          NODE
+      - name: Retain immutable pre-verification checkout
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sutura-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22.22.2
@@ -134,6 +198,27 @@ jobs:
           - { node: 24, node-version: 24.21.0 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Immutable checkout proof is uploaded before any candidate-owned command.
+      - name: Record native checkout before verification
+        env:
+          SUTURA_NATIVE_JOB_KEY: ${{ github.event_name == 'pull_request' && format('Test (Node {0})', matrix.node) || format('Test (Node {0}, push)', matrix.node) }}
+          SUTURA_NATIVE_RECORD: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+        run: |
+          node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const cp = require('node:child_process');
+          const testedSha = cp.execFileSync('git', ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          if (!/^[a-f0-9]{40}$/.test(testedSha)) throw new Error('Exact native checkout unavailable');
+          fs.writeFileSync(process.env.SUTURA_NATIVE_RECORD, JSON.stringify({ schemaVersion: 'sutura-native-checkout-v1', runId: Number(process.env.GITHUB_RUN_ID), attempt: Number(process.env.GITHUB_RUN_ATTEMPT), jobKey: process.env.SUTURA_NATIVE_JOB_KEY, testedSha }) + '\n', { flag: 'wx', mode: 0o600 });
+          NODE
+      - name: Retain immutable pre-verification checkout
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sutura-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: ${{ matrix.node-version }}
@@ -165,6 +250,27 @@ jobs:
           - { node: 24, node-version: 24.21.0 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Immutable checkout proof is uploaded before any candidate-owned command.
+      - name: Record native checkout before verification
+        env:
+          SUTURA_NATIVE_JOB_KEY: ${{ github.event_name == 'pull_request' && format('Smoke (Node {0})', matrix.node) || format('Smoke (Node {0}, push)', matrix.node) }}
+          SUTURA_NATIVE_RECORD: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+        run: |
+          node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const cp = require('node:child_process');
+          const testedSha = cp.execFileSync('git', ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          if (!/^[a-f0-9]{40}$/.test(testedSha)) throw new Error('Exact native checkout unavailable');
+          fs.writeFileSync(process.env.SUTURA_NATIVE_RECORD, JSON.stringify({ schemaVersion: 'sutura-native-checkout-v1', runId: Number(process.env.GITHUB_RUN_ID), attempt: Number(process.env.GITHUB_RUN_ATTEMPT), jobKey: process.env.SUTURA_NATIVE_JOB_KEY, testedSha }) + '\n', { flag: 'wx', mode: 0o600 });
+          NODE
+      - name: Retain immutable pre-verification checkout
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sutura-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: ${{ matrix.node-version }}
@@ -197,6 +303,27 @@ jobs:
         os: ${{ fromJSON(needs.plan.outputs.terminal-os) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Immutable checkout proof is uploaded before any candidate-owned command.
+      - name: Record native checkout before verification
+        env:
+          SUTURA_NATIVE_JOB_KEY: Terminal smoke (${{ matrix.os }})
+          SUTURA_NATIVE_RECORD: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+        run: |
+          node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const cp = require('node:child_process');
+          const testedSha = cp.execFileSync('git', ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          if (!/^[a-f0-9]{40}$/.test(testedSha)) throw new Error('Exact native checkout unavailable');
+          fs.writeFileSync(process.env.SUTURA_NATIVE_RECORD, JSON.stringify({ schemaVersion: 'sutura-native-checkout-v1', runId: Number(process.env.GITHUB_RUN_ID), attempt: Number(process.env.GITHUB_RUN_ATTEMPT), jobKey: process.env.SUTURA_NATIVE_JOB_KEY, testedSha }) + '\n', { flag: 'wx', mode: 0o600 });
+          NODE
+      - name: Retain immutable pre-verification checkout
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sutura-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22.22.2
@@ -234,6 +361,27 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Immutable checkout proof is uploaded before any candidate-owned command.
+      - name: Record native checkout before verification
+        env:
+          SUTURA_NATIVE_JOB_KEY: Recovery and efficiency
+          SUTURA_NATIVE_RECORD: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+        run: |
+          node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const cp = require('node:child_process');
+          const testedSha = cp.execFileSync('git', ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          if (!/^[a-f0-9]{40}$/.test(testedSha)) throw new Error('Exact native checkout unavailable');
+          fs.writeFileSync(process.env.SUTURA_NATIVE_RECORD, JSON.stringify({ schemaVersion: 'sutura-native-checkout-v1', runId: Number(process.env.GITHUB_RUN_ID), attempt: Number(process.env.GITHUB_RUN_ATTEMPT), jobKey: process.env.SUTURA_NATIVE_JOB_KEY, testedSha }) + '\n', { flag: 'wx', mode: 0o600 });
+          NODE
+      - name: Retain immutable pre-verification checkout
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sutura-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22.22.2
@@ -255,6 +403,27 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Immutable checkout proof is uploaded before any candidate-owned command.
+      - name: Record native checkout before verification
+        env:
+          SUTURA_NATIVE_JOB_KEY: PTY governor
+          SUTURA_NATIVE_RECORD: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+        run: |
+          node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const cp = require('node:child_process');
+          const testedSha = cp.execFileSync('git', ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          if (!/^[a-f0-9]{40}$/.test(testedSha)) throw new Error('Exact native checkout unavailable');
+          fs.writeFileSync(process.env.SUTURA_NATIVE_RECORD, JSON.stringify({ schemaVersion: 'sutura-native-checkout-v1', runId: Number(process.env.GITHUB_RUN_ID), attempt: Number(process.env.GITHUB_RUN_ATTEMPT), jobKey: process.env.SUTURA_NATIVE_JOB_KEY, testedSha }) + '\n', { flag: 'wx', mode: 0o600 });
+          NODE
+      - name: Retain immutable pre-verification checkout
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sutura-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22.22.2
@@ -279,6 +448,27 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Immutable checkout proof is uploaded before any candidate-owned command.
+      - name: Record native checkout before verification
+        env:
+          SUTURA_NATIVE_JOB_KEY: PTY other files
+          SUTURA_NATIVE_RECORD: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+        run: |
+          node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const cp = require('node:child_process');
+          const testedSha = cp.execFileSync('git', ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          if (!/^[a-f0-9]{40}$/.test(testedSha)) throw new Error('Exact native checkout unavailable');
+          fs.writeFileSync(process.env.SUTURA_NATIVE_RECORD, JSON.stringify({ schemaVersion: 'sutura-native-checkout-v1', runId: Number(process.env.GITHUB_RUN_ID), attempt: Number(process.env.GITHUB_RUN_ATTEMPT), jobKey: process.env.SUTURA_NATIVE_JOB_KEY, testedSha }) + '\n', { flag: 'wx', mode: 0o600 });
+          NODE
+      - name: Retain immutable pre-verification checkout
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sutura-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22.22.2
@@ -295,20 +485,42 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  # Legacy required `PTY` context, on pull requests only (protection reads it
+  # Legacy required `PTY` context on PRs; exact repair merges also run the
+  # push context. Ordinary develop push cadence remains unchanged. Protection reads it
   # there). It reports the terminal work this run selected: the full shards
   # for broad candidates, the smoke otherwise. A job skipped by its `if` still
   # posts a check run, so push runs name it "PTY (push)".
   pty:
     name: ${{ github.event_name == 'pull_request' && 'PTY' || 'PTY (push)' }}
     needs: [plan, terminal-smoke, pty-governor, pty-rest]
-    if: always() && github.event_name == 'pull_request'
+    if: always() && (github.event_name == 'pull_request' || fromJSON(needs.plan.outputs.plan).repairIntegration == true)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           sparse-checkout: scripts
+      # Immutable checkout proof is uploaded before any candidate-owned command.
+      - name: Record native checkout before verification
+        env:
+          SUTURA_NATIVE_JOB_KEY: ${{ github.event_name == 'pull_request' && 'PTY' || 'PTY (push)' }}
+          SUTURA_NATIVE_RECORD: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+        run: |
+          node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const cp = require('node:child_process');
+          const testedSha = cp.execFileSync('git', ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          if (!/^[a-f0-9]{40}$/.test(testedSha)) throw new Error('Exact native checkout unavailable');
+          fs.writeFileSync(process.env.SUTURA_NATIVE_RECORD, JSON.stringify({ schemaVersion: 'sutura-native-checkout-v1', runId: Number(process.env.GITHUB_RUN_ID), attempt: Number(process.env.GITHUB_RUN_ATTEMPT), jobKey: process.env.SUTURA_NATIVE_JOB_KEY, testedSha }) + '\n', { flag: 'wx', mode: 0o600 });
+          NODE
+      - name: Retain immutable pre-verification checkout
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sutura-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22.22.2
@@ -330,6 +542,27 @@ jobs:
       pull-requests: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Immutable checkout proof is uploaded before any candidate-owned command.
+      - name: Record native checkout before verification
+        env:
+          SUTURA_NATIVE_JOB_KEY: Promotion identity
+          SUTURA_NATIVE_RECORD: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+        run: |
+          node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const cp = require('node:child_process');
+          const testedSha = cp.execFileSync('git', ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          if (!/^[a-f0-9]{40}$/.test(testedSha)) throw new Error('Exact native checkout unavailable');
+          fs.writeFileSync(process.env.SUTURA_NATIVE_RECORD, JSON.stringify({ schemaVersion: 'sutura-native-checkout-v1', runId: Number(process.env.GITHUB_RUN_ID), attempt: Number(process.env.GITHUB_RUN_ATTEMPT), jobKey: process.env.SUTURA_NATIVE_JOB_KEY, testedSha }) + '\n', { flag: 'wx', mode: 0o600 });
+          NODE
+      - name: Retain immutable pre-verification checkout
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sutura-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22.22.2
@@ -347,6 +580,27 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           sparse-checkout: scripts
+      # Immutable checkout proof is uploaded before any candidate-owned command.
+      - name: Record native checkout before verification
+        env:
+          SUTURA_NATIVE_JOB_KEY: ${{ github.event_name == 'pull_request' && 'Release candidate' || 'Push checks' }}
+          SUTURA_NATIVE_RECORD: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+        run: |
+          node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const cp = require('node:child_process');
+          const testedSha = cp.execFileSync('git', ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          if (!/^[a-f0-9]{40}$/.test(testedSha)) throw new Error('Exact native checkout unavailable');
+          fs.writeFileSync(process.env.SUTURA_NATIVE_RECORD, JSON.stringify({ schemaVersion: 'sutura-native-checkout-v1', runId: Number(process.env.GITHUB_RUN_ID), attempt: Number(process.env.GITHUB_RUN_ATTEMPT), jobKey: process.env.SUTURA_NATIVE_JOB_KEY, testedSha }) + '\n', { flag: 'wx', mode: 0o600 });
+          NODE
+      - name: Retain immutable pre-verification checkout
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sutura-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-checkout-${{ github.job }}-${{ strategy.job-index || 0 }}.json
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22.22.2
@@ -354,3 +608,56 @@ jobs:
           CI_PLAN: ${{ needs.plan.outputs.plan }}
           CI_NEEDS: ${{ toJSON(needs) }}
         run: node scripts/release-candidate.mjs aggregate
+
+  native-receipt:
+    name: Native proof receipt
+    needs: [plan, lint, pack, test, smoke, terminal-smoke, sustained, pty-governor, pty-rest, pty, promotion, candidate]
+    if: >-
+      always() && (fromJSON(needs.plan.outputs.plan).repairIntegration == true ||
+      (github.event_name == 'pull_request' && github.base_ref == 'develop' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'sutura/fix-')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      # Isolated producer: no consumer checkout or candidate code execution.
+      - name: Read reviewed Sutura receipt implementation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: juan294/sutura
+          ref: 94dab7eab0957d1d2e9e4aab2dc4e2ea9828f07c
+          path: .receipt-engine
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22.22.2
+      - name: Read immutable pre-test checkout records
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: sutura-checkout-*-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-checkouts
+          merge-multiple: true
+      # Resolve the actual last policy-file commit, which stays stable while
+      # integration advances without changing policy. The existing CLI verifies
+      # exact ancestry and identical current/source policy bytes independently.
+      - name: Build native receipt from the exact enrolled policy source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          policy_source=$(gh api --hostname github.com "repos/$GITHUB_REPOSITORY/commits?path=.github/native-policy.json&sha=develop&per_page=1" --jq '.[0].sha')
+          if ! [[ "$policy_source" =~ ^[a-f0-9]{40}$ ]]; then
+            echo 'Exact native-policy enrollment commit is unavailable.' >&2
+            exit 1
+          fi
+          node .receipt-engine/scripts/fleet-native-receipt.mjs "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" refs/heads/develop "$RUNNER_TEMP/native-checkouts" "$policy_source" > "$RUNNER_TEMP/native-receipt.json"
+      - name: Retain native proof receipt
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sutura-native-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-receipt.json
+          overwrite: false
+          if-no-files-found: error
+          retention-days: 30
