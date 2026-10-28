@@ -11,6 +11,7 @@ import {
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 
+import {ciResponse} from "./ci-response.mjs";
 import { graphqlHeaders, graphqlResponseFor, readGraphqlDocument } from "./graphql-response.mjs";
 
 if (process.env.GH_GLANCE_REQUEST_ORACLE) {
@@ -106,6 +107,9 @@ function bodyEtag(body) {
 }
 
 function defaultApiBody(path) {
+  const detail=ciResponse(path);
+  if(detail)return JSON.stringify(detail);
+  if(/\/actions\/jobs\/.*\/logs/.test(path??""))throw new Error("gh log acquisition forbidden");
   if (path === "user") return JSON.stringify({
     id: Number(process.env.GH_GLANCE_FIXTURE_USER_ID ?? 1),
     login: process.env.GH_GLANCE_FIXTURE_LOGIN ?? "octocat",
@@ -320,6 +324,8 @@ function selector() {
   if (args[0] === "api" && apiInvocation?.path === "graphql") {
     return graphqlAnswer?.operation === "graphql.observer" ? "graphql-observer" : "graphql-data";
   }
+  if (/\/actions\/runs\/\d+\/attempts\/\d+\/jobs\?/.test(apiInvocation?.path??""))return "ci-jobs";
+  if (/\/actions\/runs\/\d+\?/.test(apiInvocation?.path??""))return "ci-run";
   if (apiInvocation?.path?.includes("/actions/workflows?") && args.some((arg) => arg.includes("total_count"))) return "setup";
   if (args[0] === "api" && apiInvocation?.path?.includes("/actions/")) return "actions";
   if (args[0] === "api") return "security";

@@ -90,7 +90,7 @@ test("D6: recovery cause maps resource, action, retry and cached age without raw
     ["legacy-unresolved", "core", /older requests/i, /restart/i],
     ["migration-hold", "core", /older session/i, /retry|wait/i],
     ["restart-required", "core", /older session/i, /restart/i],
-    ["version-mismatch", "core", /older session/i, /restart/i],
+    ["version-mismatch", "core", /protocol requires an update/i, /update.*restart/i],
     ["identity-backoff", "graphql", /budget check/i, /retry/i],
     ["probe-failed", "graphql", /budget check/i, /retry/i],
     ["identity-capacity", "graphql", /budget check/i, /retry/i],

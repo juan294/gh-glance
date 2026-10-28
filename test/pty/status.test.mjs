@@ -718,16 +718,20 @@ test("a held core tab stays Paused while a selected GraphQL tab progresses", (t)
 });
 
 test("corrupt, live-locked, and blocked storage pause with no data calls", (t) => {
-  const box = sharedFixture(t);
-  capture({
-    cols: 80,
-    rows: 24,
-    signal: "none",
-    settle: 15,
-    stdin: quitAfterCached("actions"),
-    configHome: box.root,
-    env: { GH_GLANCE_FIXTURE_STATE: box.statePath, GH_GLANCE_FIXTURE_PANE: "warm" },
-  });
+  const warmFixture = () => {
+    const box = sharedFixture(t);
+    capture({
+      cols: 80,
+      rows: 24,
+      signal: "none",
+      settle: 15,
+      stdin: quitAfterCached("actions"),
+      configHome: box.root,
+      env: { GH_GLANCE_FIXTURE_STATE: box.statePath, GH_GLANCE_FIXTURE_PANE: "warm" },
+    });
+    return box;
+  };
+  const box = warmFixture();
   const path = governorPath(box.root);
   const healthy = readFileSync(path, "utf8");
   const before = dataStarts(box.read()).length;
@@ -742,19 +746,26 @@ test("corrupt, live-locked, and blocked storage pause with no data calls", (t) =
   });
   writeFileSync(path, healthy, { mode: 0o600 });
   assert.match(statusLine(corrupt) ?? "", /^‖ Paused/);
-  assert.match(corrupt.finalFrame.lines.join("\n"), translatedCoordinationNotice);
+  assert.match(corrupt.finalFrame.lines.join("\n"), /Local coordination is corrupt/);
+  assert.match(corrupt.finalFrame.lines.join("\n"),
+    /Run gh-glance --doctor; preserve the reported state file/);
 
-  writeFileSync(`${path}.lock`, `${JSON.stringify({ pid: process.pid, nonce: "live-test-owner" })}\n`, {
+  // A retained corruption cause survives contention until successful recovery.
+  // Use independent healthy state to test a live lock's own recovery message.
+  const lockBox = warmFixture();
+  const lockPath = `${governorPath(lockBox.root)}.lock`;
+  const beforeLocked = dataStarts(lockBox.read()).length;
+  writeFileSync(lockPath, `${JSON.stringify({ pid: process.pid, nonce: "live-test-owner" })}\n`, {
     mode: 0o600,
   });
   const locked = capture({
     cols: 80,
     rows: 24,
     settle: 7,
-    configHome: box.root,
-    env: { GH_GLANCE_FIXTURE_STATE: box.statePath, GH_GLANCE_FIXTURE_PANE: "locked" },
+    configHome: lockBox.root,
+    env: { GH_GLANCE_FIXTURE_STATE: lockBox.statePath, GH_GLANCE_FIXTURE_PANE: "locked" },
   });
-  rmSync(`${path}.lock`, { force: true });
+  rmSync(lockPath, { force: true });
   assert.match(statusLine(locked) ?? "", /^‖ Paused/);
   assert.match(locked.finalFrame.lines.join("\n"), translatedCoordinationNotice);
 
@@ -771,6 +782,7 @@ test("corrupt, live-locked, and blocked storage pause with no data calls", (t) =
   assert.match(unwritable.finalFrame.lines.join("\n"), /Local coordination cannot be written/);
   assert.match(unwritable.finalFrame.lines.join("\n"), /Run gh-glance --doctor; check storage permissions/);
   assert.equal(dataStarts(box.read()).length, before);
+  assert.equal(dataStarts(lockBox.read()).length, beforeLocked);
   assert.equal(dataStarts(blocked.read()).length, 0);
 });
 

@@ -1173,3 +1173,36 @@ On Issues or Pull requests, press `/`, type a query, and press Enter. Focus sear
 For optional semantic Focus, set `TYPESAFE_API_KEY` in your shell and start `gh-glance --jev` in an interactive standalone terminal. A key alone enables nothing. Press `J` on submitted Focus results, review the exact repository/access scope and metadata disclosure, then Enter to send or Escape to cancel. TypeSafe receives the topic, titles, available labels and PR branches; separate repository/account identity, author, body and URL fields are omitted. Query and metadata text remain literal supplied text. Public metadata also needs permission. `x` revokes that scope's permission, cancels work and clears its results. Permission and normalized results remain in memory for this session only.
 
 Semantic Focus uses pinned `jev-1.14.0`, a four-second action deadline and at most 60 uncached eligible rows per explicit action. Exact filters still run locally, and all filter-eligible rows can be considered, including synonyms absent from local results. `m` evaluates the next loaded candidates. Coverage distinguishes matches, uncertain answers and unevaluated rows; all remain inspectable and Escape returns to the ordinary list. Filter-only queries send nothing. No automatic model requests or retries occur on startup, typing, polling or refresh. The session defaults to 100 dispatched calls; `--jev-max-requests 1..10000` changes that per-process cap. Errors, cooldowns and exhaustion retain local Focus and show the next explicit action. No account retention guarantee is implied. The live provider contract and semantic accuracy are not yet qualified.
+
+### Selected CI evidence
+
+On Actions, select a run and press `d` to inspect its exact run ID, attempt,
+head SHA, jobs and step facts. Failed and timed-out jobs appear first. Up/Down
+selects a job; `l` explicitly captures a selected failed/timed-out job's plaintext
+log, and Enter opens
+that exact job on GitHub. Escape returns to ordinary Actions. This view is
+standalone only; connected collectors offer the selected run's browser link.
+Nothing is acquired for this feature during ordinary polling or idle time.
+
+The view loads one page of at most 100 jobs and 100 steps per job, and displays
+loaded/total coverage. Metadata has a 2 MiB aggregate bound and 45-second total
+deadline. A selected log has a 1 MiB cumulative bound and 20-second total
+deadline: one admitted GitHub API GET and at most one credential-free HTTPS
+storage GET, with no automatic retries or pagination. Actions read permission
+is required. Unsupported proxies or storage redirects offer Open GitHub.
+Step metadata does not imply a step-to-log-line association. Log text stays in
+session memory and never enters dashboard/collector caches.
+
+This version upgrades the shared quota protocol from 7 to 8 at the same ledger
+path. **Restart all gh-glance panes with this version; keep the shared quota
+ledger. Never clear, delete, downgrade or replace it to resolve a version
+mismatch.** Live old leases hold the upgrade until they close or expire. The
+upgrade saves an exact private `.pre-v8.backup` before its first write. A
+conflicting backup names its path in recovery help/doctor: preserve it under an
+unused archival filename before retrying. Storage failures refuse new admission.
+A future protocol requires updating and restarting every pane.
+
+An unverified native connection closure retains its quota charge and displays
+the computed uncertainty-window deadline. Restarting a pane does not refund that
+charge. The ledger's existing verified closure/boot/window recovery rules apply;
+Open GitHub remains available while waiting.

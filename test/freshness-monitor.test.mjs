@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -718,3 +718,12 @@ test("qualification CLI rejects early SIGINT after a valid source and records in
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('read-only monitor discloses restart and future-version recovery without persistence',()=>{
+  for(const reason of ['restart-required','version-mismatch']){
+    const monitor=createFreshnessMonitor({manifest:qualificationManifest(),candidateHash:CANDIDATE_HASH,storePath:'/unused/acquisition.json',...quotaOptions,now:()=>AT,monotonicNow:()=>0,readStore:()=>store(AT),readQuota:()=>({ok:false,reason}),inspectLock:()=>({status:'unobstructed',ageMs:null})});
+    const sample=monitor.sample();assert.equal(sample.ok,false);assert.equal(sample.diagnostics.reason,reason);assert.match(sample.diagnostics.remedy,/Restart all gh-glance panes/);assert.match(sample.diagnostics.remedy,/keep the shared quota ledger/);if(reason==='version-mismatch')assert.match(sample.diagnostics.remedy,/Update gh-glance/);
+  }
+});
+
+test('actual read-only monitor preserves v7 ledger and backup absence through lease/version holds',t=>{const root=mkdtempSync(join(tmpdir(),'glance-monitor-v7-'));t.after(()=>rmSync(root,{recursive:true,force:true}));const path=join(root,'quota.json'),state=emptyGovernorState();state.version=7;const id='11111111-1111-4111-8111-111111111111';state.leases[id]={expiresAt:AT+10000,floorMs:5000,activeTab:'actions',phaseSeed:{seed:id,registeredAt:AT},demand:{core:1,graphql:0}};const options={manifest:qualificationManifest(),candidateHash:CANDIDATE_HASH,storePath:'/unused/acquisition.json',quotaPath:path,verifyQuotaScope:()=>true,isPidAlive:()=>"live",now:()=>AT,monotonicNow:()=>0,readStore:()=>store(AT),inspectLock:()=>({status:'unobstructed',ageMs:null})};for(const [version,reason]of [[7,'restart-required'],[9,'version-mismatch']]){state.version=version;const raw=JSON.stringify(state);writeFileSync(path,raw);const sample=createFreshnessMonitor(options).sample();assert.equal(sample.diagnostics.reason,reason);assert.equal(readFileSync(path,'utf8'),raw);assert.equal(existsSync(path+'.pre-v8.backup'),false);}state.version=7;state.leases={};const raw=JSON.stringify(state);writeFileSync(path,raw);createFreshnessMonitor(options).sample();assert.equal(readFileSync(path,'utf8'),raw);assert.equal(existsSync(path+'.pre-v8.backup'),false);});

@@ -160,7 +160,9 @@ identityTest("ID-05: reappearing legacy leases pause an already active identity"
   const serialized = JSON.stringify(legacy);
   writeFileSync(legacyPath, serialized, { mode: 0o600 });
   now += 250;
-  await assert.rejects(acquireIdentityHttpPermit(coordinator, { now: () => now }), /Restart required/);
+  await assert.rejects(acquireIdentityHttpPermit(coordinator, { now: () => now }), {
+    message: "Restart all gh-glance panes with this version; keep the shared quota ledger",
+  });
   assert.equal(readFileSync(legacyPath, "utf8"), serialized);
   const after = inspectIdentityRegistry(coordinator.root).value;
   assert.equal(after.hosts["github.com"].lastStartedAt, before.hosts["github.com"].lastStartedAt);

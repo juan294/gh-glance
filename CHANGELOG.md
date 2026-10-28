@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Actions `d` opens exact run/attempt/job evidence in standalone mode; `l`
+  explicitly captures a bounded failed/timed-out job log. Enter opens the exact
+  selected job. Coverage and unsupported proxy/storage limitations are visible.
+
+### Changed
+
+- Shared quota protocol 8 upgrades the same ledger path with a private exact
+  `.pre-v8.backup`. Restart all gh-glance panes with this version; keep the
+  shared quota ledger. Never clear, delete or downgrade it for a version
+  mismatch. A future protocol requires updating every pane. Preserve a
+  conflicting backup under an unused archival filename before retrying;
+  recovery help/doctor reports its exact path. An unverified native connection
+  keeps its charge until the ledger's computed uncertainty-window recovery.
+
 ## [0.17.1] - 2026-10-26
 
 ### Fixed

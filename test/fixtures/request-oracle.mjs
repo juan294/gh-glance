@@ -1,3 +1,4 @@
+import {ciResponse} from '../pty/fixtures/ci-response.mjs';
 // Independent synthetic GitHub server. Never import application accounting here.
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -149,6 +150,7 @@ export function graphqlShape(query, variables) {
 }
 
 export function identifyOracleRequest(argv, { input = null } = {}) {
+  if (argv.some(arg=>/^--log/.test(arg))) throw new Error("gh log acquisition is forbidden");
   if (argv[0] === "--version") return { operation: "cli.version", local: true };
   if (argv[0] === "auth" && argv[1] === "token") return { operation: "cli.token", local: true };
 
@@ -233,6 +235,8 @@ export function identifyOracleRequest(argv, { input = null } = {}) {
       repository: shape.repository ?? repository };
 
   }
+  const detail=/^repos\/([^/]+\/[^/]+)\/actions\/runs\/([1-9][0-9]*)(\?exclude_pull_requests=true|\/attempts\/([1-9][0-9]*)\/jobs\?per_page=100&page=1)$/.exec(path ?? '');
+  if(detail)return {...base,repository:detail[1],operation:detail[4]?'actions.detail-jobs':'actions.detail-run',runId:Number(detail[2]),...(detail[4]?{attempt:Number(detail[4]),pageSize:100}:{}),resource:'core',cost:1};
   const match = /^repos\/([^/]+\/[^/]+)\/(actions\/runs|actions\/workflows|dependabot\/alerts|code-scanning\/alerts|secret-scanning\/alerts)(?:\?(.*))?$/.exec(path ?? "");
   if (!match) throw new Error(`unknown fixture API path: ${path}`);
   const operations = { "actions/runs": "actions.runs", "actions/workflows": "actions.workflows", "dependabot/alerts": "security.dependabot", "code-scanning/alerts": "security.code", "secret-scanning/alerts": "security.secret" };
@@ -293,6 +297,7 @@ function fixtureId(kind, ...identity) {
 
 function defaultPayload(request, identity) {
   switch (request.operation) {
+    case "actions.detail-run": case "actions.detail-jobs": return ciResponse(request.path);
     case "actions.runs": return fixture("actions-runs");
     case "actions.workflows": return fixture("actions-workflows");
     case "actions.setup": return fixture("actions-setup");

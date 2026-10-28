@@ -2,8 +2,8 @@
 // gh-glance -- a live-refreshing GitHub dashboard sized for a narrow terminal
 // pane: Actions, Issues, Pull Requests, and Security (Dependabot/
 // code-scanning/secret-scanning alerts). All data comes from `gh` (issue/pr/
-// run list + `gh api` for security alerts) -- no direct GitHub API calls of
-// our own. Renders with ink so redraws are diffed in place, no full-screen
+// run list + `gh api` for security alerts). Explicit failed-job logs use
+// separately admitted native HTTPS with one credential-free storage transfer. Renders with ink so redraws are diffed in place, no full-screen
 // clear/flash on refresh.
 
 // React's development build instruments every render with performance.measure()
@@ -751,7 +751,7 @@ function operationPausedUntil(operation, now = Date.now()) {
 }
 
 async function runGh(args, { signal, operation, input = null, execute = null,
-  closeWaitMs = 15_000 } = {}) {
+  closeWaitMs = 15_000, timeoutMs = GH_TIMEOUT_MS, maxBuffer = GH_MAX_BUFFER } = {}) {
   if (operationCost(operation) === null) {
     throw new Error(`undeclared gh operation: ${operation ?? "missing"}`);
   }
@@ -836,9 +836,9 @@ async function runGh(args, { signal, operation, input = null, execute = null,
     }
     const executeChild = execute ?? bound?.executeGh ?? execFileAsync;
     const pending = executeChild("gh", args, {
-      timeout: GH_TIMEOUT_MS,
+      timeout: Math.min(GH_TIMEOUT_MS, timeoutMs),
       killSignal: "SIGKILL",
-      maxBuffer: GH_MAX_BUFFER,
+      maxBuffer: Math.min(GH_MAX_BUFFER, maxBuffer),
       env: withoutJevCredential({ ...(bound?.credentialEnvironment ?? process.env), ...GH_ENV_OVERRIDES }),
       signal,
     });
@@ -1009,16 +1009,17 @@ function ghApiArgs(args, etag = null) {
   ];
 }
 
-async function ghApi(args, { operation, signal, etag = null, run = runGh, includeHeaders = false } = {}) {
+async function ghApi(args, { operation, signal, etag = null, run = runGh, includeHeaders = false, timeoutMs, maxBuffer } = {}) {
   const argv = ghApiArgs(args, etag);
   try {
-    const parsed = parseGhApiResponse(await run(argv, { operation, signal }));
+    const captured=await run(argv, { operation, signal, timeoutMs, maxBuffer });
+    const parsed = parseGhApiResponse(captured);
     return {
       status: parsed.status,
       etag: parsed.headers.etag ?? null,
       rateLimit: pickRateLimit(parsed.headers),
       body: parsed.body,
-      ...(includeHeaders ? { headers: parsed.headers } : {}),
+      ...(includeHeaders ? { headers: parsed.headers, capturedBytes:Buffer.byteLength(captured) } : {}),
     };
   } catch (error) {
     const parsed = parseGhApiResponse(error?.stdout);
@@ -1559,6 +1560,384 @@ function actionsSetupPresentation(state, nowMs) {
   return { title: state.busy ? "Checking Actions setup" : state.error ? "Setup check unavailable"
     : state.message ? state.title ?? "Actions setup" : result?.title,
   action: state.action ?? (state.error ? "s Retry; g Actions; ? Details" : "s Setup; g Actions; ? Details"), notes };
+}
+
+// ---------- Explicit selected-run evidence (never a source cache) ----------
+const CI_METADATA_BYTES = 2 * 1024 * 1024;
+const CI_LOG_BYTES = 1024 * 1024;
+const CI_METADATA_DEADLINE_MS = 45_000;
+const CI_LOG_DEADLINE_MS = 20_000;
+const CI_STATUS = new Set(['queued','in_progress','completed','waiting','requested','pending']);
+const CI_CONCLUSION = new Set(['success','failure','neutral','cancelled','skipped','timed_out','action_required','stale','startup_failure']);
+const CI_ERRORS = Object.freeze({
+  'changed': 'Run changed; refresh Actions and reopen.',
+  'invalid': 'CI response is unusable. Retry or open GitHub.',
+  'permission': 'Actions read permission is required. Retry or open GitHub.',
+  'unavailable': 'Job log unavailable or expired. Press l to retry or Enter to open GitHub.',
+  'unsupported-proxy': 'Native log downloads do not support this proxy configuration. Open GitHub.',
+  'unsupported-storage': 'Unsupported log storage topology. Open GitHub.',
+  'oversize': 'Log too large to analyze. Open GitHub.',
+  'metadata-oversize': 'CI metadata exceeds the 2 MiB bound. Open GitHub.',
+  'timeout': 'CI request timed out. Retry or open GitHub.',
+  'canceled': 'CI request canceled. Retry or open GitHub.',
+  'network': 'CI connection failed. Retry or open GitHub.',
+  'credential-changed': 'Credential changed; reopen CI details.',
+  'credential-unavailable': 'GitHub login unavailable. Run gh auth status, then retry.',
+  'closure': 'Connection closure unverified; quota charge remains held.',
+  'admission': 'GitHub admission is paused. Retry after the shown wait or open GitHub.',
+});
+function ciError(code, detail = {}) {
+  return Object.assign(new Error(CI_ERRORS[code] ?? CI_ERRORS.network), { code, ...detail });
+}
+function ciBoundText(value, max = 512) {
+  if (typeof value !== 'string' || !value.trim() || Buffer.byteLength(value) > max) throw ciError('invalid');
+  return safe(value);
+}
+function ciState(value) {
+  if (!CI_STATUS.has(value.status) || value.conclusion !== null && !CI_CONCLUSION.has(value.conclusion)) throw ciError('invalid');
+  return { status: value.status, conclusion: value.conclusion };
+}
+function ciBrowserUrl(value, host, repository, runId, jobId = null) {
+  const url = admittedRowUrl(value, host);
+  if (!url || Buffer.byteLength(url)>2048) throw ciError('invalid');
+  const parsed = new URL(url);
+  if (parsed.username || parsed.password || !parsed.pathname.toLowerCase().startsWith(`/${repository.toLowerCase()}/`)) throw ciError('invalid');
+  const base=`/${repository.toLowerCase()}`;
+  const paths=jobId===null?[`${base}/actions/runs/${runId}`]:[`${base}/actions/runs/${runId}/job/${jobId}`,`${base}/runs/${runId}/jobs/${jobId}`];
+  if(!paths.includes(parsed.pathname.toLowerCase().replace(/\/$/,'')))throw ciError('invalid');
+  return url;
+}
+function parseCiRun(body, { host, repository, selected }) {
+  let raw;
+  try { raw = JSON.parse(body); } catch { throw ciError('invalid'); }
+  if (!isRecord(raw) || !Number.isSafeInteger(raw.id) || raw.id<1 || raw.id !== selected.databaseId || raw.repository?.full_name?.toLowerCase() !== repository.toLowerCase()) throw ciError('changed');
+  if (!Number.isSafeInteger(raw.run_attempt) || raw.run_attempt < 1 || !/^[0-9a-f]{40}$/i.test(raw.head_sha ?? '') || typeof raw.updated_at!=='string' || Buffer.byteLength(raw.updated_at)>64 || !Number.isFinite(Date.parse(raw.updated_at))) throw ciError('invalid');
+  if (Date.parse(raw.updated_at) !== Date.parse(selected.updatedAt) || raw.status !== selected.status || raw.conclusion !== selected.conclusion ||
+      selected.headSha && selected.headSha !== raw.head_sha || selected.attempt && selected.attempt !== raw.run_attempt) throw ciError('changed');
+  return { id: raw.id, attempt: raw.run_attempt, headSha: raw.head_sha, ...ciState(raw),
+    updatedAt: raw.updated_at, url: ciBrowserUrl(raw.html_url, host, repository,raw.id) };
+}
+function parseCiJobs(body, { host, repository, run, headers = {} }) {
+  let raw;
+  try { raw = JSON.parse(body); } catch { throw ciError('invalid'); }
+  if (!isRecord(raw) || !Number.isSafeInteger(raw.total_count) || raw.total_count < 0 || !Array.isArray(raw.jobs) || raw.jobs.length > 100 || raw.total_count < raw.jobs.length || raw.total_count > 0 && raw.jobs.length === 0) throw ciError('invalid');
+  const ids = new Set();
+  const jobs = raw.jobs.map(job => {
+    if (!isRecord(job) || !Number.isSafeInteger(job.id) || job.id < 1 || ids.has(job.id) || job.run_id !== run.id || job.head_sha !== run.headSha || !Array.isArray(job.steps) || job.steps.length > 100) throw ciError('invalid');
+    ids.add(job.id);
+    const numbers = new Set();
+    return { id: job.id, name: ciBoundText(job.name), ...ciState(job), url: ciBrowserUrl(job.html_url, host, repository,run.id,job.id),
+      steps: job.steps.map(step => {
+        if (!isRecord(step) || !Number.isSafeInteger(step.number) || step.number < 1 || numbers.has(step.number)) throw ciError('invalid');
+        numbers.add(step.number);
+        return { number: step.number, name: ciBoundText(step.name), ...ciState(step) };
+      }) };
+  });
+  jobs.sort((a,b) => Number(ciFailedJob(b)) - Number(ciFailedJob(a)));
+  return { total: raw.total_count, jobs, complete: raw.total_count === jobs.length && !/rel=["']?next\b/i.test(headers.link ?? '') };
+}
+function ciFailedJob(job) { return job?.status === 'completed' && ['failure','timed_out'].includes(job.conclusion); }
+function ciRunArgs({ host, repository, selected }) {
+  return [`repos/${repository}/actions/runs/${selected.databaseId}?exclude_pull_requests=true`, '--hostname', host];
+}
+function ciJobsArgs({ host, repository, run }) {
+  return [`repos/${repository}/actions/runs/${run.id}/attempts/${run.attempt}/jobs?per_page=100&page=1`, '--hostname', host];
+}
+function ciApiUrl(host, repository, jobId) {
+  const normalized = normalizeHost(host);
+  if (!normalized || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository ?? '') || !Number.isSafeInteger(jobId) || jobId < 1) throw ciError('invalid');
+  const prefix = normalized === 'github.com' ? 'https://api.github.com' : `https://${normalized}/api/v3`;
+  return new URL(`${prefix}/repos/${repository.split('/').map(encodeURIComponent).join('/')}/actions/jobs/${jobId}/logs`);
+}
+function ciProxyApplies(hostname, env, requestedPort = '443') {
+  if (![env.HTTPS_PROXY,env.https_proxy,env.ALL_PROXY,env.all_proxy,env.HTTP_PROXY,env.http_proxy].some(Boolean)) return false;
+  const bypass = String(env.NO_PROXY ?? env.no_proxy ?? '').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean);
+  return !bypass.some(entry => {
+    if (entry === '*') return true;
+    const [name,port] = entry.split(':');
+    if (port && port !== requestedPort) return false;
+    const domain = name.replace(/^\*?\./,'');
+    return hostname === domain || hostname.endsWith(`.${domain}`);
+  });
+}
+function ciStorageUrl(location, api) {
+  let url;
+  try { url = new URL(location); } catch { throw ciError('unsupported-storage'); }
+  if (url.protocol !== 'https:' || url.username || url.password || !url.hostname || url.hostname === api.hostname ||
+      url.hostname === 'api.github.com' || url.hostname === 'github.com') throw ciError('unsupported-storage');
+  return url;
+}
+// Only a fixed set of numeric authority fields leaves the API-stage closure.
+function ciApiEvidence(headers, status) {
+  const allowed = {};
+  for (const name of ['x-ratelimit-limit','x-ratelimit-remaining','x-ratelimit-used','x-ratelimit-reset','retry-after']) {
+    const value = headers[name];
+    if (typeof value === 'string' && /^\d{1,16}$/.test(value)) allowed[name] = value;
+  }
+  if (headers['x-ratelimit-resource'] === 'core') allowed['x-ratelimit-resource'] = 'core';
+  return { status, headers: allowed, rateLimit: pickRateLimit(allowed) };
+}
+// The injected function is solely the external HTTPS boundary; production URL,
+// redirect, credential, TLS, byte, deadline and closure policies remain here.
+function createCiLogTransfer({ api, signal, request, deadlineMs, maxBytes }) {
+  const closure = [];
+  const tracked = new WeakSet();
+  const active = new Set();
+  let bytes = 0, apiAttempts = 0, storageAttempts = 0, apiEvidence = null;
+  let apiDispatched = false, unknownClosure = false, stopError = null;
+  const track = object => {
+    if (!object || tracked.has(object)) return;
+    tracked.add(object); active.add(object);
+    closure.push(new Promise(resolve => object.once('close', () => { active.delete(object); resolve(); })));
+  };
+  const destroy = () => { for (const object of active) object.destroy(); };
+  const stop = code => { stopError ??= ciError(code); destroy(); };
+  const onAbort = () => stop('canceled');
+  const timer = setTimeout(()=>stop('timeout'), deadlineMs);
+  signal?.addEventListener('abort', onAbort, { once:true });
+  const stage = (url, headers, storage) => new Promise((resolve,reject) => {
+    if (stopError || signal?.aborted) { reject(stopError ?? ciError('canceled')); return; }
+    let settled = false;
+    const fail = () => { if (!settled) { settled=true; reject(stopError ?? ciError('network')); } };
+    let req;
+    try {
+      if (storage) storageAttempts++; else { apiAttempts++; apiDispatched=true; }
+      req = request(url, { method:'GET', agent:false, headers }, res => {
+        track(res);
+        const status = res.statusCode;
+        if (!storage) apiEvidence = ciApiEvidence(res.headers ?? {}, status);
+        const chunks = [];
+        res.on('data', chunk => {
+          bytes += Buffer.byteLength(chunk);
+          if (bytes > maxBytes) { stop('oversize'); fail(); return; }
+          if (storage) chunks.push(Buffer.from(chunk));
+        });
+        res.once('error',fail);
+        res.once('aborted',fail);
+        res.once('end',()=>{
+          if (settled) return;
+          settled=true;
+          resolve({status, location:storage ? null : res.headers.location,
+            text: storage ? Buffer.concat(chunks).toString('utf8') : null});
+        });
+      });
+      track(req);
+      req.once('socket', socket => track(socket));
+      req.once('error',fail);
+      req.once('close',()=>{ if(!settled) fail(); });
+      req.end();
+    } catch { unknownClosure=true; fail(); }
+  });
+  return {
+    dispose() { clearTimeout(timer); signal?.removeEventListener('abort',onAbort); destroy(); },
+    async run(token, beforeDispatch) {
+      try {
+        if (signal?.aborted) throw ciError('canceled');
+        beforeDispatch();
+        const first = await stage(api, {Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':`gh-glance/${version}`}, false);
+        if (first.status !== 302) throw ciError([401,403].includes(first.status)?'permission':'unavailable',{status:first.status});
+        const storage = ciStorageUrl(first.location,api);
+        if (ciProxyApplies(storage.hostname, beforeDispatch.env ?? {}, storage.port || '443')) throw ciError('unsupported-proxy');
+        const second = await stage(storage, {}, true);
+        if (second.status !== 200) throw ciError(second.status>=300 && second.status<400 ? 'unsupported-storage':'unavailable',{status:second.status});
+        if(stopError)throw stopError;
+        return { text:second.text, complete:true, bytes, apiAttempts, storageAttempts,
+          rateLimit:apiEvidence?.rateLimit ?? null, status:apiEvidence?.status ?? null,
+          budgetObservations:apiEvidence?.rateLimit ? [responseHeaderObservation(apiEvidence.rateLimit,1)] : [] };
+      } finally {
+        clearTimeout(timer); signal?.removeEventListener('abort',onAbort); destroy();
+      }
+    },
+    get dispatched(){return apiDispatched;},
+    get evidence(){return apiEvidence;},
+    get attempts(){return {apiAttempts,storageAttempts};},
+    async closed(waitMs) {
+      if (unknownClosure) return false;
+      let timeout;
+      const result = await Promise.race([Promise.all(closure).then(()=>true),new Promise(resolve=>{timeout=setTimeout(()=>resolve(false),waitMs);})]);
+      clearTimeout(timeout); return result;
+    },
+    closure(){return unknownClosure ? new Promise(()=>{}) : Promise.all(closure);},
+  };
+}
+const nativeCiPendingClosure = new WeakMap();
+const nativeCiThrottleEvidence = new WeakMap();
+function ciClosureRecoveryAt(scope,identity,at=Date.now()){
+  const snapshot=inspectGovernor({...scope,identityProvider:null},at);
+  if(!snapshot.ok)return identity.deadline+IDENTITY_UNCERTAIN_MAX_MS;
+  const group=snapshot.value.debtGroups[identity.generation];
+  if(group)return group.quiescent?null:debtGroupSettlesAt(group);
+  const reservation=identity.reservationId?snapshot.value.reservations[identity.reservationId]:
+    Object.values(snapshot.value.reservations).find(item=>item.receipt?.generation===identity.generation);
+  if(!reservation || reservation.receipt.dispatches.every(dispatch=>dispatch.terminalAt!==null))return null;
+  return Math.max(at,identity.deadline)+IDENTITY_UNCERTAIN_MAX_MS;
+}
+async function requestGitHubJobLog({host,repository,jobId,signal,env,request=httpsRequest,
+  deadlineMs=CI_LOG_DEADLINE_MS,maxBytes=CI_LOG_BYTES,closeWaitMs=15_000}={}) {
+  const operation='detail:actions-job-log';
+  const api=ciApiUrl(host,repository,jobId);
+  const deadlineController=new AbortController();
+  const deadlineTimer=setTimeout(()=>deadlineController.abort(),deadlineMs);
+  const externalSignal=signal;
+  signal=signal?AbortSignal.any([signal,deadlineController.signal]):deadlineController.signal;
+  const bound=requestIdentityStorage.getStore();
+  env ??= bound?.credentialEnvironment ?? process.env;
+  if(ciProxyApplies(api.hostname,env)){clearTimeout(deadlineTimer);throw ciError('unsupported-proxy',{notStarted:true});}
+  const identityCoordinator=bound?.identityCoordinator ?? runtimeIdentityCoordinator;
+  const now=bound?.now ?? Date.now;
+  let permit=null,dispatch=null,capability=bound?.receiptCapability,activeKey=null,error=null,result=null;
+  const transfer=createCiLogTransfer({api,signal,request,deadlineMs,maxBytes});
+  const releaseActive=()=>{
+    if(!activeKey)return;
+    const remaining=(activeOwnerDispatches.get(activeKey)??1)-1;
+    if(remaining>0)activeOwnerDispatches.set(activeKey,remaining);else activeOwnerDispatches.delete(activeKey);
+    activeKey=null;
+    const sealed=inspectGovernor({...bound,identityProvider:null},now());
+    const nonce=sealed.ok && sealed.value.debtGroups[capability.generation]?.nonce;
+    if(nonce)acknowledgeSealedGeneration(bound,capability,nonce,now());
+  };
+  const releasePermit=async()=>{
+    if(!permit)return;
+    const release=()=>releaseIdentityHttpPermit(identityCoordinator,permit,error,now());
+    const result=await retryIdentityCompletion(release,{timeoutMs:IDENTITY_RELEASE_WAIT_MS,shouldRetry:()=>!identityCoordinator.isClosed()});
+    if(!result.ok)identityCoordinator.deferCompletion(`permit:${permit.nonce}`,release);
+  };
+  const finish=()=>{
+    if(!dispatch)return {ok:true};
+    const terminal=terminalGovernorDispatch(bound,capability,dispatch.sequence,now(),{neverStarted:!transfer.dispatched});
+    if(terminal.ok || terminal.reason==='compacted')releaseActive();
+    return terminal;
+  };
+  try {
+    assertBoundCredential(bound);
+    if(identityCoordinator)permit=await acquireIdentityHttpPermit(identityCoordinator,{signal,now,operationDeadline:capability?.deadline,...(bound?.httpWait?{wait:bound.httpWait}:{})});
+    assertBoundCredential(bound);
+    const beforeDispatch=()=>{
+      assertBoundCredential(bound);
+      if(signal?.aborted)throw ciError(deadlineController.signal.aborted && !externalSignal?.aborted?'timeout':'canceled');
+      if(bound){
+        const ready=inspectAdmittedHttpStart(bound,operation,now);
+        if(!ready.ok)throw ciError('admission',{reason:ready.reason,retryAt:ready.retryAt});
+        const fence=acquisitionFenceStorage.getStore()?.();
+        if(fence && !fence.ok)throw ciError('canceled');
+        if(!capability)throw ciError('admission');
+        activeKey=ownerDispatchKey(bound,capability);
+        activeOwnerDispatches.set(activeKey,(activeOwnerDispatches.get(activeKey)??0)+1);
+        const issued=issueGovernorDispatch(bound,capability,operation,now());
+        if(!issued.ok){releaseActive();throw ciError('admission',{reason:issued.reason});}
+        dispatch=issued.value;
+      }
+    };
+    beforeDispatch.env=env;
+    const credential=await withEffectiveCredential({host,env,bound,signal,timeoutMs:deadlineMs,runLocalToken:bound?.runLocalToken},token=>transfer.run(token,beforeDispatch));
+    if(!credential.ok)throw ciError(credential.reason==='credential-changed'?'credential-changed':'credential-unavailable');
+    result=credential.value;
+  } catch (caught) {
+    const credentialChanged=Boolean(bound?.accessKey && bound.accessKey!==identityCoordinator?.current()?.accessKey);
+    error=ciError(deadlineController.signal.aborted && !externalSignal?.aborted?'timeout':externalSignal?.aborted?'canceled':credentialChanged?'credential-changed':Object.hasOwn(CI_ERRORS,caught?.code)?caught.code:'network',{
+      ...(Number.isInteger(caught?.status)?{status:caught.status}:{}),
+      ...(Number.isFinite(caught?.retryAt)?{retryAt:caught.retryAt}:{}),
+      ...(Object.hasOwn(RECOVERY_COPY,caught?.reason??'')?{reason:caught.reason}:{}),
+      notStarted:!transfer.dispatched,
+    });
+    if(transfer.evidence?.rateLimit)error.budgetObservations=[responseHeaderObservation(transfer.evidence.rateLimit,1)];
+  } finally {
+    clearTimeout(deadlineTimer);
+    transfer.dispose();
+    const closed=await transfer.closed(closeWaitMs);
+    if(closed){
+      const terminal=await retryIdentityCompletion(finish,{timeoutMs:15_000,shouldRetry:()=>!identityCoordinator?.isClosed?.()});
+      if(!terminal.ok)identityCoordinator?.deferCompletion?.(`dispatch:${capability.reservationId}:${dispatch.sequence}`,finish);
+    } else {
+      const recovery={reservationId:capability?.reservationId,generation:capability?.generation,deadline:capability?.deadline ?? now()};
+      error=ciError('closure',{notStarted:false,closureRecovery:recovery,
+        retryAt:bound?ciClosureRecoveryAt(bound,recovery,now()):recovery.deadline+IDENTITY_UNCERTAIN_MAX_MS});
+      const later=transfer.closure().then(async()=>{
+        const terminal=await retryIdentityCompletion(finish,{timeoutMs:15_000,shouldRetry:()=>!identityCoordinator?.isClosed?.()});
+        if(!terminal.ok && retryableCoordination(terminal.reason) && identityCoordinator?.deferCompletion){
+          // Actual closure is proven, but its durable dispatch record is still
+          // pending. Keep the native completion promise pending too, so the
+          // admitted reservation settles after the deferred write succeeds.
+          return new Promise(resolve=>identityCoordinator.deferCompletion(
+            `dispatch:${capability.reservationId}:${dispatch.sequence}`,
+            ()=>{
+              const retried=finish();
+              if(retried.ok || retried.reason==='compacted')void releasePermit().then(()=>resolve(retried));
+              return retried;
+            }));
+        }
+        await releasePermit();
+        return terminal;
+      });
+      nativeCiPendingClosure.set(error,later);
+    }
+    if(error && transfer.evidence)nativeCiThrottleEvidence.set(error,transfer.evidence);
+    if(closed)await releasePermit();
+  }
+  if(error){if(transfer.evidence)nativeCiThrottleEvidence.set(error,transfer.evidence);error.ciAttempts=transfer.attempts;throw error;}
+  return {...result, lines:result.text.split(/\r?\n/), requestMetrics:{coreUnits:1}, ciAttempts:transfer.attempts};
+}
+
+async function loadCiEvidence({scope,leaseId,host,repository,selected,signal,now=Date.now,wait}) {
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),CI_METADATA_DEADLINE_MS);
+  const combined=signal?AbortSignal.any([signal,controller.signal]):controller.signal;
+  const deadline=now()+CI_METADATA_DEADLINE_MS;
+  let used=0;
+  const fetch=async(operation,args,parse)=>{
+    const admitted=await runAdmittedOperation({scope,leaseId,operation,priority:'manual',signal:combined,waitMs:GOVERNOR_ADMISSION_WAIT_MS,now,...(wait?{wait}:{}),
+      run:async admittedSignal=>{
+        if(combined.aborted || now()>=deadline)throw ciError('timeout',{notStarted:true});
+        const response=await ghApi(args,{operation,signal:admittedSignal,includeHeaders:true,
+          maxBuffer:CI_METADATA_BYTES-used,timeoutMs:Math.max(1,deadline-now())});
+        used+=response.capturedBytes;
+        if(used>CI_METADATA_BYTES)throw ciError('metadata-oversize');
+        if(response.status!==200)throw ciError([401,403].includes(response.status)?'permission':'invalid');
+        return {...response,facts:parse(response),budgetObservations:response.rateLimit?[responseHeaderObservation(response.rateLimit,1)]:[]};
+      }});
+    if(!admitted.ok){
+      if(admitted.skipped){const reason=admitted.decision?.reason ?? admitted.decision?.value?.reason;throw ciError('admission',{reason,retryAt:admitted.decision?.retryAt ?? admitted.decision?.value?.retryAt ?? admitted.decision?.value?.notBefore ?? admitted.decision?.value?.resetMs});}
+      const error=admitted.error;
+      if(error?.code==='ERR_CHILD_PROCESS_STDIO_MAXBUFFER')throw ciError('metadata-oversize');
+      if(combined.aborted)throw ciError(signal?.aborted?'canceled':'timeout');
+      if(error?.apiResponse?.status===401 || error?.apiResponse?.status===403)throw ciError('permission');
+      throw Object.hasOwn(CI_ERRORS,error?.code)?error:ciError('network');
+    }
+    if(combined.aborted || now()>=deadline)throw ciError(signal?.aborted?'canceled':'timeout');
+    return admitted.value.facts;
+  };
+  try{
+    const run=await fetch('detail:actions-run',ciRunArgs({host,repository,selected}),response=>parseCiRun(response.body,{host,repository,selected}));
+    const jobs=await fetch('detail:actions-jobs',ciJobsArgs({host,repository,run}),response=>parseCiJobs(response.body,{host,repository,run,headers:response.headers}));
+    return {run,...jobs,metadataBytes:used};
+  }finally{clearTimeout(timer);}
+}
+function ciEvidenceLines(view) {
+  const lines=[];
+  if(view.run)lines.push(`Run ${view.run.id}; attempt ${view.run.attempt}; SHA ${view.run.headSha}`);
+  if(view.jobs)lines.push(`${view.jobs.length}/${view.total} jobs loaded${view.complete?'; complete':'; partial coverage; open GitHub for remaining jobs'}.`);
+  if(view.message)lines.push(view.message);
+  if(view.busy)lines.push(view.logBusy?'Loading selected job log; Esc Cancel.':'Loading exact run and jobs; Esc Cancel.');
+  if(view.jobs?.length){
+    const job=view.jobs[view.jobIndex??0];
+    lines.push(`Job ${(view.jobIndex??0)+1}/${view.jobs.length}: ${job.name} (${job.conclusion??job.status})`);
+    if(view.log){
+      const logLines=view.log.lines;
+      const offset=view.logOffset??0;
+      lines.push(`Log complete; ${view.log.bytes} bytes; lines ${offset+1}-${Math.min(logLines.length,offset+8)}/${logLines.length}. PgUp/PgDn Scroll.`);
+      lines.push(...logLines.slice(offset,offset+8).map((line,i)=>`${offset+i+1}: ${safe(line)}`));
+    }else{
+      lines.push(...job.steps.slice(0,4).map(step=>`Step ${step.number}: ${step.name} (${step.conclusion??step.status})`));
+      if(job.steps.length>4)lines.push(`${job.steps.length} steps; open GitHub for all steps.`);
+    }
+  }else if(view.jobs)lines.push('No jobs in this complete attempt page.');
+  lines.push('Up/Down Jobs; l Load failed/timed-out job log; Enter Open GitHub; d Retry; Esc Back; q Quit.');
+  return lines;
+}
+function ciFailureMessage(error){
+  const code=Object.hasOwn(CI_ERRORS,error?.code)?error.code:'network';
+  const recovery=error?.reason && RECOVERY_COPY[error.reason]?(()=>{const cause=recoveryCause({...error,reason:error.reason});return `${cause.summary}. ${cause.action}`;})():null;
+  return `${recovery??CI_ERRORS[code]}${Number.isFinite(error?.retryAt)?` Wait until ${new Date(error.retryAt).toISOString()}.`:''}`;
 }
 
 function parseActionsRuns(runsBody) {
@@ -2286,6 +2665,10 @@ const OPERATION_COSTS = Object.freeze({
   // no name of its own, and settled against its own reservation.
   "catalog:actions-workflows": { core: 1, graphql: 0 },
   "setup:actions-workflows": { core: 1, graphql: 0 },
+  "detail:actions-run": { core: 1, graphql: 0 },
+  "detail:actions-jobs": { core: 1, graphql: 0 },
+  "detail:actions-job-log": { core: 1, graphql: 0 },
+  "attention:details": { core: 0, graphql: 2 },
   "tab:security-endpoint": { core: 1, graphql: 0 },
   "failure-context:repository": { core: 0, graphql: GRAPHQL_OBSERVER_POINTS },
   // Each page past the first reserves its own envelope, so a denial there is a
@@ -3003,7 +3386,7 @@ function credentialConfigurationRevision(host, env = process.env) {
   return privateIdentityDigest(host, directory, stamp);
 }
 
-async function resolveEffectiveCredential({ host, env = process.env, runLocalToken } = {}) {
+async function withEffectiveCredential({ host, env = process.env, runLocalToken, bound, signal, timeoutMs = GH_TIMEOUT_MS } = {}, consume = null) {
   host = normalizeHost(host);
   if (!host) return { ok: false, reason: "unknown-host" };
   const names = credentialEnvironmentNames(host);
@@ -3016,20 +3399,28 @@ async function resolveEffectiveCredential({ host, env = process.env, runLocalTok
       // This seam never passes through runGh/logGh and never exposes the child
       // error, stdout or stderr. Credentials exist only in this lexical scope.
       const result = await (runLocalToken ?? (async (args) => execFileAsync("gh", args, {
-        env: { ...env, ...GH_ENV_OVERRIDES }, timeout: GH_TIMEOUT_MS,
+        env: { ...env, ...GH_ENV_OVERRIDES }, timeout: Math.min(GH_TIMEOUT_MS,timeoutMs), signal,
         maxBuffer: 1024 * 1024, killSignal: "SIGKILL",
-      })))(["auth", "token", "--hostname", host]);
+      })))(["auth", "token", "--hostname", host], {signal,timeoutMs});
       token = String(typeof result === "string" ? result : result.stdout ?? "").trim();
     }
     if (credentialConfigurationRevision(host, env) !== initialRevision) return { ok: false, reason: "credential-changed" };
     if (!token || /\s/.test(token)) return { ok: false, reason: "credential-unavailable" };
     const credentialKey = privateIdentityDigest("credential-v1", host, token);
+    if (bound?.accessKey && bound.accessKey !== (bound.identityCoordinator ?? runtimeIdentityCoordinator)?.current()?.accessKey ||
+        bound?.credentialKey && bound.credentialKey !== credentialKey ||
+        bound?.identityCoordinator?.current()?.credentialKey && bound.identityCoordinator.current().credentialKey !== credentialKey ||
+        bound?.configurationRevision && bound.configurationRevision !== initialRevision) return { ok: false, reason: "credential-changed" };
+    const value = consume ? await consume(token) : { host, credentialKey, configurationRevision: initialRevision };
     token = null;
-    return { ok: true, value: { host, credentialKey, configurationRevision: initialRevision } };
-  } catch {
+    return { ok: true, value };
+  } catch (error) {
+    if (consume) throw error;
     return { ok: false, reason: "credential-unavailable" };
   }
 }
+
+async function resolveEffectiveCredential(options = {}) { return withEffectiveCredential(options); }
 
 function emptyIdentityRegistry() {
   return { version: IDENTITY_VERSION, migration: { activated: false, holdUntil: 0 }, identities: {}, attempts: {}, hosts: {} };
@@ -3185,6 +3576,7 @@ function inspectLegacyMigration(root, state, now) {
   for (const name of names) {
     let raw;
     try { raw = JSON.parse(readFileSync(join(dirname(root), name), "utf8")); } catch { return { ok: false, reason: "legacy-corrupt" }; }
+    if(Number.isSafeInteger(raw?.version) && raw.version>GOVERNOR_STATE_VERSION)return {ok:false,reason:"version-mismatch"};
     // Evidence is never rewritten. Recognize only the pinned legacy schemas.
     // Every protocol an older pane could still be running, newest first. The set
     // grows as GOVERNOR_STATE_VERSION advances: a version bump makes an old
@@ -3206,7 +3598,17 @@ function inspectLegacyMigration(root, state, now) {
     for (const resource of RATE_RESOURCES) {
       const budget = legacy.budgets[resource];
       holdUntil = Math.max(holdUntil, budget?.blockUntil ?? 0);
-      const uncertain = Object.values(legacy.reservations).filter((reservation) =>
+      // Receipt-shape ledgers can have no data reservations while control or
+      // compacted debt still holds quota. These files have no verified mapping
+      // to a new principal; wait conservatively without rewriting the evidence.
+      const groups=Object.values(legacy.debtGroups ?? {}).filter(group=>group.units[resource]>0);
+      const debtUnits=(legacy.debt?.[resource]?.unresolvedUnits??0)+(legacy.debt?.[resource]?.quiescentUnits??0);
+      if(raw.version>=GOVERNOR_RECEIPT_SHAPE_VERSION && debtUnits>0){
+        if(groups.some(group=>!Number.isFinite(debtGroupSettlesAt(group))))return {ok:false,reason:'legacy-unresolved'};
+        holdUntil=Math.max(holdUntil,Number.isFinite(budget?.resetMs)?budget.resetMs+BUDGET_RESET_GRACE_MS:0,
+          ...groups.filter(group=>!group.quiescent || !Number.isFinite(budget?.resetMs)).map(group=>debtGroupSettlesAt(group)));
+      }
+      const uncertain = [...Object.values(legacy.reservations),...Object.values(legacy.controlReceipts ?? {}).filter(Boolean)].filter((reservation) =>
         ["started", "completed"].includes(reservation.status) && reservationCost(reservation, resource, legacy.leases, now) > 0);
       if (uncertain.length > 0) {
         // The deadline may only be read from the migrated view for resources the
@@ -3235,8 +3637,11 @@ function inspectLegacyMigration(root, state, now) {
           : Number.isFinite(Number(raw?.budgets?.[resource]?.resetMs))
             ? Number(raw.budgets[resource].resetMs)
             : recorded.length > 0 ? Math.max(...recorded) : NaN;
-        if (!Number.isFinite(reset)) return { ok: false, reason: "legacy-unresolved" };
-        holdUntil = Math.max(holdUntil, reset + BUDGET_RESET_GRACE_MS);
+        if (!Number.isFinite(reset) && raw.version < GOVERNOR_RECEIPT_SHAPE_VERSION) return { ok: false, reason: "legacy-unresolved" };
+        const unknownDispatch=uncertain.filter(reservation=>reservation.receipt?.dispatches.some(dispatch=>dispatch.terminalAt===null));
+        holdUntil = Math.max(holdUntil, Number.isFinite(reset)?reset+BUDGET_RESET_GRACE_MS:0,
+          ...(raw.version>=GOVERNOR_RECEIPT_SHAPE_VERSION && !Number.isFinite(reset)?uncertain.map(reservation=>(reservation.receipt?.deadline ?? reservation.completedAt ?? reservation.startedAt)+IDENTITY_UNCERTAIN_MAX_MS):[]),
+          ...unknownDispatch.map(reservation=>reservation.receipt.deadline+IDENTITY_UNCERTAIN_MAX_MS));
       }
     }
   }
@@ -3280,7 +3685,7 @@ function claimIdentityBootstrap(root, { credentialKey, host, resource = "core", 
 }
 
 function readIdentityQuotaState(registry, scope, now, options = {}) {
-  const loaded = readGovernorState(scope.path, now, options);
+  const loaded = readGovernorState(scope.path, now, { persistMigration: false, ...options });
   const known = Object.values(registry.identities).some((identity) => identity.quotaKey === scope.quotaKey) ||
     Object.values(registry.attempts).some((attempt) => attempt.imported && attempt.quotaKey === scope.quotaKey);
   return loaded.ok && loaded.missing && known ? { ok: false, reason: "corrupt" } : loaded;
@@ -3315,7 +3720,7 @@ function importIdentityDebts(root, state, credentialKey, identity, now) {
       loaded.value.importMarkers[id] = true;
       transferred.push(id);
     }
-    const written = writeGovernorQuotaState(scope.path, loaded.value, now);
+    const written = writeGovernorQuotaState(scope.path, loaded.value, now, loaded.migration);
     if (!written.ok) return written;
     // Marked transferred only once the receipts are durable. withIdentityRegistry
     // persists the registry whatever this returns, so setting these before the
@@ -3373,7 +3778,7 @@ function finishIdentityBootstrap(root, { credentialKey, id, nonce, response = nu
           ledger.value.epochs.core = observation.budget.epoch;
           ledger.value.observers.core = { etag: typeof response.etag === "string" ? response.etag : null, outcome: "healthy", at: now, nextAt: now + BUDGET_PROBE_MS };
         }
-        return writeGovernorQuotaState(scope.path, ledger.value, now);
+        return writeGovernorQuotaState(scope.path, ledger.value, now, ledger.migration);
       });
       if (!seeded.ok) return seeded;
     }
@@ -3539,7 +3944,7 @@ function startIdentityControl(coordinator, now = Date.now()) {
           deadline: now + ACQUISITION_STARTED_DEADLINE_MS,
           allowance: { core: 1, graphql: 0 }, dispatches: [],
         } };
-      const written = writeGovernorQuotaState(scope.path, state, now);
+      const written = writeGovernorQuotaState(scope.path, state, now, loaded.migration);
       return written.ok ? { ok: true, value: { id, identity,
         receiptCapability: { reservationId: `control:core`, controlResource: "core",
           leaseId: id, scopeHash: scope.hash,
@@ -3583,7 +3988,7 @@ function settleIdentityControl(coordinator, control, stdout, now = Date.now(),
         const failure = retireControlReceiptToDebt(loaded.value, "core", now);
         if (failure) return failure;
       }
-      return writeGovernorQuotaState(scope.path, loaded.value, now);
+      return writeGovernorQuotaState(scope.path, loaded.value, now, loaded.migration);
     });
   }, { now });
 }
@@ -3795,7 +4200,7 @@ function releaseIdentityHttpPermit(coordinator, permit, error = null, now = Date
     const held = transport?.permits.find((item) => item.nonce === permit.nonce);
     if (transport) transport.permits = transport.permits.filter((item) => item.nonce !== permit.nonce);
     if (transport && error) {
-      const response = parseGhApiResponse(error.stdout ?? "");
+      const response = nativeCiThrottleEvidence.get(error) ?? parseGhApiResponse(error.stdout ?? "");
       const verdict = classifyThrottle({
         status: response.status,
         headers: response.headers,
@@ -3836,7 +4241,9 @@ function retryThrottledTransport(root, host, { now = Date.now } = {}) {
 }
 
 function identityCoordinationMessage(reason) {
-  if (reason === "restart-required") return "Restart required: close older gh-glance panes";
+  if (reason === "version-mismatch") return "Update gh-glance. Restart all gh-glance panes with the new version; keep the shared quota ledger";
+  if (reason === "restart-required") return "Restart all gh-glance panes with this version; keep the shared quota ledger";
+  if (reason === "backup-conflict") return "Governor backup conflict; run gh-glance --doctor for its path, preserve the backup under an unused archival filename, then retry";
   // These two were one message for a long time, and the difference between them
   // is the difference between waiting and being stuck. A migration hold has a
   // deadline and ends by itself. An unresolved legacy ledger has no deadline at
@@ -3871,11 +4278,12 @@ const GOVERNOR_SCOPE_VERSION = 1;
 // 5: scheduling fairness is persisted, because the starvation it prevents
 // happens *between* planning passes -- each manual refresh is its own pass, so
 // a counter that lives only inside one cannot see a run of them.
-const GOVERNOR_STATE_VERSION = 7;
+const GOVERNOR_STATE_VERSION = 8;
+const GOVERNOR_RECEIPT_SHAPE_VERSION = 7;
 // Readable-as-evidence, never written: the shapes a still-running older pane
 // holds. Recognising that such a pane owns a live lease is what the restart
 // boundary depends on.
-const LEGACY_GOVERNOR_VERSIONS = [GOVERNOR_STATE_VERSION, 6, 5, 4, 3, 2];
+const LEGACY_GOVERNOR_VERSIONS = [GOVERNOR_STATE_VERSION, 7, 6, 5, 4, 3, 2];
 // The first version whose file is already in the per-resource observer shape.
 // Anything below it is adapted before it can be read; see readLegacyGovernorState.
 const GOVERNOR_OBSERVER_SPLIT_VERSION = 4;
@@ -4246,7 +4654,7 @@ function normalizeManualProbe(raw, nowMs) {
 // never publishes what it reads. Every other caller takes the default, so a
 // version this build does not write is unreadable and fails closed.
 function normalizeGovernorState(raw, nowMs, { prune = true, acceptVersion = GOVERNOR_STATE_VERSION } = {}) {
-  const legacyShape = acceptVersion < 7;
+  const legacyShape = acceptVersion < GOVERNOR_RECEIPT_SHAPE_VERSION;
   if (!exactKeys(raw, [
     "version", "epochs", "budgets", "fairness", "observers", "probeClaims", "leases",
     "intents", "reservations", "manualProbe",
@@ -4489,6 +4897,12 @@ function serializeGovernorState(state) {
 function migrateGovernorState(raw, nowMs) {
   if (!isRecord(raw) || !Number.isSafeInteger(raw.version) || raw.version < 1) return null;
   if (raw.version >= GOVERNOR_STATE_VERSION) return null;
+  if (raw.version === 7) {
+    // Receipt shape 7 already carries complete accounting. Validate without
+    // pruning, then change only the protocol discriminator.
+    return normalizeGovernorState(raw, nowMs, { prune: false, acceptVersion: 7 })
+      ? { ...structuredClone(raw), version: GOVERNOR_STATE_VERSION } : null;
+  }
   if (raw.version === 1) return migrateV1GovernorState(raw, nowMs);
   // Everything from 2 onwards is this build's shape or one adaptation away from
   // it, and what it holds is worth keeping: the uncertain reservations are debts
@@ -4906,25 +5320,51 @@ function readGovernorState(path, nowMs, { persistMigration = true } = {}) {
     const parsed = JSON.parse(raw);
     const normalized = normalizeGovernorState(parsed, nowMs);
     if (normalized) return { ok: true, value: normalized };
+    if (Number.isSafeInteger(parsed?.version) && parsed.version > GOVERNOR_STATE_VERSION) {
+      return { ok: false, reason: "version-mismatch" };
+    }
     const migrated = migrateGovernorState(parsed, nowMs);
     if (!migrated) return { ok: false, reason: "corrupt" };
-    if (persistMigration && parsed.version === 6) {
-      const backupPath = `${path}.pre-v7.backup`;
-      try {
-        writeFileSync(backupPath, raw, { encoding: "utf8", mode: 0o600, flag: "wx" });
-        chmodSync(backupPath, 0o600);
-      } catch (error) {
-        if (error?.code !== "EEXIST") return { ok: false, reason: "unwritable" };
-      }
+    if (parsed.version === 7 && Object.values(parsed.leases).some((lease) => lease.expiresAt > nowMs)) {
+      return { ok: false, reason: "restart-required",
+        retryAt: Math.max(...Object.values(parsed.leases).map((lease) => lease.expiresAt)) };
     }
-    if (!persistMigration) return { ok: true, value: migrated, migrated: true };
-    // Read-only callers persist the exact migration while they still hold the
-    // scope lock. Mutating callers use this same value for their final write.
-    const written = writeGovernorState(path, migrated);
+    const migration = { originalBytes: raw, originalVersion: parsed.version };
+    const backup = inspectGovernorMigrationBackup(path,migration);
+    if(!backup.ok)return backup;
+    if (!persistMigration) return { ok: true, value: migrated, migrated: true, migration };
+    const written = commitGovernorMigration(path, migrated, migration);
     return written.ok ? { ok: true, value: migrated, migrated: true } : written;
   } catch {
     return { ok: false, reason: "corrupt" };
   }
+}
+
+// Called only while the canonical scope lock is held. Every first upgraded
+// write consumes the original descriptor, including rejected mutator paths.
+function governorMigrationBackupPath(path,migration){return `${path}${migration.originalVersion===6?'.pre-v7.backup':'.pre-v8.backup'}`;}
+function inspectGovernorMigrationBackup(path,migration){
+  const backupPath=governorMigrationBackupPath(path,migration);
+  try{
+    const info=lstatSync(backupPath);
+    return info.isFile() && info.size===Buffer.byteLength(migration.originalBytes) && readFileSync(backupPath,'utf8')===migration.originalBytes
+      ? {ok:true,exists:true}: {ok:false,reason:'backup-conflict',backupPath};
+  }catch(error){return error?.code==='ENOENT'?{ok:true,exists:false}:{ok:false,reason:'unwritable'};}
+}
+function commitGovernorMigration(path, state, migration = null) {
+  if (migration) {
+    const backupPath=governorMigrationBackupPath(path,migration);
+    try {
+      writeFileSync(backupPath, migration.originalBytes, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      chmodSync(backupPath, 0o600);
+    } catch (error) {
+      if (error?.code !== "EEXIST") return { ok: false, reason: "unwritable" };
+      const inspected=inspectGovernorMigrationBackup(path,migration);
+      if(!inspected.ok)return inspected;
+      try { chmodSync(backupPath,0o600); } catch { return {ok:false,reason:'unwritable'}; }
+    }
+  }
+  return writeGovernorState(path, state);
 }
 
 function writeGovernorState(path, state) {
@@ -4959,13 +5399,13 @@ function writeGovernorState(path, state) {
   }
 }
 
-function writeGovernorQuotaState(path, state, nowMs) {
+function writeGovernorQuotaState(path, state, nowMs, migration = null) {
   const normalized = normalizeGovernorState(state, nowMs, { prune: false });
   if (!normalized) return { ok: false, reason: "corrupt" };
   if (!governorAccountingSafe(normalized, nowMs)) {
     return ACCOUNTING_OVERFLOW;
   }
-  return writeGovernorState(path, normalized);
+  return commitGovernorMigration(path, normalized, migration);
 }
 
 function lockOwner(path) {
@@ -5293,7 +5733,7 @@ function mutateGovernor(scope, nowMs, mutate) {
       ? structuredClone(state) : null;
     const returnAfterMigration = (result) => {
       if (migration === null) return result;
-      const written = writeGovernorState(scope.path, migration);
+      const written = commitGovernorMigration(scope.path, migration, loaded.migration);
       return written.ok ? result : written;
     };
     const value = mutate(state, at);
@@ -5301,7 +5741,7 @@ function mutateGovernor(scope, nowMs, mutate) {
     if (!governorAccountingSafe(state, at)) return returnAfterMigration(ACCOUNTING_OVERFLOW);
     const normalized = normalizeGovernorState(state, at);
     if (!normalized) return returnAfterMigration({ ok: false, reason: "corrupt" });
-    const written = writeGovernorState(scope.path, normalized);
+    const written = commitGovernorMigration(scope.path, normalized, loaded.migration);
     if (!written.ok) return written;
     return value?.ok === false ? { ok: false, reason: value.reason } : { ok: true, value: value?.value };
   });
@@ -6438,7 +6878,9 @@ function governorHealth(result, nowMs = Date.now()) {
   // The doctor is the one surface that may name the raw reason: a bare
   // "unavailable" could not tell a lock nobody released (busy) from a file that
   // failed validation (corrupt), and those are fixed in different places.
-  if (!result?.ok) return { status: `unavailable (${result?.reason ?? "unknown"})`, leases: 0, resources: {} };
+  if (!result?.ok) return { status: `unavailable (${result?.reason ?? "unknown"})`, leases: 0, resources: {},
+    ...(result?.backupPath ? {backupPath:result.backupPath, remedy:`Preserve ${result.backupPath} under an unused archival filename before retry; keep the shared quota ledger`}:{}),
+    ...(["restart-required","version-mismatch"].includes(result?.reason)?{remedy:"Update and restart all gh-glance panes; keep the shared quota ledger"}:{}) };
   const state = result.value;
   let status = "healthy";
   if (hasLiveProbeClaim(state, nowMs)) status = "waiting for probe";
@@ -6497,7 +6939,7 @@ function doctorCachedQuotaScope(host, { root = identityRegistryRoot(), nowMs = D
   const result = readIdentityQuotaState(registry, { path, quotaKey }, nowMs, { persistMigration: false });
   return result.ok && !result.missing
     ? { ok: true, result, path, quotaKey }
-    : { ok: false, reason: result.ok ? "cached quota missing" : result.reason, path };
+    : { ok: false, reason: result.ok ? "cached quota missing" : result.reason, path, ...(result.backupPath?{backupPath:result.backupPath}:{}) };
 }
 
 async function retryGovernorMutation(run, { now, wait, deadline, signal }) {
@@ -7756,7 +8198,7 @@ function persistGitHubAppIdentity(root, identity, now = Date.now()) {
     const initialized = withGovernorLock(scope, () => {
       const loaded = readIdentityQuotaState(state, scope, now);
       if (!loaded.ok) return loaded;
-      return loaded.missing ? writeGovernorQuotaState(scope.path, loaded.value, now) : { ok: true };
+      return loaded.missing || loaded.migration ? writeGovernorQuotaState(scope.path, loaded.value, now, loaded.migration) : { ok: true };
     });
     if (!initialized.ok) return initialized;
     state.identities[identity.credentialKey] = { host: identity.host, kind: identity.kind,
@@ -11339,7 +11781,7 @@ async function runDoctor({ probeEndpoints = false } = {}) {
   const governor = probeEndpoints
     ? governorHealth(governorResult, Date.now())
     : cachedQuota?.ok ? governorHealth(cachedQuota.result, Date.now())
-      : { status: `unavailable (${cachedQuota?.reason ?? "cached scope unavailable"})`, leases: 0, resources: {} };
+      : governorHealth({ok:false,...cachedQuota,reason:cachedQuota?.reason ?? "cached scope unavailable"});
   const diagnosticScope = probeEndpoints
     ? scopeResult?.ok ? scopeResult.value : null
     : cachedQuota?.ok ? { path: cachedQuota.path } : null;
@@ -11442,6 +11884,8 @@ async function runDoctor({ probeEndpoints = false } = {}) {
       field(`${resource} observer age`, recoveryDetails[resource]?.observerAt == null
         ? "unavailable" : formatDuration(Math.max(0, Date.now() - recoveryDetails[resource].observerAt))),
     ]),
+    ...(governor.backupPath || currentRecovery?.backupPath ? [field('conflicting backup',governor.backupPath ?? currentRecovery.backupPath),field('backup remedy','Preserve this backup under an unused archival filename before retry; keep the shared quota ledger')] : []),
+    ...(['restart-required','version-mismatch'].includes(cachedQuota?.reason) ? [field('upgrade remedy','Update and restart all gh-glance panes; keep the shared quota ledger; never clear or downgrade it')] : []),
     field("next retry", nextRecoveryAt == null ? "unavailable" : new Date(nextRecoveryAt).toISOString()),
     field("terminalization backlog", currentRecovery?.terminalizationBacklog == null
       ? "unavailable" : `${currentRecovery.terminalizationBacklog} (last recorded)`),
@@ -11745,6 +12189,7 @@ const KEY_TABLE = [
   ["Enter", "Open the selected item or accept a prompt"],
   ["r", "Refresh the current tab when a safe grant is available"],
   ["R", "Resynchronize the current tab, ignoring cached validators and backoff"],
+  ["d", "Actions: selected run, jobs and bounded failed-job log (standalone only)"],
   ["s", "Actions: read-only setup check (standalone only; saved for five minutes)"],
   ["g", "Actions: open the selected repository Actions page"],
   ["/", "Focus: search loaded Issues or Pull requests"],
@@ -11771,6 +12216,7 @@ const HELP_PRIORITY = [
   "Tab / Shift+Tab",
   "PgUp / PgDn",
   "R",
+  "d",
   "s",
   "g",
 ];
@@ -11879,6 +12325,13 @@ ${keyTableLines()
   .join("\n")}
 
 The cursor clears itself after 60s with no movement.
+
+Shared quota upgrades: restart all gh-glance panes with this version; keep the
+shared quota ledger. Never clear, delete or downgrade it for a version mismatch.
+A conflicting backup must be preserved under an unused archival filename before
+retrying; --doctor reports its exact path. Unverified native connection closure
+retains its charge until the displayed uncertainty-window recovery deadline.
+
 
 Environment:
   TYPESAFE_API_KEY          Used only with --jev and explicit scoped consent.
@@ -15811,7 +16264,7 @@ const RECOVERY_JOURNAL_MAX_BYTES = 128 * 1024;
 const RECOVERY_ENTRY_MAX_BYTES = 1024;
 // Reasons that no retry can clear: the ledger itself must be repaired. The
 // runtime keeps them sticky and doctor names the manual remedy for them.
-const HARD_STORAGE_REASONS = Object.freeze(["corrupt", "unwritable", "capacity", "accounting-overflow"]);
+const HARD_STORAGE_REASONS = Object.freeze(["corrupt", "unwritable", "capacity", "accounting-overflow", "backup-conflict"]);
 // A source failure on a tab may be superseded by these coordination causes.
 const STICKY_OVER_SOURCE_REASONS = Object.freeze([...HARD_STORAGE_REASONS, "receipt-retry", "interrupted-request"]);
 const LEDGER_REPAIR_ADVICE = "quit every gh-glance pane, then move the state file, its .recovery.json and " +
@@ -15834,7 +16287,7 @@ const RECOVERY_COPY = Object.freeze({
   "legacy-unresolved": ["Older requests still reserve quota", "Verify old children ended; a verified system restart can resolve unknown ownership", "Old debt; restart"],
   "legacy-corrupt": ["Older coordination evidence is corrupt", "Run gh-glance --doctor; preserve the reported state file", "Old state; doctor"],
   "migration-hold": ["Older session still uses coordination", "Wait for the older quota reset; retry automatically at the shown time", "Old quota; wait"],
-  "restart-required": ["Older session still uses coordination", "Restart older gh-glance panes with this version", "Old pane; restart"],
+  "restart-required": ["Older session still uses coordination", "Restart all gh-glance panes with this version; keep the shared quota ledger", "Old pane; restart"],
   "identity-backoff": ["GitHub budget check failed", "Retry automatically at the shown time", "Budget check; retry"],
   "identity-capacity": ["GitHub budget check allowance is full", "Retry automatically when the rolling window renews", "Budget check; retry"],
   "budget-unknown": ["GitHub budget check pending", "Retry automatically", "Budget check; retry"],
@@ -15869,14 +16322,15 @@ const RECOVERY_COPY = Object.freeze({
   unavailable: ["Repository or endpoint unavailable", "Check the selected repository and permissions", "Repo; check access"],
   "source-incomplete": ["GitHub response incomplete", "Retry source observation automatically", "Incomplete; retry"],
   "unknown-scope": ["GitHub account scope unavailable", "Run gh auth status; retry when identity is verified", "Login; gh auth status"],
-  "version-mismatch": ["Older session cannot share coordination", "Restart older gh-glance panes with this version", "Old pane; restart"],
+  "backup-conflict": ["Governor backup conflicts", "Preserve the .pre-v8.backup under an unused archival filename before retry; keep the shared quota ledger", "Backup conflict; preserve"],
+  "version-mismatch": ["Coordination protocol requires an update", "Update gh-glance. Restart all gh-glance panes with the new version; keep the shared quota ledger", "Old pane; restart"],
   "unsafe-permissions": ["Local coordination permissions are unsafe", "Run gh-glance --doctor; repair directory permissions", "Permissions; doctor"],
   "disk-full": ["Local coordination storage is full", "Run gh-glance --doctor; free local storage", "Disk full; doctor"],
   coordination: ["Local coordination unavailable", "Run gh-glance --doctor; retry when storage works", "Coordination; doctor"],
 });
 
 function recoveryCause({ reason, resource = null, at = Date.now(), retryAt = null,
-  sourceAt = null, receiptUnits = null, debtUnits = null, oldestUnresolvedAt = null,
+  sourceAt = null, receiptUnits = null, debtUnits = null, oldestUnresolvedAt = null, backupPath = null,
   observerAt = null, terminalizationBacklog = null, lastFailedTransition = null,
   origin = "coordination", tab = null } = {}) {
   const code = typeof reason === "string" && Object.hasOwn(RECOVERY_COPY, reason)
@@ -15895,7 +16349,9 @@ function recoveryCause({ reason, resource = null, at = Date.now(), retryAt = nul
     terminalizationBacklog: units(terminalizationBacklog),
     lastFailedTransition: typeof lastFailedTransition === "string" && Object.hasOwn(RECOVERY_COPY, lastFailedTransition)
       ? lastFailedTransition : code,
-    summary: copy[0], action: copy[1], short: copy[2],
+    summary: copy[0], action: code === "backup-conflict" && typeof backupPath === "string" && backupPath.length <= 4096
+      ? `Preserve ${safe(backupPath)} under an unused archival filename before retry; keep the shared quota ledger` : copy[1],
+    ...(code === "backup-conflict" && typeof backupPath === "string" ? { backupPath: safe(backupPath) } : {}), short: copy[2],
   };
 }
 
@@ -15969,7 +16425,7 @@ function presentRecovery(cause, { nowMs = Date.now(), cols = 80, hasSnapshot } =
     ? `Older requests still reserve ${cause.debtUnits} units` : cause.summary;
   if (width < 60) {
     const action = cause.action.toLowerCase();
-    const narrowAction = cause.code === "legacy-unresolved" ? "Check children; restart"
+    const narrowAction = cause.code === "backup-conflict" ? "Archive backup; doctor" : cause.code === "legacy-unresolved" ? "Check children; restart"
       : action.includes("gh-glance --doctor") ? "Run gh-glance --doctor"
       : action.includes("gh auth") ? "Run gh auth status"
         : action.includes("selected repository") ? "Check repository access"
@@ -16630,6 +17086,7 @@ async function runAdmittedOperation({
       value?.ok === false ? governorOutcomeForError(value.failure) : "measured-success";
     const terminal = queueTerminalization(settlementScope, admitted.value.receiptCapability, {
       outcome,
+      observations: value?.budgetObservations ?? [],
       ...(value?.notStarted === true ? { neverStarted: true } : {}),
       ...(measured || outcome === "measured-success" ? { actualCosts: costs } : {}),
     }, now);
@@ -16643,9 +17100,18 @@ async function runAdmittedOperation({
     }
     return { ok: true, value, reservationId };
   } catch (error) {
+    const pendingClosure=nativeCiPendingClosure.get(error);
+    if(pendingClosure){
+      void pendingClosure.then(closed=>{
+        if(closed.ok)queueTerminalization(settlementScope,admitted.value.receiptCapability,{
+          outcome:governorOutcomeForError(error),observations:error.budgetObservations??[]},now);
+      });
+      return {ok:false,error,reservationId};
+    }
     const actualCost = measuredNestedOperationCost(operation, { requestMetrics: error?.requestMetrics });
     const terminal = queueTerminalization(settlementScope, admitted.value.receiptCapability, {
       outcome: governorOutcomeForError(error),
+      observations: error?.budgetObservations ?? [],
       ...(error?.notStarted === true ? { neverStarted: true } : {}),
       ...(actualCost ? { actualCosts: actualCost } : {}),
     }, now);
@@ -16799,6 +17265,7 @@ function activeKeyHints({
 }) {
   if (!interactive) return [{ label: "Quit", keys: "^C" }];
   if (remoteSetup) return REMOTE_SETUP_HINTS;
+  if (feature?.mode === 'ci') return [{label:'Jobs',keys:'↑↓'},{label:'Log',keys:'l'},{label:'Open',keys:'Ent'},{label:'Retry',keys:'d'},{label:'Back',keys:'Esc'},{label:'Quit',keys:'q'}];
   if (feature?.mode === 'focus') return feature.editing
     ? [{label:'Search',keys:'Ent'},{label:'Cancel',keys:'Esc'},{label:'Quit',keys:'^C'}]
     : [{label:'Edit',keys:'/'}, ...(canMove?[{label:'Move',keys:'↑↓'}]:[]),
@@ -17370,6 +17837,7 @@ function focusCoverage({rows,matches,sourceAt=null,nowMs=Date.now(),hasNextPage=
   return `${matches.length===0 && rows.length>0?'No local match; ':''}${count}. ${age}.${hasNextPage?' More source pages not searched.':''}`;
 }
 function featureKeyLines(feature) {
+  if(feature?.mode==='ci')return ['CI evidence: selected run/attempt/SHA; Up/Down Jobs','l Selected failed/timed-out job log; PgUp/PgDn Scroll','Enter Exact job on GitHub; d Retry metadata; Esc Back; q Quit'];
   if(feature?.mode==='focus') return feature.editing
     ? ['Focus editor: type query (q is text)', 'Enter Search loaded rows; Backspace Edit', 'Esc Cancel edit; Ctrl+C Quit']
     : ['/ Edit; Enter Open; J Semantic Focus', 'm More; x Revoke Jev permission', 'Up/Down or j/k Move; r Refresh source', 'Esc Cancel/back; q/Ctrl+C Quit'];
@@ -17732,6 +18200,17 @@ function App({ onCreateRemote = () => {} } = {}) {
   const [iconHintDue, setIconHintDue] = useState(false);
   const [actionsSetup, setActionsSetup] = useState({});
   const actionsSetupRef = useRef(null);
+  const ciEvidenceRef = useRef(null);
+  const ciControllerRef = useRef(null);
+  const ciClosureRecoveryRef=useRef(null);
+  useEffect(()=>{
+    if(feature?.mode!=='ci' || !feature.identity?.sourceDigest)return;
+    const selectedRun=data.actions?.find(row=>row.databaseId===feature.identity.runId);
+    if(!selectedRun || jevDigest([selectedRun.databaseId,selectedRun.updatedAt,selectedRun.status,selectedRun.conclusion])!==feature.identity.sourceDigest){
+      ciControllerRef.current?.abort();
+      setFeature(current=>({...current,identity:null,run:null,jobs:null,log:null,busy:false,logBusy:false,message:CI_ERRORS.changed}));
+    }
+  },[feature,data.actions]);
   const [errors, setErrors] = useState({ actions: null, issues: null, prs: null, security: null });
   const [failureContext, setFailureContext] = useState(null);
   const [loading, setLoading] = useState({ actions: false, issues: false, prs: false, security: false });
@@ -17949,13 +18428,27 @@ function App({ onCreateRemote = () => {} } = {}) {
     presentation.action = focus.error ?? focus.semantic?.message ?? focusMessage;
     presentation.notes = [...focusDisclosureLines(focusMessage,focus.semantic?.message), ...featureKeyLines(focus), `Full query: ${focus.editing ? focus.draft : focus.query}`];
   }
-  if (!focus && featureNotice) {
+  const ciView=feature?.mode==='ci' && tab.key==='actions' ? feature : null;
+  const closureDeadline=ciView?.closureError && ciClosureRecoveryRef.current?ciClosureRecoveryRef.current():null;
+  const ciDisplay=ciView?.closureError && closureDeadline===null?{...ciView,message:'Closure hold resolved. Press l to retry or Enter to open GitHub.'}:ciView;
+  const ciLines=ciDisplay?ciEvidenceLines(ciDisplay):[];
+  if(Number.isFinite(closureDeadline))ciLines.unshift(`Quota charge held; uncertainty window until ${new Date(closureDeadline).toISOString()}. Restarting does not refund it.`);
+  if(ciView){
+    presentation.showTable=false;
+    presentation.title='CI evidence';
+    presentation.explanation='Exact selected-run facts; ordinary Actions data is unchanged.';
+    presentation.action=ciView.message ?? (ciView.busy?'Loading CI evidence':'l Log; Enter Open; Esc Back');
+    presentation.notes=ciLines;
+  }
+  if (!focus && !ciView && featureNotice) {
     presentation.action = featureNotice;
     presentation.notes.push(featureNotice);
   }
-  const panelLines = presentation.showTable ? [] : contextualPanelLayout(presentation, { cols, rows });
+  const panelLines = presentation.showTable ? [] : ciView
+    ? ['CI evidence',...ciLines].flatMap(line=>wrapPanelText(line,Math.max(1,cols-5))).slice(0,Math.max(1,rows-6))
+    : contextualPanelLayout(presentation, { cols, rows });
 
-  const tableVisible = Array.isArray(items) && items.length > 0;
+  const tableVisible = !ciView && Array.isArray(items) && items.length > 0;
   const tableNoticeCapacity = Math.max(0, rows - 9);
   const needsTableContext = ["failed", "overdue", "waiting"].includes(presentation.state);
   const shortAction = /gh-glance --doctor/.test(presentation.action) ? "gh-glance --doctor"
@@ -18049,7 +18542,7 @@ function App({ onCreateRemote = () => {} } = {}) {
   };
   const pageStep = Math.max(1, bodyRows - 1);
   useEffect(() => {
-    if (featureRef.current && featureRef.current.tab !== tab.key) { jevOperationRef.current=null;runtimeJevSession?.clear();setFeature(null); }
+    if (featureRef.current && featureRef.current.tab !== tab.key) { ciControllerRef.current?.abort();jevOperationRef.current=null;runtimeJevSession?.clear();setFeature(null); }
     setFeatureNotice(null);
   }, [tab.key]);
 
@@ -18379,6 +18872,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         return;
       }
       if (input === "q" || (input === "c" && key.ctrl)) {
+        ciControllerRef.current?.abort();
         jevOperationRef.current=null;runtimeJevSession?.clear();
         openRequests.abortAll();
         flushWidthPreferences();
@@ -18409,6 +18903,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       } else if (key.escape && featureRef.current?.semantic?.pending) {
         jevOperationRef.current=null;runtimeJevSession?.cancel();setFeature(current=>({...current,semantic:{...current.semantic,pending:false,message:'Jev canceled; J Retry.'}}));
       } else if (key.escape && featureRef.current) {
+        ciControllerRef.current?.abort();
         jevOperationRef.current=null;runtimeJevSession?.clear();
         const old=featureRef.current;
         setFeature(null);
@@ -18424,6 +18919,23 @@ function App({ onCreateRemote = () => {} } = {}) {
           setHelpPage(clampHelpPage(helpPageRef.current.index + (input === "n" ? 1 : -1),
             helpPageRef.current.count));
         } else setShowHelp(false);
+      } else if (featureRef.current?.mode==='ci' && (key.upArrow || key.downArrow || input==='j' || input==='k')) {
+        if(!featureRef.current.jobs?.length)return;
+        ciControllerRef.current?.abort();
+        const direction=key.downArrow || input==='j'?1:-1;
+        setFeature(current=>({...current,jobIndex:Math.max(0,Math.min((current.jobs?.length??1)-1,(current.jobIndex??0)+direction)),log:null,logOffset:0,busy:false,logBusy:false,message:null}));
+      } else if (featureRef.current?.mode==='ci' && (key.pageDown || key.pageUp)) {
+        setFeature(current=>({...current,logOffset:Math.max(0,Math.min(Math.max(0,(current.log?.lines.length??1)-1),(current.logOffset??0)+(key.pageDown?8:-8)))}));
+      } else if (featureRef.current?.mode==='ci' && key.return) {
+        const current=featureRef.current;
+        const url=current.jobs?.[current.jobIndex??0]?.url ?? current.run?.url ?? current.selected?.url;
+        if(url)void openInBrowser('actions',{url});
+      } else if (featureRef.current?.mode==='ci' && input==='l') {
+        void ciEvidenceRef.current?.('log');
+      } else if (input==='d' && TABS[activeIndexRef.current].key==='actions') {
+        void ciEvidenceRef.current?.('open');
+      } else if (featureRef.current?.mode==='ci' && input==='r') {
+        ciControllerRef.current?.abort(); setFeature(null);void fetchTabRef.current?.('actions',manualRefreshRequest(refreshIntent(input)));
       } else if (featureRef.current?.mode==='focus' && input==='x') {
         jevOperationRef.current=null;const current=featureRef.current;
         if(runtimeIdentityCoordinator?.current()?.accessKey)runtimeJevSession?.revoke(jevIdentityRef.current(current,dataRef.current[current.tab]));
@@ -18574,6 +19086,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       const previous = recoveryRef.current[resource];
       const candidate = recoveryCause({
         reason, resource, at, retryAt, sourceAt: lastOkRef.current[key] ?? null,
+        ...(reason === "backup-conflict" ? {backupPath:runtimeIdentityCoordinator?.inspect()?.backupPath ?? (scope?.path?readGovernorState(scope.path,at,{persistMigration:false}).backupPath:null)}:{}),
         origin, tab: origin === "source" ? key : null,
       });
       const hardFailure = HARD_STORAGE_REASONS.includes(candidate.code);
@@ -19136,6 +19649,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     const inFlightStartedAt = {};
     const wakeScheduler = createWakeScheduler();
     let scope = null;
+    let scopeFailure = null;
     let cleanupScope = null;
     let registeredScopeHash = null;
     // The access partition the retained rows belong to, kept across a window
@@ -19243,6 +19757,11 @@ function App({ onCreateRemote = () => {} } = {}) {
     }
 
     actionsSetupRef.current = () => publishSetup({ title: "Standalone only", action: "g Actions; ? Help", message: "Setup checks are available in standalone mode. Press g to open Actions." });
+    ciEvidenceRef.current=()=>{
+      const selectedRun=navRef.current.items.find(item=>itemKey(item)===navRef.current.key) ?? navRef.current.items[0];
+      setFeature({mode:'ci',tab:'actions',selection:navRef.current.key,selected:selectedRun,
+        message:'CI evidence is standalone only. Enter opens the selected run on GitHub; Esc returns to Actions.'});
+    };
     if (runtime.connect !== null) {
       const repository = effectiveRuntimeRepository({ remoteUrls: runtimeRemoteUrls });
       const host = effectiveRuntimeHost({ remoteUrls: runtimeRemoteUrls });
@@ -19636,6 +20155,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     }
 
     function retireCurrentScope() {
+      ciControllerRef.current?.abort();
       jevOperationRef.current=null;runtimeJevSession?.clear();
       setFeature(null);
       setFeatureNotice(null);
@@ -19703,6 +20223,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       const current = identity();
       const nextHash = current?.quotaKey;
       if (!nextHash) {
+        scopeFailure=runtimeIdentityCoordinator?.inspect() ?? null;
         if (scope !== null) {
           retireCurrentScope();
           registeredScopeHash = null;
@@ -19724,7 +20245,8 @@ function App({ onCreateRemote = () => {} } = {}) {
         if (!maintain) return scope;
         const activeTab = TABS[activeIndexRef.current].key;
         const kept = maintainControlLease(scope, leaseId, runtime.refreshMs, activeTab, nowMs);
-        if (kept.ok) return scope;
+        if (kept.ok) {scopeFailure=null;return scope;}
+        scopeFailure=kept;
         retireSetup();
         registeredScopeHash = null;
         if (governorRef.current?.leaseId === leaseId) governorRef.current = null;
@@ -19778,7 +20300,8 @@ function App({ onCreateRemote = () => {} } = {}) {
         phaseSeed: { seed: leaseId, registeredAt: nowMs },
         demand: tabRequestCost(activeTab),
       });
-      if (!registered.ok) return null;
+      if (!registered.ok) {scopeFailure=registered;return null;}
+      scopeFailure=null;
       registeredScopeHash = nextHash;
       governorRef.current = { scope, leaseId };
       return scope;
@@ -19927,7 +20450,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       const nowMs = Date.now();
       const currentScope = ensureScope(nowMs);
       if (!currentScope) {
-        pauseCoordination(key, "unknown-scope");
+        pauseCoordination(key,scopeFailure?.reason ?? "unknown-scope",null,false,scopeFailure?.retryAt);
         return Promise.resolve({ persisted: false, retry: true, kind, key });
       }
       const snapshot = inspectGovernor(currentScope, nowMs);
@@ -20119,6 +20642,50 @@ function App({ onCreateRemote = () => {} } = {}) {
       } else await transport;
       return { persisted: true, retry: false, kind, key };
     }
+    ciEvidenceRef.current=async(action)=>{
+      const previous=featureRef.current;
+      if(previous?.mode==='ci' && previous.busy)return;
+      const selectedRun=previous?.mode==='ci'?previous.selected:
+        navRef.current.items.find(item=>itemKey(item)===navRef.current.key) ?? navRef.current.items[0];
+      if(!selectedRun){setFeatureNotice('Select an Actions run before pressing d.');return;}
+      const target=dashboardTarget();
+      const capturedScope=ensureScope(Date.now());
+      if(!capturedScope){const failure=scopeFailure ?? runtimeIdentityCoordinator?.inspect();setFeature({mode:'ci',tab:'actions',selection:navRef.current.key,selected:selectedRun,message:ciFailureMessage(ciError('admission',{reason:failure?.reason,retryAt:failure?.retryAt,backupPath:failure?.backupPath}))});return;}
+      const job=action==='log'?previous?.jobs?.[previous.jobIndex??0]:null;
+      if(action==='log' && !ciFailedJob(job)){setFeature(current=>({...current,message:'Logs are available here for selected failed or timed-out jobs. Enter opens GitHub.'}));return;}
+      ciControllerRef.current?.abort();
+      ciClosureRecoveryRef.current=null;
+      const flight=new AbortController();ciControllerRef.current=flight;
+      const signal=AbortSignal.any([controller.signal,flight.signal]);
+      const generation=governorId();
+      const sourceDigest=jevDigest([selectedRun.databaseId,selectedRun.updatedAt,selectedRun.status,selectedRun.conclusion]);
+      const identity={host:target.host,repo:target.repository,accessPartition:capturedScope.accessKey,runId:selectedRun.databaseId,sourceDigest,generation};
+      const current=()=>!cancelled && !signal.aborted && ciControllerRef.current===flight &&
+        featureRef.current?.mode==='ci' && featureRef.current.identity?.generation===generation &&
+        identity.accessPartition===runtimeIdentityCoordinator?.current()?.accessKey &&
+        dataRef.current.actions?.some(row=>row.databaseId===selectedRun.databaseId && jevDigest([row.databaseId,row.updatedAt,row.status,row.conclusion])===sourceDigest) &&
+        actionsPageUrl(target)===actionsPageUrl() && !remoteSetupRef.current;
+      setFeature({...(action==='log'?previous:{}),mode:'ci',tab:'actions',selection:previous?.mode==='ci'?previous.selection:navRef.current.key,
+        selected:selectedRun,identity,busy:true,logBusy:action==='log',closureError:false,message:null,log:action==='log'?null:undefined});
+      try{
+        if(action==='log'){
+          const admitted=await runAdmittedOperation({scope:capturedScope,leaseId,operation:'detail:actions-job-log',priority:'manual',signal,waitMs:GOVERNOR_ADMISSION_WAIT_MS,
+            run:admittedSignal=>requestGitHubJobLog({host:target.host,repository:target.repository,jobId:job.id,signal:admittedSignal})});
+          if(!admitted.ok){
+            if(admitted.skipped)throw ciError('admission',{reason:admitted.decision?.reason ?? admitted.decision?.value?.reason,
+              retryAt:admitted.decision?.retryAt ?? admitted.decision?.value?.retryAt ?? admitted.decision?.value?.notBefore ?? admitted.decision?.value?.resetMs});
+            throw admitted.error;
+          }
+          if(current())setFeature(value=>({...value,log:admitted.value,logOffset:0,busy:false,logBusy:false,closureError:false}));
+        }else{
+          const evidence=await loadCiEvidence({scope:capturedScope,leaseId,...target,selected:selectedRun,signal});
+          if(current())setFeature(value=>({...value,...evidence,jobIndex:0,busy:false,logBusy:false}));
+        }
+      }catch(error){if(current()){
+        ciClosureRecoveryRef.current=error.closureRecovery?()=>ciClosureRecoveryAt(capturedScope,error.closureRecovery,Date.now()):null;
+        setFeature(value=>({...value,busy:false,logBusy:false,closureError:error.code==='closure',message:ciFailureMessage(error)}));
+      }}
+    };
     actionsSetupRef.current = async () => {
       if (cancelled || setupFlight) return;
       const nowMs = Date.now();
@@ -20129,8 +20696,10 @@ function App({ onCreateRemote = () => {} } = {}) {
       }
       const capturedScope = ensureScope(nowMs);
       if (!capturedScope) {
-        publishSetup({ ...setupState, error: "Setup check unavailable while account coordination recovers.",
-          retryAt: actionsSetupRetryAt(nowMs) });
+        const failure=scopeFailure ?? runtimeIdentityCoordinator?.inspect();
+        publishSetup({ ...setupState, error:ciFailureMessage(ciError('admission',{
+          reason:failure?.reason,retryAt:failure?.retryAt,backupPath:failure?.backupPath})),
+          retryAt:Number.isFinite(failure?.retryAt)?failure.retryAt:actionsSetupRetryAt(nowMs) });
         return;
       }
       const partition = JSON.stringify(["standalone", target.host, target.repository, capturedScope.accessKey]);
@@ -20431,7 +21000,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       }
       const refreshed = currentScope
         ? await refreshRuntimeBudget(currentScope)
-        : { ok: false, ...(runtimeIdentityCoordinator?.inspect() ?? { reason: "stale" }) };
+        : { ok: false, ...(scopeFailure ?? runtimeIdentityCoordinator?.inspect() ?? { reason: "stale" }) };
       if (cancelled) return;
       const checkedAt = Date.now();
       const snapshot = currentScope ? inspectGovernor(currentScope, checkedAt) : refreshed;
@@ -20533,7 +21102,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (cancelled) return;
       const currentScope = ensureScope(Date.now());
       if (!currentScope) {
-        const identityFailure = runtimeIdentityCoordinator?.inspect();
+        const identityFailure = scopeFailure ?? runtimeIdentityCoordinator?.inspect();
         pauseCoordination(TABS[activeIndexRef.current].key,
           identityFailure?.reason ?? "unknown-scope", null, false, identityFailure?.retryAt);
         armWake("control", governorControlRetryAt(Date.now(), runtime.refreshMs), controlWake);
@@ -20952,7 +21521,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           selectedWidthKey: resizeRef.current.active ? selectedWidthKey : null,
           headerRef,
         }),
-      ...(tooNarrow || showHelp || remoteSetup ? [] : visibleItems).map((item) => {
+      ...(tooNarrow || showHelp || remoteSetup || ciView ? [] : visibleItems).map((item) => {
         const key = itemKey(item);
         return e(
           RowBoundary,
@@ -20994,7 +21563,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       interactive,
       cols: frameCols,
       remoteSetup,
-      feature: focus,
+      feature: ciView ?? focus,
       widthMode: resizeRef.current.active,
       widthColumn: selectedWidthColumn,
       widthSaveError,
@@ -21293,6 +21862,7 @@ export {
   finishIdentityBootstrap,
   createIdentityCoordinator,
   createQuotaScope,
+  persistGitHubAppIdentity,
   acquireIdentityHttpPermit,
   releaseIdentityHttpPermit,
   parseArgs,
@@ -21366,6 +21936,7 @@ export {
   normalizeGovernorState,
   serializeGovernorState,
   readGovernorState,
+  commitGovernorMigration,
   readIdentityQuotaState,
   writeGovernorState,
   writeGovernorQuotaState,
@@ -21444,6 +22015,7 @@ export {
   actionsWorkflowsArgs,
   actionsSetupArgs,
   parseActionsSetup,
+  ciClosureRecoveryAt, loadCiEvidence, ciEvidenceLines, ciFailureMessage, parseCiRun, parseCiJobs, ciFailedJob, ciRunArgs, ciJobsArgs, ciProxyApplies, requestGitHubJobLog, CI_ERRORS, CI_LOG_BYTES, CI_METADATA_BYTES,
   actionsSetupFresh,
   actionsSetupRetryAt,
   actionsPageUrl,

@@ -878,7 +878,7 @@ test("a live pane's file stays readable across a change to what a tab costs", (t
   const current = inspectGovernor(box.scope, started.notBefore);
   assert.equal(current.ok, true, JSON.stringify(current));
   const olderPaneFile = structuredClone(current.value);
-  olderPaneFile.version = GOVERNOR_STATE_VERSION - 1;
+  olderPaneFile.version = 6;
   delete olderPaneFile.controlReceipts;
   delete olderPaneFile.revision;
   delete olderPaneFile.debt;
@@ -3041,12 +3041,13 @@ test("schema, bounds, corrupt data, and future timestamps fail closed", (t) => {
   assert.equal(inspectGovernor(scope, NOW).reason, "corrupt");
 
   const wrongVersion = emptyGovernorState();
-  // Any version this build does not write, in either direction: a newer file is
-  // as unreadable as an older one, and guessing at either is how a live pane's
-  // leases get discarded.
+  // A future protocol is distinct from corruption and stays untouched until
+  // every pane has a build that understands it.
   wrongVersion.version = GOVERNOR_STATE_VERSION + 1;
   writeGovernorState(scope.path, wrongVersion);
-  assert.equal(inspectGovernor(scope, NOW).reason, "corrupt");
+  const wrongVersionBytes = readFileSync(scope.path, "utf8");
+  assert.equal(inspectGovernor(scope, NOW).reason, "version-mismatch");
+  assert.equal(readFileSync(scope.path, "utf8"), wrongVersionBytes);
 
   const future = emptyGovernorState();
   future.observers.graphql.nextAt = NOW + 25 * 60 * 60 * 1000;

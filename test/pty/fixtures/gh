@@ -304,6 +304,11 @@ case "$gh_command" in
         ;;
     esac
     case "$api_path" in
+      *'/actions/jobs/'*'/logs'*) printf '%s\n' 'gh log acquisition forbidden' >&2; exit 1 ;;
+      *'/actions/runs/'*'/attempts/'*'/jobs?per_page=100&page=1'|*'/actions/runs/'*'?exclude_pull_requests=true')
+        detail=$(node "$FIXTURE_DIR/ci-response.mjs" "$api_path")
+        emit_api_text '"fixture-ci-details"' "$detail"
+        exit 0 ;;
       *'/actions/runs?'*)
         run_file="$FIXTURE_DIR/actions-runs.json"
         run_etag='"fixture-runs-v1"'

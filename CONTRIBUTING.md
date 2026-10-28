@@ -369,3 +369,22 @@ Jev runtime policy stays in `index.mjs`. The exact `@typesafe-ai/sdk` 0.7.0 depe
 The normalized LRU has 128 entries, 2 MiB and ten-minute limits. Active-view coverage is separate from that cache, so more than 128 loaded candidates can be inspected through explicit continuation actions. Source snapshots, collectors and persisted caches never receive semantic results. Live evaluation requires separate authorization, a reviewed exact payload manifest and explicit call/byte/dollar ceilings. Offline passing tests do not qualify provider behavior or held-out semantic accuracy.
 
 `node scripts/measure-jev-interaction.mjs` measures 100 real terminal navigation paints while an offline TypeSafe fetch fixture is pending. Each explicit action retains the four-second deadline; the script reports exact source/fixture hashes, fake request count and keypress-to-paint p95. It sends no live requests. Active coverage is separately limited to 150 Focus answers (600 for attention), 2 MiB and ten minutes; exceeding a manifest bound is unavailable/input-too-large rather than silently dropping candidates.
+
+The selected CI evidence tests remain offline. Run focused policy coverage, then the applicable full gates:
+
+```sh
+node --test test/ci-details.test.mjs test/ci-owner-death.test.mjs \
+  test/governor-v8.test.mjs test/ci-request-oracle.test.mjs
+```
+`node scripts/check-governor-compatibility.mjs` imports the exact
+baseline `0319c9c58d211867ec35776357259b02b235909f` source and package manifest
+from the local git object database, with installed dependencies and an isolated,
+sanitized child environment. It never runs the historical CLI or downloads it.
+
+Run `node scripts/qualify-ci-log-transport.mjs` on both supported Node majors.
+It uses two local HTTPS origins, a synthetic test CA/key in
+`test/fixtures/ci-tls/`, fake credentials and a narrow external-request seam.
+Production has no endpoint override or TLS bypass. It checks redirect topology,
+credential isolation, shared byte/deadline bounds, cancellation, actual socket
+closure and safe errors. These are local transport qualifications, not live
+GitHub/provider proof. Preserve their source hashes and runtime identities.
