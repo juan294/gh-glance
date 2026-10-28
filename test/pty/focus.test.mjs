@@ -184,7 +184,8 @@ const FOCUS_COLLECTOR_CONFIG={version:1,providers:{personal:{type:'gh',host:'git
 for(const connection of ['local','ssh:studio']) test(`Focus connected source ${connection} recovers unloaded to empty to loaded and never opens a removed selection`,async t=>{
  const root=focusBox(t);
  const sourceAt=Date.now()-120000;
- const env={GH_GLANCE_CAPTURE_LIVE_FLUSH:'1'};
+ const jevImports=join(root,'jev-imports'),jevCalls=join(root,'jev-calls');writeFileSync(jevImports,'');writeFileSync(jevCalls,'');
+ const env={GH_GLANCE_CAPTURE_LIVE_FLUSH:'1',TYPESAFE_API_KEY:'dummy-test-key',GH_GLANCE_TEST_JEV_IMPORTS:jevImports,GH_GLANCE_TEST_JEV_CALLS:jevCalls,NODE_OPTIONS:`--import=${new URL('./fixtures/jev-child-guard.mjs',import.meta.url).pathname} --import=${new URL('./fixtures/jev-fetch.mjs',import.meta.url).pathname}`};
  if(connection==='ssh:studio'){
   const bin=join(root,'bin');mkdirSync(bin);
   symlinkSync(new URL('../../index.mjs',import.meta.url).pathname,join(bin,'gh-glance'));
@@ -240,6 +241,7 @@ send('\\u001b'); await until(()=>!screen().includes('Focus:') && screen().includ
 save('ordinary-after-removal.txt',screen());
 `) });
  assertFocusFlow(root,result);
+ assert.equal(readFileSync(jevImports,'utf8'),'');assert.equal(readFileSync(jevCalls,'utf8'),'');
  assert.equal(refreshes,3);
  assert.deepEqual(observed.map(item=>item.numbers),[[],[41,37],[37]]);
  assert.deepEqual(observed.map(item=>item.sourceAt),[sourceAt+1000,sourceAt+2000,sourceAt+3000]);
