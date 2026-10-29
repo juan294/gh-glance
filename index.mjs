@@ -10893,7 +10893,6 @@ async function runCollectorForeground(configPath, {
     },
   });
   const service = await createCollectorService({ config: loaded.value, pathOptions, platform, runtime: activeRuntime });
-  stderr.write(`gh-glance: collector listening at ${service.socketPath}\n`);
   const stop = () => resolveStop?.();
   let resolveStop;
   try {
@@ -10901,6 +10900,7 @@ async function runCollectorForeground(configPath, {
       resolveStop = resolve;
       process.once("SIGINT", stop);
       process.once("SIGTERM", stop);
+      stderr.write(`gh-glance: collector listening at ${service.socketPath}\n`);
     });
   } finally {
     process.off("SIGINT", stop);

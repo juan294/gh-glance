@@ -33,6 +33,7 @@ import {
   loadCollectorConfig,
   loadAcquisitionStore,
   normalizeCollectorConfig,
+  runCollectorForeground,
   runCollectorStdioBridge,
 } from "../index.mjs";
 
@@ -63,6 +64,29 @@ const CONFIG = {
   providers: { personal: { type: "gh", host: "github.com" } },
   targets: [{ host: "github.com", repo: "acme/widget", provider: "personal" }],
 };
+
+test("collector readiness accepts immediate shutdown and removes its endpoint", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-ready-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const config = join(root, "collector.json");
+  writeFileSync(config, JSON.stringify(CONFIG), { mode: 0o600 });
+  const pathOptions = { env: { XDG_CONFIG_HOME: root } };
+  let accepted = false;
+  let fallback;
+  await runCollectorForeground(config, {
+    pathOptions,
+    stderr: { write(message) {
+      if (!message.includes("collector listening")) return;
+      accepted = process.emit("SIGTERM");
+      // Let the old ordering shut down too, so the regression fails without hanging.
+      if (!accepted) fallback = setImmediate(() => process.emit("SIGTERM"));
+    } },
+  });
+  clearImmediate(fallback);
+  assert.equal(accepted, true, "readiness must accept immediate SIGTERM");
+  assert.equal(existsSync(collectorSocketPath(pathOptions)), false);
+  assert.equal(existsSync(`${collectorSocketPath(pathOptions)}.lock`), false);
+});
 
 test("COL-02/07: collector config is strict, private, and provider fenced", (t) => {
   const root = mkdtempSync(join(tmpdir(), "gh-glance-collector-config-"));

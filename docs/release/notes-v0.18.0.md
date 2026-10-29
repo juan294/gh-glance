@@ -32,6 +32,7 @@ with optional Jev interpretation behind explicit opt-in and consent.
   merge authority.
 - Refreshing attention keeps unchanged source metadata usable across live and
   cached reads; real metadata changes still invalidate prior results.
+- Collectors can shut down cleanly immediately after announcing readiness.
 
 **Upgrade all panes together.** Shared quota protocol 8 migrates the existing
 ledger in place and saves its exact original bytes in a private

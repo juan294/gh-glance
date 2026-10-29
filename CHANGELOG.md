@@ -47,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Collector readiness now guarantees shutdown handlers are installed, so an
+  immediate stop closes the socket and lock cleanly.
 - Attention refresh compares live and cached metadata consistently, so an
   unchanged unknown PR review value cannot invalidate its source binding.
   Real metadata changes still retire the prior view and require explicit restart.
