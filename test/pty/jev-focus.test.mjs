@@ -52,6 +52,8 @@ try{
 });
 test('Jev Focus freezes loaded manifest and explicitly continues 60/60/30 while preserving partial source coverage',t=>{
  const root=mkdtempSync(join(tmpdir(),'jev-manifest-'));t.after(()=>rmSync(root,{recursive:true,force:true}));const calls=join(root,'jev-calls');writeFileSync(calls,'');
+ const resource={limit:5000,remaining:5000,used:0,resetMs:Date.now()+600000};
+ writeFileSync(join(root,'state.json'),JSON.stringify({createdAt:Date.now(),core:resource,graphql:resource,events:[]}));
  const driver=join(root,'driver.mjs');writeFileSync(driver,`import {readFileSync,writeFileSync} from 'node:fs';
 import {parseCapture} from ${JSON.stringify(new URL('./capture.mjs',import.meta.url).href)};
 const root=${JSON.stringify(root)},pause=ms=>new Promise(r=>setTimeout(r,ms)),send=s=>process.stdout.write(s);
@@ -79,7 +81,7 @@ try{
  writeFileSync(root+'/complete','yes');
 }catch(error){writeFileSync(root+'/failure',String(error));}finally{send('\\u0003');}
 `);
- const result=capture({cols:100,rows:24,signal:'none',settle:70,configHome:root,args:'--repo acme/widget --tab issues --refresh 300 --background off --jev',env:{GH_GLANCE_CAPTURE_LIVE_FLUSH:'1',GH_GLANCE_FIXTURE_GRAPHQL_ROWS:'200',TYPESAFE_API_KEY:'dummy',NODE_OPTIONS:`--import=${new URL('./fixtures/jev-fetch.mjs',import.meta.url).pathname}`,GH_GLANCE_TEST_JEV_CALLS:calls},stdin:`node '${driver}'`});
+ const result=capture({cols:100,rows:24,signal:'none',settle:70,configHome:root,args:'--repo acme/widget --tab issues --refresh 300 --background off --jev',env:{GH_GLANCE_CAPTURE_LIVE_FLUSH:'1',GH_GLANCE_FIXTURE_STATE:join(root,'state.json'),GH_GLANCE_FIXTURE_GRAPHQL_ROWS:'200',TYPESAFE_API_KEY:'dummy',NODE_OPTIONS:`--import=${new URL('./fixtures/jev-fetch.mjs',import.meta.url).pathname}`,GH_GLANCE_TEST_JEV_CALLS:calls},stdin:`node '${driver}'`});
  let failure='';try{failure=readFileSync(join(root,'failure'),'utf8');}catch{/* none */}assert.equal(failure,'',failure);assert.equal(readFileSync(join(root,'complete'),'utf8'),'yes');assert.equal(result.exitCode,0);assert.equal(result.altEnter,result.altExit);
  const batches=readFileSync(calls,'utf8').trim().split('\n').map(JSON.parse);assert.equal(batches.length,14);assert.ok(batches.every(x=>Object.keys(x.request.questions).length<=15));
 });
