@@ -1,9 +1,10 @@
 // Test-only third-party HTTPS boundary. Production origin policy is unchanged.
 import https from 'node:https';
 import {syncBuiltinESMExports} from 'node:module';
-import {appendFileSync} from 'node:fs';
+import {appendFileSync,readFileSync} from 'node:fs';
 import {ciHttpsFixture} from '../../fixtures/ci-https-fixture.mjs';
-const fixture=await ciHttpsFixture({mode:process.env.GH_GLANCE_CI_MODE??'ok',onRequest:event=>{
+const fixture=await ciHttpsFixture({mode:process.env.GH_GLANCE_CI_MODE??'ok',
+  ...(process.env.GH_GLANCE_CI_LOG_FILE?{logText:()=>readFileSync(process.env.GH_GLANCE_CI_LOG_FILE,'utf8')}:{}),onRequest:event=>{
   if(process.env.GH_GLANCE_CI_EVENTS)appendFileSync(process.env.GH_GLANCE_CI_EVENTS,JSON.stringify(event)+'\n');
 }});
 fixture.unref();

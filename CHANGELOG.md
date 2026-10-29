@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Actions `d` opens exact run/attempt/job evidence in standalone mode; `l`
   explicitly captures a bounded failed/timed-out job log. Enter opens the exact
   selected job. Coverage and unsupported proxy/storage limitations are visible.
+- Optional CI `J` previews sanitized bounded log text before every send, then
+  reports six independent observations with existing original-line evidence.
+  `e` selects a clean smaller range; `x` revokes permission and clears active
+  log/excerpt/results. Exact GitHub facts stay authoritative; live semantic
+  qualification and developer benefit remain unmeasured.
 
 ### Changed
 

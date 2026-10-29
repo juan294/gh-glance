@@ -3,7 +3,7 @@ import {readFileSync} from 'node:fs';
 const externalRequest=httpsRequest;
 const key=readFileSync(new URL('./ci-tls/test-private-key.fixture',import.meta.url));
 const cert=readFileSync(new URL('./ci-tls/test-ca.crt',import.meta.url));
-export async function ciHttpsFixture({mode='ok',onRequest=()=>{},trust=true,servername='localhost'}={}) {
+export async function ciHttpsFixture({mode='ok',onRequest=()=>{},trust=true,servername='localhost',logText='test failed\nassert expected true\n'}={}) {
   const events=[],sockets=new Set();
   const serve=stage=>(req,res)=>{
     const event={stage,method:req.method,authorization:Boolean(req.headers.authorization),cookie:Boolean(req.headers.cookie),path:req.url.split('?')[0]};
@@ -23,7 +23,7 @@ export async function ciHttpsFixture({mode='ok',onRequest=()=>{},trust=true,serv
     if(mode==='expired'){res.writeHead(403);res.end('expired');return;}
     res.writeHead(200,{'content-type':'text/plain','x-ratelimit-remaining':'7777','x-ratelimit-resource':'core','x-ratelimit-limit':'7777','x-ratelimit-reset':String(Math.floor(Date.now()/1000)+3600)});
     if(mode==='storage-hang'){res.write('first');return;}
-    res.end(mode==='oversize'?'x'.repeat(1024*1024+1):mode==='aggregate'?'x'.repeat(600*1024):'test failed\nassert expected true\n');
+    res.end(mode==='oversize'?'x'.repeat(1024*1024+1):mode==='aggregate'?'x'.repeat(600*1024):typeof logText==='function'?logText():logText);
   };
   const api=createServer({key,cert},serve('api')),storage=createServer({key,cert},serve('storage'));
   for(const server of [api,storage])server.on('connection',socket=>{sockets.add(socket);socket.once('close',()=>sockets.delete(socket));});

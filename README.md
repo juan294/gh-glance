@@ -1206,3 +1206,13 @@ An unverified native connection closure retains its quota charge and displays
 the computed uncertainty-window deadline. Restarting a pane does not refund that
 charge. The ledger's existing verified closure/boot/window recovery rules apply;
 Open GitHub remains available while waiting.
+
+### Optional CI log observations
+
+With `--jev` and `TYPESAFE_API_KEY`, press `J` after explicitly loading a selected failed/timed-out job log. Every send opens a TypeSafe preview of the exact sanitized state, even when this session already has permission or the answer is cached. PgUp/PgDn reviews the complete preview; Enter sends and Escape cancels without sending. Separate repository/account/run identity fields and step names stay local. Log text can still contain private or identifying content; redaction does not guarantee that it is secret-free.
+
+Known credentials, authorization/cookie headers, private-key blocks and signed links are redacted locally and block cloud submission for the selected range. Press `e`, type an existing `start-end` line range, one line number, or `all`, and Enter to apply it. A clean smaller range can reach a new preview. While editing, `q` is text and Ctrl-C quits. Excerpts retain original line numbers, contain at most 40 spans/8 KiB, and disclose omitted or truncated lines. Source log capture and GitHub facts remain independent of inference.
+
+The six independent observations are assertion mismatch, dependency-download failure, explicit permission denial, reported execution timeout, explicit memory exhaustion, and concrete static-check diagnostics. A positive observation must point to an existing span in this exact run/attempt/SHA/job/excerpt. These are reported log observations rather than proven root causes or generated fixes. “No listed observation found” applies only to this excerpt; uncertain or missing evidence does not mean healthy CI. GitHub's conclusion is always retained. Results are invalidated by source, account, job, log or range changes and expire after ten minutes.
+
+`x` revokes this scope's Jev permission, cancels work and clears the active log/excerpt/results; press `l` to load a log again. Requests use the shared four-second deadline, call cap and bounded memory-only cache. Typing, refreshing, polling and opening a view never send model requests. Errors retain local evidence and show an explicit review/retry or smaller-range action. The live Jev contract, semantic accuracy and developer benefit remain unverified or unmeasured.

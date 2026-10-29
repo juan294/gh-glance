@@ -388,3 +388,7 @@ Production has no endpoint override or TLS bypass. It checks redirect topology,
 credential isolation, shared byte/deadline bounds, cancellation, actual socket
 closure and safe errors. These are local transport qualifications, not live
 GitHub/provider proof. Preserve their source hashes and runtime identities.
+
+CI observation policy is tested by `node --test test/ci-observations.test.mjs test/ci-evaluation.test.mjs`; `test/pty/ci-observations.test.mjs` drives the real standalone UI and SDK with fake external transport. The tests cover exact previews, secret blocks and clean-range recovery, independent Noul/Choice gating, synchronous identity/expiry projection, cancellation and ordinary source refresh. The local TLS fixture accepts test-only log text so those UI paths exercise the real native adapter. Production has no such option.
+
+`node scripts/evaluate-jev.mjs --feature ci` runs offline against the frozen synthetic rubric. Replay metrics retain category TP/FP/FN/abstention counts, supporting-span accuracy, insufficient-evidence assertions and identity errors. Preparing a manifest remains offline. Live evaluation still requires separate authorization and exact reviewed payload/call/byte/dollar budgets; neither a passing fixture nor corpus labels establish live model accuracy. Run the normal complete lint/syntax/unit/PTY phase gates and repeat transport qualification when its fixture or adapter inputs change.
