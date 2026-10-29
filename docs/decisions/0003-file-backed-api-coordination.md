@@ -452,3 +452,23 @@ failure, prints the manual remedy: quit every pane, then move the quota ledger,
 its `.recovery.json` and `registry.json` aside. All three are needed because the
 registry still names a ledger that was moved alone, and a missing ledger for a
 known identity stays `corrupt` so that deleting it cannot silently drop debt.
+
+## Amendment: native log transport and protocol 8 (2026-10-29)
+
+Explicit failed-job log capture adds native HTTPS dispatch to the same admission,
+HTTP-permit and durable-receipt machinery. The protocol discriminator advances
+from 7 to 8 while the receipt shape remains 7. Migration validates the complete
+v7 ledger without pruning and changes only the discriminator, preserving its
+leases, reservations, observations and unsettled debt at the same canonical path.
+
+A live v7 lease blocks migration until it closes or expires. Restart all panes
+with the new version and keep the ledger; deleting, replacing or downgrading it
+would discard accounting evidence. Before the first upgraded write, migration
+preserves the exact original bytes in a private `.pre-v8.backup`. An existing
+identical backup is reusable; a conflicting one blocks the write and names its
+path for archival recovery. Storage failure denies admission.
+
+The native adapter retains its charge until actual connection closure is proven
+or the existing causal/window recovery rules permit retirement. A canceled
+promise or pane restart alone proves neither closure nor a refund. Selected
+logs remain session-only; the ledger stores accounting rather than log text.

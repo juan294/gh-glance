@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // gh-glance -- a live-refreshing GitHub dashboard sized for a narrow terminal
 // pane: Actions, Issues, Pull Requests, and Security (Dependabot/
-// code-scanning/secret-scanning alerts). All data comes from `gh` (issue/pr/
-// run list + `gh api` for security alerts). Explicit failed-job logs use
-// separately admitted native HTTPS with one credential-free storage transfer. Renders with ink so redraws are diffed in place, no full-screen
-// clear/flash on refresh.
+// code-scanning/secret-scanning alerts). Ordinary metadata comes from `gh`.
+// Explicit failed-job logs use separately admitted native HTTPS with one
+// credential-free storage transfer. Optional TypeSafe interpretation requires
+// scoped consent. Ink diffs redraws in place, with no full-screen clear/flash.
 
 // React's development build instruments every render with performance.measure()
 // calls for its DevTools timeline. In a browser those entries are dropped once
@@ -12325,7 +12325,8 @@ Options:
                            \`off\` never requests data
                            for a tab you are not looking at; its count stays at
                            the last known value and visibly ages.
-  --jev                    Enable explicit semantic Focus in standalone mode.
+  --jev                    Enable explicit semantic Focus, CI observations and
+                           attention badges in standalone mode.
   --jev-max-requests <n>    Session call cap, 1-10000 (default 100); requires --jev.
   --verbose                Write one line per gh invocation to stderr. stderr
                            must be redirected -- writing it to the terminal

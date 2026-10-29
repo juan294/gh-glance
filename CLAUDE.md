@@ -51,8 +51,10 @@ throttle coverage already creates real concurrent panes; parallel files can
 starve independent PTY deadlines. Individual cases still exercise their required
 process concurrency. CI routes by change (see `.github/workflows/ci.yml`): a
 `develop` -> `main` release PR packs one tarball, checks it on Node 22/24 and
-runs the selected suites once; `develop` pushes run quick checks; `main` pushes
-only prove the merge tree equals the tested one.
+runs the selected suites once; ordinary `develop` pushes run quick checks;
+Sutura repair proposals and authenticated exact same-repository repair merges
+select full native verification. `main` pushes only prove the merge tree equals
+the tested one. Sutura owns CI routing; this describes the installed behavior.
 
 ## Git Workflow
 

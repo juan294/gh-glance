@@ -87,7 +87,9 @@ It is a separate script from `npm test` on purpose. The unit run is fast; the
 pty run is slow and timing-sensitive. CI routes them by the change
 (`scripts/release-candidate.mjs` `planCi`): `develop` pushes (unless the release
 PR is open, whose run already covers the same head) and ordinary PRs run the
-fast unit selection and the terminal smoke, and a `develop` -> `main`
+fast unit selection and the terminal smoke. Sutura repair proposals and
+authenticated exact same-repository repair merges select full native
+verification; ordinary owner pushes retain the quick path. A `develop` -> `main`
 release PR whose change can affect coordination or terminal behavior runs the
 full PTY suite once, plus the recovery and efficiency selections. The required
 `PTY` context reports whichever terminal work the run selected. The full suite
@@ -244,8 +246,10 @@ Worth knowing about the app's shape before changing it:
   lock, per-tab/per-column three-way merge, and post-save adoption of the merged
   snapshot together; removing any one can let simultaneous panes overwrite
   unrelated state on a later save.
-- Everything from `gh` goes through `safe()` before it is stored in memory,
-  persisted, or rendered. See `SECURITY.md`.
+- Ordinary display metadata from `gh` goes through `safe()` before storage or
+  rendering. Multiline CI logs use their separate bounded capture and line
+  cleaning/excerpt policy, stay in session memory and never enter shared
+  snapshots or dashboard caches. See `SECURITY.md`.
 
 ## Branching Model
 
@@ -276,7 +280,9 @@ workflow *filename*, and the `npm` environment, so renaming
 `.github/workflows/release.yml` or that environment breaks publishing until
 `npm trust github gh-glance` is re-run.
 
-`develop` is not protected: the maintainer commits to it directly. The
+`develop` permits direct maintainer pushes. Minimal protection blocks force
+pushes and deletion, including for admins; it does not require a PR or check
+gate for ordinary owner work. The
 PR-per-change requirement was removed on 2026-08-04 as pure overhead on a solo
 project. CI still runs on `develop`, but it now reports *after* a push rather
 than gating it, which makes a green local run the only thing standing between a

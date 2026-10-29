@@ -10,7 +10,9 @@ and the [repair plan](../plans/2026-10-02-release-process-repair.md).
 
 ## Topology
 
-- `develop` is the unprotected integration branch. `main` is protected (strict
+- `develop` is the integration branch: direct owner pushes are permitted, while
+  minimal protection blocks force pushes and deletion, including for admins.
+  `main` is protected (strict
   up-to-date checks, admins included, PR-only) and is the released state.
 - A release is one `develop` -> `main` pull request merged with a **merge
   commit** (never squash, never `--delete-branch`), then an annotated tag on
@@ -154,7 +156,7 @@ do not see those commands: review the authority file before resuming.
    `gh run list --commit <full-sha> --event pull_request` (a short SHA silently
    matches nothing) and read `gh run view <id> --log-failed`; diagnose and fix
    locally. Never rerun a hosted job to collect evidence.
-3. Sutura and the coverage workflow (push and scheduled) are optional observers.
+3. Sutura's CI-completion monitor and scheduled/manual coverage are optional observers.
    They never block a release and are never waited for. Correlate a Sutura run
    through its triggering run ID, not its own default-branch SHA, and report its
    actual repair result; never merge its output automatically.
@@ -240,7 +242,7 @@ decision and steps.
 
 | Area | Before the repair | Now in the workflow files | Still to activate |
 | --- | --- | --- | --- |
-| Candidate CI | Full suites on every `develop` push, PR and `main` push | Release PR owns one selection, packs once and uploads the tarball; `develop` pushes are quick, and skipped while the release PR is open; `main` pushes check promotion identity only; an always-running `Release candidate` aggregate | Require `Release candidate` on `main`, observe it, then retire the legacy contexts (add before remove); `main` still requires the eight legacy contexts (read 2026-10-03) |
+| Candidate CI | Full suites on every `develop` push, PR and `main` push | Release PR owns one selection, packs once and uploads the tarball; ordinary `develop` pushes are quick, and skipped while the release PR is open; Sutura repair proposals and authenticated exact same-repository repair merges select full native verification; `main` pushes check promotion identity only; an always-running `Release candidate` aggregate | Require `Release candidate` on `main`, observe it, then retire the legacy contexts (add before remove); `main` still requires the eight legacy contexts (read 2026-10-03) |
 | Publisher | Re-tests, re-packs the tag, floating npm, skip-on-existing without byte comparison | Verifies and publishes the accepted tarball with pinned npm; collisions block | None: v0.16.2 exercised OIDC publication of a verified artifact (publisher run 37112912694) |
 | Delivery | Manual readback (step 5) | Bounded registry, provenance and fresh-install checks on Node 22 and 24 in an unprivileged job | None: the v0.16.2 Delivery job passed |
 | Coverage | Also on every `develop` push | Scheduled and manual only | None |

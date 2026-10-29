@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Local Focus searches loaded Issues and PRs with `/`, topic words and exact
+  number, author, branch and updated-date filters, without extra GitHub requests.
+  Optional semantic Focus uses `--jev`, `TYPESAFE_API_KEY` and scoped consent;
+  `m` evaluates more loaded candidates. Model calls share a session cap and
+  four-second action deadline; results stay in memory. Live provider behavior,
+  semantic accuracy and developer benefit remain unqualified or unmeasured.
 - Standalone `a` shows exact personal review, assignment and authored-PR
   attention among loaded rows, with explicit 25-item detail batches, unknown
   relationship coverage and refresh/retry controls. Optional `J` metadata
@@ -25,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Sutura's protected native-proof pilot records exact checkout evidence and
+  selects full native verification for repair proposals and authenticated exact
+  repair merges. Ordinary development checks and release publication authority
+  remain separate.
 - Shared quota protocol 8 upgrades the same ledger path with a private exact
   `.pre-v8.backup`. Restart all gh-glance panes with this version; keep the
   shared quota ledger. Never clear, delete or downgrade it for a version

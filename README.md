@@ -69,6 +69,14 @@ current.
 - **Issues** -- open issues: title, author, first label, age
 - **Pull Requests** -- open PRs: title, author, branch, review status
   (approved / changes requested / pending), age
+- **[Focus](#focus-loaded-work)** -- `/` searches loaded Issues and PRs locally;
+  optional `J` adds semantic matching after explicit consent
+- **[Selected CI evidence](#selected-ci-evidence)** -- `d` opens exact run/job
+  facts and `l` loads a failed-job log in standalone mode; optional
+  [CI observations](#optional-ci-log-observations) cite original log lines
+- **[Personal attention](#personal-attention)** -- `a` shows personal review,
+  assignment and authored-PR facts in standalone mode; optional metadata badges
+  leave the exact queue and order unchanged
 - **Security** -- open Dependabot, code-scanning, and secret-scanning alerts,
   sorted with the most severe first and with severity spelled out rather than
   carried by colour alone. Each source starts with its newest 100 open alerts.
@@ -303,9 +311,16 @@ stdout isn't a terminal rather than streaming redraw frames into a pipe.
 | `R` | Resynchronize the current tab: one generation without validators, and the only key that clears a negative capability backoff. Still subject to the budget and the secondary cooldown. |
 | `s` | On Actions, request or reuse a read-only setup check (standalone only) |
 | `g` | On Actions, open the selected repository’s Actions page |
+| `/` | Search loaded Issues or Pull requests with Focus |
+| `d` | On Actions, inspect the selected run and jobs (standalone only) |
+| `a` | Open personal attention for a verified human user (standalone only) |
+| `J` | In Focus, a loaded CI log or attention, request optional Jev interpretation; requires `--jev`, an API key and scoped consent |
+| `m` | In semantic Focus, evaluate more loaded candidates; in attention, request the next GitHub detail batch |
+| `l` / `e` | In CI details, load the selected failed/timed-out job log / edit its excerpt range |
+| `x` | Revoke the current scope's Jev permission and clear its semantic results; in CI, also clear the active log and excerpt |
 | `w` | Adjust table column widths |
 | `?` | Open or close contextual help; `n` / `p` moves through its pages |
-| `q` / `Esc` / `Ctrl+C` | Quit (`Esc` leaves width mode) |
+| `q` / `Esc` / `Ctrl+C` | Quit from ordinary navigation; `Esc` leaves feature views, editors and width mode. While editing a query or range, `q` is text and `Ctrl+C` quits. |
 
 ### Adjusting column widths
 
@@ -382,6 +397,8 @@ pane definition. Flags are there when you want them:
 | `--refresh <seconds>` | Minimum automatic poll interval, 2-3600, default 5. A floor, never a ceiling: a tab whose content is unchanged twice in a row slows to 30 seconds (60 for Security), and Actions with a running or queued job is checked every 5. Safe shared grants can make any check later. |
 | `--tab <name>` | Start on `actions`, `issues`, `prs` or `security`. |
 | `--background <mode>` | `on-demand` (default): active Actions updates automatically; Issues, PRs and Security use cached data and check when opened or refreshed with `r`. Unopened tabs make no data requests. `all` continuously polls active and inactive tabs; `off` continuously polls only the selected tab. |
+| `--jev` | Enable optional semantic Focus, CI observations and attention badges in an interactive standalone dashboard. Requires `TYPESAFE_API_KEY` and explicit scoped consent; startup and ordinary refresh send no model requests. |
+| `--jev-max-requests <n>` | Set the per-process model-call cap, 1-10000 (default 100); requires `--jev`. |
 | `--verbose` | Log one line per dashboard `gh` call to stderr, with timing and outcome. Credential lookup and the account-identity proof are deliberately excluded, so that they cannot log anything derived from a token. stderr must be redirected: `gh-glance --verbose 2>gh-glance.log`. |
 | `--doctor` | Print a diagnostic report and exit. See [Diagnostics](#diagnostics). |
 | `--doctor --probe` | Add bounded, admitted GitHub capability probes to the local diagnostic report. |
@@ -608,6 +625,7 @@ Environment variables work too, and the flags take precedence:
 
 | Variable | Effect |
 |---|---|
+| `TYPESAFE_API_KEY` | TypeSafe credential used only with `--jev` and explicit scoped consent. Removed from child-process environments; never saved in dashboard or collector state. |
 | `GH_REPO=[host/]owner/name` | Watch a specific repository instead of the current directory's. A qualified value supplies the host; an unqualified value means `github.com`. An explicit `--repo` wins. |
 | `GH_HOST=<host>` | When no explicit `--repo` overrides it, send every call and the account governor to a GitHub Enterprise or EMU host instead of `github.com`. |
 | `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN` | Used by the default `gh` provider with `gh`'s host-specific precedence. gh-glance never logs or stores the raw values. One-way credential digests keep private rows access-partitioned; credentials GitHub verifies as the same principal share its quota ledger. App-provider children remove these variables before setting their memory-only installation token. |

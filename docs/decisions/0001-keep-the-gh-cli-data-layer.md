@@ -147,3 +147,19 @@ without changing this decision.
 Priority lanes preserve independent source completion and bounded top-N
 visibility. They do not introduce a new network client or a cross-tab barrier,
 so the accepted decision remains unchanged.
+
+## Clarification: explicit evidence and interpretation (2026-10-29)
+
+Ordinary tab acquisition still uses independent governed `gh` invocations and
+publishes each tab as it completes. Personal attention adds an explicitly
+requested, bounded GraphQL detail batch through the same `gh` boundary; it does
+not combine ordinary tab polling behind a new completion barrier.
+
+Selected failed-job logs use a separately admitted native HTTPS adapter: one
+authenticated GitHub log-endpoint GET followed by at most one credential-free
+storage GET. Optional TypeSafe interpretation is another explicit network path,
+enabled only with `--jev`, an API key and scoped consent. Its observations and
+badges are not acquisition authority and do not change GitHub facts or exact
+attention membership/order. These bounded paths do not replace the ordinary
+`gh` data layer. See [selected CI evidence](../../README.md#selected-ci-evidence)
+and the [security model](../../SECURITY.md#security-model).
