@@ -141,7 +141,7 @@ test("WF-04 simulated events: one authoritative selection, zero full suites on d
     coordinationPr: planCi({ event: "pull_request", repository: REPO, baseRef: "develop", headRef: "fix",
       headRepository: REPO, changedPaths: ["index.mjs"] }),
   };
-  assert.deepEqual(fullSuites(events.releasePr), Object.keys(FULL_SUITES));
+  assert.deepEqual(fullSuites(events.releasePr), [], "owner releases use the bounded gate");
   assert.deepEqual(fullSuites(events.developPush), []);
   assert.deepEqual(fullSuites(events.mainPush), []);
   assert.deepEqual(fullSuites(events.featurePr), [], "an ordinary PR to develop runs quick checks only");

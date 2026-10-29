@@ -101,9 +101,11 @@ export function planCi({ event, repository, baseRef, headRef, headRepository, ch
     return { role: "pull-request", profile: decision.profile, jobs: [...PROFILE_JOBS[decision.profile], ...always],
       reasons: ["pull request to develop: read-only checks, no publishable artifact", ...decision.reasons] };
   }
-  return { role: "candidate", profile: decision.profile,
-    jobs: [...PROFILE_JOBS[decision.profile], "pack", ...always],
-    reasons: ["release pull request: the one authoritative candidate selection", ...decision.reasons] };
+  // Sutura-coordinated small-CLI policy: one bounded owner release gate.
+  // Stress suites remain available for explicit validation and repair proof.
+  return { role: "candidate", profile: decision.profile === "docs" ? "docs" : "ordinary",
+    jobs: [...QUICK_JOBS, "pack", ...always],
+    reasons: ["owner release pull request: one bounded candidate gate"] };
 }
 
 // GNU script(1) on Linux always; BSD on macOS only for a release candidate.

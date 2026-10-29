@@ -119,6 +119,9 @@ describe what exists; do not suggest improvements unless asked.
 - Keep implementation work in isolated worktrees or temporary branches
 - Releases follow `docs/release/release-playbook.md`, which also decides
   when the `rpi-pre-launch` sequence below applies.
+  Its short release gate overrides the full implementation checks above during
+  release preparation. Reuse unchanged-input evidence and run focused fixes;
+  never add a release gate without a demonstrated risk and an owner decision.
 <!-- rpi:push-accountability:start -->
 # Push Accountability
 

@@ -40,6 +40,11 @@ lifecycle changes. Add `npm run test:efficiency` for acquisition, scheduling,
 collector, or efficiency changes; `npm test` excludes that suite. Return
 failure if any required check fails.
 
+Release preparation follows the short gate in
+`docs/release/release-playbook.md`: fast units and focused regressions, reusing
+valid unchanged-input evidence. Full implementation checks above are not
+repeated automatically during release preparation.
+
 ## Mocking Boundary
 
 Mock only what you do not own -- third-party APIs, network calls, the clock,

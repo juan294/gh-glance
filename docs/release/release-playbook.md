@@ -59,6 +59,29 @@ dependency change, new live or paid scope, or a materially different candidate
 needs a new owner decision. No delegated agent decides on its own to push,
 merge, tag or publish.
 
+## Proportional verification
+
+Sutura coordinates this small CLI's routine release selection. A same-repository
+`develop` -> `main` release uses the existing short `ordinary` profile (or
+`docs` for documentation only): lint/syntax, fast units on Node 22 and 24, one
+packed artifact exercised on both Node versions, and terminal smoke on Linux
+and macOS. The PTY and Release candidate aggregates, CodeQL, dependency review,
+protected merge, exact artifact/tree checks, OIDC publication and delivery stay
+in force. This replaces broad stress selection for trusted owner release PRs,
+including release-control changes; it is a repository-specific risk decision,
+not a fleet routing or credential change.
+
+The full PTY, sustained-recovery and efficiency suites remain available through
+their existing commands for explicit validation of a named risk. Sutura repair
+proof and applicable non-release broad checks still select them. Routine
+publication does not repeat those suites. The normal release target is under
+ten minutes, not a new timing gate or a guarantee about hosted queue time.
+
+Reuse valid evidence for unchanged inputs. After a narrow fix, run its focused
+regression and the short gate; preserve earlier failures without repeating every
+unrelated suite. Do not add qualification, reports, gates or retries to a
+routine release without a demonstrated risk and an owner decision.
+
 ## Release driver
 
 `scripts/release.mjs` runs the procedure below and shows where a release
@@ -128,12 +151,14 @@ do not see those commands: review the authority file before resuming.
    `## [x.y.z] - YYYY-MM-DD` changelog section. Diff `CHANGELOG.md` against the
    previous tag so in-flight entries do not land under an already published
    heading. Grep the old version across tracked files.
-3. Run the complete applicable local gate sequentially, keeping every exit
-   status: `npm run lint`, `node --check index.mjs`, `npm test`, plus
-   `npm run test:efficiency` and `npm run test:pty` when the change touches
-   their areas. `npm run test:fast`, `test:recovery`, `test:package` and
-   `test:pty:smoke` are named subsets for quick feedback, not substitutes. A
-   later pass never erases an earlier failure.
+3. Run the short local release gate sequentially: `npm run lint`,
+   `node --check index.mjs`, `npm run test:fast`, and focused regressions for
+   changed behavior. Reuse valid package and terminal evidence for unchanged
+   inputs; run `test:package` or `test:pty:smoke` when their inputs changed.
+   Full recovery, efficiency and PTY suites are explicit risk checks, not
+   automatic release prerequisites. Preserve every exit; later passes never
+   erase earlier failures. The hosted candidate still packs and exercises its
+   exact artifact once under the short selection above.
 4. Get an independent review of the release diff. A routine release does
    **not** require a fresh broad pre-launch audit or exploratory charter; use
    independent review for substantial changes and keep useful charter
@@ -242,7 +267,7 @@ decision and steps.
 
 | Area | Before the repair | Now in the workflow files | Still to activate |
 | --- | --- | --- | --- |
-| Candidate CI | Full suites on every `develop` push, PR and `main` push | Release PR owns one selection, packs once and uploads the tarball; ordinary `develop` pushes are quick, and skipped while the release PR is open; Sutura repair proposals and authenticated exact same-repository repair merges select full native verification; `main` pushes check promotion identity only; an always-running `Release candidate` aggregate | Require `Release candidate` on `main`, observe it, then retire the legacy contexts (add before remove); `main` still requires the eight legacy contexts (read 2026-10-03) |
+| Candidate CI | Full suites on every `develop` push, PR and `main` push | Release PR owns one short selection, packs once and uploads the tarball; ordinary `develop` pushes are quick, and skipped while the release PR is open; Sutura repair proposals and authenticated exact same-repository repair merges select full native verification; `main` pushes check promotion identity only; an always-running `Release candidate` aggregate | Require `Release candidate` on `main`, observe it, then retire the legacy contexts (add before remove); `main` still requires the eight legacy contexts (read 2026-10-03) |
 | Publisher | Re-tests, re-packs the tag, floating npm, skip-on-existing without byte comparison | Verifies and publishes the accepted tarball with pinned npm; collisions block | None: v0.16.2 exercised OIDC publication of a verified artifact (publisher run 37112912694) |
 | Delivery | Manual readback (step 5) | Bounded registry, provenance and fresh-install checks on Node 22 and 24 in an unprivileged job | None: the v0.16.2 Delivery job passed |
 | Coverage | Also on every `develop` push | Scheduled and manual only | None |

@@ -252,15 +252,29 @@ const actionsReadyMs = Math.ceil(GOVERNOR_PHASE_WINDOW_MS +
 const automaticPollWaitMs = 2 * actionsReadyMs + pollPolicyInterval({
   tab: "actions", floorMs: 5000, demand: "active", unchangedCount: 2, inProgressCI: false,
 });
+const automaticPollDriver = join(cachedConfigHome, "automatic-poll.mjs");
+writeFileSync(automaticPollDriver, `
+import {readFileSync} from 'node:fs';
+import {parseCapture} from ${JSON.stringify(new URL('./capture.mjs', import.meta.url).href)};
+const deadline=Date.now()+${automaticPollWaitMs};
+try{while(Date.now()<deadline){try{
+  const calls=readFileSync(process.env.GH_GLANCE_CAPTURE_OUT+'.calls','utf8').split('\\n');
+  const statuses=parseCapture(readFileSync(process.env.GH_GLANCE_CAPTURE_OUT,'utf8'),{cols:80,rows:24}).liveScreen.statusHistory;
+  const lastChecking=statuses.findLastIndex(status=>/ Checking(?:\\s|$)/.test(status));
+  if(calls.filter(call=>call.includes('/actions/runs?')).length>=2 &&
+    statuses.some((status,index)=>index>lastChecking && / Watching(?:\\s|$)/.test(status)) &&
+    / Watching(?:\\s|$)/.test(statuses.at(-1)??''))break;
+}catch(error){if(error.code!=='ENOENT')throw error;}
+  await new Promise(resolve=>setTimeout(resolve,50));
+}}finally{process.stdout.write('q');}
+`);
 const automaticPoll = capture({
   cols: 80,
   rows: 24,
   signal: "none",
   settle: Math.ceil(automaticPollWaitMs / 1000) + 5,
   args: "--background off",
-  stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT.calls"',
-    'index($0, "/actions/runs?") { calls++ } calls >= 2 { ok=1 }',
-    Math.ceil(automaticPollWaitMs / 100)) + "printf q",
+  stdin: `node '${automaticPollDriver}'`,
   env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
   configHome: cachedConfigHome,
 });
@@ -417,6 +431,7 @@ test("a cache-hydrated adapted check is static and settles before routine polls"
     (status, index) => index > lastCheckingAt && / Watching(?:\s|$)/.test(status),
   );
   assert.ok(settledAt >= 0, `expected Watching after data, saw ${statuses.join(" -> ")}`);
+  assert.match(statuses.at(-1), / Watching(?:\s|$)/, "quit only after the current check settled");
   assert.equal(
     statuses.slice(settledAt + 1).some((status) => / Checking(?:\s|$)/.test(status)),
     false,
