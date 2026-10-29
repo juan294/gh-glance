@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import { capture, waitForAwk } from "./capture.mjs";
-import { AUTH_RETRY_MS, GOVERNOR_PHASE_WINDOW_MS, resourceReserve, tabRequestCost } from "../../index.mjs";
+import { AUTH_RETRY_MS, GOVERNOR_PHASE_WINDOW_MS, resourceReserve, tabRequestCost, pollPolicyInterval } from "../../index.mjs";
 
 const ESC = String.fromCharCode(27);
 const strip = (text) =>
@@ -246,10 +246,22 @@ const narrowAuthFailure = capture({
   },
 });
 
+const actionsReadyMs = Math.ceil(GOVERNOR_PHASE_WINDOW_MS +
+  tabRequestCost("actions").core * 3_600_000 / (5000 - resourceReserve(5000)) +
+  tabRequestCost("actions").core * 250 + 2000);
+const automaticPollWaitMs = 2 * actionsReadyMs + pollPolicyInterval({
+  tab: "actions", floorMs: 5000, demand: "active", unchangedCount: 2, inProgressCI: false,
+});
 const automaticPoll = capture({
   cols: 80,
   rows: 24,
-  settle: 12,
+  signal: "none",
+  settle: Math.ceil(automaticPollWaitMs / 1000) + 5,
+  args: "--background off",
+  stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT.calls"',
+    'index($0, "/actions/runs?") { calls++ } calls >= 2 { ok=1 }',
+    Math.ceil(automaticPollWaitMs / 100)) + "printf q",
+  env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
   configHome: cachedConfigHome,
 });
 rmSync(cachedConfigHome, { recursive: true, force: true });
@@ -394,6 +406,7 @@ test("a narrow auth failure starts with the recovery action", () => {
 });
 
 test("a cache-hydrated adapted check is static and settles before routine polls", () => {
+  assert.equal(automaticPoll.exitCode, 0);
   const runCalls = automaticPoll.fixtureCalls.filter((call) => call.includes("/actions/runs?"));
   assert.ok(runCalls.length >= 2, `expected automatic polls, saw ${runCalls.length}`);
   const firstData = automaticPoll.raw.indexOf("ci: pin actions");

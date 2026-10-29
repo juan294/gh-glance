@@ -11,7 +11,9 @@ function scenario(t,{cols=100,log='setup done\nAssertionError: expected true, ac
   const root=mkdtempSync(join(tmpdir(),'glance-ci-jev-'));t.after(()=>rmSync(root,{recursive:true,force:true}));
   for(const name of ['calls','imports','native'])writeFileSync(join(root,name),'');
   writeFileSync(join(root,'log.txt'),log);writeFileSync(join(root,'config.json'),JSON.stringify(config));
-  const resource={limit:5000,remaining:5000,used:0,resetMs:Date.now()+3600000};
+  // These cases test evidence/consent with ample capacity; dedicated CI
+  // admission cases retain the tighter hour window and forced holds.
+  const resource={limit:5000,remaining:5000,used:0,resetMs:Date.now()+600000};
   writeFileSync(join(root,'state.json'),JSON.stringify({createdAt:Date.now(),core:resource,graphql:resource,events:[]}));
   const driver=join(root,'driver.mjs');
   writeFileSync(driver,String.raw`import assert from 'node:assert/strict';import {readFileSync,writeFileSync} from 'node:fs';import {parseCapture} from ${JSON.stringify(reader)};import {admittedCiStage} from ${JSON.stringify(admissionHelper)};
