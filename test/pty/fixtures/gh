@@ -281,7 +281,7 @@ case "$gh_command" in
         exec node "$FIXTURE_DIR/graphql.mjs"
         ;;
       user)
-        emit_api_text '"fixture-user-v1"' "$(printf '{"id":%s,"login":"%s"}' "${GH_GLANCE_FIXTURE_USER_ID:-1}" "${GH_GLANCE_FIXTURE_LOGIN:-octocat}")"
+        emit_api_text '"fixture-user-v1"' "$(printf '{"type":"User","id":%s,"login":"%s"}' "${GH_GLANCE_FIXTURE_USER_ID:-1}" "${GH_GLANCE_FIXTURE_LOGIN:-octocat}")"
         exit 0
         ;;
       rate_limit)

@@ -392,3 +392,22 @@ GitHub/provider proof. Preserve their source hashes and runtime identities.
 CI observation policy is tested by `node --test test/ci-observations.test.mjs test/ci-evaluation.test.mjs`; `test/pty/ci-observations.test.mjs` drives the real standalone UI and SDK with fake external transport. The tests cover exact previews, secret blocks and clean-range recovery, independent Noul/Choice gating, synchronous identity/expiry projection, cancellation and ordinary source refresh. The local TLS fixture accepts test-only log text so those UI paths exercise the real native adapter. Production has no such option.
 
 `node scripts/evaluate-jev.mjs --feature ci` runs offline against the frozen synthetic rubric. Replay metrics retain category TP/FP/FN/abstention counts, supporting-span accuracy, insufficient-evidence assertions and identity errors. Preparing a manifest remains offline. Live evaluation still requires separate authorization and exact reviewed payload/call/byte/dollar budgets; neither a passing fixture nor corpus labels establish live model accuracy. Run the normal complete lint/syntax/unit/PTY phase gates and repeat transport qualification when its fixture or adapter inputs change.
+
+Personal attention policy lives in `index.mjs`; `node --test test/attention.test.mjs`
+checks the static 25-alias query, strict independent request parser, tri-state
+relations, identity/expiry guards, normalized retention, actual GraphQL settlement
+and paired metadata batches. `test/pty/attention.test.mjs` drives the real UI and
+SDK with synthetic external GitHub/TypeSafe responses. Fixture counters distinguish
+source pages, explicit attention details and Jev calls. Keep capture artifacts in
+a new phase-specific directory so earlier terminal evidence remains intact.
+Changes to these acquisition paths require the sequential efficiency and full
+PTY gates in addition to lint, syntax and unit tests.
+
+`node scripts/evaluate-jev.mjs --feature attention` reports the frozen metadata
+rubric offline. Replay reports each badge's TP/FP/FN/abstention counts and ambiguous
+assertions. Real policy and PTY tests independently verify exact queue
+membership and order invariants. A prepared manifest is
+not a live evaluation. Live qualification still requires separately authorized
+reviewed payloads and call/byte/dollar budgets. Attention permits 300 metadata
+rows/600 answers in active coverage, with at most 60 rows per explicit action;
+byte packing preserves each row's two independent questions.

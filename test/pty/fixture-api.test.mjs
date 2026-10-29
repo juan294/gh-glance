@@ -168,7 +168,7 @@ test("fixture token lookup is synthetic and local; user responses expose the cho
     GH_GLANCE_FIXTURE_USER_ID: "42", GH_GLANCE_FIXTURE_LOGIN: "fixture-other",
   });
   assert.equal(user.status, 0, user.stderr);
-  assert.deepEqual(JSON.parse(user.stdout.split(/\r?\n\r?\n/)[1]), { id: 42, login: "fixture-other" });
+  assert.deepEqual(JSON.parse(user.stdout.split(/\r?\n\r?\n/)[1]), { type:"User", id: 42, login: "fixture-other" });
   assert.match(user.stdout, /x-ratelimit-resource: core/);
 
   const statePath = join(root, "server.json");

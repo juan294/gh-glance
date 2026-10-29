@@ -111,6 +111,7 @@ function defaultApiBody(path) {
   if(detail)return JSON.stringify(detail);
   if(/\/actions\/jobs\/.*\/logs/.test(path??""))throw new Error("gh log acquisition forbidden");
   if (path === "user") return JSON.stringify({
+    type:process.env.GH_GLANCE_FIXTURE_USER_TYPE??"User",
     id: Number(process.env.GH_GLANCE_FIXTURE_USER_ID ?? 1),
     login: process.env.GH_GLANCE_FIXTURE_LOGIN ?? "octocat",
   });

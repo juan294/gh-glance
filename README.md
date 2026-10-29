@@ -1216,3 +1216,39 @@ Known credentials, authorization/cookie headers, private-key blocks and signed l
 The six independent observations are assertion mismatch, dependency-download failure, explicit permission denial, reported execution timeout, explicit memory exhaustion, and concrete static-check diagnostics. A positive observation must point to an existing span in this exact run/attempt/SHA/job/excerpt. These are reported log observations rather than proven root causes or generated fixes. “No listed observation found” applies only to this excerpt; uncertain or missing evidence does not mean healthy CI. GitHub's conclusion is always retained. Results are invalidated by source, account, job, log or range changes and expire after ten minutes.
 
 `x` revokes this scope's Jev permission, cancels work and clears the active log/excerpt/results; press `l` to load a log again. Requests use the shared four-second deadline, call cap and bounded memory-only cache. Typing, refreshing, polling and opening a view never send model requests. Errors retain local evidence and show an explicit review/retry or smaller-range action. The live Jev contract, semantic accuracy and developer benefit remain unverified or unmeasured.
+
+### Personal attention
+
+Press `a` in standalone mode to inspect direct review requests, assignments and
+viewer-authored PRs among the currently loaded Issues and PRs. The account must
+be a verified human GitHub user. Cached identities without a human proof offer
+`r` to verify `/user` explicitly; connected views and GitHub App installations
+explain how to use standalone user authentication.
+
+Opening requests at most 25 details. `m` explicitly requests the next 25, up to
+300 frozen candidates; it never drains the list automatically. `r` refreshes the
+first source page for Issues and PRs, rebuilds the manifest, and requests one
+batch. Empty/unloaded lists require that explicit action. Source coverage/age
+and each detail batch's age remain separate. Details expire after five minutes;
+changed source metadata or account scope requires an explicit refresh/restart.
+Errors retain prior same-scope facts as partial/as-of and show retry controls.
+
+The fixed order is direct personal review requests, assigned Issues, changes
+requested on your non-draft PRs, assigned PRs, then other authored PRs under
+Following. Draft badges and all exact reasons remain visible. Within a tier,
+items use their update time, oldest first; this is not request age or an overdue
+claim. `u` inspects unknown/unqueried relationships. Truncated nested lists cannot
+prove absence; team review requests do not establish personal membership.
+PgUp/PgDn scroll disclosures, arrows select, Enter opens the original Issue/PR
+URL, and Escape returns to ordinary navigation.
+
+With `--jev`, `J` optionally annotates current unchanged attention metadata with
+“Reports regression” and “Describes user impact.” Review the TypeSafe destination,
+exact repository/access scope and title/label/branch disclosure, then Enter Send
+or Escape Cancel. Badges cannot change queue membership, reasons, tier, order or
+navigation. Each explicit `J` covers at most 60 eligible rows, using at most 15
+rows per HTTP request and complete badge pairs packed within 24 KiB. Repeated
+`J` advances remaining rows; `m` remains GitHub detail pagination. `x` revokes
+permission and clears badges while retaining exact facts. The shared deadline,
+call cap, cooldown and memory limits apply. The live provider contract, badge
+accuracy and developer benefit remain unverified or unmeasured.

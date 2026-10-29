@@ -13,6 +13,8 @@ globalThis.fetch=async (url,init)=>{
    const choices=Object.keys(question.criteria),choice=config.ciSpan??choices[Math.min(1,choices.length-1)];
    return [id,{type:'choice',choice,confidence:1,probabilities:Object.fromEntries(choices.map(key=>[key,key===choice?1:0]))}];
   }
+  const badge=/^i[0-9]+_(reported_regression|user_visible_impact)$/.exec(id)?.[1];
+  if(badge)return [id,{type:'noul',noul:config.attentionProbabilities?.[badge]??.5}];
   const category=id.endsWith('_observed')?id.slice(0,-'_observed'.length):null;
   return [id,{type:'noul',noul:category?config.ciProbabilities?.[category]??.5:config.probabilities?.[i]??.5}];
  })),usage:{input_tokens:42,output_tokens:1}});

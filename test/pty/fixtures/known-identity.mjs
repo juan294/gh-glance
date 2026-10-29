@@ -30,7 +30,7 @@ export function seedKnownHeldIdentity(root, state, now = Date.now()) {
   const registryRoot = identityRegistryRoot({ env: { XDG_CONFIG_HOME: root } });
   const resetMs = Math.floor((Number.isFinite(core.resetOffsetMs) ? now + core.resetOffsetMs : core.resetMs) / 1000) * 1000;
   const budget = { resource: "core", limit: core.limit, used: core.used, remaining: core.remaining, resetMs };
-  const user = { id: 1, login: "octocat" };
+  const user = { type: "User", id: 1, login: "octocat" };
   // Match gh-state's validator for the unchanged default /user representation.
   const etag = `"fixture-${createHash("sha256").update(JSON.stringify(user)).digest("hex").slice(0, 16)}"`;
   const proofAt = now - BUDGET_SNAPSHOT_TTL_MS - 1000;

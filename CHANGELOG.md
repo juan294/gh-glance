@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Standalone `a` shows exact personal review, assignment and authored-PR
+  attention among loaded rows, with explicit 25-item detail batches, unknown
+  relationship coverage and refresh/retry controls. Optional `J` metadata
+  badges preserve deterministic membership/order; `x` revokes permission.
+
 - Actions `d` opens exact run/attempt/job evidence in standalone mode; `l`
   explicitly captures a bounded failed/timed-out job log. Enter opens the exact
   selected job. Coverage and unsupported proxy/storage limitations are visible.

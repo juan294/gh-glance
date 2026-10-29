@@ -244,6 +244,126 @@ function validateCiManifest(manifest,{corpusHash=null,corpus=null}={}){
  if(bytes>192*1024)throw new EvaluationError('CI contract probe exceeds 192 KiB of serialized input.');
  return {calls:manifest.entries.length,bytes,reservationDollars:manifest.entries.length*CALL_NANODOLLARS/1e9};
 }
+const ATTENTION_VERSION='attention-v1';
+const ATTENTION_BADGES=['reported_regression','user_visible_impact'];
+function attentionHelpers(){
+ if(app.ATTENTION_QUESTION_VERSION!==ATTENTION_VERSION||JSON.stringify(app.ATTENTION_BADGES)!==JSON.stringify(ATTENTION_BADGES)||typeof app.buildAttentionJevRequest!=='function')throw new EvaluationError('Attention badge helpers differ from the frozen evaluation contract.');
+}
+function validAttentionMetadata(metadata){
+ return exactKeys(metadata,['title','labels','branch'])&&typeof metadata.title==='string'&&Array.isArray(metadata.labels)&&metadata.labels.every(value=>typeof value==='string')&&(metadata.branch===null||typeof metadata.branch==='string');
+}
+function inspectAttentionCorpus(corpus){
+ attentionHelpers();
+ if(corpus?.schemaVersion!==1||corpus.feature!=='attention'||corpus.questionVersion!==ATTENTION_VERSION||!Array.isArray(corpus.cases)||!corpus.cases.length)throw new EvaluationError('Expected a labeled attention corpus.');
+ if(corpus.splitPolicy?.frozen!==true)throw new EvaluationError('Attention held-out scoring requires a frozen split.');
+ const ids=new Set(),groups=new Map();
+ for(const c of corpus.cases){
+  if(typeof c.id!=='string'||!c.id||ids.has(c.id))throw new EvaluationError('Attention case IDs must be unique.');ids.add(c.id);
+  if(!['development','held-out'].includes(c.split)||typeof c.groupId!=='string'||!c.groupId)throw new EvaluationError('Attention split/group is missing.');
+  if(groups.has(c.groupId)&&groups.get(c.groupId)!==c.split)throw new EvaluationError('Related attention group crosses the frozen split.');groups.set(c.groupId,c.split);
+  if(!Array.isArray(c.slices)||c.slices.some(value=>typeof value!=='string'))throw new EvaluationError('Attention slice labels are invalid.');
+  if(!validAttentionMetadata(c.metadata))throw new EvaluationError('Attention metadata must contain only title, labels and branch.');
+  if(!exactKeys(c.labels,ATTENTION_BADGES)||Object.values(c.labels).some(value=>![true,false,null].includes(value)))throw new EvaluationError('Attention badge labels are incomplete.');
+ }
+ return corpus;
+}
+export function buildAttentionEvaluationEntry(c,{corpusHash}={}){
+ attentionHelpers();
+ if(!/^[a-f0-9]{64}$/.test(corpusHash??''))throw new EvaluationError('Attention projection needs its frozen corpus hash.');
+ if(!validAttentionMetadata(c.metadata))throw new EvaluationError('Attention metadata projection is invalid.');
+ const row={kind:'issue',number:1,title:c.metadata.title,labels:c.metadata.labels,branch:c.metadata.branch??''};
+ const built=app.buildAttentionJevRequest([row]),wire=JSON.stringify(built.request);
+ if(Buffer.byteLength(wire)>24576||Object.keys(built.request.questions).length!==2||!exactKeys(built.questionIds?.[0],ATTENTION_BADGES))throw new EvaluationError('Attention serialized question bound or mapping is invalid.');
+ const contentDigest=hash(c.metadata),identity={feature:'attention',host:'synthetic.invalid',repo:'evaluation/attention',accessPartition:corpusHash,
+  contentDigest,questionVersion:ATTENTION_VERSION,viewerId:1,manifestDigest:hash([c.id,contentDigest])};
+ const bindingDigest=hash([identity,built.request]);
+ return {caseId:c.id,metadata:c.metadata,request:built.request,requestHash:hash(wire),bytes:Buffer.byteLength(wire),identity,bindingDigest,questionIds:built.questionIds[0],truncated:built.truncated};
+}
+const attentionAmbiguous=c=>c.classification==='ambiguous'||Object.values(c.labels).some(value=>value===null);
+function attentionCoverage(corpus){
+ const held=corpus.cases.filter(c=>c.split==='held-out');
+ return {cases:corpus.cases.length,heldOut:held.length,development:corpus.cases.length-held.length,ambiguousCases:held.filter(attentionAmbiguous).length,
+  nonEnglishOrAdversarialCases:held.filter(c=>c.slices.some(s=>['non-English','non-english','adversarial'].includes(s))).length,
+  badges:Object.fromEntries(ATTENTION_BADGES.map(key=>[key,{positive:held.filter(c=>c.labels[key]===true).length,negative:held.filter(c=>c.labels[key]===false).length,ambiguous:held.filter(c=>c.labels[key]===null).length}]))};
+}
+function normalizedAttentionRecord(record,entry){
+ const absent=(error,identityError=false)=>({status:'unavailable',error,identityError,outcomes:{}});
+ if(!record)return absent('missing-record');
+ const matches=exactKeys(record.identity,Object.keys(entry.identity))&&Object.entries(entry.identity).every(([key,value])=>record.identity[key]===value);
+ if(!matches||record.bindingDigest!==entry.bindingDigest)return absent('stale',true);
+ if(record.status==='unavailable')return absent(safeReplayError(record.error));
+ if(record.status!=='completed'||!exactKeys(record.outcomes,ATTENTION_BADGES))return absent('invalid-record');
+ for(const value of Object.values(record.outcomes))if(!value||!['positive','negative','uncertain'].includes(value.decision)||
+  value.probability!==undefined&&(!Number.isFinite(value.probability)||value.probability<0||value.probability>1||app.classifyJevProbability(value.probability)!==value.decision))return absent('invalid-record');
+ return {status:'completed',error:safeReplayError(record.error),identityError:false,outcomes:record.outcomes};
+}
+export function scoreAttention(corpus,records=[],{corpusHash=hash(corpus)}={}){
+ inspectAttentionCorpus(corpus);const byId=new Map();
+ for(const record of records){if(byId.has(record.caseId))throw new EvaluationError('Duplicate attention replay case ID.');byId.set(record.caseId,record);}
+ if([...byId.keys()].some(id=>!corpus.cases.some(c=>c.id===id)))throw new EvaluationError('Attention replay contains an unknown case ID.');
+ const badges=Object.fromEntries(ATTENTION_BADGES.map(key=>[key,{tp:0,fp:0,fn:0,tn:0,abstentions:0,positiveExamples:0,negativeExamples:0,ambiguousExamples:0}]));
+ const attempts=[];let identityErrors=0,ambiguousCases=0,ambiguousAssertionCases=0;
+ for(const c of corpus.cases.filter(c=>c.split==='held-out')){
+  const entry=buildAttentionEvaluationEntry(c,{corpusHash}),record=normalizedAttentionRecord(byId.get(c.id),entry),outcomes={};let positives=0,unsupported=0;
+  const ambiguous=attentionAmbiguous(c);ambiguousCases+=Number(ambiguous);identityErrors+=Number(record.identityError);
+  for(const key of ATTENTION_BADGES){
+   const decision=record.outcomes[key]?.decision??'unavailable',gold=c.labels[key],stats=badges[key];outcomes[key]={decision};
+   if(gold===true){stats.positiveExamples++;if(decision==='positive')stats.tp++;else stats.fn++;}
+   else if(gold===false){stats.negativeExamples++;if(decision==='positive')stats.fp++;else if(decision==='negative')stats.tn++;}
+   else stats.ambiguousExamples++;
+   if(['uncertain','unavailable'].includes(decision))stats.abstentions++;
+   positives+=Number(decision==='positive');unsupported+=Number(decision==='positive'&&gold!==true);
+  }
+  ambiguousAssertionCases+=Number(ambiguous&&unsupported>0);
+  attempts.push({id:c.id,slices:c.slices,status:record.status,error:record.error??null,identityError:record.identityError,ambiguous,positiveBadges:positives,outcomes});
+ }
+ for(const stats of Object.values(badges)){stats.precision=stats.tp+stats.fp?stats.tp/(stats.tp+stats.fp):null;stats.recall=stats.positiveExamples?stats.tp/stats.positiveExamples:null;}
+ const slices=Object.fromEntries([...new Set(attempts.flatMap(c=>c.slices))].map(slice=>{
+  const values=attempts.filter(c=>c.slices.includes(slice)),gold=corpus.cases.filter(c=>c.split==='held-out'&&c.slices.includes(slice));
+  return [slice,{attempted:values.length,unavailable:values.filter(c=>c.status==='unavailable').length,ambiguous:values.filter(c=>c.ambiguous).length,
+   badges:Object.fromEntries(ATTENTION_BADGES.map(key=>[key,{positiveExamples:gold.filter(c=>c.labels[key]===true).length,negativeExamples:gold.filter(c=>c.labels[key]===false).length,ambiguousExamples:gold.filter(c=>c.labels[key]===null).length}]))}];
+ }));
+ return {coverage:attentionCoverage(corpus),badges,identityErrors,ambiguousCases,ambiguousAssertionCases,ambiguousAssertionRate:ambiguousCases?ambiguousAssertionCases/ambiguousCases:null,
+  deterministicMembershipOrderPreservation:null,deterministicQualification:'Exercised separately by exact queue tests; badge replay does not measure queue behavior.',
+  slices,attempts,qualified:false,qualification:'UNVERIFIED: offline/replay arithmetic does not establish the live model contract or held-out badge accuracy.'};
+}
+export function prepareAttentionManifest(corpus,{corpusHash=hash(corpus)}={}){
+ inspectAttentionCorpus(corpus);
+ if(!['synthetic','public'].includes(corpus.provenance?.dataClass))throw new EvaluationError('Attention manifest requires frozen synthetic/public labels.');
+ const entries=[];
+ for(const c of corpus.cases.filter(c=>c.split==='development')){
+  const entry=buildAttentionEvaluationEntry(c,{corpusHash});
+  if(entries.length>=12||entries.reduce((sum,item)=>sum+item.bytes,0)+entry.bytes>192*1024)break;
+  entries.push(entry);
+ }
+ const manifest={schemaVersion:1,feature:'attention',purpose:'contract',dataClass:corpus.provenance.dataClass,model:app.JEV_MODEL,
+  questionVersion:ATTENTION_VERSION,corpusHash,pricing:MODEL_RESERVATION,entries};
+ validateEvaluationManifest(manifest);return manifest;
+}
+function validateAttentionManifest(manifest,{corpusHash=null,corpus=null}={}){
+ attentionHelpers();
+ if(manifest?.schemaVersion!==1||manifest.feature!=='attention'||manifest.purpose!=='contract'||manifest.model!==app.JEV_MODEL||manifest.questionVersion!==ATTENTION_VERSION||!/^[a-f0-9]{64}$/.test(manifest.corpusHash??''))throw new EvaluationError('Attention manifest model/question/corpus identity mismatch.');
+ if(!['synthetic','public'].includes(manifest.dataClass)||JSON.stringify(manifest.pricing)!==JSON.stringify(MODEL_RESERVATION))throw new EvaluationError('Attention manifest data class or pricing requires review.');
+ if(corpus){inspectAttentionCorpus(corpus);if(corpus.provenance?.dataClass!==manifest.dataClass)throw new EvaluationError('Attention corpus must match its synthetic/public class.');}
+ if(corpusHash&&manifest.corpusHash!==corpusHash)throw new EvaluationError('Attention corpus hash differs from the reviewed manifest.');
+ if(!Array.isArray(manifest.entries)||!manifest.entries.length||manifest.entries.length>12)throw new EvaluationError('Attention contract probe permits 1-12 calls.');
+ const ids=new Set();let bytes=0;
+ for(const entry of manifest.entries){
+  if(typeof entry.caseId!=='string'||ids.has(entry.caseId))throw new EvaluationError('Duplicate/missing attention manifest case ID.');ids.add(entry.caseId);
+  const expected=buildAttentionEvaluationEntry({id:entry.caseId,metadata:entry.metadata},{corpusHash:manifest.corpusHash});
+  if(expected.requestHash!==entry.requestHash||expected.bytes!==entry.bytes||hash(entry.request)!==entry.requestHash||JSON.stringify(expected.identity)!==JSON.stringify(entry.identity)||expected.bindingDigest!==entry.bindingDigest||JSON.stringify(expected.questionIds)!==JSON.stringify(entry.questionIds))throw new EvaluationError('Attention reviewed payload/hash/binding differs from its fixed projection.');
+  if(corpus){
+   const c=corpus.cases.find(c=>c.id===entry.caseId);
+   if(!c||c.split!=='development')throw new EvaluationError('Attention contract manifest must use reviewed development cases.');
+   const frozen=buildAttentionEvaluationEntry(c,{corpusHash:manifest.corpusHash});
+   if(frozen.requestHash!==entry.requestHash||frozen.bindingDigest!==entry.bindingDigest)throw new EvaluationError('Attention manifest payload differs from the frozen corpus projection.');
+  }
+  bytes+=entry.bytes;
+ }
+ if(bytes>192*1024)throw new EvaluationError('Attention contract probe exceeds 192 KiB of serialized input.');
+ return {calls:manifest.entries.length,bytes,reservationDollars:manifest.entries.length*CALL_NANODOLLARS/1e9};
+}
+
 export function reserveEvaluationCall(state,bytes){
  if(!Number.isSafeInteger(bytes)||bytes<1)throw new EvaluationError('Invalid serialized byte count.');
  if(!Number.isSafeInteger(state.maxCalls)||state.calls>=state.maxCalls)throw new EvaluationError('Call budget exhausted.');
@@ -274,6 +394,7 @@ export function prepareFocusManifest(corpus,{corpusHash=hash(corpus)}={}){
 }
 export function validateEvaluationManifest(manifest,{corpusHash=null,corpus=null}={}){
  if(manifest?.feature==='ci')return validateCiManifest(manifest,{corpusHash,corpus});
+ if(manifest?.feature==='attention')return validateAttentionManifest(manifest,{corpusHash,corpus});
  if(manifest?.schemaVersion!==1||manifest.feature!=='focus'||manifest.purpose!=='contract')throw new EvaluationError('Expected a Focus contract manifest.');
  if(!['synthetic','public'].includes(manifest.dataClass))throw new EvaluationError('Only synthetic/public payloads are permitted.');
  if(manifest.model!==app.JEV_MODEL || manifest.questionVersion!==app.JEV_QUESTION_VERSION || !/^[a-f0-9]{64}$/.test(manifest.corpusHash??''))throw new EvaluationError('Model/question/corpus identity mismatch.');
@@ -321,28 +442,28 @@ function parseCLI(argv){
 }
 export async function runEvaluationCLI(argv,{env=process.env,makeSession=app.createJevSession,fetchImpl=(...args)=>globalThis.fetch(...args)}={}){
  const opts=parseCLI(argv),feature=opts.feature??'focus';
- if(!['focus','ci'].includes(feature))throw new EvaluationError('Choose the Focus or CI evaluation feature.');
+ if(!['focus','ci','attention'].includes(feature))throw new EvaluationError('Choose the Focus, CI or attention evaluation feature.');
  const corpusBytes=readFileSync(opts.corpus??new URL(`../test/fixtures/jev/${feature}.json`,import.meta.url));
  const corpus=JSON.parse(corpusBytes),corpusHash=hash(corpusBytes);
  if(corpus.feature!==feature)throw new EvaluationError('Corpus feature differs from the selected evaluation.');
- if(feature==='ci')inspectCiCorpus(corpus);else inspectCorpus(corpus);
- const questionVersion=feature==='ci'?CI_VERSION:app.JEV_QUESTION_VERSION;
+ if(feature==='ci')inspectCiCorpus(corpus);else if(feature==='attention')inspectAttentionCorpus(corpus);else inspectCorpus(corpus);
+ const questionVersion=feature==='ci'?CI_VERSION:feature==='attention'?ATTENTION_VERSION:app.JEV_QUESTION_VERSION;
  const identity={feature,corpusHash,model:app.JEV_MODEL,questionVersion,runtime:process.version,
   candidateHashes:Object.fromEntries(['index.mjs','package.json','package-lock.json'].map(name=>[name,hash(readFileSync(new URL('../'+name,import.meta.url)))]))};
  if(opts['prepare-manifest']){
   if(opts.live)throw new EvaluationError('Prepare and review the exact manifest before a separate live invocation.');
-  const manifest=feature==='ci'?prepareCiManifest(corpus,{corpusHash}):prepareFocusManifest(corpus,{corpusHash});
+  const manifest=feature==='ci'?prepareCiManifest(corpus,{corpusHash}):feature==='attention'?prepareAttentionManifest(corpus,{corpusHash}):prepareFocusManifest(corpus,{corpusHash});
   writeFileSync(opts['prepare-manifest'],JSON.stringify(manifest,null,2)+'\n',{mode:0o600});
   return {...identity,mode:'prepare',liveContract:'UNVERIFIED',dispatchedCalls:0,manifestPath:opts['prepare-manifest'],
    manifestHash:hash(readFileSync(opts['prepare-manifest'])),...validateEvaluationManifest(manifest)};
  }
  if(!opts.live){
   const replay=opts.replay?JSON.parse(readFileSync(opts.replay,'utf8')):null;
-  if(replay && (replay.corpusHash!==corpusHash||replay.model!==app.JEV_MODEL||replay.questionVersion!==questionVersion || replay.feature && replay.feature!==feature || feature==='ci'&&replay.feature!=='ci'))throw new EvaluationError('Replay identity differs from feature/corpus/model/questions.');
+  if(replay && (replay.corpusHash!==corpusHash||replay.model!==app.JEV_MODEL||replay.questionVersion!==questionVersion || replay.feature && replay.feature!==feature || feature!=='focus'&&replay.feature!==feature))throw new EvaluationError('Replay identity differs from feature/corpus/model/questions.');
   return {...identity,mode:'offline',liveContract:'UNVERIFIED',dispatchedCalls:0,
    baseline:feature==='focus'?scoreFocus(corpus,localRecords(corpus)):null,
-   ...(feature==='ci'?{corpusCoverage:ciCoverage(corpus)}:{}),
-   semantic:replay?(feature==='ci'?scoreCi(corpus,replay.records,{corpusHash}):scoreFocus(corpus,replay.records)):null,
+   ...(feature==='ci'?{corpusCoverage:ciCoverage(corpus)}:feature==='attention'?{corpusCoverage:attentionCoverage(corpus)}:{}),
+   semantic:replay?(feature==='ci'?scoreCi(corpus,replay.records,{corpusHash}):feature==='attention'?scoreAttention(corpus,replay.records,{corpusHash}):scoreFocus(corpus,replay.records)):null,
    qualification:'Offline arithmetic and replay outcomes do not verify live model behavior.'};
  }
  if(!opts.manifest||!opts['manifest-sha256']||!opts['max-calls']||!opts['max-bytes']||!opts['max-dollars'])throw new EvaluationError('Live evaluation requires a reviewed manifest hash and explicit call/byte/dollar budgets.');
@@ -368,7 +489,7 @@ export async function runEvaluationCLI(argv,{env=process.env,makeSession=app.cre
  try {
   for(const entry of manifest.entries){
    budget=reserveEvaluationCall(budget,entry.bytes);approved={...entry,sent:false};
-   const sourceIdentity=feature==='ci'?entry.identity:{feature:'focus',host:'synthetic.invalid',repo:'evaluation/focus',accessPartition:manifestHash,
+   const sourceIdentity=feature!=='focus'?entry.identity:{feature:'focus',host:'synthetic.invalid',repo:'evaluation/focus',accessPartition:manifestHash,
     contentDigest:entry.requestHash,query:entry.request.state.query,questionVersion:app.JEV_QUESTION_VERSION};
    session.grant(sourceIdentity);const start=performance.now(),before=dispatchedCalls;
    const result=await session.evaluateJev(entry.request,sourceIdentity,{isCurrent:()=>true});
@@ -381,6 +502,10 @@ export async function runEvaluationCLI(argv,{env=process.env,makeSession=app.cre
      const validated=app.validateCiObservations({...result,bindingDigest:entry.bindingDigest},built,entry.identity);
      normalized={...normalized,status:'completed',outcomes:validated.outcomes,error:null};
     }catch{normalized.error='invalid-observations';}
+   }else if(feature==='attention'){
+    normalized={status:result.status==='complete'?'completed':'unavailable',identity:entry.identity,bindingDigest:entry.bindingDigest,
+     outcomes:result.status==='complete'?Object.fromEntries(ATTENTION_BADGES.map(key=>[key,result.answers?.[entry.questionIds[key]]??{decision:'unavailable'}])):{},error:safeReplayError(result.error)};
+    if(result.status==='complete'&&Object.values(normalized.outcomes).some(value=>!['positive','negative','uncertain'].includes(value.decision)))normalized={...normalized,status:'unavailable',outcomes:{},error:'invalid-record'};
    }else{
     const decisions=Object.fromEntries(entry.rowIds.map((id,index)=>[id,result.answers?.[`i${index}`]??{decision:'unavailable'}]));
     const ranking=Object.entries(decisions).filter(([,a])=>a.decision==='positive').sort((a,b)=>(b[1].probability??0)-(a[1].probability??0)).map(([id])=>id);
