@@ -6,6 +6,7 @@ import {test} from 'node:test';
 import {capture} from './capture.mjs';
 
 const reader=new URL('./capture.mjs',import.meta.url).href;
+const admissionHelper=new URL('./ci-admission.mjs',import.meta.url).href;
 function scenario(t,{cols=100,log='setup done\nAssertionError: expected true, actual false\ncompleted with exit 1',config={},program}={}){
   const root=mkdtempSync(join(tmpdir(),'glance-ci-jev-'));t.after(()=>rmSync(root,{recursive:true,force:true}));
   for(const name of ['calls','imports','native'])writeFileSync(join(root,name),'');
@@ -13,7 +14,7 @@ function scenario(t,{cols=100,log='setup done\nAssertionError: expected true, ac
   const resource={limit:5000,remaining:5000,used:0,resetMs:Date.now()+3600000};
   writeFileSync(join(root,'state.json'),JSON.stringify({createdAt:Date.now(),core:resource,graphql:resource,events:[]}));
   const driver=join(root,'driver.mjs');
-  writeFileSync(driver,String.raw`import assert from 'node:assert/strict';import {readFileSync,writeFileSync} from 'node:fs';import {parseCapture} from ${JSON.stringify(reader)};
+  writeFileSync(driver,String.raw`import assert from 'node:assert/strict';import {readFileSync,writeFileSync} from 'node:fs';import {parseCapture} from ${JSON.stringify(reader)};import {admittedCiStage} from ${JSON.stringify(admissionHelper)};
 const root=${JSON.stringify(root)},cols=${cols};const pause=ms=>new Promise(r=>setTimeout(r,ms)),send=s=>process.stdout.write(s);
 const screen=()=>parseCapture(readFileSync(process.env.GH_GLANCE_CAPTURE_OUT,'utf8'),{cols,rows:24}).finalFrame.lines.join('\n');
 const jevCalls=()=>readFileSync(root+'/calls','utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
@@ -21,7 +22,8 @@ const ghCalls=()=>readFileSync(process.env.GH_GLANCE_CAPTURE_OUT+'.calls','utf8'
 const sourceCalls=()=>ghCalls().filter(s=>s.includes('/actions/runs?'));
 const until=async(fn,ms=20000)=>{const end=Date.now()+ms;while(Date.now()<end){try{if(fn())return;}catch{}await pause(40);}throw Error('UI barrier '+fn+'\n'+screen());};
 const save=name=>writeFileSync(root+'/'+name+'.txt',screen());
-const openLog=async()=>{await until(()=>screen().includes('ci: pin actions')&&screen().includes('Watching'));send('j');await pause(120);send('j');await until(()=>screen().split('\n').some(s=>s.includes('>')&&s.includes('restore')));send('d');await until(()=>screen().includes('2/2 jobs loaded'));send('l');await until(()=>screen().includes('Log complete'));};
+const admittedStage=(text,key)=>admittedCiStage({screen,until,pause,send,calls:ghCalls,nativeEvents:()=>readFileSync(root+'/native','utf8')},text,key);
+const openLog=async()=>{await until(()=>screen().includes('ci: pin actions')&&screen().includes('Watching'));send('j');await pause(120);send('j');await until(()=>screen().split('\n').some(s=>s.includes('>')&&s.includes('restore')));send('d');await admittedStage('2/2 jobs loaded','d');send('l');await admittedStage('Log complete','l');};
 try{${program}
 writeFileSync(root+'/complete','yes');}catch(error){writeFileSync(root+'/failure',String(error));}finally{send('\u0003');}`);
   const preloads=['ci-https.mjs','jev-fetch.mjs','jev-child-guard.mjs'].map(name=>`--import=${new URL('./fixtures/'+name,import.meta.url).pathname}`).join(' ');
