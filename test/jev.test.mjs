@@ -136,7 +136,7 @@ test('Jev transport honors the SDK cancellation signal as well as the whole acti
  const sdk={TypeSafeClient:class {constructor(config){this.config=config;}systemOne(batch){const controller=new AbortController();setImmediate(()=>controller.abort());return this.config.fetch('https://api.typesafe.ai/v1/systemone',{method:'POST',body:JSON.stringify(batch),signal:controller.signal}).then(r=>r.json());}}};
  const f=fixture({loadSdk:async()=>sdk,fetchImpl:async(_url,init)=>new Promise((_resolve,reject)=>{init.signal.addEventListener('abort',()=>{sdkAborted=true;reject(new Error('canceled'));},{once:true});})});f.session.grant(identity);
  const pending=f.session.evaluateJev(request(),identity,{deadlineAt:Date.now()+1000});
- await new Promise(resolve=>setTimeout(resolve,30));assert.equal(sdkAborted,true);assert.equal((await pending).error,'provider');
+ const outcome=await pending;assert.equal(sdkAborted,true);assert.equal(outcome.error,'provider');
 });
 test('Jev source/account/query changed after dispatch rejects obsolete answer, then explicit retry recovers',async()=>{
  for(const field of ['contentDigest','accessPartition','query']){

@@ -18145,6 +18145,11 @@ const ATTENTION_BADGES=Object.freeze(['reported_regression','user_visible_impact
 const ATTENTION_DETAIL_TTL_MS=300000;
 const ATTENTION_BYTES=2*1024*1024;
 function attentionError(code,details={}){return Object.assign(new Error(`Attention ${code}`),{code,...details});}
+function attentionSourceDigest(sources){
+  // Live rows and adopted snapshots must compare through the same row codec.
+  return jevDigest(['issues','prs'].map(kind=>Array.isArray(sources[kind])
+    ? sources[kind].map(row=>normalizeCachedItem(kind,row)??row):sources[kind]));
+}
 function attentionManifest(sources,{host,repo,accessPartition,viewer}){
   const seen=new Set(),rows=[];
   for(const kind of ['issues','prs'])for(const original of sources[kind]??[]){
@@ -18153,7 +18158,7 @@ function attentionManifest(sources,{host,repo,accessPartition,viewer}){
   }
   rows.sort((a,b)=>(Date.parse(b.updatedAt)||0)-(Date.parse(a.updatedAt)||0)||a.kind.localeCompare(b.kind)||a.number-b.number);
   const bounded=rows.slice(0,300);
-  return {rows:bounded,host,repo,accessPartition,viewer:{id:viewer?.id,login:viewer?.login},digest:jevDigest(bounded),sourceDigest:jevDigest([sources.issues,sources.prs]),missing:['issues','prs'].filter(k=>sources[k]===null||sources[k]===undefined),truncated:rows.length>300};
+  return {rows:bounded,host,repo,accessPartition,viewer:{id:viewer?.id,login:viewer?.login},digest:jevDigest(bounded),sourceDigest:attentionSourceDigest(sources),missing:['issues','prs'].filter(k=>sources[k]===null||sources[k]===undefined),truncated:rows.length>300};
 }
 function attentionBatchVariables(manifest,start=0){
   if(!Number.isSafeInteger(start)||start<0||start%25!==0||start>=300)throw attentionError('batch');
@@ -18251,7 +18256,7 @@ function projectAttentionView(view,context,sources){
   const manifest=view.manifest;
   if(context.activeTab!==undefined&&view.tab!==undefined&&context.activeTab!==view.tab||!context.human||manifest.host!==context.host||manifest.repo!==context.repo||manifest.accessPartition!==context.accessPartition||manifest.viewer.id!==context.viewerId)return {...view,manifest:null,records:{},semantic:null,busy:false,refreshingLists:false,pendingSourceDigest:null,message:'Verified human identity changed. r Verify user; Esc Back.'};
   const sourceDigest=view.pendingSourceDigest??manifest.sourceDigest;
-  if((view.pendingSourceDigest||!view.stale&&!view.refreshingLists)&&sourceDigest!==jevDigest([sources.issues,sources.prs]))return {...view,stale:true,busy:false,refreshingLists:false,pendingSourceDigest:null,semantic:null,message:'Source manifest changed; r Restart attention. Prior facts are as-of only.'};
+  if((view.pendingSourceDigest||!view.stale&&!view.refreshingLists)&&sourceDigest!==attentionSourceDigest(sources))return {...view,stale:true,busy:false,refreshingLists:false,pendingSourceDigest:null,semantic:null,message:'Source manifest changed; r Restart attention. Prior facts are as-of only.'};
   if(view.semantic?.identity){
     const eligible=attentionEligibleRows(view,context.nowMs);
     if(jevDigest(view.semantic.identity)!==jevDigest(attentionSemanticIdentity(view,eligible)))return {...view,semantic:null};
@@ -21271,11 +21276,11 @@ function App({ onCreateRemote = () => {} } = {}) {
         }
       }
       const retryFresh=action==='more'&&base.retryDetails===true;
-      if(retryFresh&&base.retrySourceDigest!==jevDigest([dataRef.current.issues,dataRef.current.prs])){publishAttention({...base,stale:true,busy:false,refreshingLists:false,pendingSourceDigest:null,message:'Source manifest changed; r Restart attention.'});return;}
+      if(retryFresh&&base.retrySourceDigest!==attentionSourceDigest(dataRef.current)){publishAttention({...base,stale:true,busy:false,refreshingLists:false,pendingSourceDigest:null,message:'Source manifest changed; r Restart attention.'});return;}
       const more=action==='more'&&!retryFresh;
       let manifest=more?base.manifest:attentionManifest(dataRef.current,captured);
       if(!manifest){publishAttention({...base,busy:false,message:'No manifest; r Load lists or Restart.'});return;}
-      if(more&&(base.stale||manifest.sourceDigest!==jevDigest([dataRef.current.issues,dataRef.current.prs]))){publishAttention({...base,stale:true,busy:false,refreshingLists:false,pendingSourceDigest:null,semantic:null,message:'Source manifest changed; r Restart attention.'});return;}
+      if(more&&(base.stale||manifest.sourceDigest!==attentionSourceDigest(dataRef.current))){publishAttention({...base,stale:true,busy:false,refreshingLists:false,pendingSourceDigest:null,semantic:null,message:'Source manifest changed; r Restart attention.'});return;}
       const coverage=['issues','prs'].map(kind=>({kind,count:dataRef.current[kind]?.length??0,missing:dataRef.current[kind]===null,sourceAt:lastOkRef.current[kind]??null,partial:Boolean(metaRef.current[kind]?.hasNextPage||metaRef.current[kind]?.truncated||metaRef.current[kind]?.incomplete)}));
       const next=more?base.next??0:0,records=more?base.records??{}:{},batches=more?base.batches??[]:[];
       const view={...base,manifest,records,batches,next,coverage,generation,busy:false,retryDetails:false,retrySourceDigest:null,refreshingLists:false,pendingSourceDigest:null,stale:false,semantic:null,panelOffset:0,followSelection:false,message:null};
@@ -21283,7 +21288,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       if(next>=manifest.rows.length||next>=300){publishAttention({...view,message:'All frozen candidates queried. Truncated relationships require GitHub; r Refresh.'});return;}
       const prior=(action==='refresh'||retryFresh)&&base.manifest&&base.manifest.accessPartition===manifest.accessPartition?{...base,semantic:null,refreshingLists:true,generation}:null;
       publishAttention({...view,...(prior?{records:prior.records,manifest:prior.manifest,batches:prior.batches,coverage:prior.coverage}:{}),busy:true,refreshingLists:false,pendingSourceDigest:manifest.sourceDigest,message:`Loading candidates ${next+1}-${Math.min(next+25,manifest.rows.length)}; Esc Cancel.`});
-      const isCurrent=()=>scopeCurrent()&&featureRef.current?.mode==='attention'&&featureRef.current.generation===generation&&manifest.sourceDigest===jevDigest([dataRef.current.issues,dataRef.current.prs]);
+      const isCurrent=()=>scopeCurrent()&&featureRef.current?.mode==='attention'&&featureRef.current.generation===generation&&manifest.sourceDigest===attentionSourceDigest(dataRef.current);
       try{
         const admitted=await runAdmittedOperation({scope:currentScope,leaseId,operation:'attention:details',priority:'manual',signal,waitMs:2000,
           run:admittedSignal=>fetchAttentionBatch(manifest,next,{signal:admittedSignal})});

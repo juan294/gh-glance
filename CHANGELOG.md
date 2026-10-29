@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-29
+
 ### Added
 
 - Local Focus searches loaded Issues and PRs with `/`, topic words and exact
@@ -42,6 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conflicting backup under an unused archival filename before retrying;
   recovery help/doctor reports its exact path. An unverified native connection
   keeps its charge until the ledger's computed uncertainty-window recovery.
+
+### Fixed
+
+- Attention refresh compares live and cached metadata consistently, so an
+  unchanged unknown PR review value cannot invalidate its source binding.
+  Real metadata changes still retire the prior view and require explicit restart.
 
 ## [0.17.1] - 2026-10-26
 
@@ -1351,7 +1359,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.17.1...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/juan294/gh-glance/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/juan294/gh-glance/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/juan294/gh-glance/compare/v0.16.2...v0.17.0
 [0.16.2]: https://github.com/juan294/gh-glance/compare/v0.16.1...v0.16.2

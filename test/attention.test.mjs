@@ -182,3 +182,22 @@ test('attention staged detail source binding retires on a later source change be
  const later={issues:[{...fresh.issues[0],title:'T2'}],prs:[]},retired=projectAttentionView(view,context,later);assert.equal(retired.stale,true);assert.equal(retired.busy,false);assert.equal(retired.refreshingLists,false);assert.equal(retired.pendingSourceDigest,null);assert.equal(retired.semantic,null);
  for(const change of [{activeTab:'prs'},{accessPartition:'other'},{viewerId:8},{human:false},{repo:'acme/other'}]){const invalid=projectAttentionView(view,{...context,...change},fresh);assert.equal(invalid.manifest,null);assert.equal(invalid.busy,false);assert.equal(invalid.pendingSourceDigest,null);assert.equal(invalid.refreshingLists,false);}
 });
+
+test('attention source binding survives the actual acquisition snapshot codec but retires real metadata changes',async t=>{
+ const root=mkdtempSync(join(tmpdir(),'glance-attention-codec-'));
+ const at=Date.parse('2026-10-29T12:00:00Z'),engine=createAcquisitionEngine({pathOptions:{env:{XDG_CONFIG_HOME:root}},now:()=>at});t.after(()=>{engine.close();rmSync(root,{recursive:true,force:true});});
+ const live={number:1,title:'Review the session fix',author:'viewer',headRefName:'fix/session',isDraft:false,reviewDecision:null,updatedAt:'2026-10-28T10:00:00Z',url:'https://github.com/acme/widget/pull/1'};
+ const query={host:'github.com',repositoryId:'R_widget',repository:'acme/widget',accessKey:'a'.repeat(64),targetKey:'github.com\0R_widget',resource:'prs',queryVersion:2,filters:{},pageSize:50,cursorGeneration:'first'},subscription=engine.subscribe(query,{active:false,floorMs:5000});
+ const produced=await engine.refresh(subscription.value.id,{force:true,acquire:async()=>({rows:[live],entities:[],raw:JSON.stringify([live]),pageInfo:{loadedPages:1,hasNextPage:false},lastSuccessAt:at,lastChangedAt:at,nextDueAt:at+5000,hold:null,capabilities:{},meta:{at,truncated:false},securityNotes:[],securityBlind:false})});
+ assert.equal(produced.ok,true,JSON.stringify(produced));const cached=produced.value.snapshot.rows[0];
+ assert.equal(cached.reviewDecision,'');assert.deepEqual({...cached,reviewDecision:null},live);
+ const identity={host:'github.com',repo:'acme/widget',accessPartition:'access',viewer},sources={issues:[],prs:[live]},m=attentionManifest(sources,identity),roundTrip={issues:[],prs:[cached]};
+ assert.equal(attentionManifest(roundTrip,identity).sourceDigest,m.sourceDigest);
+ const view={mode:'attention',tab:'prs',manifest:m,records:{},busy:true,refreshingLists:false,pendingSourceDigest:m.sourceDigest,semantic:null},context={host:'github.com',repo:'acme/widget',accessPartition:'access',viewerId:7,human:true,activeTab:'prs',nowMs:at};
+ assert.equal(projectAttentionView(view,context,roundTrip),view);
+ assert.equal(live.reviewDecision,null);assert.equal(cached.reviewDecision,'');
+ for(const patch of [{number:2},{title:'Changed title'},{author:'other'},{headRefName:'fix/other'},{isDraft:true},{reviewDecision:'APPROVED'},{updatedAt:'2026-10-29T10:00:00Z'},{url:'https://github.com/acme/widget/pull/2'}]){
+  const retired=projectAttentionView(view,context,{issues:[],prs:[{...cached,...patch}]});assert.equal(retired.stale,true,JSON.stringify(patch));assert.equal(retired.busy,false);assert.equal(retired.pendingSourceDigest,null);
+ }
+ assert.equal(projectAttentionView(view,context,{issues:[{number:2,title:'Assigned issue',author:'viewer',label:'bug',updatedAt:live.updatedAt,url:'https://github.com/acme/widget/issues/2'}],prs:[cached]}).stale,true);
+});
