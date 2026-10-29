@@ -1,0 +1,135 @@
+{
+  "schemaVersion": "sutura-native-policy-v1",
+  "obligations": {
+    "schemaVersion": "sutura-native-verification-v1",
+    "repositoryId": 1320091829,
+    "baseBranch": "develop",
+    "protected": true,
+    "fullRequired": true,
+    "stages": {
+      "proposal": {
+        "event": "pull_request",
+        "branchRole": "repair-head",
+        "requiredJobs": [
+          {
+            "workflowId": 325516279,
+            "jobKey": "Plan"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "Lint"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "Test (Node 22)"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "Test (Node 24)"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "Smoke (Node 22)"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "Smoke (Node 24)"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "Terminal smoke (ubuntu-latest)"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "Recovery and efficiency"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "PTY governor"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "PTY other files"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "PTY"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "Release candidate"
+          }
+        ]
+      },
+      "integration": {
+        "event": "push",
+        "branchRole": "base",
+        "requiredJobs": [
+          {
+            "workflowId": 325516279,
+            "jobKey": "Plan"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "Lint (push)"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "Test (Node 22, push)"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "Test (Node 24, push)"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "Smoke (Node 22, push)"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "Smoke (Node 24, push)"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "Terminal smoke (ubuntu-latest)"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "Recovery and efficiency"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "PTY governor"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "PTY other files"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "PTY (push)"
+          },
+          {
+            "workflowId": 325516279,
+            "jobKey": "Push checks"
+          }
+        ]
+      }
+    }
+  },
+  "receiptProducers": [
+    {
+      "kind": "native",
+      "workflowId": 325516279,
+      "path": ".github/workflows/ci.yml",
+      "blobSha": "7db2b39b24723d57b3816f5df4c729b83290d927"
+    },
+    {
+      "kind": "publication",
+      "workflowId": 357063343,
+      "path": ".github/workflows/sutura.yml",
+      "blobSha": "338bfd01cc3fc94d499568d9c91628a48179e408",
+      "actionSha": "94dab7eab0957d1d2e9e4aab2dc4e2ea9828f07c"
+    }
+  ]
+}

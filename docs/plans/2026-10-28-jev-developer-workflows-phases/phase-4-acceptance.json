@@ -1,0 +1,557 @@
+{
+  "schema_version": 1,
+  "objective": "Phase4 exact-preview, secret-blocked and identity-bound CI observations with offline evaluation",
+  "phase": "implement",
+  "approved_phases": [
+    "implement"
+  ],
+  "resource_limit": 3,
+  "candidate": "17e91242bc605657a190951ef5aaf95c7fdaea036abdeb2daadd1c3b0556f62a",
+  "assignments": [
+    {
+      "id": "runtime",
+      "owner": "phase4_runtime",
+      "role": "implementer",
+      "objective": "Complete bounded Phase4 evidence-bound CI observations and qualification mechanics",
+      "allowed_actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "allowed_files": [
+        "index.mjs",
+        "README.md",
+        "CONTRIBUTING.md",
+        "CHANGELOG.md",
+        "test/ci-observations.test.mjs",
+        "test/pty/ci-observations.test.mjs",
+        "test/fixtures/ci-https-fixture.mjs",
+        "test/pty/fixtures/ci-https.mjs",
+        "test/pty/fixtures/jev-fetch.mjs"
+      ],
+      "evidence_contract": "Exact hashes, RED/GREEN, fixed corpus provenance, findings and complete local gates",
+      "resource_constraints": "Sequential product verification slot; no live provider/GitHubfeature calls, routing changes or publication",
+      "completion_condition": "Current-candidate approved result with no confirmed open finding",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "phase4-implementation"
+    },
+    {
+      "id": "evaluation",
+      "owner": "parent",
+      "role": "implementer",
+      "objective": "Complete bounded Phase4 evidence-bound CI observations and qualification mechanics",
+      "allowed_actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "allowed_files": [
+        "scripts/evaluate-jev.mjs",
+        "test/ci-evaluation.test.mjs",
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-4-acceptance.json"
+      ],
+      "evidence_contract": "Exact hashes, RED/GREEN, fixed corpus provenance, findings and complete local gates",
+      "resource_constraints": "Sequential product verification slot; no live provider/GitHubfeature calls, routing changes or publication",
+      "completion_condition": "Current-candidate approved result with no confirmed open finding",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "phase4-implementation"
+    },
+    {
+      "id": "corpus",
+      "owner": "phase4_corpus",
+      "role": "implementer",
+      "objective": "Complete bounded Phase4 evidence-bound CI observations and qualification mechanics",
+      "allowed_actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "allowed_files": [
+        "test/fixtures/jev/ci.json"
+      ],
+      "evidence_contract": "Exact hashes, RED/GREEN, fixed corpus provenance, findings and complete local gates",
+      "resource_constraints": "Sequential product verification slot; no live provider/GitHubfeature calls, routing changes or publication",
+      "completion_condition": "Current-candidate approved result with no confirmed open finding",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "phase4-implementation"
+    },
+    {
+      "id": "policy-review",
+      "owner": "phase4_policy_review",
+      "role": "reviewer",
+      "objective": "Complete bounded Phase4 evidence-bound CI observations and qualification mechanics",
+      "allowed_actions": [
+        "read",
+        "check"
+      ],
+      "allowed_files": [
+        "index.mjs",
+        "scripts/evaluate-jev.mjs",
+        "test/",
+        "docs/"
+      ],
+      "evidence_contract": "Exact hashes, RED/GREEN, fixed corpus provenance, findings and complete local gates",
+      "resource_constraints": "Sequential product verification slot; no live provider/GitHubfeature calls, routing changes or publication",
+      "completion_condition": "Current-candidate approved result with no confirmed open finding",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "phase4-review"
+    },
+    {
+      "id": "ui-review",
+      "owner": "phase3_native_review",
+      "role": "reviewer",
+      "objective": "Complete bounded Phase4 evidence-bound CI observations and qualification mechanics",
+      "allowed_actions": [
+        "read",
+        "check"
+      ],
+      "allowed_files": [
+        "index.mjs",
+        "test/pty/ci-observations.test.mjs",
+        "test/ci-observations.test.mjs"
+      ],
+      "evidence_contract": "Exact hashes, RED/GREEN, fixed corpus provenance, findings and complete local gates",
+      "resource_constraints": "Sequential product verification slot; no live provider/GitHubfeature calls, routing changes or publication",
+      "completion_condition": "Current-candidate approved result with no confirmed open finding",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "phase4-review"
+    },
+    {
+      "id": "final-test-doc-review",
+      "owner": "parent",
+      "role": "reviewer",
+      "objective": "Complete bounded Phase4 evidence-bound CI observations and qualification mechanics",
+      "allowed_actions": [
+        "read",
+        "check"
+      ],
+      "allowed_files": [
+        "test/pty/ci-observations.test.mjs",
+        "README.md",
+        "CONTRIBUTING.md",
+        "CHANGELOG.md"
+      ],
+      "evidence_contract": "Exact hashes, RED/GREEN, fixed corpus provenance, findings and complete local gates",
+      "resource_constraints": "Sequential product verification slot; no live provider/GitHubfeature calls, routing changes or publication",
+      "completion_condition": "Current-candidate approved result with no confirmed open finding",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "phase4-final-review"
+    }
+  ],
+  "results": [
+    {
+      "assignment_id": "runtime",
+      "status": "complete",
+      "candidate": "17e91242bc605657a190951ef5aaf95c7fdaea036abdeb2daadd1c3b0556f62a",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "changed_files": [
+        "index.mjs",
+        "README.md",
+        "CONTRIBUTING.md",
+        "CHANGELOG.md",
+        "test/ci-observations.test.mjs",
+        "test/pty/ci-observations.test.mjs",
+        "test/fixtures/ci-https-fixture.mjs",
+        "test/pty/fixtures/ci-https.mjs",
+        "test/pty/fixtures/jev-fetch.mjs"
+      ]
+    },
+    {
+      "assignment_id": "evaluation",
+      "status": "complete",
+      "candidate": "17e91242bc605657a190951ef5aaf95c7fdaea036abdeb2daadd1c3b0556f62a",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "changed_files": [
+        "scripts/evaluate-jev.mjs",
+        "test/ci-evaluation.test.mjs",
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-4-acceptance.json"
+      ]
+    },
+    {
+      "assignment_id": "corpus",
+      "status": "complete",
+      "candidate": "17e91242bc605657a190951ef5aaf95c7fdaea036abdeb2daadd1c3b0556f62a",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "changed_files": [
+        "test/fixtures/jev/ci.json"
+      ]
+    },
+    {
+      "assignment_id": "policy-review",
+      "status": "complete",
+      "candidate": "17e91242bc605657a190951ef5aaf95c7fdaea036abdeb2daadd1c3b0556f62a",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check"
+      ],
+      "changed_files": []
+    },
+    {
+      "assignment_id": "ui-review",
+      "status": "complete",
+      "candidate": "17e91242bc605657a190951ef5aaf95c7fdaea036abdeb2daadd1c3b0556f62a",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check"
+      ],
+      "changed_files": []
+    },
+    {
+      "assignment_id": "final-test-doc-review",
+      "status": "complete",
+      "candidate": "17e91242bc605657a190951ef5aaf95c7fdaea036abdeb2daadd1c3b0556f62a",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check"
+      ],
+      "changed_files": []
+    }
+  ],
+  "behavioral_change": true,
+  "tdd": {
+    "regression": "Secret/redaction recovery, span bounds and identity, six independent typed observations, synchronous UI lifecycle and honest evaluator denominators",
+    "red": {
+      "sequence": 0,
+      "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-policy-red.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-evaluator-red.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-ui-red.log"
+    },
+    "green": {
+      "sequence": 4,
+      "candidate": "17e91242bc605657a190951ef5aaf95c7fdaea036abdeb2daadd1c3b0556f62a",
+      "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-unit-final.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-pty-final.log"
+    }
+  },
+  "findings": [
+    {
+      "id": "QA-M1",
+      "review_id": "OAuthFalsePositive",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ]
+    },
+    {
+      "id": "QA-M2",
+      "review_id": "QuotedHeaders",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ]
+    },
+    {
+      "id": "QA-M3",
+      "review_id": "PGPAndPermittedSteps",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ]
+    },
+    {
+      "id": "QA-M4",
+      "review_id": "BoundedRetention",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ]
+    },
+    {
+      "id": "QA-M5",
+      "review_id": "ZeroUsableSpan",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ]
+    },
+    {
+      "id": "QA-M6",
+      "review_id": "SynchronousProjection",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ]
+    },
+    {
+      "id": "QA-M7",
+      "review_id": "PendingSlash",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ]
+    },
+    {
+      "id": "QA-M8",
+      "review_id": "ContextRangeRecovery",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ]
+    },
+    {
+      "id": "QA-M9",
+      "review_id": "InsufficientAndPolicyDenominators",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ]
+    },
+    {
+      "id": "QA-M10",
+      "review_id": "UnavailableIdentity",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ]
+    },
+    {
+      "id": "QA-M11",
+      "review_id": "FrozenSplit",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ]
+    },
+    {
+      "id": "QA-M12",
+      "review_id": "IdentityFieldOrder",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ]
+    },
+    {
+      "id": "QA-M13",
+      "review_id": "AdversarialInsufficientCoverage",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ]
+    },
+    {
+      "id": "QA-M14",
+      "review_id": "PreviewPaging",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-source-scope.json"
+      ]
+    }
+  ],
+  "simplify": {
+    "mode": "parent",
+    "changed_files": [
+      "index.mjs",
+      "README.md",
+      "CONTRIBUTING.md",
+      "CHANGELOG.md",
+      "test/ci-observations.test.mjs",
+      "test/pty/ci-observations.test.mjs",
+      "test/fixtures/ci-https-fixture.mjs",
+      "test/pty/fixtures/ci-https.mjs",
+      "test/pty/fixtures/jev-fetch.mjs",
+      "scripts/evaluate-jev.mjs",
+      "test/ci-evaluation.test.mjs",
+      "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+      "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-4-acceptance.json",
+      "test/fixtures/jev/ci.json"
+    ],
+    "invalidated_checks": [
+      "lint",
+      "syntax",
+      "unit",
+      "pty"
+    ],
+    "checks": [
+      {
+        "id": "lint",
+        "status": "pass",
+        "candidate": "17e91242bc605657a190951ef5aaf95c7fdaea036abdeb2daadd1c3b0556f62a",
+        "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-lint-final.log"
+      },
+      {
+        "id": "syntax",
+        "status": "pass",
+        "candidate": "17e91242bc605657a190951ef5aaf95c7fdaea036abdeb2daadd1c3b0556f62a",
+        "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-syntax-final.log"
+      },
+      {
+        "id": "unit",
+        "status": "pass",
+        "candidate": "17e91242bc605657a190951ef5aaf95c7fdaea036abdeb2daadd1c3b0556f62a",
+        "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-unit-final.log"
+      },
+      {
+        "id": "pty",
+        "status": "pass",
+        "candidate": "17e91242bc605657a190951ef5aaf95c7fdaea036abdeb2daadd1c3b0556f62a",
+        "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-pty-final.log"
+      }
+    ]
+  },
+  "gate_status": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-gate-status.json",
+  "source_manifest": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-candidate.json",
+  "runtime_sha256": "508283d4ab582144b58983bc668446a5e43c163bb5bc7c69114e601e58bd4f4b",
+  "verification": {
+    "unit": {
+      "pass": 991,
+      "fail": 0,
+      "skip": 0
+    },
+    "pty": {
+      "pass": 241,
+      "fail": 0,
+      "skip": 1,
+      "skip_reason": "Optional unmodified0.15.2 historical reproduction not supplied"
+    },
+    "tls": "23cases passed each Node22.22.2/24.22.1 at exactruntime/fixture; reused current evidence",
+    "efficiency": "Accepted Phase3 evidence reused; relevant acquisition/admission/governor/sharedSDK/suiteinputs unchanged. AST+independentUIreview recorded.",
+    "corpus": "228synthetic cases204heldout24dev;49safeinsufficient/ambiguousincluding20adversarial;strictsource/split/supportprojection passed",
+    "offline_and_contract_preparation": "pass zero livecalls;12reviewable preparedpayloads68373bytes $.032256conservative reservation only"
+  },
+  "live_contract": "UNVERIFIED",
+  "semantic_accuracy": "UNMEASURED",
+  "developer_benefit": "UNMEASURED",
+  "authority": "Local implementation only; userauthorizedfinaldevelopintegration/push/pruneafterPhase5. No production/provider/CIrouting action.",
+  "publicationAmendment": {
+    "originalAcceptedCandidate": "7eb6ecc953a975d2dbc97db379d0349af58f186ba5ba55e94020dc0b6a2a4934",
+    "publicationCandidate": "17e91242bc605657a190951ef5aaf95c7fdaea036abdeb2daadd1c3b0556f62a",
+    "originalCiCorpusSha256": "6add9e6aed98779e5ed7f6d4e0863394c50f975a5779d6d089b7a41c5e39591f",
+    "ciCorpusSha256": "c13a835241f92f76e7768e6fe1a3ab7e8c739caa9ab33bd73028e603f006bfc8",
+    "scope": "Onlyfourcredentialvaluesintwosyntheticblocked/cleanrangegroups;224casesandeverygold/group/split/range/spanunchanged;sourcecodeunchanged. No inference/tuning.",
+    "reason": "PrepublicationGitHubpushprotectionrejectedtoken-shapedtestexamples;remove lookalikesinunpublishedhistoryratherthanbypassprotection",
+    "evidence": [
+      "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/push-protection-fixture-amendment.json",
+      "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/safe-corpus-check-status.json",
+      "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase4-candidate-publication.json",
+      "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/before-push-protection-redaction.bundle"
+    ],
+    "verification": "25CIpolicy/evaluatortests andall228actualproductionprojections plusreboundmanifest pass; CIhelpersbyte-identicaltoP4,remainingphase4gateinputsunchanged. Original full logs remain attributedtooriginalacceptedcandidate."
+  }
+}

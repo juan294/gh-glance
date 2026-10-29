@@ -61,12 +61,22 @@ const PROFILE_JOBS = {
 // already covered by that PR's candidate run on the same head; running the
 // quick checks again would duplicate it.
 export function planCi({ event, repository, baseRef, headRef, headRepository, changedPaths: paths,
-  reviewedOrdinary = null, releasePrOpen = false }) {
+  reviewedOrdinary = null, releasePrOpen = false, commit = null, mergedPullRequest = null }) {
   if (event === "push" && baseRef === "main") {
     return { role: "promotion", profile: null, jobs: ["promotion", "candidate"],
       reasons: ["push to main: promotion identity only, no suite repeats"] };
   }
   if (event === "push" && baseRef === "develop") {
+    // The CLI supplies authenticated associated-PR evidence; branch names alone
+    // never escalate ordinary pushes or override their existing covered cadence.
+    const repair = mergedPullRequest;
+    if (SHA.test(commit ?? "") && repair?.mergedAt && repair.mergeCommit === commit &&
+        repair.base === "develop" && repair.baseRepository === repository &&
+        repair.headRepository === repository && /^sutura\/fix-[1-9]\d*(?:-dispatch-[a-f0-9]{16})?$/.test(repair.headRef ?? "")) {
+      return { role: "integration", profile: "broad", repairIntegration: true,
+        jobs: [...PROFILE_JOBS.broad, "pty", "candidate"],
+        reasons: ["exact same-repository Sutura repair merge: full native integration checks"] };
+    }
     if (releasePrOpen) {
       return { role: "covered", profile: null, jobs: ["candidate"],
         reasons: ["push to develop with the release PR open: its candidate run covers this head"] };
@@ -84,12 +94,18 @@ export function planCi({ event, repository, baseRef, headRef, headRepository, ch
   }
   const decision = classifyChanges(paths, { reviewedOrdinary });
   if (baseRef !== "main") {
+    if (baseRef === "develop" && headRepository === repository && /^sutura\/fix-[1-9]\d*(?:-dispatch-[a-f0-9]{16})?$/.test(headRef ?? "")) {
+      return { role: "pull-request", profile: "broad", jobs: [...PROFILE_JOBS.broad, ...always],
+        reasons: ["Sutura pilot repair proposal: full application checks without release/publication admission"] };
+    }
     return { role: "pull-request", profile: decision.profile, jobs: [...PROFILE_JOBS[decision.profile], ...always],
       reasons: ["pull request to develop: read-only checks, no publishable artifact", ...decision.reasons] };
   }
-  return { role: "candidate", profile: decision.profile,
-    jobs: [...PROFILE_JOBS[decision.profile], "pack", ...always],
-    reasons: ["release pull request: the one authoritative candidate selection", ...decision.reasons] };
+  // Sutura-coordinated small-CLI policy: one bounded owner release gate.
+  // Stress suites remain available for explicit validation and repair proof.
+  return { role: "candidate", profile: decision.profile === "docs" ? "docs" : "ordinary",
+    jobs: [...QUICK_JOBS, "pack", ...always],
+    reasons: ["owner release pull request: one bounded candidate gate"] };
 }
 
 // GNU script(1) on Linux always; BSD on macOS only for a release candidate.
@@ -427,12 +443,15 @@ function fail(problems) {
 }
 
 function mergedPullRequestFor(commit, repository) {
-  const pulls = ghJson(`repos/${repository}/commits/${commit}/pulls`)
-    .filter((pull) => pull.merged_at && pull.merge_commit_sha === commit);
+  const associated = ghJson(`repos/${repository}/commits/${commit}/pulls?per_page=100`);
+  // A saturated response cannot prove unique attribution within this bound.
+  if (!Array.isArray(associated) || associated.length >= 100) return null;
+  const pulls = associated.filter((pull) => pull.merged_at && pull.merge_commit_sha === commit);
   if (pulls.length !== 1) return null;
   const [pull] = pulls;
   return { number: pull.number, head: pull.head.sha, headRef: pull.head.ref,
     headRepository: pull.head.repo?.full_name ?? null, base: pull.base.ref,
+    baseRepository: pull.base.repo?.full_name ?? null,
     mergedAt: pull.merged_at, mergeCommit: pull.merge_commit_sha };
 }
 
@@ -496,8 +515,11 @@ const commands = {
     const owner = env.GITHUB_REPOSITORY.split("/")[0];
     const releasePrOpen = event === "push" && baseRef === "develop" &&
       ghJson(`repos/${env.GITHUB_REPOSITORY}/pulls?base=main&head=${owner}:develop&state=open`).length > 0;
+    const mergedPullRequest = event === "push" && baseRef === "develop" && SHA.test(env.GITHUB_SHA ?? "")
+      ? mergedPullRequestFor(env.GITHUB_SHA, env.GITHUB_REPOSITORY) : null;
     const plan = planCi({ event, repository: env.GITHUB_REPOSITORY, baseRef, headRef: env.GITHUB_HEAD_REF,
-      headRepository: env.HEAD_REPOSITORY, changedPaths: changed, releasePrOpen });
+      headRepository: env.HEAD_REPOSITORY, changedPaths: changed, releasePrOpen,
+      commit: env.GITHUB_SHA, mergedPullRequest });
     output({ plan: JSON.stringify(plan), jobs: JSON.stringify(plan.jobs), "terminal-os": JSON.stringify(terminalRunners(plan)) });
     return 0;
   },

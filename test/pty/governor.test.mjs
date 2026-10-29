@@ -369,7 +369,7 @@ test("aged v6 packed CLI renders queued, running, and completed Actions values",
     observed.push(recovered);
   }
   assert.ok(Date.now() - startedAt < 60_000);
-  assert.equal(observed.at(-1).governor.version, 7);
+  assert.equal(observed.at(-1).governor.version, 8);
   assert.equal(observed.at(-1).governor.debt.core.unresolvedUnits, 456);
   assert.equal(observed.at(-1).governor.debt.graphql.unresolvedUnits, 162);
   const sourceTimes = observed.map(({ shared }) => Object.values(shared.queries)

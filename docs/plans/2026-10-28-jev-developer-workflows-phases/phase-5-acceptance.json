@@ -1,0 +1,789 @@
+{
+  "schema_version": 1,
+  "objective": "Phase5 exact human attention queue, bounded explicit acquisition and optional metadata-only badges with offline evaluation",
+  "phase": "implement",
+  "approved_phases": [
+    "implement"
+  ],
+  "candidate": "4ff50aabff6b16d02bfd04bcc97698c02929254caf2b41af02e731a596552e7c",
+  "resource_limit": 3,
+  "assignments": [
+    {
+      "id": "runtime",
+      "owner": "phase4_runtime",
+      "role": "implementer",
+      "objective": "Complete approved Phase5 scoped work and independent evidence review",
+      "allowed_actions": [
+        "read",
+        "write",
+        "check"
+      ],
+      "allowed_files": [
+        "index.mjs",
+        "test/attention.test.mjs",
+        "test/pty/attention.test.mjs",
+        "test/fixtures/request-oracle.mjs",
+        "test/pty/fixture-api.test.mjs",
+        "test/pty/fixtures/gh",
+        "test/pty/fixtures/gh-state.mjs",
+        "test/pty/fixtures/graphql-response.mjs",
+        "test/pty/fixtures/jev-fetch.mjs",
+        "README.md",
+        "CONTRIBUTING.md",
+        "CHANGELOG.md"
+      ],
+      "evidence_contract": "Actual frozen source hashes, source/behavior oracles and retained command exits; no live qualification inferred",
+      "resource_constraints": "One coordinated product verification slot; no live inference, routing or unauthorized publication",
+      "completion_condition": "Approved scope complete with all actionable findings resolved and current candidate checks",
+      "domains": [
+        "QA",
+        "UX",
+        "SE"
+      ],
+      "root_causes": [],
+      "concurrency_group": "phase5"
+    },
+    {
+      "id": "evaluator",
+      "owner": "parent",
+      "role": "implementer",
+      "objective": "Complete approved Phase5 scoped work and independent evidence review",
+      "allowed_actions": [
+        "read",
+        "write",
+        "check"
+      ],
+      "allowed_files": [
+        "test/pty/fixtures/known-identity.mjs",
+        "test/pty/ci-details.test.mjs",
+        "scripts/evaluate-jev.mjs",
+        "test/attention-evaluation.test.mjs",
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-5-acceptance.json"
+      ],
+      "evidence_contract": "Actual frozen source hashes, source/behavior oracles and retained command exits; no live qualification inferred",
+      "resource_constraints": "One coordinated product verification slot; no live inference, routing or unauthorized publication",
+      "completion_condition": "Approved scope complete with all actionable findings resolved and current candidate checks",
+      "domains": [
+        "QA",
+        "UX",
+        "SE"
+      ],
+      "root_causes": [],
+      "concurrency_group": "phase5"
+    },
+    {
+      "id": "corpus",
+      "owner": "phase4_corpus",
+      "role": "implementer",
+      "objective": "Complete approved Phase5 scoped work and independent evidence review",
+      "allowed_actions": [
+        "read",
+        "write",
+        "check"
+      ],
+      "allowed_files": [
+        "test/fixtures/jev/attention.json"
+      ],
+      "evidence_contract": "Actual frozen source hashes, source/behavior oracles and retained command exits; no live qualification inferred",
+      "resource_constraints": "One coordinated product verification slot; no live inference, routing or unauthorized publication",
+      "completion_condition": "Approved scope complete with all actionable findings resolved and current candidate checks",
+      "domains": [
+        "QA",
+        "UX",
+        "SE"
+      ],
+      "root_causes": [],
+      "concurrency_group": "phase5"
+    },
+    {
+      "id": "runtime-review",
+      "owner": "phase3_native_review",
+      "role": "reviewer",
+      "objective": "Complete approved Phase5 scoped work and independent evidence review",
+      "allowed_actions": [
+        "read",
+        "check"
+      ],
+      "allowed_files": [
+        "index.mjs",
+        "test/attention.test.mjs",
+        "test/pty/attention.test.mjs",
+        "test/fixtures/request-oracle.mjs",
+        "test/pty/fixture-api.test.mjs",
+        "test/pty/fixtures/gh",
+        "test/pty/fixtures/gh-state.mjs",
+        "test/pty/fixtures/graphql-response.mjs",
+        "test/pty/fixtures/jev-fetch.mjs",
+        "README.md",
+        "CONTRIBUTING.md",
+        "CHANGELOG.md"
+      ],
+      "evidence_contract": "Actual frozen source hashes, source/behavior oracles and retained command exits; no live qualification inferred",
+      "resource_constraints": "One coordinated product verification slot; no live inference, routing or unauthorized publication",
+      "completion_condition": "Approved scope complete with all actionable findings resolved and current candidate checks",
+      "domains": [
+        "QA",
+        "UX",
+        "SE"
+      ],
+      "root_causes": [],
+      "concurrency_group": "phase5"
+    },
+    {
+      "id": "ci-setup-review",
+      "owner": "phase3_native_review",
+      "role": "reviewer",
+      "objective": "Complete approved Phase5 scoped work and independent evidence review",
+      "allowed_actions": [
+        "read",
+        "check"
+      ],
+      "allowed_files": [
+        "test/pty/ci-details.test.mjs",
+        "test/pty/fixtures/known-identity.mjs"
+      ],
+      "evidence_contract": "Actual frozen source hashes, source/behavior oracles and retained command exits; no live qualification inferred",
+      "resource_constraints": "One coordinated product verification slot; no live inference, routing or unauthorized publication",
+      "completion_condition": "Approved scope complete with all actionable findings resolved and current candidate checks",
+      "domains": [
+        "QA",
+        "UX",
+        "SE"
+      ],
+      "root_causes": [],
+      "concurrency_group": "phase5"
+    },
+    {
+      "id": "policy-review",
+      "owner": "phase4_policy_review",
+      "role": "reviewer",
+      "objective": "Complete approved Phase5 scoped work and independent evidence review",
+      "allowed_actions": [
+        "read",
+        "check"
+      ],
+      "allowed_files": [
+        "scripts/evaluate-jev.mjs",
+        "test/attention-evaluation.test.mjs",
+        "test/fixtures/jev/attention.json",
+        "index.mjs"
+      ],
+      "evidence_contract": "Actual frozen source hashes, source/behavior oracles and retained command exits; no live qualification inferred",
+      "resource_constraints": "One coordinated product verification slot; no live inference, routing or unauthorized publication",
+      "completion_condition": "Approved scope complete with all actionable findings resolved and current candidate checks",
+      "domains": [
+        "QA",
+        "UX",
+        "SE"
+      ],
+      "root_causes": [],
+      "concurrency_group": "phase5"
+    }
+  ],
+  "results": [
+    {
+      "assignment_id": "runtime",
+      "status": "complete",
+      "candidate": "4ff50aabff6b16d02bfd04bcc97698c02929254caf2b41af02e731a596552e7c",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-owned-file-manifest-REPAIRED.json"
+      ],
+      "domains": [
+        "QA",
+        "UX",
+        "SE"
+      ],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "write",
+        "check"
+      ],
+      "changed_files": [
+        "index.mjs",
+        "test/attention.test.mjs",
+        "test/pty/attention.test.mjs",
+        "test/fixtures/request-oracle.mjs",
+        "test/pty/fixture-api.test.mjs",
+        "test/pty/fixtures/gh",
+        "test/pty/fixtures/gh-state.mjs",
+        "test/pty/fixtures/graphql-response.mjs",
+        "test/pty/fixtures/jev-fetch.mjs",
+        "README.md",
+        "CONTRIBUTING.md",
+        "CHANGELOG.md"
+      ]
+    },
+    {
+      "assignment_id": "evaluator",
+      "status": "complete",
+      "candidate": "4ff50aabff6b16d02bfd04bcc97698c02929254caf2b41af02e731a596552e7c",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-evaluation-green-final-focused.log",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-gate-status-repaired.json"
+      ],
+      "domains": [
+        "QA",
+        "UX",
+        "SE"
+      ],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "write",
+        "check"
+      ],
+      "changed_files": [
+        "test/pty/fixtures/known-identity.mjs",
+        "test/pty/ci-details.test.mjs",
+        "scripts/evaluate-jev.mjs",
+        "test/attention-evaluation.test.mjs",
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-5-acceptance.json"
+      ]
+    },
+    {
+      "assignment_id": "corpus",
+      "status": "complete",
+      "candidate": "4ff50aabff6b16d02bfd04bcc97698c02929254caf2b41af02e731a596552e7c",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-corpus-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-corpus-integrity.json"
+      ],
+      "domains": [
+        "QA",
+        "UX",
+        "SE"
+      ],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "write",
+        "check"
+      ],
+      "changed_files": [
+        "test/fixtures/jev/attention.json"
+      ]
+    },
+    {
+      "assignment_id": "runtime-review",
+      "status": "complete",
+      "candidate": "4ff50aabff6b16d02bfd04bcc97698c02929254caf2b41af02e731a596552e7c",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json"
+      ],
+      "domains": [
+        "QA",
+        "UX",
+        "SE"
+      ],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check"
+      ],
+      "changed_files": []
+    },
+    {
+      "assignment_id": "ci-setup-review",
+      "status": "complete",
+      "candidate": "4ff50aabff6b16d02bfd04bcc97698c02929254caf2b41af02e731a596552e7c",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-fixture-setup-review.json"
+      ],
+      "domains": [
+        "QA",
+        "UX",
+        "SE"
+      ],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check"
+      ],
+      "changed_files": []
+    },
+    {
+      "assignment_id": "policy-review",
+      "status": "complete",
+      "candidate": "4ff50aabff6b16d02bfd04bcc97698c02929254caf2b41af02e731a596552e7c",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-policy-review.json"
+      ],
+      "domains": [
+        "QA",
+        "UX",
+        "SE"
+      ],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check"
+      ],
+      "changed_files": []
+    }
+  ],
+  "behavioral_change": true,
+  "tdd": {
+    "regression": "Exact query/identity/tri-state relationships, deterministic tiers and selection, bounds/deadlines, explicit recovery/cancel/tab lifecycle, truthful meter and badge/evaluator coverage",
+    "red": {
+      "sequence": 0,
+      "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-policy-red.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-evaluation-red.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-ui-red.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-publication-deadline-red.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-metadata-disclosure-red.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-staged-detail-policy-repaired-red.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-staged-detail-ui-repaired-red-with-events.log"
+    },
+    "green": {
+      "sequence": 5,
+      "candidate": "4ff50aabff6b16d02bfd04bcc97698c02929254caf2b41af02e731a596552e7c",
+      "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-unit-repaired.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-pty-repaired.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-fixture-repair-final-status.json"
+    }
+  },
+  "findings": [
+    {
+      "id": "QA-H1",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json review A1"
+      ]
+    },
+    {
+      "id": "QA-H2",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json review A2"
+      ]
+    },
+    {
+      "id": "QA-H3",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json review A3"
+      ]
+    },
+    {
+      "id": "QA-H4",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json review A4"
+      ]
+    },
+    {
+      "id": "QA-H5",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json review A5"
+      ]
+    },
+    {
+      "id": "QA-H6",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json review A6"
+      ]
+    },
+    {
+      "id": "QA-H7",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json review A7"
+      ]
+    },
+    {
+      "id": "QA-H8",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json review A8"
+      ]
+    },
+    {
+      "id": "QA-H9",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json review A9"
+      ]
+    },
+    {
+      "id": "QA-H10",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json review A10"
+      ]
+    },
+    {
+      "id": "QA-H11",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json review A11"
+      ]
+    },
+    {
+      "id": "QA-H12",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json review A12"
+      ]
+    },
+    {
+      "id": "QA-H13",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json review A13"
+      ]
+    },
+    {
+      "id": "QA-H14",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json review A14"
+      ]
+    },
+    {
+      "id": "QA-H15",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json review A15"
+      ]
+    },
+    {
+      "id": "QA-H16",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json review A16"
+      ]
+    },
+    {
+      "id": "QA-H17",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json review A17"
+      ]
+    },
+    {
+      "id": "QA-H18",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json review A18"
+      ]
+    },
+    {
+      "id": "QA-M19",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-publication-deadline-green.log finite publication boundary"
+      ]
+    },
+    {
+      "id": "QA-M20",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-final-policy-green-second.log metadata coverage disclosure"
+      ]
+    },
+    {
+      "id": "QA-M21",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-policy-review.json mixed gold/evaluator field types/badge criteria"
+      ]
+    },
+    {
+      "id": "QA-M22",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-evaluation-green-final-focused.log nested metadata manifest regression"
+      ]
+    },
+    {
+      "id": "QA-H23",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-review-repaired.json late source during refreshed detail flight pendingSourceDigest/owned terminal repair"
+      ]
+    },
+    {
+      "id": "QA-M24",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-runtime-handoff-REPAIRED.json wide setup explicitadmissionretry preservingexactcounts"
+      ]
+    },
+    {
+      "id": "QA-M25",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-fixture-setup-review.json one explicit log-admission retry preserves all native/metadata/browser assertions"
+      ]
+    },
+    {
+      "id": "QA-M26",
+      "disposition": "resolved",
+      "evidence": [
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-fixture-setup-review.json aligned known-identity ETag with typedUser fixture; direct200vs304probe and10affectedcasepasses"
+      ]
+    }
+  ],
+  "simplify": {
+    "mode": "parent",
+    "changed_files": [
+      "index.mjs",
+      "test/attention.test.mjs",
+      "test/pty/attention.test.mjs",
+      "test/fixtures/request-oracle.mjs",
+      "test/pty/fixture-api.test.mjs",
+      "test/pty/fixtures/gh",
+      "test/pty/fixtures/gh-state.mjs",
+      "test/pty/fixtures/graphql-response.mjs",
+      "test/pty/fixtures/jev-fetch.mjs",
+      "README.md",
+      "CONTRIBUTING.md",
+      "CHANGELOG.md",
+      "test/pty/fixtures/known-identity.mjs",
+      "test/pty/ci-details.test.mjs",
+      "scripts/evaluate-jev.mjs",
+      "test/attention-evaluation.test.mjs",
+      "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+      "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-5-acceptance.json",
+      "test/fixtures/jev/attention.json"
+    ],
+    "invalidated_checks": [
+      "lint",
+      "syntax",
+      "unit",
+      "efficiency",
+      "pty"
+    ],
+    "checks": [
+      {
+        "id": "lint",
+        "status": "pass",
+        "candidate": "4ff50aabff6b16d02bfd04bcc97698c02929254caf2b41af02e731a596552e7c",
+        "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-lint-repaired.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-fixture-repair-final-status.json unchanged source/other checked inputs; corrected wide/narrow+10held consumers and file lint pass"
+      },
+      {
+        "id": "syntax",
+        "status": "pass",
+        "candidate": "4ff50aabff6b16d02bfd04bcc97698c02929254caf2b41af02e731a596552e7c",
+        "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-syntax-repaired.log; same tested inputs; only two scoped PTY setup/fixture inputs changed, all affected cases revalidated"
+      },
+      {
+        "id": "unit",
+        "status": "pass",
+        "candidate": "4ff50aabff6b16d02bfd04bcc97698c02929254caf2b41af02e731a596552e7c",
+        "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-unit-repaired.log; same tested inputs; only two scoped PTY setup/fixture inputs changed, all affected cases revalidated"
+      },
+      {
+        "id": "efficiency",
+        "status": "pass",
+        "candidate": "4ff50aabff6b16d02bfd04bcc97698c02929254caf2b41af02e731a596552e7c",
+        "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-efficiency-repaired.log; same tested inputs; only two scoped PTY setup/fixture inputs changed, all affected cases revalidated"
+      },
+      {
+        "id": "pty",
+        "status": "pass",
+        "candidate": "4ff50aabff6b16d02bfd04bcc97698c02929254caf2b41af02e731a596552e7c",
+        "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-pty-repaired.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-fixture-repair-final-status.json unchanged source/other checked inputs; corrected wide/narrow+10held consumers and file lint pass"
+      }
+    ]
+  },
+  "verification": {
+    "unit": {
+      "tests": 1024,
+      "pass": 1024,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0
+    },
+    "pty": {
+      "tests": 256,
+      "pass": 255,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 1,
+      "method": "Unique required cases covered by complete raw run plus 12 affected focused cases; ten prior passing affected cases revalidated and not counted twice",
+      "originalFullCommand": {
+        "tests": 256,
+        "pass": 253,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 1,
+        "exit": 1
+      },
+      "focusedCorrection": {
+        "status": "pass",
+        "candidate": "4ff50aabff6b16d02bfd04bcc97698c02929254caf2b41af02e731a596552e7c",
+        "baseCandidate": "ca868d35ad7954d7c7471d504cdc66eb4bacd2034be4f82eba4b670379591b1b",
+        "sourceSha256": "f09af5375edf590b439436bb81739cf6821d84c235ceabef1d2eab8b742a6688",
+        "testSha256": "401ffc41bda5731dd94a2bad920c0af00dc5dee8b98f46128d31f993c98f261b",
+        "fixtureSha256": "4a97ec9f36550051d83ba1ba0dae3b0e66d01183e415a032a3cbb4aeba2272f5",
+        "commands": [
+          {
+            "id": "etag-contract",
+            "exit": 0,
+            "log": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-user-etag-contract-final.log",
+            "reused": true
+          },
+          {
+            "id": "file-lint",
+            "command": [
+              "npx",
+              "eslint",
+              "--max-warnings",
+              "0",
+              "test/pty/ci-details.test.mjs",
+              "test/pty/fixtures/known-identity.mjs"
+            ],
+            "exit": 0,
+            "seconds": 0.673,
+            "log": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-fixture-repair-file-lint.log",
+            "reuseScope": "known-identity fixture only; CI test lint superseded by current command"
+          },
+          {
+            "id": "held-identity-consumers",
+            "command": [
+              "/Users/juan/.nvm/versions/node/v24.22.1/bin/node",
+              "--test",
+              "--test-concurrency=1",
+              "--test-name-pattern=^(?:manual\\ refresh\\ wins\\ a\\ held\\ lane\\ without\\ stacking\\ repeated\\ requests|twelve\\ exhausted\\ core\\ panes\\ share\\ one\\ visible\\ hold\\ and\\ make\\ no\\ REST\\ data\\ calls|a\\ held\\ core\\ pane\\ switches\\ to\\ Issues\\ and\\ spends\\ only\\ GraphQL|a\\ real\\ reset\\ resumes\\ all\\ panes,\\ while\\ atomic\\ external\\ burn\\ limits\\ the\\ next\\ epoch|a\\ held\\ core\\ tab\\ stays\\ Paused\\ while\\ a\\ selected\\ GraphQL\\ tab\\ progresses|linear\\ screen\\-reader\\ output\\ retains\\ startup,\\ holds,\\ failures,\\ limits,\\ stale\\ rows,\\ and\\ errors|manual\\ refresh\\ bursts\\ create\\ one\\ unchanged\\ held\\-sample\\ probe\\ demand|a\\ held\\ core\\ resource\\ leaves\\ both\\ GraphQL\\ tabs\\ usable|a\\ real\\ reset\\ gets\\ one\\ fresh\\ probe\\ then\\ one\\ shared\\ active\\ acquisition|twelve\\ held\\ panes\\ share\\ one\\ block\\ probe\\ instead\\ of\\ retrying\\ per\\ pane)$",
+              "test/pty/governor.test.mjs",
+              "test/pty/status.test.mjs",
+              "test/pty/throttle.test.mjs"
+            ],
+            "exit": 0,
+            "seconds": 218.923,
+            "log": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-fixture-repair-held-identity-consumers.log"
+          },
+          {
+            "id": "lint",
+            "command": [
+              "npx",
+              "eslint",
+              "--max-warnings",
+              "0",
+              "test/pty/ci-details.test.mjs"
+            ],
+            "exit": 0,
+            "seconds": 0.714,
+            "log": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-ci-stage-repair-lint.log"
+          },
+          {
+            "id": "wide-narrow",
+            "command": [
+              "/Users/juan/.nvm/versions/node/v24.22.1/bin/node",
+              "--test",
+              "--test-concurrency=1",
+              "--test-name-pattern=CI exact selected attempt/job/log and return",
+              "test/pty/ci-details.test.mjs"
+            ],
+            "exit": 0,
+            "seconds": 12.186,
+            "log": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-ci-stage-repair-wide-narrow.log"
+          }
+        ],
+        "ci": {
+          "tests": 2,
+          "pass": 2,
+          "fail": 0,
+          "cancelled": 0,
+          "skipped": 0
+        },
+        "heldConsumers": {
+          "tests": 10,
+          "pass": 10,
+          "fail": 0,
+          "cancelled": 0,
+          "skipped": 0
+        },
+        "originalFailedAttempts": [
+          "phase5-gate-status-repaired.json",
+          "phase5-fixture-repair-status.json"
+        ],
+        "coverage": "253 passed full; two failed fixture/setup cases corrected. Ten already-passing affected cases revalidated too; 243 unchanged passing +12 focused =255 required unique cases; one optional historical skip retained."
+      }
+    },
+    "efficiency": "pass; current complete gate after finite publication repair",
+    "firstPaint": {
+      "sampleCount": 5,
+      "candidateMedianMs": 225,
+      "baselineMedianMs": 226,
+      "withinAllowance": true
+    },
+    "focusPendingInput": {
+      "scheduledCount": 100,
+      "attemptCount": 100,
+      "sampleCount": 100,
+      "invalidCount": 0,
+      "p95Ms": 47.3823339999999,
+      "within100Ms": true
+    },
+    "attentionPendingInput": {
+      "scheduledCount": 100,
+      "attemptCount": 100,
+      "sampleCount": 100,
+      "invalidCount": 0,
+      "p95Ms": 43.940207999999984,
+      "within100Ms": true
+    },
+    "processTreeResources": "unmeasured",
+    "corpus": "132synthetic cases120heldout12development; eachbadge50positive45negative25unknown;25ambiguous25nonEnglish20adversarial; frozen before inference",
+    "offlineManifest": {
+      "feature": "attention",
+      "corpusHash": "711778d2baa4096554dfcc372dff39b10ecc8f6997dcb4fc3d5709d3399e866b",
+      "model": "jev-1.14.0",
+      "questionVersion": "attention-v1",
+      "runtime": "v24.22.1",
+      "candidateHashes": {
+        "index.mjs": "f09af5375edf590b439436bb81739cf6821d84c235ceabef1d2eab8b742a6688",
+        "package.json": "c73ace19021dd87995fe8977e83eb13ff8c49ce90a676ec78aba3c0164a6946f",
+        "package-lock.json": "c65e7bd9d931e3a987a9b5cd8b62c40adb9e2ec2ca9fcacd6ebf7e036f948ab6"
+      },
+      "mode": "prepare",
+      "liveContract": "UNVERIFIED",
+      "dispatchedCalls": 0,
+      "manifestPath": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-attention-contract-manifest-repaired.json",
+      "manifestHash": "d07a5da7795c619710fb11e8eafee94a635bcb30ac543412bfa96b652a79cc18",
+      "calls": 12,
+      "bytes": 13130,
+      "reservationDollars": 0.032256
+    },
+    "nativeAndProtocol": "Accepted Phase3/4 subsystem evidence reused; 22protectedbindings and qualifier scripts/fixtures unchanged; exact current top-level comparison preserved",
+    "manual": "9frozen-sourceframes archived phase5-visual-snapshot-repaired/manifest.json; narrow/wide disclosures/controls, direct/draft/tier labels/source coverage and badges inspected"
+  },
+  "repairedFullGate": {
+    "candidate": "ca868d35ad7954d7c7471d504cdc66eb4bacd2034be4f82eba4b670379591b1b",
+    "status": "complete rawPTY command failed two invalid setup/fixture oracles; all other commands pass",
+    "sourceSha256": "f09af5375edf590b439436bb81739cf6821d84c235ceabef1d2eab8b742a6688",
+    "testOnlyCorrection": "Only CI exact-case loop and known-identity user representation changed afterward; production/package/scripts/154otherfiles unchanged. CI wide/narrow and10held-identity cases plus filelint pass complete required coverage. Original commandexit1 retained.",
+    "evidence": [
+      "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-gate-status-repaired.json",
+      "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-fixture-repair-final-status.json",
+      "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-fixture-repair-input-scope.json"
+    ]
+  },
+  "initialFullGate": {
+    "candidate": "7a87129d8bff70f10132062accf4571398dbe32208ba8cdce1fad1cc26b66fa5",
+    "runtime": "fb6c1b78decd146438c21429aeff053bd80f165b7a8486014c62fafdaa149b84",
+    "status": "INCOMPLETE/FAILED;2observedattentionfailures thenownedcontrollerinterrupted143 afterconfirmedproductdefect",
+    "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-gate-status.json",
+    "dispositions": "wide setup corrected toexplicitadmissionretry; stageddetailstale-flight defect deterministicRED thenpending-source-digest/ownedterminalrepair; exactoriginalcancelpredicate remainsunknown; allcompletegatesfresh onrepairedsource"
+  },
+  "failurePreservation": "Initial failed commands retain failed status; earlier3casepublicationrecovery2pass1fail followed by focused hold repair and final13/13attention;3 overwritten intermediate outputs are explicitlyPARTIAL withfullstdoutUNAVAILABLE, not rewritten as passes.",
+  "liveContract": "UNVERIFIED",
+  "semanticAccuracy": "UNMEASURED",
+  "developerBenefit": "UNMEASURED",
+  "authority": "Allphases continuation,localdevelopintegration,onepushandownedtreeprune authorizedbyuser; no liveexperiment/release/CIrouting/provider/account changes.",
+  "publicationAmendment": {
+    "originalAcceptedCandidate": "6ca5768affcbc7a5640be6e94f3fafad7d9cb12ce811de279b74943624baff97",
+    "publicationCandidate": "4ff50aabff6b16d02bfd04bcc97698c02929254caf2b41af02e731a596552e7c",
+    "scope": "Four synthetic CI credential values only; all 224 other cases, gold labels, split/group/range/span fields and product source remain unchanged. No live inference or tuning.",
+    "reason": "GitHub rejected the unpublished push for synthetic token patterns; removed lookalikes instead of bypassing protection. Remote develop remained at the original base.",
+    "originalCiCorpusSha256": "6add9e6aed98779e5ed7f6d4e0863394c50f975a5779d6d089b7a41c5e39591f",
+    "ciCorpusSha256": "c13a835241f92f76e7768e6fe1a3ab7e8c739caa9ab33bd73028e603f006bfc8",
+    "evidence": [
+      "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase5-candidate-publication.json",
+      "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/push-protection-fixture-amendment.json",
+      "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/safe-corpus-check-status.json",
+      "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/before-push-protection-redaction.bundle"
+    ],
+    "verification": "Independent policy review approved. All 25 CI policy/evaluator tests, all 228 offline production projections and rebound manifest preparation pass. Original unit, efficiency, terminal and performance evidence is reused for byte-identical inputs. Failed historical commands retain their original identities and statuses."
+  }
+}

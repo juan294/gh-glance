@@ -1,0 +1,604 @@
+{
+  "schema_version": 1,
+  "objective": "Phase 3 same-path governor v8 migration and exact selected-run/job/log evidence",
+  "phase": "implement",
+  "approved_phases": [
+    "implement"
+  ],
+  "resource_limit": 3,
+  "candidate": "14c095c0995683efaf0e6c9b5a457233911b2613a39e8a3e8abacc3eed45105c",
+  "assignments": [
+    {
+      "id": "runtime",
+      "owner": "phase3_runtime",
+      "role": "implementer",
+      "objective": "Complete bounded Phase 3 implementation, review and evidence contract",
+      "allowed_actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "allowed_files": [
+        "CHANGELOG.md",
+        "CONTRIBUTING.md",
+        "README.md",
+        "index.mjs",
+        "scripts/check-governor-compatibility.mjs",
+        "scripts/freshness-monitor.mjs",
+        "scripts/qualify-ci-log-transport.mjs",
+        "test/ci-details.test.mjs",
+        "test/ci-owner-death.test.mjs",
+        "test/ci-request-oracle.test.mjs",
+        "test/fixtures/ci-https-fixture.mjs",
+        "test/fixtures/ci-tls/README.md",
+        "test/fixtures/ci-tls/test-ca.crt",
+        "test/fixtures/ci-tls/test-private-key.fixture",
+        "test/fixtures/populated-governor-v7.mjs",
+        "test/fixtures/request-oracle.mjs",
+        "test/freshness-monitor.test.mjs",
+        "test/governor-v8.test.mjs",
+        "test/governor.test.mjs",
+        "test/pty/ci-details.test.mjs",
+        "test/pty/fixtures/ci-https.mjs",
+        "test/pty/fixtures/ci-response.mjs",
+        "test/pty/fixtures/gh",
+        "test/pty/fixtures/gh-state.mjs",
+        "test/recovery.test.mjs",
+        "test/scheduling-policy.test.mjs"
+      ],
+      "evidence_contract": "Exact source hashes, RED/GREEN evidence, findings dispositions and complete local gates",
+      "resource_constraints": "Single sequential verification slot; no live model or GitHub feature call, routing edit or publication",
+      "completion_condition": "Return current-candidate approved result with no confirmed open finding",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "phase3-implementation"
+    },
+    {
+      "id": "integration",
+      "owner": "parent",
+      "role": "implementer",
+      "objective": "Complete bounded Phase 3 implementation, review and evidence contract",
+      "allowed_actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "allowed_files": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-3-acceptance.json",
+        "test/identity-process.test.mjs",
+        "test/pty/governor.test.mjs",
+        "test/pty/status.test.mjs"
+      ],
+      "evidence_contract": "Exact source hashes, RED/GREEN evidence, findings dispositions and complete local gates",
+      "resource_constraints": "Single sequential verification slot; no live model or GitHub feature call, routing edit or publication",
+      "completion_condition": "Return current-candidate approved result with no confirmed open finding",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "phase3-implementation"
+    },
+    {
+      "id": "migration-review",
+      "owner": "phase2_review",
+      "role": "reviewer",
+      "objective": "Complete bounded Phase 3 implementation, review and evidence contract",
+      "allowed_actions": [
+        "read",
+        "check"
+      ],
+      "allowed_files": [
+        "index.mjs",
+        "scripts/",
+        "test/",
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md"
+      ],
+      "evidence_contract": "Exact source hashes, RED/GREEN evidence, findings dispositions and complete local gates",
+      "resource_constraints": "Single sequential verification slot; no live model or GitHub feature call, routing edit or publication",
+      "completion_condition": "Return current-candidate approved result with no confirmed open finding",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "phase3-review"
+    },
+    {
+      "id": "native-review",
+      "owner": "phase3_native_review",
+      "role": "reviewer",
+      "objective": "Complete bounded Phase 3 implementation, review and evidence contract",
+      "allowed_actions": [
+        "read",
+        "check"
+      ],
+      "allowed_files": [
+        "index.mjs",
+        "scripts/",
+        "test/",
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md"
+      ],
+      "evidence_contract": "Exact source hashes, RED/GREEN evidence, findings dispositions and complete local gates",
+      "resource_constraints": "Single sequential verification slot; no live model or GitHub feature call, routing edit or publication",
+      "completion_condition": "Return current-candidate approved result with no confirmed open finding",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "phase3-review"
+    },
+    {
+      "id": "ui-review",
+      "owner": "parent",
+      "role": "reviewer",
+      "objective": "Complete bounded Phase 3 implementation, review and evidence contract",
+      "allowed_actions": [
+        "read",
+        "check"
+      ],
+      "allowed_files": [
+        "index.mjs",
+        "test/pty/ci-details.test.mjs",
+        "README.md",
+        "CONTRIBUTING.md",
+        "CHANGELOG.md"
+      ],
+      "evidence_contract": "Exact source hashes, RED/GREEN evidence, findings dispositions and complete local gates",
+      "resource_constraints": "Single sequential verification slot; no live model or GitHub feature call, routing edit or publication",
+      "completion_condition": "Return current-candidate approved result with no confirmed open finding",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "phase3-ui-review"
+    }
+  ],
+  "results": [
+    {
+      "assignment_id": "runtime",
+      "status": "complete",
+      "candidate": "14c095c0995683efaf0e6c9b5a457233911b2613a39e8a3e8abacc3eed45105c",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "changed_files": [
+        "CHANGELOG.md",
+        "CONTRIBUTING.md",
+        "README.md",
+        "index.mjs",
+        "scripts/check-governor-compatibility.mjs",
+        "scripts/freshness-monitor.mjs",
+        "scripts/qualify-ci-log-transport.mjs",
+        "test/ci-details.test.mjs",
+        "test/ci-owner-death.test.mjs",
+        "test/ci-request-oracle.test.mjs",
+        "test/fixtures/ci-https-fixture.mjs",
+        "test/fixtures/ci-tls/README.md",
+        "test/fixtures/ci-tls/test-ca.crt",
+        "test/fixtures/ci-tls/test-private-key.fixture",
+        "test/fixtures/populated-governor-v7.mjs",
+        "test/fixtures/request-oracle.mjs",
+        "test/freshness-monitor.test.mjs",
+        "test/governor-v8.test.mjs",
+        "test/governor.test.mjs",
+        "test/pty/ci-details.test.mjs",
+        "test/pty/fixtures/ci-https.mjs",
+        "test/pty/fixtures/ci-response.mjs",
+        "test/pty/fixtures/gh",
+        "test/pty/fixtures/gh-state.mjs",
+        "test/recovery.test.mjs",
+        "test/scheduling-policy.test.mjs"
+      ]
+    },
+    {
+      "assignment_id": "integration",
+      "status": "complete",
+      "candidate": "14c095c0995683efaf0e6c9b5a457233911b2613a39e8a3e8abacc3eed45105c",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "changed_files": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-3-acceptance.json",
+        "test/identity-process.test.mjs",
+        "test/pty/governor.test.mjs",
+        "test/pty/status.test.mjs"
+      ]
+    },
+    {
+      "assignment_id": "migration-review",
+      "status": "complete",
+      "candidate": "14c095c0995683efaf0e6c9b5a457233911b2613a39e8a3e8abacc3eed45105c",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check"
+      ],
+      "changed_files": []
+    },
+    {
+      "assignment_id": "native-review",
+      "status": "complete",
+      "candidate": "14c095c0995683efaf0e6c9b5a457233911b2613a39e8a3e8abacc3eed45105c",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check"
+      ],
+      "changed_files": []
+    },
+    {
+      "assignment_id": "ui-review",
+      "status": "complete",
+      "candidate": "14c095c0995683efaf0e6c9b5a457233911b2613a39e8a3e8abacc3eed45105c",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check"
+      ],
+      "changed_files": []
+    }
+  ],
+  "behavioral_change": true,
+  "tdd": {
+    "regression": "Ledger conservation and backup-before-write, exact CI identities, controlled native transport, actual closure/death recovery and UI input/recovery",
+    "red": {
+      "sequence": 0,
+      "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-migration-red.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-ci-red.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-deferred-terminal-red.log"
+    },
+    "green": {
+      "sequence": 4,
+      "candidate": "14c095c0995683efaf0e6c9b5a457233911b2613a39e8a3e8abacc3eed45105c",
+      "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-unit.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-pty-final.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-pty.log"
+    }
+  },
+  "findings": [
+    {
+      "id": "QA-M1",
+      "review_id": "M1",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ]
+    },
+    {
+      "id": "QA-M2",
+      "review_id": "M2",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ]
+    },
+    {
+      "id": "QA-M3",
+      "review_id": "M3",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ]
+    },
+    {
+      "id": "QA-M4",
+      "review_id": "M4",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ]
+    },
+    {
+      "id": "QA-M5",
+      "review_id": "N1",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ]
+    },
+    {
+      "id": "QA-M6",
+      "review_id": "N2",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ]
+    },
+    {
+      "id": "QA-M7",
+      "review_id": "N3",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ]
+    },
+    {
+      "id": "QA-M8",
+      "review_id": "N4",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ]
+    },
+    {
+      "id": "QA-M9",
+      "review_id": "N5",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ]
+    },
+    {
+      "id": "QA-M10",
+      "review_id": "N6",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ]
+    },
+    {
+      "id": "QA-M11",
+      "review_id": "N7",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ]
+    },
+    {
+      "id": "QA-M12",
+      "review_id": "N8",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ]
+    },
+    {
+      "id": "QA-M13",
+      "review_id": "N9",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ]
+    },
+    {
+      "id": "QA-M14",
+      "review_id": "N10",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ]
+    },
+    {
+      "id": "QA-M15",
+      "review_id": "N11",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ]
+    },
+    {
+      "id": "QA-M16",
+      "review_id": "N12",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ]
+    },
+    {
+      "id": "QA-M17",
+      "review_id": "API-User-Agent",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ]
+    },
+    {
+      "id": "QA-M18",
+      "review_id": "legacy-assertions",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-review.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-runtime-handoff.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json"
+      ]
+    }
+  ],
+  "simplify": {
+    "mode": "parent",
+    "changed_files": [
+      "CHANGELOG.md",
+      "CONTRIBUTING.md",
+      "README.md",
+      "index.mjs",
+      "scripts/check-governor-compatibility.mjs",
+      "scripts/freshness-monitor.mjs",
+      "scripts/qualify-ci-log-transport.mjs",
+      "test/ci-details.test.mjs",
+      "test/ci-owner-death.test.mjs",
+      "test/ci-request-oracle.test.mjs",
+      "test/fixtures/ci-https-fixture.mjs",
+      "test/fixtures/ci-tls/README.md",
+      "test/fixtures/ci-tls/test-ca.crt",
+      "test/fixtures/ci-tls/test-private-key.fixture",
+      "test/fixtures/populated-governor-v7.mjs",
+      "test/fixtures/request-oracle.mjs",
+      "test/freshness-monitor.test.mjs",
+      "test/governor-v8.test.mjs",
+      "test/governor.test.mjs",
+      "test/pty/ci-details.test.mjs",
+      "test/pty/fixtures/ci-https.mjs",
+      "test/pty/fixtures/ci-response.mjs",
+      "test/pty/fixtures/gh",
+      "test/pty/fixtures/gh-state.mjs",
+      "test/recovery.test.mjs",
+      "test/scheduling-policy.test.mjs",
+      "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+      "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-3-acceptance.json",
+      "test/identity-process.test.mjs",
+      "test/pty/governor.test.mjs",
+      "test/pty/status.test.mjs"
+    ],
+    "invalidated_checks": [
+      "assertion-repair-pty",
+      "assertion-repair-lint",
+      "unit"
+    ],
+    "checks": [
+      {
+        "id": "assertion-repair-pty",
+        "status": "pass",
+        "candidate": "14c095c0995683efaf0e6c9b5a457233911b2613a39e8a3e8abacc3eed45105c",
+        "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-pty.log"
+      },
+      {
+        "id": "assertion-repair-lint",
+        "status": "pass",
+        "candidate": "14c095c0995683efaf0e6c9b5a457233911b2613a39e8a3e8abacc3eed45105c",
+        "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-lint.log"
+      },
+      {
+        "id": "unit",
+        "status": "pass",
+        "candidate": "14c095c0995683efaf0e6c9b5a457233911b2613a39e8a3e8abacc3eed45105c",
+        "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-unit.log"
+      }
+    ]
+  },
+  "initial_gate_status": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-gate-status.json",
+  "final_repair_status": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-status.json",
+  "source_manifest": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-candidate-repaired.json",
+  "verification": {
+    "unit": {
+      "passed": 966,
+      "failed": 0,
+      "skipped": 0,
+      "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-unit.log"
+    },
+    "pty": {
+      "initial_passed": 230,
+      "initial_failed": 2,
+      "optional_skipped": 1,
+      "repaired_cases_passed": 2,
+      "current_required_case_coverage": "232 passed across unchanged full-run cases and two corrected cases; optional0.15.2 reproduction remains skipped",
+      "initial_log": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-pty-final.log",
+      "repair_log": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase3-assertion-repair-pty.log"
+    },
+    "efficiency": "pass",
+    "baseline_reader_node22_node24": "pass actual pinned baseline, empty and populated fixtures",
+    "native_tls_node22_node24": "pass23offlinecases per runtime",
+    "lint": "Initial full lint plus passing changed-three-file lint; exact evidence is preserved in the status files.",
+    "syntax": "pass unchanged runtime",
+    "reused_input_difference": [
+      "test/identity-process.test.mjs",
+      "test/pty/governor.test.mjs",
+      "test/pty/status.test.mjs"
+    ]
+  },
+  "runtime_sha256": "d02de0b19a6850de8458b21958e416c0e31e9d6e014c80003f0727d8e6235a18",
+  "live_contract": "UNVERIFIED; zero live model calls; no semantic accuracy or benefit claimed"
+}

@@ -3,6 +3,8 @@
 // are checked against what CI will run.
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import { CANDIDATE_JOBS, CI_JOBS, NPM_UPGRADE, PINS, REPOSITORY, planCi } from "../scripts/release-candidate.mjs";
@@ -10,18 +12,39 @@ import { readWorkflow, renderJobName } from "./fixtures/workflow.mjs";
 
 const REPO = REPOSITORY;
 
-test("WF-01 ci.yml jobs are exactly the routed jobs, each gated on its own plan entry", () => {
+test("WF-01 ci.yml contains exactly the routed jobs and isolated native receipt producer", () => {
   const ci = readWorkflow("ci.yml");
-  assert.deepEqual(Object.keys(ci.jobs).sort(), ["plan", ...CI_JOBS].sort());
+  assert.deepEqual(Object.keys(ci.jobs).sort(), ["plan", ...CI_JOBS, "native-receipt"].sort());
   for (const id of CI_JOBS.filter((job) => !["pty", "candidate"].includes(job))) {
     assert.match(ci.jobs[id].if ?? "", new RegExp(`contains\\(fromJSON\\(needs\\.plan\\.outputs\\.jobs\\), '${id}'\\)`),
       `${id} must run only when selected`);
   }
   assert.equal(ci.jobs.candidate.if, "always()", "the aggregate must always report");
-  assert.equal(ci.jobs.pty.if, "always() && github.event_name == 'pull_request'",
-    "the legacy PTY context reports on every pull request");
+  assert.equal(ci.jobs.pty.if, "always() && (github.event_name == 'pull_request' || fromJSON(needs.plan.outputs.plan).repairIntegration == true)",
+    "PTY reports every PR and exact repair integrations, with distinct push names");
   assert.deepEqual(ci.jobs.candidate.needs.sort(), ["plan", ...CI_JOBS.filter((id) => id !== "candidate")].sort(),
     "the aggregate must see every job");
+});
+
+test("WF-13 native proof is isolated, immutable and bound to the declared producer bytes", () => {
+  const ci = readWorkflow("ci.yml"), native = ci.jobs["native-receipt"];
+  assert.deepEqual(native.needs.sort(), ["plan", ...CI_JOBS].sort());
+  assert.match(native.body, /repairIntegration == true/);
+  assert.match(native.body, /github\.base_ref == 'develop'/);
+  assert.match(native.body, /github\.event\.pull_request\.head\.repo\.full_name == github\.repository/);
+  assert.match(native.body, /startsWith\(github\.event\.pull_request\.head\.ref, 'sutura\/fix-'\)/);
+  assert.doesNotMatch(native.body, /secrets\.|contents: write|actions: write|pull-requests: write/);
+  assert.equal((native.body.match(/uses: actions\/checkout@/g) ?? []).length, 1);
+  assert.match(native.body, /repository: juan294\/sutura/);
+  assert.match(native.body, /path: \.receipt-engine/);
+  assert.match(native.body, /fleet-native-receipt\.mjs[^\n]+"\$policy_source"/);
+  assert.match(native.body, /overwrite: false/);
+  const policy = JSON.parse(readFileSync(new URL("../.github/native-policy.json", import.meta.url), "utf8"));
+  for (const [file, kind] of [["ci.yml", "native"], ["sutura.yml", "publication"]]) {
+    const bytes = Buffer.from(readWorkflow(file).text);
+    const digest = createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+    assert.equal(policy.receiptProducers.find(producer => producer.kind === kind).blobSha, digest);
+  }
 });
 
 // Every name a job can render, per event, from its matrix rows.
@@ -46,7 +69,7 @@ test("WF-02 required context names come only from pull_request runs, on jobs doi
   // push name counts, including jobs that never run on push.
   const pushNames = renderedNames(ci, "push");
   assert.deepEqual(pushNames.filter((name) => REQUIRED.includes(name)), []);
-  assert.match(ci.jobs.pty.if, /github\.event_name == 'pull_request'/, "PTY runs on pull requests only");
+  assert.match(ci.jobs.pty.if, /github\.event_name == 'pull_request'/, "PTY still reports every PR; push names stay distinct");
   for (const id of ["test", "smoke"]) {
     const rows = [...ci.jobs[id].body.matchAll(/- \{ node: (\d+), node-version: ([\d.]+) \}/g)];
     assert.deepEqual(rows.map((row) => [row[1], row[2]]), [["22", PINS.node22], ["24", PINS.node24]]);
@@ -118,7 +141,7 @@ test("WF-04 simulated events: one authoritative selection, zero full suites on d
     coordinationPr: planCi({ event: "pull_request", repository: REPO, baseRef: "develop", headRef: "fix",
       headRepository: REPO, changedPaths: ["index.mjs"] }),
   };
-  assert.deepEqual(fullSuites(events.releasePr), Object.keys(FULL_SUITES));
+  assert.deepEqual(fullSuites(events.releasePr), [], "owner releases use the bounded gate");
   assert.deepEqual(fullSuites(events.developPush), []);
   assert.deepEqual(fullSuites(events.mainPush), []);
   assert.deepEqual(fullSuites(events.featurePr), [], "an ordinary PR to develop runs quick checks only");

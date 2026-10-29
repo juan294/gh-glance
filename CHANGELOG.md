@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-29
+
+### Added
+
+- Local Focus searches loaded Issues and PRs with `/`, topic words and exact
+  number, author, branch and updated-date filters, without extra GitHub requests.
+  Optional semantic Focus uses `--jev`, `TYPESAFE_API_KEY` and scoped consent;
+  `m` evaluates more loaded candidates. Model calls share a session cap and
+  four-second action deadline; results stay in memory. Live provider behavior,
+  semantic accuracy and developer benefit remain unqualified or unmeasured.
+- Standalone `a` shows exact personal review, assignment and authored-PR
+  attention among loaded rows, with explicit 25-item detail batches, unknown
+  relationship coverage and refresh/retry controls. Optional `J` metadata
+  badges preserve deterministic membership/order; `x` revokes permission.
+
+- Actions `d` opens exact run/attempt/job evidence in standalone mode; `l`
+  explicitly captures a bounded failed/timed-out job log. Enter opens the exact
+  selected job. Coverage and unsupported proxy/storage limitations are visible.
+- Optional CI `J` previews sanitized bounded log text before every send, then
+  reports six independent observations with existing original-line evidence.
+  `e` selects a clean smaller range; `x` revokes permission and clears active
+  log/excerpt/results. Exact GitHub facts stay authoritative; live semantic
+  qualification and developer benefit remain unmeasured.
+
+### Changed
+
+- Sutura's protected native-proof pilot records exact checkout evidence and
+  selects full native verification for repair proposals and authenticated exact
+  repair merges. Ordinary development checks and release publication authority
+  remain separate.
+- Shared quota protocol 8 upgrades the same ledger path with a private exact
+  `.pre-v8.backup`. Restart all gh-glance panes with this version; keep the
+  shared quota ledger. Never clear, delete or downgrade it for a version
+  mismatch. A future protocol requires updating every pane. Preserve a
+  conflicting backup under an unused archival filename before retrying;
+  recovery help/doctor reports its exact path. An unverified native connection
+  keeps its charge until the ledger's computed uncertainty-window recovery.
+
+### Fixed
+
+- Collector readiness now guarantees shutdown handlers are installed, so an
+  immediate stop closes the socket and lock cleanly.
+- Attention refresh compares live and cached metadata consistently, so an
+  unchanged unknown PR review value cannot invalidate its source binding.
+  Real metadata changes still retire the prior view and require explicit restart.
+
 ## [0.17.1] - 2026-10-26
 
 ### Fixed
@@ -1315,7 +1361,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.17.1...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/juan294/gh-glance/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/juan294/gh-glance/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/juan294/gh-glance/compare/v0.16.2...v0.17.0
 [0.16.2]: https://github.com/juan294/gh-glance/compare/v0.16.1...v0.16.2

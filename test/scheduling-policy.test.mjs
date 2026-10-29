@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -503,5 +503,7 @@ test("a state file from a newer protocol is still refused rather than half-read"
   // The other direction of the same rule. This build cannot know what a later
   // one added, so it must not guess -- and unlike the case above, refusing is
   // recoverable: the newer build is still there to rewrite the file.
-  assert.equal(inspectGovernor(box.scope, box.at()).reason, "corrupt");
+  const beforeBytes = readFileSync(box.scope.path, "utf8");
+  assert.equal(inspectGovernor(box.scope, box.at()).reason, "version-mismatch");
+  assert.equal(readFileSync(box.scope.path, "utf8"), beforeBytes);
 });

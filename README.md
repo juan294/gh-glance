@@ -69,6 +69,14 @@ current.
 - **Issues** -- open issues: title, author, first label, age
 - **Pull Requests** -- open PRs: title, author, branch, review status
   (approved / changes requested / pending), age
+- **[Focus](#focus-loaded-work)** -- `/` searches loaded Issues and PRs locally;
+  optional `J` adds semantic matching after explicit consent
+- **[Selected CI evidence](#selected-ci-evidence)** -- `d` opens exact run/job
+  facts and `l` loads a failed-job log in standalone mode; optional
+  [CI observations](#optional-ci-log-observations) cite original log lines
+- **[Personal attention](#personal-attention)** -- `a` shows personal review,
+  assignment and authored-PR facts in standalone mode; optional metadata badges
+  leave the exact queue and order unchanged
 - **Security** -- open Dependabot, code-scanning, and secret-scanning alerts,
   sorted with the most severe first and with severity spelled out rather than
   carried by colour alone. Each source starts with its newest 100 open alerts.
@@ -303,9 +311,16 @@ stdout isn't a terminal rather than streaming redraw frames into a pipe.
 | `R` | Resynchronize the current tab: one generation without validators, and the only key that clears a negative capability backoff. Still subject to the budget and the secondary cooldown. |
 | `s` | On Actions, request or reuse a read-only setup check (standalone only) |
 | `g` | On Actions, open the selected repository’s Actions page |
+| `/` | Search loaded Issues or Pull requests with Focus |
+| `d` | On Actions, inspect the selected run and jobs (standalone only) |
+| `a` | Open personal attention for a verified human user (standalone only) |
+| `J` | In Focus, a loaded CI log or attention, request optional Jev interpretation; requires `--jev`, an API key and scoped consent |
+| `m` | In semantic Focus, evaluate more loaded candidates; in attention, request the next GitHub detail batch |
+| `l` / `e` | In CI details, load the selected failed/timed-out job log / edit its excerpt range |
+| `x` | Revoke the current scope's Jev permission and clear its semantic results; in CI, also clear the active log and excerpt |
 | `w` | Adjust table column widths |
 | `?` | Open or close contextual help; `n` / `p` moves through its pages |
-| `q` / `Esc` / `Ctrl+C` | Quit (`Esc` leaves width mode) |
+| `q` / `Esc` / `Ctrl+C` | Quit from ordinary navigation; `Esc` leaves feature views, editors and width mode. While editing a query or range, `q` is text and `Ctrl+C` quits. |
 
 ### Adjusting column widths
 
@@ -382,6 +397,8 @@ pane definition. Flags are there when you want them:
 | `--refresh <seconds>` | Minimum automatic poll interval, 2-3600, default 5. A floor, never a ceiling: a tab whose content is unchanged twice in a row slows to 30 seconds (60 for Security), and Actions with a running or queued job is checked every 5. Safe shared grants can make any check later. |
 | `--tab <name>` | Start on `actions`, `issues`, `prs` or `security`. |
 | `--background <mode>` | `on-demand` (default): active Actions updates automatically; Issues, PRs and Security use cached data and check when opened or refreshed with `r`. Unopened tabs make no data requests. `all` continuously polls active and inactive tabs; `off` continuously polls only the selected tab. |
+| `--jev` | Enable optional semantic Focus, CI observations and attention badges in an interactive standalone dashboard. Requires `TYPESAFE_API_KEY` and explicit scoped consent; startup and ordinary refresh send no model requests. |
+| `--jev-max-requests <n>` | Set the per-process model-call cap, 1-10000 (default 100); requires `--jev`. |
 | `--verbose` | Log one line per dashboard `gh` call to stderr, with timing and outcome. Credential lookup and the account-identity proof are deliberately excluded, so that they cannot log anything derived from a token. stderr must be redirected: `gh-glance --verbose 2>gh-glance.log`. |
 | `--doctor` | Print a diagnostic report and exit. See [Diagnostics](#diagnostics). |
 | `--doctor --probe` | Add bounded, admitted GitHub capability probes to the local diagnostic report. |
@@ -608,6 +625,7 @@ Environment variables work too, and the flags take precedence:
 
 | Variable | Effect |
 |---|---|
+| `TYPESAFE_API_KEY` | TypeSafe credential used only with `--jev` and explicit scoped consent. Removed from child-process environments; never saved in dashboard or collector state. |
 | `GH_REPO=[host/]owner/name` | Watch a specific repository instead of the current directory's. A qualified value supplies the host; an unqualified value means `github.com`. An explicit `--repo` wins. |
 | `GH_HOST=<host>` | When no explicit `--repo` overrides it, send every call and the account governor to a GitHub Enterprise or EMU host instead of `github.com`. |
 | `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN` | Used by the default `gh` provider with `gh`'s host-specific precedence. gh-glance never logs or stores the raw values. One-way credential digests keep private rows access-partitioned; credentials GitHub verifies as the same principal share its quota ledger. App-provider children remove these variables before setting their memory-only installation token. |
@@ -1165,3 +1183,90 @@ See [SECURITY.md](./SECURITY.md).
 ## License
 
 [MIT](./LICENSE)
+
+### Focus loaded work
+
+On Issues or Pull requests, press `/`, type a query, and press Enter. Focus searches loaded titles, available labels and PR branches locally. Exact filters are `#123`, `author:alice`, `branch:fix/session` (case sensitive), and `updated:>=2026-10-01`. Filters and topic words are combined. Prefixes and a single edit in words of five or more characters can match; no additional GitHub request is made. Counts and source age describe only loaded metadata. Press `/` to edit, Escape to cancel an edit or return to the ordinary list, and Enter on a selected result to open GitHub. While editing, `q` is text; Ctrl-C quits.
+
+For optional semantic Focus, set `TYPESAFE_API_KEY` in your shell and start `gh-glance --jev` in an interactive standalone terminal. A key alone enables nothing. Press `J` on submitted Focus results, review the exact repository/access scope and metadata disclosure, then Enter to send or Escape to cancel. TypeSafe receives the topic, titles, available labels and PR branches; separate repository/account identity, author, body and URL fields are omitted. Query and metadata text remain literal supplied text. Public metadata also needs permission. `x` revokes that scope's permission, cancels work and clears its results. Permission and normalized results remain in memory for this session only.
+
+Semantic Focus uses pinned `jev-1.14.0`, a four-second action deadline and at most 60 uncached eligible rows per explicit action. Exact filters still run locally, and all filter-eligible rows can be considered, including synonyms absent from local results. `m` evaluates the next loaded candidates. Coverage distinguishes matches, uncertain answers and unevaluated rows; all remain inspectable and Escape returns to the ordinary list. Filter-only queries send nothing. No automatic model requests or retries occur on startup, typing, polling or refresh. The session defaults to 100 dispatched calls; `--jev-max-requests 1..10000` changes that per-process cap. Errors, cooldowns and exhaustion retain local Focus and show the next explicit action. No account retention guarantee is implied. The live provider contract and semantic accuracy are not yet qualified.
+
+### Selected CI evidence
+
+On Actions, select a run and press `d` to inspect its exact run ID, attempt,
+head SHA, jobs and step facts. Failed and timed-out jobs appear first. Up/Down
+selects a job; `l` explicitly captures a selected failed/timed-out job's plaintext
+log, and Enter opens
+that exact job on GitHub. Escape returns to ordinary Actions. This view is
+standalone only; connected collectors offer the selected run's browser link.
+Nothing is acquired for this feature during ordinary polling or idle time.
+
+The view loads one page of at most 100 jobs and 100 steps per job, and displays
+loaded/total coverage. Metadata has a 2 MiB aggregate bound and 45-second total
+deadline. A selected log has a 1 MiB cumulative bound and 20-second total
+deadline: one admitted GitHub API GET and at most one credential-free HTTPS
+storage GET, with no automatic retries or pagination. Actions read permission
+is required. Unsupported proxies or storage redirects offer Open GitHub.
+Step metadata does not imply a step-to-log-line association. Log text stays in
+session memory and never enters dashboard/collector caches.
+
+This version upgrades the shared quota protocol from 7 to 8 at the same ledger
+path. **Restart all gh-glance panes with this version; keep the shared quota
+ledger. Never clear, delete, downgrade or replace it to resolve a version
+mismatch.** Live old leases hold the upgrade until they close or expire. The
+upgrade saves an exact private `.pre-v8.backup` before its first write. A
+conflicting backup names its path in recovery help/doctor: preserve it under an
+unused archival filename before retrying. Storage failures refuse new admission.
+A future protocol requires updating and restarting every pane.
+
+An unverified native connection closure retains its quota charge and displays
+the computed uncertainty-window deadline. Restarting a pane does not refund that
+charge. The ledger's existing verified closure/boot/window recovery rules apply;
+Open GitHub remains available while waiting.
+
+### Optional CI log observations
+
+With `--jev` and `TYPESAFE_API_KEY`, press `J` after explicitly loading a selected failed/timed-out job log. Every send opens a TypeSafe preview of the exact sanitized state, even when this session already has permission or the answer is cached. PgUp/PgDn reviews the complete preview; Enter sends and Escape cancels without sending. Separate repository/account/run identity fields and step names stay local. Log text can still contain private or identifying content; redaction does not guarantee that it is secret-free.
+
+Known credentials, authorization/cookie headers, private-key blocks and signed links are redacted locally and block cloud submission for the selected range. Press `e`, type an existing `start-end` line range, one line number, or `all`, and Enter to apply it. A clean smaller range can reach a new preview. While editing, `q` is text and Ctrl-C quits. Excerpts retain original line numbers, contain at most 40 spans/8 KiB, and disclose omitted or truncated lines. Source log capture and GitHub facts remain independent of inference.
+
+The six independent observations are assertion mismatch, dependency-download failure, explicit permission denial, reported execution timeout, explicit memory exhaustion, and concrete static-check diagnostics. A positive observation must point to an existing span in this exact run/attempt/SHA/job/excerpt. These are reported log observations rather than proven root causes or generated fixes. “No listed observation found” applies only to this excerpt; uncertain or missing evidence does not mean healthy CI. GitHub's conclusion is always retained. Results are invalidated by source, account, job, log or range changes and expire after ten minutes.
+
+`x` revokes this scope's Jev permission, cancels work and clears the active log/excerpt/results; press `l` to load a log again. Requests use the shared four-second deadline, call cap and bounded memory-only cache. Typing, refreshing, polling and opening a view never send model requests. Errors retain local evidence and show an explicit review/retry or smaller-range action. The live Jev contract, semantic accuracy and developer benefit remain unverified or unmeasured.
+
+### Personal attention
+
+Press `a` in standalone mode to inspect direct review requests, assignments and
+viewer-authored PRs among the currently loaded Issues and PRs. The account must
+be a verified human GitHub user. Cached identities without a human proof offer
+`r` to verify `/user` explicitly; connected views and GitHub App installations
+explain how to use standalone user authentication.
+
+Opening requests at most 25 details. `m` explicitly requests the next 25, up to
+300 frozen candidates; it never drains the list automatically. `r` refreshes the
+first source page for Issues and PRs, rebuilds the manifest, and requests one
+batch. Empty/unloaded lists require that explicit action. Source coverage/age
+and each detail batch's age remain separate. Details expire after five minutes;
+changed source metadata or account scope requires an explicit refresh/restart.
+Errors retain prior same-scope facts as partial/as-of and show retry controls.
+
+The fixed order is direct personal review requests, assigned Issues, changes
+requested on your non-draft PRs, assigned PRs, then other authored PRs under
+Following. Draft badges and all exact reasons remain visible. Within a tier,
+items use their update time, oldest first; this is not request age or an overdue
+claim. `u` inspects unknown/unqueried relationships. Truncated nested lists cannot
+prove absence; team review requests do not establish personal membership.
+PgUp/PgDn scroll disclosures, arrows select, Enter opens the original Issue/PR
+URL, and Escape returns to ordinary navigation.
+
+With `--jev`, `J` optionally annotates current unchanged attention metadata with
+“Reports regression” and “Describes user impact.” Review the TypeSafe destination,
+exact repository/access scope and title/label/branch disclosure, then Enter Send
+or Escape Cancel. Badges cannot change queue membership, reasons, tier, order or
+navigation. Each explicit `J` covers at most 60 eligible rows, using at most 15
+rows per HTTP request and complete badge pairs packed within 24 KiB. Repeated
+`J` advances remaining rows; `m` remains GitHub detail pagination. `x` revokes
+permission and clears badges while retaining exact facts. The shared deadline,
+call cap, cooldown and memory limits apply. The live provider contract, badge
+accuracy and developer benefit remain unverified or unmeasured.

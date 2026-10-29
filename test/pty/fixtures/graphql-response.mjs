@@ -6,7 +6,7 @@
 // The document is parsed with the request oracle's grammar rather than
 // pattern-matched, so an unbounded page, an unknown field, or two connections
 // in one document fail here instead of being answered generically.
-import { readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -19,7 +19,9 @@ const DIR = dirname(fileURLToPath(import.meta.url));
 // larger set so that path can actually be driven.
 const SYNTHETIC_ROWS = Number.parseInt(process.env.GH_GLANCE_FIXTURE_GRAPHQL_ROWS ?? "", 10);
 
+function attentionFixture(){try{return process.env.GH_GLANCE_ATTENTION_FILE?JSON.parse(readFileSync(process.env.GH_GLANCE_ATTENTION_FILE,'utf8')):{};}catch{return {};}}
 function rows(name) {
+  const overridden=attentionFixture().sources?.[name.replace('.json','')];if(Array.isArray(overridden))return overridden;
   const real = JSON.parse(readFileSync(join(DIR, name), "utf8"));
   if (!Number.isSafeInteger(SYNTHETIC_ROWS) || SYNTHETIC_ROWS <= real.length) return real;
   return Array.from({ length: SYNTHETIC_ROWS }, (_, index) => {
@@ -28,7 +30,7 @@ function rows(name) {
   });
 }
 
-export const GRAPHQL_COSTS = { "graphql.observer": 1, "repository.identity": 1, "issues.page": 2, "pulls.page": 2 };
+export const GRAPHQL_COSTS = { "graphql.observer": 1, "repository.identity": 1, "issues.page": 2, "pulls.page": 2, "attention.details":2 };
 
 // Returns the parsed shape, or a rejection describing why the document was
 // refused. GitHub answers a rejected query with HTTP 200 and an errors array,
@@ -90,6 +92,27 @@ export function graphqlResponseFor(parsed, { host = "github.com", budget = null 
   if (shape.operation === "repository.identity") {
     return { operation: shape.operation, status: 200, cost, body: JSON.stringify({ data: { repository: base, rateLimit } }) };
   }
+  if(shape.operation==='attention.details'){
+    const config=attentionFixture();if(process.env.GH_GLANCE_ATTENTION_EVENTS)appendFileSync(process.env.GH_GLANCE_ATTENTION_EVENTS,JSON.stringify({kind:'start',numbers:shape.candidates.map(c=>c.number)})+'\n');if(config.delay)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,config.delay);
+    const viewerId=Number(process.env.GH_GLANCE_FIXTURE_USER_ID??1),login=process.env.GH_GLANCE_FIXTURE_LOGIN??'octocat',connection=(nodes=[])=>({totalCount:nodes.length,pageInfo:{hasNextPage:false},nodes});
+    const slots={};for(const candidate of shape.candidates){
+      const issue=rows('issues.json').find(r=>r.number===candidate.number),pr=rows('prs.json').find(r=>r.number===candidate.number),row=issue??pr;
+      slots[candidate.alias]=Object.hasOwn(config.details??{},candidate.number)?config.details[candidate.number]:!row?null:{__typename:issue?'Issue':'PullRequest',id:`${issue?'I':'PR'}_${row.number}`,number:row.number,closed:false,updatedAt:row.updatedAt,viewerDidAuthor:!issue,assignees:connection([{id:`U_${viewerId}`,login}]),...(!issue?{isDraft:row.isDraft??false,reviewDecision:row.reviewDecision??null,reviewRequests:connection([{requestedReviewer:{__typename:'User',id:`U_${viewerId}`,login}}])}:{})};
+    }
+    const data={viewer:config.viewer??{id:`U_${viewerId}`,databaseId:viewerId,login},repository:{...base,...slots},rateLimit};
+    const body=config.oversize?' '.repeat(2*1024*1024+1):JSON.stringify({data,...(config.errors?{errors:[{message:'synthetic permission denial'}]}:{})});
+    if(config.responseGateFile&&existsSync(config.responseGateFile)){
+      const event=kind=>{if(process.env.GH_GLANCE_ATTENTION_EVENTS)appendFileSync(process.env.GH_GLANCE_ATTENTION_EVENTS,JSON.stringify({kind,at:Date.now()})+'\n');};
+      event('attention-response-gate-enter');
+      const deadline=Date.now()+12000,waitCell=new Int32Array(new SharedArrayBuffer(4));
+      while(existsSync(config.responseGateFile)&&Date.now()<deadline)Atomics.wait(waitCell,0,0,20);
+      if(existsSync(config.responseGateFile)){event('attention-response-gate-expired');throw new Error('Synthetic attention response gate timed out');}
+      event('attention-response-gate-released');
+    }
+    if(process.env.GH_GLANCE_ATTENTION_EVENTS)appendFileSync(process.env.GH_GLANCE_ATTENTION_EVENTS,JSON.stringify({kind:'end',numbers:shape.candidates.map(c=>c.number)})+'\n');
+    return {operation:shape.operation,status:config.status??200,cost,body};
+  }
+  if(['issues.page','pulls.page'].includes(shape.operation)&&attentionFixture().sourceDelay)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,attentionFixture().sourceDelay);
   if (shape.operation === "issues.page") {
     const issues = connection(rows("issues.json"), (row) => ({
       id: `I_${row.number}`,

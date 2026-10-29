@@ -1,4 +1,50 @@
 {
   "version": 1,
-  "runtime": "node"
+  "runtime": "node",
+  "reproductionProfiles": [
+    {
+      "id": "pilot-terminal-rest",
+      "nativeCommand": "node scripts/test-select.mjs run pty:rest",
+      "cwd": ".",
+      "argv": [
+        "node",
+        "--test",
+        "--test-reporter=spec",
+        "--test-concurrency=1",
+        "--test-timeout=900000"
+      ],
+      "sourceInputs": [
+        {
+          "path": "package.json",
+          "sha256": "5fcf63d0211ae7068c8adc7b2bc8aa3eb7ead839e3a552fa7260cd6a970965d0"
+        },
+        {
+          "path": "scripts/test-select.mjs",
+          "sha256": "a954e9232ad1a60ce976ebc93ce4791ab97400850a1c1b7779da47c2481f8cd3"
+        },
+        {
+          "path": ".github/workflows/ci.yml",
+          "sha256": "256fb28ea3bf7600f25b208d20a27bebe82571988dd25bed947fd3bb9ea1e2f8"
+        },
+        {
+          "path": "package-lock.json",
+          "sha256": "13b5aecd550d103815d5b807beb2a570885885e69b48193c579959e992a59b32"
+        }
+      ],
+      "nativeNodeVersion": "22.22.2",
+      "sandboxNodeVersion": "22.22.2",
+      "imageRef": "node:22.22.2-bookworm@sha256:03746f6aafd73f2da621094d5e27426225820e93bc202daea0cf1fa388c1ce09",
+      "probeTimeoutSec": 600,
+      "fullCommand": "node scripts/test-select.mjs run pty:rest",
+      "fullTimeoutSec": 1800,
+      "callers": [],
+      "approverIds": [],
+      "providerTimeoutLimitKey": "instance_max_timeout"
+    }
+  ],
+  "protectedPaths": [
+    ".github/native-policy.json",
+    ".github/workflows/**",
+    "scripts/release-candidate.mjs"
+  ]
 }

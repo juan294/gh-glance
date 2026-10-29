@@ -6,7 +6,8 @@ Only the current release line receives security patches.
 
 | Version | Supported           |
 | ------- | ------------------- |
-| 0.17.x  | Yes                 |
+| 0.18.x  | Yes                 |
+| 0.17.x  | No                  |
 | 0.16.x  | No                  |
 | 0.15.x  | No                  |
 | 0.14.x  | No                  |
@@ -191,8 +192,8 @@ installation ID, absolute private-key path, repository-ID allowlist, and an
 explicit read-only permission set. The private key must be a regular,
 current-user-owned mode-0600 file. It is read only on the collector machine and
 is never sent over the collector protocol. RS256 JWTs live only for signing and
-the installation token remains memory-only. App authentication is the sole
-native HTTPS GitHub request: it uses the fixed installation-token endpoint,
+the installation token remains memory-only. App authentication uses a separate
+native HTTPS path with the fixed installation-token endpoint,
 normal TLS verification, no redirects, a ten-second deadline, and a 1 MiB
 response bound. GitHub.com uses `api.github.com`; Enterprise Server uses its
 validated host and `/api/v3` prefix.
@@ -211,6 +212,40 @@ that completes after installation authority changes. Installation core
 authority comes from conditional `/installation/repositories?per_page=1`, never
 `/user`. Authentication, permission, suspension, expiry, and unsupported-source
 failures retain last-known-good rows and never fall back to a personal token.
+
+Selected failed/timed-out job logs are a second bounded native HTTPS path,
+available only after an explicit standalone action. One admitted authenticated
+GET targets the validated host, repository and job's fixed GitHub log endpoint.
+Its redirect permits at most one credential-free HTTPS storage GET; further
+redirects, invalid storage URLs and unsupported proxies fail closed with an Open
+GitHub action. Normal TLS verification stays enabled. Both stages share a 1 MiB
+byte bound and a 20-second deadline. Unproven connection closure retains the
+conservative quota charge. Captured logs stay in session memory and never enter
+dashboard caches, acquisition snapshots or collector frames.
+
+Optional Jev interpretation requires an interactive standalone dashboard,
+`--jev`, `TYPESAFE_API_KEY` and explicit permission for the exact repository/access
+scope. The pinned SDK sends only to `https://api.typesafe.ai/v1/systemone`, using
+`jev-1.14.0`, disabled SDK logging and automatic retries, a four-second action
+deadline and a bounded session call cap. Every child-process environment removes
+`TYPESAFE_API_KEY`. The key, permissions and normalized results are not persisted
+in application state; `x` revokes permission, cancels work and clears results.
+In CI it also clears the active log and excerpt. This makes no guarantee about
+the provider's retention policy.
+
+Focus discloses topic text, titles, available labels and PR branches. Attention
+badges disclose titles, available labels and branches. Separate account,
+repository, author, body and URL fields are omitted, but literal metadata can
+still identify a project or contain private information. CI interpretation
+previews the exact sanitized excerpt before every send, with original line
+references and omission/truncation disclosures. Known credential patterns,
+authorization/cookie headers, private-key blocks and signed links are redacted
+and block submission of the selected range. A clean smaller range can be
+reviewed separately. Redaction is not a guarantee that text is secret-free.
+Typing, startup, polling and source refresh never send model requests. Model
+observations cannot change GitHub conclusions, authorize actions or alter exact
+attention membership, reasons or ordering. The live provider contract and
+semantic accuracy remain unqualified.
 
 The published npm artifact is also a security boundary. Its manifest contains
 only `index.mjs`, `package.json`, `README.md`, `CHANGELOG.md`, and `LICENSE`;
@@ -340,7 +375,8 @@ them.
 
 Default standalone and `gh` collector providers delegate authentication to the
 existing `gh auth login` session, including on GitHub Enterprise and EMU hosts.
-Their repository data calls go through the `gh` CLI. Effective credential
+Ordinary repository metadata goes through the `gh` CLI; selected standalone job
+logs use the bounded native adapter described above. Effective credential
 selection follows `gh`'s host-specific environment precedence. When no
 applicable environment token is selected, a dedicated non-logging `gh auth
 token --hostname <host>` call obtains the local credential, hashes it

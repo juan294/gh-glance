@@ -51,8 +51,10 @@ throttle coverage already creates real concurrent panes; parallel files can
 starve independent PTY deadlines. Individual cases still exercise their required
 process concurrency. CI routes by change (see `.github/workflows/ci.yml`): a
 `develop` -> `main` release PR packs one tarball, checks it on Node 22/24 and
-runs the selected suites once; `develop` pushes run quick checks; `main` pushes
-only prove the merge tree equals the tested one.
+runs the selected suites once; ordinary `develop` pushes run quick checks;
+Sutura repair proposals and authenticated exact same-repository repair merges
+select full native verification. `main` pushes only prove the merge tree equals
+the tested one. Sutura owns CI routing; this describes the installed behavior.
 
 ## Git Workflow
 
@@ -63,8 +65,10 @@ only prove the merge tree equals the tested one.
 Conventional commits, lowercase, no scope required:
 `feat|fix|docs|chore|refactor: description`
 
-`develop` is unprotected: commit directly to it. This is a solo project, so
-the PR-per-change ceremony was pure overhead -- removed 2026-08-04. Run
+`develop` permits direct pushes with no required PR, review or CI gate. Owner
+decision, 2026-10-28: minimal protection blocks force-pushes and deletion,
+including for admins, and supplies Sutura's protected native-policy boundary.
+The solo-project direct-push workflow remains in place. Run
 verification locally *before* committing (lint, test, test:pty as needed);
 CI on `develop` is now observed after the fact rather than gating the push,
 so a green local run is what stands between a bad commit and a red `develop`.

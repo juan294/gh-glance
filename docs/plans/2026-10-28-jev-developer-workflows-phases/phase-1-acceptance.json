@@ -1,0 +1,423 @@
+{
+  "schema_version": 1,
+  "objective": "Phase 1 useful local Focus with source isolation and all source modes",
+  "candidate": "4b54eecbb4eaeddeae1c793977a0b3ecf9ed87f36528a04dc53fa0e3e4a84252",
+  "phase": "implement",
+  "approved_phases": [
+    "implement"
+  ],
+  "resource_limit": 2,
+  "assignments": [
+    {
+      "id": "runtime",
+      "owner": "parent",
+      "role": "implementer",
+      "objective": "Implement local Focus with TDD and preserve approved plan/research",
+      "allowed_actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "allowed_files": [
+        "CONTRIBUTING.md",
+        "README.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/consumer-sweep.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-1.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-2.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-3.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-4.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-5.md",
+        "docs/plans/2026-10-28-jev-developer-workflows.md",
+        "docs/research/2026-10-28-jev-capabilities-and-current-architecture.md",
+        "docs/research/2026-10-28-jev-opportunities-assessment.md",
+        "index.mjs",
+        "scripts/measure-feature-interaction.mjs",
+        "scripts/measure-focus.mjs",
+        "test/focus.test.mjs",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-1-acceptance.json"
+      ],
+      "evidence_contract": "Exact scoped files, findings and source/check identities",
+      "resource_constraints": "One sequential verification command; no provider call or publication",
+      "completion_condition": "Return complete current-candidate scoped result",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "runtime-and-corpus"
+    },
+    {
+      "id": "corpus",
+      "owner": "phase1_corpus",
+      "role": "implementer",
+      "objective": "Create frozen labeled synthetic corpus",
+      "allowed_actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "allowed_files": [
+        "test/fixtures/jev/focus.json"
+      ],
+      "evidence_contract": "Exact scoped files, findings and source/check identities",
+      "resource_constraints": "One sequential verification command; no provider call or publication",
+      "completion_condition": "Return complete current-candidate scoped result",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "runtime-and-corpus"
+    },
+    {
+      "id": "pty",
+      "owner": "phase1_corpus",
+      "role": "implementer",
+      "objective": "Exercise real feature interactions and source modes",
+      "allowed_actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "allowed_files": [
+        "test/pty/focus.test.mjs"
+      ],
+      "evidence_contract": "Exact scoped files, findings and source/check identities",
+      "resource_constraints": "One sequential verification command; no provider call or publication",
+      "completion_condition": "Return complete current-candidate scoped result",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "pty-sequential"
+    },
+    {
+      "id": "review",
+      "owner": "phase1_review",
+      "role": "reviewer",
+      "objective": "Independently review plan compliance and three simplify lenses",
+      "allowed_actions": [
+        "read",
+        "check"
+      ],
+      "allowed_files": [
+        "index.mjs",
+        "test/",
+        "scripts/",
+        "README.md",
+        "CONTRIBUTING.md",
+        "docs/plans/"
+      ],
+      "evidence_contract": "Exact scoped files, findings and source/check identities",
+      "resource_constraints": "One sequential verification command; no provider call or publication",
+      "completion_condition": "Return complete current-candidate scoped result",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "review-sequential"
+    }
+  ],
+  "results": [
+    {
+      "assignment_id": "runtime",
+      "status": "complete",
+      "candidate": "4b54eecbb4eaeddeae1c793977a0b3ecf9ed87f36528a04dc53fa0e3e4a84252",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-gate-status.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "changed_files": [
+        "CONTRIBUTING.md",
+        "README.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/consumer-sweep.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-1.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-2.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-3.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-4.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-5.md",
+        "docs/plans/2026-10-28-jev-developer-workflows.md",
+        "docs/research/2026-10-28-jev-capabilities-and-current-architecture.md",
+        "docs/research/2026-10-28-jev-opportunities-assessment.md",
+        "index.mjs",
+        "scripts/measure-feature-interaction.mjs",
+        "scripts/measure-focus.mjs",
+        "test/focus.test.mjs",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-1-acceptance.json"
+      ]
+    },
+    {
+      "assignment_id": "corpus",
+      "status": "complete",
+      "candidate": "4b54eecbb4eaeddeae1c793977a0b3ecf9ed87f36528a04dc53fa0e3e4a84252",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-gate-status.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "changed_files": [
+        "test/fixtures/jev/focus.json"
+      ]
+    },
+    {
+      "assignment_id": "pty",
+      "status": "complete",
+      "candidate": "4b54eecbb4eaeddeae1c793977a0b3ecf9ed87f36528a04dc53fa0e3e4a84252",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-gate-status.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "changed_files": [
+        "test/pty/focus.test.mjs"
+      ]
+    },
+    {
+      "assignment_id": "review",
+      "status": "complete",
+      "candidate": "4b54eecbb4eaeddeae1c793977a0b3ecf9ed87f36528a04dc53fa0e3e4a84252",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-gate-status.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check"
+      ],
+      "changed_files": []
+    }
+  ],
+  "behavioral_change": true,
+  "tdd": {
+    "regression": "Local query semantics and source-empty versus filtered-empty UI",
+    "red": {
+      "sequence": 0,
+      "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/gh-glance-jev-phase1-red.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/gh-glance-jev-phase1-source-empty-red.log"
+    },
+    "green": {
+      "sequence": 4,
+      "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-unit-final.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-pty-final.log",
+      "candidate": "4b54eecbb4eaeddeae1c793977a0b3ecf9ed87f36528a04dc53fa0e3e4a84252"
+    }
+  },
+  "findings": [
+    {
+      "id": "UX-M1",
+      "review_id": "F1",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-pty-final.log"
+      ]
+    },
+    {
+      "id": "UX-M2",
+      "review_id": "F2",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-pty-final.log"
+      ]
+    },
+    {
+      "id": "UX-M3",
+      "review_id": "F3",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-pty-final.log"
+      ]
+    },
+    {
+      "id": "UX-M4",
+      "review_id": "F4",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-pty-final.log"
+      ]
+    },
+    {
+      "id": "UX-M5",
+      "review_id": "F5",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-pty-final.log"
+      ]
+    },
+    {
+      "id": "UX-M6",
+      "review_id": "F6",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-pty-final.log"
+      ]
+    },
+    {
+      "id": "UX-M7",
+      "review_id": "F7",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-pty-final.log"
+      ]
+    },
+    {
+      "id": "UX-M8",
+      "review_id": "F8",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-pty-final.log"
+      ]
+    },
+    {
+      "id": "UX-M9",
+      "review_id": "F9",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-pty-final.log"
+      ]
+    },
+    {
+      "id": "UX-M10",
+      "review_id": "F10",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-pty-final.log"
+      ]
+    },
+    {
+      "id": "UX-M11",
+      "review_id": "F11",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-pty-final.log"
+      ]
+    },
+    {
+      "id": "UX-M12",
+      "review_id": "F12",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-pty-final.log"
+      ]
+    }
+  ],
+  "simplify": {
+    "mode": "parent",
+    "changed_files": [
+      "CONTRIBUTING.md",
+      "README.md",
+      "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+      "docs/plans/2026-10-28-jev-developer-workflows-phases/consumer-sweep.md",
+      "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-1.md",
+      "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-2.md",
+      "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-3.md",
+      "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-4.md",
+      "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-5.md",
+      "docs/plans/2026-10-28-jev-developer-workflows.md",
+      "docs/research/2026-10-28-jev-capabilities-and-current-architecture.md",
+      "docs/research/2026-10-28-jev-opportunities-assessment.md",
+      "index.mjs",
+      "scripts/measure-feature-interaction.mjs",
+      "scripts/measure-focus.mjs",
+      "test/focus.test.mjs",
+      "test/fixtures/jev/focus.json",
+      "test/pty/focus.test.mjs",
+      "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-1-acceptance.json"
+    ],
+    "invalidated_checks": [],
+    "checks": [
+      {
+        "id": "lint",
+        "command": [
+          "npm",
+          "run",
+          "lint"
+        ],
+        "exit": 0,
+        "seconds": 2.572,
+        "candidate": "4b54eecbb4eaeddeae1c793977a0b3ecf9ed87f36528a04dc53fa0e3e4a84252",
+        "log": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-lint-final.log"
+      },
+      {
+        "id": "syntax",
+        "command": [
+          "node",
+          "--check",
+          "index.mjs"
+        ],
+        "exit": 0,
+        "seconds": 0.049,
+        "candidate": "4b54eecbb4eaeddeae1c793977a0b3ecf9ed87f36528a04dc53fa0e3e4a84252",
+        "log": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-syntax-final.log"
+      },
+      {
+        "id": "unit",
+        "command": [
+          "npm",
+          "test"
+        ],
+        "exit": 0,
+        "seconds": 400.156,
+        "candidate": "4b54eecbb4eaeddeae1c793977a0b3ecf9ed87f36528a04dc53fa0e3e4a84252",
+        "log": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-unit-final.log"
+      },
+      {
+        "id": "pty",
+        "command": [
+          "npm",
+          "run",
+          "test:pty"
+        ],
+        "exit": 0,
+        "seconds": 2273.841,
+        "candidate": "4b54eecbb4eaeddeae1c793977a0b3ecf9ed87f36528a04dc53fa0e3e4a84252",
+        "log": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-pty-final.log"
+      },
+      {
+        "id": "ranking",
+        "command": [
+          "node",
+          "scripts/measure-focus.mjs"
+        ],
+        "exit": 0,
+        "seconds": 0.336,
+        "candidate": "4b54eecbb4eaeddeae1c793977a0b3ecf9ed87f36528a04dc53fa0e3e4a84252",
+        "log": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-ranking-final.log"
+      },
+      {
+        "id": "interaction",
+        "command": [
+          "node",
+          "scripts/measure-feature-interaction.mjs",
+          "/tmp/gh-glance-jev-baseline-0319c9c/index.mjs"
+        ],
+        "exit": 0,
+        "seconds": 22.205,
+        "candidate": "4b54eecbb4eaeddeae1c793977a0b3ecf9ed87f36528a04dc53fa0e3e4a84252",
+        "log": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase1-interaction-final.log"
+      }
+    ]
+  }
+}

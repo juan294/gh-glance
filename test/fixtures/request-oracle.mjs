@@ -1,3 +1,4 @@
+import {ciResponse} from '../pty/fixtures/ci-response.mjs';
 // Independent synthetic GitHub server. Never import application accounting here.
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -36,7 +37,7 @@ export function oracleEnvironment({ root, statePath, credential = "fixture-full"
 // fragments and extra connections fail closed instead of getting a cheap answer.
 export function graphqlShape(query, variables) {
   const tokens = [];
-  const scanner = /\s+|#[^\n]*|"(?:[^"\\]|\\.)*"|[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[!$():{},[\]]/gy;
+  const scanner = /\s+|#[^\n]*|"(?:[^"\\]|\\.)*"|[A-Za-z_][A-Za-z_0-9]*|[0-9]+|\.\.\.|[!$@():{},[\]]/gy;
   let position = 0;
   while (position < query.length) {
     scanner.lastIndex = position;
@@ -46,6 +47,7 @@ export function graphqlShape(query, variables) {
     if (!/^\s|^#|^,$/.test(token)) tokens.push(token);
   }
   let index = 0;
+  let argumentReferences=null;
   const take = (expected) => {
     if (tokens[index++] !== expected) throw new Error("unknown fixture GraphQL query shape");
   };
@@ -56,7 +58,7 @@ export function graphqlShape(query, variables) {
   };
   function value() {
     const token = tokens[index++];
-    if (token === "$") return variables[name()];
+    if (token === "$") {const variable=name();argumentReferences?.push(variable);return variables[variable];}
     if (token === "[") {
       const list = [];
       while (tokens[index] !== "]" && index < tokens.length) list.push(value());
@@ -76,23 +78,34 @@ export function graphqlShape(query, variables) {
     if (/^[A-Za-z_][A-Za-z_0-9]*$/.test(token ?? "")) return token;
     throw new Error("unknown fixture GraphQL argument");
   }
+  const declarations={};
   function selection() {
     take("{");
     const fields = {};
     while (tokens[index] !== "}" && index < tokens.length) {
-      const field = name();
+      if(tokens[index]==='...'){
+        index++;take('on');const type=name(),field=`...on${type}`;
+        if(Object.hasOwn(fields,field))throw new Error('duplicate fragment');
+        fields[field]={args:{},children:selection(),actual:field,directives:[]};continue;
+      }
+      let field=name(),actual=field;
+      if(field==='on')throw new Error('unknown fragment');
+      if(tokens[index-1]==='...')throw new Error('unknown fragment');
+      if(tokens[index] === ':'){index++;actual=name();}
       if (Object.hasOwn(fields, field)) throw new Error("duplicate fixture GraphQL field");
-      const args = {};
+      const args = {},references={};
       if (tokens[index] === "(") {
         index += 1;
         while (tokens[index] !== ")" && index < tokens.length) {
           const key = name();
           if (Object.hasOwn(args, key)) throw new Error("duplicate fixture GraphQL argument");
-          take(":"); args[key] = value();
+          take(":"); argumentReferences=[];args[key] = value();references[key]=argumentReferences;argumentReferences=null;
         }
         take(")");
       }
-      fields[field] = { args, children: tokens[index] === "{" ? selection() : null };
+      const directives=[];
+      while(tokens[index]==='@'){index++;const directive=name();take('(');const arg=name();take(':');take('$');const variable=name();take(')');directives.push({name:directive,arg,variable,value:variables[variable]});}
+      fields[field] = { args, children: tokens[index] === "{" ? selection() : null,actual,directives,references };
     }
     take("}");
     return fields;
@@ -101,16 +114,42 @@ export function graphqlShape(query, variables) {
     index += 1;
     if (/^[A-Za-z_]/.test(tokens[index] ?? "")) index += 1;
     if (tokens[index] === "(") {
-      let depth = 0;
-      do {
-        if (tokens[index] === "(") depth += 1;
-        if (tokens[index++] === ")") depth -= 1;
-      } while (depth > 0 && index < tokens.length);
-      if (depth !== 0) throw new Error("unknown fixture GraphQL variable declaration");
+      index++;
+      while(tokens[index]!==')'&&index<tokens.length){take('$');const variable=name();take(':');let type=name();if(tokens[index]==='!'){index++;type+='!';}if(Object.hasOwn(declarations,variable))throw new Error('duplicate variable');declarations[variable]=type;}
+      take(')');
     }
   }
   const root = selection();
   if (index !== tokens.length) throw new Error("unknown fixture GraphQL extra operation");
+  const aliases=Object.keys(root.repository?.children??{}).filter(k=>/^c[0-9]+$/.test(k));
+  if(aliases.length){
+    const exact=(fields,keys)=>{if(!fields||Object.keys(fields).sort().join('|')!==keys.sort().join('|'))throw new Error('unknown attention shape');};
+    const leaves=(fields,keys)=>{exact(fields,keys);for(const [key,field] of Object.entries(fields))if(field.actual!==key||field.children||Object.keys(field.args).length||field.directives.length)throw new Error('unknown attention leaf');};
+    const wrappers=(fields)=>{for(const [key,field]of Object.entries(fields)){if(!/^c[0-9]+$/.test(key)&&field.actual!==key)throw new Error('attention field alias');if(!/^c[0-9]+$/.test(key)&&key!=='repository'&&key!=='assignees'&&key!=='reviewRequests'&&(Object.keys(field.args).length||field.directives.length))throw new Error('attention wrapper');if(field.children)wrappers(field.children);}};wrappers(root);
+    exact(root,['viewer','repository','rateLimit']);leaves(root.viewer.children,['id','databaseId','login']);leaves(root.rateLimit.children,['cost','limit','used','remaining','resetAt']);
+    const repo=root.repository;exact(repo.args,['owner','name']);if(JSON.stringify(repo.references)!==JSON.stringify({owner:['owner'],name:['name']})||repo.directives.length)throw new Error('repository directive');
+    const expectedDeclarations={owner:'String!',name:'String!'};for(let i=0;i<25;i++){expectedDeclarations[`n${i}`]='Int!';expectedDeclarations[`use${i}`]='Boolean!';}
+    exact(declarations,Object.keys(expectedDeclarations));exact(variables,Object.keys(expectedDeclarations));
+    for(const [key,type]of Object.entries(expectedDeclarations)){if(declarations[key]!==type|| (type==='Int!'?(!Number.isSafeInteger(variables[key])||variables[key]<=0):type==='Boolean!'?typeof variables[key]!=='boolean':typeof variables[key]!=='string'||!variables[key]))throw new Error('attention variable type');}
+    exact(repo.children,['id','nameWithOwner','url',...Array.from({length:25},(_,i)=>`c${i}`)]);
+    leaves(Object.fromEntries(['id','nameWithOwner','url'].map(k=>[k,repo.children[k]])),['id','nameWithOwner','url']);
+    const candidates=[];
+    for(let i=0;i<25;i++){
+      const slot=repo.children[`c${i}`];if(slot.actual!=='issueOrPullRequest'||slot.args.number!==variables[`n${i}`]||JSON.stringify(slot.references?.number)!==JSON.stringify([`n${i}`])||Object.keys(slot.args).join()!=='number'||JSON.stringify(slot.directives)!==JSON.stringify([{name:'include',arg:'if',variable:`use${i}`,value:variables[`use${i}`]}]))throw new Error('attention alias or directive');
+      exact(slot.children,['__typename','...onIssue','...onPullRequest']);leaves({__typename:slot.children.__typename},['__typename']);
+      for(const kind of ['Issue','PullRequest']){
+        const branch=slot.children[`...on${kind}`];if(Object.keys(branch.args).length||branch.directives.length)throw new Error('attention fragment');
+        const fields=branch.children,scalar=['id','number','closed','updatedAt','viewerDidAuthor',...(kind==='PullRequest'?['isDraft','reviewDecision']:[])];
+        exact(fields,[...scalar,'assignees',...(kind==='PullRequest'?['reviewRequests']:[])]);leaves(Object.fromEntries(scalar.map(k=>[k,fields[k]])),scalar);
+        for(const field of ['assignees',...(kind==='PullRequest'?['reviewRequests']:[])]){
+          const connection=fields[field];if(JSON.stringify(connection.args)!==JSON.stringify({first:50})||connection.references?.first?.length||connection.directives.length)throw new Error('unbounded attention connection');exact(connection.children,['totalCount','pageInfo','nodes']);leaves({totalCount:connection.children.totalCount},['totalCount']);leaves(connection.children.pageInfo.children,['hasNextPage']);
+          if(field==='assignees')leaves(connection.children.nodes.children,['id','login']);else{const nodes=connection.children.nodes.children;exact(nodes,['requestedReviewer']);const reviewer=nodes.requestedReviewer.children;exact(reviewer,['__typename','...onUser']);leaves({__typename:reviewer.__typename},['__typename']);leaves(reviewer['...onUser'].children,['id','login']);}
+        }
+      }
+      if(variables[`use${i}`])candidates.push({alias:`c${i}`,number:variables[`n${i}`]});
+    }
+    return {operation:'attention.details',pageSize:25,candidates,repository:`${repo.args.owner}/${repo.args.name}`};
+  }
   const leaf = null;
   const author = { login: leaf };
   const node = { id: leaf, number: leaf, title: leaf, url: leaf, createdAt: leaf, updatedAt: leaf, author,
@@ -120,6 +159,7 @@ export function graphqlShape(query, variables) {
     repository: { id: leaf, name: leaf, nameWithOwner: leaf, url: leaf, viewerPermission: leaf, issues: connection, pullRequests: connection } };
   function validate(fields, expected) {
     for (const [field, definition] of Object.entries(fields)) {
+      if(definition.actual!==field || definition.directives.length)throw new Error("unknown fixture GraphQL alias or directive");
       if (!expected || !Object.hasOwn(expected, field)) throw new Error(`unknown fixture GraphQL field: ${field}`);
       const allowedArgs = field === "repository" ? ["owner", "name"] :
         ["issues", "pullRequests"].includes(field) ? ["first", "after", "states", "orderBy"] : field === "labels" ? ["first"] : [];
@@ -149,6 +189,7 @@ export function graphqlShape(query, variables) {
 }
 
 export function identifyOracleRequest(argv, { input = null } = {}) {
+  if (argv.some(arg=>/^--log/.test(arg))) throw new Error("gh log acquisition is forbidden");
   if (argv[0] === "--version") return { operation: "cli.version", local: true };
   if (argv[0] === "auth" && argv[1] === "token") return { operation: "cli.token", local: true };
 
@@ -228,11 +269,13 @@ export function identifyOracleRequest(argv, { input = null } = {}) {
     // Priced per operation, identically to test/pty/fixtures/graphql-response.mjs.
     // A flat price of 1 modelled economics no server has and hid a real
     // double-charge that only appears at three points or more.
-    const cost = { "graphql.observer": 1, "repository.identity": 1, "issues.page": 2, "pulls.page": 2 }[shape.operation] ?? 1;
+    const cost = { "graphql.observer": 1, "repository.identity": 1, "issues.page": 2, "pulls.page": 2, "attention.details":2 }[shape.operation] ?? 1;
     return { ...base, ...shape, observer: shape.operation === "graphql.observer", resource: "graphql", cost,
       repository: shape.repository ?? repository };
 
   }
+  const detail=/^repos\/([^/]+\/[^/]+)\/actions\/runs\/([1-9][0-9]*)(\?exclude_pull_requests=true|\/attempts\/([1-9][0-9]*)\/jobs\?per_page=100&page=1)$/.exec(path ?? '');
+  if(detail)return {...base,repository:detail[1],operation:detail[4]?'actions.detail-jobs':'actions.detail-run',runId:Number(detail[2]),...(detail[4]?{attempt:Number(detail[4]),pageSize:100}:{}),resource:'core',cost:1};
   const match = /^repos\/([^/]+\/[^/]+)\/(actions\/runs|actions\/workflows|dependabot\/alerts|code-scanning\/alerts|secret-scanning\/alerts)(?:\?(.*))?$/.exec(path ?? "");
   if (!match) throw new Error(`unknown fixture API path: ${path}`);
   const operations = { "actions/runs": "actions.runs", "actions/workflows": "actions.workflows", "dependabot/alerts": "security.dependabot", "code-scanning/alerts": "security.code", "secret-scanning/alerts": "security.secret" };
@@ -293,13 +336,14 @@ function fixtureId(kind, ...identity) {
 
 function defaultPayload(request, identity) {
   switch (request.operation) {
+    case "actions.detail-run": case "actions.detail-jobs": return ciResponse(request.path);
     case "actions.runs": return fixture("actions-runs");
     case "actions.workflows": return fixture("actions-workflows");
     case "actions.setup": return fixture("actions-setup");
     case "issues.legacy": return fixture("issues");
     case "pulls.legacy": return fixture("prs");
     case "repository.identity": return { id: fixtureId("R", request.host, request.repository), nameWithOwner: request.repository, url: `https://${request.host}/${request.repository}`, viewerPermission: "READ" };
-    case "core.observer": return { id: identity.id ?? Number.parseInt(createHash("sha256").update(JSON.stringify([request.host, identity.principal])).digest("hex").slice(0, 12), 16), login: identity.principal };
+    case "core.observer": return { type:identity.type??"User", id: identity.id ?? Number.parseInt(createHash("sha256").update(JSON.stringify([request.host, identity.principal])).digest("hex").slice(0, 12), 16), login: identity.principal };
     case "cli.auth": return [{ host: request.host, login: identity.principal }];
     default: return [];
   }

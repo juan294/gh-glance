@@ -25,13 +25,14 @@ const releasePr = (paths) => planCi({ event: "pull_request", repository: REPO, b
   headRef: "develop", headRepository: REPO, changedPaths: paths });
 
 test("RC-01 CI roles: one candidate selection, quick develop pushes, identity-only main", () => {
-  const broad = releasePr(["index.mjs"]);
-  assert.equal(broad.role, "candidate");
-  assert.equal(broad.profile, "broad");
-  for (const job of ["pack", "sustained", "pty-governor", "pty-rest", "terminal-smoke", "test", "smoke"]) {
-    assert.ok(broad.jobs.includes(job), job);
+  const candidate = releasePr(["index.mjs", "package.json", "package-lock.json", "scripts/release-candidate.mjs"]);
+  assert.equal(candidate.role, "candidate");
+  assert.equal(candidate.profile, "ordinary");
+  for (const job of ["lint", "pack", "terminal-smoke", "test", "smoke", "pty", "candidate"]) {
+    assert.ok(candidate.jobs.includes(job), job);
   }
-  assert.deepEqual(terminalRunners(broad), ["ubuntu-latest", "macos-latest"]);
+  assert.ok(!candidate.jobs.some(job => ["sustained", "pty-governor", "pty-rest"].includes(job)));
+  assert.deepEqual(terminalRunners(candidate), ["ubuntu-latest", "macos-latest"]);
 
   // While main requires the legacy contexts, a docs release PR still runs real
   // work behind Test, Smoke and PTY; it only skips the full suites.
@@ -75,9 +76,10 @@ test("RC-02 the aggregate rejects skipped, missing, failed or unexpected work", 
   const plan = releasePr(["index.mjs"]);
   assert.deepEqual(aggregate({ plan, needs: needsFor(plan) }), { ok: true, problems: [] });
   const cases = [
-    [{ sustained: { result: "skipped" } }, /sustained: selected but skipped/],
-    [{ "pty-governor": undefined }, /pty-governor: selected but missing/],
-    [{ "pty-rest": { result: "cancelled" } }, /pty-rest: selected but cancelled/],
+    [{ test: { result: "skipped" } }, /test: selected but skipped/],
+    [{ "terminal-smoke": undefined }, /terminal-smoke: selected but missing/],
+    [{ smoke: { result: "cancelled" } }, /smoke: selected but cancelled/],
+    [{ "pty-rest": { result: "success" } }, /pty-rest: not selected but success/],
     [{ promotion: { result: "success" } }, /promotion: not selected but success/],
     [{ plan: { result: "failure" } }, /plan: failure/],
     [{ pack: { result: "success", outputs: {} } }, /no tarball digest output/],
@@ -94,8 +96,8 @@ test("RC-02 the aggregate rejects skipped, missing, failed or unexpected work", 
   // The PTY context checks only the terminal jobs this run selected.
   const only = ["terminal-smoke", "pty-governor", "pty-rest"];
   assert.equal(aggregate({ plan, needs: needsFor(plan, { lint: { result: "failure" } }), only }).ok, true);
-  assert.match(aggregate({ plan, needs: needsFor(plan, { "pty-rest": { result: "failure" } }), only }).problems.join("\n"),
-    /pty-rest: selected but failure/);
+  assert.match(aggregate({ plan, needs: needsFor(plan, { "terminal-smoke": { result: "failure" } }), only }).problems.join("\n"),
+    /terminal-smoke: selected but failure/);
 });
 
 function manifestFor(bytes, overrides = {}) {

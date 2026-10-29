@@ -287,9 +287,13 @@ test("PAGE-01 scrolling toward the end acquires one page, and only then", (t) =>
     // single input and "jjjj" matches no binding. A 60-second floor means no
     // automatic poll can land inside the run, so every request here was asked
     // for by the viewport.
-    stdin: waitForIssuePagesInLog(1) + "sleep .8; " +
+    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"',
+      'index($0, "Issues (50+)") { ok=1 }', 200) +
       "i=0; while [ $i -lt 45 ]; do printf j; i=$((i + 1)); sleep .08; done; " +
-      waitForIssuePagesInLog(3) + "sleep .5; printf q",
+      waitForAwk('"$GH_GLANCE_CAPTURE_OUT.calls"',
+        'index($0, "graphql issues.page") && index($0, "after=cursor:50") { ok=1 }', 200) +
+      waitForAwk('"$GH_GLANCE_CAPTURE_OUT"',
+        'index($0, "Issues (100+)") { ok=1 }', 100) + "printf q",
     args: "--repo acme/widget --refresh 60 --tab issues",
     configHome: box.root,
     env: {
@@ -299,6 +303,7 @@ test("PAGE-01 scrolling toward the end acquires one page, and only then", (t) =>
     },
   });
   const pages = result.fixtureCalls.filter((call) => call.startsWith("graphql issues.page"));
+  assert.equal(result.exitCode, 0);
   const cursored = pages.filter((call) => !call.endsWith("after=-"));
   // Exactly one page past the first. Three page-downs are one demand, not
   // three, and the cap is nowhere near reached.

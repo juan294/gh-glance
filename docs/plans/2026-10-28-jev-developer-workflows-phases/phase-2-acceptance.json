@@ -1,0 +1,463 @@
+{
+  "schema_version": 1,
+  "objective": "Phase 2 optional bounded Jev semantic Focus with offline evaluation",
+  "phase": "implement",
+  "approved_phases": [
+    "implement"
+  ],
+  "resource_limit": 2,
+  "candidate": "d3fae5b3d4e97df1b3879a9899039f49de0090ffb350ac6062014ed6efe1d23d",
+  "assignments": [
+    {
+      "id": "runtime",
+      "owner": "phase2_runtime",
+      "role": "implementer",
+      "objective": "Complete scoped Phase 2 contract and preserve evidence",
+      "allowed_actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "allowed_files": [
+        "CONTRIBUTING.md",
+        "README.md",
+        "index.mjs",
+        "package-lock.json",
+        "package.json",
+        "scripts/measure-jev-interaction.mjs",
+        "test/jev-child-env.test.mjs",
+        "test/jev.test.mjs",
+        "test/pty/fixtures/jev-child-guard.mjs",
+        "test/pty/fixtures/jev-fetch.mjs",
+        "test/pty/focus.test.mjs",
+        "test/pty/jev-focus.test.mjs"
+      ],
+      "evidence_contract": "Exact file hashes, RED/GREEN checks and findings dispositions",
+      "resource_constraints": "One verification command; no live provider or remote publication",
+      "completion_condition": "Return approved current-candidate result",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "phase2-implementation"
+    },
+    {
+      "id": "evaluation",
+      "owner": "parent",
+      "role": "implementer",
+      "objective": "Complete scoped Phase 2 contract and preserve evidence",
+      "allowed_actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "allowed_files": [
+        "scripts/evaluate-jev.mjs",
+        "test/jev-evaluation.test.mjs",
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-2-acceptance.json"
+      ],
+      "evidence_contract": "Exact file hashes, RED/GREEN checks and findings dispositions",
+      "resource_constraints": "One verification command; no live provider or remote publication",
+      "completion_condition": "Return approved current-candidate result",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "phase2-implementation"
+    },
+    {
+      "id": "runtime-review",
+      "owner": "phase2_review",
+      "role": "reviewer",
+      "objective": "Complete scoped Phase 2 contract and preserve evidence",
+      "allowed_actions": [
+        "read",
+        "check"
+      ],
+      "allowed_files": [
+        "index.mjs",
+        "package.json",
+        "package-lock.json",
+        "test/",
+        "scripts/measure-jev-interaction.mjs",
+        "README.md",
+        "CONTRIBUTING.md"
+      ],
+      "evidence_contract": "Exact file hashes, RED/GREEN checks and findings dispositions",
+      "resource_constraints": "One verification command; no live provider or remote publication",
+      "completion_condition": "Return approved current-candidate result",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "phase2-review"
+    },
+    {
+      "id": "evaluation-review",
+      "owner": "phase1_review",
+      "role": "reviewer",
+      "objective": "Complete scoped Phase 2 contract and preserve evidence",
+      "allowed_actions": [
+        "read",
+        "check"
+      ],
+      "allowed_files": [
+        "scripts/evaluate-jev.mjs",
+        "test/jev-evaluation.test.mjs"
+      ],
+      "evidence_contract": "Exact file hashes, RED/GREEN checks and findings dispositions",
+      "resource_constraints": "One verification command; no live provider or remote publication",
+      "completion_condition": "Return approved current-candidate result",
+      "domains": [],
+      "root_causes": [],
+      "concurrency_group": "phase2-review"
+    }
+  ],
+  "results": [
+    {
+      "assignment_id": "runtime",
+      "status": "complete",
+      "candidate": "d3fae5b3d4e97df1b3879a9899039f49de0090ffb350ac6062014ed6efe1d23d",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-pending-harness-repair.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "changed_files": [
+        "CONTRIBUTING.md",
+        "README.md",
+        "index.mjs",
+        "package-lock.json",
+        "package.json",
+        "scripts/measure-jev-interaction.mjs",
+        "test/jev-child-env.test.mjs",
+        "test/jev.test.mjs",
+        "test/pty/fixtures/jev-child-guard.mjs",
+        "test/pty/fixtures/jev-fetch.mjs",
+        "test/pty/focus.test.mjs",
+        "test/pty/jev-focus.test.mjs"
+      ]
+    },
+    {
+      "assignment_id": "evaluation",
+      "status": "complete",
+      "candidate": "d3fae5b3d4e97df1b3879a9899039f49de0090ffb350ac6062014ed6efe1d23d",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-pending-harness-repair.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check",
+        "write"
+      ],
+      "changed_files": [
+        "scripts/evaluate-jev.mjs",
+        "test/jev-evaluation.test.mjs",
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-2-acceptance.json"
+      ]
+    },
+    {
+      "assignment_id": "runtime-review",
+      "status": "complete",
+      "candidate": "d3fae5b3d4e97df1b3879a9899039f49de0090ffb350ac6062014ed6efe1d23d",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-pending-harness-repair.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check"
+      ],
+      "changed_files": []
+    },
+    {
+      "assignment_id": "evaluation-review",
+      "status": "complete",
+      "candidate": "d3fae5b3d4e97df1b3879a9899039f49de0090ffb350ac6062014ed6efe1d23d",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-gate-status.json",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-pending-harness-repair.json"
+      ],
+      "domains": [],
+      "root_causes": [],
+      "actions": [
+        "read",
+        "check"
+      ],
+      "changed_files": []
+    }
+  ],
+  "behavioral_change": true,
+  "tdd": {
+    "regression": "Typed provider policy, exact consent identity, replay privacy/completeness and bounded all-attempt performance measurement",
+    "red": {
+      "sequence": 0,
+      "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-evaluator-red.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-verified-consent-red.log"
+    },
+    "green": {
+      "sequence": 4,
+      "candidate": "d3fae5b3d4e97df1b3879a9899039f49de0090ffb350ac6062014ed6efe1d23d",
+      "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-unit-final.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-pty-final.log; /Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-pending-input-bounded.log"
+    }
+  },
+  "findings": [
+    {
+      "id": "QA-M1",
+      "review_id": "R-revoke",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-pending-harness-repair.json"
+      ]
+    },
+    {
+      "id": "QA-M2",
+      "review_id": "R-source-coverage",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-pending-harness-repair.json"
+      ]
+    },
+    {
+      "id": "QA-M3",
+      "review_id": "R-unverified-consent",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-pending-harness-repair.json"
+      ]
+    },
+    {
+      "id": "QA-M4",
+      "review_id": "R-PTY-cache-oracle",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-pending-harness-repair.json"
+      ]
+    },
+    {
+      "id": "QA-M5",
+      "review_id": "E1",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-pending-harness-repair.json"
+      ]
+    },
+    {
+      "id": "QA-M6",
+      "review_id": "E2",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-pending-harness-repair.json"
+      ]
+    },
+    {
+      "id": "QA-M7",
+      "review_id": "E3",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-pending-harness-repair.json"
+      ]
+    },
+    {
+      "id": "QA-M8",
+      "review_id": "P2-PERF-HISTORY",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-pending-harness-repair.json"
+      ]
+    },
+    {
+      "id": "QA-M9",
+      "review_id": "P2-PERF-DROPPED-ATTEMPT",
+      "disposition": "resolved",
+      "evidence": [
+        "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+        "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-pending-harness-repair.json"
+      ]
+    }
+  ],
+  "simplify": {
+    "mode": "parent",
+    "changed_files": [
+      "CONTRIBUTING.md",
+      "README.md",
+      "index.mjs",
+      "package-lock.json",
+      "package.json",
+      "scripts/measure-jev-interaction.mjs",
+      "test/jev-child-env.test.mjs",
+      "test/jev.test.mjs",
+      "test/pty/fixtures/jev-child-guard.mjs",
+      "test/pty/fixtures/jev-fetch.mjs",
+      "test/pty/focus.test.mjs",
+      "test/pty/jev-focus.test.mjs",
+      "scripts/evaluate-jev.mjs",
+      "test/jev-evaluation.test.mjs",
+      "docs/plans/2026-10-28-jev-developer-workflows-notes.md",
+      "docs/plans/2026-10-28-jev-developer-workflows-phases/phase-2-acceptance.json"
+    ],
+    "invalidated_checks": [
+      "pending-input"
+    ],
+    "checks": [
+      {
+        "id": "pending-input",
+        "status": "pass",
+        "candidate": "d3fae5b3d4e97df1b3879a9899039f49de0090ffb350ac6062014ed6efe1d23d",
+        "evidence": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-pending-input-bounded.log"
+      }
+    ]
+  },
+  "initial_gate_status": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-gate-status.json",
+  "reused_unchanged_inputs": [
+    "CONTRIBUTING.md",
+    "README.md",
+    "eslint.config.js",
+    "index.mjs",
+    "package-lock.json",
+    "package.json",
+    "scripts/evaluate-jev.mjs",
+    "scripts/extract-coverage-metrics.mjs",
+    "scripts/freshness-monitor.mjs",
+    "scripts/measure-efficiency.mjs",
+    "scripts/measure-feature-interaction.mjs",
+    "scripts/measure-focus.mjs",
+    "scripts/package-check.mjs",
+    "scripts/release-candidate.mjs",
+    "scripts/release-policy.mjs",
+    "scripts/release.mjs",
+    "scripts/report-coverage.sh",
+    "scripts/sustained-recovery.mjs",
+    "scripts/test-select.mjs",
+    "test/acquisition.test.mjs",
+    "test/actions-setup.test.mjs",
+    "test/app-auth.test.mjs",
+    "test/args.test.mjs",
+    "test/cache.test.mjs",
+    "test/collector-protocol.test.mjs",
+    "test/collector.test.mjs",
+    "test/context-help.test.mjs",
+    "test/coverage-reporting.test.mjs",
+    "test/doctor.test.mjs",
+    "test/efficiency.test.mjs",
+    "test/fixtures/acquisition-worker.mjs",
+    "test/fixtures/aged-governor-v6.mjs",
+    "test/fixtures/capture-request-baseline.mjs",
+    "test/fixtures/debt-group.mjs",
+    "test/fixtures/governor-worker.mjs",
+    "test/fixtures/jev/focus.json",
+    "test/fixtures/legacy-governor-v2.json",
+    "test/fixtures/request-oracle.mjs",
+    "test/fixtures/ssh",
+    "test/fixtures/tarball.mjs",
+    "test/fixtures/webhook-events.json",
+    "test/fixtures/workflow.mjs",
+    "test/fixtures/workloads/multi-instance-v1.json",
+    "test/focus.test.mjs",
+    "test/freshness-monitor.test.mjs",
+    "test/governor.test.mjs",
+    "test/graphql.test.mjs",
+    "test/identity-process.test.mjs",
+    "test/identity-transport.test.mjs",
+    "test/identity.test.mjs",
+    "test/jev-child-env.test.mjs",
+    "test/jev-evaluation.test.mjs",
+    "test/jev.test.mjs",
+    "test/lint-scope.test.mjs",
+    "test/npm-publish.test.mjs",
+    "test/onboarding.test.mjs",
+    "test/package-boundary.test.mjs",
+    "test/package-check.test.mjs",
+    "test/pagination.test.mjs",
+    "test/poll-policy.test.mjs",
+    "test/preferences.test.mjs",
+    "test/pty/actions-setup.test.mjs",
+    "test/pty/adaptive-polling.test.mjs",
+    "test/pty/background-progress.test.mjs",
+    "test/pty/cache.test.mjs",
+    "test/pty/capture.mjs",
+    "test/pty/capture.test.mjs",
+    "test/pty/collector.test.mjs",
+    "test/pty/conditional-polling.test.mjs",
+    "test/pty/context-help.test.mjs",
+    "test/pty/e2e.test.mjs",
+    "test/pty/evidence.mjs",
+    "test/pty/evidence.test.mjs",
+    "test/pty/fixture-api.test.mjs",
+    "test/pty/fixtures/actions-runs-expanded.json",
+    "test/pty/fixtures/actions-runs-nameless.json",
+    "test/pty/fixtures/actions-runs-running.json",
+    "test/pty/fixtures/actions-runs.json",
+    "test/pty/fixtures/actions-setup.json",
+    "test/pty/fixtures/actions-workflows.json",
+    "test/pty/fixtures/gh",
+    "test/pty/fixtures/gh-state.mjs",
+    "test/pty/fixtures/graphql-response.mjs",
+    "test/pty/fixtures/graphql.mjs",
+    "test/pty/fixtures/issues.json",
+    "test/pty/fixtures/jev-child-guard.mjs",
+    "test/pty/fixtures/jev-fetch.mjs",
+    "test/pty/fixtures/known-identity.mjs",
+    "test/pty/fixtures/open",
+    "test/pty/fixtures/prs.json",
+    "test/pty/fixtures/runs-expanded.json",
+    "test/pty/fixtures/runs.json",
+    "test/pty/fixtures/xdg-open",
+    "test/pty/focus.test.mjs",
+    "test/pty/governor.test.mjs",
+    "test/pty/graphql-budget.test.mjs",
+    "test/pty/identity-migration.test.mjs",
+    "test/pty/identity-switch.test.mjs",
+    "test/pty/jev-focus.test.mjs",
+    "test/pty/keys.test.mjs",
+    "test/pty/mouse.test.mjs",
+    "test/pty/onboarding.test.mjs",
+    "test/pty/pacing-credit.test.mjs",
+    "test/pty/readme-sample.mjs",
+    "test/pty/remote-collector.test.mjs",
+    "test/pty/routing.test.mjs",
+    "test/pty/run.sh",
+    "test/pty/runtime-remediation.test.mjs",
+    "test/pty/secondary-limit.test.mjs",
+    "test/pty/selection.test.mjs",
+    "test/pty/shared-acquisition.test.mjs",
+    "test/pty/status.test.mjs",
+    "test/pty/throttle.test.mjs",
+    "test/recovery.test.mjs",
+    "test/release-candidate.test.mjs",
+    "test/release-driver.test.mjs",
+    "test/release-policy.test.mjs",
+    "test/request-oracle.test.mjs",
+    "test/runtime-coverage.mjs",
+    "test/runtime-coverage.test.mjs",
+    "test/runtime-remediation.test.mjs",
+    "test/scheduling-policy.test.mjs",
+    "test/ssh-transport.test.mjs",
+    "test/sustained-reconciliation.test.mjs",
+    "test/sustained-recovery.test.mjs",
+    "test/sutura-native-routing.test.mjs",
+    "test/test-select.test.mjs",
+    "test/unit.test.mjs",
+    "test/webhooks.test.mjs",
+    "test/workflows.test.mjs"
+  ],
+  "superseding_measurement": "/Users/juan/.local/share/gh-glance/implementation/2026-10-28-jev-workflows/phase2-pending-harness-repair.json"
+}

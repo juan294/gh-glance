@@ -271,12 +271,14 @@ function createFreshnessMonitor({ manifest, storePath, now = Date.now,
       readStore === loadAcquisitionStore && !existsSync(storePath)
       ? "missing-store" : !loaded?.ok ? "corrupt-store" : null;
     let quota = null;
+    let quotaReason = null;
     if (qualifying) {
       try {
         // Hydrating acquisition artifacts may take long enough for a writer to
         // advance the quota ledger after the sample clock was captured.
         const read = quotaBound && quotaPath ? readQuota(quotaPath, now()) : null;
         quota = read?.ok && !read.missing ? read.value : null;
+        quotaReason=read?.ok?null:read?.reason??"unavailable";
       } catch { quota = null; }
       if (!quota) failed = true;
     }
@@ -458,6 +460,7 @@ function createFreshnessMonitor({ manifest, storePath, now = Date.now,
     });
     samples += 1;
     const diagnostics = qualifying ? { status: quota ? "available" : "unavailable",
+      ...(["restart-required","version-mismatch"].includes(quotaReason)?{reason:quotaReason,remedy:quotaReason==="version-mismatch"?"Update gh-glance. Restart all gh-glance panes with the new version; keep the shared quota ledger":"Restart all gh-glance panes with this version; keep the shared quota ledger"}:{}),
       observers: Object.fromEntries(["core", "graphql"].map((resource) => [resource,
         quota?.observers?.[resource] ? { outcome: quota.observers[resource].outcome,
           nextAt: quota.observers[resource].nextAt } : null])),

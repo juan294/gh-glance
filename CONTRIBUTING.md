@@ -87,7 +87,9 @@ It is a separate script from `npm test` on purpose. The unit run is fast; the
 pty run is slow and timing-sensitive. CI routes them by the change
 (`scripts/release-candidate.mjs` `planCi`): `develop` pushes (unless the release
 PR is open, whose run already covers the same head) and ordinary PRs run the
-fast unit selection and the terminal smoke, and a `develop` -> `main`
+fast unit selection and the terminal smoke. Sutura repair proposals and
+authenticated exact same-repository repair merges select full native
+verification; ordinary owner pushes retain the quick path. A `develop` -> `main`
 release PR whose change can affect coordination or terminal behavior runs the
 full PTY suite once, plus the recovery and efficiency selections. The required
 `PTY` context reports whichever terminal work the run selected. The full suite
@@ -244,8 +246,10 @@ Worth knowing about the app's shape before changing it:
   lock, per-tab/per-column three-way merge, and post-save adoption of the merged
   snapshot together; removing any one can let simultaneous panes overwrite
   unrelated state on a later save.
-- Everything from `gh` goes through `safe()` before it is stored in memory,
-  persisted, or rendered. See `SECURITY.md`.
+- Ordinary display metadata from `gh` goes through `safe()` before storage or
+  rendering. Multiline CI logs use their separate bounded capture and line
+  cleaning/excerpt policy, stay in session memory and never enter shared
+  snapshots or dashboard caches. See `SECURITY.md`.
 
 ## Branching Model
 
@@ -276,7 +280,9 @@ workflow *filename*, and the `npm` environment, so renaming
 `.github/workflows/release.yml` or that environment breaks publishing until
 `npm trust github gh-glance` is re-run.
 
-`develop` is not protected: the maintainer commits to it directly. The
+`develop` permits direct maintainer pushes. Minimal protection blocks force
+pushes and deletion, including for admins; it does not require a PR or check
+gate for ordinary owner work. The
 PR-per-change requirement was removed on 2026-08-04 as pure overhead on a solo
 project. CI still runs on `develop`, but it now reports *after* a push rather
 than gating it, which makes a green local run the only thing standing between a
@@ -361,3 +367,53 @@ Two consequences worth knowing before adding PTY coverage:
 
 If you discover a security vulnerability, please follow the [Security
 Policy](SECURITY.md) instead of opening a public issue.
+
+Focus fixtures live in `test/fixtures/jev/focus.json`. Keep related source groups in a single frozen development or held-out partition. `node scripts/measure-focus.mjs` reports the local ranking baseline with corpus identity and matching/no-match denominators. `node scripts/measure-feature-interaction.mjs [baseline-index.mjs]` uses offline real-terminal fixtures to measure paired first paint and keypress-to-paint; the optional baseline must have its package and dependencies resolvable. These commands make no model requests. Model benefit and process-tree CPU/RSS remain unmeasured until their corresponding evaluations run.
+
+Jev runtime policy stays in `index.mjs`. The exact `@typesafe-ai/sdk` 0.7.0 dependency is loaded only after an explicit permitted action; model, origin, logging, retry and compression settings are fixed in code. Unit tests inject external fetch/clock/SDK loading while exercising real policy. `test/pty/fixtures/jev-fetch.mjs` is a test-only Node preload for the fixed endpoint; it is never a production endpoint setting. `node --test test/jev.test.mjs test/jev-child-env.test.mjs` exercises bounds, privacy, cancellation and recovery offline, and `test/pty/jev-focus.test.mjs` drives the real UI. Every product child launch strips `TYPESAFE_API_KEY` immutably, including copied/injected environments.
+
+The normalized LRU has 128 entries, 2 MiB and ten-minute limits. Active-view coverage is separate from that cache, so more than 128 loaded candidates can be inspected through explicit continuation actions. Source snapshots, collectors and persisted caches never receive semantic results. Live evaluation requires separate authorization, a reviewed exact payload manifest and explicit call/byte/dollar ceilings. Offline passing tests do not qualify provider behavior or held-out semantic accuracy.
+
+`node scripts/measure-jev-interaction.mjs` measures 100 real terminal navigation paints while an offline TypeSafe fetch fixture is pending. Each explicit action retains the four-second deadline; the script reports exact source/fixture hashes, fake request count and keypress-to-paint p95. It sends no live requests. Active coverage is separately limited to 150 Focus answers (600 for attention), 2 MiB and ten minutes; exceeding a manifest bound is unavailable/input-too-large rather than silently dropping candidates.
+
+The selected CI evidence tests remain offline. Run focused policy coverage, then the applicable full gates:
+
+```sh
+node --test test/ci-details.test.mjs test/ci-owner-death.test.mjs \
+  test/governor-v8.test.mjs test/ci-request-oracle.test.mjs
+```
+`node scripts/check-governor-compatibility.mjs` imports the exact
+baseline `0319c9c58d211867ec35776357259b02b235909f` source and package manifest
+from the local git object database, with installed dependencies and an isolated,
+sanitized child environment. It never runs the historical CLI or downloads it.
+
+Run `node scripts/qualify-ci-log-transport.mjs` on both supported Node majors.
+It uses two local HTTPS origins, a synthetic test CA/key in
+`test/fixtures/ci-tls/`, fake credentials and a narrow external-request seam.
+Production has no endpoint override or TLS bypass. It checks redirect topology,
+credential isolation, shared byte/deadline bounds, cancellation, actual socket
+closure and safe errors. These are local transport qualifications, not live
+GitHub/provider proof. Preserve their source hashes and runtime identities.
+
+CI observation policy is tested by `node --test test/ci-observations.test.mjs test/ci-evaluation.test.mjs`; `test/pty/ci-observations.test.mjs` drives the real standalone UI and SDK with fake external transport. The tests cover exact previews, secret blocks and clean-range recovery, independent Noul/Choice gating, synchronous identity/expiry projection, cancellation and ordinary source refresh. The local TLS fixture accepts test-only log text so those UI paths exercise the real native adapter. Production has no such option.
+
+`node scripts/evaluate-jev.mjs --feature ci` runs offline against the frozen synthetic rubric. Replay metrics retain category TP/FP/FN/abstention counts, supporting-span accuracy, insufficient-evidence assertions and identity errors. Preparing a manifest remains offline. Live evaluation still requires separate authorization and exact reviewed payload/call/byte/dollar budgets; neither a passing fixture nor corpus labels establish live model accuracy. Run the normal complete lint/syntax/unit/PTY phase gates and repeat transport qualification when its fixture or adapter inputs change.
+
+Personal attention policy lives in `index.mjs`; `node --test test/attention.test.mjs`
+checks the static 25-alias query, strict independent request parser, tri-state
+relations, identity/expiry guards, normalized retention, actual GraphQL settlement
+and paired metadata batches. `test/pty/attention.test.mjs` drives the real UI and
+SDK with synthetic external GitHub/TypeSafe responses. Fixture counters distinguish
+source pages, explicit attention details and Jev calls. Keep capture artifacts in
+a new phase-specific directory so earlier terminal evidence remains intact.
+Changes to these acquisition paths require the sequential efficiency and full
+PTY gates in addition to lint, syntax and unit tests.
+
+`node scripts/evaluate-jev.mjs --feature attention` reports the frozen metadata
+rubric offline. Replay reports each badge's TP/FP/FN/abstention counts and ambiguous
+assertions. Real policy and PTY tests independently verify exact queue
+membership and order invariants. A prepared manifest is
+not a live evaluation. Live qualification still requires separately authorized
+reviewed payloads and call/byte/dollar budgets. Attention permits 300 metadata
+rows/600 answers in active coverage, with at most 60 rows per explicit action;
+byte packing preserves each row's two independent questions.
