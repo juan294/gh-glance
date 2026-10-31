@@ -7288,9 +7288,15 @@ function mergeAlertRows(groups) {
 // mid-session is picked up within the hour.
 const alertBackoff = new Map();
 
-function backoffStorageKey(key) {
-  const access = requestIdentityStorage.getStore()?.accessKey ?? runtimeIdentityCoordinator?.current()?.accessKey;
-  return access ? `${access}\0${key}` : key;
+// A capability verdict is a statement about one repository on one host, so the
+// bound host and repository are part of the key: one collector credential can
+// serve several repositories, and one repository's 403 must not replay for
+// (or be cleared by) another.
+function backoffStorageKey(key, accessKey = null) {
+  const access = accessKey ?? requestIdentityStorage.getStore()?.accessKey ??
+    runtimeIdentityCoordinator?.current()?.accessKey;
+  const scoped = `${effectiveRuntimeHost() ?? ""}\0${effectiveRuntimeRepository()?.toLowerCase() ?? ""}\0${key}`;
+  return access ? `${access}\0${scoped}` : scoped;
 }
 
 function backoffActive(key, now) {
@@ -10230,11 +10236,13 @@ function createCollectorAcquisitionRuntime({
       providerContexts.set(target.provider, context);
     }
     let identity;
+    let credentialEnvironment = null;
+    let capabilities = null;
     if (context.definition.type === "github-app") {
       const resolved = await context.coordinator.resolve({ signal });
       identity = resolved.identity;
-      context.credentialEnvironment = resolved.environment;
-      context.capabilities = resolved.capabilities;
+      credentialEnvironment = resolved.environment;
+      capabilities = resolved.capabilities;
       if (context.identity?.accessKey !== identity.accessKey) {
         const persisted = persistGitHubAppIdentity(context.coordinator.root, identity, now());
         if (!persisted.ok) throw new Error("collector provider unavailable");
@@ -10243,13 +10251,10 @@ function createCollectorAcquisitionRuntime({
       const resolved = await context.coordinator.refresh();
       if (!resolved.ok) throw new Error("collector provider unavailable");
       identity = resolved.value;
-      context.credentialEnvironment = null;
-      context.capabilities = null;
       context.readBudgets = readBudgets;
     }
     if (identity.host !== target.host) throw new Error("collector provider unavailable");
-    context.identity = identity;
-    context.scope = {
+    const scope = Object.freeze({
       ...createQuotaScope(identity, {
         root: context.coordinator.root,
         now,
@@ -10259,9 +10264,28 @@ function createCollectorAcquisitionRuntime({
       repository: target.repo,
       providerType: context.definition.type,
       ...(executeGh ? { executeGh } : {}),
-      ...(context.credentialEnvironment ? { credentialEnvironment: context.credentialEnvironment } : {}),
-    };
-    return context;
+      ...(credentialEnvironment ? { credentialEnvironment } : {}),
+    });
+    // The provider context keeps only provider-wide state (coordinator,
+    // lease, budget reader, latest access identity). Its scope is used to
+    // release the provider lease on close, never to bind a request.
+    context.identity = identity;
+    context.credentialEnvironment = credentialEnvironment;
+    context.capabilities = capabilities;
+    context.scope = { ...scope };
+    // Each target operation gets its own immutable binding, captured once, so
+    // another target's resolution cannot redirect it after an await.
+    return Object.freeze({
+      coordinator: context.coordinator,
+      definition: context.definition,
+      leaseId: context.leaseId,
+      readBudgets: context.readBudgets,
+      onObserverPublished: context.onObserverPublished,
+      identity,
+      scope,
+      credentialEnvironment,
+      capabilities,
+    });
   }
 
   async function defaultProduce({ target, resource, demand, snapshot, claim, markStarted, provider, signal, force }) {
@@ -10493,9 +10517,17 @@ function createCollectorAcquisitionRuntime({
     item.invalidations.clear();
   }
 
+  // Identifies one delivered generation for one engine subscription and
+  // binding. A rebind or a new subscription (a new connection) changes it.
+  function collectorDeliveryKey(subscriptionId, bindingRevision, snapshot) {
+    return Number.isSafeInteger(snapshot?.generation)
+      ? `${subscriptionId}\0${bindingRevision}\0${snapshot.generation}` : null;
+  }
+
   function deliverCollectorSnapshot(item, snapshot, bindingRevision, { publication = false } = {}) {
     if (bindingRevision !== item.bindingRevision) return false;
     item.nextDueAt = snapshot.nextDueAt;
+    item.lastDeliveryKey = collectorDeliveryKey(item.id, bindingRevision, snapshot);
     if (Number.isSafeInteger(snapshot.generation)) item.lastDeliveredGeneration = snapshot.generation;
     if (Number.isFinite(snapshot.lastSuccessAt)) item.lastDeliveredSuccessAt = snapshot.lastSuccessAt;
     if (publication && item.requestedAt !== null && snapshot.lastSuccessAt >= item.requestedAt) {
@@ -10580,11 +10612,15 @@ function createCollectorAcquisitionRuntime({
         retryIn = 1;
         return;
       }
-      item.provider = refreshedProvider;
+      const provider = refreshedProvider;
+      item.provider = provider;
       const ownership = await engine.refresh(subscriptionId, { force: manual });
       if (!ownership.ok) { item.onHold?.("disconnected"); retryIn = 1_000; return; }
       if (ownership.value.role !== "producer") {
-        if (ownership.value.snapshot) {
+        // A follower wake re-reads the shared record; re-send only a
+        // generation this subscription has not already delivered.
+        if (ownership.value.snapshot && item.lastDeliveryKey !==
+            collectorDeliveryKey(subscriptionId, bindingRevision, ownership.value.snapshot)) {
           deliverCollectorSnapshot(item, ownership.value.snapshot, bindingRevision);
         }
         if (ownership.value.reason !== "fresh") {
@@ -10615,7 +10651,7 @@ function createCollectorAcquisitionRuntime({
             active: ownership.value.demand?.active || item.requestedAt !== null },
           snapshot: ownership.value.snapshot,
           claim: { ...claim, state: item },
-          provider: item.provider,
+          provider,
           signal: item.controller.signal,
           force,
           markStarted: async (receipt) => {
@@ -10625,11 +10661,11 @@ function createCollectorAcquisitionRuntime({
             return started;
           },
         }));
-        const produced = item.provider?.scope
-          ? await requestIdentityStorage.run(item.provider.scope, produceBound)
+        const produced = provider?.scope
+          ? await requestIdentityStorage.run(provider.scope, produceBound)
           : await produceBound();
-        if (item.provider?.definition?.type === "github-app" &&
-            item.provider.coordinator.current()?.accessKey !== claim.accessKey) {
+        if (provider?.definition?.type === "github-app" &&
+            provider.coordinator.current()?.accessKey !== claim.accessKey) {
           engine.refresh(subscriptionId, { claim, failure: {
             hold: "disconnected",
             requestMetrics: produced.requestMetrics ?? {},
@@ -10659,13 +10695,13 @@ function createCollectorAcquisitionRuntime({
         const published = await engine.refresh(subscriptionId, { claim, publish: produced });
         if (!published.ok) { item.onHold?.("disconnected"); retryIn = 1_000; }
         else {
-          item.provider?.coordinator?.markAuthorized?.();
+          provider?.coordinator?.markAuthorized?.();
           retryIn = Math.max(1, published.value.snapshot.nextDueAt - now());
         }
       } catch (error) {
-        if (item.provider?.definition?.type === "github-app" && error?.apiResponse?.status === 401 &&
+        if (provider?.definition?.type === "github-app" && error?.apiResponse?.status === 401 &&
             !error.appCredentialInvalidated) {
-          item.provider.coordinator.invalidate("unauthorized");
+          provider.coordinator.invalidate("unauthorized");
         }
         const hold = error?.notStarted ? "shared-wait" : acquisitionFailureHold(error);
         if (claim && error?.notStarted) engine.refresh(subscriptionId, { cancel: claim });
@@ -10674,7 +10710,7 @@ function createCollectorAcquisitionRuntime({
           requestMetrics: error?.requestMetrics ?? {},
         } });
         else engine.setHold(subscriptionId, hold, { resource: item.resource, accessKey: item.identity.accessKey });
-        item.onHold?.(item.provider?.definition?.type === "github-app" &&
+        item.onHold?.(provider?.definition?.type === "github-app" &&
           (error?.apiResponse?.status === 401 || error?.message === "GitHub App token unavailable" ||
             classify(error) === "auth-problem")
           ? "app-auth" : hold);
@@ -10762,7 +10798,7 @@ function createCollectorAcquisitionRuntime({
       const item = { target, resource, demand: normalizedDemand, onSnapshot, onHold, id: null, identity: null,
         provider: null, polling: false, pollPhase: null, pollPromise: null, controller: null,
         initializePromise: null, closed: false, timer: null, queuedRefresh: null, requestedAt: null,
-        bindingRevision: 0, invalidations: new Set(), lastDeliveredGeneration: null,
+        bindingRevision: 0, invalidations: new Set(), lastDeliveredGeneration: null, lastDeliveryKey: null,
         lastDeliveredSuccessAt: null, promotionGeneration: null, promotionAt: null };
       items.add(item);
       void startInitialize(item);
@@ -10915,7 +10951,9 @@ function createCollectorAcquisitionRuntime({
       for (const entry of targetInitializations.values()) entry.controller.abort();
       await Promise.allSettled([...items].flatMap((item) =>
         [item.initializePromise, item.pollPromise].filter(Boolean)));
-      for (const item of items) if (item.id) engine.unsubscribe(item.id);
+      // Per-target operation contexts are frozen; drop them so a retained
+      // handle does not keep the credential environment reachable.
+      for (const item of items) { if (item.id) engine.unsubscribe(item.id); item.provider = null; }
       items.clear();
       engine.close();
       for (const context of providerContexts.values()) {
@@ -11053,7 +11091,13 @@ function createCollectorProtocolClient({ createTransport, onReady = () => {},
     resourceForId: (id) => subscriptions.get(id)?.resource ?? null,
     onSnapshot(snapshot, frame) {
       const item = subscriptions.get(frame.id);
-      if (!item || frame.serverEpoch !== serverEpoch || snapshot.generation <= item.generation) return;
+      if (!item || frame.serverEpoch !== serverEpoch || snapshot.generation < item.generation) return;
+      // A same-epoch reconnect keeps the generation fence, and the server
+      // replays its cached generation for the new subscription. The first
+      // equal-generation snapshot on a connection acknowledges that
+      // connection; later repeats on it are not new deliveries.
+      if (snapshot.generation === item.generation && item.connectionAcknowledged) return;
+      item.connectionAcknowledged = true;
       item.generation = snapshot.generation;
       item.controlGeneration = Math.max(item.controlGeneration, snapshot.generation);
       const sourceAgeMs = item.sourceAge.observe({
@@ -11088,6 +11132,7 @@ function createCollectorProtocolClient({ createTransport, onReady = () => {},
         item.generation = -1;
         item.controlGeneration = -1;
       }
+      item.connectionAcknowledged = false;
       write({ type: "subscribe", id: item.id, host: item.host, repo: item.repo,
         resource: item.resource, demand: item.demand });
       flushRefresh(item);
@@ -11181,7 +11226,7 @@ function createCollectorProtocolClient({ createTransport, onReady = () => {},
         return { ok: false, reason: "invalid" };
       }
       const item = { ...subscription,
-        onSnapshot, onHold, onError, onDiagnostic, generation: -1, controlGeneration: -1, pendingRefresh: null,
+        onSnapshot, onHold, onError, onDiagnostic, generation: -1, controlGeneration: -1, connectionAcknowledged: false, pendingRefresh: null,
         sourceAge: createCollectorSourceAgeTracker({ now, monotonicNow, checkpoint: sourceCheckpoint }) };
       subscriptions.set(id, item);
       if (welcomed) write({ type: "subscribe", id: item.id, host: item.host, repo: item.repo,
@@ -20370,7 +20415,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         const accessKey = identity()?.accessKey;
         if (accessKey) {
           for (const [sourceKey, capability] of Object.entries(snapshot.capabilities ?? {})) {
-            alertBackoff.set(`${accessKey}\0${sourceKey}`, {
+            alertBackoff.set(backoffStorageKey(sourceKey, accessKey), {
               ...capability,
               until: performance.now() + Math.max(0, capability.until - Date.now()),
             });
