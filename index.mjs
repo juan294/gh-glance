@@ -2555,13 +2555,14 @@ async function fetchGraphqlList(kind, mapRow, {
   const incomplete = merged.incomplete || truncatedWalk;
   // Serialized rows are the payload identity the unchanged-frame suppression
   // and the cache both compare on, so it must cover exactly what is rendered --
-  // including the markers that say the list is not all of it.
-  const raw = JSON.stringify({
-    v: GRAPHQL_QUERY_VERSION,
-    totalCount,
-    incomplete,
-    hasNextPage: merged.hasNextPage,
+  // including the markers that say the list is not all of it. It is the shared
+  // representation a stored snapshot rebuilds, so a collector producer that
+  // compares against its normalized previous snapshot can see "unchanged".
+  // `truncated` is what pollResultTransition derives from the limit below.
+  const raw = acquisitionContentRaw(kind, {
     rows: merged.rows,
+    truncated: incomplete || merged.rows.length >= LIST_LIMIT,
+    hasNextPage: merged.hasNextPage,
   });
   return {
     raw: raw === previousRaw ? previousRaw : raw,
@@ -13932,6 +13933,33 @@ function normalizeCachedItem(tabKey, item) {
   return null;
 }
 
+// The one "unchanged" identity for an acquired result. Fetchers emit it, the
+// shared store rebuilds it from a validated snapshot, and adoption carries it,
+// so a producer comparing against a stored snapshot sees the same string it
+// would have produced itself. It covers what the tab renders: the rows through
+// the stored-snapshot validator, the markers that say the list is incomplete
+// and, for Security, the coverage notes. Timestamps are excluded on purpose.
+function acquisitionContentRaw(resource, { rows, truncated = false, hasNextPage = false, notes = [], blind = false }) {
+  return JSON.stringify({
+    v: GRAPHQL_QUERY_VERSION,
+    resource,
+    truncated: truncated === true,
+    hasNextPage: hasNextPage === true,
+    notes: resource === "security" ? notes : [],
+    blind: resource === "security" && blind === true,
+    rows: rows.map((row) => normalizeCachedItem(resource, row)),
+  });
+}
+
+// A pane's unchanged sentinel must describe the rows it displays. Adopting a
+// peer's different content without moving it let an A, B, A sequence compare
+// the third result against A and republish B as "unchanged". A snapshot that
+// does not carry the shared representation clears it, which costs one parse.
+function adoptedAcquisitionRaw(currentRaw, snapshot, sameContent) {
+  if (sameContent) return currentRaw;
+  return typeof snapshot?.raw === "string" ? snapshot.raw : null;
+}
+
 function normalizeDashboardCacheEntry(entry) {
   if (!isRecord(entry) || !isRecord(entry.tabs)) return null;
   const tabs = {};
@@ -14558,6 +14586,7 @@ function normalizeAcquisitionSnapshot(raw, query, generation, producerEpoch) {
   const content = JSON.stringify(rows);
   const contentDigest = createHash("sha256").update(content).digest("hex");
   if (raw.raw === undefined && raw.contentDigest !== contentDigest) return null;
+  const securityNotes = raw.securityNotes.filter((note) => typeof note === "string").map(safe);
   return {
     schema: 1,
     producerEpoch,
@@ -14565,7 +14594,8 @@ function normalizeAcquisitionSnapshot(raw, query, generation, producerEpoch) {
     generation,
     rows,
     pageInfo,
-    raw: content,
+    raw: acquisitionContentRaw(query.resource, { rows, truncated: raw.meta.truncated,
+      hasNextPage: pageInfo?.hasNextPage, notes: securityNotes, blind: raw.securityBlind }),
     contentDigest,
     entities,
     lastSuccessAt: raw.lastSuccessAt,
@@ -14574,7 +14604,7 @@ function normalizeAcquisitionSnapshot(raw, query, generation, producerEpoch) {
     hold: null,
     capabilities,
     meta: { at: raw.meta.at, truncated: raw.meta.truncated },
-    securityNotes: raw.securityNotes.filter((note) => typeof note === "string").map(safe),
+    securityNotes,
     securityBlind: raw.securityBlind,
   };
 }
@@ -20304,6 +20334,10 @@ function App({ onCreateRemote = () => {} } = {}) {
         entityRef.current.set(entity.key, { etag: entity.etag, body: entity.body });
       }
       const sameRows = JSON.stringify(dataRef.current[key]) === JSON.stringify(snapshot.rows);
+      const sameContent = sameRows && (key !== "security" ||
+        JSON.stringify(securityNotesRef.current) === JSON.stringify(snapshot.securityNotes ?? []) &&
+        securityBlindRef.current === (snapshot.securityBlind === true));
+      rawRef.current[key] = adoptedAcquisitionRaw(rawRef.current[key], snapshot, sameContent);
       if (!sameRows) setData((current) => ({ ...current, [key]: snapshot.rows }));
       setMeta((current) => current[key]?.at === snapshotMeta.at &&
         current[key]?.truncated === snapshotMeta.truncated
@@ -22806,6 +22840,7 @@ export {
   saveDashboardCache,
   mergeDashboardCacheSnapshots,
   nextSecurityRaw,
+  adoptedAcquisitionRaw,
   shouldCheckpointFreshness,
   ACQUISITION_STORE_VERSION,
   ACQUISITION_CLAIM_TTL_MS,
