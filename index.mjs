@@ -7240,9 +7240,15 @@ function mergeAlertRows(groups) {
 // mid-session is picked up within the hour.
 const alertBackoff = new Map();
 
-function backoffStorageKey(key) {
-  const access = requestIdentityStorage.getStore()?.accessKey ?? runtimeIdentityCoordinator?.current()?.accessKey;
-  return access ? `${access}\0${key}` : key;
+// A capability verdict is a statement about one repository on one host, so the
+// bound host and repository are part of the key: one collector credential can
+// serve several repositories, and one repository's 403 must not replay for
+// (or be cleared by) another.
+function backoffStorageKey(key, accessKey = null) {
+  const access = accessKey ?? requestIdentityStorage.getStore()?.accessKey ??
+    runtimeIdentityCoordinator?.current()?.accessKey;
+  const scoped = `${effectiveRuntimeHost() ?? ""}\0${effectiveRuntimeRepository()?.toLowerCase() ?? ""}\0${key}`;
+  return access ? `${access}\0${scoped}` : scoped;
 }
 
 function backoffActive(key, now) {
@@ -20331,7 +20337,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         const accessKey = identity()?.accessKey;
         if (accessKey) {
           for (const [sourceKey, capability] of Object.entries(snapshot.capabilities ?? {})) {
-            alertBackoff.set(`${accessKey}\0${sourceKey}`, {
+            alertBackoff.set(backoffStorageKey(sourceKey, accessKey), {
               ...capability,
               until: performance.now() + Math.max(0, capability.until - Date.now()),
             });

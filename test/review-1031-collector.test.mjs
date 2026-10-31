@@ -11,6 +11,9 @@ import {
   normalizeCollectorConfig,
 } from "../index.mjs";
 
+// Regression tests for the 2026-10-31 review findings on collector
+// multi-target isolation and collector status (PC-01, PC-02, PC-06, PC-07).
+
 const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const PRIVATE_KEY = privateKey.export({ type: "pkcs8", format: "pem" });
 const APP_PROVIDER = {
@@ -26,6 +29,9 @@ const REPOSITORIES = {
   "acme/widget": { id: "R_widget", databaseId: 101 },
   "acme/gadget": { id: "R_gadget", databaseId: 202 },
 };
+const DEMAND = { active: true, background: true, floorMs: 5_000, pages: 1 };
+// A short budget window keeps governor pacing out of the test duration.
+const BUDGET_WINDOW_MS = 60_000;
 
 function privatePathOptions(t) {
   const root = mkdtempSync(join(tmpdir(), "gh-glance-review-1031-"));
@@ -42,24 +48,33 @@ function tokenResponse(provider, token, expiresAt) {
   };
 }
 
-function ghResponse(resource, body, at, resetMs = at + 3_600_000) {
-  return `HTTP/2 200 OK\r\nx-ratelimit-resource: ${resource}\r\n` +
+function ghResponse(resource, body, at, { status = "200 OK" } = {}) {
+  return `HTTP/2 ${status}\r\nx-ratelimit-resource: ${resource}\r\n` +
     `x-ratelimit-limit: 5000\r\nx-ratelimit-used: 1\r\nx-ratelimit-remaining: 4999\r\n` +
-    `x-ratelimit-reset: ${Math.ceil(resetMs / 1000)}\r\netag: fixture-etag\r\n\r\n${JSON.stringify(body)}`;
+    `x-ratelimit-reset: ${Math.ceil((at + BUDGET_WINDOW_MS) / 1000)}\r\netag: fixture-etag\r\n\r\n${JSON.stringify(body)}`;
 }
 
 // A fake `gh` child. The response is computed after runGh writes stdin, so a
-// GraphQL fixture can answer by the repository variables it was sent.
+// GraphQL fixture can answer by the repository variables it was sent. A
+// `failure` response rejects the way a non-zero gh exit does.
 function ghChild(respond) {
   const child = new EventEmitter();
   child.pid = process.pid;
   let input = null;
   child.stdin = { on() {}, end(value) { input = value; } };
-  const pending = new Promise((resolve) => setTimeout(() => {
-    const { stdout, delayMs = 0 } = respond(input);
+  const pending = new Promise((resolve, reject) => setTimeout(() => {
+    const { stdout, delayMs = 0, failure = null } = respond(input);
     setTimeout(() => {
-      resolve({ stdout, stderr: "" });
-      child.emit("close", 0);
+      if (failure) {
+        const error = new Error(`Command failed: gh\n${failure}`);
+        error.code = 1;
+        error.stdout = stdout;
+        error.stderr = failure;
+        reject(error);
+      } else {
+        resolve({ stdout, stderr: "" });
+      }
+      child.emit("close", failure ? 1 : 0);
     }, delayMs);
   }, 0));
   pending.child = child;
@@ -77,29 +92,18 @@ async function within(promise, timeoutMs = 5_000, label = "collector") {
   }
 }
 
-function sentinelRun(repo) {
-  return { databaseId: REPOSITORIES[repo].databaseId, displayTitle: `sentinel ${repo}`,
-    workflowName: "CI", number: 1, headBranch: "main", status: "completed", conclusion: "success",
-    startedAt: "2026-10-31T00:00:00Z", updatedAt: "2026-10-31T00:01:00Z", workflowId: 1,
-    url: `https://github.com/${repo}/actions/runs/${REPOSITORIES[repo].databaseId}` };
+function repositoryFromPath(path) {
+  return Object.keys(REPOSITORIES).find((candidate) => path.startsWith(`repos/${candidate}/`)) ?? null;
 }
 
-test("PC-01 (#163): two targets on one provider keep their own repository through default resolution", async (t) => {
-  const config = normalizeCollectorConfig({ version: 1, providers: { app: APP_PROVIDER },
-    targets: [
-      { host: "github.com", repo: "acme/widget", provider: "app" },
-      { host: "github.com", repo: "acme/gadget", provider: "app" },
-    ] });
+// One GitHub App provider with two configured targets, resolved through the
+// production defaultResolve/defaultProduce path (no resolveProvider or produce
+// injection). PC-01 also keeps the default target identity read.
+function twoTargetRuntime(t, { provider = APP_PROVIDER, rest, readCore = null, injectTargetIdentity = false } = {}) {
+  const config = normalizeCollectorConfig({ version: 1, providers: { app: provider },
+    targets: Object.keys(REPOSITORIES).map((repo) => ({ host: "github.com", repo, provider: "app" })) });
   const requests = [];
-  // Holds a budget read until a second operation joins it (or 250 ms pass),
-  // so the two targets' operations are interleaved deterministically.
-  let waiting = [];
-  const budgetRendezvous = () => new Promise((resolve) => {
-    waiting.push(resolve);
-    const release = () => { const ready = waiting; waiting = []; for (const done of ready) done(); };
-    if (waiting.length >= 2) release();
-    else setTimeout(() => { if (waiting.includes(resolve)) release(); }, 250);
-  });
+  const diagnostics = [];
   const executeGh = (command, args) => {
     assert.equal(command, "gh");
     if (args.includes("graphql")) {
@@ -107,7 +111,7 @@ test("PC-01 (#163): two targets on one provider keep their own repository throug
         const input = JSON.parse(raw ?? "{}");
         const at = Date.now();
         const rateLimit = { cost: 1, limit: 5_000, used: 1, remaining: 4_999,
-          resetAt: new Date(at + 3_600_000).toISOString() };
+          resetAt: new Date(at + BUDGET_WINDOW_MS).toISOString() };
         const repo = input.variables?.owner ? `${input.variables.owner}/${input.variables.name}` : null;
         if (repo && REPOSITORIES[repo]) {
           requests.push({ kind: "identity", repo });
@@ -122,64 +126,165 @@ test("PC-01 (#163): two targets on one provider keep their own repository throug
       });
     }
     const path = String(args.find((arg) => String(arg).startsWith("repos/")) ?? "");
-    const repo = Object.keys(REPOSITORIES).find((candidate) => path.startsWith(`repos/${candidate}/`));
+    const repo = repositoryFromPath(path);
     requests.push({ kind: "rest", repo, path: path.split("?")[0] });
-    return ghChild(() => ({ stdout: repo && path.includes("/actions/runs")
-      ? ghResponse("core", [sentinelRun(repo)], Date.now())
-      : ghResponse("core", { total_count: 0, workflows: [] }, Date.now()) }));
+    return ghChild(() => rest({ repo, path, at: Date.now() }));
   };
-  const diagnostics = [];
   const runtime = createCollectorAcquisitionRuntime({ config, pathOptions: privatePathOptions(t),
     executeGh,
     onDiagnostic: (event) => diagnostics.push(event),
     githubAppOptions: { readPrivateKey: () => PRIVATE_KEY,
-      requestToken: async () => tokenResponse(APP_PROVIDER, "installation-token", Date.now() + 3_600_000) },
-    // Delayed budget evidence: each read waits until both targets have
-    // resolved through the shared provider, so whichever resumes first must
-    // still use its own repository.
+      requestToken: async () => tokenResponse(provider, "installation-token", Date.now() + 3_600_000) },
+    ...(injectTargetIdentity ? { resolveTargetIdentity: async ({ target }) => ({
+      id: REPOSITORIES[target.repo].id, nameWithOwner: target.repo }) } : {}),
     readInstallationCore: async () => {
       requests.push({ kind: "core-observer" });
-      await budgetRendezvous();
+      await readCore?.();
       return { budget: { resource: "core", limit: 5_000, remaining: 4_999, used: 1,
-        resetMs: Date.now() + 3_600_000 }, etag: "app-core", receivedAt: Date.now(), cost: 1 };
+        resetMs: Date.now() + BUDGET_WINDOW_MS }, etag: "app-core", receivedAt: Date.now(), cost: 1 };
     },
   });
   t.after(() => runtime.close());
   const snapshots = new Map(config.targets.map((target) => [target.repo, []]));
   const waiters = new Map();
-  const nextPublished = (repo, afterGeneration) => new Promise((resolve) => {
-    waiters.set(repo, { afterGeneration, resolve });
+  const handles = new Map();
+  const nextSnapshot = (repo, afterGeneration, accept = () => true) => new Promise((resolve) => {
+    waiters.set(repo, { afterGeneration, accept, resolve });
   });
-  const handles = config.targets.map((target) => runtime.subscribe({ target, resource: "actions",
-    demand: { active: true, background: true, floorMs: 5_000, pages: 1 },
-    onSnapshot(snapshot) {
-      snapshots.get(target.repo).push(snapshot);
-      const waiter = waiters.get(target.repo);
-      if (waiter && snapshot.rows.length > 0 && snapshot.generation > waiter.afterGeneration) {
-        waiters.delete(target.repo);
-        waiter.resolve(snapshot);
-      }
-    },
-    onHold(hold) { diagnostics.push({ hold, repo: target.repo }); } }));
-  const settle = (label, promises) => within(Promise.all(promises), 10_000, label).catch((error) => {
+  const subscribe = (repo, resource) => {
+    const target = config.targets.find((candidate) => candidate.repo === repo);
+    handles.set(repo, runtime.subscribe({ target, resource, demand: DEMAND,
+      onSnapshot(snapshot) {
+        snapshots.get(repo).push(snapshot);
+        const waiter = waiters.get(repo);
+        if (waiter && snapshot.generation > waiter.afterGeneration && waiter.accept(snapshot)) {
+          waiters.delete(repo);
+          waiter.resolve(snapshot);
+        }
+      },
+      onHold(hold) { diagnostics.push({ hold, repo }); } }));
+    return handles.get(repo);
+  };
+  const settle = (label, promises) => within(Promise.all(promises), 20_000, label).catch((error) => {
     throw new Error(`${error.message}: ${JSON.stringify({ diagnostics, requests })}`);
   });
-  // Concurrent initialization (identity and first poll).
-  const initial = await settle("two-target initialization",
-    config.targets.map((target) => nextPublished(target.repo, 0)));
+  return { config, runtime, requests, diagnostics, snapshots, handles, subscribe, nextSnapshot, settle };
+}
+
+function sentinelRun(repo) {
+  return { databaseId: REPOSITORIES[repo].databaseId, displayTitle: `sentinel ${repo}`,
+    workflowName: "CI", number: 1, headBranch: "main", status: "completed", conclusion: "success",
+    startedAt: "2026-10-31T00:00:00Z", updatedAt: "2026-10-31T00:01:00Z", workflowId: 1,
+    url: `https://github.com/${repo}/actions/runs/${REPOSITORIES[repo].databaseId}` };
+}
+
+test("PC-01 (#163): two targets on one provider keep their own repository through default resolution", async (t) => {
+  // Holds a budget read until a second operation joins it (or 250 ms pass),
+  // so the two targets' operations interleave after both have resolved
+  // through the shared provider.
+  let waiting = [];
+  const budgetRendezvous = () => new Promise((resolve) => {
+    waiting.push(resolve);
+    const release = () => { const ready = waiting; waiting = []; for (const done of ready) done(); };
+    if (waiting.length >= 2) release();
+    else setTimeout(() => { if (waiting.includes(resolve)) release(); }, 250);
+  });
+  const fixture = twoTargetRuntime(t, {
+    readCore: budgetRendezvous,
+    rest: ({ repo, path, at }) => ({ stdout: repo && path.includes("/actions/runs")
+      ? ghResponse("core", [sentinelRun(repo)], at)
+      : ghResponse("core", { total_count: 0, workflows: [] }, at) }),
+  });
+  const repos = Object.keys(REPOSITORIES);
+  const withRows = (snapshot) => snapshot.rows.length > 0;
+  // Concurrent initialization (target identity and first poll).
+  const initialPending = repos.map((repo) => fixture.nextSnapshot(repo, 0, withRows));
+  for (const repo of repos) fixture.subscribe(repo, "actions");
+  const initial = await fixture.settle("two-target initialization", initialPending);
   // Concurrent forced polls on already-initialized targets.
-  const refreshed = config.targets.map((target, index) => nextPublished(target.repo, initial[index].generation));
-  for (const handle of handles) handle.refresh(true);
-  await settle("two-target polling", refreshed);
-  const identityReads = requests.filter((request) => request.kind === "identity").map((request) => request.repo);
+  const refreshed = repos.map((repo, index) => fixture.nextSnapshot(repo, initial[index].generation, withRows));
+  for (const repo of repos) fixture.handles.get(repo).refresh(true);
+  await fixture.settle("two-target polling", refreshed);
+  const identityReads = fixture.requests.filter((request) => request.kind === "identity")
+    .map((request) => request.repo);
   assert.deepEqual([...new Set(identityReads)].sort(), ["acme/gadget", "acme/widget"],
-    `target identity read another target's repository: ${JSON.stringify(requests)}`);
-  for (const target of config.targets) {
-    for (const snapshot of snapshots.get(target.repo)) {
+    `target identity read another target's repository: ${JSON.stringify(fixture.requests)}`);
+  for (const repo of repos) {
+    for (const snapshot of fixture.snapshots.get(repo)) {
       assert.deepEqual(snapshot.rows.map((row) => row.displayTitle ?? row.title),
-        snapshot.rows.length ? [`sentinel ${target.repo}`] : [],
-        `${target.repo} received another target's rows: ${JSON.stringify(requests)}`);
+        snapshot.rows.length ? [`sentinel ${repo}`] : [],
+        `${repo} received another target's rows: ${JSON.stringify(fixture.requests)}`);
     }
   }
-  await runtime.close();
+});
+
+// Dependabot is the only granted Security source, so each Security poll makes
+// exactly one REST request per repository unless a backoff replays it. The
+// capability backoff is process-wide, so each test uses its own installation
+// (and therefore its own access key).
+function dependabotProvider(installationId) {
+  return { ...APP_PROVIDER, installationId,
+    permissions: { ...APP_PROVIDER.permissions, vulnerability_alerts: "read" } };
+}
+const DISABLED = "gh: Dependabot alerts are disabled for this repository. (HTTP 403)";
+
+function dependabotRest({ repo, path, at }) {
+  assert.match(path, /\/dependabot\/alerts/);
+  if (repo === "acme/widget") {
+    return { stdout: ghResponse("core", { message: "Dependabot alerts are disabled for this repository." }, at,
+      { status: "403 Forbidden" }), failure: DISABLED };
+  }
+  return { stdout: ghResponse("core", [{ number: 7, state: "open", created_at: "2026-10-30T00:00:00Z",
+    severity: "high", title: "Prototype pollution", detail: "lodash" }], at) };
+}
+
+function dependabotRequests(fixture, repo) {
+  return fixture.requests.filter((request) => request.kind === "rest" && request.repo === repo).length;
+}
+
+test("PC-02 (#165): one repository's Dependabot 403 does not hide another repository's alerts", async (t) => {
+  const fixture = twoTargetRuntime(t, { provider: dependabotProvider(2001), rest: dependabotRest,
+    injectTargetIdentity: true });
+  const widget = fixture.nextSnapshot("acme/widget", 0);
+  fixture.subscribe("acme/widget", "security");
+  const widgetSnapshot = await fixture.settle("repository A security", [widget]);
+  assert.deepEqual(widgetSnapshot[0].rows, []);
+  assert.equal(dependabotRequests(fixture, "acme/widget"), 1);
+  // Repository B polls inside A's 60 s backoff window.
+  const gadget = fixture.nextSnapshot("acme/gadget", 0);
+  fixture.subscribe("acme/gadget", "security");
+  const [gadgetSnapshot] = await fixture.settle("repository B security", [gadget]);
+  assert.equal(dependabotRequests(fixture, "acme/gadget"), 1,
+    "repository B must request its own Dependabot alerts");
+  assert.deepEqual(gadgetSnapshot.rows.map((row) => row.id), ["dependabot-7"]);
+  // The other two sources are not granted to the fixture App; only the
+  // Dependabot verdict is the invariant here.
+  assert.equal(gadgetSnapshot.securityNotes.some((note) => /Dependabot/.test(note)), false);
+  assert.equal(Object.hasOwn(gadgetSnapshot.capabilities ?? {}, "dependabot"), false);
+});
+
+test("PC-02 (#165): another repository's success does not reset a repository's backoff ladder", async (t) => {
+  const fixture = twoTargetRuntime(t, { provider: dependabotProvider(2002), rest: dependabotRest,
+    injectTargetIdentity: true });
+  const gadget = fixture.nextSnapshot("acme/gadget", 0);
+  fixture.subscribe("acme/gadget", "security");
+  const [gadgetFirst] = await fixture.settle("repository B security", [gadget]);
+  const widget = fixture.nextSnapshot("acme/widget", 0);
+  fixture.subscribe("acme/widget", "security");
+  const [widgetFirst] = await fixture.settle("repository A security", [widget]);
+  assert.equal(dependabotRequests(fixture, "acme/widget"), 1);
+  // A forced refresh bypasses B's own backoff and succeeds, which clears the
+  // backoff entry for the key it is bound to.
+  const gadgetForced = fixture.nextSnapshot("acme/gadget", gadgetFirst.generation);
+  fixture.handles.get("acme/gadget").refresh(true);
+  await fixture.settle("repository B forced success", [gadgetForced]);
+  assert.equal(dependabotRequests(fixture, "acme/gadget"), 2);
+  // An ordinary manual refresh of A inside its window must replay A's
+  // backoff instead of re-probing the disabled endpoint.
+  const widgetAgain = fixture.nextSnapshot("acme/widget", widgetFirst.generation);
+  fixture.handles.get("acme/widget").refresh(false);
+  const [widgetSecond] = await fixture.settle("repository A replay", [widgetAgain]);
+  assert.equal(dependabotRequests(fixture, "acme/widget"), 1,
+    "repository B's success reset repository A's backoff ladder");
+  assert.equal(widgetSecond.capabilities?.dependabot?.verdict, "unavailable");
 });
