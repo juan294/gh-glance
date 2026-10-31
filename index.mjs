@@ -7500,6 +7500,14 @@ async function fetchSecurity(signal, {
     requestMetrics,
     graphqlSpent: 0,
     measuredSuccess: parts.every((part) => part.verdict === "ok"),
+    // Whether this batch observed the source at all: some source made a real
+    // request and GitHub answered it (200/304, or a current capability refusal).
+    // A batch in which every source replayed its backoff made no request, so it
+    // must not advance freshness or complete webhook work (plan D6, ADR 0005).
+    // With no sources (an App granted no Security permission) there is nothing
+    // to observe, and the configuration answer keeps its existing behavior.
+    sourceObserved: parts.length === 0 || parts.some((part) => part.httpRequests > 0 &&
+      (part.verdict === "ok" || part.verdict === "unavailable")),
     rateLimited: parts.some((part) => part.verdict === "rate-limited"),
     stagedEntities,
     observations: parts.flatMap((part) => part.observations ?? []),
@@ -10057,7 +10065,11 @@ async function createCollectorService({ config, pathOptions = {}, runtime, platf
 }
 
 function collectorPublicationFromResult(resource, result, previous, demand, completedAt, state = {}) {
-  const transition = pollResultTransition({
+  // A Security batch that only replayed capability backoff made no request. It
+  // republishes the previous observation unchanged, with its success time, so
+  // neither freshness nor webhook completion can advance on it.
+  const observed = result.sourceObserved !== false;
+  const transition = !observed ? { kind: "unchanged", completedAt } : pollResultTransition({
     key: resource,
     previousRaw: previous?.raw ?? null,
     raw: result.raw,
@@ -10086,7 +10098,8 @@ function collectorPublicationFromResult(resource, result, previous, demand, comp
     },
     raw: transition.kind === "changed" ? transition.nextRaw : previous.raw,
     entities,
-    lastSuccessAt: completedAt,
+    lastSuccessAt: observed ? completedAt : previous.lastSuccessAt,
+    sourceObserved: observed,
     lastChangedAt,
     nextDueAt: completedAt + pollPolicyInterval({
       tab: resource,
@@ -10466,13 +10479,21 @@ function createCollectorAcquisitionRuntime({
     }
     item.onSnapshot(snapshot);
     if (!publication || !Number.isSafeInteger(snapshot.generation)) return true;
+    let awaitingObservation = false;
     for (const waiter of item.invalidations) {
       if (bindingRevision !== waiter.bindingRevision || waiter.requiredGeneration === null ||
           snapshot.generation < waiter.requiredGeneration) continue;
+      // A newer generation that republished an older observation (a Security
+      // capability-backoff replay) is not API validation of the webhook. Leave
+      // the waiter for the next real observation on the ordinary cadence.
+      if (Number.isFinite(waiter.invalidatedAt) && !(snapshot.lastSuccessAt >= waiter.invalidatedAt)) {
+        awaitingObservation = true;
+        continue;
+      }
       item.invalidations.delete(waiter);
       waiter.resolve(snapshot);
     }
-    if (item.invalidations.size > 0 && !closed && !item.closed && demandEnabled(item.demand)) {
+    if (item.invalidations.size > 0 && !awaitingObservation && !closed && !item.closed && demandEnabled(item.demand)) {
       queueMicrotask(() => startPoll(item, { manual: true }));
     }
     return true;
@@ -10623,6 +10644,9 @@ function createCollectorAcquisitionRuntime({
         if (!published.ok) { item.onHold?.("disconnected"); retryIn = 1_000; }
         else {
           item.provider?.coordinator?.markAuthorized?.();
+          // A replay answers the request as far as backoff allows without
+          // advancing the success time that would otherwise clear it.
+          if (produced.sourceObserved === false) item.requestedAt = null;
           retryIn = Math.max(1, published.value.snapshot.nextDueAt - now());
         }
       } catch (error) {
@@ -10837,6 +10861,7 @@ function createCollectorAcquisitionRuntime({
         }
         item.invalidations.add({
           requiredGeneration,
+          invalidatedAt: now(),
           bindingRevision: item.bindingRevision,
           accessRemoved: normalized.accessRemoved,
           accessOnly: normalized.accessRemoved && !demandEnabled(item.demand),
@@ -20098,6 +20123,17 @@ function App({ onCreateRemote = () => {} } = {}) {
             setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
             setSecurityNotes(transition.notes);
             setSecurityBlind(true);
+            return;
+          }
+          // Every Security source replayed its capability backoff: no request
+          // was made, so nothing was observed. Keep the displayed rows, the
+          // freshness clock and the peers' snapshot as they are (plan D6), and
+          // let the ordinary cadence retry. The request itself is answered.
+          if (result?.sourceObserved === false) {
+            await cancelAcquisition(acquisition);
+            requestedTabs.delete(key);
+            rescheduleTab(key, completedAt);
+            setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
             return;
           }
           // The shared nonce/generation is the publication fence. A superseded

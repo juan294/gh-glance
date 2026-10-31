@@ -8,13 +8,16 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import {
+  ALERT_SOURCES,
   POLL_QUIET_MS,
   adoptedAcquisitionRaw,
+  clearForcedBackoffAfterStart,
   collectorPublicationFromResult,
   createCollectorAcquisitionRuntime,
   createCollectorSourceAgeTracker,
   dashboardCacheTarget,
   fetchGraphqlList,
+  fetchSecurity,
   loadDashboardCache,
   normalizeCollectorConfig,
   pollResultTransition,
@@ -239,4 +242,135 @@ test("RT-04: collector source age includes time spent suspended and never shrink
   assert.equal(tracker.current(), 3_611_000);
   assert.equal(tracker.observe({ lastSuccessAt: wall - 500, serverNow: wall }), 500,
     "a newer observation still replaces the age");
+});
+
+// RT-07 (#168): a Security batch in which every source replays its capability
+// backoff makes no request. It is not a source observation (plan D6), so it
+// must not advance freshness or complete durable webhook work (ADR 0005).
+const forbidden = Object.assign(new Error("HTTP 403: feature disabled"), {
+  requestMetrics: { httpRequests: 1, failedRequests: 1 },
+});
+const emptyAlerts = { status: 200, body: "[]", staged: null, observations: [],
+  requestMetrics: { httpRequests: 1, rest200: 1, coreUnits: 1, failedRequests: 0 } };
+
+function clearSecurityBackoff(t) {
+  clearForcedBackoffAfterStart("security", true, "started");
+  t.after(() => clearForcedBackoffAfterStart("security", true, "started"));
+}
+
+test("RT-07: fetchSecurity reports whether any source produced a real observation", async (t) => {
+  clearSecurityBackoff(t);
+  const refused = await fetchSecurity(null, { request: async () => { throw forbidden; } });
+  assert.equal(refused.httpRequests, ALERT_SOURCES.length);
+  assert.equal(refused.sourceObserved, true, "a current provider refusal is an observation");
+  const replayed = await fetchSecurity(null, { request: async () => { throw new Error("must not request"); } });
+  assert.equal(replayed.httpRequests, 0);
+  assert.equal(replayed.sourceObserved, false, "an all-backoff batch is not an observation");
+  const forced = await fetchSecurity(null, { force: true, request: async () => emptyAlerts });
+  assert.equal(forced.sourceObserved, true);
+});
+
+test("RT-07: a collector all-backoff publication keeps the previous success time and rows", () => {
+  const previous = { rows: [], raw: "previous", entities: [], pageInfo: null, lastSuccessAt: 1_000,
+    lastChangedAt: 500, meta: { at: 500, truncated: false }, capabilities: {},
+    securityNotes: ["Dependabot: not enabled"], securityBlind: false };
+  const replay = { raw: "backoff:x", parse: () => ({ alerts: [], notes: ["Dependabot: not enabled"] }),
+    limit: 100, stagedEntities: new Map(), sourceObserved: false, capabilities: {} };
+  const demand = { active: true, background: true, floorMs: 5_000, pages: 1 };
+  const published = collectorPublicationFromResult("security", replay, previous, demand, 9_000, {});
+  assert.equal(published.lastSuccessAt, 1_000);
+  assert.equal(published.lastChangedAt, 500);
+  assert.deepEqual(published.securityNotes, ["Dependabot: not enabled"]);
+  assert.ok(published.nextDueAt > 9_000, "the replay still schedules the next attempt");
+  assert.throws(() => collectorPublicationFromResult("security", replay, null, demand, 9_000, {}),
+    /no valid snapshot/, "a replay cannot create the first observation");
+  const observed = collectorPublicationFromResult("security", { ...replay, sourceObserved: true },
+    previous, demand, 9_000, {});
+  assert.equal(observed.lastSuccessAt, 9_000);
+});
+
+const WEBHOOK_CONFIG = { ...CONFIG, webhook: { enabled: true, address: "127.0.0.1", port: 8787,
+  secretFile: "/private/webhook-secret", targets: [{ ...CONFIG.targets[0], resources: ["security"] }] } };
+
+test("RT-07: a Security webhook is not completed by a capability-backoff replay", async (t) => {
+  clearSecurityBackoff(t);
+  let now = 5_000_000;
+  let calls = 0;
+  let requests = 0;
+  const runtime = createCollectorAcquisitionRuntime({
+    config: normalizeCollectorConfig(WEBHOOK_CONFIG),
+    pathOptions: temporaryRoot(t),
+    now: () => now,
+    setTimeout() { return { unref() {} }; }, clearTimeout() {},
+    resolveProvider: async () => IDENTITY,
+    resolveTargetIdentity: async () => ({ id: "R_1", nameWithOwner: "acme/widget" }),
+    async produce({ snapshot, demand, claim, markStarted, force }) {
+      await markStarted();
+      calls += 1;
+      const result = await fetchSecurity(null, { force, entities: new Map(), previousRaw: snapshot?.raw ?? null,
+        request: async () => { requests += 1; if (calls === 1) throw forbidden; return emptyAlerts; } });
+      return collectorPublicationFromResult("security", result, snapshot, demand, now, claim.state);
+    },
+  });
+  t.after(() => runtime.close());
+  const snapshots = [];
+  const handle = runtime.subscribe({ target: normalizeCollectorConfig(CONFIG).targets[0], resource: "security",
+    demand: { active: true, background: true, floorMs: 5_000, pages: 1 },
+    onSnapshot(snapshot) { snapshots.push(snapshot); }, onHold() {} });
+  await handle.whenCurrentPollSettled();
+  assert.equal(requests, ALERT_SOURCES.length, "the first poll is a real refusal");
+  const observedAt = snapshots.at(-1).lastSuccessAt;
+
+  now += 10_000;
+  let completed = false;
+  const invalidated = runtime.invalidate({ ...CONFIG.targets[0], resource: "security", accessRemoved: false })
+    .then(() => { completed = true; });
+  for (let turn = 0; turn < 20 && calls < 2; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+  await handle.whenCurrentPollSettled();
+  for (let turn = 0; turn < 20; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 2, "the replay must not re-poll in a tight loop");
+  assert.equal(requests, ALERT_SOURCES.length, "the follow-up replayed backoff with zero requests");
+  assert.equal(snapshots.at(-1).lastSuccessAt, observedAt, "a replay does not advance freshness");
+  assert.equal(completed, false, "a replay must not complete durable webhook work");
+
+  now += 10_000;
+  await handle.refresh(true);
+  await handle.whenCurrentPollSettled();
+  await invalidated;
+  assert.equal(completed, true, "a real observation completes it");
+  assert.ok(snapshots.at(-1).lastSuccessAt > observedAt);
+});
+
+test("RT-07: an on-demand refresh answered by a replay does not keep polling", async (t) => {
+  clearSecurityBackoff(t);
+  let now = 6_000_000;
+  let calls = 0;
+  const timers = [];
+  const runtime = createCollectorAcquisitionRuntime({
+    config: normalizeCollectorConfig(CONFIG),
+    pathOptions: temporaryRoot(t),
+    now: () => now,
+    setTimeout(run, delay) { timers.push(delay); return { unref() {} }; }, clearTimeout() {},
+    resolveProvider: async () => IDENTITY,
+    resolveTargetIdentity: async () => ({ id: "R_1", nameWithOwner: "acme/widget" }),
+    async produce({ snapshot, demand, claim, markStarted, force }) {
+      await markStarted();
+      calls += 1;
+      const result = await fetchSecurity(null, { force, entities: new Map(), previousRaw: snapshot?.raw ?? null,
+        request: async () => { throw forbidden; } });
+      return collectorPublicationFromResult("security", result, snapshot, demand, now, claim.state);
+    },
+  });
+  t.after(() => runtime.close());
+  const handle = runtime.subscribe({ target: normalizeCollectorConfig(CONFIG).targets[0], resource: "security",
+    demand: { active: false, background: false, floorMs: 5_000, pages: 1 }, onSnapshot() {}, onHold() {} });
+  await handle.refresh();
+  await handle.whenCurrentPollSettled();
+  assert.equal(calls, 1);
+  now += 10_000;
+  timers.length = 0;
+  await handle.refresh();
+  await handle.whenCurrentPollSettled();
+  assert.equal(calls, 2, "the second request replayed backoff");
+  assert.deepEqual(timers, [], "an answered on-demand request schedules no further poll");
 });
