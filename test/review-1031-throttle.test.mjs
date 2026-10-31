@@ -3,13 +3,13 @@
 // Every test runs against temporary directories and fixture responses only.
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
   createGovernorScope, registerLease, registerIntent, claimProbe, publishProbe,
-  requestManualProbe, inspectGovernor, startReservation, GOVERNOR_LEASE_TTL_MS,
+  requestManualProbe, inspectGovernor, startReservation, readIntentDecision, GOVERNOR_LEASE_TTL_MS,
 } from "../index.mjs";
 
 const NOW = 1_800_000_000_000;
@@ -76,4 +76,52 @@ test("PC-05: a reservation that charges GraphQL still waits behind the GraphQL o
   assert.equal(started.value?.status, "waiting");
   assert.equal(started.value.reason, "probe");
   assert.equal(started.value.notBefore, graphqlClaim.value.leaseUntil);
+});
+
+function ledgerIdentity(scope) {
+  const info = statSync(scope.path);
+  return { ino: info.ino, mtimeMs: info.mtimeMs, revision: JSON.parse(readFileSync(scope.path, "utf8")).revision,
+    bytes: readFileSync(scope.path, "utf8") };
+}
+
+test("PC-08: no-op governor waits leave the ledger file untouched", (t) => {
+  const { scope, leaseId } = governorFixture(t);
+  const intentId = randomUUID();
+  const grant = registerIntent(scope, {
+    id: intentId, leaseId, tab: "actions", priority: "active", costs: { core: 1, graphql: 0 },
+    requestedAt: NOW, expiresAt: NOW + GOVERNOR_LEASE_TTL_MS,
+  }).value;
+  assert.equal(grant.status, "scheduled");
+  const graphqlEpoch = inspectGovernor(scope, NOW + 1).value.budgets.graphql.epoch;
+  assert.equal(requestManualProbe(scope, leaseId, graphqlEpoch, NOW + 1, NOW + 1).ok, true);
+  assert.equal(claimProbe(scope, leaseId, NOW + 1, "graphql").value?.status, "claimed");
+  const at = NOW + 2;
+
+  const beforeWait = ledgerIdentity(scope);
+  const waiting = claimProbe(scope, leaseId, at, "graphql");
+  assert.equal(waiting.ok, true);
+  assert.notEqual(waiting.value.status, "claimed", "the fixture must exercise the waiting path");
+  const afterWait = ledgerIdentity(scope);
+  assert.equal(afterWait.revision, beforeWait.revision, "a waiting claimProbe bumped the revision");
+  assert.equal(afterWait.ino, beforeWait.ino, "a waiting claimProbe replaced the ledger inode");
+  assert.equal(afterWait.bytes, beforeWait.bytes);
+
+  const first = readIntentDecision(scope, intentId, at, null);
+  const second = readIntentDecision(scope, intentId, at, null);
+  assert.equal(first.ok, true);
+  assert.equal(second.value?.status, first.value?.status);
+  const afterReads = ledgerIdentity(scope);
+  assert.equal(afterReads.revision, beforeWait.revision, "readIntentDecision bumped the revision");
+  assert.equal(afterReads.ino, beforeWait.ino, "readIntentDecision replaced the ledger inode");
+  assert.equal(afterReads.mtimeMs, beforeWait.mtimeMs);
+});
+
+test("PC-08: a governor mutation that changes state still commits a new revision", (t) => {
+  const { scope, leaseId } = governorFixture(t);
+  const before = ledgerIdentity(scope);
+  const graphqlEpoch = inspectGovernor(scope, NOW + 1).value.budgets.graphql.epoch;
+  assert.equal(requestManualProbe(scope, leaseId, graphqlEpoch, NOW + 1, NOW + 1).ok, true);
+  const after = ledgerIdentity(scope);
+  assert.equal(after.revision, before.revision + 1);
+  assert.notEqual(after.bytes, before.bytes);
 });

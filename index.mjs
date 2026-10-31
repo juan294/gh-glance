@@ -5363,7 +5363,7 @@ function readGovernorState(path, nowMs, { persistMigration = true } = {}) {
     if (Buffer.byteLength(raw) > GOVERNOR_MAX_LEDGER_BYTES) return { ok: false, reason: "capacity" };
     const parsed = JSON.parse(raw);
     const normalized = normalizeGovernorState(parsed, nowMs);
-    if (normalized) return { ok: true, value: normalized };
+    if (normalized) return { ok: true, value: normalized, bytes: raw };
     if (Number.isSafeInteger(parsed?.version) && parsed.version > GOVERNOR_STATE_VERSION) {
       return { ok: false, reason: "version-mismatch" };
     }
@@ -5785,6 +5785,13 @@ function mutateGovernor(scope, nowMs, mutate) {
     if (!governorAccountingSafe(state, at)) return returnAfterMigration(ACCOUNTING_OVERFLOW);
     const normalized = normalizeGovernorState(state, at);
     if (!normalized) return returnAfterMigration({ ok: false, reason: "corrupt" });
+    // A wait or decision read that changed nothing must not bump the revision
+    // and replace the file: compare the would-be bytes, as the identity
+    // registry does. Migrations and explicit rejected writes always commit.
+    if (migration === null && value?.ok !== false && typeof loaded.bytes === "string" &&
+        serializeGovernorState(normalized) === loaded.bytes) {
+      return { ok: true, value: value?.value };
+    }
     const written = commitGovernorMigration(scope.path, normalized, loaded.migration);
     if (!written.ok) return written;
     return value?.ok === false ? { ok: false, reason: value.reason } : { ok: true, value: value?.value };
