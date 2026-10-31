@@ -6512,9 +6512,11 @@ function startReservation(scope, reservationId, nowMs) {
       return { ok: false, reason: "stale", write: Boolean(reservation) };
     }
     if (reservation.notBefore > at) return { value: { status: "waiting", notBefore: reservation.notBefore } };
-    // Any live observer claim defers a start: the claim owns the shared HTTP
-    // permit for its window, so starting here would contend for it.
+    // A live observer claim defers only work that charges its resource. The
+    // other resource's observer says nothing about this counter, and the shared
+    // HTTP pool, start gap and host cooldown still bound the two together.
     const liveClaim = RATE_RESOURCES
+      .filter((resource) => reservation.costs[resource] > 0)
       .map((resource) => state.probeClaims[resource])
       .filter((claim) => claim && claim.leaseUntil > at)
       .sort((left, right) => right.leaseUntil - left.leaseUntil)[0];
