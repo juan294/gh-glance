@@ -761,6 +761,9 @@ async function runGh(args, { signal, operation, input = null, execute = null,
   let control = null;
   const identityCoordinator = bound?.identityCoordinator ?? runtimeIdentityCoordinator;
   const requestNow = typeof bound?.now === "function" ? bound.now : Date.now;
+  if (identityCoordinator && bound && operation === "budget-core-observer") {
+    retryTransportAfterReset(identityCoordinator, bound, requestNow);
+  }
   const permit = identityCoordinator && !local
     ? await acquireIdentityHttpPermit(identityCoordinator, { signal, now: requestNow,
         operationDeadline: CONTROL_OPERATIONS.includes(operation) ? undefined : bound?.receiptCapability?.deadline,
@@ -4187,6 +4190,19 @@ function classifyThrottle({ status = null, headers = null, graphqlErrors = null,
   return { kind: "none" };
 }
 
+// A "rate limit" message does not say which limit. Secondary limits are already
+// held by the shared transport cooldown; publishing one as a resource block until
+// the sampled primary reset would hold every pane for the rest of the window.
+// Only evidence classified as secondary is excluded. Stderr alone ("API rate
+// limit exceeded" with no headers) classifies as none and stays primary.
+function secondaryThrottleEvidence(error) {
+  if (error?.coordinationReason === "throttle-paused") return true;
+  const response = nativeCiThrottleEvidence.get(error) ?? error?.apiResponse ??
+    parseGhApiResponse(error?.stdout ?? "");
+  return classifyThrottle({ status: response.status, headers: response.headers, stderr: errText(error) })
+    .kind === "secondary";
+}
+
 function transportCooldownDeadline({ retryAfter, status, secondary, at, attempts = 0 }) {
   const supplied = typeof retryAfter === "string" && /^\d+(?:\.\d+)?$/.test(retryAfter)
     ? at + Number(retryAfter) * 1000
@@ -4271,17 +4287,40 @@ function releaseIdentityHttpPermit(coordinator, permit, error = null, now = Date
   return result;
 }
 
-// The explicit retry a paused transport waits for. Clears the ladder and the
-// deadline together: a person choosing to retry is choosing to spend the next
-// request finding out, which is exactly the recovery election the pause defers.
-function retryThrottledTransport(root, host, { now = Date.now } = {}) {
+// The explicit retry, or the reset-triggered recovery, a paused transport waits
+// for. Clears the ladder and the pause but never the deadline: a server-supplied
+// Retry-After is honoured exactly (ADR 0003), so the next request still waits it
+// out. The registry lock is the election: only the first caller resumes a given
+// pause. A reset recovers only a pause whose last throttle predates that reset,
+// so one primary window elects at most one recovery.
+function retryThrottledTransport(root, host, { now = Date.now, resetAt = null } = {}) {
+  const at = now();
   return withIdentityRegistry(root, (state) => {
     const transport = state.hosts[host];
     if (!transport?.throttle?.paused) return { ok: true, value: { resumed: false } };
+    if (resetAt !== null &&
+        !(Number.isFinite(resetAt) && at >= resetAt && transport.throttle.lastAt < resetAt)) {
+      return { ok: true, value: { resumed: false } };
+    }
     transport.throttle = emptyTransportThrottle();
-    transport.cooldownUntil = Math.min(transport.cooldownUntil, now());
-    return { ok: true, value: { resumed: true } };
-  }, { now: now() });
+    return { ok: true, value: { resumed: true, cooldownUntil: transport.cooldownUntil } };
+  }, { now: at });
+}
+
+function retryPausedTransport(coordinator, options = {}) {
+  const host = coordinator?.current?.()?.host;
+  if (typeof coordinator?.root !== "string" || !host) return { ok: true, value: { resumed: false } };
+  return retryThrottledTransport(coordinator.root, host, options);
+}
+
+// Only the pane holding the core observer claim runs budget-core-observer, so the
+// claim elects the one request that finds out whether the limit has lifted.
+function retryTransportAfterReset(coordinator, scope, now = Date.now) {
+  const at = now();
+  const snapshot = inspectGovernor({ ...scope, identityProvider: null }, at);
+  const resetAt = snapshot.ok ? snapshot.value.budgets.core?.resetMs : null;
+  if (!Number.isFinite(resetAt) || at < resetAt) return { ok: true, value: { resumed: false } };
+  return retryPausedTransport(coordinator, { now: () => at, resetAt });
 }
 
 function identityCoordinationMessage(reason) {
@@ -5363,7 +5402,7 @@ function readGovernorState(path, nowMs, { persistMigration = true } = {}) {
     if (Buffer.byteLength(raw) > GOVERNOR_MAX_LEDGER_BYTES) return { ok: false, reason: "capacity" };
     const parsed = JSON.parse(raw);
     const normalized = normalizeGovernorState(parsed, nowMs);
-    if (normalized) return { ok: true, value: normalized };
+    if (normalized) return { ok: true, value: normalized, bytes: raw };
     if (Number.isSafeInteger(parsed?.version) && parsed.version > GOVERNOR_STATE_VERSION) {
       return { ok: false, reason: "version-mismatch" };
     }
@@ -5785,6 +5824,13 @@ function mutateGovernor(scope, nowMs, mutate) {
     if (!governorAccountingSafe(state, at)) return returnAfterMigration(ACCOUNTING_OVERFLOW);
     const normalized = normalizeGovernorState(state, at);
     if (!normalized) return returnAfterMigration({ ok: false, reason: "corrupt" });
+    // A wait or decision read that changed nothing must not bump the revision
+    // and replace the file: compare the would-be bytes, as the identity
+    // registry does. Migrations and explicit rejected writes always commit.
+    if (migration === null && value?.ok !== false && typeof loaded.bytes === "string" &&
+        serializeGovernorState(normalized) === loaded.bytes) {
+      return { ok: true, value: value?.value };
+    }
     const written = commitGovernorMigration(scope.path, normalized, loaded.migration);
     if (!written.ok) return written;
     return value?.ok === false ? { ok: false, reason: value.reason } : { ok: true, value: value?.value };
@@ -6512,9 +6558,11 @@ function startReservation(scope, reservationId, nowMs) {
       return { ok: false, reason: "stale", write: Boolean(reservation) };
     }
     if (reservation.notBefore > at) return { value: { status: "waiting", notBefore: reservation.notBefore } };
-    // Any live observer claim defers a start: the claim owns the shared HTTP
-    // permit for its window, so starting here would contend for it.
+    // A live observer claim defers only work that charges its resource. The
+    // other resource's observer says nothing about this counter, and the shared
+    // HTTP pool, start gap and host cooldown still bound the two together.
     const liveClaim = RATE_RESOURCES
+      .filter((resource) => reservation.costs[resource] > 0)
       .map((resource) => state.probeClaims[resource])
       .filter((claim) => claim && claim.leaseUntil > at)
       .sort((left, right) => right.leaseUntil - left.leaseUntil)[0];
@@ -7428,6 +7476,7 @@ async function fetchAlertSource(source, signal, now, {
       rest200,
       rest304,
       verdict,
+      secondaryThrottle: verdict === "rate-limited" && secondaryThrottleEvidence(err),
       allNotModified: false,
       stagedEntities: new Map(),
       observations,
@@ -7499,7 +7548,7 @@ async function fetchSecurity(signal, {
     requestMetrics,
     graphqlSpent: 0,
     measuredSuccess: parts.every((part) => part.verdict === "ok"),
-    rateLimited: parts.some((part) => part.verdict === "rate-limited"),
+    rateLimited: parts.some((part) => part.verdict === "rate-limited" && !part.secondaryThrottle),
     stagedEntities,
     observations: parts.flatMap((part) => part.observations ?? []),
     capabilities,
@@ -10748,7 +10797,10 @@ function createCollectorAcquisitionRuntime({
           }
           return updated;
         },
-        refresh(force = false) { return startPoll(item, { manual: true, force: force === true }); },
+        refresh(force = false) {
+          retryPausedTransport(item.provider?.scope?.identityCoordinator);
+          return startPoll(item, { manual: true, force: force === true });
+        },
         inspect() {
           if (!item.id) return { source: "local collector", status: "initializing", resource: item.resource };
           const inspected = engine.inspect(item.id);
@@ -19522,6 +19574,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       } else if (input==='d' && TABS[activeIndexRef.current].key==='actions') {
         void ciEvidenceRef.current?.('open');
       } else if (featureRef.current?.mode==='ci' && input==='r') {
+        retryPausedTransport(runtimeIdentityCoordinator);
         ciControllerRef.current?.abort();attentionControllerRef.current?.abort();jevOperationRef.current=null;runtimeJevSession?.clear();setFeature(null);void fetchTabRef.current?.('actions',manualRefreshRequest(refreshIntent(input)));
       } else if (featureRef.current?.mode==='focus' && input==='x') {
         jevOperationRef.current=null;const current=featureRef.current;
@@ -19570,6 +19623,9 @@ function App({ onCreateRemote = () => {} } = {}) {
         // validators: `r` on a quiet repository answers 304 and costs nothing,
         // which is exactly when the key is most likely to be pressed.
         const request = manualRefreshRequest(refreshIntent(input));
+        // The explicit retry a paused transport waits for. A collector client has
+        // no local coordinator; its collector resumes on the refresh it receives.
+        if (request) retryPausedTransport(runtimeIdentityCoordinator);
         if (request) fetchTabRef.current?.(TABS[activeIndexRef.current].key, request);
       } else if (input.length === 1 && input >= "1" && input <= String(TABS.length)) {
         setActiveIndex(Number(input) - 1);
@@ -20152,7 +20208,9 @@ function App({ onCreateRemote = () => {} } = {}) {
             const recovery = requestFailureRecovery(err, verdict);
             recordRuntimeRecovery(key, recovery.reason, { origin: recovery.origin, retryAt });
           }
-          if (verdict === "rate-limited") {
+          // A secondary limit is held by the shared transport cooldown, not by a
+          // resource block until the primary reset.
+          if (verdict === "rate-limited" && !secondaryThrottleEvidence(err)) {
             const snapshot = inspectGovernor(scope, Date.now());
             const costs = tabRequestCost(key);
             const blocks = [];
@@ -22637,12 +22695,14 @@ export {
   maintainControlLease,
   claimProbe,
   classifyThrottle,
+  secondaryThrottleEvidence,
   applyTransportCooldown,
   clearTransportThrottle,
   emptyTransportThrottle,
   throttleLadderMs,
   transportCooldownDeadline,
   retryThrottledTransport,
+  retryPausedTransport,
   THROTTLE_LADDER_MS,
   THROTTLE_PAUSE_AFTER,
   MANUAL_GRANT_STREAK_LIMIT,
