@@ -9,7 +9,7 @@ Date: 2026-10-31. Target: `develop` at `2b21de9e2e228a07765e55d2f99801f448fed9ce
 - Verification: three independent Claude reviewers tried to refute every item from the source at the same commit, read the cited ADR and plan text, checked the relevant tests (without running the suite), and wrote small reproductions against exported functions where possible. Nothing in the repository was modified; reproductions used temporary directories only. Result: no item refuted; 11 confirmed, 1 partial. Severities below are the verifiers', with the model's in brackets.
 - Cost: USD 18.77 (two passes, about 406K input and 17K output tokens each), from the ChatGPT Pro API credit on the owner's Personal OpenAI organization.
 
-Raw model output, verifier reports, reproduction scripts and the runner are in `docs/research/2026-10-31-astra-review-raw/`.
+Raw model output and verifier reports are in `docs/research/2026-10-31-astra-review-raw/`. The reproduction scripts and the runner are kept locally in the gitignored `docs/agents/2026-10-31-astra-review-raw/`, because every tracked JavaScript file must be inside a lint target (LINT-01). Paths such as `repro-C/rt01.mjs` below refer to that folder.
 
 ## Summary
 
