@@ -172,7 +172,9 @@ test("SSH-03/04: reconnect retains same-epoch fences and adopts only a new epoch
       serverEpoch: EPOCH_ONE, generation, serverNow: 1_200,
       snapshot: snapshot(generation, 1100) })));
   }
-  assert.deepEqual(snapshots, [5, 6]);
+  // The equal-generation replay acknowledges the same-epoch reconnect (#170);
+  // the older generation stays fenced.
+  assert.deepEqual(snapshots, [5, 5, 6]);
   assert.equal(transports[1].writes.filter((frame) => frame.type === "subscribe").length, 1);
   transports[1].destroy();
   timers.at(-1).callback();
@@ -185,7 +187,7 @@ test("SSH-03/04: reconnect retains same-epoch fences and adopts only a new epoch
     serverEpoch: EPOCH_ONE, generation: 7, serverNow: 1_300, snapshot: snapshot(7, 1200) })));
   transports[2].emit("data", Buffer.from(encodeCollectorFrame({ type: "snapshot", id: "one",
     serverEpoch: EPOCH_TWO, generation: 1, serverNow: 1_300, snapshot: snapshot(1, 1200) })));
-  assert.deepEqual(snapshots, [5, 6, 1]);
+  assert.deepEqual(snapshots, [5, 5, 6, 1]);
   assert.deepEqual(ready, [true, false, true, false, true]);
   assert.equal(transports[2].writes.filter((frame) => frame.type === "subscribe").length, 1);
   client.close();

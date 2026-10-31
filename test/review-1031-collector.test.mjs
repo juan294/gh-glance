@@ -8,6 +8,8 @@ import { test } from "node:test";
 
 import {
   createCollectorAcquisitionRuntime,
+  createSshCollectorClient,
+  encodeCollectorFrame,
   normalizeCollectorConfig,
 } from "../index.mjs";
 
@@ -287,4 +289,94 @@ test("PC-02 (#165): another repository's success does not reset a repository's b
   assert.equal(dependabotRequests(fixture, "acme/widget"), 1,
     "repository B's success reset repository A's backoff ladder");
   assert.equal(widgetSecond.capabilities?.dependabot?.verdict, "unavailable");
+});
+
+const EPOCH = "11111111-1111-4111-8111-111111111111";
+const OTHER_EPOCH = "22222222-2222-4222-8222-222222222222";
+
+class FakeTransport extends EventEmitter {
+  writable = true;
+  writes = [];
+  write(value) { this.writes.push(String(value)); return true; }
+  destroy() {
+    if (!this.writable) return;
+    this.writable = false;
+    this.emit("close");
+  }
+}
+
+function protocolSnapshot(generation, at) {
+  return { resource: "actions", generation, rows: [], pageInfo: { loadedPages: 1, hasNextPage: false },
+    lastSuccessAt: at, lastChangedAt: at, nextDueAt: at + 5_000, hold: null, meta: { at, truncated: false },
+    securityNotes: [], securityBlind: false, capabilities: {} };
+}
+
+function sshClientFixture() {
+  const transports = [];
+  const timers = [];
+  const ready = [];
+  const delivered = [];
+  const client = createSshCollectorClient({ alias: "studio",
+    createTransport() { const transport = new FakeTransport(); transports.push(transport); return transport; },
+    random: () => 0,
+    setTimeout(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; },
+    clearTimeout() {},
+    onReady: (value) => ready.push(value) });
+  client.subscribe({ id: "one", host: "github.com", repo: "acme/widget", resource: "actions",
+    demand: { active: false, background: false, floorMs: 5_000, pages: 1 },
+    onSnapshot: (snapshot) => delivered.push(snapshot.generation) });
+  const welcome = (transport, serverEpoch = EPOCH) => transport.emit("data", Buffer.from(encodeCollectorFrame({
+    type: "welcome", protocolVersion: 1, serverEpoch, capabilities: { chunks: true, maxSubscriptions: 64 } })));
+  const send = (transport, generation, serverEpoch = EPOCH) => transport.emit("data", Buffer.from(
+    encodeCollectorFrame({ type: "snapshot", id: "one", serverEpoch, generation, serverNow: 2_000,
+      snapshot: protocolSnapshot(generation, 1_000) })));
+  const reconnect = () => {
+    transports.at(-1).destroy();
+    timers.at(-1).callback();
+    const transport = transports.at(-1);
+    transport.emit("connect");
+    return transport;
+  };
+  return { client, transports, ready, delivered, welcome, send, reconnect };
+}
+
+test("PC-06 (#170): an equal-generation replay after a same-epoch reconnect acknowledges the connection", (t) => {
+  const fixture = sshClientFixture();
+  t.after(() => fixture.client.close());
+  const first = fixture.transports[0];
+  first.emit("connect");
+  fixture.welcome(first);
+  fixture.send(first, 5);
+  assert.deepEqual(fixture.ready, [true]);
+  assert.deepEqual(fixture.delivered, [5]);
+  // The same snapshot again on the same connection is not a new delivery.
+  fixture.send(first, 5);
+  assert.deepEqual(fixture.delivered, [5]);
+  const second = fixture.reconnect();
+  fixture.welcome(second);
+  // The server replays its cached generation 5 for the new subscription.
+  fixture.send(second, 5);
+  assert.equal(second.writable, true);
+  assert.deepEqual(fixture.ready, [true, false, true],
+    "a live same-epoch connection must leave Disconnected on an equal-generation replay");
+  assert.deepEqual(fixture.delivered, [5, 5],
+    "the replay must be delivered so the App restores its snapshot marker");
+  fixture.send(second, 5);
+  fixture.send(second, 4);
+  assert.deepEqual(fixture.delivered, [5, 5], "repeats and older generations stay rejected");
+});
+
+test("PC-06 (#170): an older generation or another epoch's frame does not acknowledge a reconnect", (t) => {
+  const fixture = sshClientFixture();
+  t.after(() => fixture.client.close());
+  const first = fixture.transports[0];
+  first.emit("connect");
+  fixture.welcome(first);
+  fixture.send(first, 5);
+  const second = fixture.reconnect();
+  fixture.welcome(second);
+  fixture.send(second, 4);
+  fixture.send(second, 5, OTHER_EPOCH);
+  assert.deepEqual(fixture.ready, [true, false]);
+  assert.deepEqual(fixture.delivered, [5]);
 });

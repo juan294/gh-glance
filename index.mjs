@@ -11026,7 +11026,13 @@ function createCollectorProtocolClient({ createTransport, onReady = () => {},
     resourceForId: (id) => subscriptions.get(id)?.resource ?? null,
     onSnapshot(snapshot, frame) {
       const item = subscriptions.get(frame.id);
-      if (!item || frame.serverEpoch !== serverEpoch || snapshot.generation <= item.generation) return;
+      if (!item || frame.serverEpoch !== serverEpoch || snapshot.generation < item.generation) return;
+      // A same-epoch reconnect keeps the generation fence, and the server
+      // replays its cached generation for the new subscription. The first
+      // equal-generation snapshot on a connection acknowledges that
+      // connection; later repeats on it are not new deliveries.
+      if (snapshot.generation === item.generation && item.connectionAcknowledged) return;
+      item.connectionAcknowledged = true;
       item.generation = snapshot.generation;
       item.controlGeneration = Math.max(item.controlGeneration, snapshot.generation);
       const sourceAgeMs = item.sourceAge.observe({
@@ -11061,6 +11067,7 @@ function createCollectorProtocolClient({ createTransport, onReady = () => {},
         item.generation = -1;
         item.controlGeneration = -1;
       }
+      item.connectionAcknowledged = false;
       write({ type: "subscribe", id: item.id, host: item.host, repo: item.repo,
         resource: item.resource, demand: item.demand });
       flushRefresh(item);
@@ -11154,7 +11161,7 @@ function createCollectorProtocolClient({ createTransport, onReady = () => {},
         return { ok: false, reason: "invalid" };
       }
       const item = { ...subscription,
-        onSnapshot, onHold, onError, onDiagnostic, generation: -1, controlGeneration: -1, pendingRefresh: null,
+        onSnapshot, onHold, onError, onDiagnostic, generation: -1, controlGeneration: -1, connectionAcknowledged: false, pendingRefresh: null,
         sourceAge: createCollectorSourceAgeTracker({ now, monotonicNow, checkpoint: sourceCheckpoint }) };
       subscriptions.set(id, item);
       if (welcomed) write({ type: "subscribe", id: item.id, host: item.host, repo: item.repo,
