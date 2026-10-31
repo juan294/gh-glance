@@ -10,6 +10,7 @@ import { test } from "node:test";
 import {
   createGovernorScope, registerLease, registerIntent, claimProbe, publishProbe,
   requestManualProbe, inspectGovernor, startReservation, readIntentDecision, GOVERNOR_LEASE_TTL_MS,
+  fetchSecurity, secondaryThrottleEvidence,
 } from "../index.mjs";
 
 const NOW = 1_800_000_000_000;
@@ -125,3 +126,40 @@ test("PC-08: a governor mutation that changes state still commits a new revision
   assert.equal(after.revision, before.revision + 1);
   assert.notEqual(after.bytes, before.bytes);
 });
+
+// gh api -i puts the status line and headers on stdout and the message on stderr.
+function ghFailure(stderr, stdout = "") {
+  return Object.assign(new Error(stderr), { stderr, stdout });
+}
+const SECONDARY_STDERR = "gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)";
+const SECONDARY_429 = ghFailure("gh: API rate limit exceeded (HTTP 429)",
+  "HTTP/2.0 429 Too Many Requests\nretry-after: 60\n\n{}");
+const PRIMARY_STRUCTURED = ghFailure("gh: API rate limit exceeded for user ID 1. (HTTP 403)",
+  `HTTP/2.0 403 Forbidden\nx-ratelimit-remaining: 0\nx-ratelimit-reset: ${Math.floor((NOW + HOUR) / 1000)}\nx-ratelimit-resource: core\n\n{}`);
+const PRIMARY_STDERR_ONLY = ghFailure("HTTP 403: API rate limit exceeded");
+
+test("RT-02a: only throttle evidence classified as secondary is kept out of primary resource blocks", () => {
+  assert.equal(secondaryThrottleEvidence(ghFailure(SECONDARY_STDERR)), true);
+  assert.equal(secondaryThrottleEvidence(SECONDARY_429), true);
+  const paused = Object.assign(new Error("Paused after repeated rate limits; refresh to retry"),
+    { coordinationReason: "throttle-paused" });
+  assert.equal(secondaryThrottleEvidence(paused), true);
+  assert.equal(secondaryThrottleEvidence(PRIMARY_STRUCTURED), false);
+  assert.equal(secondaryThrottleEvidence(PRIMARY_STDERR_ONLY), false,
+    "stderr-only primary text must keep the existing primary block");
+});
+
+for (const [name, error, expected] of [
+  ["a secondary-limit message", ghFailure(SECONDARY_STDERR), false],
+  ["a 429 with Retry-After", SECONDARY_429, false],
+  ["structured primary exhaustion", PRIMARY_STRUCTURED, true],
+  ["stderr-only primary text", PRIMARY_STDERR_ONLY, true],
+]) {
+  test(`RT-02a: Security publishes a primary block only for primary evidence: ${name}`, async () => {
+    const result = await fetchSecurity(new AbortController().signal, {
+      force: true,
+      request: async () => { throw error; },
+    });
+    assert.equal(result.rateLimited, expected);
+  });
+}

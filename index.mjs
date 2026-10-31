@@ -4187,6 +4187,19 @@ function classifyThrottle({ status = null, headers = null, graphqlErrors = null,
   return { kind: "none" };
 }
 
+// A "rate limit" message does not say which limit. Secondary limits are already
+// held by the shared transport cooldown; publishing one as a resource block until
+// the sampled primary reset would hold every pane for the rest of the window.
+// Only evidence classified as secondary is excluded. Stderr alone ("API rate
+// limit exceeded" with no headers) classifies as none and stays primary.
+function secondaryThrottleEvidence(error) {
+  if (error?.coordinationReason === "throttle-paused") return true;
+  const response = nativeCiThrottleEvidence.get(error) ?? error?.apiResponse ??
+    parseGhApiResponse(error?.stdout ?? "");
+  return classifyThrottle({ status: response.status, headers: response.headers, stderr: errText(error) })
+    .kind === "secondary";
+}
+
 function transportCooldownDeadline({ retryAfter, status, secondary, at, attempts = 0 }) {
   const supplied = typeof retryAfter === "string" && /^\d+(?:\.\d+)?$/.test(retryAfter)
     ? at + Number(retryAfter) * 1000
@@ -7437,6 +7450,7 @@ async function fetchAlertSource(source, signal, now, {
       rest200,
       rest304,
       verdict,
+      secondaryThrottle: verdict === "rate-limited" && secondaryThrottleEvidence(err),
       allNotModified: false,
       stagedEntities: new Map(),
       observations,
@@ -7508,7 +7522,7 @@ async function fetchSecurity(signal, {
     requestMetrics,
     graphqlSpent: 0,
     measuredSuccess: parts.every((part) => part.verdict === "ok"),
-    rateLimited: parts.some((part) => part.verdict === "rate-limited"),
+    rateLimited: parts.some((part) => part.verdict === "rate-limited" && !part.secondaryThrottle),
     stagedEntities,
     observations: parts.flatMap((part) => part.observations ?? []),
     capabilities,
@@ -20161,7 +20175,9 @@ function App({ onCreateRemote = () => {} } = {}) {
             const recovery = requestFailureRecovery(err, verdict);
             recordRuntimeRecovery(key, recovery.reason, { origin: recovery.origin, retryAt });
           }
-          if (verdict === "rate-limited") {
+          // A secondary limit is held by the shared transport cooldown, not by a
+          // resource block until the primary reset.
+          if (verdict === "rate-limited" && !secondaryThrottleEvidence(err)) {
             const snapshot = inspectGovernor(scope, Date.now());
             const costs = tabRequestCost(key);
             const blocks = [];
@@ -22646,6 +22662,7 @@ export {
   maintainControlLease,
   claimProbe,
   classifyThrottle,
+  secondaryThrottleEvidence,
   applyTransportCooldown,
   clearTransportThrottle,
   emptyTransportThrottle,
