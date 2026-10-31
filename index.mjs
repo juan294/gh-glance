@@ -13834,8 +13834,10 @@ function authCacheIdentity({
 }
 
 // Explicit targets are stable across working directories. In inferred mode the
-// directory is the only repository identity available without making another
-// GitHub call -- exactly the call that cannot succeed when this cache is needed.
+// directory and the remote slug, both resolved offline without the GitHub call
+// that cannot succeed when this cache is needed, form the identity: a changed
+// remote or a reused checkout path must not restore another repository's rows.
+// A null slug (no remote, or remotes that disagree) is its own key.
 // JSON encoding avoids delimiter ambiguity in host, repo, and path strings.
 function dashboardCacheTarget({
   repo = null,
@@ -13843,11 +13845,13 @@ function dashboardCacheTarget({
   host = null,
   cwd = process.cwd(),
   account = authCacheIdentity(),
+  remoteUrls = [],
 } = {}) {
   const target = repo || ghRepo;
   return target
     ? JSON.stringify({ kind: "repo", host: String(host ?? ""), repo: String(target), account })
-    : JSON.stringify({ kind: "cwd", host: String(host ?? ""), cwd: String(cwd), account });
+    : JSON.stringify({ kind: "cwd", host: String(host ?? ""), cwd: String(cwd),
+      remote: resolveEffectiveRepository({ remoteUrls }), account });
 }
 
 function sshCollectorCacheIdentity(alias) {
@@ -18555,6 +18559,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       host: runtimeIdentityCoordinator?.current()?.host ?? effectiveRuntimeHost(),
       cwd: process.cwd(),
       account: sshCacheIdentity ?? runtimeIdentityCoordinator?.current()?.accessKey ?? "unverified",
+      remoteUrls: runtimeRemoteUrls,
     }),
   );
   const [loadedCache] = useState(() => loadDashboardCache(cachePath, cacheTarget));
@@ -20897,7 +20902,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         recoveryRef.current = savedRecovery.status === "healthy"
           ? { ...savedRecovery.current } : { core: null, graphql: null };
         setRecoveryCauses(recoveryRef.current);
-        const nextTarget = dashboardCacheTarget({ repo: runtime.repo, ghRepo: process.env.GH_REPO, host: current.host, account: current.accessKey });
+        const nextTarget = dashboardCacheTarget({ repo: runtime.repo, ghRepo: process.env.GH_REPO, host: current.host, account: current.accessKey, remoteUrls: runtimeRemoteUrls });
         // The mount-time target had to guess the account, and guesses
         // "unverified" whenever the bounded warm resolution above did not land
         // in time -- so a session that has rows on disk can start with none.

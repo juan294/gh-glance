@@ -12,9 +12,12 @@ import {
   adoptedAcquisitionRaw,
   collectorPublicationFromResult,
   createCollectorAcquisitionRuntime,
+  dashboardCacheTarget,
   fetchGraphqlList,
+  loadDashboardCache,
   normalizeCollectorConfig,
   pollResultTransition,
+  saveDashboardCache,
 } from "../index.mjs";
 
 const CONFIG = {
@@ -190,4 +193,29 @@ test("RT-06: adopting the same content keeps the sentinel, and a stored snapshot
   assert.equal(pollResultTransition({ key: "issues", previousRaw: storedA.raw, raw: again.raw,
     parse() { throw new Error("unchanged results must not parse"); }, limit: again.limit, completedAt: 3 }).kind,
   "unchanged");
+});
+
+// PC-04 (#172): with no --repo or GH_REPO the cache key is inferred. The remote
+// slug is resolved offline before mount, so it is part of the identity: a
+// changed remote in the same directory must not restore the other repository.
+test("PC-04: a changed remote in the same directory does not restore the other repository's rows", (t) => {
+  const root = temporaryRoot(t).home;
+  const path = join(root, "gh-glance", "dashboard-cache.json");
+  const cwd = join(root, "checkout");
+  const inferred = (remoteUrls) => dashboardCacheTarget({ repo: null, ghRepo: null, host: "github.com",
+    cwd, account: "a".repeat(64), remoteUrls });
+  const one = inferred(["git@github.com:acme/one.git"]);
+  const two = inferred(["https://github.com/acme/two.git"]);
+  const unresolved = inferred([]);
+  assert.equal(new Set([one, two, unresolved]).size, 3);
+  const row = { databaseId: 1, displayTitle: "acme/one run", workflowName: "CI", number: 1,
+    headBranch: "main", status: "completed", conclusion: "success",
+    startedAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-01T00:01:00Z",
+    url: "https://github.com/acme/one/actions/runs/1" };
+  const tabs = { actions: { data: [row], meta: { at: 1, truncated: false }, lastOk: 1 } };
+  assert.equal(saveDashboardCache(path, { [one]: { tabs, securityNotes: [], securityBlind: false,
+    updatedAt: Date.now() } }).ok, true);
+  assert.equal(loadDashboardCache(path, one).entry?.tabs.actions.data[0].displayTitle, "acme/one run");
+  assert.equal(loadDashboardCache(path, two).entry, null);
+  assert.equal(loadDashboardCache(path, unresolved).entry, null);
 });
