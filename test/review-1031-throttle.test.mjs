@@ -3,7 +3,8 @@
 // Every test runs against temporary directories and fixture responses only.
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -11,6 +12,9 @@ import {
   createGovernorScope, registerLease, registerIntent, claimProbe, publishProbe,
   requestManualProbe, inspectGovernor, startReservation, readIntentDecision, GOVERNOR_LEASE_TTL_MS,
   fetchSecurity, secondaryThrottleEvidence,
+  createIdentityCoordinator, acquireIdentityHttpPermit, releaseIdentityHttpPermit, inspectIdentityRegistry,
+  retryThrottledTransport, retryPausedTransport, createQuotaScope, refreshSharedBudget, runGh, THROTTLE_PAUSE_AFTER,
+  createCollectorAcquisitionRuntime, normalizeCollectorConfig,
 } from "../index.mjs";
 
 const NOW = 1_800_000_000_000;
@@ -163,3 +167,201 @@ for (const [name, error, expected] of [
     assert.equal(result.rateLimited, expected);
   });
 }
+
+async function transportFixture(t) {
+  const root = mkdtempSync(join(tmpdir(), "glance-review-1031-transport-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const coordinator = createIdentityCoordinator({
+    host: "github.com", pathOptions: { env: { XDG_CONFIG_HOME: root } }, env: { GH_TOKEN: "synthetic-review" },
+    now: () => NOW,
+    requestIdentity: async () => ({ body: { id: 1, login: "fixture" }, rateLimit: {
+      resource: "core", limit: 5000, used: 1, remaining: 4999, resetMs: NOW + HOUR,
+    } }),
+  });
+  assert.equal((await coordinator.refresh()).ok, true);
+  t.after(() => coordinator.close());
+  const read = (at) => inspectIdentityRegistry(coordinator.root, { now: at }).value.hosts["github.com"];
+  return { coordinator, read };
+}
+
+function throttled(retryAfter) {
+  return Object.assign(new Error("secondary"), {
+    stdout: `HTTP/2.0 403 Forbidden\nretry-after: ${retryAfter}\n\n{}`,
+    stderr: "gh: You have exceeded a secondary rate limit (HTTP 403)",
+  });
+}
+
+// Five real throttled responses, each admitted once the previous cooldown ends.
+// Returns the time of the last response and its server-supplied deadline.
+async function throttleFiveTimes(coordinator, read, lastRetryAfter) {
+  let at = NOW + 250;
+  for (let index = 0; index < THROTTLE_PAUSE_AFTER; index += 1) {
+    const permit = await acquireIdentityHttpPermit(coordinator, { now: () => at });
+    const retryAfter = index === THROTTLE_PAUSE_AFTER - 1 ? lastRetryAfter : 60;
+    assert.equal(releaseIdentityHttpPermit(coordinator, permit, throttled(retryAfter), at + 1).ok, true);
+    if (index < THROTTLE_PAUSE_AFTER - 1) at = read(at + 1).cooldownUntil + 1;
+  }
+  const host = read(at + 1);
+  assert.equal(host.throttle.paused, true);
+  assert.equal(host.throttle.attempts, THROTTLE_PAUSE_AFTER);
+  assert.equal(host.cooldownUntil, at + 1 + lastRetryAfter * 1000);
+  await assert.rejects(acquireIdentityHttpPermit(coordinator, { now: () => at + 2 }),
+    (error) => error.coordinationReason === "throttle-paused");
+  return { lastAt: at + 1, cooldownUntil: host.cooldownUntil };
+}
+
+test("RT-02b: the explicit retry clears the pause without shortening a Retry-After deadline", async (t) => {
+  const { coordinator, read } = await transportFixture(t);
+  const { lastAt, cooldownUntil } = await throttleFiveTimes(coordinator, read, 7200);
+  const pressedAt = lastAt + 10_000;
+  const resumed = retryThrottledTransport(coordinator.root, "github.com", { now: () => pressedAt });
+  assert.equal(resumed.value.resumed, true);
+  const host = read(pressedAt);
+  assert.equal(host.throttle.paused, false);
+  assert.equal(host.throttle.attempts, 0);
+  assert.equal(host.cooldownUntil, cooldownUntil, "the retry shortened the server's Retry-After deadline");
+  await assert.rejects(acquireIdentityHttpPermit(coordinator, { now: () => pressedAt }),
+    (error) => error.coordinationReason === "transport-busy", "the Retry-After hold must still apply");
+});
+
+test("RT-02b: pressing r resumes a paused transport once, for one pane", async (t) => {
+  const { coordinator, read } = await transportFixture(t);
+  const { lastAt, cooldownUntil } = await throttleFiveTimes(coordinator, read, 60);
+  const pressedAt = cooldownUntil + 1_000;
+  assert.equal(retryPausedTransport(coordinator, { now: () => pressedAt }).value.resumed, true);
+  assert.equal(retryPausedTransport(coordinator, { now: () => pressedAt }).value.resumed, false,
+    "a second simultaneous press must not elect a second recovery");
+  assert.equal(read(pressedAt).cooldownUntil, cooldownUntil);
+  assert.ok(lastAt < pressedAt);
+  const permit = await acquireIdentityHttpPermit(coordinator, { now: () => pressedAt });
+  assert.equal(releaseIdentityHttpPermit(coordinator, permit, null, pressedAt + 100).ok, true);
+  assert.equal(read(pressedAt + 100).throttle.attempts, 0);
+});
+
+function observerScope(coordinator, clock) {
+  return {
+    ...createQuotaScope(coordinator.current(), { root: coordinator.root, now: () => clock.at }),
+    identityCoordinator: coordinator, accessKey: coordinator.current().accessKey,
+  };
+}
+
+// The real control path: refreshSharedBudget elects one pane through the core
+// observer claim, and only that pane runs the budget-core-observer request.
+async function runCoreObserver(scope, clock) {
+  let executions = 0;
+  const leaseId = randomUUID();
+  assert.equal(registerLease(scope, { id: leaseId, expiresAt: clock.at + 60_000, floorMs: 5_000,
+    activeTab: "actions", phaseSeed: { seed: leaseId, registeredAt: clock.at },
+    demand: { core: 1, graphql: 0 } }, clock.at).ok, true);
+  const execute = () => {
+    executions += 1;
+    const child = new EventEmitter();
+    child.pid = process.pid;
+    const pending = Promise.resolve({ stdout: "{}" });
+    pending.child = child;
+    queueMicrotask(() => child.emit("close", 0));
+    return pending;
+  };
+  const result = await refreshSharedBudget(scope, leaseId, new AbortController().signal, {
+    now: () => clock.at,
+    wait: async (ms) => { clock.at += ms; },
+    readBudgets: async (_signal, _host, { resources }) => {
+      if (!resources.includes("core")) return null;
+      await runGh(["api", "user"], { operation: "budget-core-observer", execute });
+      return { core: { budget: { resource: "core", limit: 5000, used: 1, remaining: 4999,
+        resetMs: clock.at + HOUR }, etag: null, receivedAt: clock.at } };
+    },
+  });
+  return { result, executions };
+}
+
+test("RT-02b: a primary reset lets the elected core observer recover a paused transport", async (t) => {
+  const { coordinator, read } = await transportFixture(t);
+  const clock = { at: NOW };
+  const scope = observerScope(coordinator, clock);
+  const resetAt = inspectGovernor(scope, NOW).value.budgets.core?.resetMs;
+  assert.ok(Number.isFinite(resetAt), "the fixture must hold a sampled core reset");
+  const { lastAt } = await throttleFiveTimes(coordinator, read, 60);
+  assert.ok(lastAt < resetAt);
+
+  clock.at = resetAt - 1_000;
+  const early = await runCoreObserver(scope, clock);
+  assert.equal(early.executions, 0);
+  assert.equal(read(clock.at).throttle.paused, true, "the observer recovered before the reset");
+
+  clock.at = resetAt + 1_000;
+  await assert.rejects(acquireIdentityHttpPermit(coordinator, { now: () => clock.at }),
+    (error) => error.coordinationReason === "throttle-paused",
+    "data requests must not elect themselves to recover");
+  const observed = await runCoreObserver(scope, clock);
+  assert.equal(observed.executions, 1, JSON.stringify(observed.result));
+  assert.equal(read(clock.at).throttle.paused, false);
+});
+
+test("RT-02b: reset recovery keeps the Retry-After deadline and recovers once per window", async (t) => {
+  const { coordinator, read } = await transportFixture(t);
+  const clock = { at: NOW };
+  const scope = observerScope(coordinator, clock);
+  const resetAt = inspectGovernor(scope, NOW).value.budgets.core?.resetMs;
+  assert.ok(Number.isFinite(resetAt));
+  const { cooldownUntil } = await throttleFiveTimes(coordinator, read, 7200);
+  assert.ok(cooldownUntil > resetAt + 60_000, "the fixture must hold a deadline beyond the reset");
+
+  clock.at = resetAt + 1_000;
+  const observed = await runCoreObserver(scope, clock);
+  assert.equal(observed.executions, 0, "the observer started inside the server's Retry-After hold");
+  const host = read(clock.at);
+  assert.equal(host.throttle.paused, false);
+  assert.equal(host.throttle.attempts, 0);
+  assert.equal(host.cooldownUntil, cooldownUntil, "reset recovery shortened the Retry-After deadline");
+
+  // Throttled again after the reset: the same reset cannot elect a second recovery.
+  assert.equal(retryThrottledTransport(coordinator.root, "github.com",
+    { now: () => clock.at, resetAt }).value.resumed, false);
+  const registry = join(coordinator.root, "registry.json");
+  const state = JSON.parse(readFileSync(registry, "utf8"));
+  state.hosts["github.com"].throttle = { attempts: THROTTLE_PAUSE_AFTER, lastAt: clock.at, paused: true };
+  writeFileSync(registry, JSON.stringify(state));
+  assert.equal(retryThrottledTransport(coordinator.root, "github.com",
+    { now: () => clock.at + 1, resetAt }).value.resumed, false);
+  assert.equal(read(clock.at + 1).throttle.paused, true);
+});
+
+test("RT-02b: a collector refresh resumes its provider's paused transport", async (t) => {
+  const { coordinator, read } = await transportFixture(t);
+  const { cooldownUntil } = await throttleFiveTimes(coordinator, read, 7200);
+  const root = mkdtempSync(join(tmpdir(), "glance-review-1031-collector-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const config = normalizeCollectorConfig({
+    version: 1,
+    providers: { personal: { type: "gh", host: "github.com" } },
+    targets: [{ host: "github.com", repo: "acme/widget", provider: "personal" }],
+  });
+  const runtime = createCollectorAcquisitionRuntime({
+    config,
+    pathOptions: { env: { XDG_CONFIG_HOME: root }, platform: "linux" },
+    setTimeout(run, delay) { return { run, delay, unref() {} }; },
+    clearTimeout() {},
+    setInterval() { return { unref() {} }; },
+    clearInterval() {},
+    resolveProvider: async () => ({ identity: coordinator.current(), scope: { identityCoordinator: coordinator } }),
+    resolveTargetIdentity: async () => ({ id: "R_1", nameWithOwner: "acme/widget" }),
+    async produce() { throw new Error("fixture producer"); },
+  });
+  t.after(() => runtime.close());
+  const handle = runtime.subscribe({
+    target: config.targets[0], resource: "actions",
+    demand: { active: false, background: false, floorMs: 5_000, pages: 1 },
+    onSnapshot() {}, onHold() {},
+  });
+  const deadline = Date.now() + 2_000;
+  while (handle.inspect().status === "initializing") {
+    assert.ok(Date.now() < deadline, "the collector subscription did not initialize");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(read(Date.now()).throttle.paused, true, "initialization alone must not resume the transport");
+  await handle.refresh(false);
+  const host = read(Date.now());
+  assert.equal(host.throttle.paused, false, "the collector refresh did not resume the transport");
+  assert.equal(host.cooldownUntil, cooldownUntil);
+});

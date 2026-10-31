@@ -761,6 +761,9 @@ async function runGh(args, { signal, operation, input = null, execute = null,
   let control = null;
   const identityCoordinator = bound?.identityCoordinator ?? runtimeIdentityCoordinator;
   const requestNow = typeof bound?.now === "function" ? bound.now : Date.now;
+  if (identityCoordinator && bound && operation === "budget-core-observer") {
+    retryTransportAfterReset(identityCoordinator, bound, requestNow);
+  }
   const permit = identityCoordinator && !local
     ? await acquireIdentityHttpPermit(identityCoordinator, { signal, now: requestNow,
         operationDeadline: CONTROL_OPERATIONS.includes(operation) ? undefined : bound?.receiptCapability?.deadline,
@@ -4284,17 +4287,40 @@ function releaseIdentityHttpPermit(coordinator, permit, error = null, now = Date
   return result;
 }
 
-// The explicit retry a paused transport waits for. Clears the ladder and the
-// deadline together: a person choosing to retry is choosing to spend the next
-// request finding out, which is exactly the recovery election the pause defers.
-function retryThrottledTransport(root, host, { now = Date.now } = {}) {
+// The explicit retry, or the reset-triggered recovery, a paused transport waits
+// for. Clears the ladder and the pause but never the deadline: a server-supplied
+// Retry-After is honoured exactly (ADR 0003), so the next request still waits it
+// out. The registry lock is the election: only the first caller resumes a given
+// pause. A reset recovers only a pause whose last throttle predates that reset,
+// so one primary window elects at most one recovery.
+function retryThrottledTransport(root, host, { now = Date.now, resetAt = null } = {}) {
+  const at = now();
   return withIdentityRegistry(root, (state) => {
     const transport = state.hosts[host];
     if (!transport?.throttle?.paused) return { ok: true, value: { resumed: false } };
+    if (resetAt !== null &&
+        !(Number.isFinite(resetAt) && at >= resetAt && transport.throttle.lastAt < resetAt)) {
+      return { ok: true, value: { resumed: false } };
+    }
     transport.throttle = emptyTransportThrottle();
-    transport.cooldownUntil = Math.min(transport.cooldownUntil, now());
-    return { ok: true, value: { resumed: true } };
-  }, { now: now() });
+    return { ok: true, value: { resumed: true, cooldownUntil: transport.cooldownUntil } };
+  }, { now: at });
+}
+
+function retryPausedTransport(coordinator, options = {}) {
+  const host = coordinator?.current?.()?.host;
+  if (typeof coordinator?.root !== "string" || !host) return { ok: true, value: { resumed: false } };
+  return retryThrottledTransport(coordinator.root, host, options);
+}
+
+// Only the pane holding the core observer claim runs budget-core-observer, so the
+// claim elects the one request that finds out whether the limit has lifted.
+function retryTransportAfterReset(coordinator, scope, now = Date.now) {
+  const at = now();
+  const snapshot = inspectGovernor({ ...scope, identityProvider: null }, at);
+  const resetAt = snapshot.ok ? snapshot.value.budgets.core?.resetMs : null;
+  if (!Number.isFinite(resetAt) || at < resetAt) return { ok: true, value: { resumed: false } };
+  return retryPausedTransport(coordinator, { now: () => at, resetAt });
 }
 
 function identityCoordinationMessage(reason) {
@@ -10771,7 +10797,10 @@ function createCollectorAcquisitionRuntime({
           }
           return updated;
         },
-        refresh(force = false) { return startPoll(item, { manual: true, force: force === true }); },
+        refresh(force = false) {
+          retryPausedTransport(item.provider?.scope?.identityCoordinator);
+          return startPoll(item, { manual: true, force: force === true });
+        },
         inspect() {
           if (!item.id) return { source: "local collector", status: "initializing", resource: item.resource };
           const inspected = engine.inspect(item.id);
@@ -19545,6 +19574,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       } else if (input==='d' && TABS[activeIndexRef.current].key==='actions') {
         void ciEvidenceRef.current?.('open');
       } else if (featureRef.current?.mode==='ci' && input==='r') {
+        retryPausedTransport(runtimeIdentityCoordinator);
         ciControllerRef.current?.abort();attentionControllerRef.current?.abort();jevOperationRef.current=null;runtimeJevSession?.clear();setFeature(null);void fetchTabRef.current?.('actions',manualRefreshRequest(refreshIntent(input)));
       } else if (featureRef.current?.mode==='focus' && input==='x') {
         jevOperationRef.current=null;const current=featureRef.current;
@@ -19593,6 +19623,9 @@ function App({ onCreateRemote = () => {} } = {}) {
         // validators: `r` on a quiet repository answers 304 and costs nothing,
         // which is exactly when the key is most likely to be pressed.
         const request = manualRefreshRequest(refreshIntent(input));
+        // The explicit retry a paused transport waits for. A collector client has
+        // no local coordinator; its collector resumes on the refresh it receives.
+        if (request) retryPausedTransport(runtimeIdentityCoordinator);
         if (request) fetchTabRef.current?.(TABS[activeIndexRef.current].key, request);
       } else if (input.length === 1 && input >= "1" && input <= String(TABS.length)) {
         setActiveIndex(Number(input) - 1);
@@ -22669,6 +22702,7 @@ export {
   throttleLadderMs,
   transportCooldownDeadline,
   retryThrottledTransport,
+  retryPausedTransport,
   THROTTLE_LADDER_MS,
   THROTTLE_PAUSE_AFTER,
   MANUAL_GRANT_STREAK_LIMIT,
