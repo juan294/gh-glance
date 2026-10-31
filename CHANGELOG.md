@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-10-31
+
+### Fixed
+
+- A collector that serves several repositories through one provider gives each
+  target its own immutable request scope, so one repository's rows can no
+  longer be fetched or published under another (#163). Security capability
+  backoff is now scoped by host and repository, so one repository's disabled
+  feature no longer hides another's alerts or resets its backoff ladder (#165).
+- A secondary rate limit no longer blocks a resource until the hourly primary
+  reset; it stays under the shared transport cooldown (#164). A transport paused
+  after repeated throttles now recovers on `r` or after the primary reset, and
+  recovery never shortens a server-supplied Retry-After (#164).
+- A GraphQL observer claim no longer delays core-only work, and the reverse
+  (#169). Governor waits that change nothing no longer rewrite the ledger (#174).
+- Collector Issues and PR results compare as unchanged when their rows are the
+  same, so quiet queries reach the quiet cadence instead of polling at the
+  floor (#166). Adopting a peer's snapshot updates the local unchanged sentinel
+  (#167).
+- A Security batch that only replayed capability backoff no longer advances the
+  success time or completes webhook refresh work (#168).
+- A same-epoch collector reconnect shows Connected again without waiting for a
+  newer generation (#170), and followers no longer re-send unchanged snapshots
+  (#173).
+- The Actions clock advances in collector mode, and collector source age counts
+  time spent suspended (#171).
+- The inferred display cache is keyed by the repository resolved from the
+  remote, so a changed remote in the same directory no longer restores another
+  repository's rows (#172). Existing directory-only cache entries start cold
+  once.
+
 ## [0.18.0] - 2026-10-29
 
 ### Added
@@ -1361,7 +1392,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.18.1...HEAD
+[0.18.1]: https://github.com/juan294/gh-glance/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/juan294/gh-glance/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/juan294/gh-glance/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/juan294/gh-glance/compare/v0.16.2...v0.17.0

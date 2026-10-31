@@ -1,0 +1,325 @@
+{
+  "items": [
+    {
+      "id": "PC-01",
+      "kind": "defect",
+      "confidence": "high",
+      "evidence": "index.mjs:10153\n    let context = providerContexts.get(target.provider);\nindex.mjs:10181\n      providerContexts.set(target.provider, context);\nindex.mjs:10202-10215\n    context.identity = identity;\n    context.scope = {\n      ...createQuotaScope(identity, {\n        root: context.coordinator.root,\n        now,\n        identityProvider: context.coordinator.current,\n      }),\n      identityCoordinator: context.coordinator,\n      repository: target.repo,\n      providerType: context.definition.type,\n      ...(executeGh ? { executeGh } : {}),\n      ...(context.credentialEnvironment ? { credentialEnvironment: context.credentialEnvironment } : {}),\n    };\n    return context;\nindex.mjs:10223\n    const refreshed = await refreshProviderBudget(context, signal, resource);\nindex.mjs:10270\n    const transportScope = { ...context.scope, receiptCapability: admitted.receiptCapability };\nindex.mjs:10292\n      let result = await requestIdentityStorage.run(transportScope, () => descriptor.fetch({",
+      "priority": "high",
+      "risk": "Keep the credential coordinator and quota ledger shared by provider/principal; splitting quota state by repository would undo coordination. Capture immutable identity/environment/scope bindings for each operation, and continue settling old work against its original receipt after credential changes. Exercise simultaneous target initialization as well as polling.",
+      "expected_gain": "Correctness rather than fewer requests: prevents a collector serving two or more repositories through one provider from fetching or publishing another target's rows. Request count and declared quota costs need not increase.",
+      "locations": [
+        {
+          "line_start": 10152,
+          "path": "index.mjs",
+          "line_end": 10215
+        },
+        {
+          "line_start": 10218,
+          "path": "index.mjs",
+          "line_end": 10300
+        },
+        {
+          "line_start": 10387,
+          "path": "index.mjs",
+          "line_end": 10415
+        }
+      ],
+      "proposal": "Change createCollectorAcquisitionRuntime.defaultResolve to cache only provider-level authentication machinery and return a fresh, immutable per-target operation context. In defaultTargetIdentity, defaultProduce and refreshProviderBudget, capture that operation's scope and identity once rather than rereading a shared mutable context after awaits. Add a concurrent A/B repository scenario using the same provider, with distinct sentinel rows and delayed budget responses.",
+      "effort": "medium",
+      "title": "Collector targets share a mutable repository scope",
+      "already_documented": "ADR 0005, Decision, lines 25-28 requires exact host/repository targets and provider-fenced aliases. The code shares authentication appropriately, but also shares and overwrites the repository-bearing scope; that violates the target boundary rather than implementing an intentional sharing policy.",
+      "current_behavior": "providerContexts is keyed only by provider name, and every defaultResolve overwrites the same object's scope.repository. If target A waits for budget or admission while target B resolves through that provider, A can resume using B's scope. Concurrent initializations can also discover B's repository identity for A. Actions has no repositoryIdentity in its fetch result to expose this substitution before publication."
+    },
+    {
+      "id": "PC-02",
+      "kind": "defect",
+      "confidence": "high",
+      "evidence": "index.mjs:194\nconst BACKOFF_STEPS_MS = [60_000, 300_000, 1_800_000, 3_600_000];\nindex.mjs:7243-7246\nfunction backoffStorageKey(key) {\n  const access = requestIdentityStorage.getStore()?.accessKey ?? runtimeIdentityCoordinator?.current()?.accessKey;\n  return access ? `${access}\\0${key}` : key;\n}\nindex.mjs:7292-7293\n  if (!force && backoffActive(source.key, now)) {\n    const { note, verdict } = alertBackoff.get(backoffStorageKey(source.key));\nindex.mjs:7309\n      parse: () => ({ alerts: [], note, verdict, truncated: false }),\nindex.mjs:7418-7420\n    if (steps) {\n      recordFailure(source.key, now, steps);\n      Object.assign(alertBackoff.get(backoffStorageKey(source.key)), { note, verdict });\nindex.mjs:20315\n            alertBackoff.set(`${accessKey}\\0${sourceKey}`, {",
+      "priority": "high",
+      "risk": "Repository isolation will restore requests currently suppressed incorrectly, so consumption can rise relative to this defective behavior. That increase is justified: one repository's disabled feature cannot establish another's capability. Retain producer deduplication, normal governor admission, expiry ladders and the R-only capability reset contract.",
+      "expected_gain": "Eliminates cross-repository false-unavailable results for the remaining 1-, 5-, 30- or 60-minute backoff window. Preserves valid Security rows instead of allowing another repository's negative result to replace them. No extra requests for duplicate subscribers to the same repository are required.",
+      "locations": [
+        {
+          "line_start": 7238,
+          "path": "index.mjs",
+          "line_end": 7272
+        },
+        {
+          "line_start": 7287,
+          "path": "index.mjs",
+          "line_end": 7310
+        },
+        {
+          "line_start": 7416,
+          "path": "index.mjs",
+          "line_end": 7436
+        },
+        {
+          "line_start": 20311,
+          "path": "index.mjs",
+          "line_end": 20319
+        }
+      ],
+      "proposal": "Make backoffStorageKey include the bound host/repository and access partition, then route backoffActive, recordFailure, clearBackoff and adoptAcquisitionSnapshot restoration through that single key builder. Use the immutable operation binding from PC-01. Test one collector provider watching a repository with disabled scanning and another with live alerts, including R on only one target.",
+      "effort": "medium",
+      "title": "Security negative caching is not repository-scoped",
+      "already_documented": "ADR 0004, shared acquisition ownership, lines 159-164 partitions queries by access identity, host and repository. README lines 675-680 likewise describes repository/access-scoped caching. The durable snapshots have those partitions, but the process-global backoff map does not.",
+      "current_behavior": "A collector can watch up to 32 targets, but alertBackoff keys contain only accessKey and source name. A 403/404 for repository A therefore suppresses that source for repository B using the same credential. The replay returns no alerts with verdict unavailable, which Security deliberately does not classify as blindness. Snapshot capability restoration also writes the same cross-repository key."
+    },
+    {
+      "id": "PC-03",
+      "kind": "defect",
+      "confidence": "high",
+      "evidence": "index.mjs:2559-2565\n  const raw = JSON.stringify({\n    v: GRAPHQL_QUERY_VERSION,\n    totalCount,\n    incomplete,\n    hasNextPage: merged.hasNextPage,\n    rows: merged.rows,\n  });\nindex.mjs:10048-10052\n  const transition = pollResultTransition({\n    key: resource,\n    previousRaw: previous?.raw ?? null,\n    raw: result.raw,\n    parse: result.parse,\nindex.mjs:10068\n  state.unchangedCount = advanceUnchangedCount(state.unchangedCount ?? 0, transition.kind);\nindex.mjs:14558\n  const content = JSON.stringify(rows);\nindex.mjs:14568\n    raw: content,\nindex.mjs:17180\n  if (previousRaw === raw) return { kind: \"unchanged\", completedAt };\nindex.mjs:20306-20310\n      const sameRows = JSON.stringify(dataRef.current[key]) === JSON.stringify(snapshot.rows);\n      if (!sameRows) setData((current) => ({ ...current, [key]: snapshot.rows }));\n      setMeta((current) => current[key]?.at === snapshotMeta.at &&\n        current[key]?.truncated === snapshotMeta.truncated\n        ? current : { ...current, [key]: snapshotMeta });",
+      "priority": "high",
+      "risk": "The comparison identity must include meaningful coverage and Security-note changes, but exclude observation timestamps and scheduling deadlines. Version any persisted representation change and preserve validator/body pairing. Do not replace separate quota evidence with a content digest.",
+      "expected_gain": "For a continuously polled, quiet collector Issues/PR query at a 5-second floor, restores the nominal 30-second cadence: 720 to 120 requests/hour, saving 600 gh spawns and up to 1,200 declared GraphQL reservation points/hour. Webhook-covered quiet queries can reach 300 seconds: 720 to 12 requests/hour. These are cadence calculations excluding transport time and governor delays, not measured billing.",
+      "locations": [
+        {
+          "line_start": 2554,
+          "path": "index.mjs",
+          "line_end": 2567
+        },
+        {
+          "line_start": 10047,
+          "path": "index.mjs",
+          "line_end": 10085
+        },
+        {
+          "line_start": 14543,
+          "path": "index.mjs",
+          "line_end": 14578
+        },
+        {
+          "line_start": 20269,
+          "path": "index.mjs",
+          "line_end": 20329
+        },
+        {
+          "line_start": 17179,
+          "path": "index.mjs",
+          "line_end": 17208
+        }
+      ],
+      "proposal": "Define one normalized representation fingerprint shared by fetchGraphqlList, fetchActions, fetchSecurity, normalizeAcquisitionSnapshot and pollResultTransition. Persist that fingerprint separately from the rows-only digest if necessary. Update App.adoptAcquisitionSnapshot's comparison baseline whenever shared rows are adopted. Test repeated identical GraphQL responses, identical REST 200s, coverage-only changes and an A→B→A sequence acquired by alternating producers.",
+      "effort": "medium",
+      "title": "Shared snapshots discard the fingerprint used to detect unchanged data",
+      "already_documented": "ADR 0003 lines 310-317 requires two validated unchanged observations before quiet cadence. ADR 0005 lines 74-78 requires quiet webhook reconciliation. The normalization step prevents collector GraphQL results from satisfying those policies. This is a codec mismatch, not a reason to change the policies.",
+      "current_behavior": "GraphQL fetchers return a versioned object as raw; acquisition normalization replaces it with JSON.stringify(rows). The collector compares the next versioned object against that array string, so identical GraphQL results are always changed and unchangedCount resets to zero. Identical REST 200s have the same mismatch; all-304 batches can escape it by explicitly returning previousRaw. Separately, standalone snapshot adoption replaces rows without updating rawRef: after adopting B, a later response matching the pane's old A fingerprint can be treated as unchanged while B remains displayed and is republished."
+    },
+    {
+      "id": "PC-04",
+      "kind": "defect",
+      "confidence": "high",
+      "evidence": "index.mjs:1312-1318\nfunction resolveEffectiveRepository({ runtimeRepo = null, ghRepo = null, remoteUrls = [] } = {}) {\n  if (runtimeRepo) return runtimeRepo;\n  if (ghRepo) {\n    try { return parseRepoTarget(ghRepo).slug; } catch { return null; }\n  }\n  const slugs = new Set(remoteUrls.map(remoteSlug).filter(Boolean));\n  return slugs.size === 1 ? [...slugs][0] : null;\nindex.mjs:12511\n  if (opts.connect === null) runtimeRemoteUrls = await gitRemoteUrls();\nindex.mjs:13846-13849\n  const target = repo || ghRepo;\n  return target\n    ? JSON.stringify({ kind: \"repo\", host: String(host ?? \"\"), repo: String(target), account })\n    : JSON.stringify({ kind: \"cwd\", host: String(host ?? \"\"), cwd: String(cwd), account });\nindex.mjs:18521-18528\n  const [cacheTarget] = useState(() =>\n    dashboardCacheTarget({\n      repo: runtime.repo,\n      ghRepo: process.env.GH_REPO,\n      host: runtimeIdentityCoordinator?.current()?.host ?? effectiveRuntimeHost(),\n      cwd: process.cwd(),\n      account: sshCacheIdentity ?? runtimeIdentityCoordinator?.current()?.accessKey ?? \"unverified\",\n    }),",
+      "priority": "medium",
+      "risk": "Do not reinterpret an old cwd-only entry as belonging to the newly resolved repository. Preserve checkout separation if desired by adding the resolved slug to the cwd key rather than removing cwd. Unknown or ambiguous targets must not select another repository's cache. This need not add any GitHub request.",
+      "expected_gain": "Prevents restoration of up to 240 wrong-repository rows per target—60 in each of four tabs—after a remote changes or a checkout directory is reused. Removes an otherwise unbounded wrong-data window during outages or for unopened on-demand tabs.",
+      "locations": [
+        {
+          "line_start": 13835,
+          "path": "index.mjs",
+          "line_end": 13850
+        },
+        {
+          "line_start": 18521,
+          "path": "index.mjs",
+          "line_end": 18530
+        },
+        {
+          "line_start": 20866,
+          "path": "index.mjs",
+          "line_end": 20883
+        },
+        {
+          "line_start": 1312,
+          "path": "index.mjs",
+          "line_end": 1318
+        }
+      ],
+      "proposal": "Extend dashboardCacheTarget's inferred-target identity with the validated, offline-resolved repository slug. Pass it consistently from App initialization and ensureScope. Reject legacy cwd-only entries when repository identity cannot be established safely; retain host/access partitioning and optional cwd isolation.",
+      "effort": "small",
+      "title": "Inferred display-cache keys survive a repository change in the same directory",
+      "already_documented": "index.mjs lines 13835-13837 justify cwd-only identity because it was the only identity available without GitHub I/O. That rationale no longer holds: startup already reads git remotes before mounting, and resolveEffectiveRepository resolves their slug locally. README lines 675-678 promises repository-scoped recovery.",
+      "current_behavior": "With neither --repo nor GH_REPO, the cache key contains host, cwd and account but no repository. Restarting in the same directory after changing its remote to another repository on the same host/account loads the previous repository's rows. Cache normalization applies size/shape limits but no repository revalidation or age-based rejection."
+    },
+    {
+      "id": "PC-05",
+      "kind": "defect",
+      "confidence": "high",
+      "evidence": "index.mjs:6515-6522\n    // Any live observer claim defers a start: the claim owns the shared HTTP\n    // permit for its window, so starting here would contend for it.\n    const liveClaim = RATE_RESOURCES\n      .map((resource) => state.probeClaims[resource])\n      .filter((claim) => claim && claim.leaseUntil > at)\n      .sort((left, right) => right.leaseUntil - left.leaseUntil)[0];\n    if (liveClaim) {\n      return { value: { status: \"waiting\", reason: \"probe\", notBefore: liveClaim.leaseUntil } };\nindex.mjs:3340\nconst HTTP_MAX_PERMITS = 3;\nindex.mjs:7013-7015\n  for (const resource of BUDGET_REFRESH_ORDER) {\n    outcomes.push([resource, await refreshResourceBudget(scope, leaseId, signal, resource, options)]);\n  }\nindex.mjs:21798\n      const refreshed = await refreshRuntimeBudget(currentScope);\nindex.mjs:21806\n        openPollDeadlines(checkedAt);\ndocs/decisions/0003-file-backed-api-coordination.md:233-237\nObserver claims, readiness and outcomes are per resource. Core and GraphQL each\nhave their own claim; a slow or failed observer for one no longer holds up the\nother's readiness, because nothing about the resources couples them. What still\ncouples them is the shared HTTP permit and any account-wide secondary hold, and\nthose are enforced where they belong rather than by serialising the observers.",
+      "priority": "high",
+      "risk": "Preserve resource-specific draining and reconciliation, reset-triggered GraphQL observation, startup phases, scheduling fairness and the shared transport cooldown. Healthy-resource work may now run during an unrelated observer delay; that is justified restoration of documented freshness, not permission to exceed the poll floor or reserve.",
+      "expected_gain": "A stalled GraphQL child alone can currently add roughly its 30-second timeout to first fresh Actions data; draining can add up to another 30 seconds. Resource-specific release removes that unrelated delay. No additional observer calls are necessary; eligible data calls still use the three-permit pool and 250 ms start spacing.",
+      "locations": [
+        {
+          "line_start": 6506,
+          "path": "index.mjs",
+          "line_end": 6528
+        },
+        {
+          "line_start": 7009,
+          "path": "index.mjs",
+          "line_end": 7015
+        },
+        {
+          "line_start": 7073,
+          "path": "index.mjs",
+          "line_end": 7088
+        },
+        {
+          "line_start": 21796,
+          "path": "index.mjs",
+          "line_end": 21812
+        },
+        {
+          "line_start": 233,
+          "path": "docs/decisions/0003-file-backed-api-coordination.md",
+          "line_end": 255
+        }
+      ],
+      "proposal": "In startReservation, consider observer claims only for resources charged by that reservation. Refactor refreshSharedBudget and the App bootstrap/control consumers so a healthy required resource can open its data scheduling without awaiting the unrelated observer's entire cycle. Retain the explicit core-reset synchronization rule and use the existing shared transport gate for actual HTTP concurrency.",
+      "effort": "large",
+      "title": "Unrelated observer work still blocks healthy-resource startup and refresh",
+      "already_documented": "ADR 0003's phase-4 amendment explicitly selects independent observer readiness; durable-freshness acceptance F07 repeats it. Code implements separate claims but retains an all-resource start barrier and a sequential bootstrap barrier. The startReservation comment assumes one claim owns the transport for its entire window, whereas the current pool permits three requests and acquisition occurs per HTTP call.",
+      "current_behavior": "Any live Core or GraphQL probe claim prevents every data reservation from starting, regardless of its cost vector. Standalone bootstrap also awaits GraphQL then Core before opening poll deadlines. Thus healthy REST capacity does not suffice to start Actions while GraphQL observation is slow, despite resource-specific readiness helpers elsewhere."
+    },
+    {
+      "id": "PC-06",
+      "kind": "defect",
+      "confidence": "high",
+      "evidence": "index.mjs:11004\n      if (!item || frame.serverEpoch !== serverEpoch || snapshot.generation <= item.generation) return;\nindex.mjs:11011-11015\n      if (!ready) {\n        ready = true;\n        reconnectAttempt = 0;\n        onReady(true);\n      }\nindex.mjs:11033-11038\n  const resubscribe = (resetGenerations) => {\n    for (const item of subscriptions.values()) {\n      if (resetGenerations) {\n        item.generation = -1;\n        item.controlGeneration = -1;\n      }\nindex.mjs:11058-11063\n          const epochChanged = serverEpoch !== frame.serverEpoch;\n          if (epochChanged) assembler.reset();\n          serverEpoch = frame.serverEpoch;\n          welcomed = true;\n          ready = false;\n          resubscribe(epochChanged);\nindex.mjs:20377-20381\n          if (cancelled) return;\n          collectorReady = ready;\n          if (!ready) receivedSnapshots.clear();\n          setGovernorDecisions(Object.fromEntries(TAB_KEYS.map((key) => [key,\n            collectorDisplayDecision({ connected: ready, hasSnapshot: receivedSnapshots.has(key) })])));",
+      "priority": "medium",
+      "risk": "Do not reset generation high-water marks on every connection: older frames must remain rejected within the same server epoch. A same-generation replay can establish connection/subscription readiness but cannot establish a newer source observation or reduce conservative source age.",
+      "expected_gain": "Restores connection status at the first validated replay without a GitHub request. Avoids waiting until the next 30-/300-second observation—or indefinitely for inactive on-demand subscriptions—before a successfully reconnected client stops reporting Disconnected.",
+      "locations": [
+        {
+          "line_start": 10998,
+          "path": "index.mjs",
+          "line_end": 11042
+        },
+        {
+          "line_start": 11052,
+          "path": "index.mjs",
+          "line_end": 11064
+        },
+        {
+          "line_start": 11106,
+          "path": "index.mjs",
+          "line_end": 11119
+        },
+        {
+          "line_start": 20375,
+          "path": "index.mjs",
+          "line_end": 20381
+        }
+      ],
+      "proposal": "Separate transport/subscription readiness from content-generation advancement in createCollectorProtocolClient. Permit a validated equal-generation snapshot to acknowledge the new connection and restore that subscription's display state while retaining its rows and conservative age. Continue rejecting lower generations and mismatched epochs. Test disconnect/reconnect to the same collector epoch with all subscriptions inactive and no new API publication.",
+      "effort": "medium",
+      "title": "Same-epoch reconnect stays disconnected when only cached generations arrive",
+      "already_documented": "ADR 0005 lines 35-36 makes generations monotonic within an epoch; lines 51-56 separates source freshness from transport receipt. The code correctly retains generation history, but incorrectly uses generation advancement as the prerequisite for connection recovery.",
+      "current_behavior": "Disconnect sets ready=false and clears App's receivedSnapshots. Reconnecting to the still-running collector preserves subscription generation numbers. Replayed cached snapshots are rejected before onReady(true), so a live connection remains visibly disconnected until some source produces a strictly newer generation. In on-demand mode that observation may never occur automatically."
+    },
+    {
+      "id": "PC-07",
+      "kind": "optimization",
+      "confidence": "high",
+      "evidence": "index.mjs:10504\n    }, Math.max(1, Math.min(delay, item.demand.floorMs)));\nindex.mjs:10535-10540\n      const ownership = await engine.refresh(subscriptionId, { force: manual });\n      if (!ownership.ok) { item.onHold?.(\"disconnected\"); retryIn = 1_000; return; }\n      if (ownership.value.role !== \"producer\") {\n        if (ownership.value.snapshot) {\n          deliverCollectorSnapshot(item, ownership.value.snapshot, bindingRevision);\n        }\nindex.mjs:15600-15604\n    if (claimed.ok && claimed.value?.snapshot) {\n      const record = claimed.state.queries[claimed.value.queryKey];\n      const loadedSnapshot = loadRecordSnapshot(record);\n      if (!loadedSnapshot.ok) return loadedSnapshot;\n      claimed.value.snapshot = loadedSnapshot.value;\nindex.mjs:14768-14775\n      const raw = readFileSync(join(acquisitionSnapshotRoot(path), current.snapshot.artifact), \"utf8\");\n      if (Buffer.byteLength(raw) !== current.snapshot.bytes ||\n          createHash(\"sha256\").update(raw).digest(\"hex\") !== current.snapshot.digest) {\n        return { ok: false, reason: \"corrupt\" };\n      }\n      const parsed = JSON.parse(raw);\n      const snapshot = normalizeAcquisitionSnapshot(\n        parsed, current.query, current.generation, parsed.producerEpoch,",
+      "priority": "medium",
+      "risk": "Memoize immutable payloads, not claims, quota authority or credential configuration. Bound retained decoded bytes and invalidate by the complete artifact identity and binding. Keep metadata inspection, takeover deadlines and manual demand responsive. The first snapshot on each new connection must still be delivered, including the equal-generation readiness case in PC-06.",
+      "expected_gain": "At a 5-second floor, a quiet 30-second query has roughly six collector wake opportunities per source observation; webhook reconciliation makes that sixty at 300 seconds. Suppressing unchanged delivery removes those repeated wire snapshots and client normalizations. A bounded per-artifact decode cache also reduces identical reads/hash/parse/sanitize work from N subscribers to once per artifact, without changing API requests.",
+      "locations": [
+        {
+          "line_start": 10447,
+          "path": "index.mjs",
+          "line_end": 10455
+        },
+        {
+          "line_start": 10498,
+          "path": "index.mjs",
+          "line_end": 10545
+        },
+        {
+          "line_start": 14758,
+          "path": "index.mjs",
+          "line_end": 14778
+        },
+        {
+          "line_start": 15031,
+          "path": "index.mjs",
+          "line_end": 15072
+        },
+        {
+          "line_start": 15560,
+          "path": "index.mjs",
+          "line_end": 15607
+        }
+      ],
+      "proposal": "Add a byte-bounded immutable snapshot cache behind createAcquisitionEngine.loadRecordSnapshot, keyed by artifact/query/generation/digest, and reuse a snapshot already loaded by deliver when inspect(id) returns it. In deliverCollectorSnapshot, suppress repeat delivery for the same binding and generation. Keep provider/access refresh and lightweight metadata checks independent from payload hydration.",
+      "effort": "medium",
+      "title": "Collector followers repeatedly hydrate and transmit unchanged snapshots",
+      "already_documented": "ADR 0004 lines 186-190 says followers inspect metadata until the generation changes. The periodic engine inspect path largely does this, but refresh hydrates the snapshot unconditionally and the collector forwards it on every fresh-follower wake. The existing shared encoding cache is useful, but its object-identity key cannot eliminate repeated independent decodes.",
+      "current_behavior": "Collector scheduling caps sleep at each subscription's floor even when nextDueAt is much later. Every fresh-follower refresh reads, hashes, parses and sanitizes the artifact, then calls onSnapshot again. The client discards equal generations only after protocol decoding and snapshot normalization. Multiple subscriptions to the same query therefore avoid duplicate HTTP but still duplicate substantial local payload work."
+    },
+    {
+      "id": "PC-08",
+      "kind": "optimization",
+      "confidence": "high",
+      "evidence": "index.mjs:5985-5987\n    const held = state.probeClaims[resource];\n    if (held && held.leaseUntil > at) {\n      return { value: { status: \"waiting\", leaseUntil: held.leaseUntil } };\nindex.mjs:6013\n    if (nextAt > at) return { value: { status: \"waiting\", nextAt } };\nindex.mjs:6453-6455\nfunction readIntentDecision(scope, intentId, nowMs, previousEvidence = null) {\n  return mutateGovernor(scope, nowMs, (state, at) => {\n    const scheduled = scheduleGovernorState(state, at);\nindex.mjs:5786-5789\n    const normalized = normalizeGovernorState(state, at);\n    if (!normalized) return returnAfterMigration({ ok: false, reason: \"corrupt\" });\n    const written = commitGovernorMigration(scope.path, normalized, loaded.migration);\n    if (!written.ok) return written;\nindex.mjs:5422\n      state.revision += 1;\nindex.mjs:5432\n    writeFileSync(tempPath, serialized, { encoding: \"utf8\", mode: 0o600, flag: \"wx\" });\nindex.mjs:5436\n    renameSync(tempPath, path);\nindex.mjs:3596\n    if (JSON.stringify(state) === before) return result;",
+      "priority": "medium",
+      "risk": "A nominally read-only call can still perform required pruning, migration, debt compaction or scheduling. Skip replacement only when all of those and the requested mutation are unchanged. Keep registry-before-quota locking and dispatch persistence intact; do not cache admission decisions. Diagnostic projections must remain fresh even if ledger revision no longer changes on no-ops.",
+      "expected_gain": "Each proven no-op avoids one complete quota-file serialization/write/rename and an artificial revision increment. For ledger size B, K such checks save approximately K×B payload bytes written; the ledger allows B up to 2 MiB. Lock acquisition and authoritative reads remain necessary, so this is not a claim of eliminating all coordination I/O.",
+      "locations": [
+        {
+          "line_start": 5747,
+          "path": "index.mjs",
+          "line_end": 5791
+        },
+        {
+          "line_start": 5981,
+          "path": "index.mjs",
+          "line_end": 6013
+        },
+        {
+          "line_start": 6453,
+          "path": "index.mjs",
+          "line_end": 6482
+        },
+        {
+          "line_start": 5414,
+          "path": "index.mjs",
+          "line_end": 5437
+        },
+        {
+          "line_start": 3538,
+          "path": "index.mjs",
+          "line_end": 3598
+        }
+      ],
+      "proposal": "Give mutateGovernor an explicit dirty/no-op result, including normalization and maintenance changes. Have claimProbe waiting paths and readIntentDecision return unchanged when scheduling made no transition. Apply the same no-op suppression principle already used by withIdentityRegistry, while incrementing revision only for actual committed state changes.",
+      "effort": "medium",
+      "title": "Successful governor inspections rewrite the entire ledger even when unchanged",
+      "already_documented": "ADR 0003 lines 107-126 requires locked, atomic state transitions and fail-closed authority, not replacement on every successful read. withIdentityRegistry already deliberately suppresses identical writes at index.mjs:3596; extending that behavior to quota mutations preserves the chosen file-backed design.",
+      "current_behavior": "claimProbe returns successful waiting results without changing state, and readIntentDecision can find an unchanged scheduled reservation with nothing to schedule. Both pass through mutateGovernor's unconditional successful-write path. That rewrites the full ledger and increments revision, extending critical sections across panes and making diagnostic projections appear changed even when only an inspection occurred."
+    }
+  ],
+  "summary": "Static review of commit 2b21de9 found six caching/freshness defects and two focused local-I/O optimizations. Prioritize collector target isolation, repository-scoped negative caching and consistent representation fingerprints: these can serve incorrect rows or defeat quiet polling. The existing gh transport, bounded queries, conditional REST and shared acquisition should remain; replacing them is unnecessary. Quantified gains below are derived from code, not new benchmark results.",
+  "checked_sound": [
+    "Conditional REST is already implemented, not a missing optimization. index.mjs:1008 sends \"If-None-Match\", 1026-1032 recognizes HTTP 304 even on gh failure, and 2166-2167 restricts staged validator publication to \"changed\" and \"unchanged\" transitions. Keep the separately admitted unconditional recovery rather than adding retries inside the transport.",
+    "The ordinary request shapes are appropriately bounded: index.mjs:113 declares \"const ACTIONS_RUN_LIMIT = 60;\", 1065 declares \"const GRAPHQL_PAGE_SIZE = 50;\", and 2473 defaults to \"pages = 1,\". Issues/PRs expand to at most three independently admitted pages. Security uses three base requests and at most three additional priority requests; index.mjs:7324 skips priority lanes unless the base fills. Actual 304s and backoff reduce paid work further.",
+    "Keep independent tab requests. index.mjs:1070-1072 explicitly rejects combining Issues and PRs behind a completion barrier, consistent with ADR 0001 lines 22-30 and ADR 0004 lines 119-126. The selected fields, including \"labels(first:1)\" at index.mjs:1084, already avoid the earlier porcelain overfetch.",
+    "Quota and access identities are intentionally separate. index.mjs:3792 uses \"privateIdentityDigest(\"quota-v2\", attempt.host, \"user\", parsed.id)\" while 3793 derives access from credentialKey and generation. index.mjs:3827 freezes settlement scope with \"identityProvider: null\". These boundaries should survive all proposed caching changes.",
+    "Acquisition payloads are separated from lightweight metadata, with artifact digest verification at index.mjs:14768-14775 and artifact-before-reference publication at 14861-14868. The one-second inspection timer at 15114-15121 avoids payload delivery when generation is unchanged through the guard at 15033. PC-07 addresses the other paths that bypass this benefit.",
+    "Display-cache retention is explicitly bounded by \"MAX_DASHBOARD_CACHE_TARGETS = 32\" and \"MAX_DASHBOARD_CACHE_ROWS_PER_TAB = 60\" at index.mjs:13782-13783. Unchanged standalone observations checkpoint freshness using the 60,000 ms threshold at 14086-14089 and 20093-20095, rather than rewriting the cache every successful tick.",
+    "Several render protections are sound: production React is selected before dynamic imports at index.mjs:23 and 12533-12537; development timing entries are cleared every ten seconds at 12558-12561; rows are memoized at 13200-13203; only executing Actions rows receive the changing spinner prop at 22225-22226. Resize listeners are removed at 17797, and incremental rendering is enabled at 22474.",
+    "Webhook acceptance has stronger durability than ordinary cache replacement: index.mjs:8759 fsyncs the temporary file, 8762 renames it, and 8764 fsyncs the directory before queue acceptance can lead to \"finish(202)\" at 9145. Do not remove these syncs as a generic write-frequency optimization."
+  ],
+  "unresolved": [
+    "Tests and measurement scripts were excluded, and no execution was performed. Validate these findings through the packed CLI and production collector using concurrent same-provider targets, contrasting Security capabilities, repeated identical GraphQL results and same-epoch reconnects. Measure CPU, event-loop delay, file operations and source-to-display latency on a compatible baseline before claiming percentage improvements.",
+    "What invalidates persistent collector repository aliases after rename or name reuse when access webhooks are absent? index.mjs:10405 selects \"!requireAccessRefresh && persisted.value ? persisted.value\" without an expiry, and loadCollectorCanonicalOwnership at 7862-7882 stores no observation time. This needs an explicit lifetime/identity-revalidation contract, especially for Actions-only subscriptions.",
+    "Does the collector queue memory budget include prepared snapshots, or only encoded frames? index.mjs:9713 retains snapshotCache.acquire output while 9715 records \"bytes: 0, frameCount: 0\" for pending snapshots. The configured 4 MiB/client and 64 MiB/service limits therefore do not directly account for retained prepared payloads. Measure stalled-client fan-out and define the intended total-memory bound.",
+    "Is second-resolution Cached age required? index.mjs:21984 runs \"setInterval(() => setNow(new Date()), 1000)\", and 22216 passes that new now object to every visible row. That produces nominally 3,600 App clock updates/hour on an otherwise idle secondary view, unlike the older minute-granular constraint in the conditional-polling plan lines 228-237. If seconds are intentional, isolate the footer clock rather than sacrificing the feature; benchmark the resulting row/render savings.",
+    "Clarify the crash model for quota persistence. writeGovernorState at index.mjs:5432-5436 uses write-plus-rename without fsync, while webhook acceptance explicitly syncs file and directory. Atomic replacement protects concurrent readers and ordinary process crashes, but is not by itself a power-loss durability guarantee. Adding syncs to every governor transition would have substantial latency implications and should follow an explicit durability decision."
+  ]
+}

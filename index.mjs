@@ -761,6 +761,9 @@ async function runGh(args, { signal, operation, input = null, execute = null,
   let control = null;
   const identityCoordinator = bound?.identityCoordinator ?? runtimeIdentityCoordinator;
   const requestNow = typeof bound?.now === "function" ? bound.now : Date.now;
+  if (identityCoordinator && bound && operation === "budget-core-observer") {
+    retryTransportAfterReset(identityCoordinator, bound, requestNow);
+  }
   const permit = identityCoordinator && !local
     ? await acquireIdentityHttpPermit(identityCoordinator, { signal, now: requestNow,
         operationDeadline: CONTROL_OPERATIONS.includes(operation) ? undefined : bound?.receiptCapability?.deadline,
@@ -2555,13 +2558,14 @@ async function fetchGraphqlList(kind, mapRow, {
   const incomplete = merged.incomplete || truncatedWalk;
   // Serialized rows are the payload identity the unchanged-frame suppression
   // and the cache both compare on, so it must cover exactly what is rendered --
-  // including the markers that say the list is not all of it.
-  const raw = JSON.stringify({
-    v: GRAPHQL_QUERY_VERSION,
-    totalCount,
-    incomplete,
-    hasNextPage: merged.hasNextPage,
+  // including the markers that say the list is not all of it. It is the shared
+  // representation a stored snapshot rebuilds, so a collector producer that
+  // compares against its normalized previous snapshot can see "unchanged".
+  // `truncated` is what pollResultTransition derives from the limit below.
+  const raw = acquisitionContentRaw(kind, {
     rows: merged.rows,
+    truncated: incomplete || merged.rows.length >= LIST_LIMIT,
+    hasNextPage: merged.hasNextPage,
   });
   return {
     raw: raw === previousRaw ? previousRaw : raw,
@@ -4187,6 +4191,19 @@ function classifyThrottle({ status = null, headers = null, graphqlErrors = null,
   return { kind: "none" };
 }
 
+// A "rate limit" message does not say which limit. Secondary limits are already
+// held by the shared transport cooldown; publishing one as a resource block until
+// the sampled primary reset would hold every pane for the rest of the window.
+// Only evidence classified as secondary is excluded. Stderr alone ("API rate
+// limit exceeded" with no headers) classifies as none and stays primary.
+function secondaryThrottleEvidence(error) {
+  if (error?.coordinationReason === "throttle-paused") return true;
+  const response = nativeCiThrottleEvidence.get(error) ?? error?.apiResponse ??
+    parseGhApiResponse(error?.stdout ?? "");
+  return classifyThrottle({ status: response.status, headers: response.headers, stderr: errText(error) })
+    .kind === "secondary";
+}
+
 function transportCooldownDeadline({ retryAfter, status, secondary, at, attempts = 0 }) {
   const supplied = typeof retryAfter === "string" && /^\d+(?:\.\d+)?$/.test(retryAfter)
     ? at + Number(retryAfter) * 1000
@@ -4271,17 +4288,40 @@ function releaseIdentityHttpPermit(coordinator, permit, error = null, now = Date
   return result;
 }
 
-// The explicit retry a paused transport waits for. Clears the ladder and the
-// deadline together: a person choosing to retry is choosing to spend the next
-// request finding out, which is exactly the recovery election the pause defers.
-function retryThrottledTransport(root, host, { now = Date.now } = {}) {
+// The explicit retry, or the reset-triggered recovery, a paused transport waits
+// for. Clears the ladder and the pause but never the deadline: a server-supplied
+// Retry-After is honoured exactly (ADR 0003), so the next request still waits it
+// out. The registry lock is the election: only the first caller resumes a given
+// pause. A reset recovers only a pause whose last throttle predates that reset,
+// so one primary window elects at most one recovery.
+function retryThrottledTransport(root, host, { now = Date.now, resetAt = null } = {}) {
+  const at = now();
   return withIdentityRegistry(root, (state) => {
     const transport = state.hosts[host];
     if (!transport?.throttle?.paused) return { ok: true, value: { resumed: false } };
+    if (resetAt !== null &&
+        !(Number.isFinite(resetAt) && at >= resetAt && transport.throttle.lastAt < resetAt)) {
+      return { ok: true, value: { resumed: false } };
+    }
     transport.throttle = emptyTransportThrottle();
-    transport.cooldownUntil = Math.min(transport.cooldownUntil, now());
-    return { ok: true, value: { resumed: true } };
-  }, { now: now() });
+    return { ok: true, value: { resumed: true, cooldownUntil: transport.cooldownUntil } };
+  }, { now: at });
+}
+
+function retryPausedTransport(coordinator, options = {}) {
+  const host = coordinator?.current?.()?.host;
+  if (typeof coordinator?.root !== "string" || !host) return { ok: true, value: { resumed: false } };
+  return retryThrottledTransport(coordinator.root, host, options);
+}
+
+// Only the pane holding the core observer claim runs budget-core-observer, so the
+// claim elects the one request that finds out whether the limit has lifted.
+function retryTransportAfterReset(coordinator, scope, now = Date.now) {
+  const at = now();
+  const snapshot = inspectGovernor({ ...scope, identityProvider: null }, at);
+  const resetAt = snapshot.ok ? snapshot.value.budgets.core?.resetMs : null;
+  if (!Number.isFinite(resetAt) || at < resetAt) return { ok: true, value: { resumed: false } };
+  return retryPausedTransport(coordinator, { now: () => at, resetAt });
 }
 
 function identityCoordinationMessage(reason) {
@@ -5363,7 +5403,7 @@ function readGovernorState(path, nowMs, { persistMigration = true } = {}) {
     if (Buffer.byteLength(raw) > GOVERNOR_MAX_LEDGER_BYTES) return { ok: false, reason: "capacity" };
     const parsed = JSON.parse(raw);
     const normalized = normalizeGovernorState(parsed, nowMs);
-    if (normalized) return { ok: true, value: normalized };
+    if (normalized) return { ok: true, value: normalized, bytes: raw };
     if (Number.isSafeInteger(parsed?.version) && parsed.version > GOVERNOR_STATE_VERSION) {
       return { ok: false, reason: "version-mismatch" };
     }
@@ -5785,6 +5825,13 @@ function mutateGovernor(scope, nowMs, mutate) {
     if (!governorAccountingSafe(state, at)) return returnAfterMigration(ACCOUNTING_OVERFLOW);
     const normalized = normalizeGovernorState(state, at);
     if (!normalized) return returnAfterMigration({ ok: false, reason: "corrupt" });
+    // A wait or decision read that changed nothing must not bump the revision
+    // and replace the file: compare the would-be bytes, as the identity
+    // registry does. Migrations and explicit rejected writes always commit.
+    if (migration === null && value?.ok !== false && typeof loaded.bytes === "string" &&
+        serializeGovernorState(normalized) === loaded.bytes) {
+      return { ok: true, value: value?.value };
+    }
     const written = commitGovernorMigration(scope.path, normalized, loaded.migration);
     if (!written.ok) return written;
     return value?.ok === false ? { ok: false, reason: value.reason } : { ok: true, value: value?.value };
@@ -6512,9 +6559,11 @@ function startReservation(scope, reservationId, nowMs) {
       return { ok: false, reason: "stale", write: Boolean(reservation) };
     }
     if (reservation.notBefore > at) return { value: { status: "waiting", notBefore: reservation.notBefore } };
-    // Any live observer claim defers a start: the claim owns the shared HTTP
-    // permit for its window, so starting here would contend for it.
+    // A live observer claim defers only work that charges its resource. The
+    // other resource's observer says nothing about this counter, and the shared
+    // HTTP pool, start gap and host cooldown still bound the two together.
     const liveClaim = RATE_RESOURCES
+      .filter((resource) => reservation.costs[resource] > 0)
       .map((resource) => state.probeClaims[resource])
       .filter((claim) => claim && claim.leaseUntil > at)
       .sort((left, right) => right.leaseUntil - left.leaseUntil)[0];
@@ -7240,9 +7289,15 @@ function mergeAlertRows(groups) {
 // mid-session is picked up within the hour.
 const alertBackoff = new Map();
 
-function backoffStorageKey(key) {
-  const access = requestIdentityStorage.getStore()?.accessKey ?? runtimeIdentityCoordinator?.current()?.accessKey;
-  return access ? `${access}\0${key}` : key;
+// A capability verdict is a statement about one repository on one host, so the
+// bound host and repository are part of the key: one collector credential can
+// serve several repositories, and one repository's 403 must not replay for
+// (or be cleared by) another.
+function backoffStorageKey(key, accessKey = null) {
+  const access = accessKey ?? requestIdentityStorage.getStore()?.accessKey ??
+    runtimeIdentityCoordinator?.current()?.accessKey;
+  const scoped = `${effectiveRuntimeHost() ?? ""}\0${effectiveRuntimeRepository()?.toLowerCase() ?? ""}\0${key}`;
+  return access ? `${access}\0${scoped}` : scoped;
 }
 
 function backoffActive(key, now) {
@@ -7428,6 +7483,7 @@ async function fetchAlertSource(source, signal, now, {
       rest200,
       rest304,
       verdict,
+      secondaryThrottle: verdict === "rate-limited" && secondaryThrottleEvidence(err),
       allNotModified: false,
       stagedEntities: new Map(),
       observations,
@@ -7499,7 +7555,15 @@ async function fetchSecurity(signal, {
     requestMetrics,
     graphqlSpent: 0,
     measuredSuccess: parts.every((part) => part.verdict === "ok"),
-    rateLimited: parts.some((part) => part.verdict === "rate-limited"),
+    // Whether this batch observed the source at all: some source made a real
+    // request and GitHub answered it (200/304, or a current capability refusal).
+    // A batch in which every source replayed its backoff made no request, so it
+    // must not advance freshness or complete webhook work (plan D6, ADR 0005).
+    // With no sources (an App granted no Security permission) there is nothing
+    // to observe, and the configuration answer keeps its existing behavior.
+    sourceObserved: parts.length === 0 || parts.some((part) => part.httpRequests > 0 &&
+      (part.verdict === "ok" || part.verdict === "unavailable")),
+    rateLimited: parts.some((part) => part.verdict === "rate-limited" && !part.secondaryThrottle),
     stagedEntities,
     observations: parts.flatMap((part) => part.observations ?? []),
     capabilities,
@@ -7774,7 +7838,16 @@ function createCollectorSourceAgeTracker({ now = Date.now, monotonicNow = () => 
     lowerBound += Math.max(0, now() - checkpoint.clientCheckpointAt);
   }
   let measuredAt = monotonicNow();
-  const current = () => lowerBound + Math.max(0, monotonicNow() - measuredAt);
+  // The monotonic clock does not advance across a suspend, so positive wall
+  // elapsed time also bounds the age. A forward wall step can only overstate
+  // staleness; the high-water mark keeps a backward step from shrinking it.
+  let wallMeasuredAt = now();
+  let reported = lowerBound;
+  const current = () => {
+    reported = Math.max(reported, lowerBound +
+      Math.max(0, monotonicNow() - measuredAt, now() - wallMeasuredAt));
+    return reported;
+  };
   return {
     observe({ lastSuccessAt, serverNow }) {
       if (!Number.isFinite(lastSuccessAt) || !Number.isFinite(serverNow)) return current();
@@ -7784,6 +7857,8 @@ function createCollectorSourceAgeTracker({ now = Date.now, monotonicNow = () => 
       else lowerBound = Math.max(elapsed, candidate);
       sourceAt = sourceAt === null ? lastSuccessAt : Math.max(sourceAt, lastSuccessAt);
       measuredAt = monotonicNow();
+      wallMeasuredAt = now();
+      reported = lowerBound;
       return lowerBound;
     },
     current,
@@ -10045,7 +10120,11 @@ async function createCollectorService({ config, pathOptions = {}, runtime, platf
 }
 
 function collectorPublicationFromResult(resource, result, previous, demand, completedAt, state = {}) {
-  const transition = pollResultTransition({
+  // A Security batch that only replayed capability backoff made no request. It
+  // republishes the previous observation unchanged, with its success time, so
+  // neither freshness nor webhook completion can advance on it.
+  const observed = result.sourceObserved !== false;
+  const transition = !observed ? { kind: "unchanged", completedAt } : pollResultTransition({
     key: resource,
     previousRaw: previous?.raw ?? null,
     raw: result.raw,
@@ -10074,7 +10153,8 @@ function collectorPublicationFromResult(resource, result, previous, demand, comp
     },
     raw: transition.kind === "changed" ? transition.nextRaw : previous.raw,
     entities,
-    lastSuccessAt: completedAt,
+    lastSuccessAt: observed ? completedAt : previous.lastSuccessAt,
+    sourceObserved: observed,
     lastChangedAt,
     nextDueAt: completedAt + pollPolicyInterval({
       tab: resource,
@@ -10181,11 +10261,13 @@ function createCollectorAcquisitionRuntime({
       providerContexts.set(target.provider, context);
     }
     let identity;
+    let credentialEnvironment = null;
+    let capabilities = null;
     if (context.definition.type === "github-app") {
       const resolved = await context.coordinator.resolve({ signal });
       identity = resolved.identity;
-      context.credentialEnvironment = resolved.environment;
-      context.capabilities = resolved.capabilities;
+      credentialEnvironment = resolved.environment;
+      capabilities = resolved.capabilities;
       if (context.identity?.accessKey !== identity.accessKey) {
         const persisted = persistGitHubAppIdentity(context.coordinator.root, identity, now());
         if (!persisted.ok) throw new Error("collector provider unavailable");
@@ -10194,13 +10276,10 @@ function createCollectorAcquisitionRuntime({
       const resolved = await context.coordinator.refresh();
       if (!resolved.ok) throw new Error("collector provider unavailable");
       identity = resolved.value;
-      context.credentialEnvironment = null;
-      context.capabilities = null;
       context.readBudgets = readBudgets;
     }
     if (identity.host !== target.host) throw new Error("collector provider unavailable");
-    context.identity = identity;
-    context.scope = {
+    const scope = Object.freeze({
       ...createQuotaScope(identity, {
         root: context.coordinator.root,
         now,
@@ -10210,9 +10289,28 @@ function createCollectorAcquisitionRuntime({
       repository: target.repo,
       providerType: context.definition.type,
       ...(executeGh ? { executeGh } : {}),
-      ...(context.credentialEnvironment ? { credentialEnvironment: context.credentialEnvironment } : {}),
-    };
-    return context;
+      ...(credentialEnvironment ? { credentialEnvironment } : {}),
+    });
+    // The provider context keeps only provider-wide state (coordinator,
+    // lease, budget reader, latest access identity). Its scope is used to
+    // release the provider lease on close, never to bind a request.
+    context.identity = identity;
+    context.credentialEnvironment = credentialEnvironment;
+    context.capabilities = capabilities;
+    context.scope = { ...scope };
+    // Each target operation gets its own immutable binding, captured once, so
+    // another target's resolution cannot redirect it after an await.
+    return Object.freeze({
+      coordinator: context.coordinator,
+      definition: context.definition,
+      leaseId: context.leaseId,
+      readBudgets: context.readBudgets,
+      onObserverPublished: context.onObserverPublished,
+      identity,
+      scope,
+      credentialEnvironment,
+      capabilities,
+    });
   }
 
   async function defaultProduce({ target, resource, demand, snapshot, claim, markStarted, provider, signal, force }) {
@@ -10444,9 +10542,17 @@ function createCollectorAcquisitionRuntime({
     item.invalidations.clear();
   }
 
+  // Identifies one delivered generation for one engine subscription and
+  // binding. A rebind or a new subscription (a new connection) changes it.
+  function collectorDeliveryKey(subscriptionId, bindingRevision, snapshot) {
+    return Number.isSafeInteger(snapshot?.generation)
+      ? `${subscriptionId}\0${bindingRevision}\0${snapshot.generation}` : null;
+  }
+
   function deliverCollectorSnapshot(item, snapshot, bindingRevision, { publication = false } = {}) {
     if (bindingRevision !== item.bindingRevision) return false;
     item.nextDueAt = snapshot.nextDueAt;
+    item.lastDeliveryKey = collectorDeliveryKey(item.id, bindingRevision, snapshot);
     if (Number.isSafeInteger(snapshot.generation)) item.lastDeliveredGeneration = snapshot.generation;
     if (Number.isFinite(snapshot.lastSuccessAt)) item.lastDeliveredSuccessAt = snapshot.lastSuccessAt;
     if (publication && item.requestedAt !== null && snapshot.lastSuccessAt >= item.requestedAt) {
@@ -10454,13 +10560,21 @@ function createCollectorAcquisitionRuntime({
     }
     item.onSnapshot(snapshot);
     if (!publication || !Number.isSafeInteger(snapshot.generation)) return true;
+    let awaitingObservation = false;
     for (const waiter of item.invalidations) {
       if (bindingRevision !== waiter.bindingRevision || waiter.requiredGeneration === null ||
           snapshot.generation < waiter.requiredGeneration) continue;
+      // A newer generation that republished an older observation (a Security
+      // capability-backoff replay) is not API validation of the webhook. Leave
+      // the waiter for the next real observation on the ordinary cadence.
+      if (Number.isFinite(waiter.invalidatedAt) && !(snapshot.lastSuccessAt >= waiter.invalidatedAt)) {
+        awaitingObservation = true;
+        continue;
+      }
       item.invalidations.delete(waiter);
       waiter.resolve(snapshot);
     }
-    if (item.invalidations.size > 0 && !closed && !item.closed && demandEnabled(item.demand)) {
+    if (item.invalidations.size > 0 && !awaitingObservation && !closed && !item.closed && demandEnabled(item.demand)) {
       queueMicrotask(() => startPoll(item, { manual: true }));
     }
     return true;
@@ -10531,11 +10645,15 @@ function createCollectorAcquisitionRuntime({
         retryIn = 1;
         return;
       }
-      item.provider = refreshedProvider;
+      const provider = refreshedProvider;
+      item.provider = provider;
       const ownership = await engine.refresh(subscriptionId, { force: manual });
       if (!ownership.ok) { item.onHold?.("disconnected"); retryIn = 1_000; return; }
       if (ownership.value.role !== "producer") {
-        if (ownership.value.snapshot) {
+        // A follower wake re-reads the shared record; re-send only a
+        // generation this subscription has not already delivered.
+        if (ownership.value.snapshot && item.lastDeliveryKey !==
+            collectorDeliveryKey(subscriptionId, bindingRevision, ownership.value.snapshot)) {
           deliverCollectorSnapshot(item, ownership.value.snapshot, bindingRevision);
         }
         if (ownership.value.reason !== "fresh") {
@@ -10566,7 +10684,7 @@ function createCollectorAcquisitionRuntime({
             active: ownership.value.demand?.active || item.requestedAt !== null },
           snapshot: ownership.value.snapshot,
           claim: { ...claim, state: item },
-          provider: item.provider,
+          provider,
           signal: item.controller.signal,
           force,
           markStarted: async (receipt) => {
@@ -10576,11 +10694,11 @@ function createCollectorAcquisitionRuntime({
             return started;
           },
         }));
-        const produced = item.provider?.scope
-          ? await requestIdentityStorage.run(item.provider.scope, produceBound)
+        const produced = provider?.scope
+          ? await requestIdentityStorage.run(provider.scope, produceBound)
           : await produceBound();
-        if (item.provider?.definition?.type === "github-app" &&
-            item.provider.coordinator.current()?.accessKey !== claim.accessKey) {
+        if (provider?.definition?.type === "github-app" &&
+            provider.coordinator.current()?.accessKey !== claim.accessKey) {
           engine.refresh(subscriptionId, { claim, failure: {
             hold: "disconnected",
             requestMetrics: produced.requestMetrics ?? {},
@@ -10610,13 +10728,16 @@ function createCollectorAcquisitionRuntime({
         const published = await engine.refresh(subscriptionId, { claim, publish: produced });
         if (!published.ok) { item.onHold?.("disconnected"); retryIn = 1_000; }
         else {
-          item.provider?.coordinator?.markAuthorized?.();
+          provider?.coordinator?.markAuthorized?.();
+          // A replay answers the request as far as backoff allows without
+          // advancing the success time that would otherwise clear it.
+          if (produced.sourceObserved === false) item.requestedAt = null;
           retryIn = Math.max(1, published.value.snapshot.nextDueAt - now());
         }
       } catch (error) {
-        if (item.provider?.definition?.type === "github-app" && error?.apiResponse?.status === 401 &&
+        if (provider?.definition?.type === "github-app" && error?.apiResponse?.status === 401 &&
             !error.appCredentialInvalidated) {
-          item.provider.coordinator.invalidate("unauthorized");
+          provider.coordinator.invalidate("unauthorized");
         }
         const hold = error?.notStarted ? "shared-wait" : acquisitionFailureHold(error);
         if (claim && error?.notStarted) engine.refresh(subscriptionId, { cancel: claim });
@@ -10625,7 +10746,7 @@ function createCollectorAcquisitionRuntime({
           requestMetrics: error?.requestMetrics ?? {},
         } });
         else engine.setHold(subscriptionId, hold, { resource: item.resource, accessKey: item.identity.accessKey });
-        item.onHold?.(item.provider?.definition?.type === "github-app" &&
+        item.onHold?.(provider?.definition?.type === "github-app" &&
           (error?.apiResponse?.status === 401 || error?.message === "GitHub App token unavailable" ||
             classify(error) === "auth-problem")
           ? "app-auth" : hold);
@@ -10713,7 +10834,7 @@ function createCollectorAcquisitionRuntime({
       const item = { target, resource, demand: normalizedDemand, onSnapshot, onHold, id: null, identity: null,
         provider: null, polling: false, pollPhase: null, pollPromise: null, controller: null,
         initializePromise: null, closed: false, timer: null, queuedRefresh: null, requestedAt: null,
-        bindingRevision: 0, invalidations: new Set(), lastDeliveredGeneration: null,
+        bindingRevision: 0, invalidations: new Set(), lastDeliveredGeneration: null, lastDeliveryKey: null,
         lastDeliveredSuccessAt: null, promotionGeneration: null, promotionAt: null };
       items.add(item);
       void startInitialize(item);
@@ -10748,7 +10869,10 @@ function createCollectorAcquisitionRuntime({
           }
           return updated;
         },
-        refresh(force = false) { return startPoll(item, { manual: true, force: force === true }); },
+        refresh(force = false) {
+          retryPausedTransport(item.provider?.scope?.identityCoordinator);
+          return startPoll(item, { manual: true, force: force === true });
+        },
         inspect() {
           if (!item.id) return { source: "local collector", status: "initializing", resource: item.resource };
           const inspected = engine.inspect(item.id);
@@ -10825,6 +10949,7 @@ function createCollectorAcquisitionRuntime({
         }
         item.invalidations.add({
           requiredGeneration,
+          invalidatedAt: now(),
           bindingRevision: item.bindingRevision,
           accessRemoved: normalized.accessRemoved,
           accessOnly: normalized.accessRemoved && !demandEnabled(item.demand),
@@ -10863,7 +10988,9 @@ function createCollectorAcquisitionRuntime({
       for (const entry of targetInitializations.values()) entry.controller.abort();
       await Promise.allSettled([...items].flatMap((item) =>
         [item.initializePromise, item.pollPromise].filter(Boolean)));
-      for (const item of items) if (item.id) engine.unsubscribe(item.id);
+      // Per-target operation contexts are frozen; drop them so a retained
+      // handle does not keep the credential environment reachable.
+      for (const item of items) { if (item.id) engine.unsubscribe(item.id); item.provider = null; }
       items.clear();
       engine.close();
       for (const context of providerContexts.values()) {
@@ -11001,7 +11128,13 @@ function createCollectorProtocolClient({ createTransport, onReady = () => {},
     resourceForId: (id) => subscriptions.get(id)?.resource ?? null,
     onSnapshot(snapshot, frame) {
       const item = subscriptions.get(frame.id);
-      if (!item || frame.serverEpoch !== serverEpoch || snapshot.generation <= item.generation) return;
+      if (!item || frame.serverEpoch !== serverEpoch || snapshot.generation < item.generation) return;
+      // A same-epoch reconnect keeps the generation fence, and the server
+      // replays its cached generation for the new subscription. The first
+      // equal-generation snapshot on a connection acknowledges that
+      // connection; later repeats on it are not new deliveries.
+      if (snapshot.generation === item.generation && item.connectionAcknowledged) return;
+      item.connectionAcknowledged = true;
       item.generation = snapshot.generation;
       item.controlGeneration = Math.max(item.controlGeneration, snapshot.generation);
       const sourceAgeMs = item.sourceAge.observe({
@@ -11036,6 +11169,7 @@ function createCollectorProtocolClient({ createTransport, onReady = () => {},
         item.generation = -1;
         item.controlGeneration = -1;
       }
+      item.connectionAcknowledged = false;
       write({ type: "subscribe", id: item.id, host: item.host, repo: item.repo,
         resource: item.resource, demand: item.demand });
       flushRefresh(item);
@@ -11129,7 +11263,7 @@ function createCollectorProtocolClient({ createTransport, onReady = () => {},
         return { ok: false, reason: "invalid" };
       }
       const item = { ...subscription,
-        onSnapshot, onHold, onError, onDiagnostic, generation: -1, controlGeneration: -1, pendingRefresh: null,
+        onSnapshot, onHold, onError, onDiagnostic, generation: -1, controlGeneration: -1, connectionAcknowledged: false, pendingRefresh: null,
         sourceAge: createCollectorSourceAgeTracker({ now, monotonicNow, checkpoint: sourceCheckpoint }) };
       subscriptions.set(id, item);
       if (welcomed) write({ type: "subscribe", id: item.id, host: item.host, repo: item.repo,
@@ -13833,8 +13967,10 @@ function authCacheIdentity({
 }
 
 // Explicit targets are stable across working directories. In inferred mode the
-// directory is the only repository identity available without making another
-// GitHub call -- exactly the call that cannot succeed when this cache is needed.
+// directory and the remote slug, both resolved offline without the GitHub call
+// that cannot succeed when this cache is needed, form the identity: a changed
+// remote or a reused checkout path must not restore another repository's rows.
+// A null slug (no remote, or remotes that disagree) is its own key.
 // JSON encoding avoids delimiter ambiguity in host, repo, and path strings.
 function dashboardCacheTarget({
   repo = null,
@@ -13842,11 +13978,13 @@ function dashboardCacheTarget({
   host = null,
   cwd = process.cwd(),
   account = authCacheIdentity(),
+  remoteUrls = [],
 } = {}) {
   const target = repo || ghRepo;
   return target
     ? JSON.stringify({ kind: "repo", host: String(host ?? ""), repo: String(target), account })
-    : JSON.stringify({ kind: "cwd", host: String(host ?? ""), cwd: String(cwd), account });
+    : JSON.stringify({ kind: "cwd", host: String(host ?? ""), cwd: String(cwd),
+      remote: resolveEffectiveRepository({ remoteUrls }), account });
 }
 
 function sshCollectorCacheIdentity(alias) {
@@ -13930,6 +14068,33 @@ function normalizeCachedItem(tabKey, item) {
     };
   }
   return null;
+}
+
+// The one "unchanged" identity for an acquired result. Fetchers emit it, the
+// shared store rebuilds it from a validated snapshot, and adoption carries it,
+// so a producer comparing against a stored snapshot sees the same string it
+// would have produced itself. It covers what the tab renders: the rows through
+// the stored-snapshot validator, the markers that say the list is incomplete
+// and, for Security, the coverage notes. Timestamps are excluded on purpose.
+function acquisitionContentRaw(resource, { rows, truncated = false, hasNextPage = false, notes = [], blind = false }) {
+  return JSON.stringify({
+    v: GRAPHQL_QUERY_VERSION,
+    resource,
+    truncated: truncated === true,
+    hasNextPage: hasNextPage === true,
+    notes: resource === "security" ? notes : [],
+    blind: resource === "security" && blind === true,
+    rows: rows.map((row) => normalizeCachedItem(resource, row)),
+  });
+}
+
+// A pane's unchanged sentinel must describe the rows it displays. Adopting a
+// peer's different content without moving it let an A, B, A sequence compare
+// the third result against A and republish B as "unchanged". A snapshot that
+// does not carry the shared representation clears it, which costs one parse.
+function adoptedAcquisitionRaw(currentRaw, snapshot, sameContent) {
+  if (sameContent) return currentRaw;
+  return typeof snapshot?.raw === "string" ? snapshot.raw : null;
 }
 
 function normalizeDashboardCacheEntry(entry) {
@@ -14558,6 +14723,7 @@ function normalizeAcquisitionSnapshot(raw, query, generation, producerEpoch) {
   const content = JSON.stringify(rows);
   const contentDigest = createHash("sha256").update(content).digest("hex");
   if (raw.raw === undefined && raw.contentDigest !== contentDigest) return null;
+  const securityNotes = raw.securityNotes.filter((note) => typeof note === "string").map(safe);
   return {
     schema: 1,
     producerEpoch,
@@ -14565,7 +14731,8 @@ function normalizeAcquisitionSnapshot(raw, query, generation, producerEpoch) {
     generation,
     rows,
     pageInfo,
-    raw: content,
+    raw: acquisitionContentRaw(query.resource, { rows, truncated: raw.meta.truncated,
+      hasNextPage: pageInfo?.hasNextPage, notes: securityNotes, blind: raw.securityBlind }),
     contentDigest,
     entities,
     lastSuccessAt: raw.lastSuccessAt,
@@ -14574,7 +14741,7 @@ function normalizeAcquisitionSnapshot(raw, query, generation, producerEpoch) {
     hold: null,
     capabilities,
     meta: { at: raw.meta.at, truncated: raw.meta.truncated },
-    securityNotes: raw.securityNotes.filter((note) => typeof note === "string").map(safe),
+    securityNotes,
     securityBlind: raw.securityBlind,
   };
 }
@@ -18525,6 +18692,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       host: runtimeIdentityCoordinator?.current()?.host ?? effectiveRuntimeHost(),
       cwd: process.cwd(),
       account: sshCacheIdentity ?? runtimeIdentityCoordinator?.current()?.accessKey ?? "unverified",
+      remoteUrls: runtimeRemoteUrls,
     }),
   );
   const [loadedCache] = useState(() => loadDashboardCache(cachePath, cacheTarget));
@@ -19522,6 +19690,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       } else if (input==='d' && TABS[activeIndexRef.current].key==='actions') {
         void ciEvidenceRef.current?.('open');
       } else if (featureRef.current?.mode==='ci' && input==='r') {
+        retryPausedTransport(runtimeIdentityCoordinator);
         ciControllerRef.current?.abort();attentionControllerRef.current?.abort();jevOperationRef.current=null;runtimeJevSession?.clear();setFeature(null);void fetchTabRef.current?.('actions',manualRefreshRequest(refreshIntent(input)));
       } else if (featureRef.current?.mode==='focus' && input==='x') {
         jevOperationRef.current=null;const current=featureRef.current;
@@ -19570,6 +19739,9 @@ function App({ onCreateRemote = () => {} } = {}) {
         // validators: `r` on a quiet repository answers 304 and costs nothing,
         // which is exactly when the key is most likely to be pressed.
         const request = manualRefreshRequest(refreshIntent(input));
+        // The explicit retry a paused transport waits for. A collector client has
+        // no local coordinator; its collector resumes on the refresh it receives.
+        if (request) retryPausedTransport(runtimeIdentityCoordinator);
         if (request) fetchTabRef.current?.(TABS[activeIndexRef.current].key, request);
       } else if (input.length === 1 && input >= "1" && input <= String(TABS.length)) {
         setActiveIndex(Number(input) - 1);
@@ -20054,6 +20226,17 @@ function App({ onCreateRemote = () => {} } = {}) {
             setSecurityBlind(true);
             return;
           }
+          // Every Security source replayed its capability backoff: no request
+          // was made, so nothing was observed. Keep the displayed rows, the
+          // freshness clock and the peers' snapshot as they are (plan D6), and
+          // let the ordinary cadence retry. The request itself is answered.
+          if (result?.sourceObserved === false) {
+            await cancelAcquisition(acquisition);
+            requestedTabs.delete(key);
+            rescheduleTab(key, completedAt);
+            setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
+            return;
+          }
           // The shared nonce/generation is the publication fence. A superseded
           // owner must not update any local freshness, rows, cadence, or cache.
           const publicationView = stagedAcquisitionPublicationView({
@@ -20152,7 +20335,9 @@ function App({ onCreateRemote = () => {} } = {}) {
             const recovery = requestFailureRecovery(err, verdict);
             recordRuntimeRecovery(key, recovery.reason, { origin: recovery.origin, retryAt });
           }
-          if (verdict === "rate-limited") {
+          // A secondary limit is held by the shared transport cooldown, not by a
+          // resource block until the primary reset.
+          if (verdict === "rate-limited" && !secondaryThrottleEvidence(err)) {
             const snapshot = inspectGovernor(scope, Date.now());
             const costs = tabRequestCost(key);
             const blocks = [];
@@ -20304,6 +20489,10 @@ function App({ onCreateRemote = () => {} } = {}) {
         entityRef.current.set(entity.key, { etag: entity.etag, body: entity.body });
       }
       const sameRows = JSON.stringify(dataRef.current[key]) === JSON.stringify(snapshot.rows);
+      const sameContent = sameRows && (key !== "security" ||
+        JSON.stringify(securityNotesRef.current) === JSON.stringify(snapshot.securityNotes ?? []) &&
+        securityBlindRef.current === (snapshot.securityBlind === true));
+      rawRef.current[key] = adoptedAcquisitionRaw(rawRef.current[key], snapshot, sameContent);
       if (!sameRows) setData((current) => ({ ...current, [key]: snapshot.rows }));
       setMeta((current) => current[key]?.at === snapshotMeta.at &&
         current[key]?.truncated === snapshotMeta.truncated
@@ -20312,7 +20501,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         const accessKey = identity()?.accessKey;
         if (accessKey) {
           for (const [sourceKey, capability] of Object.entries(snapshot.capabilities ?? {})) {
-            alertBackoff.set(`${accessKey}\0${sourceKey}`, {
+            alertBackoff.set(backoffStorageKey(sourceKey, accessKey), {
               ...capability,
               until: performance.now() + Math.max(0, capability.until - Date.now()),
             });
@@ -20863,7 +21052,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         recoveryRef.current = savedRecovery.status === "healthy"
           ? { ...savedRecovery.current } : { core: null, graphql: null };
         setRecoveryCauses(recoveryRef.current);
-        const nextTarget = dashboardCacheTarget({ repo: runtime.repo, ghRepo: process.env.GH_REPO, host: current.host, account: current.accessKey });
+        const nextTarget = dashboardCacheTarget({ repo: runtime.repo, ghRepo: process.env.GH_REPO, host: current.host, account: current.accessKey, remoteUrls: runtimeRemoteUrls });
         // The mount-time target had to guess the account, and guesses
         // "unverified" whenever the bounded warm resolution above did not land
         // in time -- so a session that has rows on disk can start with none.
@@ -21985,6 +22174,21 @@ function App({ onCreateRemote = () => {} } = {}) {
     return () => clearInterval(timer);
   }, [showCachedAge]);
 
+  // Collector mode returns from the acquisition effect before any standalone
+  // wake can advance `now`, which froze running TIME and every UPDATED age
+  // while connected. Apply the standalone rule from a display-only timer: every
+  // second while a run is in progress, otherwise at most once a minute (a same
+  // Date leaves React's render bail-out intact). It never feeds freshness.
+  const collectorDisplayClock = runtime.connect !== null;
+  useEffect(() => {
+    if (!collectorDisplayClock) return;
+    const timer = setInterval(() => setNow((previous) => {
+      const at = Date.now();
+      return hasInProgressRef.current || at - previous.getTime() >= 60_000 ? new Date(at) : previous;
+    }), 1000);
+    return () => clearInterval(timer);
+  }, [collectorDisplayClock]);
+
   const allItems = items ?? [];
   const tabOffsetRaw = offset[tab.key] ?? 0;
   const selectedKey = selected[tab.key] ?? null;
@@ -22637,12 +22841,14 @@ export {
   maintainControlLease,
   claimProbe,
   classifyThrottle,
+  secondaryThrottleEvidence,
   applyTransportCooldown,
   clearTransportThrottle,
   emptyTransportThrottle,
   throttleLadderMs,
   transportCooldownDeadline,
   retryThrottledTransport,
+  retryPausedTransport,
   THROTTLE_LADDER_MS,
   THROTTLE_PAUSE_AFTER,
   MANUAL_GRANT_STREAK_LIMIT,
@@ -22806,6 +23012,7 @@ export {
   saveDashboardCache,
   mergeDashboardCacheSnapshots,
   nextSecurityRaw,
+  adoptedAcquisitionRaw,
   shouldCheckpointFreshness,
   ACQUISITION_STORE_VERSION,
   ACQUISITION_CLAIM_TTL_MS,

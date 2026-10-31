@@ -673,14 +673,15 @@ $XDG_CONFIG_HOME/gh-glance/dashboard-cache.json
 ```
 
 The cache is scoped to the repository, host, provider, and effective access
-partition. In inferred standalone mode, the host and current working directory
-also form the identity, so rows from one checkout or credential context cannot
-appear in another. Human-provider access includes one-way digests of the
-selected credential and its authorization generation; App-provider access also
-binds the configured repository and permission restrictions. Raw credentials
-are never stored. It retains at most 32 recent targets and 60 rows per tab; a
-shortened cached tab keeps its `+` marker rather than presenting the saved count
-as exact.
+partition. In inferred standalone mode, the host, the current working directory
+and the repository resolved offline from its git remote form the identity, so
+rows from one checkout, remote or credential context cannot appear in another.
+A directory whose remote now names a different repository starts cold.
+Human-provider access includes one-way digests of the selected credential and
+its authorization generation; App-provider access also binds the configured
+repository and permission restrictions. Raw credentials are never stored. It
+retains at most 32 recent targets and 60 rows per tab; a shortened cached tab
+keeps its `+` marker rather than presenting the saved count as exact.
 
 Only successfully parsed, non-blind observations replace saved rows. A failed
 request can add a live error or `?` marker, but it cannot turn known Security
@@ -945,10 +946,12 @@ After a sustained hold, the notice names the Core or GraphQL cause, the next
 automatic retry or required action, and the age of the last complete source
 observation. A successful budget check, cache load, or heartbeat cannot make
 old rows fresh. A validated unchanged `304` response does count as a new source
-observation. Unknown older spend remains charged until owner/child quiescence
-and a later matching observer establish safe retirement. A verified new system
-boot can establish that boundary for otherwise unidentifiable older children;
-the app does not assume a restart or reset alone refunded the charge.
+observation. A Security check answered only from capability backoff sends no
+request and does not count. Unknown older spend remains charged until
+owner/child quiescence and a later matching observer establish safe retirement.
+A verified new system boot can establish that boundary for otherwise
+unidentifiable older children; the app does not assume a restart or reset alone
+refunded the charge.
 
 The enforceable boundary is admission from fresh, conservatively debited
 evidence. Another program can spend after the probe, and standalone panes in a
@@ -1165,7 +1168,7 @@ GH_GLANCE_ICONS=ascii gh-glance
 | `Local coordination journal is full` | Every slot for unsettled or recently settled requests is in use. The app retries by itself, and older requests settle after about an hour. Nothing needs repair. `gh-glance --doctor` shows the occupancy as `debt groups`. |
 | `Local coordination` corruption, overflow, full storage, or unsafe permissions | Run `gh-glance --doctor`; its read-only report gives the exact cause and redacted local file location when known. For a hard failure it also prints a `repair` line: quit every pane, move the state file, its `.recovery.json` and `registry.json` aside, then relaunch. Otherwise repair storage or permissions and let the app retry. Preserve corrupt and overflow evidence for diagnosis. |
 | `Saving request result` or `Recovering interrupted request` | The original request may have consumed quota. The app keeps its charge, retries settlement without repeating HTTP, and waits for safe observer evidence before retiring uncertain debt. |
-| `GitHub request limit` | A shared secondary hold preserves GitHub's retry deadline. Wait for the shown time; if the repeated-limit circuit explicitly asks, press `r` once to retry. Repeated refresh cannot bypass a hold. |
+| `GitHub request limit` | A shared secondary hold preserves GitHub's retry deadline and does not block the resource until the hourly reset. Wait for the shown time. After repeated limits the transport pauses: press `r` (or `R`) once to resume it, or wait for the primary reset, after which one pane resumes it. Resuming never shortens GitHub's retry deadline, and repeated refresh cannot bypass a hold. |
 | `Collector connection unavailable` or `GitHub App authorization unavailable` | Restore the selected collector connection or App authorization. The mode does not switch to independent requests. Cached rows remain labeled with their source age. |
 | `Shared HTTP request or cooldown in progress` | Panes share up to three admitted requests per host, FIFO starts with at least 250 ms spacing, and one cooldown. The pool is full, a queued request is ahead, or a server-sent `Retry-After` is still running. Normal pacing, not an error. |
 | `Verified identity unavailable; waiting to retry` | The account behind your credential has not been confirmed yet -- not signed in, a denied or malformed proof, or a slow credential helper. Check `gh auth status`. Retries are rate-limited, so this clears on its own rather than immediately. |

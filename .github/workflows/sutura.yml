@@ -25,6 +25,8 @@ jobs:
         github.event.workflow_run.conclusion == 'timed_out'
       }}
     runs-on: ubuntu-latest
+    env:
+      SUTURA_JEV_PILOT_SELECTED: ${{ vars.SUTURA_JEV_PILOT_RUN_ID != '' && vars.SUTURA_JEV_PILOT_RUN_ID == format('{0}', github.event.workflow_run.id) }}
     steps:
       - name: Create repository-scoped Sutura token
         id: sutura-app-token
@@ -37,12 +39,24 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
       - name: Verify and repair failed CI
-        uses: juan294/sutura@94dab7eab0957d1d2e9e4aab2dc4e2ea9828f07c # reviewed candidate commit
+        uses: juan294/sutura@ddab42eadc92801f97c4745ed10f7e467b9843c8 # v0.5.1
         with:
           github-token: ${{ steps.sutura-app-token.outputs.token }}
           run-id: ${{ github.event.workflow_run.id }}
           capture-replay: true
+          require-fixed: true
           runtime: auto
+          repair-inference-cost-usd: '0.25'
+          repair-sandbox-operations: '32'
+          repair-elapsed-time-sec: '600'
+          # Set the exact CI run ID before it completes; an unset selector keeps Jev off.
+          typesafe-api-key: ${{ env.SUTURA_JEV_PILOT_SELECTED == 'true' && secrets.TYPESAFE_API_KEY || '' }}
+          jev-ranking: ${{ env.SUTURA_JEV_PILOT_SELECTED == 'true' && 'assist' || 'off' }}
+          jev-grounding: ${{ env.SUTURA_JEV_PILOT_SELECTED == 'true' && 'assist' || 'off' }}
+          jev-classification: ${{ env.SUTURA_JEV_PILOT_SELECTED == 'true' && 'assist' || 'off' }}
+          jev-recovery: ${{ env.SUTURA_JEV_PILOT_SELECTED == 'true' && 'assist' || 'off' }}
+          jev-budget-usd: ${{ env.SUTURA_JEV_PILOT_SELECTED == 'true' && '0.01' || '0' }}
+          repair-typesafe-audit-usd: '0.01'
           nebius-api-key: ${{ secrets.NEBIUS_API_KEY }}
           contree-token: ${{ secrets.CONTREE_TOKEN }}
           contree-project: ${{ vars.CONTREE_PROJECT }}
