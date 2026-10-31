@@ -10899,7 +10899,9 @@ function createCollectorAcquisitionRuntime({
       for (const entry of targetInitializations.values()) entry.controller.abort();
       await Promise.allSettled([...items].flatMap((item) =>
         [item.initializePromise, item.pollPromise].filter(Boolean)));
-      for (const item of items) if (item.id) engine.unsubscribe(item.id);
+      // Per-target operation contexts are frozen; drop them so a retained
+      // handle does not keep the credential environment reachable.
+      for (const item of items) { if (item.id) engine.unsubscribe(item.id); item.provider = null; }
       items.clear();
       engine.close();
       for (const context of providerContexts.values()) {
