@@ -2558,13 +2558,14 @@ async function fetchGraphqlList(kind, mapRow, {
   const incomplete = merged.incomplete || truncatedWalk;
   // Serialized rows are the payload identity the unchanged-frame suppression
   // and the cache both compare on, so it must cover exactly what is rendered --
-  // including the markers that say the list is not all of it.
-  const raw = JSON.stringify({
-    v: GRAPHQL_QUERY_VERSION,
-    totalCount,
-    incomplete,
-    hasNextPage: merged.hasNextPage,
+  // including the markers that say the list is not all of it. It is the shared
+  // representation a stored snapshot rebuilds, so a collector producer that
+  // compares against its normalized previous snapshot can see "unchanged".
+  // `truncated` is what pollResultTransition derives from the limit below.
+  const raw = acquisitionContentRaw(kind, {
     rows: merged.rows,
+    truncated: incomplete || merged.rows.length >= LIST_LIMIT,
+    hasNextPage: merged.hasNextPage,
   });
   return {
     raw: raw === previousRaw ? previousRaw : raw,
@@ -7554,6 +7555,14 @@ async function fetchSecurity(signal, {
     requestMetrics,
     graphqlSpent: 0,
     measuredSuccess: parts.every((part) => part.verdict === "ok"),
+    // Whether this batch observed the source at all: some source made a real
+    // request and GitHub answered it (200/304, or a current capability refusal).
+    // A batch in which every source replayed its backoff made no request, so it
+    // must not advance freshness or complete webhook work (plan D6, ADR 0005).
+    // With no sources (an App granted no Security permission) there is nothing
+    // to observe, and the configuration answer keeps its existing behavior.
+    sourceObserved: parts.length === 0 || parts.some((part) => part.httpRequests > 0 &&
+      (part.verdict === "ok" || part.verdict === "unavailable")),
     rateLimited: parts.some((part) => part.verdict === "rate-limited" && !part.secondaryThrottle),
     stagedEntities,
     observations: parts.flatMap((part) => part.observations ?? []),
@@ -7829,7 +7838,16 @@ function createCollectorSourceAgeTracker({ now = Date.now, monotonicNow = () => 
     lowerBound += Math.max(0, now() - checkpoint.clientCheckpointAt);
   }
   let measuredAt = monotonicNow();
-  const current = () => lowerBound + Math.max(0, monotonicNow() - measuredAt);
+  // The monotonic clock does not advance across a suspend, so positive wall
+  // elapsed time also bounds the age. A forward wall step can only overstate
+  // staleness; the high-water mark keeps a backward step from shrinking it.
+  let wallMeasuredAt = now();
+  let reported = lowerBound;
+  const current = () => {
+    reported = Math.max(reported, lowerBound +
+      Math.max(0, monotonicNow() - measuredAt, now() - wallMeasuredAt));
+    return reported;
+  };
   return {
     observe({ lastSuccessAt, serverNow }) {
       if (!Number.isFinite(lastSuccessAt) || !Number.isFinite(serverNow)) return current();
@@ -7839,6 +7857,8 @@ function createCollectorSourceAgeTracker({ now = Date.now, monotonicNow = () => 
       else lowerBound = Math.max(elapsed, candidate);
       sourceAt = sourceAt === null ? lastSuccessAt : Math.max(sourceAt, lastSuccessAt);
       measuredAt = monotonicNow();
+      wallMeasuredAt = now();
+      reported = lowerBound;
       return lowerBound;
     },
     current,
@@ -10100,7 +10120,11 @@ async function createCollectorService({ config, pathOptions = {}, runtime, platf
 }
 
 function collectorPublicationFromResult(resource, result, previous, demand, completedAt, state = {}) {
-  const transition = pollResultTransition({
+  // A Security batch that only replayed capability backoff made no request. It
+  // republishes the previous observation unchanged, with its success time, so
+  // neither freshness nor webhook completion can advance on it.
+  const observed = result.sourceObserved !== false;
+  const transition = !observed ? { kind: "unchanged", completedAt } : pollResultTransition({
     key: resource,
     previousRaw: previous?.raw ?? null,
     raw: result.raw,
@@ -10129,7 +10153,8 @@ function collectorPublicationFromResult(resource, result, previous, demand, comp
     },
     raw: transition.kind === "changed" ? transition.nextRaw : previous.raw,
     entities,
-    lastSuccessAt: completedAt,
+    lastSuccessAt: observed ? completedAt : previous.lastSuccessAt,
+    sourceObserved: observed,
     lastChangedAt,
     nextDueAt: completedAt + pollPolicyInterval({
       tab: resource,
@@ -10535,13 +10560,21 @@ function createCollectorAcquisitionRuntime({
     }
     item.onSnapshot(snapshot);
     if (!publication || !Number.isSafeInteger(snapshot.generation)) return true;
+    let awaitingObservation = false;
     for (const waiter of item.invalidations) {
       if (bindingRevision !== waiter.bindingRevision || waiter.requiredGeneration === null ||
           snapshot.generation < waiter.requiredGeneration) continue;
+      // A newer generation that republished an older observation (a Security
+      // capability-backoff replay) is not API validation of the webhook. Leave
+      // the waiter for the next real observation on the ordinary cadence.
+      if (Number.isFinite(waiter.invalidatedAt) && !(snapshot.lastSuccessAt >= waiter.invalidatedAt)) {
+        awaitingObservation = true;
+        continue;
+      }
       item.invalidations.delete(waiter);
       waiter.resolve(snapshot);
     }
-    if (item.invalidations.size > 0 && !closed && !item.closed && demandEnabled(item.demand)) {
+    if (item.invalidations.size > 0 && !awaitingObservation && !closed && !item.closed && demandEnabled(item.demand)) {
       queueMicrotask(() => startPoll(item, { manual: true }));
     }
     return true;
@@ -10696,6 +10729,9 @@ function createCollectorAcquisitionRuntime({
         if (!published.ok) { item.onHold?.("disconnected"); retryIn = 1_000; }
         else {
           provider?.coordinator?.markAuthorized?.();
+          // A replay answers the request as far as backoff allows without
+          // advancing the success time that would otherwise clear it.
+          if (produced.sourceObserved === false) item.requestedAt = null;
           retryIn = Math.max(1, published.value.snapshot.nextDueAt - now());
         }
       } catch (error) {
@@ -10913,6 +10949,7 @@ function createCollectorAcquisitionRuntime({
         }
         item.invalidations.add({
           requiredGeneration,
+          invalidatedAt: now(),
           bindingRevision: item.bindingRevision,
           accessRemoved: normalized.accessRemoved,
           accessOnly: normalized.accessRemoved && !demandEnabled(item.demand),
@@ -13930,8 +13967,10 @@ function authCacheIdentity({
 }
 
 // Explicit targets are stable across working directories. In inferred mode the
-// directory is the only repository identity available without making another
-// GitHub call -- exactly the call that cannot succeed when this cache is needed.
+// directory and the remote slug, both resolved offline without the GitHub call
+// that cannot succeed when this cache is needed, form the identity: a changed
+// remote or a reused checkout path must not restore another repository's rows.
+// A null slug (no remote, or remotes that disagree) is its own key.
 // JSON encoding avoids delimiter ambiguity in host, repo, and path strings.
 function dashboardCacheTarget({
   repo = null,
@@ -13939,11 +13978,13 @@ function dashboardCacheTarget({
   host = null,
   cwd = process.cwd(),
   account = authCacheIdentity(),
+  remoteUrls = [],
 } = {}) {
   const target = repo || ghRepo;
   return target
     ? JSON.stringify({ kind: "repo", host: String(host ?? ""), repo: String(target), account })
-    : JSON.stringify({ kind: "cwd", host: String(host ?? ""), cwd: String(cwd), account });
+    : JSON.stringify({ kind: "cwd", host: String(host ?? ""), cwd: String(cwd),
+      remote: resolveEffectiveRepository({ remoteUrls }), account });
 }
 
 function sshCollectorCacheIdentity(alias) {
@@ -14027,6 +14068,33 @@ function normalizeCachedItem(tabKey, item) {
     };
   }
   return null;
+}
+
+// The one "unchanged" identity for an acquired result. Fetchers emit it, the
+// shared store rebuilds it from a validated snapshot, and adoption carries it,
+// so a producer comparing against a stored snapshot sees the same string it
+// would have produced itself. It covers what the tab renders: the rows through
+// the stored-snapshot validator, the markers that say the list is incomplete
+// and, for Security, the coverage notes. Timestamps are excluded on purpose.
+function acquisitionContentRaw(resource, { rows, truncated = false, hasNextPage = false, notes = [], blind = false }) {
+  return JSON.stringify({
+    v: GRAPHQL_QUERY_VERSION,
+    resource,
+    truncated: truncated === true,
+    hasNextPage: hasNextPage === true,
+    notes: resource === "security" ? notes : [],
+    blind: resource === "security" && blind === true,
+    rows: rows.map((row) => normalizeCachedItem(resource, row)),
+  });
+}
+
+// A pane's unchanged sentinel must describe the rows it displays. Adopting a
+// peer's different content without moving it let an A, B, A sequence compare
+// the third result against A and republish B as "unchanged". A snapshot that
+// does not carry the shared representation clears it, which costs one parse.
+function adoptedAcquisitionRaw(currentRaw, snapshot, sameContent) {
+  if (sameContent) return currentRaw;
+  return typeof snapshot?.raw === "string" ? snapshot.raw : null;
 }
 
 function normalizeDashboardCacheEntry(entry) {
@@ -14655,6 +14723,7 @@ function normalizeAcquisitionSnapshot(raw, query, generation, producerEpoch) {
   const content = JSON.stringify(rows);
   const contentDigest = createHash("sha256").update(content).digest("hex");
   if (raw.raw === undefined && raw.contentDigest !== contentDigest) return null;
+  const securityNotes = raw.securityNotes.filter((note) => typeof note === "string").map(safe);
   return {
     schema: 1,
     producerEpoch,
@@ -14662,7 +14731,8 @@ function normalizeAcquisitionSnapshot(raw, query, generation, producerEpoch) {
     generation,
     rows,
     pageInfo,
-    raw: content,
+    raw: acquisitionContentRaw(query.resource, { rows, truncated: raw.meta.truncated,
+      hasNextPage: pageInfo?.hasNextPage, notes: securityNotes, blind: raw.securityBlind }),
     contentDigest,
     entities,
     lastSuccessAt: raw.lastSuccessAt,
@@ -14671,7 +14741,7 @@ function normalizeAcquisitionSnapshot(raw, query, generation, producerEpoch) {
     hold: null,
     capabilities,
     meta: { at: raw.meta.at, truncated: raw.meta.truncated },
-    securityNotes: raw.securityNotes.filter((note) => typeof note === "string").map(safe),
+    securityNotes,
     securityBlind: raw.securityBlind,
   };
 }
@@ -18622,6 +18692,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       host: runtimeIdentityCoordinator?.current()?.host ?? effectiveRuntimeHost(),
       cwd: process.cwd(),
       account: sshCacheIdentity ?? runtimeIdentityCoordinator?.current()?.accessKey ?? "unverified",
+      remoteUrls: runtimeRemoteUrls,
     }),
   );
   const [loadedCache] = useState(() => loadDashboardCache(cachePath, cacheTarget));
@@ -20155,6 +20226,17 @@ function App({ onCreateRemote = () => {} } = {}) {
             setSecurityBlind(true);
             return;
           }
+          // Every Security source replayed its capability backoff: no request
+          // was made, so nothing was observed. Keep the displayed rows, the
+          // freshness clock and the peers' snapshot as they are (plan D6), and
+          // let the ordinary cadence retry. The request itself is answered.
+          if (result?.sourceObserved === false) {
+            await cancelAcquisition(acquisition);
+            requestedTabs.delete(key);
+            rescheduleTab(key, completedAt);
+            setErrors((x) => (x[key] === null ? x : { ...x, [key]: null }));
+            return;
+          }
           // The shared nonce/generation is the publication fence. A superseded
           // owner must not update any local freshness, rows, cadence, or cache.
           const publicationView = stagedAcquisitionPublicationView({
@@ -20407,6 +20489,10 @@ function App({ onCreateRemote = () => {} } = {}) {
         entityRef.current.set(entity.key, { etag: entity.etag, body: entity.body });
       }
       const sameRows = JSON.stringify(dataRef.current[key]) === JSON.stringify(snapshot.rows);
+      const sameContent = sameRows && (key !== "security" ||
+        JSON.stringify(securityNotesRef.current) === JSON.stringify(snapshot.securityNotes ?? []) &&
+        securityBlindRef.current === (snapshot.securityBlind === true));
+      rawRef.current[key] = adoptedAcquisitionRaw(rawRef.current[key], snapshot, sameContent);
       if (!sameRows) setData((current) => ({ ...current, [key]: snapshot.rows }));
       setMeta((current) => current[key]?.at === snapshotMeta.at &&
         current[key]?.truncated === snapshotMeta.truncated
@@ -20966,7 +21052,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         recoveryRef.current = savedRecovery.status === "healthy"
           ? { ...savedRecovery.current } : { core: null, graphql: null };
         setRecoveryCauses(recoveryRef.current);
-        const nextTarget = dashboardCacheTarget({ repo: runtime.repo, ghRepo: process.env.GH_REPO, host: current.host, account: current.accessKey });
+        const nextTarget = dashboardCacheTarget({ repo: runtime.repo, ghRepo: process.env.GH_REPO, host: current.host, account: current.accessKey, remoteUrls: runtimeRemoteUrls });
         // The mount-time target had to guess the account, and guesses
         // "unverified" whenever the bounded warm resolution above did not land
         // in time -- so a session that has rows on disk can start with none.
@@ -22088,6 +22174,21 @@ function App({ onCreateRemote = () => {} } = {}) {
     return () => clearInterval(timer);
   }, [showCachedAge]);
 
+  // Collector mode returns from the acquisition effect before any standalone
+  // wake can advance `now`, which froze running TIME and every UPDATED age
+  // while connected. Apply the standalone rule from a display-only timer: every
+  // second while a run is in progress, otherwise at most once a minute (a same
+  // Date leaves React's render bail-out intact). It never feeds freshness.
+  const collectorDisplayClock = runtime.connect !== null;
+  useEffect(() => {
+    if (!collectorDisplayClock) return;
+    const timer = setInterval(() => setNow((previous) => {
+      const at = Date.now();
+      return hasInProgressRef.current || at - previous.getTime() >= 60_000 ? new Date(at) : previous;
+    }), 1000);
+    return () => clearInterval(timer);
+  }, [collectorDisplayClock]);
+
   const allItems = items ?? [];
   const tabOffsetRaw = offset[tab.key] ?? 0;
   const selectedKey = selected[tab.key] ?? null;
@@ -22911,6 +23012,7 @@ export {
   saveDashboardCache,
   mergeDashboardCacheSnapshots,
   nextSecurityRaw,
+  adoptedAcquisitionRaw,
   shouldCheckpointFreshness,
   ACQUISITION_STORE_VERSION,
   ACQUISITION_CLAIM_TTL_MS,
