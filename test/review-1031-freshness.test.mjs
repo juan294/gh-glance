@@ -12,6 +12,7 @@ import {
   adoptedAcquisitionRaw,
   collectorPublicationFromResult,
   createCollectorAcquisitionRuntime,
+  createCollectorSourceAgeTracker,
   dashboardCacheTarget,
   fetchGraphqlList,
   loadDashboardCache,
@@ -218,4 +219,24 @@ test("PC-04: a changed remote in the same directory does not restore the other r
   assert.equal(loadDashboardCache(path, one).entry?.tabs.actions.data[0].displayTitle, "acme/one run");
   assert.equal(loadDashboardCache(path, two).entry, null);
   assert.equal(loadDashboardCache(path, unresolved).entry, null);
+});
+
+// RT-04 (#171), secondary part: the monotonic clock does not advance across a
+// suspend, so the collector source age alone omitted the sleep. Wall elapsed
+// time bounds it from below as well; a backward wall step still cannot make
+// the same observation younger.
+test("RT-04: collector source age includes time spent suspended and never shrinks", () => {
+  let wall = 1_000_000;
+  let mono = 0;
+  const tracker = createCollectorSourceAgeTracker({ now: () => wall, monotonicNow: () => mono });
+  assert.equal(tracker.observe({ lastSuccessAt: wall - 10_000, serverNow: wall }), 10_000);
+  wall += 3_601_000;
+  mono += 1_000;
+  assert.equal(tracker.current(), 3_611_000, "an hour asleep and a second awake");
+  wall -= 3_600_000;
+  assert.equal(tracker.current(), 3_611_000, "a backward wall step cannot shrink the age");
+  mono += 1_000;
+  assert.equal(tracker.current(), 3_611_000);
+  assert.equal(tracker.observe({ lastSuccessAt: wall - 500, serverNow: wall }), 500,
+    "a newer observation still replaces the age");
 });

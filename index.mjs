@@ -7775,7 +7775,16 @@ function createCollectorSourceAgeTracker({ now = Date.now, monotonicNow = () => 
     lowerBound += Math.max(0, now() - checkpoint.clientCheckpointAt);
   }
   let measuredAt = monotonicNow();
-  const current = () => lowerBound + Math.max(0, monotonicNow() - measuredAt);
+  // The monotonic clock does not advance across a suspend, so positive wall
+  // elapsed time also bounds the age. A forward wall step can only overstate
+  // staleness; the high-water mark keeps a backward step from shrinking it.
+  let wallMeasuredAt = now();
+  let reported = lowerBound;
+  const current = () => {
+    reported = Math.max(reported, lowerBound +
+      Math.max(0, monotonicNow() - measuredAt, now() - wallMeasuredAt));
+    return reported;
+  };
   return {
     observe({ lastSuccessAt, serverNow }) {
       if (!Number.isFinite(lastSuccessAt) || !Number.isFinite(serverNow)) return current();
@@ -7785,6 +7794,8 @@ function createCollectorSourceAgeTracker({ now = Date.now, monotonicNow = () => 
       else lowerBound = Math.max(elapsed, candidate);
       sourceAt = sourceAt === null ? lastSuccessAt : Math.max(sourceAt, lastSuccessAt);
       measuredAt = monotonicNow();
+      wallMeasuredAt = now();
+      reported = lowerBound;
       return lowerBound;
     },
     current,
@@ -22023,6 +22034,21 @@ function App({ onCreateRemote = () => {} } = {}) {
     const timer = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(timer);
   }, [showCachedAge]);
+
+  // Collector mode returns from the acquisition effect before any standalone
+  // wake can advance `now`, which froze running TIME and every UPDATED age
+  // while connected. Apply the standalone rule from a display-only timer: every
+  // second while a run is in progress, otherwise at most once a minute (a same
+  // Date leaves React's render bail-out intact). It never feeds freshness.
+  const collectorDisplayClock = runtime.connect !== null;
+  useEffect(() => {
+    if (!collectorDisplayClock) return;
+    const timer = setInterval(() => setNow((previous) => {
+      const at = Date.now();
+      return hasInProgressRef.current || at - previous.getTime() >= 60_000 ? new Date(at) : previous;
+    }), 1000);
+    return () => clearInterval(timer);
+  }, [collectorDisplayClock]);
 
   const allItems = items ?? [];
   const tabOffsetRaw = offset[tab.key] ?? 0;
