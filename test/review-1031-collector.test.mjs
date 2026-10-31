@@ -380,3 +380,73 @@ test("PC-06 (#170): an older generation or another epoch's frame does not acknow
   assert.deepEqual(fixture.ready, [true, false]);
   assert.deepEqual(fixture.delivered, [5]);
 });
+
+test("PC-07 (#173): follower wakes do not re-send an unchanged generation", async (t) => {
+  const config = normalizeCollectorConfig({ version: 1,
+    providers: { personal: { type: "gh", host: "github.com" } },
+    targets: [{ host: "github.com", repo: "acme/widget", provider: "personal" }] });
+  const timers = new Set();
+  let produced = 0;
+  const runtime = createCollectorAcquisitionRuntime({ config, pathOptions: privatePathOptions(t),
+    setTimeout(callback, delay) { const timer = { callback, delay, unref() {} }; timers.add(timer); return timer; },
+    clearTimeout(timer) { timers.delete(timer); },
+    resolveProvider: async () => ({ host: "github.com", kind: "user", id: 7, login: "octo",
+      quotaKey: "q".repeat(64), accessKey: "a".repeat(64), credentialKey: "c".repeat(64),
+      generation: 1, observedAt: 1 }),
+    resolveTargetIdentity: async () => ({ id: "R_widget", nameWithOwner: "acme/widget" }),
+    async produce({ markStarted }) {
+      produced += 1;
+      await markStarted();
+      const at = Date.now();
+      // Fresh for an hour, so every wake below is a follower read.
+      return { rows: [{ number: produced }], entities: [], raw: JSON.stringify(produced),
+        pageInfo: { loadedPages: 1, hasNextPage: false }, lastSuccessAt: at, lastChangedAt: at,
+        nextDueAt: at + 3_600_000, hold: null, capabilities: {}, requestMetrics: {},
+        uncertainReceipts: [], repositoryIdentity: { id: "R_widget", nameWithOwner: "acme/widget" },
+        meta: { at, truncated: false }, securityNotes: [], securityBlind: false };
+    },
+  });
+  t.after(() => runtime.close());
+  const subscribe = () => {
+    const deliveries = [];
+    let notify = () => {};
+    const handle = runtime.subscribe({ target: config.targets[0], resource: "issues", demand: DEMAND,
+      onSnapshot(snapshot) { deliveries.push(snapshot.generation); notify(); }, onHold() {} });
+    const next = (count) => within(new Promise((resolve) => {
+      notify = () => { if (deliveries.length >= count) resolve(); };
+      notify();
+    }), 5_000, "collector delivery");
+    return { handle, deliveries, next };
+  };
+  const wake = async (subscribers) => {
+    const due = [...timers];
+    timers.clear();
+    for (const timer of due) timer.callback();
+    for (const { handle } of subscribers) await handle.whenCurrentPollSettled();
+  };
+  const producer = subscribe();
+  await producer.next(1);
+  await producer.handle.whenCurrentPollSettled();
+  // A second connection's subscription is a follower of the same query.
+  const follower = subscribe();
+  await follower.next(1);
+  await follower.handle.whenCurrentPollSettled();
+  for (let index = 0; index < 3; index += 1) await wake([producer, follower]);
+  assert.equal(produced, 1);
+  assert.deepEqual(follower.deliveries, [1],
+    "an unchanged generation must not be re-sent on each follower wake");
+  assert.deepEqual(producer.deliveries, [1]);
+  // A new generation still reaches both subscribers once.
+  producer.handle.refresh(true);
+  await producer.next(2);
+  await follower.next(2);
+  await producer.handle.whenCurrentPollSettled();
+  await wake([producer, follower]);
+  assert.deepEqual(follower.deliveries, [1, 2]);
+  // A new connection's subscription still receives the current snapshot.
+  const reconnected = subscribe();
+  await reconnected.next(1);
+  await reconnected.handle.whenCurrentPollSettled();
+  await wake([producer, follower, reconnected]);
+  assert.deepEqual(reconnected.deliveries, [2]);
+});

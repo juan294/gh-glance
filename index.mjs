@@ -10468,9 +10468,17 @@ function createCollectorAcquisitionRuntime({
     item.invalidations.clear();
   }
 
+  // Identifies one delivered generation for one engine subscription and
+  // binding. A rebind or a new subscription (a new connection) changes it.
+  function collectorDeliveryKey(subscriptionId, bindingRevision, snapshot) {
+    return Number.isSafeInteger(snapshot?.generation)
+      ? `${subscriptionId}\0${bindingRevision}\0${snapshot.generation}` : null;
+  }
+
   function deliverCollectorSnapshot(item, snapshot, bindingRevision, { publication = false } = {}) {
     if (bindingRevision !== item.bindingRevision) return false;
     item.nextDueAt = snapshot.nextDueAt;
+    item.lastDeliveryKey = collectorDeliveryKey(item.id, bindingRevision, snapshot);
     if (Number.isSafeInteger(snapshot.generation)) item.lastDeliveredGeneration = snapshot.generation;
     if (Number.isFinite(snapshot.lastSuccessAt)) item.lastDeliveredSuccessAt = snapshot.lastSuccessAt;
     if (publication && item.requestedAt !== null && snapshot.lastSuccessAt >= item.requestedAt) {
@@ -10560,7 +10568,10 @@ function createCollectorAcquisitionRuntime({
       const ownership = await engine.refresh(subscriptionId, { force: manual });
       if (!ownership.ok) { item.onHold?.("disconnected"); retryIn = 1_000; return; }
       if (ownership.value.role !== "producer") {
-        if (ownership.value.snapshot) {
+        // A follower wake re-reads the shared record; re-send only a
+        // generation this subscription has not already delivered.
+        if (ownership.value.snapshot && item.lastDeliveryKey !==
+            collectorDeliveryKey(subscriptionId, bindingRevision, ownership.value.snapshot)) {
           deliverCollectorSnapshot(item, ownership.value.snapshot, bindingRevision);
         }
         if (ownership.value.reason !== "fresh") {
@@ -10738,7 +10749,7 @@ function createCollectorAcquisitionRuntime({
       const item = { target, resource, demand: normalizedDemand, onSnapshot, onHold, id: null, identity: null,
         provider: null, polling: false, pollPhase: null, pollPromise: null, controller: null,
         initializePromise: null, closed: false, timer: null, queuedRefresh: null, requestedAt: null,
-        bindingRevision: 0, invalidations: new Set(), lastDeliveredGeneration: null,
+        bindingRevision: 0, invalidations: new Set(), lastDeliveredGeneration: null, lastDeliveryKey: null,
         lastDeliveredSuccessAt: null, promotionGeneration: null, promotionAt: null };
       items.add(item);
       void startInitialize(item);
