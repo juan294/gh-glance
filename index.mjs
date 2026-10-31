@@ -10181,11 +10181,13 @@ function createCollectorAcquisitionRuntime({
       providerContexts.set(target.provider, context);
     }
     let identity;
+    let credentialEnvironment = null;
+    let capabilities = null;
     if (context.definition.type === "github-app") {
       const resolved = await context.coordinator.resolve({ signal });
       identity = resolved.identity;
-      context.credentialEnvironment = resolved.environment;
-      context.capabilities = resolved.capabilities;
+      credentialEnvironment = resolved.environment;
+      capabilities = resolved.capabilities;
       if (context.identity?.accessKey !== identity.accessKey) {
         const persisted = persistGitHubAppIdentity(context.coordinator.root, identity, now());
         if (!persisted.ok) throw new Error("collector provider unavailable");
@@ -10194,13 +10196,10 @@ function createCollectorAcquisitionRuntime({
       const resolved = await context.coordinator.refresh();
       if (!resolved.ok) throw new Error("collector provider unavailable");
       identity = resolved.value;
-      context.credentialEnvironment = null;
-      context.capabilities = null;
       context.readBudgets = readBudgets;
     }
     if (identity.host !== target.host) throw new Error("collector provider unavailable");
-    context.identity = identity;
-    context.scope = {
+    const scope = Object.freeze({
       ...createQuotaScope(identity, {
         root: context.coordinator.root,
         now,
@@ -10210,9 +10209,28 @@ function createCollectorAcquisitionRuntime({
       repository: target.repo,
       providerType: context.definition.type,
       ...(executeGh ? { executeGh } : {}),
-      ...(context.credentialEnvironment ? { credentialEnvironment: context.credentialEnvironment } : {}),
-    };
-    return context;
+      ...(credentialEnvironment ? { credentialEnvironment } : {}),
+    });
+    // The provider context keeps only provider-wide state (coordinator,
+    // lease, budget reader, latest access identity). Its scope is used to
+    // release the provider lease on close, never to bind a request.
+    context.identity = identity;
+    context.credentialEnvironment = credentialEnvironment;
+    context.capabilities = capabilities;
+    context.scope = { ...scope };
+    // Each target operation gets its own immutable binding, captured once, so
+    // another target's resolution cannot redirect it after an await.
+    return Object.freeze({
+      coordinator: context.coordinator,
+      definition: context.definition,
+      leaseId: context.leaseId,
+      readBudgets: context.readBudgets,
+      onObserverPublished: context.onObserverPublished,
+      identity,
+      scope,
+      credentialEnvironment,
+      capabilities,
+    });
   }
 
   async function defaultProduce({ target, resource, demand, snapshot, claim, markStarted, provider, signal, force }) {
@@ -10531,7 +10549,8 @@ function createCollectorAcquisitionRuntime({
         retryIn = 1;
         return;
       }
-      item.provider = refreshedProvider;
+      const provider = refreshedProvider;
+      item.provider = provider;
       const ownership = await engine.refresh(subscriptionId, { force: manual });
       if (!ownership.ok) { item.onHold?.("disconnected"); retryIn = 1_000; return; }
       if (ownership.value.role !== "producer") {
@@ -10566,7 +10585,7 @@ function createCollectorAcquisitionRuntime({
             active: ownership.value.demand?.active || item.requestedAt !== null },
           snapshot: ownership.value.snapshot,
           claim: { ...claim, state: item },
-          provider: item.provider,
+          provider,
           signal: item.controller.signal,
           force,
           markStarted: async (receipt) => {
@@ -10576,11 +10595,11 @@ function createCollectorAcquisitionRuntime({
             return started;
           },
         }));
-        const produced = item.provider?.scope
-          ? await requestIdentityStorage.run(item.provider.scope, produceBound)
+        const produced = provider?.scope
+          ? await requestIdentityStorage.run(provider.scope, produceBound)
           : await produceBound();
-        if (item.provider?.definition?.type === "github-app" &&
-            item.provider.coordinator.current()?.accessKey !== claim.accessKey) {
+        if (provider?.definition?.type === "github-app" &&
+            provider.coordinator.current()?.accessKey !== claim.accessKey) {
           engine.refresh(subscriptionId, { claim, failure: {
             hold: "disconnected",
             requestMetrics: produced.requestMetrics ?? {},
@@ -10610,13 +10629,13 @@ function createCollectorAcquisitionRuntime({
         const published = await engine.refresh(subscriptionId, { claim, publish: produced });
         if (!published.ok) { item.onHold?.("disconnected"); retryIn = 1_000; }
         else {
-          item.provider?.coordinator?.markAuthorized?.();
+          provider?.coordinator?.markAuthorized?.();
           retryIn = Math.max(1, published.value.snapshot.nextDueAt - now());
         }
       } catch (error) {
-        if (item.provider?.definition?.type === "github-app" && error?.apiResponse?.status === 401 &&
+        if (provider?.definition?.type === "github-app" && error?.apiResponse?.status === 401 &&
             !error.appCredentialInvalidated) {
-          item.provider.coordinator.invalidate("unauthorized");
+          provider.coordinator.invalidate("unauthorized");
         }
         const hold = error?.notStarted ? "shared-wait" : acquisitionFailureHold(error);
         if (claim && error?.notStarted) engine.refresh(subscriptionId, { cancel: claim });
@@ -10625,7 +10644,7 @@ function createCollectorAcquisitionRuntime({
           requestMetrics: error?.requestMetrics ?? {},
         } });
         else engine.setHold(subscriptionId, hold, { resource: item.resource, accessKey: item.identity.accessKey });
-        item.onHold?.(item.provider?.definition?.type === "github-app" &&
+        item.onHold?.(provider?.definition?.type === "github-app" &&
           (error?.apiResponse?.status === 401 || error?.message === "GitHub App token unavailable" ||
             classify(error) === "auth-problem")
           ? "app-auth" : hold);
