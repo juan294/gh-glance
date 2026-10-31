@@ -1,0 +1,288 @@
+{
+  "items": [
+    {
+      "id": "RT-01",
+      "kind": "defect",
+      "confidence": "high",
+      "evidence": "index.mjs:2559-2565:\nconst raw = JSON.stringify({\n  v: GRAPHQL_QUERY_VERSION,\n  totalCount,\n  incomplete,\n  hasNextPage: merged.hasNextPage,\n  rows: merged.rows,\n});\n\nindex.mjs:10050-10052:\npreviousRaw: previous?.raw ?? null,\nraw: result.raw,\nparse: result.parse,\n\nindex.mjs:14558:\nconst content = JSON.stringify(rows);\n\nindex.mjs:14568:\nraw: content,\n\nindex.mjs:17180:\nif (previousRaw === raw) return { kind: \"unchanged\", completedAt };\n\nindex.mjs:10068:\nstate.unchangedCount = advanceUnchangedCount(state.unchangedCount ?? 0, transition.kind);",
+      "priority": "high",
+      "risk": "Comparing only rows would miss changes to completeness, pagination and Security coverage. Preserve those semantics in the comparison identity. Any persisted representation change must remain compatible with acquisition-store version fencing; it must not alter quota authority or replay cached budget headers.",
+      "expected_gain": "Restore the intended collector quiet cadence for Issues and PRs. At a 5-second floor, excluding fetch/admission time and initial warm-up, each distinct active query falls from up to 720 requests/spawns per hour to 120, saving up to 600 requests/spawns and 1,200 declared GraphQL points/hour. Webhook-covered quiet queries can reach 12 checks/hour instead, saving up to 708 requests and 1,416 declared points/hour. Actual point savings depend on response-reported cost. Followers do not multiply these figures.",
+      "locations": [
+        {
+          "line_start": 2554,
+          "path": "index.mjs",
+          "line_end": 2567
+        },
+        {
+          "line_start": 10047,
+          "path": "index.mjs",
+          "line_end": 10086
+        },
+        {
+          "line_start": 14543,
+          "path": "index.mjs",
+          "line_end": 14579
+        },
+        {
+          "line_start": 9198,
+          "path": "index.mjs",
+          "line_end": 9203
+        }
+      ],
+      "proposal": "Make collectorPublicationFromResult() and normalizeAcquisitionSnapshot() use the same validated semantic comparison representation. Include rendered rows, pagination/completeness and coverage notes rather than comparing a fetcher's envelope against a row array. Preserve that representation or its digest across publication/reload. Verify repeated identical Issues/PR responses produce two unchanged observations and then enter both ordinary quiet cadence and webhook reconciliation cadence.",
+      "effort": "medium",
+      "title": "Collector GraphQL snapshots cannot accumulate unchanged observations",
+      "already_documented": "README.md:861-876 and ADR 0003, “Adaptive demand and bounded admission waits” (docs/decisions/0003-file-backed-api-coordination.md:308-322), require two unchanged observations before slowing down. ADR 0005:74-78 additionally requires quiet webhook reconciliation. The comparison formats prevent the collector's Issues/PR path from implementing those decisions.",
+      "current_behavior": "fetchGraphqlList() returns a JSON envelope containing version, counts, completeness and rows. Acquisition normalization replaces snapshot.raw with JSON.stringify(rows). The next collector refresh compares the envelope against that row array, so even identical responses are classified as changed and reset unchangedCount to zero. Active collector Issues/PRs consequently remain at the floor instead of reaching 30 seconds; webhook coverage cannot extend them to 300 seconds. Each first-page refresh launches one gh process with a conservative two-point GraphQL reservation."
+    },
+    {
+      "id": "RT-02",
+      "kind": "defect",
+      "confidence": "high",
+      "evidence": "index.mjs:20155-20161:\nif (verdict === \"rate-limited\") {\n  const snapshot = inspectGovernor(scope, Date.now());\n  const costs = tabRequestCost(key);\n  const blocks = [];\n  for (const resource of RATE_RESOURCES) {\n    if (costs[resource] <= 0) continue;\n    const resourceResetMs = snapshot.value?.budgets?.[resource]?.resetMs;\n\nindex.mjs:20710:\n(name, resetMs) => recordResourceBlock(currentScope, name, resetMs, \"rate-limit\"),\n\nindex.mjs:4081-4083:\nif (transport.throttle?.paused) {\n  return { ok: false, reason: \"throttle-paused\", retryAt: transport.cooldownUntil };\n}\n\nindex.mjs:4277-4283:\nfunction retryThrottledTransport(root, host, { now = Date.now } = {}) {\n  return withIdentityRegistry(root, (state) => {\n    const transport = state.hosts[host];\n    if (!transport?.throttle?.paused) return { ok: true, value: { resumed: false } };\n    transport.throttle = emptyTransportThrottle();\n    transport.cooldownUntil = Math.min(transport.cooldownUntil, now());\n    return { ok: true, value: { resumed: true } };\n\nindex.mjs:16363:\n\"throttle-paused\": [\"Repeated GitHub request limit\", \"Press r to retry after checking the hold\", \"Limit; press r\"],",
+      "priority": "high",
+      "risk": "Recovery must not shorten a server-supplied Retry-After, erase uncertain receipts, or allow simultaneous recovery probes from multiple panes. The existing retryThrottledTransport() helper itself shortens cooldownUntil, so merely wiring it to r would violate the documented hold contract. The host-wide transport circuit affects both standalone panes and collectors.",
+      "expected_gain": "Remove unnecessary waits until the primary reset after short secondary throttles: for a 60-second secondary hold with 50 minutes remaining in the primary window, avoid approximately 49 minutes of additional source staleness. Restore a finite recovery route after the fifth consecutive throttle instead of requiring process-external state intervention. Any resumed API work remains normally admitted and justified by the existing refresh policy.",
+      "locations": [
+        {
+          "line_start": 4158,
+          "path": "index.mjs",
+          "line_end": 4188
+        },
+        {
+          "line_start": 4234,
+          "path": "index.mjs",
+          "line_end": 4285
+        },
+        {
+          "line_start": 19982,
+          "path": "index.mjs",
+          "line_end": 19990
+        },
+        {
+          "line_start": 20155,
+          "path": "index.mjs",
+          "line_end": 20175
+        },
+        {
+          "line_start": 20707,
+          "path": "index.mjs",
+          "line_end": 20711
+        }
+      ],
+      "proposal": "Propagate classifyThrottle()'s structured result through fetchAlertSource()/fetchSecurity() and App.commit(). Publish a primary resource block only for primary exhaustion; leave secondary deadlines under the shared transport policy. Wire a single, durable manual/reset recovery election into the standalone refresh/control paths and collector refresh paths. Change retryThrottledTransport() so recovery cannot start before an outstanding server deadline. Exercise five throttles followed by both r and a primary reset.",
+      "effort": "medium",
+      "title": "Secondary throttles still become hourly blocks, and the paused circuit has no runtime recovery caller",
+      "already_documented": "ADR 0003:257-274 explicitly distinguishes primary exhaustion from secondary throttling, preserves Retry-After and promises manual/reset circuit recovery. The durable-freshness plan's stuck-state table, docs/plans/2026-09-28-durable-freshness-and-recovery.md:115-116, repeats that requirement. The transport classifier implements part of it, but standalone tab failures still publish sampled primary-reset blocks. retryThrottledTransport() is defined and exported but has no production invocation in the supplied module.",
+      "current_behavior": "runGh() correctly records a secondary transport cooldown, but App.commit() also handles every textual rate-limit verdict by blocking the tab's resource until its sampled primary reset. Security's rateLimited result takes the same path. Separately, five consecutive secondary throttles set paused=true; acquireIdentityHttpPermit() then refuses all requests, including observers. Neither ordinary/manual refresh nor reset handling invokes the circuit-reset helper, so a successful request cannot occur to clear the ladder. The UI nevertheless asks the user to press r."
+    },
+    {
+      "id": "RT-03",
+      "kind": "defect",
+      "confidence": "high",
+      "evidence": "index.mjs:6515-6523:\n// Any live observer claim defers a start: the claim owns the shared HTTP\n// permit for its window, so starting here would contend for it.\nconst liveClaim = RATE_RESOURCES\n  .map((resource) => state.probeClaims[resource])\n  .filter((claim) => claim && claim.leaseUntil > at)\n  .sort((left, right) => right.leaseUntil - left.leaseUntil)[0];\nif (liveClaim) {\n  return { value: { status: \"waiting\", reason: \"probe\", notBefore: liveClaim.leaseUntil } };\n}\n\nindex.mjs:3338-3340:\nconst HTTP_START_GAP_MS = 250;\nconst HTTP_MAX_WAITERS = 128;\nconst HTTP_MAX_PERMITS = 3;\n\nindex.mjs:6026-6028:\n.filter(([, reservation]) => reservation.status === \"started\" &&\n  state.leases[reservation.leaseId]?.expiresAt > at &&\n  reservationCost(reservation, resource, state.leases, at) > 0)\n\nindex.mjs:4364:\nconst GOVERNOR_PROBE_DRAIN_MS = 30_000;\n\nindex.mjs:178:\nconst GH_TIMEOUT_MS = 30_000;",
+      "priority": "high",
+      "risk": "Keep the observer's same-resource accounting/drain boundary intact. Preserve shared FIFO permits, 250 ms start spacing, host-wide secondary holds and the deliberate core-reset/GraphQL reconciliation ordering. Do not remove observer checks globally or make stale budgets admissible.",
+      "expected_gain": "Healthy Actions/Security need not wait for an unrelated slow GraphQL observer, and vice versa. A single slow observer subprocess can currently contribute 30 seconds of unrelated delay; its drain phase can add another 30 seconds before transport and settlement overhead. Removing this avoidable barrier makes a 5-second CI policy materially more meaningful without adding an operation or changing its cost.",
+      "locations": [
+        {
+          "line_start": 6506,
+          "path": "index.mjs",
+          "line_end": 6529
+        },
+        {
+          "line_start": 5976,
+          "path": "index.mjs",
+          "line_end": 6029
+        },
+        {
+          "line_start": 7073,
+          "path": "index.mjs",
+          "line_end": 7088
+        },
+        {
+          "line_start": 3338,
+          "path": "index.mjs",
+          "line_end": 3344
+        }
+      ],
+      "proposal": "In startReservation(), consider live probe claims only for resources charged by that reservation. Leave transport concurrency to acquireIdentityHttpPermit(). Initially scope this change to ordinary warm-budget admission, preserving the explicit startup/reset choreography. Add a scenario with a stalled GraphQL observer and a fresh, affordable core budget, asserting continued Actions publications.",
+      "effort": "medium",
+      "title": "An observer for either resource still blocks starts on both resources",
+      "already_documented": "ADR 0003, “Per-resource observers and secondary throttles” (docs/decisions/0003-file-backed-api-coordination.md:231-255), says a slow observer must not hold up the other resource. The durable-freshness plan requires the same in F07 at line 94. The remaining global guard contradicts that decision. Its stated single-permit rationale no longer holds: the code has three permits, acquired per actual request, and already drains only reservations charging the observed resource.",
+      "current_behavior": "startReservation() scans both probeClaims without filtering by reservation.costs. Thus a core-only Actions refresh waits behind a GraphQL claim even when core authority is fresh and capacity is available. Claim ownership includes draining outstanding work and observer execution, not merely occupying a transport slot. This is additional staleness beyond the configured poll interval and normal quota pacing."
+    },
+    {
+      "id": "RT-04",
+      "kind": "defect",
+      "confidence": "high",
+      "evidence": "index.mjs:7776-7777:\nlet measuredAt = monotonicNow();\nconst current = () => lowerBound + Math.max(0, monotonicNow() - measuredAt);\n\nindex.mjs:18884-18887:\nconst collectorAge = collectorSourceAgeRef.current[tab.key];\nconst sourceAgeMs = collectorAge\n  ? collectorAge.ageMs + Math.max(0, performance.now() - collectorAge.measuredAt)\n  : null;\n\nindex.mjs:13038-13039:\nconst started = new Date(item.startedAt);\nconst finished = item.status === \"completed\" ? new Date(item.updatedAt) : now;\n\nindex.mjs:21978-21986:\n// A settled on-demand view has no data wake to advance its visible age.\n// Tick only its display clock; source timestamps and acquisition stay idle.\nconst showCachedAge = semanticStatus.kind === \"cached\" && staleFor !== null;\nuseEffect(() => {\n  if (!showCachedAge) return;\n  setNow(new Date());\n  const timer = setInterval(() => setNow(new Date()), 1000);\n  return () => clearInterval(timer);\n}, [showCachedAge]);\n\nindex.mjs:7463-7465:\n// capped ladder exists to prevent. Staleness deliberately stays on Date.now()\n// for the mirror-image reason: a sleep gap is the thing it reports, and\n// performance.now() does not advance across suspend.",
+      "priority": "high",
+      "risk": "Do not compare remote source timestamps directly with an unsynchronized client wall clock. Preserve a nondecreasing age for the same observation across clock rollback and reconnect. Avoid introducing permanent second-by-second idle redraws or any GitHub calls from a collector client.",
+      "expected_gain": "A disconnected quiet local collector view will visibly age instead of freezing indefinitely. Running CI elapsed time will advance in collector mode. On platforms where the monotonic clock excludes suspend, a one-hour sleep will add the missing hour to source age. Idle clock work can remain approximately 60 wakes/hour; visible running-time updates can reuse spinner wakes or a bounded one-second timer.",
+      "locations": [
+        {
+          "line_start": 7770,
+          "path": "index.mjs",
+          "line_end": 7794
+        },
+        {
+          "line_start": 18884,
+          "path": "index.mjs",
+          "line_end": 18900
+        },
+        {
+          "line_start": 20357,
+          "path": "index.mjs",
+          "line_end": 20448
+        },
+        {
+          "line_start": 21978,
+          "path": "index.mjs",
+          "line_end": 21986
+        },
+        {
+          "line_start": 13036,
+          "path": "index.mjs",
+          "line_end": 13059
+        }
+      ],
+      "proposal": "Give App a display-only clock independent of standalone acquisition and collector connectivity. Advance it coarsely while settled/disconnected and at the needed resolution for visible running durations. In createCollectorSourceAgeTracker() and the App-side age projection, account for suspension using a nondecreasing combination of monotonic elapsed time and positive local wall-clock elapsed time since the last checkpoint. Never advance lastSuccessAt from this clock.",
+      "effort": "medium",
+      "title": "Collector display clocks freeze during idle disconnects and omit suspend time",
+      "already_documented": "ADR 0005:51-56 and README.md:613-618 promise conservative source age across reconnect and clock skew. The durable-freshness plan D6 and stuck-state table require honest ages after sleep. The collector branch returns before the standalone liveness/control timers are installed; the only general display-age timer is restricted to the Cached status. This does not fulfill those reporting guarantees.",
+      "current_behavior": "Collector snapshot receipt updates age refs but not App's now state. Spinner frames update frame only, so unfinished Actions TIME uses a frozen now value in a collector session unless another feature happens to update it. After a quiet local connection closes, there may be no further state update: repeated failed local reconnects do not call onReady(false) again. The displayed age/stale decision can therefore remain frozen. Independently, both collector age calculations use only performance.now() elapsed time during the session, omitting sleep on platforms described by the code's own suspend warning."
+    },
+    {
+      "id": "RT-05",
+      "kind": "defect",
+      "confidence": "high",
+      "evidence": "index.mjs:11004:\nif (!item || frame.serverEpoch !== serverEpoch || snapshot.generation <= item.generation) return;\n\nindex.mjs:11011-11015:\nif (!ready) {\n  ready = true;\n  reconnectAttempt = 0;\n  onReady(true);\n}\n\nindex.mjs:11035-11038:\nif (resetGenerations) {\n  item.generation = -1;\n  item.controlGeneration = -1;\n}\n\nindex.mjs:11058-11063:\nconst epochChanged = serverEpoch !== frame.serverEpoch;\nif (epochChanged) assembler.reset();\nserverEpoch = frame.serverEpoch;\nwelcomed = true;\nready = false;\nresubscribe(epochChanged);\n\nindex.mjs:10480:\nif (!demandEnabled(item.demand) && item.requestedAt === null) return null;",
+      "priority": "medium",
+      "risk": "Equal-generation replay must confirm transport availability without becoming a new source observation, clearing a newer source failure, or rolling back semantic holds. Continue rejecting older generations and old server epochs. Preserve zero client-side GitHub acquisition.",
+      "expected_gain": "Restore connected status after a validated cached snapshot on the first successful reconnect, rather than waiting for the next source refresh. This avoids waits of a quiet/reconciliation interval and removes the indefinite Disconnected state when all subscriptions are intentionally dormant. No additional GitHub request or gh spawn is needed.",
+      "locations": [
+        {
+          "line_start": 10998,
+          "path": "index.mjs",
+          "line_end": 11020
+        },
+        {
+          "line_start": 11033,
+          "path": "index.mjs",
+          "line_end": 11064
+        },
+        {
+          "line_start": 11106,
+          "path": "index.mjs",
+          "line_end": 11120
+        },
+        {
+          "line_start": 20362,
+          "path": "index.mjs",
+          "line_end": 20381
+        }
+      ],
+      "proposal": "Separate connection readiness from source-generation advancement in createCollectorProtocolClient(). A validated equal-generation snapshot from the current epoch should acknowledge the recovered connection and update the conservative age bound without republishing it as new source success. Test reconnect to the same running collector while a default on-demand secondary tab is selected and every subscription has active=false/background=false.",
+      "effort": "small",
+      "title": "Same-epoch reconnect can remain Disconnected until a new GitHub observation",
+      "already_documented": "ADR 0005:35-36 and 51-56 require epoch/generation fencing and reconnection without manufactured freshness. README.md:609-618 describes disconnected recovery. Keeping source generation monotonic is correct, but connection recovery should not require that generation to increase.",
+      "current_behavior": "Disconnect resets ready but retains per-subscription generations. Reconnecting to the same collector epoch retains those generations again. The server's current cached snapshot is rejected by the <= generation guard before ready can become true. With active polling this delays recovery until a later publication. With default on-demand secondary views, all demands can be disabled and no publication is scheduled, so the UI remains Disconnected indefinitely despite a working socket."
+    },
+    {
+      "id": "RT-06",
+      "kind": "defect",
+      "confidence": "high",
+      "evidence": "index.mjs:20303-20307:\nfor (const entity of snapshot.entities ?? []) {\n  entityRef.current.set(entity.key, { etag: entity.etag, body: entity.body });\n}\nconst sameRows = JSON.stringify(dataRef.current[key]) === JSON.stringify(snapshot.rows);\nif (!sameRows) setData((current) => ({ ...current, [key]: snapshot.rows }));\n\nindex.mjs:20601:\npreviousRaw: rawRef.current[key] ?? null,\n\nindex.mjs:17180:\nif (previousRaw === raw) return { kind: \"unchanged\", completedAt };\n\nindex.mjs:20491-20492:\nconst rows = transition.kind === \"changed\" ? transition.data : dataRef.current[key];\nconst meta = transition.kind === \"changed\" ? transition.meta : metaRef.current[key];\n\nindex.mjs:20106:\nrawRef.current[key] = transition.nextRaw;",
+      "priority": "high",
+      "risk": "Do not fix this by copying snapshot.raw blindly: RT-01 identifies its incompatible row-array format. The comparison identity must describe the adopted rows and completeness metadata, and validators must remain paired with their bodies. Preserve publication fencing and access partitions; no independent follower requests are necessary.",
+      "expected_gain": "Prevent indefinitely displaying the wrong rows while advancing last-success time and installing a validator for a different representation. Correctness is restored on the next ordinary admitted observation or shared publication, with zero additional API consumption.",
+      "locations": [
+        {
+          "line_start": 20269,
+          "path": "index.mjs",
+          "line_end": 20329
+        },
+        {
+          "line_start": 20592,
+          "path": "index.mjs",
+          "line_end": 20602
+        },
+        {
+          "line_start": 17179,
+          "path": "index.mjs",
+          "line_end": 17208
+        },
+        {
+          "line_start": 20490,
+          "path": "index.mjs",
+          "line_end": 20507
+        }
+      ],
+      "proposal": "Make adoptAcquisitionSnapshot() update or invalidate the local comparison sentinel whenever it adopts a different semantic snapshot. Prefer the common validated comparison representation introduced for RT-01; alternatively invalidate rawRef for changed adopted content so the next response is actually parsed. Add a two-pane A→B→A scenario: pane A previously fetched A, adopts B from its peer, then receives A again. Assert that A is displayed and published, not B.",
+      "effort": "medium",
+      "title": "Shared adoption changes rows without changing the local unchanged-response sentinel",
+      "already_documented": "ADR 0004's shared acquisition amendment, docs/decisions/0004-quota-and-acquisition-identities.md:180-192, requires validated shared snapshots and distinguishes successful observations from changed representations. The conditional-polling plan:98-104 relies on the unchanged sentinel identifying the data already displayed. Cross-pane adoption currently breaks that premise.",
+      "current_behavior": "adoptAcquisitionSnapshot() adopts rows, metadata, timestamps and entities but leaves rawRef unchanged. A deterministic failure follows: this pane fetched representation A, a peer publishes B, then GitHub returns A again. The response equals this pane's old rawRef, so pollResultTransition() says unchanged and acquisitionPublication() publishes the currently displayed B rows. A new A validator can be committed alongside B rows; subsequent 304s keep B on screen while success time advances."
+    },
+    {
+      "id": "RT-07",
+      "kind": "defect",
+      "confidence": "high",
+      "evidence": "index.mjs:7299-7305:\nreturn {\n  raw: `backoff:${note}`,\n  completedCalls: 0,\n  httpRequests: 0,\n  rest200: 0,\n  rest304: 0,\n  verdict,\n\nindex.mjs:7309:\nparse: () => ({ alerts: [], note, verdict, truncated: false }),\n\nindex.mjs:7527:\nblind: parsed.some((p) => p.verdict != null && p.verdict !== \"ok\" && p.verdict !== \"unavailable\"),\n\nindex.mjs:10077:\nlastSuccessAt: completedAt,\n\nindex.mjs:20081-20082:\nif (transition.kind === \"unchanged\") {\n  lastOkRef.current[key] = completedAt;\n\nindex.mjs:194:\nconst BACKOFF_STEPS_MS = [60_000, 300_000, 1_800_000, 3_600_000];",
+      "priority": "medium",
+      "risk": "Keep explicitly unavailable capabilities distinct from authentication/network blindness, and continue allowing a genuinely checked accessible subset to report its own success. Do not force probes through capability backoff to obtain a timestamp. Zero-HTTP attempts and partially failed HTTP batches must also remain distinguishable for governor settlement.",
+      "expected_gain": "Stop manufacturing up to an hour of apparent Security freshness from cached capability notes. A manual r during backoff will no longer imply that GitHub was checked. Webhook work will not be acknowledged solely because a no-I/O generation was published. No extra requests are required; keep invalidation pending until an eligible API observation succeeds.",
+      "locations": [
+        {
+          "line_start": 7287,
+          "path": "index.mjs",
+          "line_end": 7311
+        },
+        {
+          "line_start": 7484,
+          "path": "index.mjs",
+          "line_end": 7529
+        },
+        {
+          "line_start": 10047,
+          "path": "index.mjs",
+          "line_end": 10095
+        },
+        {
+          "line_start": 10455,
+          "path": "index.mjs",
+          "line_end": 10462
+        },
+        {
+          "line_start": 20081,
+          "path": "index.mjs",
+          "line_end": 20101
+        }
+      ],
+      "proposal": "Have fetchSecurity() report whether at least one accessible source actually produced a validated 200/304 observation, separately from capability-note changes. Teach pollResultTransition(), collectorPublicationFromResult() and App.commit() to update capability presentation without advancing source-success time for an entirely skipped batch. Require genuine API observation evidence before resolving webhook invalidation waiters. Preserve the original capability-check timestamps.",
+      "effort": "medium",
+      "title": "Security capability-backoff replays are stamped as new source observations",
+      "already_documented": "The durable-freshness plan D6, docs/plans/2026-09-28-durable-freshness-and-recovery.md:74-78, permits successful observations of an accessible subset but explicitly forbids synthetic freshness. ADR 0005:74-76 requires webhook work to finish only after a newer API-validated generation. A batch containing only cached backoff notes satisfies neither condition.",
+      "current_behavior": "When all three alert sources are in unavailable backoff, fetchSecurity() can make zero HTTP requests. Unavailable is deliberately excluded from blind, so its replayed notes are accepted as changed or unchanged data and both standalone and collector paths stamp a new success time. Backoff can last 3,600 seconds. The collector also advances generation, which is sufficient for its invalidation waiters to resolve even though no API observation occurred."
+    }
+  ],
+  "summary": "Static review found seven high-leverage real-time reporting defects. The intended baseline is important: default on-demand mode continuously watches only selected Actions; Issues, PRs and Security may remain old indefinitely until opened/refreshed or updated by a matching subscriber. That is deliberate, not a polling defect. For automatically polled views, default earliest delays are 5 seconds for known running/queued CI, 30 seconds for quiet Actions/Issues/PRs, 60 seconds for quiet Security, and 120/300 seconds for inactive ordinary/Security tabs (index.mjs:15816-15836). These are normally scheduled after completion, not end-to-end latency guarantees. For an event arriving during a polling wait T, the wait component is 0–T, averaging T/2 under a uniform-arrival assumption; admission, transport, parsing/publication and rendering come afterward. New CI on a previously quiet repository therefore starts with the quiet detection window. Cross-process followers inspect every second; collector-local publications push immediately. Webhooks add a 1-second coalescing delay before ordinary governed acquisition, with intended quiet reconciliation at 300 seconds. No finite worst-case freshness bound exists during provider, authentication, quota or coordination holds. The findings below concern additional avoidable delay, stalled recovery, and false freshness—not a proposal to bypass those holds.",
+  "checked_sound": [
+    "Conditional REST is already implemented and should be retained, not proposed anew. ghApiArgs() adds \"If-None-Match\" (index.mjs:1003-1009); ghApi() recognizes status 304 even after gh exits unsuccessfully (1024-1032); fetchConditionalEntity() requires the paired body and drops an unusable validator (2067-2086). A 304 still costs one HTTP request and subprocess, but zero measured primary core units (2142-2149).",
+    "The configured floor and on-demand behavior are intentional. pollPolicyInterval() returns Infinity for unrequested secondary on-demand views (index.mjs:15825-15826), and README.md:849-859 explicitly says cached counts are last-known values. I would not restore continuous secondary polling by default.",
+    "Acquisition sharing has a sound ownership boundary: one query producer, durable nonce/generation fencing, no independent fallback, 1-second metadata inspection, 10-second heartbeats, and bounded 180-second unstarted/199-second started claims (index.mjs:14094-14111, 15560-15597). Publication precedes follower delivery (15363-15380). These deadlines are failure-recovery bounds, not healthy freshness targets.",
+    "Ordinary per-refresh costs are explicit: Actions normally uses one REST request; Issues/PRs use one 50-row GraphQL page with a two-point reservation, expanding only on demand; Security uses three base requests and at most three additional priority requests (index.mjs:1058-1065, 2465-2525, 2677-2685). Combining tabs would reinstate the completion barrier rejected by ADR 0001.",
+    "Webhook invalidation is already an appropriate opt-in event-driven alternative. Signatures are verified before parsing and 202 follows durable queue acceptance (index.mjs:9124-9145). Events request normal governed acquisition rather than becoming rows. Running Actions are excluded from the slower webhook reconciliation interval (9198-9202). Duplicate delivery IDs and queued invalidations are coalesced (8856-8884).",
+    "Last-good retention during blind Security results is deliberate and appropriate: pollResultTransition() returns a blind transition (index.mjs:17189-17195), and App.commit() keeps rows and source time while exposing notes and blindness (20040-20055). Partial-source progress should not be introduced by pretending the whole Security observation succeeded.",
+    "Quota safety remains separate from freshness: start-time affordability checks retain the reserve (index.mjs:6530-6548), and only measured savings return pacing credit (6857-6864). Cached observations and faster UI clocks must never authorize requests or retire uncertain charges."
+  ],
+  "unresolved": [
+    "No tests or live measurements were executed for this review. What are change-to-display p50/p95/max values for this exact candidate on personal GitHub and EMU, including real workflow transitions, PR reviews and alert creation? The supplied durable-freshness plan explicitly requires separate live qualification; its specification and historical measurements are not evidence that this commit meets it.",
+    "A silent post-handshake SSH black hole has no application liveness deadline in createCollectorProtocolClient(); its timer is cleared on welcome (index.mjs:11049-11064), and collectorSshArgv() supplies no explicit server-alive settings (7752-7755). Is bounded disconnect detection expected independently of the user's SSH configuration? If so, add a protocol heartbeat/watchdog rather than treating absence of a new source generation as transport failure.",
+    "Newer standalone peer snapshots update source time and rows in adoptAcquisitionSnapshot() but do not clear local fetch errors or source recovery causes (index.mjs:20269-20345), unlike the collector callback at 20401-20419. Should a demonstrably newer same-access successful observation clear the corresponding older local failure? This deserves a focused two-pane recovery test alongside RT-06.",
+    "The pack does not establish events-endpoint coverage, delivery latency or safe polling intervals, so it does not justify replacing endpoint polling with an Events API gate. A separate events poll every T seconds would add 3600/T HTTP requests and gh spawns per canonical repository-hour—120/hour at 30 seconds—before triggered data refreshes. Likewise, gh api --cache is absent from ghApiArgs() (index.mjs:1003-1009); any experiment must distinguish local cache hits from new source observations and must not replay cached quota headers as fresh authority. Existing conditional endpoint polling and optional webhooks are the better-supported baseline.",
+    "README.md:776-779 promises roughly 30-second SAML recovery, but AUTH_RETRY_MS is only retry eligibility. Quiet Security, inactive tabs, on-demand policy and governor holds can make actual recovery later. Should documentation state those conditions and expose per-source retry eligibility rather than implying a universal 30-second end-to-end bound?"
+  ]
+}
