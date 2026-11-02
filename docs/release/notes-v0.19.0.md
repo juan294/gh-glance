@@ -15,15 +15,16 @@ GitHub's own platform status.
   source notes, refreshes and the moment each cause cleared, with repeats
   counted. It starts with earlier recovery transitions from the shared journal,
   dimmed, and keeps the latest 500 events in memory. `5` opens it, `1`-`4` or
-  `Esc` return, and Tab and the arrow keys cycle through all five sections.
+  `Esc` return, Tab and Left/Right cycle through all five sections, and Up/Down
+  scroll the list.
 - **Unread badge.** The tab shows how many waits and problems arrived since you
   last opened it: red when any is a problem or needs action, yellow when all are
   waits. Routine refreshes never change it, so an idle pane still redraws
   nothing.
 - **GitHub platform status.** The first row of the view reads
-  `https://www.githubstatus.com/api/v2/summary.json` every 10 minutes, when you
-  open the view, on `r` in the view and when a tab starts failing (at most once
-  a minute). It spends no GitHub API quota. Incidents and outages for API
+  `https://www.githubstatus.com/api/v2/summary.json` every 10 minutes (15 after
+  a failure), when you open the view, on `r` in the view and when a tab starts
+  failing (at most once a minute). It spends no GitHub API quota. Incidents and outages for API
   Requests, Actions, Issues, Pull Requests, Git Operations or Webhooks are
   problems and keep the badge red until they resolve; an incident posted
   without a component is a problem only when its name names something the
