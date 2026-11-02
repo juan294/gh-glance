@@ -17343,6 +17343,9 @@ const GITHUB_STATUS_MIN_GAP_MS = 60_000;
 const GITHUB_STATUS_COMPONENTS = Object.freeze(["API Requests", "Actions", "Issues", "Pull Requests",
   "Git Operations", "Webhooks"]);
 const GITHUB_STATUS_ENV = "GH_GLANCE_GITHUB_STATUS";
+// Words in an untagged incident's name that point at a surface this dashboard
+// shows. A generic "GitHub services" disruption may touch any of them.
+const GITHUB_STATUS_RELEVANT_NAME = /\b(?:actions?|runners?|issues?|pull requests?|prs?|requests?|webhooks?|git|api|repos?|repositor(?:y|ies)|dependabot|code scanning|secret scanning|security|github services)\b/i;
 
 function githubStatusConfig(env = process.env, host = null) {
   const raw = env[GITHUB_STATUS_ENV];
@@ -17396,18 +17399,27 @@ function parseGitHubStatus(body) {
       const status = text(component.status, "unknown");
       return { name: component.name, status, label: GITHUB_COMPONENT_STATUS[status] ?? status };
     });
-  // An incident that names components but none of the tracked ones is about a
-  // product this dashboard does not show. One without component data is kept.
-  const incidents = (body.incidents ?? []).filter((incident) => isRecord(incident) && (
-    !Array.isArray(incident.components) || incident.components.length === 0 ||
-      incident.components.some((component) => GITHUB_STATUS_COMPONENTS.includes(component?.name))))
-    .map((incident, index) => ({
+  // An incident tagged with components, none of them tracked, is about a
+  // product this dashboard does not show and is dropped. About a third of
+  // GitHub's incidents carry no tag (often the first post); those are kept, and
+  // count as relevant only when the name names something this dashboard shows.
+  const incidents = [];
+  for (const [index, incident] of (body.incidents ?? []).entries()) {
+    if (!isRecord(incident)) continue;
+    const tagged = Array.isArray(incident.components) && incident.components.length > 0;
+    const tracked = tagged && incident.components.some((component) =>
+      GITHUB_STATUS_COMPONENTS.includes(component?.name));
+    if (tagged && !tracked) continue;
+    const name = text(incident.name, "Unnamed incident");
+    incidents.push({
       id: text(incident.id, `incident-${index}`),
-      name: text(incident.name, "Unnamed incident"),
+      name,
       status: text(incident.status, "unknown"),
       impact: text(incident.impact, "unknown"),
       updatedAt: text(incident.updated_at, null),
-    }));
+      relevant: tracked || GITHUB_STATUS_RELEVANT_NAME.test(name),
+    });
+  }
   return { components, incidents };
 }
 
@@ -17442,7 +17454,9 @@ function githubStatusLine(state, nowMs = Date.now()) {
       : "GitHub status unavailable";
   }
   if (!state.summary) return "GitHub status: not checked yet";
-  const { incidents, components } = state.summary;
+  const { components } = state.summary;
+  const incidents = state.summary.incidents.filter((incident) => incident.relevant !== false);
+  const others = state.summary.incidents.length - incidents.length;
   if (incidents.length > 0) {
     const more = incidents.length > 1 ? ` (+${incidents.length - 1} more)` : "";
     return `GitHub incident: ${incidents[0].name}${more}`;
@@ -17450,6 +17464,9 @@ function githubStatusLine(state, nowMs = Date.now()) {
   const degraded = components.filter((component) => component.status !== "operational");
   if (degraded.length > 0) {
     return `GitHub: ${degraded.map((component) => `${component.name} ${component.label}`).join(", ")}`;
+  }
+  if (others > 0) {
+    return `GitHub status: no incident affecting this dashboard (${others} ${others === 1 ? "other" : "others"})`;
   }
   return "GitHub status: All systems operational";
 }
@@ -17469,7 +17486,7 @@ function createGitHubStatusMonitor({ config, log, fetchImpl = globalThis.fetch, 
   let inFlight = null;
   let controller = null;
   let unavailable = false;
-  let open = new Map(); // log key -> text of each ongoing incident or outage
+  let open = new Map(); // log key -> { text, level } of each ongoing incident or outage
 
   function schedule(delay) {
     if (stopped) return;
@@ -17481,15 +17498,19 @@ function createGitHubStatusMonitor({ config, log, fetchImpl = globalThis.fetch, 
   }
 
   function apply(next, at) {
+    // An incident that may not touch this dashboard is listed as information:
+    // it neither turns the badge red nor counts as an outage.
     const conditions = new Map([
-      ...next.incidents.map((incident) => [`github:incident:${incident.id}`,
-        `${incident.name} (${incident.status}, ${incident.impact} impact)`]),
+      ...next.incidents.map((incident) => [`github:incident:${incident.id}`, {
+        text: `${incident.name} (${incident.status}, ${incident.impact} impact)`,
+        level: incident.relevant === false ? "info" : "problem" }]),
       ...next.components.filter((component) => component.status !== "operational")
-        .map((component) => [`github:component:${component.name}`, `${component.name}: ${component.label}`]),
+        .map((component) => [`github:component:${component.name}`,
+          { text: `${component.name}: ${component.label}`, level: "problem" }]),
     ]);
     // A changed text is an update of the same open entry, not a new one.
-    for (const [key, text] of conditions) {
-      if (open.get(key) !== text) log.record({ key, level: "problem", source: "GitHub status", text, at });
+    for (const [key, { text, level }] of conditions) {
+      if (open.get(key)?.text !== text) log.record({ key, level, source: "GitHub status", text, at });
     }
     for (const key of open.keys()) if (!conditions.has(key)) log.end(key, at);
     open = conditions;
@@ -17547,7 +17568,7 @@ function createGitHubStatusMonitor({ config, log, fetchImpl = globalThis.fetch, 
       timer = null;
     },
     current: () => ({ enabled: Boolean(config?.enabled), reason: config?.reason ?? null, summary,
-      unavailable, nextAt, outage: open.size > 0 }),
+      unavailable, nextAt, outage: [...open.values()].some((condition) => condition.level === "problem") }),
   };
 }
 

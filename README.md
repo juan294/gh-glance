@@ -344,9 +344,14 @@ The first row of the view is GitHub's own platform status, read from
 a failure), when you open the view, when you press `r` in it, and when a tab
 starts failing (at most once a minute). It is a plain HTTPS request with a
 validator, outside `gh` and the API governor, so it spends no GitHub API
-quota. Only incidents and outages that touch API Requests, Actions, Issues,
-Pull Requests, Git Operations or Webhooks are reported; each one is a problem
-in the list and keeps the badge red until it resolves. The check runs only
+quota. Incidents and outages that touch API Requests, Actions, Issues, Pull
+Requests, Git Operations or Webhooks are problems: each keeps the badge red
+until it resolves. About a third of GitHub's incidents are posted without a
+component; those count as problems when the name names something the
+dashboard shows (Actions, runners, requests, the API, Git, repositories,
+Dependabot, code or secret scanning, or "GitHub services"), and are listed as
+information otherwise, so a Copilot or billing incident never turns the badge
+red. Incidents tagged only with other products are not listed. The check runs only
 when the target host is `github.com` and is off with
 `GH_GLANCE_GITHUB_STATUS=off` (see [Configuration](#configuration)). The
 request uses Node's built-in `fetch`, which does not read `HTTPS_PROXY`; where

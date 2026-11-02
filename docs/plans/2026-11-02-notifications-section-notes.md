@@ -104,3 +104,9 @@ The first complete gate passed lint, syntax, `npm test` (1,099) and `npm run tes
 | Cache restart: `Paused 2m0s` | Exact seconds: the rows are aged two minutes before launch, and a badge render after the first second shows `2m1s`. Failed 1 of 3 runs at `28f4e28` too. Badge renders happen only when a new wait or problem arrives, never on routine refreshes. | Test now matches `Paused 2m\d+s` |
 | Notifications wait case header | Captures now default `GH_GLANCE_GITHUB_STATUS=off`, so the header says so | Test expectation updated |
 | Jev Focus 60/60/30 at 100 columns (and Jev Focus 40 in one rerun) | Did not reproduce: both passed in the next run of `test/pty/jev-focus.test.mjs` | Recorded as an unreproduced timing failure |
+
+### Post-merge: untagged GitHub incidents (2026-11-02)
+
+- **Found:** githubstatus.com's `incidents.json` (the last 50 real incidents) showed every field the parser reads, and that 6 of the latest 20 incidents carry no component tag. Phase 3 kept all untagged incidents as problems, so Copilot-only or billing incidents would have turned the badge red.
+- **Owner decision (2026-11-02):** untagged incidents are problems only when the name names a surface the dashboard shows (`GITHUB_STATUS_RELEVANT_NAME`: Actions, runners, issues, pull requests, requests, webhooks, Git, API, repositories, Dependabot, code or secret scanning, security, "GitHub services"); otherwise they are `info` entries, never an outage, and the header reads `GitHub status: no incident affecting this dashboard (N others)`. An unnamed untagged incident is `info`.
+- **Evidence:** of the 50 real incidents, 41 are kept (9 are tagged only with untracked products); the untagged ones split as listed in `test/github-status.test.mjs` `RECENT_INCIDENTS`. The 50-incident body is 274 KB (over the 256 KiB cap), but the live summary carries only unresolved incidents; the largest real incident was 23 KB.

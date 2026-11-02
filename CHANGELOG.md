@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Operations and Webhooks. It checks every 10 minutes, on opening the view, on
   `r` in the view and when a tab starts failing, spends no GitHub API quota,
   runs only for `github.com`, and is off with `GH_GLANCE_GITHUB_STATUS=off`.
+  An incident posted without a component is a problem only when its name
+  names something the dashboard shows; otherwise it is listed as information.
 
 ### Changed
 

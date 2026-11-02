@@ -96,9 +96,65 @@ test("fetchGitHubStatus: incidents touching tracked components, missing fields a
   assert.equal(unnamed.name, "Unnamed incident");
   const line = githubStatusLine({ enabled: true, summary: result.summary });
   assert.match(line, /^GitHub incident: Disruption with/);
-  assert.match(line, /\(\+1 more\)$/);
+  // An unnamed, untagged incident cannot be shown to touch this dashboard.
+  assert.equal(unnamed.relevant, false);
+  assert.doesNotMatch(line, /more\)$/);
   assert.equal(githubStatusLine({ enabled: true, summary: { incidents: [], components: result.summary.components } }),
     "GitHub: Actions partial outage, Issues degraded performance");
+});
+
+// Names and component tags of real incidents from githubstatus.com's
+// incidents.json (2026-10 to 2026-11). About a third carry no component tag.
+const RECENT_INCIDENTS = [
+  ["Incident with Dependabot", []],
+  ["Incident with Actions, Pages, and Webhooks", ["Webhooks", "Actions", "Pages"]],
+  ["Disruption with Copilot Cloud services", []],
+  ["Disruption with some Copilot services", ["Copilot"]],
+  ["Elevated 404s for GitHub App s2s tokens in git/API", []],
+  ["Disruption with Dependabot Alerts", []],
+  ["CCA Automations are delayed when starting an Automation", []],
+  ["[Retroactive] Actions workflow run logs delayed", []],
+  ["Disruption with some GitHub services", []],
+  ["Elevated request latency", []],
+  ["Intermittent failures in runner group and runner-related permissions pages", []],
+  ["Disruption with GitHub Billing", []],
+  ["Copilot Code Review is unable to complete reviews", []],
+].map(([name, components], index) => ({ id: `r${index}`, name, status: "investigating", impact: "minor",
+  updated_at: "2026-11-02T08:00:00Z", components: components.map((component) => ({ name: component })) }));
+
+test("fetchGitHubStatus: untagged incidents are relevant only when their name names a dashboard surface", async () => {
+  const result = await fetchGitHubStatus({ url: GITHUB_STATUS_URL,
+    fetchImpl: async () => response(200, summary({ incidents: RECENT_INCIDENTS })) });
+  assert.deepEqual(result.summary.incidents.map((incident) => [incident.name, incident.relevant]), [
+    ["Incident with Dependabot", true],
+    ["Incident with Actions, Pages, and Webhooks", true],
+    ["Disruption with Copilot Cloud services", false],
+    ["Elevated 404s for GitHub App s2s tokens in git/API", true],
+    ["Disruption with Dependabot Alerts", true],
+    ["CCA Automations are delayed when starting an Automation", false],
+    ["[Retroactive] Actions workflow run logs delayed", true],
+    ["Disruption with some GitHub services", true],
+    ["Elevated request latency", true],
+    ["Intermittent failures in runner group and runner-related permissions pages", true],
+    ["Disruption with GitHub Billing", false],
+    ["Copilot Code Review is unable to complete reviews", false],
+  ]);
+});
+
+test("monitor: an incident that does not touch this dashboard is information, not an outage", async () => {
+  const clock = fakeClock();
+  const unrelated = RECENT_INCIDENTS.filter((incident) => /Copilot Cloud|CCA/.test(incident.name));
+  const log = createNotificationLog({ now: clock.now });
+  const monitor = createGitHubStatusMonitor({ config: githubStatusConfig({}, null), log,
+    fetchImpl: async () => response(200, summary({ components: [], incidents: unrelated })),
+    now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+  await monitor.ready;
+  assert.equal(monitor.current().outage, false);
+  assert.deepEqual(log.list().map((entry) => entry.level), ["info", "info"]);
+  assert.equal(log.summary().tone, "none");
+  assert.equal(githubStatusLine(monitor.current()),
+    "GitHub status: no incident affecting this dashboard (2 others)");
+  monitor.stop();
 });
 
 test("fetchGitHubStatus: every failure is unavailable", async () => {
