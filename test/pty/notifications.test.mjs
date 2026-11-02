@@ -86,7 +86,8 @@ test("a wait cause leaves the table in place, colours the badge yellow and is li
   });
   const view = viewed.finalFrame.lines.join("\n");
   assert.match(view, /Notifications · /);
-  assert.match(view, /GitHub status: not checked yet/);
+  // Captures default the status check off; the header says so.
+  assert.match(view, /GitHub status checks off \(GH_GLANCE_GITHUB_STATUS\)/);
   assert.match(view, /(?:Core|Actions): Coordinating with your other panes/);
   assert.match(view, /Cleared: Coordinating with your other panes/);
   // Opening the view marks the events seen.

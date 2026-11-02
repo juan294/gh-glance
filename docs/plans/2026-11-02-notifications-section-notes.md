@@ -17,7 +17,7 @@
 
 ### Phase 2
 
-- **Tab bar tiers.** Plan: fall back to digit-only names, then truncate names. Chose three measured tiers: full names (margin 2) from 98 columns with the existing hysteresis, short names (margin 1, `Notices`), then digits with counts and no names (`[1(4)] 2(3) 3 4(0) 5(2)`, margin 1). Why: five short labels with margin 2 are 81 columns, so 80-column panes would have lost names; the digit tier fits 40 columns with counts.
+- **Tab bar tiers.** Plan: fall back to digit-only names, then truncate names. Chose measured tiers (two more were added after the final gate, see below): full names (margin 2) from 98 columns with the existing hysteresis, short names (margin 1, `Notices`), then digits with counts and no names (`[1(4)] 2(3) 3 4(0) 5(2)`, margin 1). Why: five short labels with margin 2 are 81 columns, so 80-column panes would have lost names; the digit tier fits 40 columns with counts.
 - **PTY harness tab-bar detection.** `test/pty/capture.mjs` recognized a dashboard frame only by `1:Act`. The digit tier has no names, so the pattern now also accepts a line with the five digits in order (unit test added in `test/pty/capture.test.mjs`).
 - **Esc in the view returns to the last data tab.** Plan was silent. Esc quits from ordinary navigation, but every other view (Focus, CI, attention) uses Esc for "back"; the view follows them.
 - **Data-tab keys are ignored in the view** (Enter, `/`, `s`, `g`, `w`, `d`, `a`). Why: they would act on a hidden tab.
@@ -92,3 +92,15 @@ Skipped: one shared clock formatter with `dashboardPresentation` (different day 
 Applied: one map of open GitHub conditions and one loop instead of two; the component status label stored once at parse time; `summary` and `unavailable` replace the mixed `result`; the 304 outcome no longer carries an unused validator; the App keeps the config in a ref and stores only `monitor.current()`; the header line is built only while the view is open.
 
 Skipped: Node `mock.timers` instead of the test's fake clock (the explicit clock awaits each check); a "sticky while open" log property instead of the outage override in App (one line in App is simpler than a new log concept); suppressing `onChange` after a 304 (one render per 10 minutes); sharing `readBoundedText` with the Jev reader (outside this plan).
+
+### Final gate findings (candidate `7a5f875`)
+
+The first complete gate passed lint, syntax, `npm test` (1,099) and `npm run test:efficiency` (9), and failed 5 of 265 PTY tests:
+
+| Test | Cause | Disposition |
+|---|---|---|
+| SET-06 storage recovery at 24x10 | Regression from Phase 2 (passes 2/2 at `7686e40`, fails at `28f4e28` and `7a5f875`): at 24 columns the digit tier plus a `(1)` badge is 25 cells in a 23-cell frame, so the bar overflowed. Before this change Ink truncated the four names. | Fixed: two more tiers, no gaps (`tight`) and bare digits that keep only the Notifications badge (`digits`); unit test at 33, 32, 23 and 19 columns |
+| Stale acquisition-busy at 24 columns (badge `5(n)`) | Same overflow | Fixed by the same tiers |
+| Cache restart: `Paused 2m0s` | Exact seconds: the rows are aged two minutes before launch, and a badge render after the first second shows `2m1s`. Failed 1 of 3 runs at `28f4e28` too. Badge renders happen only when a new wait or problem arrives, never on routine refreshes. | Test now matches `Paused 2m\d+s` |
+| Notifications wait case header | Captures now default `GH_GLANCE_GITHUB_STATUS=off`, so the header says so | Test expectation updated |
+| Jev Focus 60/60/30 at 100 columns (and Jev Focus 40 in one rerun) | Did not reproduce: both passed in the next run of `test/pty/jev-focus.test.mjs` | Recorded as an unreproduced timing failure |

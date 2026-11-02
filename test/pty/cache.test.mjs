@@ -141,10 +141,12 @@ test("same-target restart keeps cached Actions rows under a live rate-limit erro
   assert.match(screen, /5:Notices \(\d+\)/);
   // The restart keeps the request-limit cause; it is listed in Notifications.
   assert.match(screenOf(recoveredView), /(?:Core|Actions): GitHub request limit/);
-  assert.match(screen, /Paused 2m0s/);
+  // The rows were aged two minutes before launch; a badge render after the
+  // first second of the run legitimately advances the shown age.
+  assert.match(screen, /Paused 2m\d+s/);
   assert.match(screen, /ci: pin actions to commit/);
   assert.match(screen, /4 of 4/);
-  assert.match(screen, /‖ Paused 2m0s/);
+  assert.match(screen, /‖ Paused 2m\d+s/);
   assert.doesNotMatch(screen, /reset \S+/);
   const pausedAt = recovered.liveScreen.statusHistory.findLastIndex((line) => / Paused(?:\s|$)/.test(line));
   assert.ok(pausedAt >= 0, recovered.liveScreen.statusHistory.join(" -> "));

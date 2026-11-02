@@ -72,6 +72,19 @@ test("tabBarEntries: five entries fit one row with every digit at 120, 80, 60 an
   assert.deepEqual(narrow.map((entry) => entry.label), ["[1(30)]", " 2(12) ", " 3(5) ", " 4(0) ", " 5(3) "]);
 });
 
+test("tabBarEntries: narrow panes drop gaps, then counts, and never exceed the width", () => {
+  const busy = tabInputs({ counts: { actions: "30", issues: "12", prs: "5", security: "0" },
+    notifications: { unread: 12, tone: "red" } });
+  const tight = tabBarEntries({ ...busy, cols: 33, useShort: true });
+  assert.deepEqual(tight.map((entry) => entry.label), ["[1(30)]", " 2(12) ", " 3(5) ", " 4(0) ", " 5(12) "]);
+  assert.equal(tabBarWidth(tight), 33);
+  for (const cols of [32, 23, 19]) {
+    const entries = tabBarEntries({ ...busy, cols, useShort: true });
+    assert.ok(tabBarWidth(entries) <= cols, `${cols}: ${entries.map((entry) => entry.label).join("|")}`);
+    assert.deepEqual(entries.map((entry) => entry.label), ["[1]", " 2 ", " 3 ", " 4 ", " 5(12) "]);
+  }
+});
+
 test("tabBarEntries: badge tone and the active Notifications entry", () => {
   const [, , , , red] = tabBarEntries({ ...tabInputs({ notifications: { unread: 1, tone: "red" } }), cols: 120 });
   assert.equal(red.color, "redBright");

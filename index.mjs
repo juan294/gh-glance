@@ -17977,8 +17977,9 @@ function tabBarWidth(entries) {
 }
 
 // Four data sections plus Notifications on one row. The widest tier that fits
-// `cols` wins: full names, short names, then digits with counts only, so every
-// section key stays visible down to a 40-column pane.
+// `cols` wins: full names, short names, digits with counts, the same without
+// gaps, then bare digits that keep only the Notifications badge -- so every
+// section key stays visible, and the row never wraps, down to a ~20-column pane.
 function tabBarEntries({ cols, counts, brokenCI, firstLoad, failed, spin, useShort, activeIndex,
   notifications = { unread: 0, tone: "none" } }) {
   const sections = TABS.map((tab) => {
@@ -18001,21 +18002,22 @@ function tabBarEntries({ cols, counts, brokenCI, firstLoad, failed, spin, useSho
     quiet: tone !== "red" && tone !== "yellow" });
   const build = (tier) => sections.map((section, index) => {
     const active = index === activeIndex;
-    const body = tier === "compact" ? `${index + 1}${section.suffix.trimStart()}`
-      : `${index + 1}:${section[tier]}${section.suffix}`;
+    const named = tier === "full" || tier === "short";
+    const suffix = tier === "digits" && section.key !== "notifications" ? "" : section.suffix;
+    const body = named ? `${index + 1}:${section[tier]}${suffix}` : `${index + 1}${suffix.trimStart()}`;
     // Bold and inverse are both stripped at chalk level 0 (NO_COLOR, or a
     // dumb terminal), which left no indication at all of which tab was
     // selected. Brackets survive; the padding they replace keeps the width
     // identical, so the bar does not shift between the two modes.
     return { key: section.key, active, label: active ? `[${body}]` : ` ${body} `,
-      margin: index === sections.length - 1 ? 0 : tier === "full" ? 2 : 1,
+      margin: index === sections.length - 1 || tier === "tight" || tier === "digits" ? 0 : tier === "full" ? 2 : 1,
       color: section.color, dim: !active && section.quiet };
   });
-  for (const tier of useShort ? ["short"] : ["full", "short"]) {
+  for (const tier of [...useShort ? [] : ["full"], "short", "compact", "tight"]) {
     const entries = build(tier);
     if (tabBarWidth(entries) <= cols) return entries;
   }
-  return build("compact");
+  return build("digits");
 }
 
 function TabBar({ entries }) {
