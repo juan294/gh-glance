@@ -85,6 +85,15 @@ test("terminal replay preserves a compact dashboard and its guard row", () => {
   assert.deepEqual(parsed.liveScreen.statusHistory, ["⣾ Checking"]);
 });
 
+test("terminal replay recognizes the digit-only tab bar of a narrow pane", () => {
+  const raw = ALT_ENTER + SYNC_START + "[1(4)] 2(3) 3 4(0) 5(2)\r\nbody\r\n· Watching\r\n" + SYNC_END + ALT_EXIT;
+  const parsed = parseCapture(raw, { cols: 30, rows: 5 });
+  assert.equal(parsed.hasTabBar, true);
+  assert.deepEqual(parsed.liveScreen.statusHistory, ["· Watching"]);
+  // A table row of numbers is not a tab bar.
+  assert.equal(parseCapture(ALT_ENTER + "│ 1 2 3 4 5\r\n" + ALT_EXIT, { cols: 30, rows: 5 }).hasTabBar, false);
+});
+
 test("terminal replay applies incremental cursor updates without accumulating status lines", () => {
   const initial = "[1:Actions]\r\nbody\r\n⣾ Checking\r\n";
   const update =

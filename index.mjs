@@ -567,10 +567,12 @@ function unavailableRemedy(accounts, targetHost) {
   return candidate.length <= MAX_ERR_LENGTH ? candidate : VERDICT_REMEDY.unavailable;
 }
 
+const BUDGET_PAUSE_ERROR = /^API budget paused(?:\s|\()/i;
+
 function formatTabError(error, failureContext = null) {
   if (error == null) return null;
   if (error.kind === "text") return error.text;
-  if (/^API budget paused(?:\s|\()/i.test(error.raw ?? "")) {
+  if (BUDGET_PAUSE_ERROR.test(error.raw ?? "")) {
     return "GitHub checks are paused until the shared API budget allows them";
   }
   if (error.verdict === "other") return error.raw;
@@ -12360,6 +12362,7 @@ const { version } = JSON.parse(readFileSync(new URL("./package.json", import.met
 // this file already applies to argv vectors and to classify().
 const KEY_TABLE = [
   ["1 2 3 4", "Actions / Issues / Pull requests / Security"],
+  ["5", "Notifications: status history; Up / Down scroll, r checks GitHub status, Esc returns"],
   ["Left / Right", "Previous / next tab"],
   ["Tab / Shift+Tab", "Next / previous tab"],
   ["Up / Down, j / k", "Move the cursor between rows"],
@@ -12389,6 +12392,7 @@ const HELP_PRIORITY = [
   "Enter",
   "Up / Down, j / k",
   "1 2 3 4",
+  "5",
   "w",
   "?",
   "Left / Right",
@@ -12524,6 +12528,9 @@ Environment:
                             Minimum active-tab poll interval, ${MIN_REFRESH_SECONDS}-${MAX_REFRESH_SECONDS};
                             safe shared grants may run later
                             (--refresh takes precedence)
+  GH_GLANCE_GITHUB_STATUS=off
+                            Turn off the githubstatus.com check in
+                            Notifications (an http(s) URL replaces the endpoint)
   GH_GLANCE_ICONS=unicode   Unicode status glyphs and text row substitutes
   GH_GLANCE_ICONS=ascii     ASCII-only status and row icons
   GH_GLANCE_NO_ANIMATION=1  Stop motion; semantic status words remain
@@ -16632,10 +16639,14 @@ function cleanupQueueForResource(queue, resource) {
   return count;
 }
 
+function recoveryResourceLabel(resource) {
+  return resource === "graphql" ? "GraphQL" : resource === "core" ? "Core" : "GitHub";
+}
+
 function presentRecovery(cause, { nowMs = Date.now(), cols = 80, hasSnapshot } = {}) {
   if (!cause) return [];
   const width = Math.max(1, Number.isSafeInteger(cols) ? cols - 1 : 79);
-  const resource = cause.resource === "graphql" ? "GraphQL" : cause.resource === "core" ? "Core" : "GitHub";
+  const resource = recoveryResourceLabel(cause.resource);
   const age = hasSnapshot === false ? "Not checked yet"
     : Number.isFinite(cause.sourceAt) && cause.sourceAt <= nowMs
       ? `cached ${formatDuration(nowMs - cause.sourceAt)}`
@@ -16817,6 +16828,7 @@ function contextHelpPages({ view, target, tab, remoteSetup = false }, keys = key
     issues: "Issues shows open issues in the selected repository.",
     prs: "Pull requests shows open requests to merge changes into the selected repository.",
     security: "Security shows alerts returned by the checked sources; unavailable sources can hide alerts.",
+    notifications: "Notifications lists status events for this pane: waits, refreshes, failures and cleared causes.",
   };
   const title = remoteSetup ? "No GitHub remote found" : view.title;
   const action = remoteSetup ? "Close help with ?, then Enter to start gh repo create; or restart with gh-glance --repo owner/name."
@@ -16977,6 +16989,587 @@ function recordRecoveryTransition(scope, event) {
 
 function safeRecordRecoveryTransition(scope, event, write = recordRecoveryTransition) {
   try { return write(scope, event); } catch { return { ok: false, reason: "unavailable" }; }
+}
+
+// ---------- Notifications ----------
+
+// Only causes the user must act on, or that waiting cannot fix, earn rows above
+// a table. Everything else -- automatic retries, refreshes, cleared causes --
+// goes to the Notifications view, so an ordinary wait no longer pushes the
+// table down. Every RECOVERY_COPY key is listed explicitly: the unknown-code
+// fallback below would otherwise hide a new code nobody classified, and
+// test/notifications.test.mjs compares the two key sets.
+const NOTICE_ACTION_CODES = Object.freeze([
+  "unwritable", "corrupt", "capacity", "accounting-overflow", "reservations-invalid",
+  "external-factor-invalid", "pacing-invalid", "budget-resource", "legacy-unresolved",
+  "legacy-corrupt", "restart-required", "throttle-paused", "credential-unavailable",
+  "identity-unavailable", "disconnected", "app-auth", "auth-problem", "unavailable",
+  "backup-conflict", "version-mismatch", "unsafe-permissions", "disk-full",
+]);
+// `coordination` is the fallback copy for unmapped reasons (an external quota
+// drain among them), and `unknown-scope` is the startup login check; the real
+// storage and login failures have their own action codes above.
+const NOTICE_WAIT_CODES = Object.freeze([
+  "busy", "stale", "identity-busy", "transport-busy", "debt-journal-full", "migration-hold",
+  "identity-backoff", "identity-capacity", "budget-unknown", "budget-stale", "budget-future",
+  "probe-failed", "block-unpublished", "budget-reset", "reset", "priority", "rate-limit",
+  "rate-limited", "local-reserve", "reserve", "blocked", "secondary", "secondary-rate-limit",
+  "abuse-limit", "network-outage", "security-incomplete", "receipt-retry", "interrupted-request",
+  "request-queue", "acquisition-busy", "clock-recovery", "source-incomplete", "unknown-scope",
+  "coordination",
+]);
+const NOTICE_LEVELS = Object.freeze(Object.fromEntries([
+  ...NOTICE_ACTION_CODES.map((code) => [code, "action"]),
+  ...NOTICE_WAIT_CODES.map((code) => [code, "wait"]),
+]));
+const VERDICT_NOTICE_LEVELS = Object.freeze({
+  "auth-problem": "action", unavailable: "action", "no-remote": "action", "rate-limited": "wait",
+});
+const NOTIFICATION_LOG_MAX = 500;
+// Tabs whose requests draw on each rate resource; a cause on that resource
+// holds them up. The cost table is fixed, so this is computed once.
+const NOTICE_RESOURCE_TABS = Object.freeze(Object.fromEntries(RATE_RESOURCES.map((resource) =>
+  [resource, TAB_KEYS.filter((key) => tabRequestCost(key)?.[resource] > 0)])));
+const EARLIER_SESSION_SOURCE = "Earlier session";
+
+// When a governor hold says it will try again.
+function decisionRetryAt(decision) {
+  return decision?.retryAt ?? decision?.resetMs ?? decision?.notBefore ?? null;
+}
+
+function noticeLevel({ code = null, verdict = null } = {}) {
+  if (code != null) return Object.hasOwn(NOTICE_LEVELS, code) ? NOTICE_LEVELS[code] : "wait";
+  // Any other verdict is a failed refresh whose raw text is the best report.
+  if (verdict != null) return Object.hasOwn(VERDICT_NOTICE_LEVELS, verdict) ? VERDICT_NOTICE_LEVELS[verdict] : "problem";
+  return "info";
+}
+
+function fetchErrorLevel(error) {
+  if (!error) return null;
+  if (error.kind !== "fetch") return "problem";
+  // A shared-budget pause reaches the tab as an unclassified fetch error.
+  if (BUDGET_PAUSE_ERROR.test(error.raw ?? "")) return "wait";
+  return noticeLevel({ verdict: error.verdict });
+}
+
+// One bounded, in-memory history per pane. Entries hold sanitized display text
+// only. A repeat of the latest entry with the same key coalesces into a count
+// (an informational repeat only if no non-info entry from the same source, or
+// one affecting the same tab, came after it); an ended entry never reopens, so a recurring condition reads
+// as a new episode. An entry the bound already dropped cannot be ended, so its
+// "Cleared" line is silently skipped. Earlier-session history is context, not
+// news, so it never raises the badge.
+function createNotificationLog({ max = NOTIFICATION_LOG_MAX, now = Date.now } = {}) {
+  const entries = []; // oldest first
+  let nextId = 1;
+  let seenId = 0;
+  let truncated = false;
+  let cachedSummary = null;
+  let cachedList = null;
+  const changed = () => {
+    cachedSummary = null;
+    cachedList = null;
+  };
+  const timeOr = (value) => Number.isFinite(value) ? value : now();
+  function record({ key, level = "info", source = "", code = null, text = "", action = null,
+    at, lastAt, tabs = [] }) {
+    const firstAt = timeOr(at);
+    const latest = Number.isFinite(lastAt) ? Math.max(lastAt, firstAt) : firstAt;
+    const cleanSource = safe(source);
+    const cleanText = safe(text);
+    let index = -1;
+    for (let i = entries.length - 1; i >= 0; i -= 1) {
+      const entry = entries[i];
+      if (entry.key === key) {
+        if (entry.endedAt === null) index = i;
+        break;
+      }
+      // Only informational repeats (refreshes) are split by a later problem; a
+      // still-open condition recorded again is the same condition, updated.
+      if (level === "info" && entry.level !== "info" && (entry.source === cleanSource ||
+        entry.tabs.some((tab) => tabs.includes(tab)))) break;
+    }
+    if (index >= 0) {
+      const [entry] = entries.splice(index, 1);
+      // A refresh repeats; a changed open condition is the same occurrence.
+      if (level === "info") entry.count += 1;
+      entry.lastAt = Math.max(entry.lastAt, latest);
+      entry.text = cleanText;
+      entries.push(entry);
+    } else {
+      entries.push({ id: nextId, key, level, source: cleanSource, code,
+        text: cleanText, action: action == null ? null : safe(action),
+        firstAt, lastAt: latest, count: 1, endedAt: null, tabs: [...tabs] });
+      nextId += 1;
+      if (entries.length > max) {
+        entries.shift();
+        truncated = true;
+      }
+    }
+    changed();
+  }
+  function end(key, at) {
+    const entry = entries.findLast((candidate) => candidate.key === key);
+    if (!entry || entry.endedAt !== null) return false;
+    entry.endedAt = timeOr(at);
+    changed();
+    if (entry.level !== "info") {
+      record({ key: `${key}:cleared`, level: "info", source: entry.source,
+        text: `Cleared: ${entry.text}`, at: entry.endedAt, tabs: entry.tabs });
+    }
+    return true;
+  }
+  function summary() {
+    if (cachedSummary) return cachedSummary;
+    let unread = 0;
+    let red = false;
+    let yellow = false;
+    for (const entry of entries) {
+      if (entry.level === "info" || entry.source === EARLIER_SESSION_SOURCE || entry.id <= seenId) continue;
+      unread += 1;
+      if (entry.level === "wait") yellow = true;
+      else red = true;
+    }
+    cachedSummary = { unread, tone: red ? "red" : yellow ? "yellow" : "none", truncated, size: entries.length };
+    return cachedSummary;
+  }
+  return {
+    record,
+    end,
+    summary,
+    // Newest first. Shared between calls until the log changes; callers read only.
+    list: () => {
+      cachedList ??= entries.map((entry) => Object.freeze({ ...entry, tabs: Object.freeze([...entry.tabs]) })).reverse();
+      return cachedList;
+    },
+    markSeen: () => {
+      if (seenId === nextId - 1) return;
+      seenId = nextId - 1;
+      changed();
+    },
+    size: () => entries.length,
+  };
+}
+
+// Conditions present in one render's snapshot. The same cause reported by a
+// rate resource and by several tabs is one condition; the resource names it
+// when it has one, because that is where it lives.
+function notificationConditions(snapshot) {
+  const conditions = new Map();
+  // `tabs` names the sections a cause holds up, so a refresh of one of them
+  // after the cause never merges with a refresh from before it.
+  const cause = (reason, source, tabs, detail = null) => {
+    // Same normalization as recoveryCause: unknown reasons use the fallback copy.
+    const code = Object.hasOwn(RECOVERY_COPY, reason) ? reason : "coordination";
+    const [summary, action] = RECOVERY_COPY[code];
+    const key = `cause:${code}`;
+    const existing = conditions.get(key);
+    if (existing) {
+      for (const tab of tabs) if (!existing.tabs.includes(tab)) existing.tabs.push(tab);
+      return;
+    }
+    conditions.set(key, { key, level: noticeLevel({ code }), source, code,
+      text: detail?.summary ?? summary, action: detail?.action ?? action, tabs: [...tabs] });
+  };
+  for (const resource of RATE_RESOURCES) {
+    const recovery = snapshot?.recovery?.[resource];
+    if (recovery?.code) {
+      cause(recovery.code, recoveryResourceLabel(resource), NOTICE_RESOURCE_TABS[resource], recovery);
+    }
+  }
+  for (const tab of TABS) {
+    const state = snapshot?.tabs?.[tab.key];
+    if (!state) continue;
+    if (state.error) {
+      // A budget pause and a real failure share the `other` verdict; the level
+      // keeps them distinct so one never hides the other.
+      const level = fetchErrorLevel(state.error);
+      const key = `fetch:${tab.key}:${level}:${state.error.kind === "fetch" ? state.error.verdict : "text"}`;
+      conditions.set(key, { key, level, source: tab.label, code: null,
+        text: formatTabError(state.error, snapshot.failureContext ?? null) ?? "", action: null, tabs: [tab.key] });
+    }
+    if (state.failure) cause(state.failure, tab.label, [tab.key]);
+    if (state.paused) cause(state.paused, tab.label, [tab.key]);
+  }
+  for (const note of snapshot?.securityNotes ?? []) {
+    const text = safe(note);
+    const key = `security:${text}`;
+    conditions.set(key, { key, level: /not enabled/i.test(text) ? "info" : "wait",
+      source: "Security", code: null, text, action: null, tabs: ["security"] });
+  }
+  if (snapshot?.disconnected) {
+    cause(typeof snapshot.disconnected === "string" ? snapshot.disconnected : "disconnected",
+      "Connection", TAB_KEYS);
+  }
+  return conditions;
+}
+
+// Diff two render snapshots into log events. A condition must persist for the
+// same debounce the inline notice used, so startup and lock-contention blips
+// never become history; `pending` is when the earliest unconfirmed condition
+// becomes due, for the caller to re-check without waiting for another render.
+function diffNotificationSnapshots(previous, current, nowMs) {
+  const prior = previous?.conditions ?? new Map();
+  const conditions = new Map();
+  const begin = [];
+  const end = [];
+  let pending = null;
+  for (const [key, condition] of notificationConditions(current)) {
+    const before = prior.get(key);
+    const since = before?.since ?? nowMs;
+    const begun = Boolean(before?.begun) || nowMs - since >= COORDINATION_NOTICE_AFTER_MS;
+    if (begun && !before?.begun) begin.push({ ...condition, at: since });
+    if (!begun) {
+      const due = since + COORDINATION_NOTICE_AFTER_MS;
+      pending = pending === null ? due : Math.min(pending, due);
+    }
+    conditions.set(key, { since, begun });
+  }
+  for (const [key, before] of prior) if (before.begun && !conditions.has(key)) end.push(key);
+  const lastOk = {};
+  for (const tab of TABS) {
+    const before = previous?.lastOk?.[tab.key];
+    const value = current?.tabs?.[tab.key]?.lastOk;
+    if (!Number.isFinite(value)) {
+      if (Number.isFinite(before)) lastOk[tab.key] = before;
+      continue;
+    }
+    lastOk[tab.key] = value;
+    if (Number.isFinite(before) && value > before) {
+      begin.push({ key: `refreshed:${tab.key}`, level: "info", source: tab.label, code: null,
+        text: `Refreshed ${tab.label}`, action: null, at: value, tabs: [tab.key] });
+    }
+  }
+  return { state: { conditions, lastOk }, begin, end, pending };
+}
+
+// Read-only: earlier recovery transitions become dimmed context in a new pane.
+function seedNotificationsFromJournal(log, scope, read = readRecoveryTransitions) {
+  let journal;
+  try { journal = read(scope); } catch { journal = { status: "unavailable", entries: [] }; }
+  if (journal.status === "missing") return;
+  if (journal.status !== "healthy") {
+    log.record({ key: "journal:unavailable", level: "info", source: EARLIER_SESSION_SOURCE,
+      text: "Earlier recovery history unavailable; run gh-glance --doctor" });
+    return;
+  }
+  const open = {};
+  for (const entry of journal.entries) {
+    const key = `journal:${entry.resource}:${entry.code}`;
+    // The same cause re-journaled for a new origin or tab is one episode here.
+    if (open[entry.resource] === key) continue;
+    if (open[entry.resource]) {
+      log.end(open[entry.resource], entry.at);
+      open[entry.resource] = null;
+    }
+    if (entry.code === "clear") continue;
+    log.record({ key, level: noticeLevel({ code: entry.code }), source: EARLIER_SESSION_SOURCE,
+      code: entry.code, text: `${recoveryResourceLabel(entry.resource)}: ${entry.summary}`,
+      action: entry.action, at: entry.firstAt, lastAt: entry.at });
+    open[entry.resource] = key;
+  }
+}
+
+// The rows a visible table gives up: an action cause's recovery lines (after
+// the usual debounce) or an action fetch verdict's one-line remedy. Waits,
+// failed refreshes and history go to the Notifications view instead.
+function criticalInlineLines({ cause = null, showCause = false, tabError = null, displayError = "",
+  capacity = 0, nowMs = Date.now(), cols = 80, hasSnapshot } = {}) {
+  let lines = [];
+  let source = null;
+  if (showCause && cause && noticeLevel({ code: cause.code }) === "action") {
+    lines = presentRecovery(cause, { nowMs, cols, hasSnapshot });
+    source = "cause";
+  } else if (tabError && displayError && fetchErrorLevel(tabError) === "action") {
+    lines = [displayError];
+    source = "error";
+  }
+  if (capacity < 1 || lines.length === 0) return { lines: [], source: null };
+  // On a one-row pane the remedy outranks the summary.
+  return { lines: capacity === 1 && lines.length > 1 ? [lines[1]] : lines.slice(0, capacity), source };
+}
+
+// `today` is a toDateString() value, or a time on that day.
+function notificationTime(at, today) {
+  const date = new Date(at);
+  const pad = (value) => String(value).padStart(2, "0");
+  const day = date.toDateString() === (typeof today === "string" ? today : new Date(today).toDateString()) ? ""
+    : `${pad(date.getMonth() + 1)}-${pad(date.getDate())} `;
+  return `${day}${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+// The Notifications body: a GitHub status row, then events newest first. Open
+// waits show their live retry time (`liveRetry`, keyed by cause code) because
+// the time a condition began says nothing about when it will clear. Ended,
+// informational and earlier-session entries are dimmed.
+function notificationViewLines({ entries, statusLine, nowMs = Date.now(), capacity, offset = 0,
+  liveRetry = {}, profile = ICON_PROFILE === "ascii" ? "ascii" : "unicode" }) {
+  const glyphs = REFRESH_STATUS_GLYPHS[profile] ?? REFRESH_STATUS_GLYPHS.unicode;
+  const glyph = { action: glyphs.failed, problem: glyphs.failed, wait: glyphs.paused, info: glyphs.watching };
+  const today = new Date(nowMs).toDateString();
+  const rows = Math.max(1, capacity);
+  const listRows = Math.max(0, rows - 1);
+  const maxOffset = Math.max(0, entries.length - listRows);
+  const start = Math.min(Math.max(0, offset), maxOffset);
+  const lines = [{ text: statusLine, level: "status", dim: false }];
+  if (entries.length === 0) lines.push({ text: "No events yet", level: "info", dim: true });
+  for (const entry of entries.slice(start, start + listRows)) {
+    const open = entry.endedAt === null;
+    const retryAt = open && entry.code ? liveRetry[entry.code] : null;
+    const retry = Number.isFinite(retryAt) ? `; next ${statusInterval(retryAt, nowMs)}` : "";
+    const action = entry.level === "action" && entry.action ? `; ${entry.action}` : "";
+    const count = entry.count > 1 ? ` x${entry.count}` : "";
+    lines.push({
+      text: `${notificationTime(entry.lastAt, today)} ${glyph[entry.level] ?? glyph.info} ${entry.source}: ${entry.text}${action}${retry}${count}`,
+      level: entry.level,
+      dim: !open || entry.level === "info" || entry.source === EARLIER_SESSION_SOURCE,
+    });
+  }
+  return { lines: lines.slice(0, rows), offset: start, maxOffset, pageRows: Math.max(1, listRows) };
+}
+
+// ---------- GitHub platform status ----------
+
+// githubstatus.com is a separate public host: checking it spends no GitHub API
+// quota and never goes through `gh` or the governor. It describes github.com
+// only, so other hosts are not checked. All remote text is display text and
+// passes safe() before it reaches the log or the screen.
+const GITHUB_STATUS_URL = "https://www.githubstatus.com/api/v2/summary.json";
+const GITHUB_STATUS_MAX_BYTES = 256 * 1024;
+const GITHUB_STATUS_TIMEOUT_MS = 10_000;
+const GITHUB_STATUS_INTERVAL_MS = 10 * 60_000;
+const GITHUB_STATUS_BACKOFF_MS = 15 * 60_000;
+const GITHUB_STATUS_MIN_GAP_MS = 60_000;
+const GITHUB_STATUS_COMPONENTS = Object.freeze(["API Requests", "Actions", "Issues", "Pull Requests",
+  "Git Operations", "Webhooks"]);
+const GITHUB_STATUS_ENV = "GH_GLANCE_GITHUB_STATUS";
+// Words in an untagged incident's name that point at a surface this dashboard
+// shows. A generic "GitHub services" disruption may touch any of them.
+const GITHUB_STATUS_RELEVANT_NAME = /\b(?:actions?|runners?|issues?|pull requests?|prs?|requests?|webhooks?|git|api|repos?|repositor(?:y|ies)|dependabot|code scanning|secret scanning|security|github services)\b/i;
+
+function githubStatusConfig(env = process.env, host = null) {
+  const raw = env[GITHUB_STATUS_ENV];
+  const value = typeof raw === "string" ? raw.trim() : "";
+  if (/^(?:off|0)$/i.test(value)) {
+    return { enabled: false, url: null, reason: `GitHub status checks off (${GITHUB_STATUS_ENV})` };
+  }
+  let url = GITHUB_STATUS_URL;
+  if (value) {
+    let parsed = null;
+    try { parsed = new URL(value); } catch { /* reported below */ }
+    if (!parsed || !["http:", "https:"].includes(parsed.protocol)) {
+      return { enabled: false, url: null, reason: `${GITHUB_STATUS_ENV} value not recognised; GitHub status checks off` };
+    }
+    url = parsed.href;
+  }
+  const selected = normalizeHost(host);
+  if (selected && selected !== "github.com") {
+    return { enabled: false, url: null, reason: `GitHub status not checked for ${safe(selected)}` };
+  }
+  return { enabled: true, url, reason: null };
+}
+
+async function readBoundedText(response, limit) {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > limit) throw new Error("oversize");
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > limit) {
+      await reader.cancel().catch(() => {});
+      throw new Error("oversize");
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function parseGitHubStatus(body) {
+  if (!isRecord(body) || !Array.isArray(body.components) ||
+      (body.incidents !== undefined && !Array.isArray(body.incidents))) return null;
+  const text = (value, fallback = "") => typeof value === "string" && value.trim() ? safe(value) : fallback;
+  const components = body.components
+    .filter((component) => isRecord(component) && GITHUB_STATUS_COMPONENTS.includes(component.name))
+    .map((component) => {
+      const status = text(component.status, "unknown");
+      return { name: component.name, status, label: GITHUB_COMPONENT_STATUS[status] ?? status };
+    });
+  // An incident tagged with components, none of them tracked, is about a
+  // product this dashboard does not show and is dropped. About a third of
+  // GitHub's incidents carry no tag (often the first post); those are kept, and
+  // count as relevant only when the name names something this dashboard shows.
+  const incidents = [];
+  for (const [index, incident] of (body.incidents ?? []).entries()) {
+    if (!isRecord(incident)) continue;
+    const tagged = Array.isArray(incident.components) && incident.components.length > 0;
+    const tracked = tagged && incident.components.some((component) =>
+      GITHUB_STATUS_COMPONENTS.includes(component?.name));
+    if (tagged && !tracked) continue;
+    const name = text(incident.name, "Unnamed incident");
+    incidents.push({
+      id: text(incident.id, `incident-${index}`),
+      name,
+      status: text(incident.status, "unknown"),
+      impact: text(incident.impact, "unknown"),
+      updatedAt: text(incident.updated_at, null),
+      relevant: tracked || GITHUB_STATUS_RELEVANT_NAME.test(name),
+    });
+  }
+  return { components, incidents };
+}
+
+async function fetchGitHubStatus({ url, etag = null, signal = null, fetchImpl = globalThis.fetch,
+  timeoutMs = GITHUB_STATUS_TIMEOUT_MS } = {}) {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+  try {
+    const response = await fetchImpl(url, { signal: combined, redirect: "follow",
+      headers: { accept: "application/json", ...(etag ? { "if-none-match": etag } : {}) } });
+    if (response.status === 304) return { status: "not-modified" };
+    if (!response.ok) return { status: "unavailable", reason: `HTTP ${response.status}` };
+    const summary = parseGitHubStatus(JSON.parse(await readBoundedText(response, GITHUB_STATUS_MAX_BYTES)));
+    if (!summary) return { status: "unavailable", reason: "unexpected response" };
+    const tag = response.headers.get("etag");
+    return { status: "ok", summary, etag: typeof tag === "string" && tag.length <= 256 ? tag : null };
+  } catch (error) {
+    return { status: "unavailable", reason: error?.name === "TimeoutError" ? "timeout" : "unreachable" };
+  }
+}
+
+const GITHUB_COMPONENT_STATUS = Object.freeze({ degraded_performance: "degraded performance",
+  partial_outage: "partial outage", major_outage: "major outage", under_maintenance: "under maintenance" });
+
+// `state` is a monitor's current(): the last good summary, kept separately from
+// whether the latest check reached the page.
+function githubStatusLine(state, nowMs = Date.now()) {
+  if (!state?.enabled) return state?.reason ?? "GitHub status checks off";
+  if (state.unavailable) {
+    return Number.isFinite(state.nextAt)
+      ? `GitHub status unavailable; next check ${notificationTime(state.nextAt, nowMs)}`
+      : "GitHub status unavailable";
+  }
+  if (!state.summary) return "GitHub status: not checked yet";
+  const { components } = state.summary;
+  const incidents = state.summary.incidents.filter((incident) => incident.relevant !== false);
+  const others = state.summary.incidents.length - incidents.length;
+  if (incidents.length > 0) {
+    const more = incidents.length > 1 ? ` (+${incidents.length - 1} more)` : "";
+    return `GitHub incident: ${incidents[0].name}${more}`;
+  }
+  const degraded = components.filter((component) => component.status !== "operational");
+  if (degraded.length > 0) {
+    return `GitHub: ${degraded.map((component) => `${component.name} ${component.label}`).join(", ")}`;
+  }
+  if (others > 0) {
+    return `GitHub status: no incident affecting this dashboard (${others} ${others === 1 ? "other" : "others"})`;
+  }
+  return "GitHub status: All systems operational";
+}
+
+// Polls the status page on a slow cadence and turns changes into log entries:
+// an incident or a degraded tracked component is a problem, its end is a
+// "Cleared" line, and an unreachable status page is one info entry per
+// episode. `checkNow` (view open, r, a failing tab) runs at most once a minute.
+function createGitHubStatusMonitor({ config, log, fetchImpl = globalThis.fetch, now = Date.now,
+  setTimer = setTimeout, clearTimer = clearTimeout, onChange = () => {} }) {
+  let summary = null;
+  let etag = null;
+  let lastAttemptAt = -Infinity;
+  let nextAt = null;
+  let timer = null;
+  let stopped = !config?.enabled;
+  let inFlight = null;
+  let controller = null;
+  let unavailable = false;
+  let open = new Map(); // log key -> { text, level } of each ongoing incident or outage
+
+  function schedule(delay) {
+    if (stopped) return;
+    if (timer !== null) clearTimer(timer);
+    nextAt = now() + delay;
+    // The promise is returned for injected test clocks; check() never rejects.
+    timer = setTimer(() => { timer = null; return check(); }, delay);
+    timer?.unref?.();
+  }
+
+  function apply(next, at) {
+    // An incident that may not touch this dashboard is listed as information:
+    // it neither turns the badge red nor counts as an outage.
+    const conditions = new Map([
+      ...next.incidents.map((incident) => [`github:incident:${incident.id}`, {
+        text: `${incident.name} (${incident.status}, ${incident.impact} impact)`,
+        level: incident.relevant === false ? "info" : "problem" }]),
+      ...next.components.filter((component) => component.status !== "operational")
+        .map((component) => [`github:component:${component.name}`,
+          { text: `${component.name}: ${component.label}`, level: "problem" }]),
+    ]);
+    // A changed text is an update of the same open entry, not a new one.
+    for (const [key, { text, level }] of conditions) {
+      if (open.get(key)?.text !== text) log.record({ key, level, source: "GitHub status", text, at });
+    }
+    for (const key of open.keys()) if (!conditions.has(key)) log.end(key, at);
+    open = conditions;
+  }
+
+  async function check() {
+    if (stopped || inFlight) return inFlight;
+    lastAttemptAt = now();
+    controller = new AbortController();
+    inFlight = (async () => {
+      const outcome = await fetchGitHubStatus({ url: config.url, etag, signal: controller.signal, fetchImpl });
+      if (stopped) return;
+      const at = now();
+      if (outcome.status === "unavailable") {
+        if (!unavailable) {
+          log.record({ key: "github:unavailable", level: "info", source: "GitHub status",
+            text: "GitHub status page unavailable", at });
+        }
+        unavailable = true;
+        schedule(GITHUB_STATUS_BACKOFF_MS);
+      } else if (outcome.status === "not-modified" && !summary) {
+        // Nothing cached to reuse: drop the validator and ask again in a minute.
+        etag = null;
+        schedule(GITHUB_STATUS_MIN_GAP_MS);
+      } else {
+        if (unavailable) log.end("github:unavailable", at);
+        unavailable = false;
+        if (outcome.status === "ok") {
+          etag = outcome.etag;
+          summary = outcome.summary;
+          apply(summary, at);
+        }
+        schedule(GITHUB_STATUS_INTERVAL_MS);
+      }
+      try { onChange(); } catch { /* a render callback must not break polling */ }
+    })().finally(() => {
+      inFlight = null;
+      controller = null;
+    });
+    return inFlight;
+  }
+
+  const ready = stopped ? Promise.resolve() : check();
+  return {
+    ready,
+    async checkNow() {
+      if (stopped || inFlight || now() - lastAttemptAt < GITHUB_STATUS_MIN_GAP_MS) return false;
+      await check();
+      return true;
+    },
+    stop() {
+      stopped = true;
+      controller?.abort();
+      if (timer !== null) clearTimer(timer);
+      timer = null;
+    },
+    current: () => ({ enabled: Boolean(config?.enabled), reason: config?.reason ?? null, summary,
+      unavailable, nextAt, outage: [...open.values()].some((condition) => condition.level === "problem") }),
+  };
 }
 
 function recoveryLedgerSummary(scope, resource, nowMs = Date.now()) {
@@ -17386,63 +17979,87 @@ const MIN_TABLE_WIDTH = Math.max(...TABS.map((t) => minimumWidthFor(t.header)));
 // status line survive at any width a terminal is realistically set to.
 const MIN_COMPACT_WIDTH = Math.max(...TABS.map((t) => minimumWidthFor(t.compactHeader)));
 
-// The tab bar is laid out independently of the table and wraps at its own
-// width. Full labels need ~77 columns; short labels ~57. Hysteresis on the
+// The tab bar is laid out independently of the table. Full labels for the five
+// sections need ~97 columns; short labels ~77. Hysteresis on the full/short
 // breakpoint so a pane parked exactly on it does not flip labels on every
-// resize event and defeat the unchanged-frame optimization.
-const TAB_LABEL_FULL_WIDTH = 78;
+// resize event and defeat the unchanged-frame optimization. Below the short
+// width the bar drops names and keeps digits and counts (see tabBarEntries).
+const TAB_LABEL_FULL_WIDTH = 98;
 const TAB_LABEL_HYSTERESIS = 4;
+const NOTIFICATIONS_LABEL = Object.freeze({ full: "Notifications", short: "Notices" });
 
 function tabFailureSuffix({ count, failed, brokenCI }) {
   if (count == null) return failed ? " x" : "";
   return ` (${count}${brokenCI ? "!" : ""}${failed ? "x" : ""})`;
 }
 
-function TabBar({ activeIndex, counts, brokenCI, firstLoad, failed, spin, useShort }) {
+function tabBarWidth(entries) {
+  return entries.reduce((sum, entry) => sum + entry.label.length + entry.margin, 0);
+}
+
+// Four data sections plus Notifications on one row. The widest tier that fits
+// `cols` wins: full names, short names, digits with counts, the same without
+// gaps, then bare digits that keep only the Notifications badge -- so every
+// section key stays visible, and the row never wraps, down to a ~20-column pane.
+function tabBarEntries({ cols, counts, brokenCI, firstLoad, failed, spin, useShort, activeIndex,
+  notifications = { unread: 0, tone: "none" } }) {
+  const sections = TABS.map((tab) => {
+    const count = counts[tab.key];
+    // A tab that has never resolved shows the spinner where its count will
+    // go, so the first load reads as "working" rather than "empty".
+    const suffix = count == null && firstLoad[tab.key] ? ` ${spin}`
+      : tabFailureSuffix({ count, failed: failed[tab.key], brokenCI: count == null ? false : brokenCI[tab.key] });
+    // A tab whose fetches are failing kept rendering its last good count at
+    // full confidence, and the error banner is only visible on the tab you
+    // have selected -- so a background tab could fail for an hour with
+    // nothing on screen to say so.
+    return { key: tab.key, full: tab.label, short: tab.short, suffix,
+      color: failed[tab.key] ? "redBright" : undefined, quiet: !failed[tab.key] };
+  });
+  const { unread, tone } = notifications;
+  sections.push({ key: "notifications", ...NOTIFICATIONS_LABEL,
+    suffix: unread > 0 ? ` (${unread})` : "",
+    color: tone === "red" ? "redBright" : tone === "yellow" ? ATTENTION : undefined,
+    quiet: tone !== "red" && tone !== "yellow" });
+  const build = (tier) => sections.map((section, index) => {
+    const active = index === activeIndex;
+    const named = tier === "full" || tier === "short";
+    const suffix = tier === "digits" && section.key !== "notifications" ? "" : section.suffix;
+    const body = named ? `${index + 1}:${section[tier]}${suffix}` : `${index + 1}${suffix.trimStart()}`;
+    // Bold and inverse are both stripped at chalk level 0 (NO_COLOR, or a
+    // dumb terminal), which left no indication at all of which tab was
+    // selected. Brackets survive; the padding they replace keeps the width
+    // identical, so the bar does not shift between the two modes.
+    return { key: section.key, active, label: active ? `[${body}]` : ` ${body} `,
+      margin: index === sections.length - 1 || tier === "tight" || tier === "digits" ? 0 : tier === "full" ? 2 : 1,
+      color: section.color, dim: !active && section.quiet };
+  });
+  for (const tier of [...useShort ? [] : ["full"], "short", "compact", "tight"]) {
+    const entries = build(tier);
+    if (tabBarWidth(entries) <= cols) return entries;
+  }
+  return build("digits");
+}
+
+function TabBar({ entries }) {
   return e(
     Box,
     { flexDirection: "row" },
-    ...TABS.map((tab, i) => {
-      const active = i === activeIndex;
-      const count = counts[tab.key];
-      // A tab that has never resolved shows the spinner where its count will
-      // go, so the first load reads as "working" rather than "empty".
-      const suffix =
-        count == null
-          ? firstLoad[tab.key]
-            ? ` ${spin}`
-            : tabFailureSuffix({ count, failed: failed[tab.key], brokenCI: false })
-          : tabFailureSuffix({
-              count,
-              failed: failed[tab.key],
-              brokenCI: brokenCI[tab.key],
-            });
-      const name = useShort ? tab.short : tab.label;
-      // Bold and inverse are both stripped at chalk level 0 (NO_COLOR, or a
-      // dumb terminal), which left no indication at all of which tab was
-      // selected. Brackets survive; the padding they replace keeps the width
-      // identical, so the bar does not shift between the two modes.
-      const label = active ? `[${i + 1}:${name}${suffix}]` : ` ${i + 1}:${name}${suffix} `;
-      return e(
-        Box,
-        { key: tab.key, marginRight: 2 },
-        e(
-          Text,
-          {
-            bold: active,
-            inverse: active,
-            // A tab whose fetches are failing kept rendering its last good
-            // count at full confidence, and the error banner is only visible on
-            // the tab you have selected -- so a background tab could fail for an
-            // hour with nothing on screen to say so.
-            color: failed[tab.key] ? "redBright" : undefined,
-            dimColor: !active && !failed[tab.key],
-            wrap: "truncate-end",
-          },
-          label,
-        ),
-      );
-    }),
+    ...entries.map((entry) => e(
+      Box,
+      { key: entry.key, marginRight: entry.margin },
+      e(
+        Text,
+        {
+          bold: entry.active,
+          inverse: entry.active,
+          color: entry.color,
+          dimColor: entry.dim,
+          wrap: "truncate-end",
+        },
+        entry.label,
+      ),
+    )),
   );
 }
 
@@ -18639,6 +19256,108 @@ function App({ onCreateRemote = () => {} } = {}) {
   const { isRawModeSupported } = useStdin();
   const { exit, suspendTerminal } = useApp();
   const [activeIndex, setActiveIndex] = useState(runtime.initialTabIndex);
+  // Notifications is a view, not a data tab: `activeIndex` keeps naming the
+  // last data tab, so polling, cache and per-tab state never see a fifth key.
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const notificationsOpenRef = useRef(notificationsOpen);
+  notificationsOpenRef.current = notificationsOpen;
+  const [notificationsOffset, setNotificationsOffset] = useState(0);
+  const notificationLogRef = useRef(null);
+  notificationLogRef.current ??= createNotificationLog();
+  // Only the badge lives in state, and it changes only when the unread count or
+  // tone does: routine refreshes never re-render a closed view, which keeps an
+  // idle dashboard's frames byte-identical.
+  const [notificationBadge, setNotificationBadge] = useState(() => notificationLogRef.current.summary());
+  const notificationBadgeRef = useRef(notificationBadge);
+  const [, setNotificationVersion] = useState(0);
+  const notificationSnapshotRef = useRef(null);
+  const notificationDiffRef = useRef(null);
+  const notificationTimerRef = useRef(null);
+  const syncNotificationsRef = useRef(null);
+  const notificationInputsRef = useRef(null);
+  syncNotificationsRef.current = ({ force = false } = {}) => {
+    const log = notificationLogRef.current;
+    const nowMs = Date.now();
+    // Spinner and clock renders change none of the inputs; skip their diff.
+    const inputs = notificationSnapshotRef.current.inputs;
+    const previousInputs = notificationInputsRef.current;
+    const unchanged = !force && previousInputs?.length === inputs.length &&
+      inputs.every((value, index) => Object.is(value, previousInputs[index]));
+    notificationInputsRef.current = inputs;
+    const result = unchanged ? { begin: [], end: [], pending: notificationTimerRef.current?.due ?? null }
+      : diffNotificationSnapshots(notificationDiffRef.current, notificationSnapshotRef.current, nowMs);
+    if (!unchanged) notificationDiffRef.current = result.state;
+    for (const event of result.begin) log.record(event);
+    for (const key of result.end) log.end(key, nowMs);
+    // A condition can become due with nothing else re-rendering the pane.
+    if ((notificationTimerRef.current?.due ?? null) !== result.pending) {
+      clearTimeout(notificationTimerRef.current?.id);
+      notificationTimerRef.current = result.pending === null ? null : {
+        due: result.pending,
+        id: setTimeout(() => {
+          notificationTimerRef.current = null;
+          syncNotificationsRef.current?.({ force: true });
+        }, Math.max(0, result.pending - nowMs)),
+      };
+      notificationTimerRef.current?.id.unref?.();
+    }
+    if (notificationsOpenRef.current && !showHelpRef.current) {
+      log.markSeen();
+      if (result.begin.length > 0 || result.end.length > 0) setNotificationVersion((version) => version + 1);
+    }
+    // A failing tab is the moment GitHub's own status is worth a look.
+    if (result.begin.some((event) => event.level === "problem" || event.code === "network-outage")) {
+      void githubStatusRef.current?.checkNow();
+    }
+    const badge = log.summary();
+    if (badge.unread !== notificationBadgeRef.current.unread || badge.tone !== notificationBadgeRef.current.tone) {
+      notificationBadgeRef.current = badge;
+      setNotificationBadge(badge);
+    }
+  };
+  useEffect(() => { syncNotificationsRef.current(); });
+  const notificationPageRef = useRef({ pageRows: 1, maxOffset: 0 });
+  // GitHub platform status: started only here, inside the mounted dashboard,
+  // so --doctor, --version, --help and other non-TUI paths never request it.
+  const githubStatusRef = useRef(null);
+  const githubStatusConfigRef = useRef(null);
+  githubStatusConfigRef.current ??= githubStatusConfig(process.env, effectiveRuntimeHost());
+  const [githubStatus, setGithubStatus] = useState(() => ({ enabled: githubStatusConfigRef.current.enabled,
+    reason: githubStatusConfigRef.current.reason, summary: null, unavailable: false, nextAt: null, outage: false }));
+  useEffect(() => {
+    const monitor = createGitHubStatusMonitor({ config: githubStatusConfigRef.current,
+      log: notificationLogRef.current,
+      onChange: () => setGithubStatus(monitor.current()) });
+    githubStatusRef.current = monitor;
+    return () => {
+      monitor.stop();
+      githubStatusRef.current = null;
+    };
+  }, []);
+  const openNotifications = () => {
+    notificationLogRef.current.markSeen();
+    setNotificationsOffset(0);
+    setNotificationsOpen(true);
+    void githubStatusRef.current?.checkNow();
+  };
+  // Five positions: the four data tabs, then Notifications.
+  const selectPosition = (position) => {
+    if (position === TABS.length) {
+      if (!notificationsOpenRef.current) openNotifications();
+      return;
+    }
+    setNotificationsOpen(false);
+    setActiveIndex(position);
+  };
+  const stepPosition = (direction) => {
+    const positions = TABS.length + 1;
+    const current = notificationsOpenRef.current ? TABS.length : activeIndexRef.current;
+    selectPosition((current + direction + positions) % positions);
+  };
+  useEffect(() => () => {
+    clearTimeout(notificationTimerRef.current?.id);
+    syncNotificationsRef.current = null;
+  }, []);
   const [preferencePath] = useState(() => widthPreferencesPath());
   const [loadedWidthPreferences] = useState(() => loadWidthPreferences(preferencePath));
   const [widthOverrides, setWidthOverrides] = useState(() => loadedWidthPreferences.preferences);
@@ -19033,14 +19752,9 @@ function App({ onCreateRemote = () => {} } = {}) {
   const noticeCause = activeRecovery ?? (noticeReason ? recoveryCause({
     reason: noticeReason === "other" ? "network-outage" : noticeReason,
     resource: noticeResource, sourceAt: noticeSourceAt,
-    retryAt: activeGovernorDecision?.retryAt ?? activeGovernorDecision?.resetMs ??
-      activeGovernorDecision?.notBefore ?? null,
+    retryAt: decisionRetryAt(activeGovernorDecision),
     origin: tabError ? "source" : "coordination", tab: tabError ? tab.key : null,
   }) : null);
-  const recoveryLines = showCoordinationNotice && noticeCause
-    ? presentRecovery(noticeCause, { nowMs: now.getTime(), cols, hasSnapshot: items !== null })
-    : [!remoteSetup && displayError ? displayError : ""];
-  const noticeTone = showCoordinationNotice ? ATTENTION : displayError ? ERROR_TEXT : undefined;
   // Data can be arbitrarily old without anything on screen saying so: a failing
   // poll only surfaces on the tab you have selected, and after a laptop sleep
   // every pane is plausible and wrong. Threshold-gated and minute-granular on
@@ -19138,34 +19852,74 @@ function App({ onCreateRemote = () => {} } = {}) {
       : ['CI evidence',...ciLines].flatMap(line=>wrapPanelText(line,Math.max(1,cols-5))).slice(0,Math.max(1,rows-6))
     : contextualPanelLayout(presentation, { cols, rows });
 
+  // One snapshot per render feeds the notification history; diffing it in an
+  // effect avoids instrumenting every error, recovery and Security-note writer.
+  const notificationDisconnected = statusDisconnected ? runtime.connect === null ? "identity-unavailable"
+    : activeGovernorDecision?.reason === "app-auth" ? "app-auth" : "disconnected" : null;
+  notificationSnapshotRef.current = {
+    // Everything the snapshot is built from, compared by identity before diffing.
+    inputs: [errors, acquisitionFailures, governorDecisions, recoveryCauses, securityNotes, failureContext,
+      notificationDisconnected, ...TABS.map(({ key }) => lastOkRef.current[key] ?? null)],
+    tabs: Object.fromEntries(TABS.map(({ key }) => {
+      const decision = governorDecisions[key];
+      return [key, { lastOk: lastOkRef.current[key] ?? null, error: errors[key],
+        failure: acquisitionFailures[key] ?? null,
+        paused: decision?.mode === "paused" || decision?.coordinationError ? decision.reason ?? null : null }];
+    })),
+    recovery: recoveryCauses,
+    securityNotes,
+    failureContext,
+    disconnected: notificationDisconnected,
+  };
+
   const tableVisible = !ciView && !attentionView && Array.isArray(items) && items.length > 0;
   const tableNoticeCapacity = Math.max(0, rows - 9);
-  const needsTableContext = ["failed", "overdue", "waiting"].includes(presentation.state);
-  const shortAction = /gh-glance --doctor/.test(presentation.action) ? "gh-glance --doctor"
-    : /gh auth/.test(presentation.action) ? "Run gh auth status" : presentation.action;
-  const tableNotices = needsTableContext
-    ? tableNoticeCapacity < 4
-      ? tableNoticeCapacity === 1 ? [shortAction]
-        : showCoordinationNotice && noticeCause
-          ? [noticeCause.summary, shortAction, presentation.sourceCheck]
-          : [shortAction, presentation.sourceCheck, presentation.title]
-      : [presentation.title, presentation.sourceCheck, ...recoveryLines.filter(Boolean)]
-    : recoveryLines;
+  // Only what needs the user's hand takes rows from a visible table; every
+  // other status event is in the Notifications view.
+  const critical = criticalInlineLines({ cause: noticeCause, showCause: showCoordinationNotice,
+    tabError: remoteSetup ? null : tabError, displayError, capacity: tableNoticeCapacity,
+    nowMs: now.getTime(), cols, hasSnapshot: items !== null });
+  const noticeTone = critical.source === "cause" ? ATTENTION : critical.source === "error" ? ERROR_TEXT : undefined;
   const featureLines = focus ? [presentation.title, ...(focus.error ? [focus.error] : []),
     ...focusDisclosureLines(focusMessage,focus.semantic?.message).flatMap(line=>line.split(/(?<=\.) /u)), ...featureKeyLines(focus)]
     .flatMap(line=>wrapPanelText(line, Math.max(1,cols-5))) : [];
-  const noticeLines = [...new Set([...(focus ? featureLines : []), ...(showCoordinationNotice ? tableNotices : []),
+  const noticeLines = [...new Set([...(focus ? featureLines : []), ...critical.lines,
     ...(setupView?.title ? [setupView.title, setupView.action, ...setupView.notes] : []),
-    ...tableNotices, ...(!focus && featureNotice ? [featureNotice] : [])])].filter(Boolean).slice(0, tableNoticeCapacity);
-  const visibleSecurityLines = tab.key === "security"
-    ? securityLines.slice(0, Math.max(0, tableNoticeCapacity - noticeLines.length)) : [];
-  const extraLines = !showHelp && !remoteSetup && tableVisible
-    ? noticeLines.length + visibleSecurityLines.length : 0;
+    ...(!focus && featureNotice ? [featureNotice] : [])])].filter(Boolean).slice(0, tableNoticeCapacity);
+  const extraLines = !showHelp && !remoteSetup && tableVisible ? noticeLines.length : 0;
   // Tab strip, divider, frame edges, footer and terminal guard use six rows.
   // Table headers alone need two more. The same budget drives navigation.
   const bodyRows = Math.max(1, rows - 6 - (tableVisible && !showHelp ? 2 : 0) - extraLines);
+  const notificationRows = Math.max(1, rows - 6);
+  const notificationStatusLine = notificationsOpen ? githubStatusLine(githubStatus, now.getTime()) : "";
+  let notificationView = null;
+  if (notificationsOpen) {
+    // Open waits show when they retry next, from the live cause or hold.
+    const liveRetry = {};
+    for (const cause of Object.values(recoveryCauses)) {
+      if (cause?.code && Number.isFinite(cause.retryAt)) liveRetry[cause.code] = cause.retryAt;
+    }
+    for (const decision of Object.values(governorDecisions)) {
+      const retryAt = decisionRetryAt(decision);
+      if (decision?.reason && Number.isFinite(retryAt)) liveRetry[decision.reason] ??= retryAt;
+    }
+    notificationView = notificationViewLines({
+      entries: notificationLogRef.current.list(), statusLine: notificationStatusLine, nowMs: now.getTime(),
+      capacity: notificationRows, offset: notificationsOffset, liveRetry,
+    });
+  }
+  notificationPageRef.current = { pageRows: notificationView?.pageRows ?? 1,
+    maxOffset: notificationView?.maxOffset ?? 0 };
   let helpPages = [];
-  if (showHelp) {
+  if (showHelp && notificationsOpen) {
+    helpPages = contextHelpPages({ view: {
+      title: NOTIFICATIONS_LABEL.full,
+      action: "Press 1-4 or Esc to return to a section; Up/Down scroll; r checks GitHub status.",
+      sourceCheck: notificationStatusLine,
+      explanation: "Lines above a table appear only when you must act. Waits, refreshes, failed refreshes and cleared causes are listed here, newest first.",
+      notes: [],
+    }, target: selectedTarget, tab: "notifications" }, keyTableLines(), cols - 5, bodyRows);
+  } else if (showHelp) {
     const fullDiagnostic = formatTabError(tabError, failureContext);
     const helpView = { ...presentation, notes: [
       ...(fullDiagnostic ? [fullDiagnostic] : []),
@@ -19602,6 +20356,33 @@ function App({ onCreateRemote = () => {} } = {}) {
         }
         // Width mode owns every other key. In particular, digits, arrows, Tab,
         // Enter and r must never fall through to their ordinary meanings.
+      } else if (notificationsOpenRef.current && !showHelpRef.current) {
+        // The view owns its keys; data-tab actions (Enter, /, s, g, w, d, a)
+        // have nothing to act on here and are ignored rather than applied to
+        // the hidden tab.
+        const { pageRows, maxOffset } = notificationPageRef.current;
+        if (input === "?") {
+          setHelpPage(0);
+          setShowHelp(true);
+        } else if (key.escape) {
+          setNotificationsOpen(false);
+        } else if (input.length === 1 && input >= "1" && input <= String(TABS.length)) {
+          selectPosition(Number(input) - 1);
+        } else if (key.tab && key.shift || key.leftArrow) {
+          stepPosition(-1);
+        } else if (key.tab || key.rightArrow) {
+          stepPosition(1);
+        } else if (key.downArrow || input === "j" || key.upArrow || input === "k" || key.pageDown || key.pageUp) {
+          const step = key.pageDown ? pageRows : key.pageUp ? -pageRows
+            : key.downArrow || input === "j" ? 1 : -1;
+          setNotificationsOffset((current) => Math.max(0, Math.min(maxOffset, current + step)));
+        } else if (input === "r" || input === "R") {
+          // In this view, r asks GitHub's status page, not the hidden data tab.
+          void githubStatusRef.current?.checkNow();
+        }
+      } else if (key.escape && showHelpRef.current && notificationsOpenRef.current) {
+        // The view's help says Esc returns; it must not quit from here.
+        setShowHelp(false);
       } else if (key.escape && showHelpRef.current && featureRef.current) {
         setShowHelp(false);
       } else if (key.escape && featureRef.current?.semantic?.consent) {
@@ -19743,14 +20524,12 @@ function App({ onCreateRemote = () => {} } = {}) {
         // no local coordinator; its collector resumes on the refresh it receives.
         if (request) retryPausedTransport(runtimeIdentityCoordinator);
         if (request) fetchTabRef.current?.(TABS[activeIndexRef.current].key, request);
-      } else if (input.length === 1 && input >= "1" && input <= String(TABS.length)) {
-        setActiveIndex(Number(input) - 1);
-      } else if (key.tab && key.shift) {
-        setActiveIndex((i) => (i - 1 + TABS.length) % TABS.length);
+      } else if (input.length === 1 && input >= "1" && input <= String(TABS.length + 1)) {
+        selectPosition(Number(input) - 1);
+      } else if (key.tab && key.shift || key.leftArrow) {
+        stepPosition(-1);
       } else if (key.tab || key.rightArrow) {
-        setActiveIndex((i) => (i + 1) % TABS.length);
-      } else if (key.leftArrow) {
-        setActiveIndex((i) => (i - 1 + TABS.length) % TABS.length);
+        stepPosition(1);
       }
     },
     // `isActive` has to be coerced: ink only skips raw mode when the flag is
@@ -20422,6 +21201,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     const inFlightStartedAt = {};
     const wakeScheduler = createWakeScheduler();
     let scope = null;
+    let notificationsSeeded = false;
     let scopeFailure = null;
     let cleanupScope = null;
     let registeredScopeHash = null;
@@ -21049,6 +21829,12 @@ function App({ onCreateRemote = () => {} } = {}) {
         scope = createQuotaScope(current, { root: runtimeIdentityCoordinator.root, identityProvider: identity });
         cleanupScope = { ...scope, identityProvider: null };
         const savedRecovery = readRecoveryTransitions(scope);
+        // Earlier transitions become dimmed history, once per pane, from the
+        // journal just read; collector clients have no journal and start empty.
+        if (!notificationsSeeded) {
+          notificationsSeeded = true;
+          seedNotificationsFromJournal(notificationLogRef.current, scope, () => savedRecovery);
+        }
         recoveryRef.current = savedRecovery.status === "healthy"
           ? { ...savedRecovery.current } : { core: null, graphql: null };
         setRecoveryCauses(recoveryRef.current);
@@ -22228,8 +23014,11 @@ function App({ onCreateRemote = () => {} } = {}) {
   }, [reconciledSelection.key, reconciledSelection.offset, selectedKey, tabOffsetRaw, tab.key]);
   // Bottom-right of the frame, lazygit style: how much of the tab you can
   // currently see out of how much there is.
-  const countLabel =
-    !tableVisible
+  const notificationSummary = notificationsOpen ? notificationLogRef.current.summary() : null;
+  const countLabel = notificationSummary
+    ? notificationSummary.truncated ? `Showing the latest ${NOTIFICATION_LOG_MAX} events`
+      : `${notificationSummary.size} ${notificationSummary.size === 1 ? "event" : "events"}`
+    : !tableVisible
       ? null
       : tabOffset > 0
         ? `${tabOffset + 1}-${tabOffset + visibleItems.length} of ${counts[tab.key]}`
@@ -22245,8 +23034,9 @@ function App({ onCreateRemote = () => {} } = {}) {
 
   // The existing resolver also supplies inferred targets without another lookup.
   // Complete target and host remain reachable in help when this edge is short.
-  const withTarget = `${tab.label} · ${selectedTarget.label}`;
-  const topLabel = frameCols - 3 - withTarget.length >= 0 ? withTarget : tab.label;
+  const viewLabel = notificationsOpen ? NOTIFICATIONS_LABEL.full : tab.label;
+  const withTarget = `${viewLabel} · ${selectedTarget.label}`;
+  const topLabel = frameCols - 3 - withTarget.length >= 0 ? withTarget : viewLabel;
 
   // Fixed columns deliberately do not shrink, so BRANCH and TIME stay readable
   // at ordinary widths. Narrow panes drop columns instead, which keeps the
@@ -22335,13 +23125,18 @@ function App({ onCreateRemote = () => {} } = {}) {
     Box,
     { flexDirection: "column", width: frameCols, height: frameRows },
     e(TabBar, {
-      activeIndex,
-      counts,
-      brokenCI,
-      firstLoad,
-      failed,
-      spin,
-      useShort: useShortLabels,
+      entries: tabBarEntries({
+        cols: frameCols,
+        counts,
+        brokenCI,
+        firstLoad,
+        failed,
+        spin,
+        useShort: useShortLabels,
+        activeIndex: notificationsOpen ? TABS.length : activeIndex,
+        // An active GitHub outage keeps the badge red even after it was read.
+        notifications: githubStatus.outage ? { ...notificationBadge, tone: "red" } : notificationBadge,
+      }),
     }),
     e(Divider, { width: frameCols }),
     e(PanelEdge, { width: frameCols, top: true, label: topLabel, labelColor: TITLE_COLOR }),
@@ -22371,20 +23166,20 @@ function App({ onCreateRemote = () => {} } = {}) {
       showHelp &&
         (helpPages[visibleHelpPage] ?? [])
           .map((line, i) => e(Text, { key: `help${i}`, wrap: "truncate-end" }, line)),
+      !showHelp && notificationView &&
+        notificationView.lines.map((line, index) => e(Text, {
+          key: `notification:${index}`, wrap: "truncate-end", dimColor: line.dim,
+          color: line.level === "status" ? TITLE_COLOR : line.dim ? undefined
+            : line.level === "wait" ? ATTENTION : ["action", "problem"].includes(line.level) ? ERROR_TEXT : undefined,
+        }, line.text)),
       !showHelp &&
+        !notificationsOpen &&
         tooNarrow &&
         e(Text, { dimColor: true, wrap: "truncate-end" }, "too narrow"),
-      ...(showHelp || !tableVisible ? [] : noticeLines).map((line, index) =>
+      ...(showHelp || notificationsOpen || !tableVisible ? [] : noticeLines).map((line, index) =>
         e(Text, { key: `recovery:${index}`, color: noticeTone, wrap: "truncate-end" }, line)),
       !showHelp &&
-        !tooNarrow &&
-        !remoteSetup &&
-        tableVisible &&
-        tab.key === "security" &&
-        visibleSecurityLines.map((note, i) =>
-          e(Text, { key: i, dimColor: true, wrap: "truncate-end" }, note),
-        ),
-      !showHelp &&
+        !notificationsOpen &&
         !tooNarrow &&
         remoteSetup &&
         (interactive ? REMOTE_SETUP_LINES : REMOTE_SETUP_NONINTERACTIVE_LINES).map(
@@ -22402,6 +23197,7 @@ function App({ onCreateRemote = () => {} } = {}) {
             ),
         ),
       !showHelp &&
+        !notificationsOpen &&
         !tooNarrow &&
         !remoteSetup &&
         tableVisible &&
@@ -22410,7 +23206,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           selectedWidthKey: resizeRef.current.active ? selectedWidthKey : null,
           headerRef,
         }),
-      ...(tooNarrow || showHelp || remoteSetup || ciView || attentionView ? [] : visibleItems).map((item) => {
+      ...(tooNarrow || showHelp || notificationsOpen || remoteSetup || ciView || attentionView ? [] : visibleItems).map((item) => {
         const key = itemKey(item);
         return e(
           RowBoundary,
@@ -22431,7 +23227,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           }),
         );
       }),
-      !showHelp && !remoteSetup && !tableVisible &&
+      !showHelp && !notificationsOpen && !remoteSetup && !tableVisible &&
         panelLines.map((line, index) => e(Text, {
           key: `context:${index}`, wrap: "truncate-end",
           bold: index === 0, color: index === 0 ? TITLE_COLOR : undefined,
@@ -22451,17 +23247,18 @@ function App({ onCreateRemote = () => {} } = {}) {
       nowMs: now.getTime(),
       interactive,
       cols: frameCols,
-      remoteSetup,
-      feature: attentionView ?? ciView ?? focus,
+      remoteSetup: remoteSetup && !notificationsOpen,
+      feature: notificationsOpen ? null : attentionView ?? ciView ?? focus,
       widthMode: resizeRef.current.active,
       widthColumn: selectedWidthColumn,
       widthSaveError,
-      canMove: allItems.length > 0,
+      canMove: notificationsOpen ? (notificationView?.maxOffset ?? 0) > 0 : allItems.length > 0,
       canOpen:
+        !notificationsOpen &&
         selectedKey !== null &&
         OPENABLE.includes(tab.key) &&
         allItems.some((item) => itemKey(item) === selectedKey),
-      canResize: fullHeaderVisible,
+      canResize: !notificationsOpen && fullHeaderVisible,
     }),
   );
 }
@@ -23083,6 +23880,25 @@ export {
   collectorSourceAdvanced,
   cleanupQueueForResource,
   presentRecovery,
+  RECOVERY_COPY,
+  NOTICE_LEVELS,
+  NOTIFICATION_LOG_MAX,
+  noticeLevel,
+  fetchErrorLevel,
+  createNotificationLog,
+  notificationConditions,
+  diffNotificationSnapshots,
+  seedNotificationsFromJournal,
+  criticalInlineLines,
+  notificationViewLines,
+  tabBarEntries,
+  tabBarWidth,
+  GITHUB_STATUS_URL,
+  GITHUB_STATUS_MAX_BYTES,
+  githubStatusConfig,
+  fetchGitHubStatus,
+  githubStatusLine,
+  createGitHubStatusMonitor,
   dashboardPresentation,
   contextualPanelLayout,
   dashboardTarget,

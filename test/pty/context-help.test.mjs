@@ -220,7 +220,9 @@ test("NAV-06: reader and no-color help include state, target, source and recover
     args: "--repo acme/widget --refresh 300 --background off", env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       INK_SCREEN_READER: "true", NO_COLOR: "1", GH_GLANCE_FIXTURE_FAIL: "HTTP 401: Bad credentials",
       GH_GLANCE_FIXTURE_FAIL_ON: "actions" },
-    stdin: waitFor("Could not load Actions") + "printf '?'; " + waitFor("n next p prev") + "sleep 1; printf q" });
+    // Let the failure's badge settle first: a linear reader reprints the whole
+    // frame on every change, and a badge change while help is open would print it twice.
+    stdin: waitFor("Could not load Actions") + "sleep 1.5; printf '?'; " + waitFor("n next p prev") + "sleep 1; printf q" });
   const help = result.raw.slice(result.raw.indexOf("Target: acme/widget"));
   assert.match(help, /Host: github.com/);
   assert.match(result.raw, /Not checked yet/);

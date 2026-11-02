@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-02
+
+### Added
+
+- A fifth section, `5:Notifications` (`Notices` on narrow panes), keeps an
+  in-memory history of status events for the pane: automatic waits, failed
+  refreshes, Security source notes, refreshes and cleared causes, newest
+  first. It starts with earlier recovery transitions from the shared journal.
+  The tab shows an unread count, red for problems and causes that need action,
+  yellow for waits.
+- Notifications reports GitHub's platform status from githubstatus.com:
+  incidents and outages for API Requests, Actions, Issues, Pull Requests, Git
+  Operations and Webhooks. It checks every 10 minutes, on opening the view, on
+  `r` in the view and when a tab starts failing, spends no GitHub API quota,
+  runs only for `github.com`, and is off with `GH_GLANCE_GITHUB_STATUS=off`.
+  An incident posted without a component is a problem only when its name
+  names something the dashboard shows; otherwise it is listed as information.
+
+### Changed
+
+- Lines above a table now appear only for causes that need you to act, such
+  as `gh-glance --doctor` or `gh auth status`. Waits such as "GitHub budget
+  evidence is old", `Waiting to update`, `Checked HH:MM`, `cached` ages and the
+  Security "not enabled" notes moved to Notifications, so the table no longer
+  moves when they start or end.
+- The tab bar fits five sections on one row: full names from about 98
+  columns, short names below that, digits with counts on narrow panes, and
+  bare digits (keeping the Notifications count) below about 30 columns.
+
 ## [0.18.1] - 2026-10-31
 
 ### Fixed
@@ -1392,7 +1421,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.18.1...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/juan294/gh-glance/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/juan294/gh-glance/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/juan294/gh-glance/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/juan294/gh-glance/compare/v0.17.0...v0.17.1
