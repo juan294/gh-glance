@@ -348,7 +348,10 @@ quota. Only incidents and outages that touch API Requests, Actions, Issues,
 Pull Requests, Git Operations or Webhooks are reported; each one is a problem
 in the list and keeps the badge red until it resolves. The check runs only
 when the target host is `github.com` and is off with
-`GH_GLANCE_GITHUB_STATUS=off` (see [Configuration](#configuration)).
+`GH_GLANCE_GITHUB_STATUS=off` (see [Configuration](#configuration)). The
+request uses Node's built-in `fetch`, which does not read `HTTPS_PROXY`; where
+only a proxy reaches the internet the row reads "GitHub status unavailable",
+and `GH_GLANCE_GITHUB_STATUS=off` turns it off.
 
 The tab label shows how many waits and problems arrived since you last opened
 the view, for example `5:Notifications (3)`: red when any is a problem or needs

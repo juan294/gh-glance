@@ -12528,6 +12528,9 @@ Environment:
                             Minimum active-tab poll interval, ${MIN_REFRESH_SECONDS}-${MAX_REFRESH_SECONDS};
                             safe shared grants may run later
                             (--refresh takes precedence)
+  GH_GLANCE_GITHUB_STATUS=off
+                            Turn off the githubstatus.com check in
+                            Notifications (an http(s) URL replaces the endpoint)
   GH_GLANCE_ICONS=unicode   Unicode status glyphs and text row substitutes
   GH_GLANCE_ICONS=ascii     ASCII-only status and row icons
   GH_GLANCE_NO_ANIMATION=1  Stop motion; semantic status words remain
@@ -17088,7 +17091,8 @@ function createNotificationLog({ max = NOTIFICATION_LOG_MAX, now = Date.now } = 
     }
     if (index >= 0) {
       const [entry] = entries.splice(index, 1);
-      entry.count += 1;
+      // A refresh repeats; a changed open condition is the same occurrence.
+      if (level === "info") entry.count += 1;
       entry.lastAt = Math.max(entry.lastAt, latest);
       entry.text = cleanText;
       entries.push(entry);
@@ -17388,12 +17392,15 @@ function parseGitHubStatus(body) {
   const text = (value, fallback = "") => typeof value === "string" && value.trim() ? safe(value) : fallback;
   const components = body.components
     .filter((component) => isRecord(component) && GITHUB_STATUS_COMPONENTS.includes(component.name))
-    .map((component) => ({ name: component.name, status: text(component.status, "unknown") }));
+    .map((component) => {
+      const status = text(component.status, "unknown");
+      return { name: component.name, status, label: GITHUB_COMPONENT_STATUS[status] ?? status };
+    });
   // An incident that names components but none of the tracked ones is about a
   // product this dashboard does not show. One without component data is kept.
-  const incidents = (body.incidents ?? []).filter(isRecord).filter((incident) =>
+  const incidents = (body.incidents ?? []).filter((incident) => isRecord(incident) && (
     !Array.isArray(incident.components) || incident.components.length === 0 ||
-      incident.components.some((component) => GITHUB_STATUS_COMPONENTS.includes(component?.name)))
+      incident.components.some((component) => GITHUB_STATUS_COMPONENTS.includes(component?.name))))
     .map((incident, index) => ({
       id: text(incident.id, `incident-${index}`),
       name: text(incident.name, "Unnamed incident"),
@@ -17411,7 +17418,7 @@ async function fetchGitHubStatus({ url, etag = null, signal = null, fetchImpl = 
   try {
     const response = await fetchImpl(url, { signal: combined, redirect: "follow",
       headers: { accept: "application/json", ...(etag ? { "if-none-match": etag } : {}) } });
-    if (response.status === 304) return { status: "not-modified", etag };
+    if (response.status === 304) return { status: "not-modified" };
     if (!response.ok) return { status: "unavailable", reason: `HTTP ${response.status}` };
     const summary = parseGitHubStatus(JSON.parse(await readBoundedText(response, GITHUB_STATUS_MAX_BYTES)));
     if (!summary) return { status: "unavailable", reason: "unexpected response" };
@@ -17425,24 +17432,24 @@ async function fetchGitHubStatus({ url, etag = null, signal = null, fetchImpl = 
 const GITHUB_COMPONENT_STATUS = Object.freeze({ degraded_performance: "degraded performance",
   partial_outage: "partial outage", major_outage: "major outage", under_maintenance: "under maintenance" });
 
+// `state` is a monitor's current(): the last good summary, kept separately from
+// whether the latest check reached the page.
 function githubStatusLine(state, nowMs = Date.now()) {
   if (!state?.enabled) return state?.reason ?? "GitHub status checks off";
-  const result = state.result;
-  if (!result) return "GitHub status: not checked yet";
-  if (result.status === "unavailable") {
+  if (state.unavailable) {
     return Number.isFinite(state.nextAt)
       ? `GitHub status unavailable; next check ${notificationTime(state.nextAt, nowMs)}`
       : "GitHub status unavailable";
   }
-  const { incidents, components } = result.summary;
+  if (!state.summary) return "GitHub status: not checked yet";
+  const { incidents, components } = state.summary;
   if (incidents.length > 0) {
     const more = incidents.length > 1 ? ` (+${incidents.length - 1} more)` : "";
     return `GitHub incident: ${incidents[0].name}${more}`;
   }
   const degraded = components.filter((component) => component.status !== "operational");
   if (degraded.length > 0) {
-    return `GitHub: ${degraded.map((component) =>
-      `${component.name} ${GITHUB_COMPONENT_STATUS[component.status] ?? component.status}`).join(", ")}`;
+    return `GitHub: ${degraded.map((component) => `${component.name} ${component.label}`).join(", ")}`;
   }
   return "GitHub status: All systems operational";
 }
@@ -17453,7 +17460,7 @@ function githubStatusLine(state, nowMs = Date.now()) {
 // episode. `checkNow` (view open, r, a failing tab) runs at most once a minute.
 function createGitHubStatusMonitor({ config, log, fetchImpl = globalThis.fetch, now = Date.now,
   setTimer = setTimeout, clearTimer = clearTimeout, onChange = () => {} }) {
-  let result = null;
+  let summary = null;
   let etag = null;
   let lastAttemptAt = -Infinity;
   let nextAt = null;
@@ -17462,7 +17469,7 @@ function createGitHubStatusMonitor({ config, log, fetchImpl = globalThis.fetch, 
   let inFlight = null;
   let controller = null;
   let unavailable = false;
-  let open = { incidents: new Map(), components: new Map() };
+  let open = new Map(); // log key -> text of each ongoing incident or outage
 
   function schedule(delay) {
     if (stopped) return;
@@ -17473,29 +17480,19 @@ function createGitHubStatusMonitor({ config, log, fetchImpl = globalThis.fetch, 
     timer?.unref?.();
   }
 
-  function apply(summary, at) {
-    const next = { incidents: new Map(), components: new Map() };
-    for (const incident of summary.incidents) {
-      const key = `github:incident:${incident.id}`;
-      const text = `${incident.name} (${incident.status}, ${incident.impact} impact)`;
-      next.incidents.set(key, text);
-      if (open.incidents.get(key) !== text) {
-        log.record({ key, level: "problem", source: "GitHub status", text, at });
-      }
+  function apply(next, at) {
+    const conditions = new Map([
+      ...next.incidents.map((incident) => [`github:incident:${incident.id}`,
+        `${incident.name} (${incident.status}, ${incident.impact} impact)`]),
+      ...next.components.filter((component) => component.status !== "operational")
+        .map((component) => [`github:component:${component.name}`, `${component.name}: ${component.label}`]),
+    ]);
+    // A changed text is an update of the same open entry, not a new one.
+    for (const [key, text] of conditions) {
+      if (open.get(key) !== text) log.record({ key, level: "problem", source: "GitHub status", text, at });
     }
-    for (const component of summary.components) {
-      if (component.status === "operational") continue;
-      const key = `github:component:${component.name}`;
-      const text = `${component.name}: ${GITHUB_COMPONENT_STATUS[component.status] ?? component.status}`;
-      next.components.set(key, text);
-      if (open.components.get(key) !== text) {
-        log.record({ key, level: "problem", source: "GitHub status", text, at });
-      }
-    }
-    for (const kind of ["incidents", "components"]) {
-      for (const key of open[kind].keys()) if (!next[kind].has(key)) log.end(key, at);
-    }
-    open = next;
+    for (const key of open.keys()) if (!conditions.has(key)) log.end(key, at);
+    open = conditions;
   }
 
   async function check() {
@@ -17512,18 +17509,18 @@ function createGitHubStatusMonitor({ config, log, fetchImpl = globalThis.fetch, 
             text: "GitHub status page unavailable", at });
         }
         unavailable = true;
-        result = outcome;
         schedule(GITHUB_STATUS_BACKOFF_MS);
+      } else if (outcome.status === "not-modified" && !summary) {
+        // Nothing cached to reuse: drop the validator and ask again in a minute.
+        etag = null;
+        schedule(GITHUB_STATUS_MIN_GAP_MS);
       } else {
         if (unavailable) log.end("github:unavailable", at);
         unavailable = false;
         if (outcome.status === "ok") {
           etag = outcome.etag;
-          apply(outcome.summary, at);
-          result = outcome;
-        } else if (result?.status !== "ok") {
-          // A 304 with nothing cached cannot be reused; drop the validator.
-          etag = null;
+          summary = outcome.summary;
+          apply(summary, at);
         }
         schedule(GITHUB_STATUS_INTERVAL_MS);
       }
@@ -17549,8 +17546,8 @@ function createGitHubStatusMonitor({ config, log, fetchImpl = globalThis.fetch, 
       if (timer !== null) clearTimer(timer);
       timer = null;
     },
-    current: () => ({ enabled: Boolean(config?.enabled), reason: config?.reason ?? null, result, nextAt,
-      outage: open.incidents.size > 0 || open.components.size > 0 }),
+    current: () => ({ enabled: Boolean(config?.enabled), reason: config?.reason ?? null, summary,
+      unavailable, nextAt, outage: open.size > 0 }),
   };
 }
 
@@ -19300,15 +19297,14 @@ function App({ onCreateRemote = () => {} } = {}) {
   // GitHub platform status: started only here, inside the mounted dashboard,
   // so --doctor, --version, --help and other non-TUI paths never request it.
   const githubStatusRef = useRef(null);
-  const [githubStatus, setGithubStatus] = useState(() => {
-    const config = githubStatusConfig(process.env, effectiveRuntimeHost());
-    return { enabled: config.enabled, reason: config.reason, result: null, nextAt: null, outage: false, config };
-  });
-  const githubStatusConfigRef = useRef(githubStatus.config);
+  const githubStatusConfigRef = useRef(null);
+  githubStatusConfigRef.current ??= githubStatusConfig(process.env, effectiveRuntimeHost());
+  const [githubStatus, setGithubStatus] = useState(() => ({ enabled: githubStatusConfigRef.current.enabled,
+    reason: githubStatusConfigRef.current.reason, summary: null, unavailable: false, nextAt: null, outage: false }));
   useEffect(() => {
     const monitor = createGitHubStatusMonitor({ config: githubStatusConfigRef.current,
       log: notificationLogRef.current,
-      onChange: () => setGithubStatus((current) => ({ ...current, ...monitor.current() })) });
+      onChange: () => setGithubStatus(monitor.current()) });
     githubStatusRef.current = monitor;
     return () => {
       monitor.stop();
@@ -19872,7 +19868,7 @@ function App({ onCreateRemote = () => {} } = {}) {
   // Table headers alone need two more. The same budget drives navigation.
   const bodyRows = Math.max(1, rows - 6 - (tableVisible && !showHelp ? 2 : 0) - extraLines);
   const notificationRows = Math.max(1, rows - 6);
-  const notificationStatusLine = githubStatusLine(githubStatus, now.getTime());
+  const notificationStatusLine = notificationsOpen ? githubStatusLine(githubStatus, now.getTime()) : "";
   let notificationView = null;
   if (notificationsOpen) {
     // Open waits show when they retry next, from the live cause or hold.

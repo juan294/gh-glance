@@ -72,3 +72,23 @@ Skipped: one shared clock formatter with `dashboardPresentation` (different day 
 - **First check at mount.** The plan lists the 10-minute cadence plus triggers. The monitor also checks once when the dashboard mounts, so an outage colours the badge without opening the view.
 - **Header for an unchecked host or invalid value** reads `GitHub status not checked for <host>`, `GitHub status checks off (GH_GLANCE_GITHUB_STATUS)` or `GH_GLANCE_GITHUB_STATUS value not recognised; GitHub status checks off`.
 - **Spawner sweep.** Every TUI launch in tests and scripts goes through `test/pty/capture.mjs` (`capture`, `captureAsync`, and the scripts `measure-feature-interaction.mjs`, `measure-jev-interaction.mjs`, `test/pty/readme-sample.mjs` import it), whose `captureEnvironment` now sets `GH_GLANCE_GITHUB_STATUS=off` unless a test supplies a value. The other spawners (`--serve`, `--collector-stdio`, `--doctor`, `--version`, argument and package checks) have no TTY or never mount the dashboard; `test/github-status.test.mjs` proves `--version`, `--help` and `--doctor` make zero requests to an override URL.
+
+### Phase 3 independent review (commit `3c6e4ff`)
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | A 304 after an unavailable check left the header "unavailable" for 10 minutes | Fixed: the monitor keeps the last good summary apart from reachability; test "a 304 after an unavailable check restores the last good summary" |
+| 2 | `--help` did not list `GH_GLANCE_GITHUB_STATUS` | Fixed; the non-TUI test asserts it in `--help` output |
+| 3 | No tests for stop() during a fetch or a declared oversize body | Added both |
+| 4 | Coalescing change had no direct log test | Added "an open condition recorded again updates its entry past newer problems" |
+| 5 | Non-TUI test discarded command outcomes | Now asserts `--version` and `--help` output and that `--doctor` reports |
+| 6 | Incident updates raised the repeat count | Fixed: only informational repeats count; an update replaces the text |
+| 7 | An unresolved host (null) still checks github.com | Accepted: an unresolved host means github.com everywhere else in gh-glance (`normalizeHost`, `dashboardTarget`) |
+| 8 | `fetch` ignores `HTTPS_PROXY` | Documented in README with the off switch; adding proxy support is new scope |
+| - | `--doctor` could show the variable | Not done: an override URL is user-supplied and doctor lists only vetted plain values; out of scope |
+
+### Phase 3 simplify pass
+
+Applied: one map of open GitHub conditions and one loop instead of two; the component status label stored once at parse time; `summary` and `unavailable` replace the mixed `result`; the 304 outcome no longer carries an unused validator; the App keeps the config in a ref and stores only `monitor.current()`; the header line is built only while the view is open.
+
+Skipped: Node `mock.timers` instead of the test's fake clock (the explicit clock awaits each check); a "sticky while open" log property instead of the outage override in App (one line in App is simpler than a new log concept); suppressing `onChange` after a 304 (one render per 10 minutes); sharing `readBoundedText` with the Jev reader (outside this plan).

@@ -112,6 +112,17 @@ test("log: end marks the open entry and appends a cleared info entry for non-inf
   assert.equal(log.size(), 4);
 });
 
+test("log: an open condition recorded again updates its entry past newer problems", () => {
+  const log = createNotificationLog({ now: () => 1 });
+  log.record({ key: "github:incident:1", level: "problem", source: "GitHub status", text: "Incident (investigating)" });
+  log.record({ key: "github:component:Actions", level: "problem", source: "GitHub status", text: "Actions: outage" });
+  log.record({ key: "github:incident:1", level: "problem", source: "GitHub status", text: "Incident (identified)" });
+  assert.deepEqual(log.list().map((entry) => [entry.key, entry.text, entry.count]), [
+    ["github:incident:1", "Incident (identified)", 1],
+    ["github:component:Actions", "Actions: outage", 1],
+  ]);
+});
+
 test("log: bound keeps the newest 500 entries and reports truncation", () => {
   const log = createNotificationLog({ now: () => 1 });
   assert.equal(NOTIFICATION_LOG_MAX, 500);

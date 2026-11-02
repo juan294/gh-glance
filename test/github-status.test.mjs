@@ -66,7 +66,7 @@ test("fetchGitHubStatus: operational summary keeps tracked components only", asy
   assert.deepEqual(result.summary.components.map((component) => component.name),
     ["Git Operations", "API Requests", "Actions"]);
   assert.deepEqual(result.summary.incidents, []);
-  assert.equal(githubStatusLine({ enabled: true, result }), "GitHub status: All systems operational");
+  assert.equal(githubStatusLine({ enabled: true, summary: result.summary }), "GitHub status: All systems operational");
 });
 
 test("fetchGitHubStatus: sends the validator and reuses on 304", async () => {
@@ -94,8 +94,11 @@ test("fetchGitHubStatus: incidents touching tracked components, missing fields a
   assert.equal(first.name.includes("\u001b"), false);
   assert.equal(first.impact, "major");
   assert.equal(unnamed.name, "Unnamed incident");
-  assert.match(githubStatusLine({ enabled: true, result }), /^GitHub incident: Disruption with/);
-  assert.match(githubStatusLine({ enabled: true, result }), /\(\+1 more\)$/);
+  const line = githubStatusLine({ enabled: true, summary: result.summary });
+  assert.match(line, /^GitHub incident: Disruption with/);
+  assert.match(line, /\(\+1 more\)$/);
+  assert.equal(githubStatusLine({ enabled: true, summary: { incidents: [], components: result.summary.components } }),
+    "GitHub: Actions partial outage, Issues degraded performance");
 });
 
 test("fetchGitHubStatus: every failure is unavailable", async () => {
@@ -105,6 +108,7 @@ test("fetchGitHubStatus: every failure is unavailable", async () => {
     "bad shape": async () => response(200, { components: "x" }),
     network: async () => { throw new TypeError("fetch failed"); },
     oversize: async () => response(200, `{"components":[],"incidents":[],"pad":"${"x".repeat(300 * 1024)}"}`),
+    "declared oversize": async () => response(200, "{}", { "content-length": String(300 * 1024) }),
   };
   assert.equal(GITHUB_STATUS_MAX_BYTES, 256 * 1024);
   for (const [name, fetchImpl] of Object.entries(cases)) {
@@ -149,7 +153,8 @@ test("monitor: first check, 10-minute cadence, 15-minute backoff, checkNow limit
     now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
   await monitor.ready;
   assert.equal(calls, 1);
-  assert.equal(monitor.current().result.status, "ok");
+  assert.equal(monitor.current().unavailable, false);
+  assert.ok(monitor.current().summary);
   assert.deepEqual(clock.pending(), [600_000]);
   assert.equal(await monitor.checkNow(), false, "within 60 s of the last check");
   assert.equal(calls, 1);
@@ -159,7 +164,7 @@ test("monitor: first check, 10-minute cadence, 15-minute backoff, checkNow limit
   await clock.advance(61_000);
   assert.equal(await monitor.checkNow(), true);
   assert.equal(calls, 3);
-  assert.equal(monitor.current().result.status, "unavailable");
+  assert.equal(monitor.current().unavailable, true);
   assert.deepEqual(clock.pending(), [900_000]);
   assert.match(githubStatusLine(monitor.current(), clock.now()), /^GitHub status unavailable; next check \d\d:\d\d$/);
   // One info entry per unavailable episode.
@@ -211,6 +216,44 @@ test("monitor: incidents and outages begin, update and resolve in the log", asyn
   monitor.stop();
 });
 
+test("monitor: a 304 after an unavailable check restores the last good summary", async () => {
+  const clock = fakeClock();
+  const replies = [() => response(200, summary(), { etag: 'W/"1"' }), () => response(503, ""), () => response(304)];
+  const validators = [];
+  const log = createNotificationLog({ now: clock.now });
+  const monitor = createGitHubStatusMonitor({ config: githubStatusConfig({}, null), log,
+    fetchImpl: async (_url, init) => { validators.push(init.headers["if-none-match"] ?? null); return replies.shift()(); },
+    now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+  await monitor.ready;
+  await clock.advance(600_000);
+  assert.match(githubStatusLine(monitor.current(), clock.now()), /unavailable/);
+  await clock.advance(900_000);
+  assert.deepEqual(validators, [null, 'W/"1"', 'W/"1"']);
+  assert.equal(githubStatusLine(monitor.current(), clock.now()), "GitHub status: All systems operational");
+  const [episode] = log.list();
+  assert.equal(episode.key, "github:unavailable");
+  assert.notEqual(episode.endedAt, null);
+  monitor.stop();
+});
+
+test("monitor: stop() during a fetch aborts it and records nothing", async () => {
+  const clock = fakeClock();
+  let aborted = false;
+  let changes = 0;
+  const log = createNotificationLog({ now: clock.now });
+  const monitor = createGitHubStatusMonitor({ config: githubStatusConfig({}, null), log,
+    fetchImpl: (_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => { aborted = true; reject(init.signal.reason); });
+    }),
+    now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer, onChange: () => { changes += 1; } });
+  monitor.stop();
+  await monitor.ready;
+  assert.equal(aborted, true);
+  assert.equal(changes, 0);
+  assert.equal(log.size(), 0);
+  assert.deepEqual(clock.pending(), []);
+});
+
 test("monitor: disabled configuration never fetches or schedules", async () => {
   const clock = fakeClock();
   let calls = 0;
@@ -234,9 +277,14 @@ test("non-TUI commands never request GitHub status, even with an override URL", 
   const env = { PATH: process.env.PATH, HOME: home, XDG_CONFIG_HOME: home, GH_CONFIG_DIR: home,
     GH_GLANCE_GITHUB_STATUS: `http://127.0.0.1:${server.address().port}/summary.json` };
   const entry = new URL("../index.mjs", import.meta.url).pathname;
-  for (const args of [["--version"], ["--help"], ["--doctor"]]) {
-    await run(process.execPath, [entry, ...args], { env, timeout: 30_000 }).catch(() => {});
-  }
+  const version = await run(process.execPath, [entry, "--version"], { env, timeout: 30_000 });
+  assert.match(version.stdout, /\d+\.\d+\.\d+/);
+  const help = await run(process.execPath, [entry, "--help"], { env, timeout: 30_000 });
+  assert.match(help.stdout, /GH_GLANCE_GITHUB_STATUS=off/);
+  // Doctor may report missing gh setup and exit non-zero here; it must still run to its report.
+  const doctor = await run(process.execPath, [entry, "--doctor"], { env, timeout: 30_000 })
+    .catch((error) => error);
+  assert.match(`${doctor.stdout ?? ""}${doctor.stderr ?? ""}`, /\S/);
   await new Promise((resolve) => setTimeout(resolve, 200));
   assert.equal(requests, 0);
 });
