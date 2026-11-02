@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-02
+
 ### Added
 
 - A fifth section, `5:Notifications` (`Notices` on narrow panes), keeps an
@@ -31,7 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Security "not enabled" notes moved to Notifications, so the table no longer
   moves when they start or end.
 - The tab bar fits five sections on one row: full names from about 98
-  columns, short names below that, and digits with counts on narrow panes.
+  columns, short names below that, digits with counts on narrow panes, and
+  bare digits (keeping the Notifications count) below about 30 columns.
 
 ## [0.18.1] - 2026-10-31
 
@@ -1418,7 +1421,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.18.1...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/juan294/gh-glance/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/juan294/gh-glance/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/juan294/gh-glance/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/juan294/gh-glance/compare/v0.17.0...v0.17.1
