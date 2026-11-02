@@ -567,10 +567,12 @@ function unavailableRemedy(accounts, targetHost) {
   return candidate.length <= MAX_ERR_LENGTH ? candidate : VERDICT_REMEDY.unavailable;
 }
 
+const BUDGET_PAUSE_ERROR = /^API budget paused(?:\s|\()/i;
+
 function formatTabError(error, failureContext = null) {
   if (error == null) return null;
   if (error.kind === "text") return error.text;
-  if (/^API budget paused(?:\s|\()/i.test(error.raw ?? "")) {
+  if (BUDGET_PAUSE_ERROR.test(error.raw ?? "")) {
     return "GitHub checks are paused until the shared API budget allows them";
   }
   if (error.verdict === "other") return error.raw;
@@ -16632,10 +16634,14 @@ function cleanupQueueForResource(queue, resource) {
   return count;
 }
 
+function recoveryResourceLabel(resource) {
+  return resource === "graphql" ? "GraphQL" : resource === "core" ? "Core" : "GitHub";
+}
+
 function presentRecovery(cause, { nowMs = Date.now(), cols = 80, hasSnapshot } = {}) {
   if (!cause) return [];
   const width = Math.max(1, Number.isSafeInteger(cols) ? cols - 1 : 79);
-  const resource = cause.resource === "graphql" ? "GraphQL" : cause.resource === "core" ? "Core" : "GitHub";
+  const resource = recoveryResourceLabel(cause.resource);
   const age = hasSnapshot === false ? "Not checked yet"
     : Number.isFinite(cause.sourceAt) && cause.sourceAt <= nowMs
       ? `cached ${formatDuration(nowMs - cause.sourceAt)}`
@@ -16977,6 +16983,276 @@ function recordRecoveryTransition(scope, event) {
 
 function safeRecordRecoveryTransition(scope, event, write = recordRecoveryTransition) {
   try { return write(scope, event); } catch { return { ok: false, reason: "unavailable" }; }
+}
+
+// ---------- Notifications ----------
+
+// Only causes the user must act on, or that waiting cannot fix, earn rows above
+// a table. Everything else -- automatic retries, refreshes, cleared causes --
+// goes to the Notifications view, so an ordinary wait no longer pushes the
+// table down. Every RECOVERY_COPY key is listed explicitly: the unknown-code
+// fallback below would otherwise hide a new code nobody classified, and
+// test/notifications.test.mjs compares the two key sets.
+const NOTICE_ACTION_CODES = Object.freeze([
+  "unwritable", "corrupt", "capacity", "accounting-overflow", "reservations-invalid",
+  "external-factor-invalid", "pacing-invalid", "budget-resource", "legacy-unresolved",
+  "legacy-corrupt", "restart-required", "throttle-paused", "credential-unavailable",
+  "identity-unavailable", "disconnected", "app-auth", "auth-problem", "unavailable",
+  "backup-conflict", "version-mismatch", "unsafe-permissions", "disk-full",
+]);
+// `coordination` is the fallback copy for unmapped reasons (an external quota
+// drain among them), and `unknown-scope` is the startup login check; the real
+// storage and login failures have their own action codes above.
+const NOTICE_WAIT_CODES = Object.freeze([
+  "busy", "stale", "identity-busy", "transport-busy", "debt-journal-full", "migration-hold",
+  "identity-backoff", "identity-capacity", "budget-unknown", "budget-stale", "budget-future",
+  "probe-failed", "block-unpublished", "budget-reset", "reset", "priority", "rate-limit",
+  "rate-limited", "local-reserve", "reserve", "blocked", "secondary", "secondary-rate-limit",
+  "abuse-limit", "network-outage", "security-incomplete", "receipt-retry", "interrupted-request",
+  "request-queue", "acquisition-busy", "clock-recovery", "source-incomplete", "unknown-scope",
+  "coordination",
+]);
+const NOTICE_LEVELS = Object.freeze(Object.fromEntries([
+  ...NOTICE_ACTION_CODES.map((code) => [code, "action"]),
+  ...NOTICE_WAIT_CODES.map((code) => [code, "wait"]),
+]));
+const VERDICT_NOTICE_LEVELS = Object.freeze({
+  "auth-problem": "action", unavailable: "action", "no-remote": "action", "rate-limited": "wait",
+});
+const NOTIFICATION_LOG_MAX = 500;
+// Tabs whose requests draw on each rate resource; a cause on that resource
+// holds them up. The cost table is fixed, so this is computed once.
+const NOTICE_RESOURCE_TABS = Object.freeze(Object.fromEntries(RATE_RESOURCES.map((resource) =>
+  [resource, TAB_KEYS.filter((key) => tabRequestCost(key)?.[resource] > 0)])));
+const EARLIER_SESSION_SOURCE = "Earlier session";
+
+function noticeLevel({ code = null, verdict = null } = {}) {
+  if (code != null) return Object.hasOwn(NOTICE_LEVELS, code) ? NOTICE_LEVELS[code] : "wait";
+  // Any other verdict is a failed refresh whose raw text is the best report.
+  if (verdict != null) return Object.hasOwn(VERDICT_NOTICE_LEVELS, verdict) ? VERDICT_NOTICE_LEVELS[verdict] : "problem";
+  return "info";
+}
+
+function fetchErrorLevel(error) {
+  if (!error) return null;
+  if (error.kind !== "fetch") return "problem";
+  // A shared-budget pause reaches the tab as an unclassified fetch error.
+  if (BUDGET_PAUSE_ERROR.test(error.raw ?? "")) return "wait";
+  return noticeLevel({ verdict: error.verdict });
+}
+
+// One bounded, in-memory history per pane. Entries hold sanitized display text
+// only. A repeat of the latest entry with the same key coalesces into a count
+// unless a non-info entry from the same source, or one affecting the same tab,
+// came after it; an ended entry never reopens, so a recurring condition reads
+// as a new episode. An entry the bound already dropped cannot be ended, so its
+// "Cleared" line is silently skipped. Earlier-session history is context, not
+// news, so it never raises the badge.
+function createNotificationLog({ max = NOTIFICATION_LOG_MAX, now = Date.now } = {}) {
+  const entries = []; // oldest first
+  let nextId = 1;
+  let seenId = 0;
+  let truncated = false;
+  let cachedSummary = null;
+  let cachedList = null;
+  const changed = () => {
+    cachedSummary = null;
+    cachedList = null;
+  };
+  const timeOr = (value) => Number.isFinite(value) ? value : now();
+  function record({ key, level = "info", source = "", code = null, text = "", action = null,
+    at, lastAt, tabs = [] }) {
+    const firstAt = timeOr(at);
+    const latest = Number.isFinite(lastAt) ? Math.max(lastAt, firstAt) : firstAt;
+    const cleanSource = safe(source);
+    const cleanText = safe(text);
+    let index = -1;
+    for (let i = entries.length - 1; i >= 0; i -= 1) {
+      const entry = entries[i];
+      if (entry.key === key) {
+        if (entry.endedAt === null) index = i;
+        break;
+      }
+      if (entry.level !== "info" && (entry.source === cleanSource ||
+        entry.tabs.some((tab) => tabs.includes(tab)))) break;
+    }
+    if (index >= 0) {
+      const [entry] = entries.splice(index, 1);
+      entry.count += 1;
+      entry.lastAt = Math.max(entry.lastAt, latest);
+      entry.text = cleanText;
+      entries.push(entry);
+    } else {
+      entries.push({ id: nextId, key, level, source: cleanSource, code,
+        text: cleanText, action: action == null ? null : safe(action),
+        firstAt, lastAt: latest, count: 1, endedAt: null, tabs: [...tabs] });
+      nextId += 1;
+      if (entries.length > max) {
+        entries.shift();
+        truncated = true;
+      }
+    }
+    changed();
+  }
+  function end(key, at) {
+    const entry = entries.findLast((candidate) => candidate.key === key);
+    if (!entry || entry.endedAt !== null) return false;
+    entry.endedAt = timeOr(at);
+    changed();
+    if (entry.level !== "info") {
+      record({ key: `${key}:cleared`, level: "info", source: entry.source,
+        text: `Cleared: ${entry.text}`, at: entry.endedAt, tabs: entry.tabs });
+    }
+    return true;
+  }
+  function summary() {
+    if (cachedSummary) return cachedSummary;
+    let unread = 0;
+    let red = false;
+    let yellow = false;
+    for (const entry of entries) {
+      if (entry.level === "info" || entry.source === EARLIER_SESSION_SOURCE || entry.id <= seenId) continue;
+      unread += 1;
+      if (entry.level === "wait") yellow = true;
+      else red = true;
+    }
+    cachedSummary = { unread, tone: red ? "red" : yellow ? "yellow" : "none", truncated, size: entries.length };
+    return cachedSummary;
+  }
+  return {
+    record,
+    end,
+    summary,
+    // Newest first. Shared between calls until the log changes; callers read only.
+    list: () => {
+      cachedList ??= entries.map((entry) => Object.freeze({ ...entry, tabs: Object.freeze([...entry.tabs]) })).reverse();
+      return cachedList;
+    },
+    markSeen: () => {
+      seenId = nextId - 1;
+      changed();
+    },
+    size: () => entries.length,
+  };
+}
+
+// Conditions present in one render's snapshot. The same cause reported by a
+// rate resource and by several tabs is one condition; the resource names it
+// when it has one, because that is where it lives.
+function notificationConditions(snapshot) {
+  const conditions = new Map();
+  // `tabs` names the sections a cause holds up, so a refresh of one of them
+  // after the cause never merges with a refresh from before it.
+  const cause = (reason, source, tabs, detail = null) => {
+    // Same normalization as recoveryCause: unknown reasons use the fallback copy.
+    const code = Object.hasOwn(RECOVERY_COPY, reason) ? reason : "coordination";
+    const [summary, action] = RECOVERY_COPY[code];
+    const key = `cause:${code}`;
+    const existing = conditions.get(key);
+    if (existing) {
+      for (const tab of tabs) if (!existing.tabs.includes(tab)) existing.tabs.push(tab);
+      return;
+    }
+    conditions.set(key, { key, level: noticeLevel({ code }), source, code,
+      text: detail?.summary ?? summary, action: detail?.action ?? action, tabs: [...tabs] });
+  };
+  for (const resource of RATE_RESOURCES) {
+    const recovery = snapshot?.recovery?.[resource];
+    if (recovery?.code) {
+      cause(recovery.code, recoveryResourceLabel(resource), NOTICE_RESOURCE_TABS[resource], recovery);
+    }
+  }
+  for (const tab of TABS) {
+    const state = snapshot?.tabs?.[tab.key];
+    if (!state) continue;
+    if (state.error) {
+      // A budget pause and a real failure share the `other` verdict; the level
+      // keeps them distinct so one never hides the other.
+      const level = fetchErrorLevel(state.error);
+      const key = `fetch:${tab.key}:${level}:${state.error.kind === "fetch" ? state.error.verdict : "text"}`;
+      conditions.set(key, { key, level, source: tab.label, code: null,
+        text: formatTabError(state.error, snapshot.failureContext ?? null) ?? "", action: null, tabs: [tab.key] });
+    }
+    if (state.failure) cause(state.failure, tab.label, [tab.key]);
+    if (state.paused) cause(state.paused, tab.label, [tab.key]);
+  }
+  for (const note of snapshot?.securityNotes ?? []) {
+    const text = safe(note);
+    const key = `security:${text}`;
+    conditions.set(key, { key, level: /not enabled/i.test(text) ? "info" : "wait",
+      source: "Security", code: null, text, action: null, tabs: ["security"] });
+  }
+  if (snapshot?.disconnected) {
+    cause(typeof snapshot.disconnected === "string" ? snapshot.disconnected : "disconnected",
+      "Connection", TAB_KEYS);
+  }
+  return conditions;
+}
+
+// Diff two render snapshots into log events. A condition must persist for the
+// same debounce the inline notice used, so startup and lock-contention blips
+// never become history; `pending` is when the earliest unconfirmed condition
+// becomes due, for the caller to re-check without waiting for another render.
+function diffNotificationSnapshots(previous, current, nowMs) {
+  const prior = previous?.conditions ?? new Map();
+  const conditions = new Map();
+  const begin = [];
+  const end = [];
+  let pending = null;
+  for (const [key, condition] of notificationConditions(current)) {
+    const before = prior.get(key);
+    const since = before?.since ?? nowMs;
+    const begun = Boolean(before?.begun) || nowMs - since >= COORDINATION_NOTICE_AFTER_MS;
+    if (begun && !before?.begun) begin.push({ ...condition, at: since });
+    if (!begun) {
+      const due = since + COORDINATION_NOTICE_AFTER_MS;
+      pending = pending === null ? due : Math.min(pending, due);
+    }
+    conditions.set(key, { since, begun });
+  }
+  for (const [key, before] of prior) if (before.begun && !conditions.has(key)) end.push(key);
+  const lastOk = {};
+  for (const tab of TABS) {
+    const before = previous?.lastOk?.[tab.key];
+    const value = current?.tabs?.[tab.key]?.lastOk;
+    if (!Number.isFinite(value)) {
+      if (Number.isFinite(before)) lastOk[tab.key] = before;
+      continue;
+    }
+    lastOk[tab.key] = value;
+    if (Number.isFinite(before) && value > before) {
+      begin.push({ key: `refreshed:${tab.key}`, level: "info", source: tab.label, code: null,
+        text: `Refreshed ${tab.label}`, action: null, at: value, tabs: [tab.key] });
+    }
+  }
+  return { state: { conditions, lastOk }, begin, end, pending };
+}
+
+// Read-only: earlier recovery transitions become dimmed context in a new pane.
+function seedNotificationsFromJournal(log, scope, read = readRecoveryTransitions) {
+  let journal;
+  try { journal = read(scope); } catch { journal = { status: "unavailable", entries: [] }; }
+  if (journal.status === "missing") return;
+  if (journal.status !== "healthy") {
+    log.record({ key: "journal:unavailable", level: "info", source: EARLIER_SESSION_SOURCE,
+      text: "Earlier recovery history unavailable; run gh-glance --doctor" });
+    return;
+  }
+  const open = {};
+  for (const entry of journal.entries) {
+    const key = `journal:${entry.resource}:${entry.code}`;
+    // The same cause re-journaled for a new origin or tab is one episode here.
+    if (open[entry.resource] === key) continue;
+    if (open[entry.resource]) {
+      log.end(open[entry.resource], entry.at);
+      open[entry.resource] = null;
+    }
+    if (entry.code === "clear") continue;
+    log.record({ key, level: noticeLevel({ code: entry.code }), source: EARLIER_SESSION_SOURCE,
+      code: entry.code, text: `${recoveryResourceLabel(entry.resource)}: ${entry.summary}`,
+      action: entry.action, at: entry.firstAt, lastAt: entry.at });
+    open[entry.resource] = key;
+  }
 }
 
 function recoveryLedgerSummary(scope, resource, nowMs = Date.now()) {
@@ -23083,6 +23359,15 @@ export {
   collectorSourceAdvanced,
   cleanupQueueForResource,
   presentRecovery,
+  RECOVERY_COPY,
+  NOTICE_LEVELS,
+  NOTIFICATION_LOG_MAX,
+  noticeLevel,
+  fetchErrorLevel,
+  createNotificationLog,
+  notificationConditions,
+  diffNotificationSnapshots,
+  seedNotificationsFromJournal,
   dashboardPresentation,
   contextualPanelLayout,
   dashboardTarget,
