@@ -3,8 +3,9 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { createServer } from "node:http";
 
-import { capture, isStatusLine, waitForAwk } from "./capture.mjs";
+import { capture, captureAsync, isStatusLine, waitForAwk } from "./capture.mjs";
 
 const ESC = "\x1b";
 
@@ -130,15 +131,64 @@ test("Notifications keys: 5 opens, Esc and digits return, arrows cycle through f
       "printf 4; sleep .4; printf '\\033[C'; sleep .6; printf '\\033[C'; sleep .6; " +
       // Left from Actions opens Notifications; Esc returns to the last data tab.
       "printf '\\033[D'; sleep .6; printf '\\033'; sleep .8; printf 2; sleep .4; printf 5; sleep .6; " +
+      // Esc with help open over the view closes help; it does not quit.
+      "printf 3; sleep .6; printf 5; sleep .6; printf '?'; sleep .6; printf '\\033'; sleep .8; " +
       "printf 3; sleep .6; printf q",
     configHome: root,
     env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
   });
-  const tabBars = result.raw.split(/\r?\n/).filter((line) => /1:|2:/.test(line));
-  assert.ok(tabBars.some((line) => /\[5:Notices/.test(line)), "Notifications never became active");
+  // Every tab-bar write names the active position; collapse repeats.
+  const active = [...result.raw.matchAll(/\[(\d):/g)].map((match) => Number(match[1]))
+    .filter((position, index, all) => index === 0 || all[index - 1] !== position);
+  // 4, Right to 5, Right wraps to 1, Left back to 5, Esc to the last data tab
+  // (1), 2, 5, then 3 closes the view.
+  assert.deepEqual(active, [1, 4, 5, 1, 5, 1, 2, 5, 3, 5, 3]);
   assert.match(result.finalFrame.lines[0], /\[3:PRs/);
   assert.equal(result.exitCode, 0);
   // Notifications is a view, never a cached data tab.
   const cache = JSON.parse(readFileSync(join(root, "gh-glance", "dashboard-cache.json"), "utf8"));
   for (const target of Object.values(cache.targets)) assert.equal(Object.hasOwn(target.tabs, "notifications"), false);
+});
+
+test("a GitHub incident from the status page turns the badge red, heads the view and clears on r", async (t) => {
+  // First request: an Actions incident. Every later request: resolved.
+  let requests = 0;
+  const server = createServer((_request, reply) => {
+    requests += 1;
+    const incident = requests === 1;
+    reply.setHeader("content-type", "application/json");
+    reply.end(JSON.stringify({
+      status: { indicator: incident ? "major" : "none" },
+      components: [{ name: "Actions", status: incident ? "major_outage" : "operational" }],
+      incidents: incident ? [{ id: "fixture-1", name: "Actions runs delayed", status: "investigating",
+        impact: "major", components: [{ name: "Actions" }] }] : [],
+    }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const root = configRoot(t, "gh-glance-notifications-status-");
+  const result = await captureAsync({
+    cols: 100,
+    rows: 18,
+    signal: "none",
+    settle: 90,
+    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Notifications (") { ok=1 }', 200) +
+      "printf 5; " +
+      waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "GitHub incident: Actions runs delayed") { ok=1 }', 200) +
+      // checkNow runs at most once a minute; r after that asks again.
+      "sleep 62; printf r; " +
+      waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Cleared: Actions runs delayed") { ok=1 }', 200) +
+      "sleep .3; printf q",
+    configHome: root,
+    env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+      GH_GLANCE_GITHUB_STATUS: `http://127.0.0.1:${server.address().port}/api/v2/summary.json` },
+  });
+  assert.match(result.raw, new RegExp(`${ESC}\\[91m 5:Notifications \\(\\d+\\) `));
+  assert.match(result.raw, /GitHub incident: Actions runs delayed/);
+  const view = result.finalFrame.lines.join("\n");
+  assert.match(view, /GitHub status: All systems operational/);
+  assert.match(view, /GitHub status: Cleared: Actions runs delayed/);
+  assert.match(view, /GitHub status: Cleared: Actions: major outage/);
+  assert.equal(requests, 2);
+  assert.equal(result.exitCode, 0);
 });

@@ -474,6 +474,9 @@ function captureEnvironment(env, configHome, animation, icons) {
     ...env,
     HOME: env.HOME ?? configHome,
     GH_CONFIG_DIR: env.GH_CONFIG_DIR ?? configHome,
+    // No capture reaches githubstatus.com; a test that needs the status source
+    // points this at a local fixture server.
+    GH_GLANCE_GITHUB_STATUS: env.GH_GLANCE_GITHUB_STATUS ?? "off",
     GH_GLANCE_CAPTURE_ANIMATION: animation ? "1" : "0",
     GH_GLANCE_CAPTURE_ICONS: icons,
     XDG_CONFIG_HOME: configHome,

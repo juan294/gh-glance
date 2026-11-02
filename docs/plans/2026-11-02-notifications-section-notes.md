@@ -47,3 +47,28 @@
 Applied: shared `recoveryResourceLabel()` (also used by `presentRecovery`); `NOTICE_RESOURCE_TABS` computed once; direct `RECOVERY_COPY` lookup in conditions; `list()` cached until the log changes; `shift()` for the bound; `findLast` in `end()`; removed the `seeded` flag (source decides) and the `note` option (a superseded seeded cause now gets the same "Cleared" line a live one gets); boolean debounce checks.
 
 Skipped: a `budget-paused` verdict in `classify()` (changes retry ladders outside this plan); storing levels as a fourth `RECOVERY_COPY` element (the plan chose the exhaustiveness test); building action codes from `HARD_STORAGE_REASONS` (the exact-set test already catches drift); a single verdict table (the explicit 4-entry table reads more clearly); lazy text building (negligible cost).
+
+### Phase 2 independent review (commit `28f4e28`)
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | Esc with help open over the view quit the app | Fixed: Esc closes help there; covered in the keys PTY case |
+| 2 | Footer offered "Create remote" while the view was open | Fixed: `remoteSetup` hint suppressed in the view |
+| 3 | Events arriving while help covered the view were marked seen | Fixed: `markSeen` only while the view itself is visible |
+| 4 | Keys PTY case did not check each step | Fixed: asserts the full active-position sequence `1,4,5,1,5,1,2,5,3,5,3` |
+| 5 | Cache restart test lost the request-limit cause check | Fixed: an extra interactive capture reads it from the view |
+| 6 | Sustained-notice case asserts a `(\d+)` badge, not `(1)` | Accepted: other waits can share the count; zero rows and view text are covered by `test/pty/notifications.test.mjs` |
+
+### Phase 2 simplify pass
+
+Applied: one five-position navigation (`selectPosition`, `stepPosition`) shared by the view and the data tabs; the sync skips renders whose inputs are identical and re-arms its debounce timer only when the due time changes; `liveRetry` and the log summary are computed only while the view is open; `decisionRetryAt()` replaces two copies of the retry chain; the tab-bar margin is resolved once and the unreachable fallback removed; `notificationViewLines` returns `pageRows` and computes "today" once.
+
+Skipped: one shared clock formatter with `dashboardPresentation` (different day formats); cell-width measurement in `tabBarWidth` (labels are ASCII plus one-cell spinner glyphs); moving PTY test helpers into `capture.mjs` (local helpers are the existing pattern); replacing `notificationBadgeRef` with a functional setState (that still schedules a render, which the ref avoids); one body-level branch for the view instead of per-element guards (larger JSX restructuring for no behavior gain); a simpler first-entry tab-bar regex (the five-digit pattern is stricter against table rows); returning the tone from `criticalInlineLines` and remedy-first ordering in `presentRecovery` (cosmetic; `presentRecovery` is outside this plan).
+
+### Phase 3
+
+- **History order.** Phase 2 fixes and the Phase 3 source were committed together (the fixes landed while Phase 3 was in progress in the same worktree).
+- **Coalescing of open conditions.** An updated GitHub incident is recorded again under the same key. The Phase 1 barrier would have opened a second entry for it, and that entry would never end. Chose: the barrier applies to informational repeats (refreshes) only; a non-info record for an open key always coalesces and replaces the text.
+- **First check at mount.** The plan lists the 10-minute cadence plus triggers. The monitor also checks once when the dashboard mounts, so an outage colours the badge without opening the view.
+- **Header for an unchecked host or invalid value** reads `GitHub status not checked for <host>`, `GitHub status checks off (GH_GLANCE_GITHUB_STATUS)` or `GH_GLANCE_GITHUB_STATUS value not recognised; GitHub status checks off`.
+- **Spawner sweep.** Every TUI launch in tests and scripts goes through `test/pty/capture.mjs` (`capture`, `captureAsync`, and the scripts `measure-feature-interaction.mjs`, `measure-jev-interaction.mjs`, `test/pty/readme-sample.mjs` import it), whose `captureEnvironment` now sets `GH_GLANCE_GITHUB_STATUS=off` unless a test supplies a value. The other spawners (`--serve`, `--collector-stdio`, `--doctor`, `--version`, argument and package checks) have no TTY or never mount the dashboard; `test/github-status.test.mjs` proves `--version`, `--help` and `--doctor` make zero requests to an override URL.

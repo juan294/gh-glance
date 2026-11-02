@@ -302,7 +302,7 @@ stdout isn't a terminal rather than streaming redraw frames into a pipe.
 | Key | Action |
 |---|---|
 | `1` `2` `3` `4` | Jump to Actions / Issues / Pull Requests / Security |
-| `5` | Open Notifications, the pane's status history. `↑` / `↓` and `PgUp` / `PgDn` scroll it; `1`-`4` or `Esc` return to a section. |
+| `5` | Open Notifications, the pane's status history. `↑` / `↓` and `PgUp` / `PgDn` scroll it, `r` checks GitHub's status page, and `1`-`4` or `Esc` return to a section. |
 | `←` / `→` | Previous / next tab (Notifications is the fifth position) |
 | `Tab` / `Shift+Tab` | Next / previous tab |
 | `↑` / `↓` or `j` / `k` | Move the cursor between rows |
@@ -338,6 +338,17 @@ the text; repeats are counted (`x12`), and an open wait shows its next retry.
 History is in memory for the pane, starts with the earlier recovery
 transitions from the shared journal (dimmed, `Earlier session`), and keeps the
 latest 500 events.
+
+The first row of the view is GitHub's own platform status, read from
+`https://www.githubstatus.com/api/v2/summary.json` every 10 minutes (15 after
+a failure), when you open the view, when you press `r` in it, and when a tab
+starts failing (at most once a minute). It is a plain HTTPS request with a
+validator, outside `gh` and the API governor, so it spends no GitHub API
+quota. Only incidents and outages that touch API Requests, Actions, Issues,
+Pull Requests, Git Operations or Webhooks are reported; each one is a problem
+in the list and keeps the badge red until it resolves. The check runs only
+when the target host is `github.com` and is off with
+`GH_GLANCE_GITHUB_STATUS=off` (see [Configuration](#configuration)).
 
 The tab label shows how many waits and problems arrived since you last opened
 the view, for example `5:Notifications (3)`: red when any is a problem or needs
@@ -654,6 +665,7 @@ Environment variables work too, and the flags take precedence:
 | `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN` | Used by the default `gh` provider with `gh`'s host-specific precedence. gh-glance never logs or stores the raw values. One-way credential digests keep private rows access-partitioned; credentials GitHub verifies as the same principal share its quota ledger. App-provider children remove these variables before setting their memory-only installation token. |
 | `GH_CONFIG_DIR` | Selects `gh`'s account configuration and contributes its normalized identity to the cache and governor namespaces. Separate values can isolate simultaneous panes on different accounts; see [No account pinning](#limitations). |
 | `GH_GLANCE_REFRESH=<seconds>` | Minimum active-tab poll interval, 2-3600. Sets the floor for every pane in a shell; `--refresh` takes precedence. See [Rate limit](#rate-limit). |
+| `GH_GLANCE_GITHUB_STATUS=off` | Turn off the GitHub platform status check in Notifications. An `http(s)` URL instead points it at another Statuspage `summary.json` endpoint. Any other value also turns it off and says so in the view. |
 | `GH_GLANCE_ICONS=unicode` | Unicode status glyphs and single-cell text substitutes for Nerd Font row icons |
 | `GH_GLANCE_ICONS=ascii` | ASCII-only status and row icons |
 | `GH_GLANCE_NO_ANIMATION=1` | Stop status and run-state motion. Semantic words such as Watching, Checking, and Paused still report what is happening. |

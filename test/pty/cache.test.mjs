@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { capture } from "./capture.mjs";
+import { capture, waitForAwk } from "./capture.mjs";
 
 const configHome = mkdtempSync(join(tmpdir(), "gh-glance-pty-cache-"));
 const cachePath = join(configHome, "gh-glance", "dashboard-cache.json");
@@ -32,6 +32,7 @@ let warmSecurity;
 let recovered;
 let securityRecovered;
 let isolated;
+let recoveredView;
 try {
   warm = capture({
     cols: 80,
@@ -97,6 +98,17 @@ try {
     env: rateLimited,
     configHome,
   });
+  recoveredView = capture({
+    cols: 80,
+    rows: 24,
+    signal: "none",
+    settle: 20,
+    args: "--repo acme/widget",
+    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Notices (") { ok=1 }', 150) + "printf 5; " +
+      waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "GitHub request limit") { ok=1 }', 150) + "sleep .3; printf q",
+    env: { ...rateLimited, GH_GLANCE_FIXTURE_RATE_REMAINING: "1000", GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
+    configHome,
+  });
 } finally {
   // This exact directory came from the mkdtempSync call above.
   rmSync(configHome, { recursive: true, force: true });
@@ -127,6 +139,8 @@ test("same-target restart keeps cached Actions rows under a live rate-limit erro
   // and does not take rows from the table.
   assert.doesNotMatch(screen, /Core: GitHub request limit/);
   assert.match(screen, /5:Notices \(\d+\)/);
+  // The restart keeps the request-limit cause; it is listed in Notifications.
+  assert.match(screenOf(recoveredView), /(?:Core|Actions): GitHub request limit/);
   assert.match(screen, /Paused 2m0s/);
   assert.match(screen, /ci: pin actions to commit/);
   assert.match(screen, /4 of 4/);

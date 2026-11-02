@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first. It starts with earlier recovery transitions from the shared journal.
   The tab shows an unread count, red for problems and causes that need action,
   yellow for waits.
+- Notifications reports GitHub's platform status from githubstatus.com:
+  incidents and outages for API Requests, Actions, Issues, Pull Requests, Git
+  Operations and Webhooks. It checks every 10 minutes, on opening the view, on
+  `r` in the view and when a tab starts failing, spends no GitHub API quota,
+  runs only for `github.com`, and is off with `GH_GLANCE_GITHUB_STATUS=off`.
 
 ### Changed
 
