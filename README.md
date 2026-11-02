@@ -20,15 +20,15 @@ pane next to your editor) where you want an always-on glance at repo activity
 without switching to the browser.
 
 ```
-[1:Actions (4)]   2:Issues    3:PRs    4:Security
+[1:Actions (4)]  2:Issues   3:PRs   4:Security   5:Notices
 ───────────────────────────────────────────────────────────────────────────
 ╭─ Actions · owner/repo ──────────────────────────────────────────────────╮
 │     TITLE                  │WORKFLOW  │BRANCH        │TIME   │UPDATED   │
 │ ─────────────────────────────────────────────────────────────────────── │
-│ >+  ci: pin actions to com… #443 CI    develop        1m20s   85d ago   │
-│  x  fix: restore the prima… #442 Code… develop        1m28s   85d ago   │
-│  +  chore: bump dependenci… #441 CI    dependa…int-10 30s     85d ago   │
-│  -  docs: update the readme #440 CI    develop        15s     86d ago   │
+│ >+  ci: pin actions to com… #443 CI    develop        1m20s   93d ago   │
+│  x  fix: restore the prima… #442 Code… develop        1m28s   93d ago   │
+│  +  chore: bump dependenci… #441 CI    dependa…int-10 30s     93d ago   │
+│  -  docs: update the readme #440 CI    develop        15s     94d ago   │
 │                                                                         │
 │                                                                         │
 ╰──────────────────────────────────────────────────────────────── 4 of 4 ─╯
@@ -47,7 +47,8 @@ without switching to the browser.
 > red" is answerable without switching to that tab — an `x` means the tab's
 > latest fetch failed, and a `?` in place of the Security count means its
 > endpoints could not be read, which is not the same as there being nothing to
-> report.
+> report. `5:Notices` gains an unread count such as `(3)` when waits or
+> problems arrive while it is closed; see [Notifications](#notifications).
 
 <!-- contract:allow-emoji -- the check/cross above stand in for Nerd Font
      Octicons the app actually draws; they are literal examples, not decoration. -->
@@ -86,7 +87,10 @@ current.
   set may still be incomplete. Code and secret scanning require GitHub Advanced
   Security -- see [Limitations](#limitations).
 - Tab bar with live counts, pinned to the top of the pane above a divider,
-  switchable via `1`-`4`, arrow keys, or `Tab`/`Shift+Tab`
+  switchable via `1`-`5`, arrow keys, or `Tab`/`Shift+Tab`
+- **[Notifications](#notifications)** -- `5` opens the pane's status history:
+  automatic waits, failed refreshes, Security source notes, cleared causes and
+  GitHub's own platform status. Only causes that need you stay above a table
 - Adjustable full-table columns, with visible header grips, a keyboard width
   mode, and preferences kept separately for each tab
 - `lazygit`-style panel frame: the tab name sits in the top border, the
@@ -979,18 +983,20 @@ recurring polling interval. When another live local pane alone owns the lane
 ahead of this pane, the detail says `sharing N` instead. The detail is capped
 at `99m+`.
 
-When a refresh fails, the last successful rows stay visible below the live
-error instead of disappearing. If gh-glance is restarted while GitHub is still
-rate-limiting, it loads the saved rows for that same target immediately. Their
-age remains explicit through the `stale` label, and the rate-limit banner still
-describes the current failed request; cached data never turns a failure into a
-false success.
-After a sustained hold, the notice names the Core or GraphQL cause, the next
-automatic retry or required action, and the age of the last complete source
-observation. A successful budget check, cache load, or heartbeat cannot make
-old rows fresh. A validated unchanged `304` response does count as a new source
-observation. A Security check answered only from capability backoff sends no
-request and does not count. Unknown older spend remains charged until
+When a refresh fails, the last successful rows stay visible instead of
+disappearing. If gh-glance is restarted while GitHub is still rate-limiting, it
+loads the saved rows for that same target immediately. Their age remains
+explicit through the `stale` label, and the footer still reports the current
+hold; cached data never turns a failure into a false success. A rate limit
+retries automatically, so it does not take rows from the table: a sustained
+hold is listed in [Notifications](#notifications) with its cause (Core,
+GraphQL, or the tab that hit it) and next automatic retry, and the badge turns
+yellow. Only a hold that needs you, such as a repeated limit that waits for
+`r`, stays above the table with its action and the age of the last complete
+source observation. A successful budget check, cache load, or heartbeat cannot
+make old rows fresh. A validated unchanged `304` response does count as a new
+source observation. A Security check answered only from capability backoff
+sends no request and does not count. Unknown older spend remains charged until
 owner/child quiescence and a later matching observer establish safe retirement.
 A verified new system boot can establish that boundary for otherwise
 unidentifiable older children; the app does not assume a restart or reset alone
@@ -1099,9 +1105,12 @@ monitor makes no GitHub request or coordination write.
 - **Security tab**: code scanning and secret scanning alerts require [GitHub
   Advanced Security](https://docs.github.com/en/code-security/getting-started/github-security-features).
   On repos/plans without it, `gh-glance` doesn't crash or spam errors -- it
-  says so in a single collapsed line -- `Code scanning, Secret scanning: not
-  enabled here` -- and still displays whatever it *can* get (Dependabot alerts
-  work independently of GHAS). If your repo has GHAS enabled, those alerts just
+  lists each disabled source, such as `Code scanning: not enabled (needs GitHub
+  Advanced Security)`, in [Notifications](#notifications) instead of above the
+  table (when no alerts are shown, the Security panel collapses them into one
+  line such as `Code scanning, Secret scanning: not enabled here`), and still
+  displays whatever it *can* get (Dependabot alerts work independently of
+  GHAS). If your repo has GHAS enabled, those alerts just
   show up automatically -- no configuration needed.
 
   If the alert endpoints cannot be read at all -- an expired SAML session, a
@@ -1186,11 +1195,11 @@ GH_GLANCE_ICONS=ascii gh-glance
 | `GraphQL: Could not resolve to a Repository...` in older gh-glance versions | The response has the same ambiguity: a missing or renamed target, or a private repository not visible to the active account. Run `gh-glance --doctor --probe`. |
 | Actions says `not available for this repository` while Repository access is `ok` | The repository resolved, but that endpoint is unavailable; inspect the corresponding `--doctor --probe` block. |
 | Row icons are blank boxes | Your terminal font is not a Nerd Font. Use `GH_GLANCE_ICONS=unicode`. |
-| Security tab shows a "not enabled" note | Code scanning and secret scanning need GitHub Advanced Security. Dependabot alerts work independently. The note now appears only when the feature genuinely is unavailable: auth, SSO and network failures show the real error instead. |
+| Notifications lists a Security "not enabled" note | Code scanning and secret scanning need GitHub Advanced Security. Dependabot alerts work independently. The note appears only when the feature genuinely is unavailable: auth, SSO and network failures show the real error instead. |
 | `none of the git remotes ... point to a known GitHub host` | `gh` is not authenticated for that host. Run `gh auth login --hostname <host>`. |
 | Security tab empty on an enterprise host in an older gh-glance version | Older versions could route alert endpoints separately. Current gh-glance routes every API call and the governor to one effective host; use `--repo host/owner/name`, `GH_HOST`, or a qualified `GH_REPO`, then confirm the resolved host with `--doctor`. |
 | Tabs start failing after working for a while | The enterprise SAML session lapsed. Re-authorize in the browser; the dashboard recovers within about 30 seconds. Run `gh-glance --doctor --probe` to confirm. |
-| A tab's count is red | That tab's last fetch failed. The error itself is shown when you switch to it, translated into what to do about it where `gh-glance` recognises the failure. |
+| A tab's count is red | That tab's last fetch failed. The error is listed in Notifications (`5`); when it needs you (login, repository or endpoint access), it also stays above that tab's table, translated into what to do about it where `gh-glance` recognises the failure. |
 | Security tab shows `?` instead of a number | The alert endpoints could not be read at all -- an expired SAML session, a token without `security_events`, or an org OAuth restriction. `?` means "unknown", not "zero"; run `gh-glance --doctor --probe` to see which probe failed and how it was classified. |
 | `Watching` with `next 2m` | The active tab has a shared budget probe or safe grant scheduled. The interval names this grant only; it is not a recurring polling interval. Pressing `r` raises safe priority but cannot bypass the lane or reserve. |
 | `Shared` | This pane is using a generation acquired for matching local subscribers. This is coalescing, not quota scarcity. |
@@ -1198,7 +1207,7 @@ GH_GLANCE_ICONS=ascii gh-glance
 | `Paused` without a reset time | Budget or coordinator evidence is unknown, corrupt, locked, or unwritable. No data call is started. Run `gh-glance --doctor`; also check the config directory permissions and whether another live process owns its private lock. |
 | `--doctor` reports an acquisition lock as `orphaned` | A dead owner or an aged incomplete lock record was found. A running pane retries recovery through the private lock protocol; plain doctor only inspects it. If the state does not change, inspect the reported lock age and the config directory permissions. |
 | `--doctor` reports an acquisition lock as `busy` | A live or unconfirmed owner, or a recent incomplete lock record, is present. Keep the other pane running and check again after the reported age advances; plain doctor does not steal a lock. |
-| Rows stay old while the footer shows a coordination reason | The rows remain last-known-good data. The reason persists until a valid shared snapshot or completed cleanup clears that acquisition failure; a healthy rate-budget probe alone does not prove that acquisition succeeded. The footer shows the source age and the notice line gives the longer reason. |
+| Rows stay old while the footer shows a coordination reason | The rows remain last-known-good data. The reason persists until a valid shared snapshot or completed cleanup clears that acquisition failure; a healthy rate-budget probe alone does not prove that acquisition succeeded. The footer shows the source age and Notifications (`5`) gives the longer reason. |
 | A failing tab seems to have stopped retrying | Recognized endpoint failures back off rather than re-spawning `gh` at the floor. Press `r` to request a higher-priority retry, or `R` to also clear the endpoint backoff; either way the retry waits for a safe grant, so the tab remains Watching or Paused. |
 | `unknown argument: -v` | `-v` used to mean `--version` and no longer does, because this CLI also has `--verbose`. Use `--version` or `--verbose` explicitly. |
 | Cached rows plus `Paused`, `Stale`, or `Disconnected` | The rows are last-known-good data while the live source is blocked, overdue, or unavailable. A cache read never advances source success. The footer never calls stale or disconnected rows `Watching`. |
