@@ -12362,6 +12362,7 @@ const { version } = JSON.parse(readFileSync(new URL("./package.json", import.met
 // this file already applies to argv vectors and to classify().
 const KEY_TABLE = [
   ["1 2 3 4", "Actions / Issues / Pull requests / Security"],
+  ["5", "Notifications: status history; Up / Down scroll, Esc returns"],
   ["Left / Right", "Previous / next tab"],
   ["Tab / Shift+Tab", "Next / previous tab"],
   ["Up / Down, j / k", "Move the cursor between rows"],
@@ -12391,6 +12392,7 @@ const HELP_PRIORITY = [
   "Enter",
   "Up / Down, j / k",
   "1 2 3 4",
+  "5",
   "w",
   "?",
   "Left / Right",
@@ -16823,6 +16825,7 @@ function contextHelpPages({ view, target, tab, remoteSetup = false }, keys = key
     issues: "Issues shows open issues in the selected repository.",
     prs: "Pull requests shows open requests to merge changes into the selected repository.",
     security: "Security shows alerts returned by the checked sources; unavailable sources can hide alerts.",
+    notifications: "Notifications lists status events for this pane: waits, refreshes, failures and cleared causes.",
   };
   const title = remoteSetup ? "No GitHub remote found" : view.title;
   const action = remoteSetup ? "Close help with ?, then Enter to start gh repo create; or restart with gh-glance --repo owner/name."
@@ -17255,6 +17258,62 @@ function seedNotificationsFromJournal(log, scope, read = readRecoveryTransitions
   }
 }
 
+// The rows a visible table gives up: an action cause's recovery lines (after
+// the usual debounce) or an action fetch verdict's one-line remedy. Waits,
+// failed refreshes and history go to the Notifications view instead.
+function criticalInlineLines({ cause = null, showCause = false, tabError = null, displayError = "",
+  capacity = 0, nowMs = Date.now(), cols = 80, hasSnapshot } = {}) {
+  let lines = [];
+  let source = null;
+  if (showCause && cause && noticeLevel({ code: cause.code }) === "action") {
+    lines = presentRecovery(cause, { nowMs, cols, hasSnapshot });
+    source = "cause";
+  } else if (tabError && displayError && fetchErrorLevel(tabError) === "action") {
+    lines = [displayError];
+    source = "error";
+  }
+  if (capacity < 1 || lines.length === 0) return { lines: [], source: null };
+  // On a one-row pane the remedy outranks the summary.
+  return { lines: capacity === 1 && lines.length > 1 ? [lines[1]] : lines.slice(0, capacity), source };
+}
+
+function notificationTime(at, nowMs) {
+  const date = new Date(at);
+  const pad = (value) => String(value).padStart(2, "0");
+  const day = date.toDateString() === new Date(nowMs).toDateString() ? ""
+    : `${pad(date.getMonth() + 1)}-${pad(date.getDate())} `;
+  return `${day}${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+// The Notifications body: a GitHub status row, then events newest first. Open
+// waits show their live retry time (`liveRetry`, keyed by cause code) because
+// the time a condition began says nothing about when it will clear. Ended,
+// informational and earlier-session entries are dimmed.
+function notificationViewLines({ entries, statusLine, nowMs = Date.now(), capacity, offset = 0,
+  liveRetry = {}, profile = ICON_PROFILE === "ascii" ? "ascii" : "unicode" }) {
+  const glyphs = REFRESH_STATUS_GLYPHS[profile] ?? REFRESH_STATUS_GLYPHS.unicode;
+  const glyph = { action: glyphs.failed, problem: glyphs.failed, wait: glyphs.paused, info: glyphs.watching };
+  const rows = Math.max(1, capacity);
+  const listRows = Math.max(0, rows - 1);
+  const maxOffset = Math.max(0, entries.length - listRows);
+  const start = Math.min(Math.max(0, offset), maxOffset);
+  const lines = [{ text: statusLine, level: "status", dim: false }];
+  if (entries.length === 0) lines.push({ text: "No events yet", level: "info", dim: true });
+  for (const entry of entries.slice(start, start + listRows)) {
+    const open = entry.endedAt === null;
+    const retryAt = open && entry.code ? liveRetry[entry.code] : null;
+    const retry = Number.isFinite(retryAt) ? `; next ${statusInterval(retryAt, nowMs)}` : "";
+    const action = entry.level === "action" && entry.action ? `; ${entry.action}` : "";
+    const count = entry.count > 1 ? ` x${entry.count}` : "";
+    lines.push({
+      text: `${notificationTime(entry.lastAt, nowMs)} ${glyph[entry.level] ?? glyph.info} ${entry.source}: ${entry.text}${action}${retry}${count}`,
+      level: entry.level,
+      dim: !open || entry.level === "info" || entry.source === EARLIER_SESSION_SOURCE,
+    });
+  }
+  return { lines: lines.slice(0, rows), offset: start, maxOffset };
+}
+
 function recoveryLedgerSummary(scope, resource, nowMs = Date.now()) {
   if (!scope?.path || !RATE_RESOURCES.includes(resource)) return null;
   const loaded = readGovernorState(scope.path, nowMs, { persistMigration: false });
@@ -17662,63 +17721,86 @@ const MIN_TABLE_WIDTH = Math.max(...TABS.map((t) => minimumWidthFor(t.header)));
 // status line survive at any width a terminal is realistically set to.
 const MIN_COMPACT_WIDTH = Math.max(...TABS.map((t) => minimumWidthFor(t.compactHeader)));
 
-// The tab bar is laid out independently of the table and wraps at its own
-// width. Full labels need ~77 columns; short labels ~57. Hysteresis on the
+// The tab bar is laid out independently of the table. Full labels for the five
+// sections need ~97 columns; short labels ~77. Hysteresis on the full/short
 // breakpoint so a pane parked exactly on it does not flip labels on every
-// resize event and defeat the unchanged-frame optimization.
-const TAB_LABEL_FULL_WIDTH = 78;
+// resize event and defeat the unchanged-frame optimization. Below the short
+// width the bar drops names and keeps digits and counts (see tabBarEntries).
+const TAB_LABEL_FULL_WIDTH = 98;
 const TAB_LABEL_HYSTERESIS = 4;
+const NOTIFICATIONS_LABEL = Object.freeze({ full: "Notifications", short: "Notices" });
 
 function tabFailureSuffix({ count, failed, brokenCI }) {
   if (count == null) return failed ? " x" : "";
   return ` (${count}${brokenCI ? "!" : ""}${failed ? "x" : ""})`;
 }
 
-function TabBar({ activeIndex, counts, brokenCI, firstLoad, failed, spin, useShort }) {
+function tabBarWidth(entries) {
+  return entries.reduce((sum, entry, index) =>
+    sum + entry.label.length + (index < entries.length - 1 ? entry.margin : 0), 0);
+}
+
+// Four data sections plus Notifications on one row. The widest tier that fits
+// `cols` wins: full names, short names, then digits with counts only, so every
+// section key stays visible down to a 40-column pane.
+function tabBarEntries({ cols, counts, brokenCI, firstLoad, failed, spin, useShort, activeIndex,
+  notifications = { unread: 0, tone: "none" } }) {
+  const sections = TABS.map((tab) => {
+    const count = counts[tab.key];
+    // A tab that has never resolved shows the spinner where its count will
+    // go, so the first load reads as "working" rather than "empty".
+    const suffix = count == null && firstLoad[tab.key] ? ` ${spin}`
+      : tabFailureSuffix({ count, failed: failed[tab.key], brokenCI: count == null ? false : brokenCI[tab.key] });
+    // A tab whose fetches are failing kept rendering its last good count at
+    // full confidence, and the error banner is only visible on the tab you
+    // have selected -- so a background tab could fail for an hour with
+    // nothing on screen to say so.
+    return { key: tab.key, full: tab.label, short: tab.short, suffix,
+      color: failed[tab.key] ? "redBright" : undefined, quiet: !failed[tab.key] };
+  });
+  const { unread, tone } = notifications;
+  sections.push({ key: "notifications", ...NOTIFICATIONS_LABEL,
+    suffix: unread > 0 ? ` (${unread})` : "",
+    color: tone === "red" ? "redBright" : tone === "yellow" ? ATTENTION : undefined,
+    quiet: tone !== "red" && tone !== "yellow" });
+  const build = (tier) => sections.map((section, index) => {
+    const active = index === activeIndex;
+    const body = tier === "compact" ? `${index + 1}${section.suffix.trimStart()}`
+      : `${index + 1}:${section[tier]}${section.suffix}`;
+    // Bold and inverse are both stripped at chalk level 0 (NO_COLOR, or a
+    // dumb terminal), which left no indication at all of which tab was
+    // selected. Brackets survive; the padding they replace keeps the width
+    // identical, so the bar does not shift between the two modes.
+    return { key: section.key, active, label: active ? `[${body}]` : ` ${body} `,
+      margin: tier === "full" ? 2 : 1, color: section.color, dim: !active && section.quiet };
+  });
+  const tiers = useShort ? ["short", "compact"] : ["full", "short", "compact"];
+  for (const tier of tiers) {
+    const entries = build(tier);
+    if (tier === "compact" || tabBarWidth(entries) <= cols) return entries;
+  }
+  return build("compact");
+}
+
+function TabBar({ entries }) {
   return e(
     Box,
     { flexDirection: "row" },
-    ...TABS.map((tab, i) => {
-      const active = i === activeIndex;
-      const count = counts[tab.key];
-      // A tab that has never resolved shows the spinner where its count will
-      // go, so the first load reads as "working" rather than "empty".
-      const suffix =
-        count == null
-          ? firstLoad[tab.key]
-            ? ` ${spin}`
-            : tabFailureSuffix({ count, failed: failed[tab.key], brokenCI: false })
-          : tabFailureSuffix({
-              count,
-              failed: failed[tab.key],
-              brokenCI: brokenCI[tab.key],
-            });
-      const name = useShort ? tab.short : tab.label;
-      // Bold and inverse are both stripped at chalk level 0 (NO_COLOR, or a
-      // dumb terminal), which left no indication at all of which tab was
-      // selected. Brackets survive; the padding they replace keeps the width
-      // identical, so the bar does not shift between the two modes.
-      const label = active ? `[${i + 1}:${name}${suffix}]` : ` ${i + 1}:${name}${suffix} `;
-      return e(
-        Box,
-        { key: tab.key, marginRight: 2 },
-        e(
-          Text,
-          {
-            bold: active,
-            inverse: active,
-            // A tab whose fetches are failing kept rendering its last good
-            // count at full confidence, and the error banner is only visible on
-            // the tab you have selected -- so a background tab could fail for an
-            // hour with nothing on screen to say so.
-            color: failed[tab.key] ? "redBright" : undefined,
-            dimColor: !active && !failed[tab.key],
-            wrap: "truncate-end",
-          },
-          label,
-        ),
-      );
-    }),
+    ...entries.map((entry, index) => e(
+      Box,
+      { key: entry.key, marginRight: index < entries.length - 1 ? entry.margin : 0 },
+      e(
+        Text,
+        {
+          bold: entry.active,
+          inverse: entry.active,
+          color: entry.color,
+          dimColor: entry.dim,
+          wrap: "truncate-end",
+        },
+        entry.label,
+      ),
+    )),
   );
 }
 
@@ -18915,6 +18997,57 @@ function App({ onCreateRemote = () => {} } = {}) {
   const { isRawModeSupported } = useStdin();
   const { exit, suspendTerminal } = useApp();
   const [activeIndex, setActiveIndex] = useState(runtime.initialTabIndex);
+  // Notifications is a view, not a data tab: `activeIndex` keeps naming the
+  // last data tab, so polling, cache and per-tab state never see a fifth key.
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const notificationsOpenRef = useRef(notificationsOpen);
+  notificationsOpenRef.current = notificationsOpen;
+  const [notificationsOffset, setNotificationsOffset] = useState(0);
+  const notificationLogRef = useRef(null);
+  notificationLogRef.current ??= createNotificationLog();
+  // Only the badge lives in state, and it changes only when the unread count or
+  // tone does: routine refreshes never re-render a closed view, which keeps an
+  // idle dashboard's frames byte-identical.
+  const [notificationBadge, setNotificationBadge] = useState(() => notificationLogRef.current.summary());
+  const notificationBadgeRef = useRef(notificationBadge);
+  const [, setNotificationVersion] = useState(0);
+  const notificationSnapshotRef = useRef(null);
+  const notificationDiffRef = useRef(null);
+  const notificationTimerRef = useRef(null);
+  const syncNotificationsRef = useRef(null);
+  syncNotificationsRef.current = () => {
+    const log = notificationLogRef.current;
+    const nowMs = Date.now();
+    const result = diffNotificationSnapshots(notificationDiffRef.current, notificationSnapshotRef.current, nowMs);
+    notificationDiffRef.current = result.state;
+    for (const event of result.begin) log.record(event);
+    for (const key of result.end) log.end(key, nowMs);
+    clearTimeout(notificationTimerRef.current);
+    // A condition can become due with nothing else re-rendering the pane.
+    notificationTimerRef.current = result.pending === null ? null
+      : setTimeout(() => syncNotificationsRef.current?.(), Math.max(0, result.pending - nowMs));
+    notificationTimerRef.current?.unref?.();
+    if (notificationsOpenRef.current && (result.begin.length > 0 || result.end.length > 0)) {
+      log.markSeen();
+      setNotificationVersion((version) => version + 1);
+    }
+    const badge = log.summary();
+    if (badge.unread !== notificationBadgeRef.current.unread || badge.tone !== notificationBadgeRef.current.tone) {
+      notificationBadgeRef.current = badge;
+      setNotificationBadge(badge);
+    }
+  };
+  useEffect(() => { syncNotificationsRef.current(); });
+  const notificationPageRef = useRef({ pageRows: 1, maxOffset: 0 });
+  const openNotifications = () => {
+    notificationLogRef.current.markSeen();
+    setNotificationsOffset(0);
+    setNotificationsOpen(true);
+  };
+  useEffect(() => () => {
+    clearTimeout(notificationTimerRef.current);
+    syncNotificationsRef.current = null;
+  }, []);
   const [preferencePath] = useState(() => widthPreferencesPath());
   const [loadedWidthPreferences] = useState(() => loadWidthPreferences(preferencePath));
   const [widthOverrides, setWidthOverrides] = useState(() => loadedWidthPreferences.preferences);
@@ -19313,10 +19446,6 @@ function App({ onCreateRemote = () => {} } = {}) {
       activeGovernorDecision?.notBefore ?? null,
     origin: tabError ? "source" : "coordination", tab: tabError ? tab.key : null,
   }) : null);
-  const recoveryLines = showCoordinationNotice && noticeCause
-    ? presentRecovery(noticeCause, { nowMs: now.getTime(), cols, hasSnapshot: items !== null })
-    : [!remoteSetup && displayError ? displayError : ""];
-  const noticeTone = showCoordinationNotice ? ATTENTION : displayError ? ERROR_TEXT : undefined;
   // Data can be arbitrarily old without anything on screen saying so: a failing
   // poll only surfaces on the tab you have selected, and after a laptop sleep
   // every pane is plausible and wrong. Threshold-gated and minute-granular on
@@ -19414,34 +19543,67 @@ function App({ onCreateRemote = () => {} } = {}) {
       : ['CI evidence',...ciLines].flatMap(line=>wrapPanelText(line,Math.max(1,cols-5))).slice(0,Math.max(1,rows-6))
     : contextualPanelLayout(presentation, { cols, rows });
 
+  // One snapshot per render feeds the notification history; diffing it in an
+  // effect avoids instrumenting every error, recovery and Security-note writer.
+  notificationSnapshotRef.current = {
+    tabs: Object.fromEntries(TABS.map(({ key }) => {
+      const decision = governorDecisions[key];
+      return [key, { lastOk: lastOkRef.current[key] ?? null, error: errors[key],
+        failure: acquisitionFailures[key] ?? null,
+        paused: decision?.mode === "paused" || decision?.coordinationError ? decision.reason ?? null : null }];
+    })),
+    recovery: recoveryCauses,
+    securityNotes,
+    failureContext,
+    disconnected: statusDisconnected ? runtime.connect === null ? "identity-unavailable"
+      : activeGovernorDecision?.reason === "app-auth" ? "app-auth" : "disconnected" : null,
+  };
+
   const tableVisible = !ciView && !attentionView && Array.isArray(items) && items.length > 0;
   const tableNoticeCapacity = Math.max(0, rows - 9);
-  const needsTableContext = ["failed", "overdue", "waiting"].includes(presentation.state);
-  const shortAction = /gh-glance --doctor/.test(presentation.action) ? "gh-glance --doctor"
-    : /gh auth/.test(presentation.action) ? "Run gh auth status" : presentation.action;
-  const tableNotices = needsTableContext
-    ? tableNoticeCapacity < 4
-      ? tableNoticeCapacity === 1 ? [shortAction]
-        : showCoordinationNotice && noticeCause
-          ? [noticeCause.summary, shortAction, presentation.sourceCheck]
-          : [shortAction, presentation.sourceCheck, presentation.title]
-      : [presentation.title, presentation.sourceCheck, ...recoveryLines.filter(Boolean)]
-    : recoveryLines;
+  // Only what needs the user's hand takes rows from a visible table; every
+  // other status event is in the Notifications view.
+  const critical = criticalInlineLines({ cause: noticeCause, showCause: showCoordinationNotice,
+    tabError: remoteSetup ? null : tabError, displayError, capacity: tableNoticeCapacity,
+    nowMs: now.getTime(), cols, hasSnapshot: items !== null });
+  const noticeTone = critical.source === "cause" ? ATTENTION : critical.source === "error" ? ERROR_TEXT : undefined;
   const featureLines = focus ? [presentation.title, ...(focus.error ? [focus.error] : []),
     ...focusDisclosureLines(focusMessage,focus.semantic?.message).flatMap(line=>line.split(/(?<=\.) /u)), ...featureKeyLines(focus)]
     .flatMap(line=>wrapPanelText(line, Math.max(1,cols-5))) : [];
-  const noticeLines = [...new Set([...(focus ? featureLines : []), ...(showCoordinationNotice ? tableNotices : []),
+  const noticeLines = [...new Set([...(focus ? featureLines : []), ...critical.lines,
     ...(setupView?.title ? [setupView.title, setupView.action, ...setupView.notes] : []),
-    ...tableNotices, ...(!focus && featureNotice ? [featureNotice] : [])])].filter(Boolean).slice(0, tableNoticeCapacity);
-  const visibleSecurityLines = tab.key === "security"
-    ? securityLines.slice(0, Math.max(0, tableNoticeCapacity - noticeLines.length)) : [];
-  const extraLines = !showHelp && !remoteSetup && tableVisible
-    ? noticeLines.length + visibleSecurityLines.length : 0;
+    ...(!focus && featureNotice ? [featureNotice] : [])])].filter(Boolean).slice(0, tableNoticeCapacity);
+  const extraLines = !showHelp && !remoteSetup && tableVisible ? noticeLines.length : 0;
   // Tab strip, divider, frame edges, footer and terminal guard use six rows.
   // Table headers alone need two more. The same budget drives navigation.
   const bodyRows = Math.max(1, rows - 6 - (tableVisible && !showHelp ? 2 : 0) - extraLines);
+  // Open waits show when they retry next, from the live cause or hold.
+  const liveRetry = {};
+  for (const cause of Object.values(recoveryCauses)) {
+    if (cause?.code && Number.isFinite(cause.retryAt)) liveRetry[cause.code] = cause.retryAt;
+  }
+  for (const decision of Object.values(governorDecisions)) {
+    const retryAt = decision?.retryAt ?? decision?.resetMs ?? decision?.notBefore;
+    if (decision?.reason && Number.isFinite(retryAt)) liveRetry[decision.reason] ??= retryAt;
+  }
+  const notificationRows = Math.max(1, rows - 6);
+  const notificationStatusLine = "GitHub status: not checked yet";
+  const notificationView = notificationsOpen ? notificationViewLines({
+    entries: notificationLogRef.current.list(), statusLine: notificationStatusLine, nowMs: now.getTime(),
+    capacity: notificationRows, offset: notificationsOffset, liveRetry,
+  }) : null;
+  notificationPageRef.current = { pageRows: Math.max(1, notificationRows - 1),
+    maxOffset: notificationView?.maxOffset ?? 0 };
   let helpPages = [];
-  if (showHelp) {
+  if (showHelp && notificationsOpen) {
+    helpPages = contextHelpPages({ view: {
+      title: NOTIFICATIONS_LABEL.full,
+      action: "Press 1-4 or Esc to return to a section; Up/Down scroll.",
+      sourceCheck: notificationStatusLine,
+      explanation: "Lines above a table appear only when you must act. Waits, refreshes, failed refreshes and cleared causes are listed here, newest first.",
+      notes: [],
+    }, target: selectedTarget, tab: "notifications" }, keyTableLines(), cols - 5, bodyRows);
+  } else if (showHelp) {
     const fullDiagnostic = formatTabError(tabError, failureContext);
     const helpView = { ...presentation, notes: [
       ...(fullDiagnostic ? [fullDiagnostic] : []),
@@ -19878,6 +20040,35 @@ function App({ onCreateRemote = () => {} } = {}) {
         }
         // Width mode owns every other key. In particular, digits, arrows, Tab,
         // Enter and r must never fall through to their ordinary meanings.
+      } else if (notificationsOpenRef.current && !showHelpRef.current) {
+        // The view owns its keys; data-tab actions (Enter, /, s, g, w, d, a)
+        // have nothing to act on here and are ignored rather than applied to
+        // the hidden tab.
+        const { pageRows, maxOffset } = notificationPageRef.current;
+        if (input === "?") {
+          setHelpPage(0);
+          setShowHelp(true);
+        } else if (key.escape) {
+          setNotificationsOpen(false);
+        } else if (input.length === 1 && input >= "1" && input <= String(TABS.length)) {
+          setNotificationsOpen(false);
+          setActiveIndex(Number(input) - 1);
+        } else if (key.tab && key.shift || key.leftArrow) {
+          setNotificationsOpen(false);
+          setActiveIndex(TABS.length - 1);
+        } else if (key.tab || key.rightArrow) {
+          setNotificationsOpen(false);
+          setActiveIndex(0);
+        } else if (key.downArrow || input === "j" || key.upArrow || input === "k" || key.pageDown || key.pageUp) {
+          const step = key.pageDown ? pageRows : key.pageUp ? -pageRows
+            : key.downArrow || input === "j" ? 1 : -1;
+          setNotificationsOffset((current) => Math.max(0, Math.min(maxOffset, current + step)));
+        } else if (input === "r" || input === "R") {
+          // Until GitHub status checks exist, r keeps refreshing the last data tab.
+          const request = manualRefreshRequest(refreshIntent(input));
+          if (request) retryPausedTransport(runtimeIdentityCoordinator);
+          if (request) fetchTabRef.current?.(TABS[activeIndexRef.current].key, request);
+        }
       } else if (key.escape && showHelpRef.current && featureRef.current) {
         setShowHelp(false);
       } else if (key.escape && featureRef.current?.semantic?.consent) {
@@ -20019,14 +20210,17 @@ function App({ onCreateRemote = () => {} } = {}) {
         // no local coordinator; its collector resumes on the refresh it receives.
         if (request) retryPausedTransport(runtimeIdentityCoordinator);
         if (request) fetchTabRef.current?.(TABS[activeIndexRef.current].key, request);
+      } else if (input === String(TABS.length + 1)) {
+        openNotifications();
       } else if (input.length === 1 && input >= "1" && input <= String(TABS.length)) {
         setActiveIndex(Number(input) - 1);
-      } else if (key.tab && key.shift) {
-        setActiveIndex((i) => (i - 1 + TABS.length) % TABS.length);
+      } else if (key.tab && key.shift || key.leftArrow) {
+        // Five positions: the first data tab steps back to Notifications.
+        if (activeIndexRef.current === 0) openNotifications();
+        else setActiveIndex((i) => i - 1);
       } else if (key.tab || key.rightArrow) {
-        setActiveIndex((i) => (i + 1) % TABS.length);
-      } else if (key.leftArrow) {
-        setActiveIndex((i) => (i - 1 + TABS.length) % TABS.length);
+        if (activeIndexRef.current === TABS.length - 1) openNotifications();
+        else setActiveIndex((i) => i + 1);
       }
     },
     // `isActive` has to be coerced: ink only skips raw mode when the flag is
@@ -20698,6 +20892,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     const inFlightStartedAt = {};
     const wakeScheduler = createWakeScheduler();
     let scope = null;
+    let notificationsSeeded = false;
     let scopeFailure = null;
     let cleanupScope = null;
     let registeredScopeHash = null;
@@ -21325,6 +21520,12 @@ function App({ onCreateRemote = () => {} } = {}) {
         scope = createQuotaScope(current, { root: runtimeIdentityCoordinator.root, identityProvider: identity });
         cleanupScope = { ...scope, identityProvider: null };
         const savedRecovery = readRecoveryTransitions(scope);
+        // Earlier transitions become dimmed history, once per pane, from the
+        // journal just read; collector clients have no journal and start empty.
+        if (!notificationsSeeded) {
+          notificationsSeeded = true;
+          seedNotificationsFromJournal(notificationLogRef.current, scope, () => savedRecovery);
+        }
         recoveryRef.current = savedRecovery.status === "healthy"
           ? { ...savedRecovery.current } : { core: null, graphql: null };
         setRecoveryCauses(recoveryRef.current);
@@ -22504,8 +22705,11 @@ function App({ onCreateRemote = () => {} } = {}) {
   }, [reconciledSelection.key, reconciledSelection.offset, selectedKey, tabOffsetRaw, tab.key]);
   // Bottom-right of the frame, lazygit style: how much of the tab you can
   // currently see out of how much there is.
-  const countLabel =
-    !tableVisible
+  const notificationSummary = notificationLogRef.current.summary();
+  const countLabel = notificationsOpen
+    ? notificationSummary.truncated ? `Showing the latest ${NOTIFICATION_LOG_MAX} events`
+      : `${notificationSummary.size} ${notificationSummary.size === 1 ? "event" : "events"}`
+    : !tableVisible
       ? null
       : tabOffset > 0
         ? `${tabOffset + 1}-${tabOffset + visibleItems.length} of ${counts[tab.key]}`
@@ -22521,8 +22725,9 @@ function App({ onCreateRemote = () => {} } = {}) {
 
   // The existing resolver also supplies inferred targets without another lookup.
   // Complete target and host remain reachable in help when this edge is short.
-  const withTarget = `${tab.label} · ${selectedTarget.label}`;
-  const topLabel = frameCols - 3 - withTarget.length >= 0 ? withTarget : tab.label;
+  const viewLabel = notificationsOpen ? NOTIFICATIONS_LABEL.full : tab.label;
+  const withTarget = `${viewLabel} · ${selectedTarget.label}`;
+  const topLabel = frameCols - 3 - withTarget.length >= 0 ? withTarget : viewLabel;
 
   // Fixed columns deliberately do not shrink, so BRANCH and TIME stay readable
   // at ordinary widths. Narrow panes drop columns instead, which keeps the
@@ -22611,13 +22816,17 @@ function App({ onCreateRemote = () => {} } = {}) {
     Box,
     { flexDirection: "column", width: frameCols, height: frameRows },
     e(TabBar, {
-      activeIndex,
-      counts,
-      brokenCI,
-      firstLoad,
-      failed,
-      spin,
-      useShort: useShortLabels,
+      entries: tabBarEntries({
+        cols: frameCols,
+        counts,
+        brokenCI,
+        firstLoad,
+        failed,
+        spin,
+        useShort: useShortLabels,
+        activeIndex: notificationsOpen ? TABS.length : activeIndex,
+        notifications: notificationBadge,
+      }),
     }),
     e(Divider, { width: frameCols }),
     e(PanelEdge, { width: frameCols, top: true, label: topLabel, labelColor: TITLE_COLOR }),
@@ -22647,20 +22856,20 @@ function App({ onCreateRemote = () => {} } = {}) {
       showHelp &&
         (helpPages[visibleHelpPage] ?? [])
           .map((line, i) => e(Text, { key: `help${i}`, wrap: "truncate-end" }, line)),
+      !showHelp && notificationView &&
+        notificationView.lines.map((line, index) => e(Text, {
+          key: `notification:${index}`, wrap: "truncate-end", dimColor: line.dim,
+          color: line.level === "status" ? TITLE_COLOR : line.dim ? undefined
+            : line.level === "wait" ? ATTENTION : ["action", "problem"].includes(line.level) ? ERROR_TEXT : undefined,
+        }, line.text)),
       !showHelp &&
+        !notificationsOpen &&
         tooNarrow &&
         e(Text, { dimColor: true, wrap: "truncate-end" }, "too narrow"),
-      ...(showHelp || !tableVisible ? [] : noticeLines).map((line, index) =>
+      ...(showHelp || notificationsOpen || !tableVisible ? [] : noticeLines).map((line, index) =>
         e(Text, { key: `recovery:${index}`, color: noticeTone, wrap: "truncate-end" }, line)),
       !showHelp &&
-        !tooNarrow &&
-        !remoteSetup &&
-        tableVisible &&
-        tab.key === "security" &&
-        visibleSecurityLines.map((note, i) =>
-          e(Text, { key: i, dimColor: true, wrap: "truncate-end" }, note),
-        ),
-      !showHelp &&
+        !notificationsOpen &&
         !tooNarrow &&
         remoteSetup &&
         (interactive ? REMOTE_SETUP_LINES : REMOTE_SETUP_NONINTERACTIVE_LINES).map(
@@ -22678,6 +22887,7 @@ function App({ onCreateRemote = () => {} } = {}) {
             ),
         ),
       !showHelp &&
+        !notificationsOpen &&
         !tooNarrow &&
         !remoteSetup &&
         tableVisible &&
@@ -22686,7 +22896,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           selectedWidthKey: resizeRef.current.active ? selectedWidthKey : null,
           headerRef,
         }),
-      ...(tooNarrow || showHelp || remoteSetup || ciView || attentionView ? [] : visibleItems).map((item) => {
+      ...(tooNarrow || showHelp || notificationsOpen || remoteSetup || ciView || attentionView ? [] : visibleItems).map((item) => {
         const key = itemKey(item);
         return e(
           RowBoundary,
@@ -22707,7 +22917,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           }),
         );
       }),
-      !showHelp && !remoteSetup && !tableVisible &&
+      !showHelp && !notificationsOpen && !remoteSetup && !tableVisible &&
         panelLines.map((line, index) => e(Text, {
           key: `context:${index}`, wrap: "truncate-end",
           bold: index === 0, color: index === 0 ? TITLE_COLOR : undefined,
@@ -22728,16 +22938,17 @@ function App({ onCreateRemote = () => {} } = {}) {
       interactive,
       cols: frameCols,
       remoteSetup,
-      feature: attentionView ?? ciView ?? focus,
+      feature: notificationsOpen ? null : attentionView ?? ciView ?? focus,
       widthMode: resizeRef.current.active,
       widthColumn: selectedWidthColumn,
       widthSaveError,
-      canMove: allItems.length > 0,
+      canMove: notificationsOpen ? (notificationView?.maxOffset ?? 0) > 0 : allItems.length > 0,
       canOpen:
+        !notificationsOpen &&
         selectedKey !== null &&
         OPENABLE.includes(tab.key) &&
         allItems.some((item) => itemKey(item) === selectedKey),
-      canResize: fullHeaderVisible,
+      canResize: !notificationsOpen && fullHeaderVisible,
     }),
   );
 }
@@ -23368,6 +23579,10 @@ export {
   notificationConditions,
   diffNotificationSnapshots,
   seedNotificationsFromJournal,
+  criticalInlineLines,
+  notificationViewLines,
+  tabBarEntries,
+  tabBarWidth,
   dashboardPresentation,
   contextualPanelLayout,
   dashboardTarget,

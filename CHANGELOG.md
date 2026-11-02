@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A fifth section, `5:Notifications` (`Notices` on narrow panes), keeps an
+  in-memory history of status events for the pane: automatic waits, failed
+  refreshes, Security source notes, refreshes and cleared causes, newest
+  first. It starts with earlier recovery transitions from the shared journal.
+  The tab shows an unread count, red for problems and causes that need action,
+  yellow for waits.
+
+### Changed
+
+- Lines above a table now appear only for causes that need you to act, such
+  as `gh-glance --doctor` or `gh auth status`. Waits such as "GitHub budget
+  evidence is old", `Waiting to update`, `Checked HH:MM`, `cached` ages and the
+  Security "not enabled" notes moved to Notifications, so the table no longer
+  moves when they start or end.
+- The tab bar fits five sections on one row: full names from about 98
+  columns, short names below that, and digits with counts on narrow panes.
+
 ## [0.18.1] - 2026-10-31
 
 ### Fixed

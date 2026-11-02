@@ -389,8 +389,11 @@ test("D6: a provider rate limit keeps its request-limit cause and action", (t) =
   capture({ cols: 80, rows: 20, signal: "none", settle: 15,
     stdin: quitAfterCached("actions"), configHome: root });
   const result = capture({ cols: 80, rows: 20, signal: "none", settle: 20,
-    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"',
-      'index($0, "GitHub request limit") { ok=1 }', 180) + "sleep .2; printf q",
+    // A self-resolving limit is a wait: it is badged instead of drawn above
+    // the table, and contextual help still states its cause and action.
+    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Notices (") { ok=1 }', 180) +
+      "printf '?'; " + waitForAwk('"$GH_GLANCE_CAPTURE_OUT"',
+      'index($0, "Retry automatically after the shared hold") { ok=1 }', 180) + "sleep .2; printf q",
     configHome: root,
     env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       GH_GLANCE_FIXTURE_FAIL: "HTTP 403: API rate limit exceeded",
@@ -767,7 +770,9 @@ test("corrupt, live-locked, and blocked storage pause with no data calls", (t) =
   });
   rmSync(lockPath, { force: true });
   assert.match(statusLine(locked) ?? "", /^‖ Paused/);
-  assert.match(locked.finalFrame.lines.join("\n"), translatedCoordinationNotice);
+  // A live lock is a wait: the badge counts it and the table keeps its rows.
+  assert.doesNotMatch(locked.finalFrame.lines.join("\n"), translatedCoordinationNotice);
+  assert.match(locked.finalFrame.lines[0], /5:Notices \(\d+\)/);
 
   const blocked = sharedFixture(t);
   writeFileSync(join(blocked.root, "gh-glance"), "not a directory\n", { mode: 0o600 });
@@ -818,13 +823,13 @@ test("stale cached rows retain an acquisition cause through budget observation a
       rows: 24,
       signal: "none",
       settle: 25,
-      stdin: waitForAwk(
-        '"$GH_GLANCE_CAPTURE_OUT"',
-        cols === 80
-          ? 'index($0, "Acquisition store is busy") { ok=1 }'
-          : 'index($0, "Store lock") { ok=1 }',
-        120,
-      ) + "sleep .4; printf q",
+      // The busy store is a wait, listed in Notifications; at 80 columns the
+      // view is opened to read it, at 24 the badge is enough.
+      stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', cols === 80
+        ? 'index($0, "lock busy") { busy=1 } index($0, "Notices (") { badge=1 } busy && badge { ok=1 }'
+        : 'index($0, "Stale") { stale=1 } index($0, "5(") { badge=1 } stale && badge { ok=1 }', 120) +
+        (cols === 80 ? "printf 5; " + waitForAwk('"$GH_GLANCE_CAPTURE_OUT"',
+          'index($0, "Acquisition store is busy") { ok=1 }', 120) : "") + "sleep .4; printf q",
       configHome: box.root,
       env: {
         GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
@@ -835,9 +840,12 @@ test("stale cached rows retain an acquisition cause through budget observation a
     const blockedStatuses = blocked.liveScreen.statusHistory;
     // Ink emits only changed cells: a later, more specific cause can replace
     // its row without rewriting the action that remains visible beside it.
-    assert.match(blocked.finalFrame.lines.join("\n"), cols === 80
-      ? /Acquisition store is busy.*Check the shared lock; retry automatically/s
-      : /Store lock.*Retry automatically/s);
+    if (cols === 80) {
+      assert.match(blocked.finalFrame.lines.join("\n"), /(?:Core|Actions): Acquisition store is busy/);
+    } else {
+      assert.match(blocked.finalFrame.lines[0], /5\(\d+\)/);
+      assert.doesNotMatch(blocked.finalFrame.lines.join("\n"), /Store lock/);
+    }
     assert.doesNotMatch(blocked.raw, /Stale stale/);
     const staleLine = blocked.finalFrame.lines.find((line) => /^\? Stale/.test(line));
     assert.ok(staleLine || blockedStatuses.some((line) => /^\? Stale/.test(line)),
@@ -989,9 +997,10 @@ test("a sustained coordination notice can appear and clear without overflowing t
       'printf \'{"pid":%s,"nonce":"notice-transition-owner"}\\n\' "$$" > "$GH_GLANCE_NOTICE_LOCK"; ' +
       waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Paused") { ok=1 }', 200) +
       'perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e \'print int(1000*clock_gettime(CLOCK_MONOTONIC)), qq(\\n)\' > "$GH_GLANCE_NOTICE_TIMER"; ' +
+      // The sustained wait is recorded and badged, never drawn above the table.
       waitForAwk(
         '"$GH_GLANCE_CAPTURE_OUT"',
-        'index($0, "Coordinating with your other panes") { ok=1 }',
+        'index($0, "Notices (") { ok=1 }',
         200,
       ) +
       'perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e \'print int(1000*clock_gettime(CLOCK_MONOTONIC)), qq(\\n)\' >> "$GH_GLANCE_NOTICE_TIMER"; ' +
@@ -1008,11 +1017,12 @@ test("a sustained coordination notice can appear and clear without overflowing t
     },
   });
 
-  assert.match(result.raw, /Coordinating with your other panes/);
+  assert.match(result.raw, /5:Notices \(\d+\)/);
+  assert.doesNotMatch(result.raw, /Coordinating with your other panes/);
   const [recognizedAt, renderedAt] = readFileSync(noticeTimer, "utf8").trim().split("\n").map(Number);
-  t.diagnostic(`notice cause/action latency ${renderedAt - recognizedAt}ms from visible Paused`);
+  t.diagnostic(`notification badge latency ${renderedAt - recognizedAt}ms from visible Paused`);
   assert.ok(renderedAt - recognizedAt <= 2_000,
-    `cause/action appeared ${renderedAt - recognizedAt}ms after the sustained Paused fault`);
+    `badge appeared ${renderedAt - recognizedAt}ms after the sustained Paused fault`);
   assert.doesNotMatch(result.raw, /Acquisition store is busy; checking the shared lock/);
   assert.doesNotMatch(result.finalFrame.lines.join("\n"), /Coordinating with your other panes/);
   assert.ok(result.liveScreen.statusHistory.some((line) => /^‖ Paused/.test(line)));
@@ -1279,12 +1289,10 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
     rows: 24,
     signal: "none",
     settle: 30,
-    stdin: waitForAwk(
-      '"$GH_GLANCE_CAPTURE_OUT"',
-      'index($0, "GitHub rate limit reached -- backing off") { failed=1 } ' +
-        'failed && index($0, "Stale 2m") { ok=1 }',
-      250,
-    ) + "sleep .3; printf q",
+    // The limit is a wait; its text is read from the Notifications view.
+    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Stale 2m") { ok=1 }', 250) +
+      "sleep 1; printf 5; " + waitForAwk('"$GH_GLANCE_CAPTURE_OUT"',
+      'index($0, "GitHub rate limit reached -- backing off") { ok=1 }', 250) + "sleep .3; printf q",
     configHome: staleRoot,
     env: {
       GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",

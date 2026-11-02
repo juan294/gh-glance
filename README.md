@@ -302,7 +302,8 @@ stdout isn't a terminal rather than streaming redraw frames into a pipe.
 | Key | Action |
 |---|---|
 | `1` `2` `3` `4` | Jump to Actions / Issues / Pull Requests / Security |
-| `←` / `→` | Previous / next tab |
+| `5` | Open Notifications, the pane's status history. `↑` / `↓` and `PgUp` / `PgDn` scroll it; `1`-`4` or `Esc` return to a section. |
+| `←` / `→` | Previous / next tab (Notifications is the fifth position) |
 | `Tab` / `Shift+Tab` | Next / previous tab |
 | `↑` / `↓` or `j` / `k` | Move the cursor between rows |
 | `PgUp` / `PgDn` | Move a page at a time |
@@ -321,6 +322,28 @@ stdout isn't a terminal rather than streaming redraw frames into a pipe.
 | `w` | Adjust table column widths |
 | `?` | Open or close contextual help; `n` / `p` moves through its pages |
 | `q` / `Esc` / `Ctrl+C` | Quit from ordinary navigation; `Esc` leaves feature views, editors and width mode. While editing a query or range, `q` is text and `Ctrl+C` quits. |
+
+### Notifications
+
+Lines above a table appear only when you must act: a local coordination store
+that needs `gh-glance --doctor`, a lost GitHub login, an inaccessible
+repository, or a repeated request limit that waits for `r`. Everything else
+goes to the fifth section, `5:Notifications`: automatic waits (budget checks,
+quota pacing, other panes), failed refreshes with their raw text, Security
+sources that are not enabled or not available, refreshes, and the moment each
+cause cleared. The table no longer moves when a wait starts or ends.
+
+Events are listed newest first, with the time, a level glyph, the source and
+the text; repeats are counted (`x12`), and an open wait shows its next retry.
+History is in memory for the pane, starts with the earlier recovery
+transitions from the shared journal (dimmed, `Earlier session`), and keeps the
+latest 500 events.
+
+The tab label shows how many waits and problems arrived since you last opened
+the view, for example `5:Notifications (3)`: red when any is a problem or needs
+action, yellow when all are waits. Routine refreshes never change the badge, so
+an idle pane still redraws nothing. The status bar keeps its one-row state
+(`Paused`, `Stale`, ...) as before.
 
 ### Adjusting column widths
 

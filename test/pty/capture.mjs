@@ -40,7 +40,9 @@ const CHARSET = new RegExp(`${ESC}[()][A-Za-z0-9]`, "g");
 // final frame.
 const FRAME_BOUNDARY = new RegExp(`${ESC}\\[[0-9]*A|${ESC}\\[2J|${ESC}\\[H`, "g");
 const SCRIPT_BANNER = /^Script (started|done) on /;
-const TAB_BAR = /1:(?:Actions|Act)/;
+// Named tabs read "1:Actions" (or a truncated "1:Act"); a narrow pane drops the
+// names and keeps the five digits with their counts, e.g. "[1(4)] 2(3) ... 5".
+const TAB_BAR = /1:(?:Actions|Act)|^[[ ]1(?![\d:]).*[[ ]2(?![\d:]).*[[ ]3(?![\d:]).*[[ ]4(?![\d:]).*[[ ]5(?![\d:])/m;
 // StatusBar always starts at column zero with one width-1 state marker. Panel
 // rows start with a border, so remote titles containing these words cannot be
 // mistaken for accumulated footers.

@@ -15,6 +15,19 @@
 - **Fetch condition keys include the level** (`fetch:<tab>:<level>:<verdict>`). Why: review found a budget pause and a real failure share verdict `other`, so a pause turning into `HTTP 502` was never recorded.
 - **Journal seed of a cause re-journaled for a new origin or tab** stays one entry.
 
+### Phase 2
+
+- **Tab bar tiers.** Plan: fall back to digit-only names, then truncate names. Chose three measured tiers: full names (margin 2) from 98 columns with the existing hysteresis, short names (margin 1, `Notices`), then digits with counts and no names (`[1(4)] 2(3) 3 4(0) 5(2)`, margin 1). Why: five short labels with margin 2 are 81 columns, so 80-column panes would have lost names; the digit tier fits 40 columns with counts.
+- **PTY harness tab-bar detection.** `test/pty/capture.mjs` recognized a dashboard frame only by `1:Act`. The digit tier has no names, so the pattern now also accepts a line with the five digits in order (unit test added in `test/pty/capture.test.mjs`).
+- **Esc in the view returns to the last data tab.** Plan was silent. Esc quits from ordinary navigation, but every other view (Focus, CI, attention) uses Esc for "back"; the view follows them.
+- **Data-tab keys are ignored in the view** (Enter, `/`, `s`, `g`, `w`, `d`, `a`). Why: they would act on a hidden tab.
+- **`r` in the view** refreshes the last data tab until Phase 3 replaces it with a GitHub status check, as the phase file says.
+- **Repeat count glyph.** Plan: `×N`. Chose `xN`: `×` is East Asian Ambiguous width and this file avoids such glyphs in fixed-width rows.
+- **View rows show the remedy for `action` entries only**; open waits show their live next retry (from the current cause or governor hold), which the time an entry began cannot tell.
+- **Wait-cause PTY fixture.** Plan named a `budget-stale` fixture; none exists. Used a live governor lock (`busy`, "Coordinating with your other panes"), which is the same level and a reliable sustained wait.
+- **Existing PTY expectations changed by design** (all were waits or Security notes that moved): `cache` rate-limit restart (badge instead of inline text), `context-help` NAV-06 (waits for the badge to settle before opening help, because a linear reader reprints on change), `status` D6 (cause and action read from help), live-locked storage (badge, no inline notice), stale acquisition-busy (read from the view at 80 columns, badge at 24), sustained coordination notice (badge latency instead of inline latency), linear screen-reader stale limit (read from the view).
+- **`test/onboarding.test.mjs`** needed no change: it tests `dashboardPresentation()`, which still feeds the no-table panel and help. The inline Security rows (`visibleSecurityLines`) were removed from the table path; Security notes reach Notifications through the snapshot (`notificationConditions`, unit-tested).
+
 ## Findings and dispositions
 
 ### Phase 1 independent review
