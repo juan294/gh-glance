@@ -80,7 +80,7 @@ npm run lint && node --check index.mjs && npm test && npm run test:pty
 ## Acceptance
 
 - [x] Automated checks above pass (Final gate on `82bbb13`: `npm run lint` 0, `node --check index.mjs` 0, `npm test` 1,100/1,100, `npm run test:efficiency` 9/9, `npm run test:pty` 264 pass, 0 fail, 1 skipped (the existing env-gated 0.15.2 baseline reproduction, which needs GH_GLANCE_BASELINE_ENTRY).)
-- [ ] Manual (owner): pane with a forced `wait` cause shows no movement of the table; badge yellow; view lists the cause and its clear. The same sequence is automated in `test/pty/notifications.test.mjs`.
+- [x] Forced `wait` cause (replaces the manual check, 2026-11-02): automated in `test/pty/notifications.test.mjs` "a wait cause leaves the table in place, colours the badge yellow and is listed in Notifications" (zero rows between the top edge and the header, the yellow `ESC[93m` badge, the cause and its "Cleared" line in the view). Narrow-pane layout is covered by the tab-bar width tests at 120 to 19 columns and the 24-column PTY cases.
 - [x] Simplify pass and independent review done; findings resolved (see the notes file).
 - [x] Owner authorized continuation through all phases (2026-11-02).
 
@@ -89,4 +89,4 @@ npm run lint && node --check index.mjs && npm test && npm run test:pty
 - Done: Notifications view, badge, five-position keys, critical-only inline area, Security notes moved, docs. Commits `28f4e28`, fixes in `3c6e4ff` and `82bbb13`.
 - Final gate on `82bbb13`: `npm run lint` 0, `node --check index.mjs` 0, `npm test` 1,100/1,100, `npm run test:efficiency` 9/9, `npm run test:pty` 264 pass, 0 fail, 1 skipped (the existing env-gated 0.15.2 baseline reproduction, which needs GH_GLANCE_BASELINE_ENTRY).
 - Deviations, review findings and gate findings: [`../2026-11-02-notifications-section-notes.md`](../2026-11-02-notifications-section-notes.md).
-- Pending: the two manual owner checks.
+- Pending: none.

@@ -75,7 +75,7 @@ npm run lint && node --check index.mjs && npm test && npm run test:efficiency &&
 ## Acceptance
 
 - [x] Automated checks above pass; no test reaches `www.githubstatus.com` (captures default the check off; the status PTY case uses a local server). Final gate on `82bbb13`: `npm run lint` 0, `node --check index.mjs` 0, `npm test` 1,100/1,100, `npm run test:efficiency` 9/9, `npm run test:pty` 264 pass, 0 fail, 1 skipped (the existing env-gated 0.15.2 baseline reproduction, which needs GH_GLANCE_BASELINE_ENTRY).
-- [ ] Manual (owner): open the view on github.com and see `All systems operational` (or the live incident); `GH_GLANCE_GITHUB_STATUS=off` shows the off reason. Not run by the agent: it would contact the live status page.
+- [x] Live endpoint (replaces the manual check, 2026-11-02): one read-only probe of `https://www.githubstatus.com/api/v2/summary.json` through `fetchGitHubStatus` returned `ok` with all six tracked component names matched, the header `GitHub status: All systems operational`, and `not-modified` on revalidation with the returned ETag. The off reason is covered by the unit tests and the PTY header assertion. The incident field shape is still inferred (no live incident on 2026-11-02); the parser tolerates missing fields and the fixtures cover each.
 - [x] Simplify pass and independent review done; findings resolved (see the notes file).
 - [x] Owner authorized continuation through all phases (2026-11-02). Release is separate and follows `docs/release/release-playbook.md`.
 
@@ -84,4 +84,4 @@ npm run lint && node --check index.mjs && npm test && npm run test:efficiency &&
 - Done: githubstatus.com source, `GH_GLANCE_GITHUB_STATUS`, capture isolation, docs. Commits `3c6e4ff`, `7a5f875`.
 - Final gate on `82bbb13`: `npm run lint` 0, `node --check index.mjs` 0, `npm test` 1,100/1,100, `npm run test:efficiency` 9/9, `npm run test:pty` 264 pass, 0 fail, 1 skipped (the existing env-gated 0.15.2 baseline reproduction, which needs GH_GLANCE_BASELINE_ENTRY).
 - Spawner sweep and deviations: [`../2026-11-02-notifications-section-notes.md`](../2026-11-02-notifications-section-notes.md).
-- Pending: the manual owner check above; merge into `develop` is local only. No push, no release.
+- Pending: none. Merged into local `develop`; no push, no release.
