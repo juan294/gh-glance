@@ -173,7 +173,11 @@ test("fetchGitHubStatus: every failure is unavailable", async () => {
   }
 });
 
-test("fetchGitHubStatus: a slow server times out", async () => {
+test("fetchGitHubStatus: a slow server times out", async (t) => {
+  // AbortSignal.timeout() never holds the event loop open, and this fake fetch
+  // holds no socket; without a handle Node 22 ends the file before the timeout.
+  const keepAlive = setInterval(() => {}, 1000);
+  t.after(() => clearInterval(keepAlive));
   const result = await fetchGitHubStatus({ url: GITHUB_STATUS_URL, timeoutMs: 30,
     fetchImpl: (_url, init) => new Promise((_resolve, reject) => {
       init.signal.addEventListener("abort", () => reject(init.signal.reason));
