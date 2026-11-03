@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The tab bar shows full section names whenever they fit the pane, instead of
+  switching to short names below a fixed 98 columns. With few counts, full
+  names now appear from about 85 columns.
+- The short name of the Notifications tab is now `Status` (was `Notices`).
+
 ## [0.19.0] - 2026-11-02
 
 ### Added

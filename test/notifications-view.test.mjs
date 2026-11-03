@@ -57,29 +57,50 @@ const tabInputs = (overrides = {}) => ({
 
 test("tabBarEntries: five entries fit one row with every digit at 120, 80, 60 and 40 columns", () => {
   for (const cols of [120, 80, 60, 40]) {
-    const entries = tabBarEntries({ ...tabInputs(), cols, useShort: cols < 98 });
+    const entries = tabBarEntries({ ...tabInputs(), cols });
     assert.equal(entries.length, 5);
     assert.ok(tabBarWidth(entries) <= cols, `${cols}: ${tabBarWidth(entries)}`);
     entries.forEach((entry, index) => assert.ok(entry.label.includes(String(index + 1)), entry.label));
   }
-  const wide = tabBarEntries({ ...tabInputs(), cols: 120, useShort: false });
+  const wide = tabBarEntries({ ...tabInputs(), cols: 120 });
   assert.deepEqual(wide.map((entry) => entry.label),
     ["[1:Actions (30)]", " 2:Issues (12) ", " 3:Pull requests (5) ", " 4:Security (0) ", " 5:Notifications (3) "]);
-  const medium = tabBarEntries({ ...tabInputs(), cols: 80, useShort: true });
-  assert.equal(medium[4].label, " 5:Notices (3) ");
+  const medium = tabBarEntries({ ...tabInputs(), cols: 80 });
+  assert.equal(medium[4].label, " 5:Status (3) ");
   assert.equal(medium[2].label, " 3:PRs (5) ");
-  const narrow = tabBarEntries({ ...tabInputs(), cols: 40, useShort: true });
+  const narrow = tabBarEntries({ ...tabInputs(), cols: 40 });
   assert.deepEqual(narrow.map((entry) => entry.label), ["[1(30)]", " 2(12) ", " 3(5) ", " 4(0) ", " 5(3) "]);
+});
+
+test("tabBarEntries: full labels whenever they fit, with hysteresis back from short labels", () => {
+  // Full labels with these counts are 97 columns: the old fixed 98-column
+  // breakpoint showed short labels here even though the full ones fit.
+  const full = tabBarEntries({ ...tabInputs(), cols: 97 });
+  assert.equal(tabBarWidth(full), 97);
+  assert.equal(full[4].label, " 5:Notifications (3) ");
+  assert.ok(full.every((entry) => entry.tier === "full"));
+  // Fewer counts need fewer columns (85 here), so full labels reach narrower panes.
+  const sparse = tabInputs({ counts: { actions: "60+", issues: null, prs: null, security: null },
+    notifications: { unread: 1, tone: "yellow" } });
+  assert.equal(tabBarWidth(tabBarEntries({ ...sparse, cols: 85 })), 85);
+  assert.equal(tabBarEntries({ ...sparse, cols: 85 })[2].label, " 3:Pull requests ");
+  const short = tabBarEntries({ ...tabInputs(), cols: 96 });
+  assert.equal(short[4].label, " 5:Status (3) ");
+  assert.ok(short.every((entry) => entry.tier === "short"));
+  // After short labels, returning to full needs the hysteresis margin.
+  assert.equal(tabBarEntries({ ...tabInputs(), cols: 97, preferShort: true })[4].label, " 5:Status (3) ");
+  assert.equal(tabBarEntries({ ...tabInputs(), cols: 100, preferShort: true })[4].label, " 5:Status (3) ");
+  assert.equal(tabBarEntries({ ...tabInputs(), cols: 101, preferShort: true })[4].label, " 5:Notifications (3) ");
 });
 
 test("tabBarEntries: narrow panes drop gaps, then counts, and never exceed the width", () => {
   const busy = tabInputs({ counts: { actions: "30", issues: "12", prs: "5", security: "0" },
     notifications: { unread: 12, tone: "red" } });
-  const tight = tabBarEntries({ ...busy, cols: 33, useShort: true });
+  const tight = tabBarEntries({ ...busy, cols: 33 });
   assert.deepEqual(tight.map((entry) => entry.label), ["[1(30)]", " 2(12) ", " 3(5) ", " 4(0) ", " 5(12) "]);
   assert.equal(tabBarWidth(tight), 33);
   for (const cols of [32, 23, 19]) {
-    const entries = tabBarEntries({ ...busy, cols, useShort: true });
+    const entries = tabBarEntries({ ...busy, cols });
     assert.ok(tabBarWidth(entries) <= cols, `${cols}: ${entries.map((entry) => entry.label).join("|")}`);
     assert.deepEqual(entries.map((entry) => entry.label), ["[1]", " 2 ", " 3 ", " 4 ", " 5(12) "]);
   }

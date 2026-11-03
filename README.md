@@ -20,7 +20,7 @@ pane next to your editor) where you want an always-on glance at repo activity
 without switching to the browser.
 
 ```
-[1:Actions (4)]  2:Issues   3:PRs   4:Security   5:Notices
+[1:Actions (4)]  2:Issues   3:PRs   4:Security   5:Status
 ───────────────────────────────────────────────────────────────────────────
 ╭─ Actions · owner/repo ──────────────────────────────────────────────────╮
 │     TITLE                  │WORKFLOW  │BRANCH        │TIME   │UPDATED   │
@@ -47,8 +47,9 @@ without switching to the browser.
 > red" is answerable without switching to that tab — an `x` means the tab's
 > latest fetch failed, and a `?` in place of the Security count means its
 > endpoints could not be read, which is not the same as there being nothing to
-> report. `5:Notices` gains an unread count such as `(3)` when waits or
-> problems arrive while it is closed; see [Notifications](#notifications).
+> report. `5:Status` (`5:Notifications` when the full names fit) gains an
+> unread count such as `(3)` when waits or problems arrive while it is closed;
+> see [Notifications](#notifications).
 
 <!-- contract:allow-emoji -- the check/cross above stand in for Nerd Font
      Octicons the app actually draws; they are literal examples, not decoration. -->
