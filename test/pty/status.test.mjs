@@ -391,7 +391,7 @@ test("D6: a provider rate limit keeps its request-limit cause and action", (t) =
   const result = capture({ cols: 80, rows: 20, signal: "none", settle: 20,
     // A self-resolving limit is a wait: it is badged instead of drawn above
     // the table, and contextual help still states its cause and action.
-    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Notices (") { ok=1 }', 180) +
+    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Status (") { ok=1 }', 180) +
       "printf '?'; " + waitForAwk('"$GH_GLANCE_CAPTURE_OUT"',
       'index($0, "Retry automatically after the shared hold") { ok=1 }', 180) + "sleep .2; printf q",
     configHome: root,
@@ -772,7 +772,7 @@ test("corrupt, live-locked, and blocked storage pause with no data calls", (t) =
   assert.match(statusLine(locked) ?? "", /^‖ Paused/);
   // A live lock is a wait: the badge counts it and the table keeps its rows.
   assert.doesNotMatch(locked.finalFrame.lines.join("\n"), translatedCoordinationNotice);
-  assert.match(locked.finalFrame.lines[0], /5:Notices \(\d+\)/);
+  assert.match(locked.finalFrame.lines[0], /5:Status \(\d+\)/);
 
   const blocked = sharedFixture(t);
   writeFileSync(join(blocked.root, "gh-glance"), "not a directory\n", { mode: 0o600 });
@@ -826,7 +826,7 @@ test("stale cached rows retain an acquisition cause through budget observation a
       // The busy store is a wait, listed in Notifications; at 80 columns the
       // view is opened to read it, at 24 the badge is enough.
       stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', cols === 80
-        ? 'index($0, "lock busy") { busy=1 } index($0, "Notices (") { badge=1 } busy && badge { ok=1 }'
+        ? 'index($0, "lock busy") { busy=1 } index($0, "Status (") { badge=1 } busy && badge { ok=1 }'
         : 'index($0, "Stale") { stale=1 } index($0, "5(") { badge=1 } stale && badge { ok=1 }', 120) +
         (cols === 80 ? "printf 5; " + waitForAwk('"$GH_GLANCE_CAPTURE_OUT"',
           'index($0, "Acquisition store is busy") { ok=1 }', 120) : "") + "sleep .4; printf q",
@@ -1000,7 +1000,7 @@ test("a sustained coordination notice can appear and clear without overflowing t
       // The sustained wait is recorded and badged, never drawn above the table.
       waitForAwk(
         '"$GH_GLANCE_CAPTURE_OUT"',
-        'index($0, "Notices (") { ok=1 }',
+        'index($0, "Status (") { ok=1 }',
         200,
       ) +
       'perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e \'print int(1000*clock_gettime(CLOCK_MONOTONIC)), qq(\\n)\' >> "$GH_GLANCE_NOTICE_TIMER"; ' +
@@ -1017,7 +1017,7 @@ test("a sustained coordination notice can appear and clear without overflowing t
     },
   });
 
-  assert.match(result.raw, /5:Notices \(\d+\)/);
+  assert.match(result.raw, /5:Status \(\d+\)/);
   assert.doesNotMatch(result.raw, /Coordinating with your other panes/);
   const [recognizedAt, renderedAt] = readFileSync(noticeTimer, "utf8").trim().split("\n").map(Number);
   t.diagnostic(`notification badge latency ${renderedAt - recognizedAt}ms from visible Paused`);

@@ -17979,14 +17979,15 @@ const MIN_TABLE_WIDTH = Math.max(...TABS.map((t) => minimumWidthFor(t.header)));
 // status line survive at any width a terminal is realistically set to.
 const MIN_COMPACT_WIDTH = Math.max(...TABS.map((t) => minimumWidthFor(t.compactHeader)));
 
-// The tab bar is laid out independently of the table. Full labels for the five
-// sections need ~97 columns; short labels ~77. Hysteresis on the full/short
-// breakpoint so a pane parked exactly on it does not flip labels on every
-// resize event and defeat the unchanged-frame optimization. Below the short
-// width the bar drops names and keeps digits and counts (see tabBarEntries).
-const TAB_LABEL_FULL_WIDTH = 98;
+// The tab bar is laid out independently of the table. Full labels are used
+// whenever they fit the measured bar (~97 columns with counts on every tab, less
+// with fewer); short labels need ~76. Once the bar has dropped to short labels,
+// full ones return only with this many spare columns, so a pane parked on the
+// boundary, or a count gaining a digit, does not flip labels back and forth and
+// defeat the unchanged-frame optimization. Below the short width the bar drops
+// names and keeps digits and counts (see tabBarEntries).
 const TAB_LABEL_HYSTERESIS = 4;
-const NOTIFICATIONS_LABEL = Object.freeze({ full: "Notifications", short: "Notices" });
+const NOTIFICATIONS_LABEL = Object.freeze({ full: "Notifications", short: "Status" });
 
 function tabFailureSuffix({ count, failed, brokenCI }) {
   if (count == null) return failed ? " x" : "";
@@ -18001,7 +18002,7 @@ function tabBarWidth(entries) {
 // `cols` wins: full names, short names, digits with counts, the same without
 // gaps, then bare digits that keep only the Notifications badge -- so every
 // section key stays visible, and the row never wraps, down to a ~20-column pane.
-function tabBarEntries({ cols, counts, brokenCI, firstLoad, failed, spin, useShort, activeIndex,
+function tabBarEntries({ cols, counts, brokenCI, firstLoad, failed, spin, preferShort = false, activeIndex,
   notifications = { unread: 0, tone: "none" } }) {
   const sections = TABS.map((tab) => {
     const count = counts[tab.key];
@@ -18032,9 +18033,11 @@ function tabBarEntries({ cols, counts, brokenCI, firstLoad, failed, spin, useSho
     // identical, so the bar does not shift between the two modes.
     return { key: section.key, active, label: active ? `[${body}]` : ` ${body} `,
       margin: index === sections.length - 1 || tier === "tight" || tier === "digits" ? 0 : tier === "full" ? 2 : 1,
-      color: section.color, dim: !active && section.quiet };
+      color: section.color, dim: !active && section.quiet, tier };
   });
-  for (const tier of [...useShort ? [] : ["full"], "short", "compact", "tight"]) {
+  const full = build("full");
+  if (tabBarWidth(full) + (preferShort ? TAB_LABEL_HYSTERESIS : 0) <= cols) return full;
+  for (const tier of ["short", "compact", "tight"]) {
     const entries = build(tier);
     if (tabBarWidth(entries) <= cols) return entries;
   }
@@ -18543,7 +18546,7 @@ function StatusBar({
 
 // ---------- Layout ----------
 
-// Terminal size, and the label breakpoint that depends on it.
+// Terminal size.
 //
 // The usableSize guard is applied on every read path, not just the first: pty
 // wrappers and a terminal mid-resize report 0 or undefined, and taking either
@@ -18553,7 +18556,6 @@ function useTerminalSize(stdout) {
   const [size, setSize] = useState(() => ({
     rows: usableSize(stdout?.rows, DEFAULT_ROWS),
     cols: usableSize(stdout?.columns, DEFAULT_COLS),
-    useShortLabels: usableSize(stdout?.columns, DEFAULT_COLS) < TAB_LABEL_FULL_WIDTH,
   }));
 
   useEffect(() => {
@@ -18561,21 +18563,9 @@ function useTerminalSize(stdout) {
     function onResize() {
       const cols = usableSize(stdout.columns, DEFAULT_COLS);
       const rows = usableSize(stdout.rows, DEFAULT_ROWS);
-      setSize((previous) => {
-        // Hysteresis on the label breakpoint: switch to short labels below it,
-        // back to full only once comfortably above, so a pane dragged along the
-        // boundary does not emit a different frame on every resize event.
-        const useShortLabels = previous.useShortLabels
-          ? cols < TAB_LABEL_FULL_WIDTH + TAB_LABEL_HYSTERESIS
-          : cols < TAB_LABEL_FULL_WIDTH;
-        // Same object when nothing moved, so a resize event that changes
-        // nothing cannot cost a redraw.
-        return previous.rows === rows &&
-          previous.cols === cols &&
-          previous.useShortLabels === useShortLabels
-          ? previous
-          : { rows, cols, useShortLabels };
-      });
+      // Same object when nothing moved, so a resize event that changes
+      // nothing cannot cost a redraw.
+      setSize((previous) => previous.rows === rows && previous.cols === cols ? previous : { rows, cols });
     }
     stdout.on("resize", onResize);
     return () => stdout.off("resize", onResize);
@@ -19636,7 +19626,11 @@ function App({ onCreateRemote = () => {} } = {}) {
       jevOperationRef.current=null;runtimeJevSession?.clear();setFeature(current=>current?{...current,semantic:{message:'Jev results expired; J Run again.'}}:null);
     }
   },[feature,now]);
-  const { rows, cols, useShortLabels } = useTerminalSize(stdout);
+  const { rows, cols } = useTerminalSize(stdout);
+  // Whether the last frame's tab bar used short labels: tabBarEntries needs it
+  // for hysteresis, and it depends on counts as well as width, so it is
+  // tracked per frame rather than per resize.
+  const shortTabLabelsRef = useRef(false);
   const [frame, setFrame] = useState(0);
   // Per tab, so switching away and back keeps your place. Keyed by item, and
   // both are plain state: they change only on a keypress, so an idle repo still
@@ -23121,23 +23115,24 @@ function App({ onCreateRemote = () => {} } = {}) {
   const liveRows = Math.min(rows, usableSize(stdout?.rows, rows));
   const frameRows = Math.max(1, liveRows - 1);
 
+  const tabEntries = tabBarEntries({
+    cols: frameCols,
+    counts,
+    brokenCI,
+    firstLoad,
+    failed,
+    spin,
+    preferShort: shortTabLabelsRef.current,
+    activeIndex: notificationsOpen ? TABS.length : activeIndex,
+    // An active GitHub outage keeps the badge red even after it was read.
+    notifications: githubStatus.outage ? { ...notificationBadge, tone: "red" } : notificationBadge,
+  });
+  shortTabLabelsRef.current = tabEntries[0].tier !== "full";
+
   return e(
     Box,
     { flexDirection: "column", width: frameCols, height: frameRows },
-    e(TabBar, {
-      entries: tabBarEntries({
-        cols: frameCols,
-        counts,
-        brokenCI,
-        firstLoad,
-        failed,
-        spin,
-        useShort: useShortLabels,
-        activeIndex: notificationsOpen ? TABS.length : activeIndex,
-        // An active GitHub outage keeps the badge red even after it was read.
-        notifications: githubStatus.outage ? { ...notificationBadge, tone: "red" } : notificationBadge,
-      }),
-    }),
+    e(TabBar, { entries: tabEntries }),
     e(Divider, { width: frameCols }),
     e(PanelEdge, { width: frameCols, top: true, label: topLabel, labelColor: TITLE_COLOR }),
     e(

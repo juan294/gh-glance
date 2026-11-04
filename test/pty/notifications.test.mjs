@@ -66,7 +66,7 @@ test("a wait cause leaves the table in place, colours the badge yellow and is li
   });
   // Captured before the lock is released: the frame still shows the wait.
   assert.match(held.finalFrame.lines.find(isStatusLine) ?? "", /^‖ Paused/);
-  assert.match(held.raw, new RegExp(`${ESC}\\[93m 5:Notices \\(\\d+\\) `));
+  assert.match(held.raw, new RegExp(`${ESC}\\[93m 5:Status \\(\\d+\\) `));
   assert.doesNotMatch(held.raw, /Coordinating with your other panes/);
   assert.deepEqual(rowsAboveHeader(held.finalFrame.lines), []);
   assert.ok(held.finalFrame.widest <= 80);
@@ -91,7 +91,7 @@ test("a wait cause leaves the table in place, colours the badge yellow and is li
   assert.match(view, /(?:Core|Actions): Coordinating with your other panes/);
   assert.match(view, /Cleared: Coordinating with your other panes/);
   // Opening the view marks the events seen.
-  assert.match(viewed.finalFrame.lines[0], /\[5:Notices\]/);
+  assert.match(viewed.finalFrame.lines[0], /\[5:Status\]/);
   assert.ok(viewed.finalFrame.widest <= 80);
 });
 
@@ -102,7 +102,7 @@ test("an action cause stays inline above the table with its remedy and a red bad
   const inline = rowsAboveHeader(result.finalFrame.lines);
   assert.ok(inline.length >= 1 && inline.length <= 3, inline.join("\n"));
   assert.match(inline.join("\n"), /gh-glance --doctor/);
-  assert.match(result.raw, new RegExp(`${ESC}\\[91m 5:Notices \\(\\d+\\) `));
+  assert.match(result.raw, new RegExp(`${ESC}\\[91m 5:Status \\(\\d+\\) `));
 });
 
 test("the tab bar keeps all five section digits on one row from 120 to 40 columns", () => {
@@ -115,7 +115,9 @@ test("the tab bar keeps all five section digits on one row from 120 to 40 column
     assert.match(divider, /^─+$/, `${cols}: tab bar wrapped:\n${result.finalFrame.lines.slice(0, 3).join("\n")}`);
     assert.ok(result.finalFrame.widest <= cols, `${cols}-column frame overflowed`);
     if (cols === 120) assert.match(bar, /5:Notifications/);
-    if (cols === 80) assert.match(bar, /5:Notices/);
+    // Full names are used whenever they fit, so 80 columns shows either tier
+    // depending on the counts loaded; tabBarEntries unit tests pin the tiers.
+    if (cols === 80) assert.match(bar, /5:(?:Notifications|Status)/);
     assert.ok(result.finalFrame.lines.some(isStatusLine));
   }
 });
@@ -144,7 +146,7 @@ test("Notifications keys: 5 opens, Esc and digits return, arrows cycle through f
   // 4, Right to 5, Right wraps to 1, Left back to 5, Esc to the last data tab
   // (1), 2, 5, then 3 closes the view.
   assert.deepEqual(active, [1, 4, 5, 1, 5, 1, 2, 5, 3, 5, 3]);
-  assert.match(result.finalFrame.lines[0], /\[3:PRs/);
+  assert.match(result.finalFrame.lines[0], /\[3:(?:PRs|Pull requests)/);
   assert.equal(result.exitCode, 0);
   // Notifications is a view, never a cached data tab.
   const cache = JSON.parse(readFileSync(join(root, "gh-glance", "dashboard-cache.json"), "utf8"));
