@@ -51,3 +51,25 @@ All of it on tree `ac6f261ba3d152e3200ee71b5c3970fc0c7b8f4c`, base `1f395d3`, da
 - **PTY ran above the load threshold.** Plan said start `pty` at a 15-minute load of 12 or lower. Found the machine at 15-minute 187-317 with 0.44% CPU idle at worst, from unrelated fleet work plus this batch's two gates. Accepted a pass at higher load. Why: the threshold exists to prevent false failures, and fixed settle windows only get harder as load rises. The plan's single normal-load re-run was not needed.
 - **Evidence came from two sessions.** Plan assumed one owner. The owner chose on 2026-11-05: the `Events` session finishes its running gate and stops, this session takes the result, runs Phase 2 and prunes. A duplicate PTY run was not started.
 - **Commit replaced.** `afdabec` was unpushed and carried a message without the PR references Phase 1 requires. It was re-committed on the same tree plus plan documents. `afdabec` itself never left this machine.
+
+## Phase 2 outcome
+
+Pushed once, at 09:36 CET: `ac3a826f4525d70cd85382b319d8ed8fbc5ad326`, a fast-forward of `1f395d3`. `origin/develop` had not moved, so no rebase was needed and Phase 1 evidence stands.
+
+| Check | Result |
+| --- | --- |
+| [CI run 41995795143](https://github.com/juan294/gh-glance/actions/runs/41995795143) | success. PTY, recovery, efficiency and pack skipped, as planned for an ordinary push. |
+| [CodeQL run 41995795108](https://github.com/juan294/gh-glance/actions/runs/41995795108) | success, with `init` and `analyze` both on `9b32540` |
+| Queue | Dependabot closed #141, #160, #177, #178 and #179 after the push. This session closed #145. None merged. |
+| Issues | 0 open |
+| Code-scanning alert 8 | `fixed` on `refs/heads/develop` at 08:38:19Z. Instances on `main` and `refs/pull/159/merge` stay open. 0 open alerts in total. |
+
+Differences from the baseline, all reported to the owner:
+
+- **New PR #182**, Dependabot, `globals` 17.13.0 to 17.14.0, lockfile only. Opened by the post-push Dependabot run and out of scope, so it stays open.
+- **New Dependabot alert 6**, GHSA-g3hv-75wg-m249, `minimatch` below 11.0.1, medium, transitive, development scope. Opened at the push; the baseline had 0 open alerts. The push did not change `minimatch` (10.2.6), and the fix is the `eslint` upstream block this plan puts out of scope. The published package does not include it: `npm audit --omit=dev` reports 0. Alert 5, named in the push output, is withdrawn (HTTP 410).
+- **The `minimatch` security job failed** ([run 41995807889](https://github.com/juan294/gh-glance/actions/runs/41995807889)), as the plan expected.
+
+Not yet proved: the `codeql-action` Dependabot group has run with no grouped PR to show, and `download-artifact` v8.0.2 and PTY on these bumps have no hosted run until the next release PR.
+
+This outcome is a local documentation commit, recorded after the plan's one push.
