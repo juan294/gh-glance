@@ -28,7 +28,7 @@
         },
         {
           "path": "package-lock.json",
-          "sha256": "3dac2b03161799fc28e6ef99e9077ac37ffe46bbdb1a5ad39efeb4adbe718258"
+          "sha256": "56fe471a6b36a08c4482b0d8a751302138fbeedb579b3d67ffbee51af047e1cb"
         }
       ],
       "nativeNodeVersion": "22.22.2",

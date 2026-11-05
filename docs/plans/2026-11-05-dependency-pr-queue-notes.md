@@ -66,7 +66,7 @@ Pushed once, at 09:36 CET: `ac3a826f4525d70cd85382b319d8ed8fbc5ad326`, a fast-fo
 
 Differences from the baseline, all reported to the owner:
 
-- **New PR #182**, Dependabot, `globals` 17.13.0 to 17.14.0, lockfile only. Opened by the post-push Dependabot run and out of scope, so it stays open.
+- **New PR #182**, Dependabot, `globals` 17.13.0 to 17.14.0, lockfile only. Opened by the post-push Dependabot run and out of scope for this plan. The owner later handed over the remaining work, so it landed locally with a `.sutura.json` refresh in the follow-up push that also carried the `Events` rename.
 - **New Dependabot alert 6**, GHSA-g3hv-75wg-m249, `minimatch` below 11.0.1, medium, transitive, development scope. Opened at the push; the baseline had 0 open alerts. The push did not change `minimatch` (10.2.6), and the fix is the `eslint` upstream block this plan puts out of scope. The published package does not include it: `npm audit --omit=dev` reports 0. Alert 5, named in the push output, is withdrawn (HTTP 410).
 - **The `minimatch` security job failed** ([run 41995807889](https://github.com/juan294/gh-glance/actions/runs/41995807889)), as the plan expected.
 
