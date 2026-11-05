@@ -12362,7 +12362,7 @@ const { version } = JSON.parse(readFileSync(new URL("./package.json", import.met
 // this file already applies to argv vectors and to classify().
 const KEY_TABLE = [
   ["1 2 3 4", "Actions / Issues / Pull requests / Security"],
-  ["5", "Notifications: status history; Up / Down scroll, r checks GitHub status, Esc returns"],
+  ["5", "Events: status history; Up / Down scroll, r checks GitHub status, Esc returns"],
   ["Left / Right", "Previous / next tab"],
   ["Tab / Shift+Tab", "Next / previous tab"],
   ["Up / Down, j / k", "Move the cursor between rows"],
@@ -12530,7 +12530,7 @@ Environment:
                             (--refresh takes precedence)
   GH_GLANCE_GITHUB_STATUS=off
                             Turn off the githubstatus.com check in
-                            Notifications (an http(s) URL replaces the endpoint)
+                            Events (an http(s) URL replaces the endpoint)
   GH_GLANCE_ICONS=unicode   Unicode status glyphs and text row substitutes
   GH_GLANCE_ICONS=ascii     ASCII-only status and row icons
   GH_GLANCE_NO_ANIMATION=1  Stop motion; semantic status words remain
@@ -16828,7 +16828,7 @@ function contextHelpPages({ view, target, tab, remoteSetup = false }, keys = key
     issues: "Issues shows open issues in the selected repository.",
     prs: "Pull requests shows open requests to merge changes into the selected repository.",
     security: "Security shows alerts returned by the checked sources; unavailable sources can hide alerts.",
-    notifications: "Notifications lists status events for this pane: waits, refreshes, failures and cleared causes.",
+    notifications: "Events lists what happened in this pane: waits, refreshes, failures and cleared causes.",
   };
   const title = remoteSetup ? "No GitHub remote found" : view.title;
   const action = remoteSetup ? "Close help with ?, then Enter to start gh repo create; or restart with gh-glance --repo owner/name."
@@ -17987,7 +17987,9 @@ const MIN_COMPACT_WIDTH = Math.max(...TABS.map((t) => minimumWidthFor(t.compactH
 // defeat the unchanged-frame optimization. Below the short width the bar drops
 // names and keeps digits and counts (see tabBarEntries).
 const TAB_LABEL_HYSTERESIS = 4;
-const NOTIFICATIONS_LABEL = Object.freeze({ full: "Notifications", short: "Status" });
+// One name at every tier: a label that changes with the pane width reads as a
+// different feature.
+const NOTIFICATIONS_LABEL = Object.freeze({ full: "Events", short: "Events" });
 
 function tabFailureSuffix({ count, failed, brokenCI }) {
   if (count == null) return failed ? " x" : "";

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The fifth section is now named `Events` (`5:Events`) at every width, in the
+  tab bar, its view title and the help text. Narrow panes no longer switch it
+  to a different word (`Status`, earlier `Notices`). Full tab names now fit
+  in panes 7 columns narrower.
+
 ## [0.19.1] - 2026-11-04
 
 ### Changed
