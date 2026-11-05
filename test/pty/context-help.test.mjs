@@ -128,7 +128,7 @@ test("NAV-03: 24x10 pages expose the complete long target and storage remedy", (
   assert.equal(result.exitCode, 0);
   const body = pageBody(root);
   assert.ok(body.includes(repository));
-  assert.ok(body.includes("tenant.ghe.com"));
+  assert.match(body, /tenant\.ghe\.com/);
   assert.ok(body.includes("Rungh-glance--doctor;checkstoragepermissions"));
   const pages = JSON.parse(readFileSync(join(root, "pages.json"), "utf8"));
   if (process.env.GH_GLANCE_HELP_CAPTURES) {
