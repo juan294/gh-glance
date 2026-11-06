@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readWorkflow } from "./fixtures/workflow.mjs";
 
-test("Sutura consumer pins the published v0.5.1 repair engine and requires a fixed outcome", () => {
+test("Sutura consumer pins the published v0.5.2 repair engine and requires a fixed outcome", () => {
   const { jobs } = readWorkflow("sutura.yml");
-  assert.match(jobs.repair.body, /uses: juan294\/sutura@ddab42eadc92801f97c4745ed10f7e467b9843c8 # v0\.5\.1/);
+  assert.match(jobs.repair.body, /uses: juan294\/sutura@c953b4b947c7c3c7fffbbedbcd6d0f55daf16bf9 # v0\.5\.2/);
   assert.match(jobs.repair.body, /require-fixed: true/);
   assert.match(jobs.repair.body, /repair-inference-cost-usd: '0\.25'/);
   assert.match(jobs.repair.body, /repair-sandbox-operations: '32'/);

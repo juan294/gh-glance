@@ -16,7 +16,7 @@
       "sourceInputs": [
         {
           "path": "package.json",
-          "sha256": "ced5fe92cd08d38bbdde946e84cb10311303013bb9e79fbee38755d923e247b2"
+          "sha256": "ef4e39e546fd8a97ab0f4b25347d8e3e0665b20b829e70e776f0a3b8bbf6ae57"
         },
         {
           "path": "scripts/test-select.mjs",
@@ -24,11 +24,11 @@
         },
         {
           "path": ".github/workflows/ci.yml",
-          "sha256": "256fb28ea3bf7600f25b208d20a27bebe82571988dd25bed947fd3bb9ea1e2f8"
+          "sha256": "17e5fe938da5834fb13c3adbdf321d24e2ff6ca93d418ae7677ddcf43fcd1789"
         },
         {
           "path": "package-lock.json",
-          "sha256": "55dbf6c8950588a5ddb791b7e48ea6498223a1bd4f5d2c419ea8882e182d034e"
+          "sha256": "68f363f1cdd9fa19d9f690c82fb679a3d699e56530748211ae2537280394d5f7"
         }
       ],
       "nativeNodeVersion": "22.22.2",

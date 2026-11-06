@@ -12362,7 +12362,7 @@ const { version } = JSON.parse(readFileSync(new URL("./package.json", import.met
 // this file already applies to argv vectors and to classify().
 const KEY_TABLE = [
   ["1 2 3 4", "Actions / Issues / Pull requests / Security"],
-  ["5", "Notifications: status history; Up / Down scroll, r checks GitHub status, Esc returns"],
+  ["5", "Events: status history; Up / Down scroll, r checks GitHub status, Esc returns"],
   ["Left / Right", "Previous / next tab"],
   ["Tab / Shift+Tab", "Next / previous tab"],
   ["Up / Down, j / k", "Move the cursor between rows"],
@@ -12530,7 +12530,7 @@ Environment:
                             (--refresh takes precedence)
   GH_GLANCE_GITHUB_STATUS=off
                             Turn off the githubstatus.com check in
-                            Notifications (an http(s) URL replaces the endpoint)
+                            Events (an http(s) URL replaces the endpoint)
   GH_GLANCE_ICONS=unicode   Unicode status glyphs and text row substitutes
   GH_GLANCE_ICONS=ascii     ASCII-only status and row icons
   GH_GLANCE_NO_ANIMATION=1  Stop motion; semantic status words remain
@@ -16828,7 +16828,7 @@ function contextHelpPages({ view, target, tab, remoteSetup = false }, keys = key
     issues: "Issues shows open issues in the selected repository.",
     prs: "Pull requests shows open requests to merge changes into the selected repository.",
     security: "Security shows alerts returned by the checked sources; unavailable sources can hide alerts.",
-    notifications: "Notifications lists status events for this pane: waits, refreshes, failures and cleared causes.",
+    notifications: "Events lists what happened in this pane: waits, refreshes, failures and cleared causes.",
   };
   const title = remoteSetup ? "No GitHub remote found" : view.title;
   const action = remoteSetup ? "Close help with ?, then Enter to start gh repo create; or restart with gh-glance --repo owner/name."
@@ -17026,6 +17026,9 @@ const VERDICT_NOTICE_LEVELS = Object.freeze({
   "auth-problem": "action", unavailable: "action", "no-remote": "action", "rate-limited": "wait",
 });
 const NOTIFICATION_LOG_MAX = 500;
+// A wait that ends within this long left nothing to look at: it stays in the
+// history but does not count as unread. Each episode is measured on its own.
+const SHORT_WAIT_MS = 120_000;
 // Tabs whose requests draw on each rate resource; a cause on that resource
 // holds them up. The cost table is fixed, so this is computed once.
 const NOTICE_RESOURCE_TABS = Object.freeze(Object.fromEntries(RATE_RESOURCES.map((resource) =>
@@ -17058,7 +17061,8 @@ function fetchErrorLevel(error) {
 // one affecting the same tab, came after it); an ended entry never reopens, so a recurring condition reads
 // as a new episode. An entry the bound already dropped cannot be ended, so its
 // "Cleared" line is silently skipped. Earlier-session history is context, not
-// news, so it never raises the badge.
+// news, so it never raises the badge, and neither does a short wait that has
+// already cleared.
 function createNotificationLog({ max = NOTIFICATION_LOG_MAX, now = Date.now } = {}) {
   const entries = []; // oldest first
   let nextId = 1;
@@ -17126,6 +17130,7 @@ function createNotificationLog({ max = NOTIFICATION_LOG_MAX, now = Date.now } = 
     let yellow = false;
     for (const entry of entries) {
       if (entry.level === "info" || entry.source === EARLIER_SESSION_SOURCE || entry.id <= seenId) continue;
+      if (entry.level === "wait" && entry.endedAt !== null && entry.endedAt - entry.firstAt < SHORT_WAIT_MS) continue;
       unread += 1;
       if (entry.level === "wait") yellow = true;
       else red = true;
@@ -17980,14 +17985,16 @@ const MIN_TABLE_WIDTH = Math.max(...TABS.map((t) => minimumWidthFor(t.header)));
 const MIN_COMPACT_WIDTH = Math.max(...TABS.map((t) => minimumWidthFor(t.compactHeader)));
 
 // The tab bar is laid out independently of the table. Full labels are used
-// whenever they fit the measured bar (~97 columns with counts on every tab, less
+// whenever they fit the measured bar (~90 columns with counts on every tab, less
 // with fewer); short labels need ~76. Once the bar has dropped to short labels,
 // full ones return only with this many spare columns, so a pane parked on the
 // boundary, or a count gaining a digit, does not flip labels back and forth and
 // defeat the unchanged-frame optimization. Below the short width the bar drops
 // names and keeps digits and counts (see tabBarEntries).
 const TAB_LABEL_HYSTERESIS = 4;
-const NOTIFICATIONS_LABEL = Object.freeze({ full: "Notifications", short: "Status" });
+// One name at every tier: a label that changes with the pane width reads as a
+// different feature.
+const NOTIFICATIONS_LABEL = Object.freeze({ full: "Events", short: "Events" });
 
 function tabFailureSuffix({ count, failed, brokenCI }) {
   if (count == null) return failed ? " x" : "";

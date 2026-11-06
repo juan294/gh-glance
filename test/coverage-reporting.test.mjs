@@ -68,7 +68,7 @@ test('coverage workflow is exact-SHA, scheduled, manual, and fail-closed', () =>
   assert.doesNotMatch(workflow.slice(0, workflow.indexOf('permissions:')), /push:/);
   assert.match(workflow, /schedule:\s*\n\s+- cron:/);
   assert.match(workflow, /workflow_dispatch:/);
-  assert.match(workflow, /timeout-minutes: 35/);
+  assert.match(workflow, /timeout-minutes: 60/);
   assert.match(workflow, /npm run test:coverage/);
   assert.match(workflow, /COVERAGE_SECRET: \$\{\{ secrets\.COVERAGE_SECRET \}\}/);
   assert.match(workflow, /SOURCE_COMMIT_SHA: \$\{\{ github\.sha \}\}/);

@@ -104,7 +104,7 @@ try {
     signal: "none",
     settle: 20,
     args: "--repo acme/widget",
-    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Status (") { ok=1 }', 150) + "printf 5; " +
+    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Events (") { ok=1 }', 150) + "printf 5; " +
       waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "GitHub request limit") { ok=1 }', 150) + "sleep .3; printf q",
     env: { ...rateLimited, GH_GLANCE_FIXTURE_RATE_REMAINING: "1000", GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
     configHome,
@@ -138,7 +138,7 @@ test("same-target restart keeps cached Actions rows under a live rate-limit erro
   // A self-resolving limit is a wait: it is counted on the Notifications tab
   // and does not take rows from the table.
   assert.doesNotMatch(screen, /Core: GitHub request limit/);
-  assert.match(screen, /5:Status \(\d+\)/);
+  assert.match(screen, /5:Events \(\d+\)/);
   // The restart keeps the request-limit cause; it is listed in Notifications.
   assert.match(screenOf(recoveredView), /(?:Core|Actions): GitHub request limit/);
   // The rows were aged two minutes before launch; a badge render after the

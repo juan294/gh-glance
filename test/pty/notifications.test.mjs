@@ -66,7 +66,7 @@ test("a wait cause leaves the table in place, colours the badge yellow and is li
   });
   // Captured before the lock is released: the frame still shows the wait.
   assert.match(held.finalFrame.lines.find(isStatusLine) ?? "", /^‖ Paused/);
-  assert.match(held.raw, new RegExp(`${ESC}\\[93m 5:Status \\(\\d+\\) `));
+  assert.match(held.raw, new RegExp(`${ESC}\\[93m 5:Events \\(\\d+\\) `));
   assert.doesNotMatch(held.raw, /Coordinating with your other panes/);
   assert.deepEqual(rowsAboveHeader(held.finalFrame.lines), []);
   assert.ok(held.finalFrame.widest <= 80);
@@ -85,13 +85,13 @@ test("a wait cause leaves the table in place, colours the badge yellow and is li
     env,
   });
   const view = viewed.finalFrame.lines.join("\n");
-  assert.match(view, /Notifications · /);
+  assert.match(view, /Events · /);
   // Captures default the status check off; the header says so.
   assert.match(view, /GitHub status checks off \(GH_GLANCE_GITHUB_STATUS\)/);
   assert.match(view, /(?:Core|Actions): Coordinating with your other panes/);
   assert.match(view, /Cleared: Coordinating with your other panes/);
   // Opening the view marks the events seen.
-  assert.match(viewed.finalFrame.lines[0], /\[5:Status\]/);
+  assert.match(viewed.finalFrame.lines[0], /\[5:Events\]/);
   assert.ok(viewed.finalFrame.widest <= 80);
 });
 
@@ -102,7 +102,7 @@ test("an action cause stays inline above the table with its remedy and a red bad
   const inline = rowsAboveHeader(result.finalFrame.lines);
   assert.ok(inline.length >= 1 && inline.length <= 3, inline.join("\n"));
   assert.match(inline.join("\n"), /gh-glance --doctor/);
-  assert.match(result.raw, new RegExp(`${ESC}\\[91m 5:Status \\(\\d+\\) `));
+  assert.match(result.raw, new RegExp(`${ESC}\\[91m 5:Events \\(\\d+\\) `));
 });
 
 test("the tab bar keeps all five section digits on one row from 120 to 40 columns", () => {
@@ -114,10 +114,10 @@ test("the tab bar keeps all five section digits on one row from 120 to 40 column
     }
     assert.match(divider, /^─+$/, `${cols}: tab bar wrapped:\n${result.finalFrame.lines.slice(0, 3).join("\n")}`);
     assert.ok(result.finalFrame.widest <= cols, `${cols}-column frame overflowed`);
-    if (cols === 120) assert.match(bar, /5:Notifications/);
+    if (cols === 120) assert.match(bar, /5:Events/);
     // Full names are used whenever they fit, so 80 columns shows either tier
     // depending on the counts loaded; tabBarEntries unit tests pin the tiers.
-    if (cols === 80) assert.match(bar, /5:(?:Notifications|Status)/);
+    if (cols === 80) assert.match(bar, /5:Events/);
     assert.ok(result.finalFrame.lines.some(isStatusLine));
   }
 });
@@ -175,7 +175,7 @@ test("a GitHub incident from the status page turns the badge red, heads the view
     rows: 18,
     signal: "none",
     settle: 90,
-    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Notifications (") { ok=1 }', 200) +
+    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Events (") { ok=1 }', 200) +
       "printf 5; " +
       waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "GitHub incident: Actions runs delayed") { ok=1 }', 200) +
       // checkNow runs at most once a minute; r after that asks again.
@@ -186,7 +186,7 @@ test("a GitHub incident from the status page turns the badge red, heads the view
     env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
       GH_GLANCE_GITHUB_STATUS: `http://127.0.0.1:${server.address().port}/api/v2/summary.json` },
   });
-  assert.match(result.raw, new RegExp(`${ESC}\\[91m 5:Notifications \\(\\d+\\) `));
+  assert.match(result.raw, new RegExp(`${ESC}\\[91m 5:Events \\(\\d+\\) `));
   assert.match(result.raw, /GitHub incident: Actions runs delayed/);
   const view = result.finalFrame.lines.join("\n");
   assert.match(view, /GitHub status: All systems operational/);
