@@ -17026,8 +17026,8 @@ const VERDICT_NOTICE_LEVELS = Object.freeze({
   "auth-problem": "action", unavailable: "action", "no-remote": "action", "rate-limited": "wait",
 });
 const NOTIFICATION_LOG_MAX = 500;
-// A wait that clears on its own within this long left nothing to look at: it
-// stays in the history but does not count as unread once it ends.
+// A wait that ends within this long left nothing to look at: it stays in the
+// history but does not count as unread. Each episode is measured on its own.
 const SHORT_WAIT_MS = 120_000;
 // Tabs whose requests draw on each rate resource; a cause on that resource
 // holds them up. The cost table is fixed, so this is computed once.
@@ -17985,7 +17985,7 @@ const MIN_TABLE_WIDTH = Math.max(...TABS.map((t) => minimumWidthFor(t.header)));
 const MIN_COMPACT_WIDTH = Math.max(...TABS.map((t) => minimumWidthFor(t.compactHeader)));
 
 // The tab bar is laid out independently of the table. Full labels are used
-// whenever they fit the measured bar (~97 columns with counts on every tab, less
+// whenever they fit the measured bar (~90 columns with counts on every tab, less
 // with fewer); short labels need ~76. Once the bar has dropped to short labels,
 // full ones return only with this many spare columns, so a pane parked on the
 // boundary, or a count gaining a digit, does not flip labels back and forth and

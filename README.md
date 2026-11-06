@@ -20,15 +20,15 @@ pane next to your editor) where you want an always-on glance at repo activity
 without switching to the browser.
 
 ```
-[1:Actions (4)]  2:Issues   3:PRs   4:Security   5:Events
+[1:Actions (4)]   2:Issues    3:Pull requests    4:Security    5:Events
 ───────────────────────────────────────────────────────────────────────────
 ╭─ Actions · owner/repo ──────────────────────────────────────────────────╮
 │     TITLE                  │WORKFLOW  │BRANCH        │TIME   │UPDATED   │
 │ ─────────────────────────────────────────────────────────────────────── │
-│ >+  ci: pin actions to com… #443 CI    develop        1m20s   93d ago   │
-│  x  fix: restore the prima… #442 Code… develop        1m28s   93d ago   │
-│  +  chore: bump dependenci… #441 CI    dependa…int-10 30s     93d ago   │
-│  -  docs: update the readme #440 CI    develop        15s     94d ago   │
+│ >+  ci: pin actions to com… #443 CI    develop        1m20s   96d ago   │
+│  x  fix: restore the prima… #442 Code… develop        1m28s   96d ago   │
+│  +  chore: bump dependenci… #441 CI    dependa…int-10 30s     96d ago   │
+│  -  docs: update the readme #440 CI    develop        15s     97d ago   │
 │                                                                         │
 │                                                                         │
 ╰──────────────────────────────────────────────────────────────── 4 of 4 ─╯
@@ -365,8 +365,9 @@ and `GH_GLANCE_GITHUB_STATUS=off` turns it off.
 
 The tab label shows how many waits and problems arrived since you last opened
 the view, for example `5:Events (3)`: red when any is a problem or needs
-action, yellow when all are waits. A wait that clears on its own in under two
-minutes stops counting when it ends, although the view still lists it. Routine
+action, yellow when all are waits. A wait that ends in under two minutes stops
+counting at that point, although the view still lists it. Each wait is measured
+on its own, so repeated short waits do not add up. Routine
 refreshes never change the badge, so an idle pane still redraws nothing. The status bar keeps its one-row state
 (`Paused`, `Stale`, ...) as before.
 

@@ -88,9 +88,9 @@ test("tabBarEntries: full labels whenever they fit, with hysteresis back from sh
   assert.equal(short[4].label, " 5:Events (3) ");
   assert.ok(short.every((entry) => entry.tier === "short"));
   // After short labels, returning to full needs the hysteresis margin.
-  assert.equal(tabBarEntries({ ...tabInputs(), cols: 90, preferShort: true })[4].label, " 5:Events (3) ");
-  assert.equal(tabBarEntries({ ...tabInputs(), cols: 93, preferShort: true })[4].label, " 5:Events (3) ");
-  assert.equal(tabBarEntries({ ...tabInputs(), cols: 94, preferShort: true })[4].label, " 5:Events (3) ");
+  assert.equal(tabBarEntries({ ...tabInputs(), cols: 90, preferShort: true })[2].label, " 3:PRs (5) ");
+  assert.equal(tabBarEntries({ ...tabInputs(), cols: 93, preferShort: true })[2].label, " 3:PRs (5) ");
+  assert.equal(tabBarEntries({ ...tabInputs(), cols: 94, preferShort: true })[2].label, " 3:Pull requests (5) ");
 });
 
 test("tabBarEntries: narrow panes drop gaps, then counts, and never exceed the width", () => {

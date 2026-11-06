@@ -11,13 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The fifth section is now named `Events` (`5:Events`) at every width, in the
-  tab bar, its view title and the help text. Narrow panes no longer switch it
+- The fifth section is now named `Events` (`5:Events`) at every width that shows
+  a name, in the tab bar, its view title and the help text. Narrow panes no longer switch it
   to a different word (`Status`, earlier `Notices`). Full tab names now fit
   in panes 7 columns narrower.
-- A wait that clears on its own in under two minutes no longer counts toward
-  the `Events` unread badge once it ends. The view still lists it. Problems,
-  causes that need action and longer waits count as before.
+- A wait that ends in under two minutes no longer counts toward the `Events`
+  unread badge. The view still lists it. Each wait is measured on its own, so
+  repeated short waits do not add up. Problems, causes that need action and
+  longer waits count as before.
 
 ## [0.19.1] - 2026-11-04
 
