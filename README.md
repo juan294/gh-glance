@@ -365,8 +365,9 @@ and `GH_GLANCE_GITHUB_STATUS=off` turns it off.
 
 The tab label shows how many waits and problems arrived since you last opened
 the view, for example `5:Events (3)`: red when any is a problem or needs
-action, yellow when all are waits. Routine refreshes never change the badge, so
-an idle pane still redraws nothing. The status bar keeps its one-row state
+action, yellow when all are waits. A wait that clears on its own in under two
+minutes stops counting when it ends, although the view still lists it. Routine
+refreshes never change the badge, so an idle pane still redraws nothing. The status bar keeps its one-row state
 (`Paused`, `Stale`, ...) as before.
 
 ### Adjusting column widths

@@ -19,8 +19,9 @@ jobs:
     name: Coverage report
     runs-on: ubuntu-latest
     # Scheduled runs add the serialized PTY runtime-coverage suite, measured at
-    # 20-21 minutes without instrumentation. Match the PTY CI job's safe ceiling.
-    timeout-minutes: 35
+    # 20-21 minutes without instrumentation. Instrumented, it did not finish in
+    # the 28 minutes a 35-minute limit left it, so this limit is deliberately wide.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7

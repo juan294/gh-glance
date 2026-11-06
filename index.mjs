@@ -17026,6 +17026,9 @@ const VERDICT_NOTICE_LEVELS = Object.freeze({
   "auth-problem": "action", unavailable: "action", "no-remote": "action", "rate-limited": "wait",
 });
 const NOTIFICATION_LOG_MAX = 500;
+// A wait that clears on its own within this long left nothing to look at: it
+// stays in the history but does not count as unread once it ends.
+const SHORT_WAIT_MS = 120_000;
 // Tabs whose requests draw on each rate resource; a cause on that resource
 // holds them up. The cost table is fixed, so this is computed once.
 const NOTICE_RESOURCE_TABS = Object.freeze(Object.fromEntries(RATE_RESOURCES.map((resource) =>
@@ -17058,7 +17061,8 @@ function fetchErrorLevel(error) {
 // one affecting the same tab, came after it); an ended entry never reopens, so a recurring condition reads
 // as a new episode. An entry the bound already dropped cannot be ended, so its
 // "Cleared" line is silently skipped. Earlier-session history is context, not
-// news, so it never raises the badge.
+// news, so it never raises the badge, and neither does a short wait that has
+// already cleared.
 function createNotificationLog({ max = NOTIFICATION_LOG_MAX, now = Date.now } = {}) {
   const entries = []; // oldest first
   let nextId = 1;
@@ -17126,6 +17130,7 @@ function createNotificationLog({ max = NOTIFICATION_LOG_MAX, now = Date.now } = 
     let yellow = false;
     for (const entry of entries) {
       if (entry.level === "info" || entry.source === EARLIER_SESSION_SOURCE || entry.id <= seenId) continue;
+      if (entry.level === "wait" && entry.endedAt !== null && entry.endedAt - entry.firstAt < SHORT_WAIT_MS) continue;
       unread += 1;
       if (entry.level === "wait") yellow = true;
       else red = true;

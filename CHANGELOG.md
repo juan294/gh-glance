@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tab bar, its view title and the help text. Narrow panes no longer switch it
   to a different word (`Status`, earlier `Notices`). Full tab names now fit
   in panes 7 columns narrower.
+- A wait that clears on its own in under two minutes no longer counts toward
+  the `Events` unread badge once it ends. The view still lists it. Problems,
+  causes that need action and longer waits count as before.
 
 ## [0.19.1] - 2026-11-04
 

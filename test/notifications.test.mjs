@@ -155,6 +155,38 @@ test("log: unread count and tone", () => {
   assert.equal(log.summary().tone, "red");
 });
 
+test("log: a wait that clears on its own within two minutes is not unread", () => {
+  const log = createNotificationLog({ now: () => 1 });
+  log.record({ key: "cause:budget-stale", level: "wait", source: "Core", text: "Budget old", at: 1000 });
+  // Still waiting: the badge reports it.
+  assert.deepEqual([log.summary().unread, log.summary().tone], [1, "yellow"]);
+  log.end("cause:budget-stale", 1000 + 119_999);
+  assert.deepEqual([log.summary().unread, log.summary().tone], [0, "none"]);
+  // The history keeps both the wait and its cleared line.
+  assert.deepEqual(log.list().map((entry) => entry.text).sort(), ["Budget old", "Cleared: Budget old"]);
+  // A recurrence is a new episode, so it counts while it lasts.
+  log.record({ key: "cause:budget-stale", level: "wait", source: "Core", text: "Budget old", at: 200_000 });
+  assert.equal(log.summary().unread, 1);
+});
+
+test("log: a wait of two minutes or more stays unread after it clears", () => {
+  const log = createNotificationLog({ now: () => 1 });
+  log.record({ key: "cause:rate-limit", level: "wait", source: "Core", text: "Limited", at: 1000 });
+  log.end("cause:rate-limit", 1000 + 120_000);
+  assert.deepEqual([log.summary().unread, log.summary().tone], [1, "yellow"]);
+});
+
+test("log: a problem or action stays unread however quickly it clears", () => {
+  const log = createNotificationLog({ now: () => 1 });
+  log.record({ key: "fetch:actions:other", level: "problem", source: "Actions", text: "boom", at: 1000 });
+  log.end("fetch:actions:other", 1001);
+  assert.deepEqual([log.summary().unread, log.summary().tone], [1, "red"]);
+  log.markSeen();
+  log.record({ key: "cause:corrupt", level: "action", source: "Core", text: "corrupt", at: 2000 });
+  log.end("cause:corrupt", 2001);
+  assert.deepEqual([log.summary().unread, log.summary().tone], [1, "red"]);
+});
+
 test("log: summary returns the same object while nothing changed", () => {
   const log = createNotificationLog({ now: () => 1 });
   log.record({ key: "cause:busy", level: "wait", source: "Core", text: "Coordinating" });
