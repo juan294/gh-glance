@@ -2720,6 +2720,40 @@ test("OBS-REGRESS-04: an invalid observer reading fails the check and schedules 
   assert.equal(state.probeClaims.core, null);
 });
 
+test("OBS-REGRESS-06: a newer GraphQL observer reading may move its window backwards", (t) => {
+  const { scope } = sandbox(t);
+  const leaseId = randomUUID();
+  registerLease(scope, lease(leaseId));
+  publishInitial(scope, leaseId);
+  const before = inspectGovernor(scope, NOW).value.budgets.graphql;
+  const at = NOW + 60_000;
+  assert.equal(heartbeatLease(scope, leaseId, { core: 1, graphql: 0 }, at).ok, true);
+  const claim = claimProbe(scope, leaseId, at, "graphql");
+  assert.equal(claim.value.status, "claimed");
+  // GitHub can report the same window with a reset one second earlier.
+  const published = publishProbe(scope, leaseId, claim.value.nonce,
+    budgets(at, { remaining: 4999, resetMs: before.resetMs - 1000 }), at, "graphql");
+  assert.equal(published.ok, true);
+  const state = inspectGovernor(scope, at).value;
+  assert.equal(state.budgets.graphql.resetMs, before.resetMs - 1000);
+  assert.equal(state.budgets.graphql.used, 1);
+  assert.equal(state.observers.graphql.outcome, "healthy");
+});
+
+test("OBS-REGRESS-07: the shared refresh reports a failed check when both readings are rejected", async (t) => {
+  const { scope } = sandbox(t);
+  const leaseId = randomUUID();
+  registerLease(scope, lease(leaseId));
+  const result = await refreshSharedBudget(scope, leaseId, null, {
+    now: () => NOW,
+    readBudgets: async () => budgets(NOW, { resetMs: NOW }),
+  });
+  assert.deepEqual(result, { ok: false, reason: "probe-failed" });
+  const state = inspectGovernor(scope, NOW).value;
+  assert.equal(state.observers.graphql.outcome, "failed");
+  assert.equal(state.observers.core.outcome, "failed");
+});
+
 test("rate_limit publication updates GraphQL but never overwrites authoritative core", (t) => {
   const { scope } = sandbox(t, { authIdentity: "source-precedence" });
   const leaseId = randomUUID();

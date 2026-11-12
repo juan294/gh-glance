@@ -55,3 +55,11 @@ The task allocated no Docker/database stack or persistent service. Existing test
 The primary checkout's pre-existing research artifact remains untracked and unchanged. Original untracked copies of this plan and phase are to be backed up in the evidence directory before integration replaces them with the committed copies. No unrelated work is to be staged or removed.
 
 Next action within the already authorized scope: commit the completed candidate and these curated notes, fast-forward local `develop`, verify source identity and preservation, then remove only `gh-glance-wt-budget-observer` and its merged task branch. There is no next implementation phase. Any publication requires a separate owner request; running installed 0.19.2 panes retain old behavior until a later release and restart.
+
+## Validation follow-up (2026-11-12)
+
+Validation of commit `143e104` passed all gates and raised two findings. The owner chose the recommended dispositions and asked for a direct fix.
+
+- V1, resolved: a failed core check is hidden by the shared refresh when the GraphQL check succeeds, and the plan's claim about the origin of the `corrupt` label was unproven. Added `OBS-REGRESS-06` (a newer GraphQL observer reading may move its window backwards) and `OBS-REGRESS-07` (the shared refresh returns `probe-failed` when both readings are rejected) in `test/governor.test.mjs`. Both fail on the base commit `24c67c5` and pass on the fix. The plan's evidence table carries the correction. No product code changed.
+- V2, accepted known behavior: a backwards window change clears a recorded secondary-limit or abuse-limit hold, as a forward change already does (`index.mjs:6191-6197`). Not observed. No change.
+- V3, information: a 1 s reset jitter is now an accepted window change for either resource. No change.
