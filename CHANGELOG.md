@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A single contradictory rate-limit reading no longer pauses all panes until
+  the hourly reset. Rejected budget readings now show a failed budget check
+  that retries automatically instead of corrupt coordination state.
+
 ## [0.19.2] - 2026-11-06
 
 ### Changed

@@ -87,6 +87,7 @@ import {
   readIntentDecision,
   recordResourceBlock,
   refreshSharedBudget,
+  refreshResourceBudget,
   readSharedBudgetSources,
   registerIntent,
   registerLease,
@@ -2626,6 +2627,97 @@ test("clean probe samples persist the shared external-spend factor", (t) => {
   next.core.remaining = 4988;
   publishProbe(scope, leaseId, claim.value.nonce, next, claimAt, "core");
   assert.equal(inspectGovernor(scope, claimAt).value.budgets.core.lastExternalFactor, 2);
+});
+
+test("OBS-REGRESS-01: a newer observer restores the earlier core window and grants work", (t) => {
+  const { scope } = sandbox(t);
+  const leaseId = randomUUID();
+  const resetMs = NOW + 33 * 60_000;
+  assert.equal(registerLease(scope, lease(leaseId)).ok, true);
+  publishInitial(scope, leaseId, NOW, budgets(NOW, { remaining: 4677, resetMs }));
+
+  for (const [at, remaining, reset] of [
+    [NOW + 60_000, 5000, NOW + 60_000 + 3_599_000],
+    [NOW + 120_000, 4670, resetMs],
+  ]) {
+    if (at === NOW + 120_000) {
+      // A fresh GraphQL publication puts its next check in the future, so
+      // only the backwards core window change can pull it forward again.
+      const graphqlAt = at - 1000;
+      const claim = claimProbe(scope, leaseId, graphqlAt, "graphql");
+      assert.equal(claim.value.status, "claimed");
+      assert.equal(publishProbe(scope, leaseId, claim.value.nonce,
+        budgets(graphqlAt, { remaining: 4670, resetMs }), graphqlAt, "graphql").ok, true);
+      assert.ok(inspectGovernor(scope, graphqlAt).value.observers.graphql.nextAt > at);
+    }
+    assert.equal(heartbeatLease(scope, leaseId, { core: 1, graphql: 0 }, at).ok, true);
+    const claim = claimProbe(scope, leaseId, at, "core");
+    assert.equal(claim.value.status, "claimed");
+    assert.equal(publishProbe(scope, leaseId, claim.value.nonce,
+      budgets(at, { remaining, resetMs: reset }), at, "core").ok, true);
+  }
+  const state = inspectGovernor(scope, NOW + 120_000).value;
+  assert.equal(state.budgets.core.resetMs, resetMs);
+  assert.equal(state.budgets.core.used, 330);
+  assert.equal(state.observers.core.outcome, "healthy");
+  assert.ok(state.observers.graphql.nextAt <= NOW + 120_000);
+  const graphqlClaim = claimProbe(scope, leaseId, NOW + 120_000, "graphql");
+  assert.equal(graphqlClaim.ok, true);
+  assert.equal(graphqlClaim.value.status, "claimed");
+  const grant = registerIntent(scope, intent(randomUUID(), leaseId, NOW + 121_000), NOW + 121_000);
+  assert.equal(grant.ok, true);
+  assert.equal(grant.value.status, "scheduled");
+});
+
+test("OBS-REGRESS-02: response headers cannot move the core window backwards", (t) => {
+  const { scope } = sandbox(t);
+  const leaseId = randomUUID();
+  registerLease(scope, lease(leaseId));
+  publishInitial(scope, leaseId);
+  const before = inspectGovernor(scope, NOW).value;
+  const grant = registerIntent(scope, intent(randomUUID(), leaseId)).value;
+  assert.equal(startReservation(scope, grant.reservationId, grant.notBefore).value.status, "started");
+  const at = grant.notBefore + 1;
+  const settled = settleReservationWithBudgetObservations(scope, leaseId, grant.reservationId, {
+    outcome: "measured-success",
+    actualCosts: { core: 1, graphql: 0 },
+    observations: [{ resource: "core", source: "response-header", receivedAt: at,
+      limit: 5000, used: 330, remaining: 4670, resetMs: before.budgets.core.resetMs - 60_000, cost: 1 }],
+  }, at);
+  assert.equal(settled.ok, true);
+  const after = inspectGovernor(scope, at).value;
+  assert.equal(after.budgets.core.resetMs, before.budgets.core.resetMs);
+  assert.equal(after.epochs.core, before.epochs.core);
+});
+
+test("OBS-REGRESS-03: a backwards observer reading must be newer than stored evidence", (t) => {
+  const { scope } = sandbox(t);
+  const leaseId = randomUUID();
+  registerLease(scope, lease(leaseId));
+  publishInitial(scope, leaseId);
+  const before = inspectGovernor(scope, NOW).value.budgets.core;
+  const claim = claimNow(scope, leaseId, NOW + 1);
+  const result = publishProbe(scope, leaseId, claim.value.nonce, {
+    core: { source: "core-observer", receivedAt: before.observedAt,
+      budget: { limit: 5000, used: 330, remaining: 4670, resetMs: before.resetMs - 60_000 } },
+  }, NOW + 1, "core");
+  assert.deepEqual(result, { ok: false, reason: "probe-failed" });
+  assert.deepEqual(inspectGovernor(scope, NOW + 1).value.budgets.core, before);
+});
+
+test("OBS-REGRESS-04: an invalid observer reading fails the check and schedules retry", async (t) => {
+  const { scope } = sandbox(t);
+  const leaseId = randomUUID();
+  registerLease(scope, lease(leaseId));
+  const result = await refreshResourceBudget(scope, leaseId, null, "core", {
+    now: () => NOW,
+    readBudgets: async () => budgets(NOW, { resetMs: NOW }),
+  });
+  assert.deepEqual(result, { ok: false, reason: "probe-failed" });
+  const state = inspectGovernor(scope, NOW).value;
+  assert.equal(state.observers.core.outcome, "failed");
+  assert.equal(state.observers.core.nextAt, NOW + 60_000);
+  assert.equal(state.probeClaims.core, null);
 });
 
 test("rate_limit publication updates GraphQL but never overwrites authoritative core", (t) => {
