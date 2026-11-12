@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.3] - 2026-11-12
+
+### Fixed
+
+- A single contradictory rate-limit reading no longer pauses all panes until
+  the hourly reset. Rejected budget readings now show a failed budget check
+  that retries automatically instead of corrupt coordination state.
+
 ## [0.19.2] - 2026-11-06
 
 ### Changed
@@ -1443,7 +1451,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.19.2...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.19.3...HEAD
+[0.19.3]: https://github.com/juan294/gh-glance/compare/v0.19.2...v0.19.3
 [0.19.2]: https://github.com/juan294/gh-glance/compare/v0.19.1...v0.19.2
 [0.19.1]: https://github.com/juan294/gh-glance/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/juan294/gh-glance/compare/v0.18.1...v0.19.0

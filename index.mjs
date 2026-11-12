@@ -6163,13 +6163,14 @@ function budgetFromObservation(raw, previous, nowMs, {
   ) return { status: "invalid" };
   const epoch = `${normalized.limit}:${normalized.resetMs}`;
   // Endpoint responses can carry cached or endpoint-specific rate headers.
-  // They may refine the counter inside the epoch established by its claimed
-  // observer, but only that observer may move the resource into a new epoch.
+  // Only the claimed observer may move the epoch in either direction. A
+  // backwards move must be newer than the stored evidence to replace it.
   if (!allowEpochChange && (!previous || previous.epoch !== epoch)) {
     return { status: "ignored", epoch };
   }
   if (previous) {
-    if (normalized.resetMs < previous.resetMs) return { status: "ignored" };
+    if (normalized.resetMs < previous.resetMs &&
+        (!allowEpochChange || receivedAt <= previous.observedAt)) return { status: "ignored" };
     if (budgetEpoch(previous) === epoch && normalized.used < previous.used) {
       if (!allowEpochChange) return { status: "ignored" };
       // The claimed observer can lag a newer endpoint response within the
@@ -6272,7 +6273,7 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs, resource) {
         clearProvenBlock: true,
         allowEpochChange: true,
       });
-      if (observed.status === "invalid") return { ok: false, reason: "corrupt" };
+      if (observed.status === "invalid") return { ok: false, reason: "probe-failed" };
       if (observed.status !== "ignored") {
         // The observer's own cost is local spend. Left out, the external-factor
         // reconciliation below attributes it to other clients, and the governor
@@ -6288,7 +6289,7 @@ function publishProbe(scope, leaseId, nonce, budgets, nowMs, resource) {
         if (observed.epochChanged && state.epochs[resource] !== null) resetResources.push(resource);
       }
     }
-    if (changedResources.length === 0) return { ok: false, reason: "corrupt" };
+    if (changedResources.length === 0) return { ok: false, reason: "probe-failed" };
     if (!retireClaimedQuiescentDebt(state, resource, claim)) {
       return ACCOUNTING_OVERFLOW;
     }
@@ -23670,6 +23671,7 @@ export {
   inspectGovernor,
   governorHealth,
   refreshSharedBudget,
+  refreshResourceBudget,
   readCoreBudget,
   readSharedBudgetSources,
   safe,
@@ -23883,6 +23885,7 @@ export {
   cleanupQueueForResource,
   presentRecovery,
   RECOVERY_COPY,
+  HARD_STORAGE_REASONS,
   NOTICE_LEVELS,
   NOTIFICATION_LOG_MAX,
   noticeLevel,

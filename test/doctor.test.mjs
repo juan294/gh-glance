@@ -19,6 +19,8 @@ import { promisify } from "node:util";
 
 import {
   BUDGET_SNAPSHOT_TTL_MS,
+  HARD_STORAGE_REASONS,
+  presentRecovery,
   GOVERNOR_LOCK_ORPHAN_MS,
   GOVERNOR_LEASE_TTL_MS,
   GOVERNOR_MAX_DEBT_GROUPS,
@@ -986,4 +988,23 @@ test("D6: a known identity with a missing ledger is corrupt; no registry means a
   assert.match(out, redactedStateFile(root));
   assert.match(out, REPAIR_LINE);
   assert.match(out, /^debt groups\s+unavailable$/m);
+});
+
+test("OBS-REGRESS-05: a failed budget check shows automatic retry without ledger repair", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "gh-glance-doctor-probe-failed-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const scope = await seededDoctorScope(root);
+  const at = Date.now();
+  const retryAt = at + 60_000;
+  const cause = recoveryCause({ reason: "probe-failed", resource: "core", at, retryAt });
+  assert.equal(recordRecoveryTransition(scope, cause).ok, true);
+  const out = await doctor({ probe: false, args: ["--repo", "acme/widget"],
+    env: { XDG_CONFIG_HOME: root } });
+  assert.match(out, /^recovery reason\s+core: probe-failed$/m);
+  assert.match(out, new RegExp(`^next retry\\s+${new Date(retryAt).toISOString()}$`, "m"));
+  assert.doesNotMatch(out, /^repair\s/m);
+  assert.equal(HARD_STORAGE_REASONS.includes("probe-failed"), false);
+  const copy = presentRecovery(cause, { nowMs: at });
+  assert.match(copy.join("\n"), /GitHub budget check failed/);
+  assert.match(copy.join("\n"), /Retry automatically at the shown time/);
 });
