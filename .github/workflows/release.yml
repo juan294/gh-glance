@@ -19,7 +19,8 @@ name: Release
 #             bytes, an unknown registry answer or a dist-tag regression block.
 #   delivery  no publish credential. Bounded registry readback, provenance
 #             bound to these bytes, release.yml at the tag and the merge commit,
-#             then one fresh install exercised on Node 22 and 24.
+#             then one fresh install exercised on Node 22 and 24. The receipt
+#             records the runtime it ran on.
 #
 # Authentication is OIDC trusted publishing, not a token. There is no NPM_TOKEN
 # secret in this repository and there should never be one: npm restricted
@@ -69,9 +70,11 @@ jobs:
           ref: main
           path: protected-main
           sparse-checkout: scripts
+      # The line comes from protected main's .nvmrc (a sparse checkout keeps the
+      # root files), never from the tag under verification.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22.22.2
+          node-version-file: protected-main/.nvmrc
       - name: Tag is a protected release merge
         run: node protected-main/scripts/release-candidate.mjs bootstrap
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -110,12 +113,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22.22.2
+          node-version-file: .nvmrc
           registry-url: https://registry.npmjs.org
-      # Node 22 bundles npm 10.9, which has no OIDC support and fails with a
-      # bare 401. Trusted publishing needs >= 11.5.1; the exact pin is a
+      # Trusted publishing needs npm >= 11.5.1 (Node 22 bundles npm 10.9, which
+      # has no OIDC support and fails with a bare 401); the exact pin is a
       # reviewed change, never @latest.
       - run: npx -y npm@11.21.0 install -g npm@11.21.0 && npm --version
+      # The Node and npm this job resolved, in the run summary and the step output.
+      - run: node scripts/release-candidate.mjs runtime
       # By ID, so re-running only this job still finds the verify job's output.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -151,13 +156,15 @@ jobs:
       RELEASE_INTEGRITY: ${{ needs.verify.outputs.integrity }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # The fresh install runs on the line (.nvmrc) and on the engines floor (a
+      # floating 22). Each runtime's resolved version lands in install.json.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 24.21.0
+          node-version-file: .nvmrc
       - run: echo "NODE24=$(command -v node)" >> "$GITHUB_ENV"
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22.22.2
+          node-version: 22
       - run: echo "NODE22=$(command -v node)" >> "$GITHUB_ENV"
       - run: npx -y npm@11.21.0 install -g npm@11.21.0 && npm --version
       - name: Registry and provenance readback (five-minute bound)
