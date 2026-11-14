@@ -10,6 +10,11 @@ controlling instructions, test contracts and the [durable handoff](references/ha
 completely. Revalidate the actual worktree, branch and failed commit before reusing
 prior diagnoses or check results. Keep repairs in an owned local branch/worktree.
 
+## Project-specific procedure
+
+The repair loop below applies. What may be pushed afterwards is governed by the
+[release playbook's failure handling](../../../docs/release/release-playbook.md#failure-handling).
+
 ## Process
 
 1. Identify the exact failed run and candidate. Inspect existing runs with
