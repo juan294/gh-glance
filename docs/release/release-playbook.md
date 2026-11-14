@@ -320,11 +320,11 @@ implicit prerequisite.
 
 ## Project-local customization of managed files
 
-The native `rpi-release` and `rpi-fix-ci` skill copies carry a short project
-preamble or section pointing here. These and the four pre-existing customized rule files
-(`.claude/rules/{testing,deployment-safety}.md`,
+The project's routing to this page lives in two project overlays,
+`.rpi/project/rpi-release.md` and `.rpi/project/rpi-fix-ci.md`, which every
+installed copy of those skills reads; the managed skill copies stay stock. The
+four pre-existing customized rule files (`.claude/rules/{testing,deployment-safety}.md`,
 `.rpi/rules/{testing,deployment-safety}.md`) are expected local drift reported
 by `.rpi/scripts/rpi-diagnostics.py`; upstream baselines and manifest hashes
 are left untouched. The legacy `/release` and `/fix-ci` commands and their
-migrated Codex skills were removed on 2026-11-14; their routing to this page
-now lives in those two native skills.
+migrated Codex skills were removed on 2026-11-14.
