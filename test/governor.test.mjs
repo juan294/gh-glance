@@ -742,6 +742,49 @@ test("a separately admitted operation waits out a lane gap instead of being refu
   assert.ok(waited.every((ms) => ms > 0 && ms <= GOVERNOR_ADMISSION_WAIT_MS), `waited ${waited}`);
 });
 
+test("a wait that wakes before the scheduled slot sleeps the remainder instead of being refused", async (t) => {
+  const now = Date.now();
+  const box = sandbox(t, { now, authIdentity: "admission-early-wake" });
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId, now));
+  publishInitial(box.scope, leaseId, now);
+  const first = await runAdmittedOperation({
+    scope: box.scope,
+    leaseId,
+    operation: "tab:actions-runs",
+    waitMs: GOVERNOR_PHASE_WINDOW_MS + 3_600_000,
+    now: box.now,
+    wait: async (ms) => box.setNow(box.now() + ms + 1),
+    run: async () => "runs",
+  });
+  assert.equal(first.ok, true, JSON.stringify(first.decision ?? first.error?.message));
+
+  // A paced slot carries a fractional millisecond, and a whole-millisecond
+  // timer can end just before it. The first sleep here ends half a
+  // millisecond short -- the hosted PAGE-01 failure, where the later page was
+  // refused and the walk ended silently.
+  const waited = [];
+  let calls = 0;
+  const admitted = await runAdmittedOperation({
+    scope: box.scope,
+    leaseId,
+    operation: "catalog:actions-workflows",
+    priority: "background",
+    waitMs: GOVERNOR_ADMISSION_WAIT_MS,
+    now: box.now,
+    wait: async (ms) => {
+      waited.push(ms);
+      box.setNow(box.now() + (waited.length === 1 ? ms - 0.5 : ms));
+      return true;
+    },
+    run: async () => { calls += 1; return "catalog"; },
+  });
+  assert.equal(admitted.ok, true, JSON.stringify(admitted.decision ?? admitted.error?.message));
+  assert.equal(calls, 1);
+  assert.equal(waited.length, 2, `waited ${waited}`);
+  assert.ok(waited[1] > 0 && waited[1] <= 1, `remainder sleep ${waited[1]}`);
+});
+
 test("an aborted deferred admission is cancelled before start and cannot run late", async (t) => {
   const now = Date.now();
   const box = sandbox(t, { now, authIdentity: "admission-abort" });

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Scrolling near the end of Issues or Pull requests now loads the next page
+  reliably. When the scheduled request slot was a fraction of a millisecond
+  away, the request was refused and the list stayed at its first page until you
+  scrolled again. Other requests that wait briefly for their slot, such as CI
+  job logs, now also wait the remainder instead of being refused.
+
 ## [0.19.3] - 2026-11-12
 
 ### Fixed

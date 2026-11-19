@@ -17854,7 +17854,19 @@ async function resolveGovernorAdmission({
   if (waitMs > 0 && scheduled) {
     const delay = scheduled.notBefore - now();
     if (delay <= waitMs) {
-      const elapsed = delay <= 0 || await wait(delay, signal);
+      let elapsed = delay <= 0 || await wait(delay, signal);
+      // Pacing gives notBefore a fractional millisecond, while Date.now() and
+      // Node timers resolve whole milliseconds, so a sleep can end on the
+      // millisecond just before the slot. start() refuses an unexpired slot,
+      // and that refusal would drop the operation outright. Sleep off the
+      // remainder; the retry bound keeps a clock that never advances from
+      // spinning here, and a remainder beyond waitMs (a clock stepped back)
+      // falls through to the ordinary refusal.
+      for (let retry = 0; retry < 3 && elapsed && !signal?.aborted; retry += 1) {
+        const remaining = scheduled.notBefore - now();
+        if (!(remaining > 0) || remaining > waitMs) break;
+        elapsed = await wait(remaining, signal);
+      }
       if ((!requireElapsed || elapsed) && !signal?.aborted) {
         admitted = start(scope, scheduled.reservationId, now());
       }
