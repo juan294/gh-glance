@@ -457,6 +457,56 @@ test("A folder with no remote enters setup before any coordination", (t) => {
   assert.doesNotMatch(frame, /Can't coordinate API use|waiting for API budget/);
 });
 
+function multiRemoteFolder(t, prefix, { resolved = null } = {}) {
+  const folder = configRoot(t, prefix);
+  execFileSync("git", ["init", "-q", folder]);
+  execFileSync("git", ["-C", folder, "remote", "add", "origin", "https://github.com/acme/widget.git"]);
+  execFileSync("git", ["-C", folder, "remote", "add", "upstream", "https://github.com/other/fork.git"]);
+  if (resolved) execFileSync("git", ["-C", folder, "config", `remote.${resolved}.gh-resolved`, "base"]);
+  return folder;
+}
+
+test("Remotes naming several repositories ask for a choice instead of failing", (t) => {
+  // A fork checkout with origin and upstream and no `gh repo set-default`
+  // choice used to paint a connection or coordination failure forever, with
+  // "Repository unresolved" as the only clue.
+  const folder = multiRemoteFolder(t, "gh-glance-status-ambiguous-");
+  const result = capture({
+    cols: 80,
+    rows: 24,
+    signal: "none",
+    settle: 8,
+    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "gh repo set-default") { ok=1 }') + "printf q",
+    configHome: configRoot(t, "gh-glance-status-ambiguous-config-"),
+    env: { GH_GLANCE_CAPTURE_CWD: folder, GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
+  });
+  assert.match(statusLine(result) ?? "", /^· Setup/);
+  const frame = result.finalFrame.lines.join("\n");
+  assert.match(frame, /Remotes name several GitHub repositories/);
+  assert.match(frame, /Remotes: acme\/widget, other\/fork/);
+  assert.match(frame, /gh repo set-default/);
+  assert.doesNotMatch(frame, /Create remote|GitHub connection failed|Local coordination unavailable/);
+  // Setup is not a fetch failure, so no tab is marked failed.
+  assert.doesNotMatch(frame.split("\n")[0], /Actions x/);
+});
+
+test("The gh repo set-default choice selects the repository", (t) => {
+  const folder = multiRemoteFolder(t, "gh-glance-status-gh-default-", { resolved: "origin" });
+  const result = capture({
+    cols: 80,
+    rows: 24,
+    signal: "none",
+    settle: 15,
+    stdin: quitAfterCached("actions"),
+    configHome: configRoot(t, "gh-glance-status-gh-default-config-"),
+    env: { GH_GLANCE_CAPTURE_CWD: folder },
+  });
+  assert.match(statusLine(result) ?? "", /^· Watching/);
+  const frame = result.finalFrame.lines.join("\n");
+  assert.match(frame, /acme\/widget/);
+  assert.doesNotMatch(frame, /Repository unresolved|several GitHub repositories/);
+});
+
 test("ASCII profile keeps the same status label and a width-one marker", (t) => {
   const result = capture({
     cols: 45,

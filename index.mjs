@@ -445,6 +445,14 @@ function isMissingRemote(err) {
 // The shorter of the two, so a verdict recorded without a gh subprocess reads
 // exactly like one gh produced and classifies the same way.
 const NO_REMOTE_ERROR_TEXT = "no git remotes found";
+// Never produced by gh, which picks a remote on its own when it cannot prompt.
+// Recorded locally when the remotes name several repositories and no
+// `gh repo set-default` choice settles it.
+const AMBIGUOUS_REMOTE_ERROR_TEXT = "git remotes name several repositories and no gh default is set";
+
+function isAmbiguousRemote(err) {
+  return errText(err).includes(AMBIGUOUS_REMOTE_ERROR_TEXT);
+}
 
 const UNUSABLE_OUTPUT_CODE = "GH_GLANCE_UNUSABLE_OUTPUT";
 
@@ -480,6 +488,7 @@ function isUnusableOutput(err) {
 function classify(err) {
   if (err == null) return "ok";
   if (isMissingRemote(err)) return "no-remote";
+  if (isAmbiguousRemote(err)) return "ambiguous-remote";
   if (isRateLimited(err)) return "rate-limited";
   if (isAuthProblem(err)) return "auth-problem";
   if (isUnavailable(err)) return "unavailable";
@@ -504,6 +513,8 @@ function classify(err) {
 const VERDICT_REMEDY = {
   "no-remote":
     "No GitHub remote found -- press Enter to create one, or use `gh-glance --repo owner/name`",
+  "ambiguous-remote":
+    "Git remotes name several GitHub repositories -- run `gh repo set-default`, or use `gh-glance --repo owner/name`",
   "auth-problem":
     "GitHub login or authorization required -- run `gh auth status`, then `gh auth login` or `gh auth refresh`",
   "rate-limited": "GitHub rate limit reached -- backing off, this clears on its own",
@@ -516,6 +527,7 @@ const NARROW_VERDICT_REMEDY = {
   "rate-limited": "Wait: GitHub rate limit; retrying",
   unavailable: "Run: gh-glance --doctor (repo unavailable)",
   "no-remote": "Run: gh-glance --repo owner/name",
+  "ambiguous-remote": "Run: gh repo set-default",
 };
 
 function toTabError(err) {
@@ -1319,8 +1331,50 @@ function resolveEffectiveRepository({ runtimeRepo = null, ghRepo = null, remoteU
   if (ghRepo) {
     try { return parseRepoTarget(ghRepo).slug; } catch { return null; }
   }
-  const slugs = new Set(remoteUrls.map(remoteSlug).filter(Boolean));
-  return slugs.size === 1 ? [...slugs][0] : null;
+  const slugs = remoteRepositorySlugs(remoteUrls);
+  return slugs.length === 1 ? slugs[0] : null;
+}
+
+// The distinct repositories a set of remote URLs names, sorted so a report and
+// a prompt list them the same way on every run.
+function remoteRepositorySlugs(remoteUrls = []) {
+  return [...new Set(remoteUrls.map(remoteSlug).filter(Boolean))].sort();
+}
+
+// Why there is no repository to show, when there is none: no remote at all is
+// the onboarding state; remotes naming several repositories (a fork with an
+// `upstream`, say) is a choice only the user can make. Neither is a connection
+// or coordination failure, and reporting one as such sends the reader to the
+// wrong remedy.
+function repositoryTargetProblem({ runtimeRepo = null, ghRepo = null, remoteUrls = [] } = {}) {
+  if (noRepositoryTarget({ runtimeRepo, ghRepo, remoteUrls })) return "no-remote";
+  if (runtimeRepo || ghRepo) return null;
+  return remoteRepositorySlugs(remoteUrls).length > 1 ? "ambiguous-remote" : null;
+}
+
+function runtimeRepositoryTargetProblem(remoteUrls = runtimeRemoteUrls) {
+  return repositoryTargetProblem({ runtimeRepo: runtime.repo, ghRepo: process.env.GH_REPO, remoteUrls });
+}
+
+// `gh repo set-default` records its choice as `remote.<name>.gh-resolved`:
+// "base" means that remote is the repository; any other value is the owner/name
+// gh uses instead, on the host of the remote it is stored on. Honouring it makes
+// a multi-remote checkout resolve to the repository gh itself targets. Without a
+// usable default every URL is kept, and an ambiguous set stays ambiguous rather
+// than becoming a guess. Two defaults that disagree are kept side by side for
+// the same reason.
+function selectGhDefaultRemoteUrls(remotes = []) {
+  const selected = [];
+  for (const { urls = [], resolved = null } of remotes) {
+    if (resolved === "base") selected.push(...urls);
+    else if (typeof resolved === "string" && REPO_PATTERN.exec(resolved)?.[0] === resolved) {
+      for (const url of urls) {
+        const host = remoteHost(url);
+        if (host) selected.push(`https://${host}/${resolved}.git`);
+      }
+    }
+  }
+  return selected.length > 0 ? selected : remotes.flatMap(({ urls = [] }) => urls);
 }
 
 function effectiveRuntimeRepository(options = {}) {
@@ -7312,6 +7366,7 @@ function backoffActive(key, now) {
 // account governor instead of a process-local retry timer.
 const FAILURE_LADDER = {
   "no-remote": BACKOFF_STEPS_MS,
+  "ambiguous-remote": BACKOFF_STEPS_MS,
   unavailable: BACKOFF_STEPS_MS,
   "auth-problem": AUTH_RETRY_MS,
 };
@@ -11483,37 +11538,55 @@ function field(label, value, width = DOCTOR_LABEL_WIDTH) {
   return label.length < width ? `${label.padEnd(width)}${value}` : `${label}  ${value}`;
 }
 
-async function gitRemote() {
+// Every remote with its URLs and the `gh repo set-default` choice stored on it.
+// `git config --get` exits 1 for an unset key, which is the common case and
+// reads as no choice. A folder outside a checkout has no remotes.
+async function readGitRemotes({ cwd } = {}) {
+  const git = (args) => execFileAsync("git", args, { timeout: GH_TIMEOUT_MS, ...(cwd ? { cwd } : {}) });
   try {
-    const { stdout } = await execFileAsync("git", ["remote", "get-url", "origin"], {
-      timeout: GH_TIMEOUT_MS,
-    });
-    return stdout.trim() || "(no origin remote)";
-  } catch {
-    return "not a git repository (or no origin remote)";
-  }
-}
-
-async function gitRemoteUrls() {
-  try {
-    const { stdout } = await execFileAsync("git", ["remote"], { timeout: GH_TIMEOUT_MS });
+    const { stdout } = await git(["remote"]);
     const names = stdout.split(/\r?\n/).map((name) => name.trim()).filter(Boolean);
     const settled = await Promise.allSettled(names.map(async (name) => {
-      const result = await execFileAsync("git", ["remote", "get-url", "--all", name], {
-        timeout: GH_TIMEOUT_MS,
-      });
-      return result.stdout.split(/\r?\n/).map((url) => url.trim()).filter(Boolean);
+      const [urls, resolved] = await Promise.all([
+        git(["remote", "get-url", "--all", name]),
+        git(["config", "--get", `remote.${name}.gh-resolved`]).then(({ stdout: value }) => value.trim() || null, () => null),
+      ]);
+      return { name, urls: urls.stdout.split(/\r?\n/).map((url) => url.trim()).filter(Boolean), resolved };
     }));
-    return settled.flatMap((result) => result.status === "fulfilled" ? result.value : []);
+    return settled.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
   } catch {
     return [];
   }
 }
 
-function targetSource() {
+async function gitRemoteUrls(options = {}) {
+  return selectGhDefaultRemoteUrls(await readGitRemotes(options));
+}
+
+function targetSource(remotes = []) {
   if (runtime.repo) return "flag";
   if (process.env.GH_REPO) return "GH_REPO";
-  return "git remote (or none, if this is not a checkout)";
+  if (remotes.length === 0) return "git remote (none found; this may not be a checkout)";
+  const chosen = remotes.filter(({ resolved }) => resolved).map(({ name }) => name);
+  return chosen.length > 0 ? `git remote (gh default: ${chosen.join(", ")})` : "git remote";
+}
+
+// The repository the dashboard will use, stated with the same resolver, so the
+// report cannot look healthy while the dashboard has no target.
+function doctorSlug(remoteUrls) {
+  const repository = effectiveRuntimeRepository({ remoteUrls });
+  if (repository) return repository;
+  if (runtimeRepositoryTargetProblem(remoteUrls) === "ambiguous-remote") {
+    return `(ambiguous: ${remoteRepositorySlugs(remoteUrls).join(", ")}; run gh repo set-default or pass --repo)`;
+  }
+  return "(unresolved; pass --repo owner/name)";
+}
+
+function doctorRemoteLines(remotes) {
+  if (remotes.length === 0) return [field("git remote", "(none)")];
+  return remotes.flatMap(({ name, urls, resolved }) => (urls.length > 0 ? urls : ["(no URL)"]).map((url) =>
+    field("git remote", `${name} ${url}${resolved === "base" ? " (gh default)"
+      : resolved ? ` (gh default: ${resolved})` : ""}`)));
 }
 
 // How much of the hourly API budget is left, and roughly how fast this
@@ -11868,15 +11941,17 @@ async function runDoctor({ probeEndpoints = false } = {}) {
   // which is the opposite of what a diagnostic run is for.
   alertBackoff.clear();
 
-  const probes = probeEndpoints ? doctorProbePlan() : [];
-
   // Free checks run first. The display rate_limit read is report data only;
   // admission re-reads its GraphQL source after owning the shared claim.
-  const [ghVersion, remote, remoteUrls] = await Promise.all([
+  const [ghVersion, remotes] = await Promise.all([
     captureGh(["--version"], "version"),
-    gitRemote(),
-    gitRemoteUrls(),
+    readGitRemotes(),
   ]);
+  // The probes resolve their target from the same remotes the dashboard reads,
+  // including the `gh repo set-default` choice, so they probe what it shows.
+  const remoteUrls = selectGhDefaultRemoteUrls(remotes);
+  runtimeRemoteUrls = remoteUrls;
+  const probes = probeEndpoints ? doctorProbePlan() : [];
   const effectiveHost = effectiveRuntimeHost({ remoteUrls });
   runtimeIdentityCoordinator = probeEndpoints ? createIdentityCoordinator({ host: effectiveHost }) : null;
   const verified = probeEndpoints
@@ -12005,10 +12080,10 @@ async function runDoctor({ probeEndpoints = false } = {}) {
     authStatus || "(no output)",
     "",
     ...section("Repository target"),
-    field("source", targetSource()),
+    field("source", targetSource(remotes)),
     field("host", effectiveHost ?? "(unresolved)"),
-    field("slug", runtime.repo ?? "(inferred from the working directory)"),
-    field("git remote", remote),
+    field("slug", doctorSlug(remoteUrls)),
+    ...doctorRemoteLines(remotes),
     "",
     // Labelled, because these two numbers come from `gh api rate_limit`, which
     // this version treats as a diagnostic and never as spendable capacity. The
@@ -16831,9 +16906,12 @@ function contextHelpPages({ view, target, tab, remoteSetup = false }, keys = key
     security: "Security shows alerts returned by the checked sources; unavailable sources can hide alerts.",
     notifications: "Events lists what happened in this pane: waits, refreshes, failures and cleared causes.",
   };
-  const title = remoteSetup ? "No GitHub remote found" : view.title;
-  const action = remoteSetup ? "Close help with ?, then Enter to start gh repo create; or restart with gh-glance --repo owner/name."
-    : view.action;
+  const ambiguous = remoteSetup === "ambiguous-remote";
+  const title = ambiguous ? "Remotes name several GitHub repositories"
+    : remoteSetup ? "No GitHub remote found" : view.title;
+  const action = ambiguous ? "Run gh repo set-default to choose one, then restart; or restart with gh-glance --repo owner/name."
+    : remoteSetup ? "Close help with ?, then Enter to start gh repo create; or restart with gh-glance --repo owner/name."
+      : view.action;
   // Wrap validated identity in bounded chunks so the remote-field sanitizer
   // cannot clip a long accepted target or consume its tail with a label prefix.
   const targetLines = [["Target", target.repository ?? target.label], ["Host", target.host ?? "unresolved"]]
@@ -16859,7 +16937,7 @@ function contextHelpPages({ view, target, tab, remoteSetup = false }, keys = key
   const priority = [title, action].flatMap((line) => wrapPanelText(line, cols));
   if (priority.length > capacity && capacity >= 2) {
     const shortAction = /gh-glance --doctor/.test(action) ? "gh-glance --doctor"
-      : /gh auth/.test(action) ? "gh auth status" : remoteSetup ? "? then Enter"
+      : /gh auth/.test(action) ? "gh auth status" : ambiguous ? "gh repo set-default" : remoteSetup ? "? then Enter"
         : /^Press r/.test(action) ? "Close ?, then r" : action;
     chunks.push([wrapPanelText(title, cols)[0], wrapPanelText(shortAction, cols)[0]]);
   }
@@ -17024,7 +17102,8 @@ const NOTICE_LEVELS = Object.freeze(Object.fromEntries([
   ...NOTICE_WAIT_CODES.map((code) => [code, "wait"]),
 ]));
 const VERDICT_NOTICE_LEVELS = Object.freeze({
-  "auth-problem": "action", unavailable: "action", "no-remote": "action", "rate-limited": "wait",
+  "auth-problem": "action", unavailable: "action", "no-remote": "action", "ambiguous-remote": "action",
+  "rate-limited": "wait",
 });
 const NOTIFICATION_LOG_MAX = 500;
 // A wait that ends within this long left nothing to look at: it stays in the
@@ -18125,6 +18204,7 @@ function activeKeyHints({
   canResize = false,
 }) {
   if (!interactive) return [{ label: "Quit", keys: "^C" }];
+  if (remoteSetup === "ambiguous-remote") return AMBIGUOUS_REMOTE_HINTS;
   if (remoteSetup) return REMOTE_SETUP_HINTS;
   if(feature?.mode==='attention')return feature.semantic?.consent?[{label:'Send',keys:'Ent'},{label:'Cancel',keys:'Esc'},{label:'Review',keys:'Pg'}]:[{label:'Details',keys:'m'},{label:'Refresh',keys:'r'},{label:'Badges',keys:'J'},{label:'Unknown',keys:'u'},{label:'Back',keys:'Esc'}];
   if (feature?.mode === 'ci') return feature.ciRange
@@ -18163,6 +18243,26 @@ const REMOTE_SETUP_NONINTERACTIVE_LINES = [
   "Choose Push an existing local repository.",
   "Or use `gh-glance --repo owner/name`; Ctrl+C quits.",
 ];
+
+// Verdicts that mean there is no repository to fetch from, so the whole
+// dashboard waits in setup instead of scheduling requests.
+const REPOSITORY_SETUP_VERDICTS = new Set(["no-remote", "ambiguous-remote"]);
+
+const AMBIGUOUS_REMOTE_HINTS = [
+  { label: "Quit", keys: "q" },
+  { label: "Help", keys: "?" },
+];
+
+// Names the repositories, because the reader has to pick one of them.
+function ambiguousRemoteLines(slugs = [], { interactive = true } = {}) {
+  return [
+    "Remotes name several GitHub repositories",
+    slugs.length > 0 ? `Remotes: ${slugs.join(", ")}` : "gh-glance cannot tell which one to show.",
+    "Run `gh repo set-default` to choose one, then restart gh-glance.",
+    interactive ? "q/Esc  Quit, or restart with `gh-glance --repo owner/name`"
+      : "Or use `gh-glance --repo owner/name`; Ctrl+C quits.",
+  ];
+}
 
 // Reserved so the hints never shift when the active tab changes state. Every
 // status label below fits this fixed cell in both icon profiles.
@@ -19678,9 +19778,11 @@ function App({ onCreateRemote = () => {} } = {}) {
   // in setup mode. Keeping this tab-local made a quick tab switch replace the
   // onboarding prompt with a second raw fetch failure while another command
   // was still settling.
-  const remoteSetup = Object.values(errors).some(
-    (error) => error?.kind === "fetch" && error.verdict === "no-remote",
-  );
+  // The value names which setup: "no-remote" offers `gh repo create`, while
+  // "ambiguous-remote" can only ask the user to choose. Both hold the scheduler.
+  const remoteSetup = Object.values(errors).find(
+    (error) => error?.kind === "fetch" && REPOSITORY_SETUP_VERDICTS.has(error.verdict),
+  )?.verdict ?? false;
   // The not-enabled notes are collapsed into a single line. Each unavailable
   // alert source used to contribute a full-width row above the column header,
   // and on any repo without Advanced Security that is two permanent lines --
@@ -20523,8 +20625,9 @@ function App({ onCreateRemote = () => {} } = {}) {
       } else if (key.pageUp) {
         moveSelection(-pageStep);
       } else if (key.return) {
-        if (remoteSetupRef.current) onCreateRemote(suspendTerminal);
-        else openSelected();
+        // An ambiguous target has nothing for Enter to open or start.
+        if (remoteSetupRef.current === "no-remote") onCreateRemote(suspendTerminal);
+        else if (!remoteSetupRef.current) openSelected();
       } else if (input === "r" || input === "R") {
         // Goes through the same per-tab in-flight guard as the poll loop, so
         // holding the key down cannot stack concurrent subprocesses. Both keys
@@ -20741,11 +20844,16 @@ function App({ onCreateRemote = () => {} } = {}) {
     // verdict is normally a fetch failure, but nothing can be fetched here --
     // there is no host to verify against -- so the same verdict is recorded on
     // every tab before coordination is attempted. remoteSetupRef then keeps the
-    // scheduler out, and the Enter hint hands off to `gh repo create`.
+    // scheduler out, and the Enter hint hands off to `gh repo create`. Remotes
+    // that name several repositories take the same route with their own
+    // verdict: no request can be addressed until the user chooses one, and
+    // letting the dashboard run on would surface the missing target as a
+    // connection or coordination failure.
     function enterRemoteSetup() {
-      if (!runtimeHasNoRepositoryTarget()) return false;
+      const problem = runtimeRepositoryTargetProblem();
+      if (!problem) return false;
       retireSetup();
-      const failure = toTabError(new Error(NO_REMOTE_ERROR_TEXT));
+      const failure = toTabError(new Error(problem === "no-remote" ? NO_REMOTE_ERROR_TEXT : AMBIGUOUS_REMOTE_ERROR_TEXT));
       setErrors(Object.fromEntries(TABS.map((t) => [t.key, failure])));
       return true;
     }
@@ -22945,7 +23053,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     }),
   );
   const failed = Object.fromEntries(
-    TABS.map((t) => [t.key, Boolean(errors[t.key]) && errors[t.key]?.verdict !== "no-remote"]),
+    TABS.map((t) => [t.key, Boolean(errors[t.key]) && !REPOSITORY_SETUP_VERDICTS.has(errors[t.key]?.verdict)]),
   );
 
   if (staleLabel && (["watching", "shared"].includes(semanticStatus.kind) ||
@@ -23197,7 +23305,9 @@ function App({ onCreateRemote = () => {} } = {}) {
         !notificationsOpen &&
         !tooNarrow &&
         remoteSetup &&
-        (interactive ? REMOTE_SETUP_LINES : REMOTE_SETUP_NONINTERACTIVE_LINES).map(
+        (remoteSetup === "ambiguous-remote"
+          ? ambiguousRemoteLines(remoteRepositorySlugs(runtimeRemoteUrls), { interactive })
+          : interactive ? REMOTE_SETUP_LINES : REMOTE_SETUP_NONINTERACTIVE_LINES).map(
           (line, index) =>
             e(
               Text,
@@ -23262,7 +23372,8 @@ function App({ onCreateRemote = () => {} } = {}) {
       nowMs: now.getTime(),
       interactive,
       cols: frameCols,
-      remoteSetup: remoteSetup && !notificationsOpen,
+      // Keeps the setup kind, not just whether there is one.
+      remoteSetup: notificationsOpen ? false : remoteSetup,
       feature: notificationsOpen ? null : attentionView ?? ciView ?? focus,
       widthMode: resizeRef.current.active,
       widthColumn: selectedWidthColumn,
@@ -23943,6 +24054,14 @@ export {
   admittedRowUrl,
   remoteSlug,
   resolveEffectiveRepository,
+  remoteRepositorySlugs,
+  repositoryTargetProblem,
+  selectGhDefaultRemoteUrls,
+  readGitRemotes,
+  gitRemoteUrls,
+  AMBIGUOUS_REMOTE_ERROR_TEXT,
+  AMBIGUOUS_REMOTE_HINTS,
+  ambiguousRemoteLines,
   graphqlPageVariables,
   graphqlRepositoryVariables,
   parseGraphqlEnvelope,

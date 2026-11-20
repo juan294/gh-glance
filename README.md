@@ -292,7 +292,10 @@ gh-glance
 ```
 
 It infers the repository from the current directory's git remote, the same
-way `gh` itself does -- no flags or config needed.
+way `gh` itself does -- no flags or config needed. When the remotes name more
+than one repository (a fork with an `upstream` remote, for example), it uses
+the default chosen with `gh repo set-default`; without one, it asks you to
+choose instead of guessing.
 
 ```bash
 gh-glance --help      # usage and keybindings
@@ -1193,6 +1196,7 @@ GH_GLANCE_ICONS=ascii gh-glance
 | `the gh CLI is not installed` | Install it from [cli.github.com](https://cli.github.com), then `gh auth login`. |
 | `not inside a git repository` | Run it from a cloned GitHub repository, or set `GH_REPO=owner/name`. |
 | `No GitHub remote found` | Press `Enter` to start `gh repo create`, then choose **Push an existing local repository**. Or press `q` and run `gh-glance --repo owner/name` to watch an existing repository without attaching this folder. |
+| `Remotes name several GitHub repositories` | The folder's git remotes name different repositories and no default is set. Run `gh repo set-default` to choose one, then restart; or run `gh-glance --repo owner/name`. `gh-glance --doctor` lists every remote and the repository it selects. |
 | `GitHub login or authorization required` | Run `gh auth status`. With no account, run `gh auth login`; with an expired authorization, run `gh auth refresh`; then press `R`, which also clears the endpoint backoff the failures accrued. |
 | `Repository not found or inaccessible to the active gh account` | The active identity cannot resolve the target. Check `gh auth status`, `git remote -v` or the explicit `--repo`, and use `gh auth switch` only if the wrong account is active. |
 | `GraphQL: Could not resolve to a Repository...` in older gh-glance versions | The response has the same ambiguity: a missing or renamed target, or a private repository not visible to the active account. Run `gh-glance --doctor --probe`. |

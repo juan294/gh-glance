@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   away, the request was refused and the list stayed at its first page until you
   scrolled again. Other requests that wait briefly for their slot, such as CI
   job logs, now also wait the remainder instead of being refused.
+- A checkout whose remotes name several repositories, such as a fork with an
+  `upstream` remote, now uses the default chosen with `gh repo set-default`,
+  as `gh` does. Without a default, the dashboard names the repositories and
+  asks you to choose. Before, it showed "Repository unresolved" with a
+  misleading connection or coordination failure, and it never recovered.
+- `gh-glance --doctor` now reports the repository the dashboard uses and lists
+  every git remote. Before, it read only `origin`, so it looked healthy while
+  the dashboard had no repository.
 
 ## [0.19.3] - 2026-11-12
 
