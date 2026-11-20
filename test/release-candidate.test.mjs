@@ -9,7 +9,8 @@ import { test } from "node:test";
 import { integrityOf } from "../scripts/package-check.mjs";
 import {
   CANDIDATE_JOBS, CI_JOBS, bootstrapDecision, CI_WORKFLOW, MANIFEST_SCHEMA, aggregate, artifactName, checkCandidateJobs, classifyRegistry,
-  deliveryCheck, planCi, pollRegistry, publishDecision, selectCandidate, terminalRunners, validateManifest,
+  deliveryCheck, deliveryReceipt, planCi, pollRegistry, publishDecision, runtimeEvidence, selectCandidate, terminalRunners,
+  validateManifest, validateRuntime,
   REPOSITORY, verifyArtifact, verifyPromotion, verifyProvenance,
 } from "../scripts/release-candidate.mjs";
 import { packageTarball } from "./fixtures/tarball.mjs";
@@ -385,4 +386,75 @@ test("RC-11 the publisher bootstrap accepts only the tag of a protected release 
   for (const [override, pattern] of cases) {
     assert.match(bootstrapDecision({ ...good, ...override }).problems.join("\n"), pattern);
   }
+});
+
+// The manifest records the Node version the pack job resolved. Workflows read
+// the line from .nvmrc or name a floating major, so the version differs between
+// runs; the verifier checks that a resolved version is present, never that it
+// equals a constant.
+const runtimeOf = (node) => ({ node, npm: "11.21.0", platform: "linux-x64" });
+const runBase = (bytes, manifest) => ({ archiveSha256: "d".repeat(64), artifact: artifact(11, 900), manifest,
+  tarballBytes: bytes, productionTree: TREE, pullRequest: pull, run: run(900) });
+
+test("RC-12 a recorded Node version that differs between runs is accepted", () => {
+  const bytes = packageTarball({ version: "9.9.9" });
+  for (const node of ["v22.22.2", "v22.23.4", "v24.21.0", "v24.22.3", "v24.23.0"]) {
+    const manifest = manifestFor(bytes, { runtime: runtimeOf(node) });
+    assert.deepEqual(validateManifest(manifest), [], node);
+    assert.deepEqual(verifyArtifact(runBase(bytes, manifest)).problems, [], node);
+  }
+});
+
+test("RC-13 a missing runtime.node is rejected by the manifest and the artifact check", () => {
+  const bytes = packageTarball({ version: "9.9.9" });
+  const withoutNode = runtimeOf("v24.22.3");
+  delete withoutNode.node;
+  const manifest = manifestFor(bytes, { runtime: withoutNode });
+  assert.match(validateManifest(manifest).join("\n"), /runtime\.node is not a valid/);
+  const verified = verifyArtifact(runBase(bytes, manifest));
+  assert.equal(verified.ok, false);
+  assert.match(verified.problems.join("\n"), /runtime\.node is not a valid/);
+  const withoutRuntime = manifestFor(bytes);
+  delete withoutRuntime.runtime;
+  assert.match(validateManifest(withoutRuntime).join("\n"), /runtime must be an object/);
+});
+
+test("RC-14 an unresolved Node declaration is not evidence of the resolved version", () => {
+  const bytes = packageTarball({ version: "9.9.9" });
+  // These are declarations (.nvmrc, a matrix major, an alias), not `node --version` output.
+  for (const node of ["24", "v24", "24.22.3", "lts/*", "latest", "v24.x", ""]) {
+    const manifest = manifestFor(bytes, { runtime: runtimeOf(node) });
+    assert.match(validateManifest(manifest).join("\n"), /runtime\.node is not a valid/, JSON.stringify(node));
+    assert.equal(verifyArtifact(runBase(bytes, manifest)).ok, false, JSON.stringify(node));
+  }
+});
+
+test("RC-15 runtime evidence is the resolved process version, never a configured constant", () => {
+  const observed = runtimeEvidence({ npm: "11.21.0" });
+  assert.equal(observed.node, process.version);
+  assert.equal(observed.platform, `${process.platform}-${process.arch}`);
+  assert.deepEqual(validateRuntime(observed), []);
+  // Another run resolved another version: still valid evidence.
+  assert.deepEqual(validateRuntime(runtimeEvidence({ node: "v24.99.0", npm: "11.21.0", platform: "linux-x64" })), []);
+  assert.match(validateRuntime({ npm: "11.21.0", platform: "linux-x64" }).join("\n"), /runtime\.node is not a valid nodeVersion/);
+  assert.match(validateRuntime(runtimeEvidence({ node: "24", npm: "11.21.0", platform: "linux-x64" })).join("\n"),
+    /runtime\.node is not a valid nodeVersion/);
+  assert.match(validateRuntime(null).join("\n"), /runtime must be an object/);
+});
+
+test("RC-16 the delivery receipt records the runtime it ran on", () => {
+  const runtime = runtimeEvidence({ node: "v22.23.4", npm: "11.21.0", platform: "linux-x64" });
+  const delivered = deliveryReceipt({ version: "9.9.9", integrity: "sha512-x", commit: MERGE,
+    result: { ok: true, gitHead: null, attempts: [], provenance: { ok: true, problems: [] } }, runtime });
+  assert.deepEqual(delivered.runtime, runtime);
+  assert.equal(delivered.delivered, true);
+  assert.equal(delivered.productionCommit, MERGE);
+  assert.equal(delivered.version, "9.9.9");
+  const failed = deliveryReceipt({ version: "9.9.9", integrity: "sha512-x", commit: MERGE,
+    result: { ok: false, reason: "not yet visible (404)", attempts: [{ status: 404 }] }, runtime });
+  assert.equal(failed.delivered, false);
+  assert.equal(failed.reason, "not yet visible (404)");
+  assert.deepEqual(failed.runtime, runtime);
+  assert.deepEqual(Object.keys(failed), ["schema", "version", "integrity", "productionCommit", "runtime", "registryGitHead",
+    "delivered", "reason", "attempts", "provenance"]);
 });

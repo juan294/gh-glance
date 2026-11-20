@@ -8,9 +8,9 @@ with both Claude Code and Codex / GPT-5.x.
 When operating in Codex, treat these files as the source of truth:
 
 - `CLAUDE.md` -- project overview, workflow, commands, git/deploy context
-- `.claude/commands/*.md` -- workflow definitions for `/research`, `/plan`,
-  `/implement`, `/validate`, `/pre-launch`, `/update-docs`, `/release`,
-  and related commands
+- `.claude/skills/rpi-*/SKILL.md` -- workflow definitions for `/rpi-research`,
+  `/rpi-plan`, `/rpi-implement`, `/rpi-validate`, `/rpi-pre-launch`,
+  `/rpi-update-docs`, `/rpi-release`, and related workflows
 - `.claude/rules/*.md` -- reusable rules and path-scoped constraints
 - `.claude/skills/*/SKILL.md` -- on-demand skills and domain procedures
 
@@ -26,8 +26,6 @@ references completely before acting. Use `/rpi-plan` in Claude Code or
 `$rpi-plan` in Codex for RPI planning; the other RPI workflows follow the
 same naming pattern. Native `/plan` and `/status` do not invoke RPI workflows.
 
-Retained project-specific commands in `.claude/commands/` apply only when
-explicitly invoked. Their presence does not replace the native RPI skills.
 If a workflow references a plan or research artifact, read it completely.
 
 ## Claude-to-Codex Translation

@@ -14,6 +14,7 @@
 //   verify-candidate   publisher: protected merge -> run -> artifact -> bytes
 //   registry-state     classify the registry before publishing
 //   deliver            bounded registry and provenance readback, with a receipt
+//   runtime            the resolved node and npm this job runs on, as output
 
 import { execFileSync } from "node:child_process";
 import { appendFileSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -28,8 +29,11 @@ export const REPOSITORY = "juan294/gh-glance";
 export const CI_WORKFLOW = ".github/workflows/ci.yml";
 const RELEASE_WORKFLOW = ".github/workflows/release.yml";
 export const MANIFEST_SCHEMA = 1;
-// The reviewed runtime pins; a workflow test holds every literal to these.
-export const PINS = { node22: "22.22.2", node24: "24.21.0", npm: "11.21.0" };
+// The one reviewed runtime pin. Node is not pinned: workflows read the line from
+// .nvmrc or name a floating support-matrix major, and the manifest and receipts
+// record the version each run resolved. npm stays pinned because the publisher's
+// OIDC path depends on it.
+export const PINS = { npm: "11.21.0" };
 // Node 22's bundled npm 10.9 deletes its own modules while replacing itself
 // with npm 11, so the pinned npm installs itself.
 export const NPM_UPGRADE = `npx -y npm@${PINS.npm} install -g npm@${PINS.npm}`;
@@ -39,6 +43,8 @@ const SHA = /^[0-9a-f]{40}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const SHA512 = /^sha512-[A-Za-z0-9+/]{86}==$/;
 const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+// `node --version` output. A declaration such as 24, v24 or lts/* is not one.
+const NODE_VERSION = /^v\d+\.\d+\.\d+$/;
 
 // ---------------------------------------------------------------- CI routing
 
@@ -148,7 +154,7 @@ const MANIFEST_SHAPE = {
   profile: "string",
   selections: "string[]",
   package: { name: "string", version: "version", files: "string[]" },
-  runtime: { node: "string", npm: "string", platform: "string" },
+  runtime: { node: "nodeVersion", npm: "string", platform: "string" },
   inputs: { lockSha256: "sha256", workflowSha256: "sha256" },
   tarball: { filename: "string", sha256: "sha256", integrity: "sha512" },
 };
@@ -171,6 +177,7 @@ function checkShape(value, shape, path, problems) {
     sha256: () => typeof value === "string" && SHA256.test(value),
     sha512: () => typeof value === "string" && SHA512.test(value),
     version: () => typeof value === "string" && VERSION.test(value),
+    nodeVersion: () => typeof value === "string" && NODE_VERSION.test(value),
   }[shape];
   if (!valid()) problems.push(`${path} is not a valid ${shape}`);
 }
@@ -179,6 +186,19 @@ export function validateManifest(manifest) {
   const problems = [];
   checkShape(manifest, MANIFEST_SHAPE, "", problems);
   if (problems.length === 0 && manifest.schema !== MANIFEST_SCHEMA) problems.push(`unknown manifest schema ${manifest.schema}`);
+  return problems;
+}
+
+// The runtime this process resolved, as evidence. Nothing compares it to a
+// constant: the check is that it is a real `node --version` output.
+export function runtimeEvidence({ node = process.version, platform = `${process.platform}-${process.arch}`,
+  npm = execFileSync("npm", ["--version"], { encoding: "utf8" }).trim() } = {}) {
+  return { node, npm, platform };
+}
+
+export function validateRuntime(runtime) {
+  const problems = [];
+  checkShape(runtime, MANIFEST_SHAPE.runtime, "runtime", problems);
   return problems;
 }
 
@@ -412,6 +432,13 @@ export function deliveryCheck({ version, integrity }) {
   };
 }
 
+// The receipt the delivery job writes and uploads. `result` is pollRegistry's
+// outcome (with `provenance` once checked); `runtime` is where delivery ran.
+export function deliveryReceipt({ version, integrity, commit, result, runtime }) {
+  return { schema: 1, version, integrity, productionCommit: commit, runtime, registryGitHead: result.gitHead ?? null,
+    delivered: result.ok, reason: result.reason ?? null, attempts: result.attempts, provenance: result.provenance ?? null };
+}
+
 // ------------------------------------------------------------------- CLI
 
 function gh(args, options = {}) {
@@ -546,8 +573,7 @@ const commands = {
       profile: plan.profile,
       selections: PROFILE_SELECTIONS[plan.profile],
       package: { name: "gh-glance", version: inspected.version, files: inspected.files },
-      runtime: { node: process.version, npm: execFileSync("npm", ["--version"], { encoding: "utf8" }).trim(),
-        platform: `${process.platform}-${process.arch}` },
+      runtime: runtimeEvidence(),
       inputs: { lockSha256: sha256File(join(ROOT, "package-lock.json")), workflowSha256: sha256File(join(ROOT, CI_WORKFLOW)) },
       tarball: { filename: "artifact.tgz", sha256: inspected.sha256, integrity: inspected.sha512 },
     };
@@ -637,6 +663,17 @@ const commands = {
       rmSync(work, { recursive: true, force: true });
     }
   },
+  // The Node and npm this job resolved, written where a reviewer reads the run.
+  runtime() {
+    const runtime = runtimeEvidence();
+    const problems = validateRuntime(runtime);
+    if (problems.length > 0) return fail(problems);
+    output({ node: runtime.node, npm: runtime.npm });
+    if (process.env.GITHUB_STEP_SUMMARY) {
+      appendFileSync(process.env.GITHUB_STEP_SUMMARY, `Resolved runtime: node ${runtime.node}, npm ${runtime.npm}, ${runtime.platform}\n`);
+    }
+    return 0;
+  },
   async "registry-state"() {
     const version = process.env.RELEASE_VERSION;
     const integrity = process.env.RELEASE_INTEGRITY;
@@ -654,6 +691,9 @@ const commands = {
     const version = process.env.RELEASE_VERSION;
     const integrity = process.env.RELEASE_INTEGRITY;
     const commit = process.env.GITHUB_SHA;
+    const runtime = runtimeEvidence();
+    const runtimeProblems = validateRuntime(runtime);
+    if (runtimeProblems.length > 0) return fail(runtimeProblems);
     const result = await pollRegistry({ read: readRegistry, check: deliveryCheck({ version, integrity }) });
     if (result.ok) {
       let attestations;
@@ -670,8 +710,7 @@ const commands = {
         result.reason = `provenance does not bind the release: ${result.provenance.problems.join("; ")}`;
       }
     }
-    const receipt = { schema: 1, version, integrity, productionCommit: commit, registryGitHead: result.gitHead ?? null,
-      delivered: result.ok, reason: result.reason ?? null, attempts: result.attempts, provenance: result.provenance ?? null };
+    const receipt = deliveryReceipt({ version, integrity, commit, result, runtime });
     if (process.env.DELIVERY_RECEIPT) writeAtomic(process.env.DELIVERY_RECEIPT, `${JSON.stringify(receipt, null, 2)}\n`);
     process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`);
     return result.ok ? 0 : fail([result.reason]);

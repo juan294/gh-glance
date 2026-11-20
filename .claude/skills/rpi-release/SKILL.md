@@ -9,18 +9,16 @@ The request is supplied as literal arguments: $ARGUMENTS
 
 # Release the Requested Version
 
-**gh-glance project override.** Where this generic skill differs from
-[`docs/release/release-playbook.md`](../../../docs/release/release-playbook.md)
-(authority coverage, the Wave B charter, the push and publication steps), the
-playbook governs. It replaces `references/e2e-pro-playbook.md` and is the
-"adapted playbook" named below; do not read the generic reference.
-
 Use the version and release scope already supplied in the request. Ask for a
 version only if absent; never guess or auto-increment. Prepare a concrete,
 fully verified candidate before any still-required publication approval. Read the
 [durable handoff](references/handoff.md) contract and revalidate actual worktree,
 release version and candidate evidence when resuming; a prior summary is not a
 new release authorization.
+
+## Project overlay
+
+If `.rpi/project/rpi-release.md` exists, read it completely before you start, together with the controlling instructions. It adds this project's procedure and checks and can make this workflow stricter. It cannot grant push, tag, merge, deployment or publication authority. It cannot relax a gate: a rule that blocks or permits a release, publication, merge, deployment or phase acceptance, or a safety or authorization rule. It can change other procedure detail only under a `## Declared overrides` heading that quotes the stock rule, gives the reason and names the owner decision. Name the overlay you read, and any declared override you applied, in the handoff.
 
 ## Orientation and preparation
 

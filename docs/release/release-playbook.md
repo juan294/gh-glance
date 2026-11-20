@@ -211,6 +211,16 @@ tagged before this repair used the older publisher (directory publish, with
 a `gitHead`); see
 [Transition](#transition-what-changed-and-what-still-needs-activation).
 
+Node is not pinned to a patch release. Jobs read the line from `.nvmrc` (`24`),
+and the Test and Smoke matrices and the delivery install name the floating
+majors 22 (the `engines` floor) and 24. Each run resolves the newest release,
+so the evidence records what ran: the candidate manifest's `runtime.node` must
+be a `node --version` output (`v24.22.3`), any such value is accepted and none
+is compared with a constant, and a missing or unresolved value (`24`, `lts/*`)
+is rejected. The publisher prints the resolved Node and npm in its run summary.
+Only npm stays pinned. Two ci.yml jobs keep Node 22.22.2 because Sutura-owned
+profiles name it; see `test/workflows.test.mjs` (WF-07).
+
 ### 5. Delivery and readback
 
 Read the registry once: `npm view gh-glance@x.y.z version dist.integrity
@@ -221,7 +231,8 @@ production commit is bound by the provenance statement instead, which the
 release workflow's delivery job checks: its subject digest, `release.yml` at
 `refs/tags/vX.Y.Z`, and the merge commit. That job also installs the version
 fresh on Node 22 and 24 and requires gh-glance's own verified attestation from
-`npm audit signatures`; its receipt is uploaded as `delivery-receipt-node-*`.
+`npm audit signatures`; its receipt (which records the Node and npm it ran on)
+is uploaded as `delivery-receipt-node-*`.
 Re-check by hand only when that job did not finish.
 Registry lag is normal:
 retry with capped backoff for at most five minutes, then report **published;
@@ -309,11 +320,11 @@ implicit prerequisite.
 
 ## Project-local customization of managed files
 
-The native `rpi-release` skill copies carry a short project preamble pointing
-here. These and the four pre-existing customized rule files
-(`.claude/rules/{testing,deployment-safety}.md`,
+The project's routing to this page lives in two project overlays,
+`.rpi/project/rpi-release.md` and `.rpi/project/rpi-fix-ci.md`, which every
+installed copy of those skills reads; the managed skill copies stay stock. The
+four pre-existing customized rule files (`.claude/rules/{testing,deployment-safety}.md`,
 `.rpi/rules/{testing,deployment-safety}.md`) are expected local drift reported
 by `.rpi/scripts/rpi-diagnostics.py`; upstream baselines and manifest hashes
-are left untouched. The retained `/release` and `/fix-ci` commands and their
-migrated Codex skills are project-owned and are thin routes to this page and to
-the native `rpi-fix-ci` skill.
+are left untouched. The legacy `/release` and `/fix-ci` commands and their
+migrated Codex skills were removed on 2026-11-14.

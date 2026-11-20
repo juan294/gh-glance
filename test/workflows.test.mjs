@@ -72,7 +72,8 @@ test("WF-02 required context names come only from pull_request runs, on jobs doi
   assert.match(ci.jobs.pty.if, /github\.event_name == 'pull_request'/, "PTY still reports every PR; push names stay distinct");
   for (const id of ["test", "smoke"]) {
     const rows = [...ci.jobs[id].body.matchAll(/- \{ node: (\d+), node-version: ([\d.]+) \}/g)];
-    assert.deepEqual(rows.map((row) => [row[1], row[2]]), [["22", PINS.node22], ["24", PINS.node24]]);
+    // The support matrix names floating majors: the 22 floor and the 24 line.
+    assert.deepEqual(rows.map((row) => [row[1], row[2]]), [["22", "22"], ["24", "24"]]);
   }
   assert.match(ci.jobs.test.body, /test-select\.mjs run fast/);
   // Every job name the publisher requires exists on the candidate's PR run.
@@ -194,15 +195,57 @@ test("WF-06 coverage leaves the push path; security checks keep their triggers",
   assert.match(sutura.on, /workflows: \["CI"\]/);
 });
 
-test("WF-07 every runtime pin in the workflows is a reviewed PINS value", () => {
-  const nodePins = new Set([PINS.node22, PINS.node24]);
+// Node is never pinned to a patch release. A workflow reads the line from
+// .nvmrc, names a floating support-matrix major, or (two reported exceptions)
+// keeps the exact version a Sutura-owned profile still expects.
+const NODE_FILES = new Set([".nvmrc", "protected-main/.nvmrc"]);
+const SUPPORT_MAJORS = new Set(["22", "24"]);
+const SUTURA_EXACT = { "ci.yml": { "pty-rest": "22.22.2", "native-receipt": "22.22.2" } };
+
+test("WF-07 Node comes from .nvmrc or a floating support major; only npm is pinned", () => {
+  assert.equal(readFileSync(new URL("../.nvmrc", import.meta.url), "utf8"), "24\n", ".nvmrc holds the bare line major");
+  assert.deepEqual(Object.keys(PINS), ["npm"]);
   for (const name of ["ci.yml", "release.yml", "coverage.yml"]) {
-    const { text } = readWorkflow(name);
-    for (const [, version] of text.matchAll(/node-version: ([\d.]+)/g)) {
-      assert.ok(nodePins.has(version), `${name}: node ${version} is not a PINS value`);
-    }
+    const { jobs, text } = readWorkflow(name);
     for (const [, version] of text.matchAll(/npm@([\w.]+)/g)) {
       assert.equal(version, PINS.npm, `${name}: npm@${version} is not the pinned npm`);
     }
+    for (const [id, job] of Object.entries(jobs)) {
+      for (const [, file] of job.body.matchAll(/node-version-file: (\S+)/g)) {
+        assert.ok(NODE_FILES.has(file), `${name} ${id}: node-version-file ${file}`);
+      }
+      for (const [, version] of job.body.matchAll(/node-version: (\$\{\{ matrix\.node-version \}\}|[^\s,}]+)/g)) {
+        const exact = SUTURA_EXACT[name]?.[id];
+        if (version === "${{ matrix.node-version }}" || SUPPORT_MAJORS.has(version) || version === exact) continue;
+        assert.fail(`${name} ${id}: node-version ${version} is neither a support major nor .nvmrc`);
+      }
+    }
   }
+  // Exceptions are exact and reported, not silent: they exist only where listed.
+  const ci = readWorkflow("ci.yml");
+  for (const [id, version] of Object.entries(SUTURA_EXACT["ci.yml"])) {
+    assert.match(ci.jobs[id].body, new RegExp(`node-version: ${version.replaceAll(".", "\\.")}`), `${id} keeps ${version}`);
+  }
+  // Every job that is not an exception or a matrix reads the line from .nvmrc.
+  for (const id of Object.keys(ci.jobs)) {
+    if (SUTURA_EXACT["ci.yml"][id] || /matrix\.node-version/.test(ci.jobs[id].body)) continue;
+    if (/actions\/setup-node/.test(ci.jobs[id].body)) assert.match(ci.jobs[id].body, /node-version-file: \.nvmrc/, id);
+  }
+  const release = readWorkflow("release.yml");
+  assert.match(release.jobs.verify.body, /node-version-file: protected-main\/\.nvmrc/, "the bootstrap reads protected main's line");
+  assert.match(release.jobs.publish.body, /node-version-file: \.nvmrc/, "the publisher runs on the line");
+  assert.match(readWorkflow("coverage.yml").jobs.coverage.body, /node-version-file: \.nvmrc/);
+  // Delivery proves the floor and the line on fresh installs: 24 from .nvmrc, 22 as the floating floor.
+  const steps = release.jobs.delivery.body;
+  assert.match(steps, /node-version-file: \.nvmrc\n\s+- run: echo "NODE24=/);
+  assert.match(steps, /node-version: 22\n\s+- run: echo "NODE22=/);
+});
+
+test("WF-14 the publisher and delivery record the resolved runtime", () => {
+  const release = readWorkflow("release.yml");
+  assert.match(release.jobs.publish.body, /run: node scripts\/release-candidate\.mjs runtime\n/, "publish prints node and npm it resolved");
+  const before = release.jobs.publish.body.indexOf("release-candidate.mjs runtime");
+  assert.ok(before > release.jobs.publish.body.indexOf("install -g npm@") &&
+    before < release.jobs.publish.body.indexOf("npm publish"), "after the pinned npm, before publication");
+  assert.match(release.jobs.delivery.body, /release-candidate\.mjs deliver/);
 });

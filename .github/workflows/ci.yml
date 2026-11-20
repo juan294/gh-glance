@@ -38,8 +38,12 @@ concurrency:
 # is retargetable by its owner at any moment, and release.yml holds an OIDC
 # token with publish rights. The trailing version comment is what makes a
 # Dependabot SHA bump reviewable, so it is load-bearing rather than decoration.
-# Runtime pins (Node 22.22.2 / 24.21.0, npm 11.21.0) are held to
-# scripts/release-candidate.mjs PINS by test/workflows.test.mjs.
+# Node is not pinned to a patch release. Jobs read the line from .nvmrc; the Test
+# and Smoke matrices name the floating support majors (the engines floor 22 and
+# the line 24), and the candidate manifest records the version each run resolved.
+# Two jobs keep the exact Node 22.22.2 that Sutura-owned profiles still name
+# (PTY other files and Native proof receipt). The npm pin (11.21.0) is held to
+# scripts/release-candidate.mjs PINS, and all of this by test/workflows.test.mjs.
 jobs:
   plan:
     name: Plan
@@ -79,7 +83,7 @@ jobs:
           retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22.22.2
+          node-version-file: .nvmrc
       - id: plan
         env:
           GH_TOKEN: ${{ github.token }}
@@ -117,7 +121,7 @@ jobs:
           retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22.22.2
+          node-version-file: .nvmrc
           cache: npm
       - run: npm ci
       - run: npm run lint
@@ -160,7 +164,7 @@ jobs:
           retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22.22.2
+          node-version-file: .nvmrc
           cache: npm
       - run: npx -y npm@11.21.0 install -g npm@11.21.0 && npm --version
       - run: npm ci
@@ -191,11 +195,11 @@ jobs:
       # destroys exactly the signal a matrix exists to produce.
       fail-fast: false
       # The context name keeps the major ("Test (Node 22)") because main's
-      # protection requires it; the exact pinned runtime is the version.
+      # protection requires it; the floating major resolves to the newest release.
       matrix:
         include:
-          - { node: 22, node-version: 22.22.2 }
-          - { node: 24, node-version: 24.21.0 }
+          - { node: 22, node-version: 22 }
+          - { node: 24, node-version: 24 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Immutable checkout proof is uploaded before any candidate-owned command.
@@ -243,11 +247,11 @@ jobs:
     strategy:
       fail-fast: false
       # The context name keeps the major ("Smoke (Node 22)") because main's
-      # protection requires it; the exact pinned runtime is the version.
+      # protection requires it; the floating major resolves to the newest release.
       matrix:
         include:
-          - { node: 22, node-version: 22.22.2 }
-          - { node: 24, node-version: 24.21.0 }
+          - { node: 22, node-version: 22 }
+          - { node: 24, node-version: 24 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Immutable checkout proof is uploaded before any candidate-owned command.
@@ -326,7 +330,7 @@ jobs:
           retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22.22.2
+          node-version-file: .nvmrc
           cache: npm
       - run: npm ci
       - if: needs.pack.result == 'success'
@@ -351,7 +355,7 @@ jobs:
           if-no-files-found: ignore
 
   # The 72-hour recovery oracle and the simulated-hour efficiency acceptance,
-  # once, on Node 22. The runner keeps going after a failure and fails if
+  # once, on the .nvmrc line. The runner keeps going after a failure and fails if
   # either selection did.
   sustained:
     name: Recovery and efficiency
@@ -384,7 +388,7 @@ jobs:
           retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22.22.2
+          node-version-file: .nvmrc
           cache: npm
       - run: npm ci
       - run: node scripts/test-select.mjs run recovery efficiency
@@ -426,7 +430,7 @@ jobs:
           retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22.22.2
+          node-version-file: .nvmrc
           cache: npm
       - run: npm ci
       - env:
@@ -469,6 +473,9 @@ jobs:
           overwrite: false
           if-no-files-found: error
           retention-days: 30
+      # Exact on purpose: .sutura.json profile pilot-terminal-rest requires the
+      # observed native runtime to equal its nativeNodeVersion (Sutura reproduction
+      # plan). Moving this job to .nvmrc is a Sutura-coordinated change.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22.22.2
@@ -523,7 +530,7 @@ jobs:
           retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22.22.2
+          node-version-file: .nvmrc
       - env:
           CI_PLAN: ${{ needs.plan.outputs.plan }}
           CI_NEEDS: ${{ toJSON(needs) }}
@@ -565,7 +572,7 @@ jobs:
           retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22.22.2
+          node-version-file: .nvmrc
       - env:
           GH_TOKEN: ${{ github.token }}
         run: node scripts/release-candidate.mjs verify-promotion "$GITHUB_SHA"
@@ -603,7 +610,7 @@ jobs:
           retention-days: 30
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22.22.2
+          node-version-file: .nvmrc
       - env:
           CI_PLAN: ${{ needs.plan.outputs.plan }}
           CI_NEEDS: ${{ toJSON(needs) }}
@@ -631,6 +638,8 @@ jobs:
           ref: 94dab7eab0957d1d2e9e4aab2dc4e2ea9828f07c
           path: .receipt-engine
           persist-credentials: false
+      # Exact on purpose: this job checks out only Sutura's receipt engine (no
+      # .nvmrc of this repository in the workspace) and runs it as reviewed.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22.22.2

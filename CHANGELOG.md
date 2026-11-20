@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.4] - 2026-11-20
+
+### Fixed
+
+- Scrolling near the end of Issues or Pull requests now loads the next page
+  reliably. When the scheduled request slot was a fraction of a millisecond
+  away, the request was refused and the list stayed at its first page until you
+  scrolled again. Other requests that wait briefly for their slot, such as CI
+  job logs, now also wait the remainder instead of being refused.
+- A checkout whose remotes name several repositories, such as a fork with an
+  `upstream` remote, now uses the default chosen with `gh repo set-default`,
+  as `gh` does. Without a default, the dashboard names the repositories and
+  asks you to choose. Before, it showed "Repository unresolved" with a
+  misleading connection or coordination failure, and it never recovered.
+- `gh-glance --doctor` now reports the repository the dashboard uses and lists
+  every git remote. Before, it read only `origin`, so it looked healthy while
+  the dashboard had no repository.
+
 ## [0.19.3] - 2026-11-12
 
 ### Fixed
@@ -1451,7 +1469,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.19.3...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.19.4...HEAD
+[0.19.4]: https://github.com/juan294/gh-glance/compare/v0.19.3...v0.19.4
 [0.19.3]: https://github.com/juan294/gh-glance/compare/v0.19.2...v0.19.3
 [0.19.2]: https://github.com/juan294/gh-glance/compare/v0.19.1...v0.19.2
 [0.19.1]: https://github.com/juan294/gh-glance/compare/v0.19.0...v0.19.1
