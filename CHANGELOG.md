@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.4] - 2026-11-20
+
 ### Fixed
 
 - Scrolling near the end of Issues or Pull requests now loads the next page
@@ -1467,7 +1469,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.19.3...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.19.4...HEAD
+[0.19.4]: https://github.com/juan294/gh-glance/compare/v0.19.3...v0.19.4
 [0.19.3]: https://github.com/juan294/gh-glance/compare/v0.19.2...v0.19.3
 [0.19.2]: https://github.com/juan294/gh-glance/compare/v0.19.1...v0.19.2
 [0.19.1]: https://github.com/juan294/gh-glance/compare/v0.19.0...v0.19.1
