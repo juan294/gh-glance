@@ -16403,6 +16403,18 @@ function governorControlRetryAt(nowMs, floorMs) {
   return nowMs + Math.min(floorMs, 1000);
 }
 
+function createInitialPollWake(scheduler) {
+  let opened = false;
+  return ({ key, rows, currentScope, refreshed, snapshot, checkedAt, pendingBlocks, dueAt }, run) => {
+    if (opened) return false;
+    opened = true;
+    if (rows !== null || !currentScope || !governorDataReady(refreshed, snapshot, key, checkedAt)) return false;
+    const costs = tabRequestCost(key);
+    if (RATE_RESOURCES.some((resource) => costs[resource] > 0 && pendingBlocks.has(resource))) return false;
+    return scheduler.arm("data", dueAt, run);
+  };
+}
+
 function createWakeScheduler({
   now = Date.now,
   set = setTimeout,
@@ -21352,6 +21364,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     // can tell an acquisition that already answers it from one that predates it.
     const inFlightStartedAt = {};
     const wakeScheduler = createWakeScheduler();
+    const armInitialPoll = createInitialPollWake(wakeScheduler);
     let scope = null;
     let notificationsSeeded = false;
     let scopeFailure = null;
@@ -21785,7 +21798,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     // used to place them. Opening them all at the same deadline would start
     // three fetches within one wake -- the herd the rotation exists to prevent,
     // and it only diverges again once each tab has taken its own interval.
-    function openPollDeadlines(at) {
+    function openPollDeadlines(at, observedScope, refreshed, snapshot) {
       const activeKey = TABS[activeIndexRef.current].key;
       const opened = { ...NEVER_DUE };
       if (runtime.background === "on-demand") requestedTabs.set(activeKey, at);
@@ -21800,6 +21813,13 @@ function App({ onCreateRemote = () => {} } = {}) {
       }
       pollDueAt = opened;
       pollDeadlinesOpen = true;
+      const current = identity();
+      armInitialPoll({
+        key: activeKey, rows: dataRef.current[activeKey], dueAt: opened[activeKey],
+        currentScope: observedScope === scope && registeredScopeHash === observedScope.hash &&
+          observedScope.hash === current?.quotaKey && observedScope.accessKey === current?.accessKey,
+        refreshed, snapshot, checkedAt: at, pendingBlocks: pendingBlockPublications,
+      }, dataWake);
     }
 
     function armWake(kind, at, run) {
@@ -22823,7 +22843,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       publishControlStatus(activeKey, refreshed, snapshot, checkedAt);
       if (currentScope && snapshot.ok) {
         if (!pollDeadlinesOpen) {
-          openPollDeadlines(checkedAt);
+          openPollDeadlines(checkedAt, currentScope, refreshed, snapshot);
           heartbeatWake.start();
         } else if (controlEpochs !== null) {
           for (const key of TAB_KEYS) {
@@ -22930,7 +22950,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       publishControlStatus(activeKey, refreshed, snapshot, checkedAt);
       if (snapshot.ok) {
         controlEpochs = { ...snapshot.value.epochs };
-        openPollDeadlines(checkedAt);
+        openPollDeadlines(checkedAt, currentScope, refreshed, snapshot);
         heartbeatWake.start();
       }
       if (!refreshed.ok) {
@@ -24023,6 +24043,7 @@ export {
   governorTabControlReady,
   governorControlRetryAt,
   createWakeScheduler,
+  createInitialPollWake,
   createRecurringWake,
   createSingleFlightWake,
   pendingFailureIsTerminal,

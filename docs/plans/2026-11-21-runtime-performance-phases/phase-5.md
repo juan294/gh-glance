@@ -33,3 +33,9 @@ Run `rg -n 'openPollDeadlines|pollDeadlinesOpen|armFromState|armWake\(|createWak
 5. For the implemented candidate, run focused regressions followed by sequential lint, syntax, unit, efficiency and PTY commands in the [main plan](../2026-11-21-runtime-performance.md). If discarding, preserve the experiment results and verify the final local runtime is identical to the accepted phase 4 runtime. All owned fixture children and private roots follow the capture harness lifecycle.
 
 **Manual acceptance.** No manual operation required. Present the keep/discard decision with the actual paired data and tested source identities. A passing scheduler unit test alone cannot establish a first-row improvement.
+
+## Completion
+
+- [x] Exercise first-opening eligibility, cancellation, budget recovery and regular admission.
+- [x] Compare five matched pairs per workload across 80 trials and 120 pane exits, including baseline repeat measurements.
+- [x] Keep the candidate. The early single-pane paired median improved by 1,014 ms. All latency, sharing and recurring-wake criteria passed. See the [paired observations, trade-off and final verification](../2026-11-21-runtime-performance-notes.md#phase-5--first-fresh-terminal-row).

@@ -127,3 +127,45 @@ On the final source, mounted bootstrap and control each used the same inspected 
 
 Lint, syntax, 1,144 unit tests and nine efficiency tests passed on Node 24.22.3, macOS arm64. The full terminal command initially reported 270 passes, one failure and one optional historical skip. The failing 24-column fixture saw an unrelated transient startup badge, then quit before the injected lock produced its notification. Its retained terminal log showed the badge appearing and clearing. The driver now waits for the acquisition-busy journal entry and checks the current tab header for the badge. The original final-frame assertions still apply. The corrected case passed twice on the same executable, completing coverage of all 271 applicable cases. Lint also passed after the fixture edit.
 After independent review the test also verifies the journal recorded this cause during the blocked capture. Lint and the focused terminal test passed with that assertion.
+
+## Phase 5 · First fresh terminal row
+
+The control was phase 4 commit `761b43e` (executable SHA-256 `e912306620332169fee210630c08d928ad8c7a726e5f19be1bd3825a33c67a2c`). Candidate SHA-256 `bef09c2ee5f4191210c6fcf6841f6b47dfdee65a655f0ba8984496b528c25950` adds a one-time wake for the active tab at its existing due time. The existing scheduler handles all subsequent work. The early wake requires absent rows, current lease registration, matching quota and access identity, usable budget and no pending block on the resources the tab charges. It re-enters ordinary admission. A warm opening, including an empty cached list, consumes the opportunity.
+
+A deterministic scheduler test failed before the change, then passed with deadlines one millisecond ahead and 19 milliseconds overdue. Twelve focused checks covered timer cancellation, duplicate callbacks, scope changes, tab-specific budget readiness, pending blocks, known-empty rows, ordinary retry and lease-specific admission. Independent review identified the possibility of a retired lease registration while a budget read is outstanding. The final predicate checks that registration as well as the scope object and credential partition. The simplify pass kept the one-time flag inside the standalone scheduling effect and reused the existing deadline and single-flight machinery.
+
+### Matched cold-start experiment
+
+Each trial used the real entry point, a 110×26 PTY, Node 24.22.3 on macOS arm64, synthetic gh with 12 ms fixture latency, Actions selected, 40 s refresh, background tabs enabled and a fresh private root. A two-pane trial shared credentials, canonical query and coordination directory, and used distinct fixed lease identities. Timings run from process launch to a terminal write containing the tab or fresh fixture row. Two-pane timings refer to the last pane to show the frame or row. All panes had the same 5.2 s observation window. The recorded reservation was joined to its actual Actions start.
+
+The fixed budget epoch was `10000:1795291899000`. The early lease seeds ended in 003d and 00e5, with intrinsic offsets 67 and 49 ms. The late seeds ended in 0013 and 0026, with offsets 2,589 and 2,558 ms. Every early pane was due or within 250 ms of opening and every late pane at least 1,500 ms away. The first pane had a free core lane at opening in every trial. The early synchronous logging pilot was excluded before the measured series. Both measured executables buffered observations in memory, flushed on exit and recorded opening telemetry after arming the timers.
+
+Five baseline/baseline pairs per workload established timing noise. Five baseline/candidate pairs then alternated build order per workload. Each cell below contains the five fresh-row observations in comparison order, rounded to milliseconds. All 80 trials matched, all 120 panes exited cleanly, and each trial made one user request, one GraphQL observer request and one Actions request with a single producer.
+
+| Workload | Control/control fresh-row pairs (ms) | Control/candidate fresh-row pairs (ms) | Median paired row saving | Improved pairs | Median paired frame saving | Control/control row / frame jitter |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| Early, one pane | 2689/2713, 2677/2692, 2683/2680, 2654/2677, 2659/2675 | 2673/1660, 2672/1682, 2785/1728, 2680/1677, 2683/1669 | 1,013.7 ms | 5/5 | −6.9 ms | 16.6 / 14.6 ms |
+| Late, one pane | 2955/2961, 2959/2966, 2983/2972, 2968/2951, 2951/2961 | 2976/2949, 2967/2955, 3182/2974, 2954/2973, 2963/2969 | 11.2 ms | 3/5 | 9.1 ms | 9.8 / 7.5 ms |
+| Early, two panes | 3280/3269, 3276/3274, 3287/3271, 3271/3267, 3288/3266 | 3282/2269, 3276/2272, 3298/2267, 3268/2280, 3273/2302 | 1,003.8 ms | 5/5 | 10.9 ms | 10.8 / 10.6 ms |
+| Late, two panes | 3280/3274, 3395/3279, 3308/3267, 3277/3256, 3280/3273 | 3257/3265, 3319/3293, 3272/3273, 3284/3274, 3278/3380 | −1.3 ms | 2/5 | 1.5 ms | 21.0 / 12.9 ms |
+
+Median elapsed milliseconds from simultaneous launch for each A/B build follow. The persisted earliest start is a wall-clock deadline, so a grant can be observed just after that deadline.
+
+| Workload, control → candidate | Frame | First demand | Grant | Earliest permitted start | Actual Actions start | First fresh row |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Early, one pane | 228 → 239 | 1587 → 591 | 1592 → 594 | 1590 → 592 | 2650 → 1645 | 2680 → 1677 |
+| Late, one pane | 236 → 226 | 1606 → 589 | 1609 → 591 | 2886 → 2878 | 2936 → 2939 | 2967 → 2969 |
+| Early, two panes | 251 → 247 | 1611 → 602 | 1613 → 605 | 1611 → 603 | 2664 → 1667 | 3276 → 2272 |
+| Late, two panes | 251 → 251 | 1609 → 595 | 1611 → 599 | 2898 → 2890 | 2958 → 2941 | 3278 → 3274 |
+
+Every actual Actions request started after its own permitted slot. In late two-pane starts the follower made three local ownership checks before the first fresh row, up from two. Four of five pairs had one extra total data wake in that startup window. The five trials together had six data wakes after the fresh row on the control and five on the candidate. Control wake counts matched. An already distant reservation absorbed the earlier demand without an extra GitHub request.
+
+### Warm restart and held-budget recovery
+
+The application reopened a known-empty Actions cache on both builds. With a cold pane and a zero-remaining budget, neither build performed an Actions read until the healthy observer returned, 60.76 s after launch on the control and 61.06 s on the candidate. The respective Actions children started at 61.81 s and 62.12 s. The candidate's early wake stayed inactive in both the warm and held openings. A 42 s fixture timeout initially missed the ordinary 60 s observer interval. Extending the fixture window let the real recovery complete without changing runtime clocks or policy.
+
+For each scenario the common eight seconds after the first response contained three Actions reads, eight data wakes, four liveness ticks and zero heartbeat ticks on each build. Both warm trials had zero control wakes and both recovery trials had one. Each of the 12 observed Actions invocations followed its own reservation deadline. All four panes restored the terminal and exited successfully.
+
+**Decision: keep the startup change.** The early single-pane median saving exceeded both the required 500 ms and the 16.6 ms same-build jitter. All five early single-pane pairs improved. All other median regression checks passed, same-target panes shared one remote read, and recurring wake counts matched in the warm and recovery comparisons. The trade-off is a bounded extra local recheck by a follower waiting for a distant slot.
+
+The final candidate passed all five local commands in sequence on Node 24.22.3, macOS arm64. Lint and syntax passed, as did 1,145 unit tests, nine efficiency tests and 271 terminal tests. One optional historical reproduction skipped because the 0.15.2 binary was unavailable. The full terminal run included the phase 4 acquisition-warning fixture with its corrected waiter. Measurements cover synthetic GitHub responses and local terminal writes. They do not establish production network latency or a whole-process memory reduction.

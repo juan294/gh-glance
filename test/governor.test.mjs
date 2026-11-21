@@ -49,6 +49,7 @@ import {
   createSingleFlightWake,
   createRecurringWake,
   createWakeScheduler,
+  createInitialPollWake,
   doctorProbePlan,
   emptyGovernorState,
   failProbeClaim,
@@ -1500,6 +1501,71 @@ test("unsafe failure context runs no quota call, and opening a row spends nothin
   assert.equal(launched.length, 1);
   assert.equal(launched[0].at(-1), "https://github.com/acme/widget/issues/7");
   assert.equal(registry.size(), 0);
+});
+
+test("the first cold poll opening schedules one ordinary wake at its deadline", (t) => {
+  const box = sandbox(t);
+  const leaseId = randomUUID();
+  registerLease(box.scope, lease(leaseId));
+  publishInitial(box.scope, leaseId);
+  const snapshot = inspectGovernor(box.scope, NOW);
+  const opening = { key: "actions", rows: null, currentScope: true,
+    refreshed: { ok: true }, snapshot, checkedAt: NOW, pendingBlocks: new Map(), dueAt: NOW + 1 };
+
+  for (const elapsed of [0, 20]) {
+    let clock = NOW + elapsed;
+    const timers = new Map();
+    const scheduler = createWakeScheduler({ now: () => clock,
+      set(run, delay) { timers.set(run, delay); return run; },
+      clear(run) { timers.delete(run); },
+    });
+    let wakes = 0;
+    const wake = () => { wakes += 1; };
+    const open = createInitialPollWake(scheduler);
+    // A failed bootstrap inspection never opens polling. The first opening
+    // here can equally come from the subsequent healthy control callback.
+    assert.equal(open(opening, wake), true);
+    scheduler.arm("data", clock + 1000, wake);
+    scheduler.arm("control", clock + 1, () => open(opening, wake));
+    const [[data, delay], [control]] = timers;
+    assert.equal(delay, Math.max(0, 1 - elapsed));
+    assert.equal(wakes, 0);
+    clock += delay;
+    control();
+    data();
+    assert.equal(wakes, 1);
+    assert.equal(open({ ...opening, dueAt: clock }, wake), false);
+    assert.equal(scheduler.at("data"), Infinity);
+    scheduler.arm("data", clock + 1000, wake);
+    assert.equal(scheduler.at("data"), clock + 1000, "ordinary retry keeps its delay");
+    scheduler.clearAll();
+  }
+
+  const failedGraphql = structuredClone(snapshot);
+  failedGraphql.value.observers.graphql.outcome = "failed";
+  const pendingCore = new Map([["core", {}]]);
+  for (const [overrides, eligible] of [
+    [{ rows: [] }, false],
+    [{ rows: [{ number: 1 }] }, false],
+    [{ currentScope: false }, false],
+    [{ refreshed: { ok: false } }, false],
+    [{ key: "issues", snapshot: failedGraphql }, false],
+    [{ key: "actions", snapshot: failedGraphql }, true],
+    [{ key: "actions", pendingBlocks: pendingCore }, false],
+    [{ key: "prs", pendingBlocks: pendingCore }, true],
+  ]) {
+    let callback;
+    const scheduler = createWakeScheduler({ now: () => NOW,
+      set(run) { callback = run; return run; }, clear() {} });
+    const open = createInitialPollWake(scheduler);
+    let wakes = 0;
+    const wake = () => { wakes += 1; };
+    assert.equal(open({ ...opening, ...overrides }, wake), eligible);
+    scheduler.clearAll();
+    callback?.();
+    assert.equal(wakes, 0, "cancelled and superseded timers cannot wake");
+    assert.equal(open(opening, wake), false, "a scope reset or later tab cannot reopen the opportunity");
+  }
 });
 
 test("independent wake schedulers clear every pending callback", () => {
