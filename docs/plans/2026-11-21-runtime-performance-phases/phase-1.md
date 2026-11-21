@@ -30,3 +30,9 @@ fail: local preflight failure -> existing exit status and message on the normal 
 - Run focused tests, then the main plan's sequential lint, syntax, unit, efficiency and PTY commands.
 
 **Manual acceptance.** No manual operation required. Capture exit codes, screen state, process counts and paired timings in the phase handoff.
+
+## Completion
+
+- [x] Skip interactive Git discovery for a complete explicit target.
+- [x] Overlap UI imports with standalone preflight and preserve early-exit diagnostics.
+- [x] Complete independent review, the timing comparison and all five local verification commands. See 2026-11-21-runtime-performance-notes.md for the results and the limits of the first-row measurement.

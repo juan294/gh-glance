@@ -11563,6 +11563,14 @@ async function gitRemoteUrls(options = {}) {
   return selectGhDefaultRemoteUrls(await readGitRemotes(options));
 }
 
+function startupRemoteUrls() {
+  const withoutRemotes = { remoteUrls: [] };
+  if (runtimeRemoteUrls.length || (effectiveRuntimeRepository(withoutRemotes) && effectiveRuntimeHost(withoutRemotes))) {
+    return runtimeRemoteUrls;
+  }
+  return gitRemoteUrls();
+}
+
 function targetSource(remotes = []) {
   if (runtime.repo) return "flag";
   if (process.env.GH_REPO) return "GH_REPO";
@@ -12614,6 +12622,11 @@ Environment:
   INK_SCREEN_READER=true    Linear, unthrottled rendering (unverified -- see README)
 `;
 
+function loadUiModules() {
+  return Promise.all([import("react"), import("ink")]);
+}
+
+let startupUiModules;
 // argv and the TTY guard run *before* react and ink are imported. Loading ink
 // costs a measured 137ms and 46MB of RSS, which is a poor trade for printing a
 // version string -- and `--version`/`--help` are exactly the paths shell
@@ -12684,7 +12697,7 @@ if (IS_MAIN) {
   // otherwise a cold invocation paints a dashboard that can only say
   // Disconnected and never has a subscription it can recover.
   if (opts.connect !== null) {
-    runtimeRemoteUrls = await gitRemoteUrls();
+    runtimeRemoteUrls = await startupRemoteUrls();
     const source = opts.connect === "local" ? "local collector" : "SSH collector";
     const problem = collectorClientPreflight(runtimeRemoteUrls, source);
     if (problem) {
@@ -12720,12 +12733,17 @@ if (IS_MAIN) {
   // Capture only on CLI startup; imported modules never read or mutate this key.
   runtimeJevSession = createJevSession({enabled:opts.jev,key:process.env.TYPESAFE_API_KEY??"",maxRequests:opts.jevMaxRequests});
   if(opts.jev && !process.stdin.isTTY){console.error("gh-glance: --jev requires an interactive standalone terminal");process.exit(2);}
+  if (opts.connect === null) {
+    startupUiModules = loadUiModules();
+    // Preflight owns the first diagnostic. Await the original import promise below.
+    startupUiModules.catch(() => {});
+  }
   const problem = opts.connect !== null ? null : await preflight();
   if (problem) {
     console.error(problem);
     process.exit(3);
   }
-  if (opts.connect === null) runtimeRemoteUrls = await gitRemoteUrls();
+  if (opts.connect === null) runtimeRemoteUrls = await startupRemoteUrls();
   runtimeIdentityCoordinator = opts.connect !== null
     ? null
     : createIdentityCoordinator({ host: () => effectiveRuntimeHost() });
@@ -12748,10 +12766,9 @@ if (IS_MAIN) {
 }
 
 const headlessEntry = IS_MAIN && runtime.headlessMode;
-const ReactModule = headlessEntry
-  ? { default: { Component: class {}, createElement: () => null, memo: (component) => component } }
-  : await import("react");
-const InkModule = headlessEntry ? {} : await import("ink");
+const [ReactModule, InkModule] = headlessEntry
+  ? [{ default: { Component: class {}, createElement: () => null, memo: (component) => component } }, {}]
+  : await (startupUiModules ?? loadUiModules());
 const { render, measureElement, Box, Text, useStdout, useInput, useStdin, useApp } = InkModule;
 
 const React = ReactModule.default;
@@ -22876,7 +22893,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     });
 
     async function runBootstrap() {
-      remoteUrls = runtimeRemoteUrls.length > 0 ? runtimeRemoteUrls : await gitRemoteUrls();
+      remoteUrls = await startupRemoteUrls();
       runtimeRemoteUrls = remoteUrls;
       if (cancelled) return;
       if (enterRemoteSetup()) return;
