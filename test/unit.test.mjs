@@ -2526,6 +2526,21 @@ test("overlapping asynchronous width preference writes are serialized in schedul
   await writer.dispose();
 });
 
+test("a width write scheduled while reporting success drains in the same flush", async () => {
+  const writes = [];
+  const writer = createWidthPreferenceWriter({
+    delay: 60_000,
+    write(value) { writes.push(value); return { ok: true }; },
+    onResult() {
+      if (writes.length === 1) writer.schedule(2);
+    },
+  });
+  writer.schedule(1);
+  await writer.flush();
+  await writer.dispose();
+  assert.deepEqual(writes, [1, 2]);
+});
+
 test("concurrent width preference flushes share one in-flight write", async () => {
   const pending = deferred();
   const value = { issues: { author: 9 } };

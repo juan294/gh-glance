@@ -13733,7 +13733,7 @@ function withPersistenceLock(path, operation) {
 }
 
 function samePersistedValue(left, right) {
-  return JSON.stringify(left) === JSON.stringify(right);
+  return left === right || JSON.stringify(left) === JSON.stringify(right);
 }
 
 function mergeWidthPreferenceSnapshots(base, disk, next) {
@@ -13961,6 +13961,9 @@ function createCoalescedWriter({ write, delay = 200, onResult = () => {} }) {
       // reported, while async replacements can neither race on disk nor report
       // out of order.
       if (!isLatest) continue;
+      // A successful snapshot has no retry consumer. Drop it before onResult
+      // can schedule a newer value; a failed write still needs its exact input.
+      if (result.ok !== false) latest = undefined;
       report(result);
       // Leave the latest generation dirty after failure. A later flush/dispose
       // retries it; concurrent callers still share this completed attempt.
@@ -14282,11 +14285,8 @@ function decodeDashboardCache(raw) {
 }
 
 function serializeDashboardCache(cache, { normalized = false } = {}) {
-  return `${JSON.stringify(
-    { version: DASHBOARD_CACHE_VERSION, targets: normalized ? cache : normalizeDashboardCache(cache) },
-    null,
-    2,
-  )}\n`;
+  const targets = normalized ? cache : normalizeDashboardCache(cache);
+  return `${JSON.stringify({ version: DASHBOARD_CACHE_VERSION, targets })}\n`;
 }
 
 function loadDashboardCache(path, target) {
@@ -19541,11 +19541,16 @@ function App({ onCreateRemote = () => {} } = {}) {
       remoteUrls: runtimeRemoteUrls,
     }),
   );
-  const [loadedCache] = useState(() => loadDashboardCache(cachePath, cacheTarget));
+  const dashboardCacheRef = useRef(null);
+  if (dashboardCacheRef.current === null) {
+    dashboardCacheRef.current = loadDashboardCache(cachePath, cacheTarget).cache;
+  }
+  const dashboardCachePersistedRef = useRef(dashboardCacheRef.current);
+  // Keep the initial target's collector checkpoint for reconnects. The full
+  // cache is owned by the two refs above, which advance together after a save.
+  const [cachedEntry] = useState(() => pick(dashboardCacheRef.current, cacheTarget, null));
   const [acquisitionEngine] = useState(() => createAcquisitionEngine());
   useEffect(() => () => acquisitionEngine.close(), [acquisitionEngine]);
-  const dashboardCacheRef = useRef(loadedCache.cache);
-  const dashboardCachePersistedRef = useRef(loadedCache.cache);
   const dashboardCacheTargetRef = useRef(cacheTarget);
   const [dashboardCacheWriter] = useState(() =>
     createCoalescedWriter({
@@ -19565,7 +19570,6 @@ function App({ onCreateRemote = () => {} } = {}) {
     // a filesystem error from replacing terminal teardown.
     void dashboardCacheWriter.dispose();
   }, [dashboardCacheWriter]);
-  const cachedEntry = loadedCache.entry;
   // `null` means "never resolved" -- distinct from `[]`, which means "resolved
   // and genuinely empty". The tab bar and the body render those differently.
   const [data, setData] = useState(() =>
@@ -20081,12 +20085,6 @@ function App({ onCreateRemote = () => {} } = {}) {
   // faster than once a minute, so it decides how often `now` has to advance.
   const hasInProgressRef = useRef(false);
   hasInProgressRef.current = (data.actions ?? []).some((r) => r.status !== "completed");
-
-  // Queued runs don't spin -- standing still is how they read as queued -- and
-  // the icons only exist on the Actions tab, so a run turning behind another
-  // tab would be ten redraws a second nobody can see.
-  const hasRunningVisible =
-    ANIMATE && tab.key === "actions" && (data.actions ?? []).some((r) => r.status === "in_progress");
 
   const inFlightRef = useRef({});
   const rawRef = useRef({});
@@ -23007,19 +23005,6 @@ function App({ onCreateRemote = () => {} } = {}) {
     disconnected: statusDisconnected,
     screenReader,
   });
-  const showSpinner = !remoteSetup && ANIMATE && (semanticStatus.animate || hasRunningVisible);
-  useEffect(() => {
-    if (!showSpinner) {
-      // Park on a fixed frame rather than freezing wherever the animation
-      // happened to stop: the resting glyph is then the same every time, so
-      // consecutive idle frames stay byte-identical and Ink writes nothing.
-      setFrame(0);
-      return;
-    }
-    const id = setInterval(() => setFrame((f) => (f + 1) % SPINNER.length), SPINNER_MS);
-    return () => clearInterval(id);
-  }, [showSpinner]);
-
   // Armed on the same condition the loading line renders on, so a start that
   // resolves inside ICON_HINT_AFTER_MS clears the timer on the way past and
   // never writes state at all -- the fast path stays exactly as many renders as
@@ -23274,6 +23259,28 @@ function App({ onCreateRemote = () => {} } = {}) {
   });
   shortTabLabelsRef.current = tabEntries[0].tier !== "full";
 
+  const drawnRows = tooNarrow || showHelp || notificationsOpen || remoteSetup || ciView || attentionView
+    ? [] : visibleItems;
+  const runningAction = (item) => item.status === "in_progress";
+  const checkingGlyph = semanticStatus.animate && ICON_PROFILE !== "ascii" && !resizeRef.current.active;
+  const firstLoadBadge = anyFirstLoad && tabEntries[0].tier !== "digits";
+  const showSpinner = ANIMATE && !remoteSetup && (
+    checkingGlyph || (tab.key === "actions" && drawnRows.some(runningAction)) ||
+    // An inactive first-load badge follows an already animated clock.
+    (firstLoadBadge && (semanticStatus.animate || (tab.key === "actions" && data.actions?.some(runningAction))))
+  );
+  useEffect(() => {
+    if (!showSpinner) {
+      // Park on a fixed frame rather than freezing wherever the animation
+      // happened to stop: the resting glyph is then the same every time, so
+      // consecutive idle frames stay byte-identical and Ink writes nothing.
+      setFrame(0);
+      return;
+    }
+    const id = setInterval(() => setFrame((f) => (f + 1) % SPINNER.length), SPINNER_MS);
+    return () => clearInterval(id);
+  }, [showSpinner]);
+
   return e(
     Box,
     { flexDirection: "column", width: frameCols, height: frameRows },
@@ -23348,7 +23355,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           selectedWidthKey: resizeRef.current.active ? selectedWidthKey : null,
           headerRef,
         }),
-      ...(tooNarrow || showHelp || notificationsOpen || remoteSetup || ciView || attentionView ? [] : visibleItems).map((item) => {
+      ...drawnRows.map((item) => {
         const key = itemKey(item);
         return e(
           RowBoundary,

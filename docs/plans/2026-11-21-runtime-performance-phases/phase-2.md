@@ -37,3 +37,8 @@ fail: latest write fails -> retain value and allow a later flush or dispose to r
 4. Run the main plan's sequential lint, syntax, unit, efficiency and PTY commands.
 
 **Manual acceptance.** No visual-only gate. Record timer counts, cache bytes and component heap evidence separately from whole-process RSS.
+
+## Completion
+
+- [x] Park invisible animation, compact display-cache writes and release superseded objects.
+- [x] Review, simplify, measure and verify the phase. Measurements and gate results are in 2026-11-21-runtime-performance-notes.md.
