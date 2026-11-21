@@ -102,3 +102,28 @@ The candidate connected client received ordinary Issue and PR rows from a phase 
 A real gh-backed collector changed its synthetic credential while an old Actions catalog response was in flight. It fetched the new account's name and discarded the obsolete result. An initial fixture tried an in-process regrant with the GitHub App provider, whose existing authority-invalidation contract requires restart. The final check uses the supported gh account switch to test the same collector publication boundary. App-provider policy was outside this phase. Independent review verified the freshness/identity comparisons, canonical acquisition keys, late-binding fences and actual outbound queries. The simplify review checked lazy allocation, first-page reuse and shared request construction. The PTY query fixture now consumes the production document instead of a second hand-written copy. Eight focused test files passed on the final source.
 
 Final phase 3 executable SHA-256 `e3c7ac2561c6e70af930aa08b5a85965801e4bc24dfd8c1d9e679a45c5e2ed40`. On Node 24.22.3, macOS arm64, lint, syntax, 1,137 unit tests, nine efficiency tests and 271 PTY tests passed. The optional 0.15.2 reproduction skipped. Phase 4 starts at this local worktree commit.
+
+## Phase 4 · Local transactions, encoding and field processing
+
+Phase 4 starts at `58155e8`. The disk transaction retains at most one prepared artifact for the exact final query key and snapshot object. Capacity accounting and the successful disk write share its bytes. Authoritative reads and injected one-argument storage remain available. The mounted display projection reuses a governor inspection only for its original scope object. The collector delays full UTF-8 buffer allocation until it actually chunks an envelope. Short sanitized fields skip the code-point array.
+
+All four operation-count regressions failed on the phase 3 baseline. The candidate's 93 focused checks passed, covering capacity refusal, interrupted replacement, retry, projection age and access, wire boundaries and Unicode. Independent review traced the trim, final writer, scope inspection, chunk iterators and normalization callers. The simplify pass restricted reuse to the exact scope object, which both mounted callers already pass. Even a second private file with identical quota and access keys falls back to fresh inspection. There is no shared cache across transactions or changes to the wire or storage schema.
+
+| Measured operation | Baseline | Candidate |
+| --- | ---: | ---: |
+| Prepare the retained candidate on each of eight disk publications | 2 serializations and hashes | 1 serialization and hash |
+| Successful display projection after inspecting the same governor | 1 additional lock and read | 0 additional locks or reads |
+| Full payload Buffer per small collector snapshot | 1 | 0 |
+| Full payload Buffers for two simultaneous chunked line senders | 1 shared | 1 shared |
+| Code-point arrays for 13 short inputs / 6 long inputs | 13 / 6 | 0 / 6 |
+
+All 24 comparisons of artifacts, descriptors and metadata matched. Ordinary and remapped snapshots passed digest-verified rereads. Failed replacement and refused capacity preserved prior data and the next eligible publication succeeded. Across the two encoders, a 1,048,576-byte multibyte envelope used a single frame and one additional byte triggered chunking. Both stalled senders drained, released the prepared object and reconstructed identical data. The assembly limit and all 19 Unicode/field results matched, including the two-pass clipping case.
+
+**Existing edge case.** A direct unnormalized publication of 299 letters, a space and one more letter retains the trailing space on its first normalization and strips it on its second. On both builds this direct fixture writes successfully and its later disk reread reports a digest mismatch. The ordinary Issues and PR fetchers normalize that same title before publication and their snapshots passed verified reread on both builds. This phase preserves the existing digest and legacy behavior; the edge is outside the performance change.
+
+The disk/frame comparisons ran on executable SHA-256 `d7be4560ba7e4ed0278b3bb7d75230fd5858a6bcac5ee91d43291469ee53b2bd`. The exact-scope cleanup affected only the diagnostic predicate. The final executable is `e912306620332169fee210630c08d928ad8c7a726e5f19be1bd3825a33c67a2c`.
+
+On the final source, mounted bootstrap and control each used the same inspected scope with zero additional disk locks or reads. A separate ledger with identical keys returned its own revision through a fresh read. Failed, missing, cloned or differently keyed observations also triggered a fresh read.
+
+Lint, syntax, 1,144 unit tests and nine efficiency tests passed on Node 24.22.3, macOS arm64. The full terminal command initially reported 270 passes, one failure and one optional historical skip. The failing 24-column fixture saw an unrelated transient startup badge, then quit before the injected lock produced its notification. Its retained terminal log showed the badge appearing and clearing. The driver now waits for the acquisition-busy journal entry and checks the current tab header for the badge. The original final-frame assertions still apply. The corrected case passed twice on the same executable, completing coverage of all 271 applicable cases. Lint also passed after the fixture edit.
+After independent review the test also verifies the journal recorded this cause during the blocked capture. Lint and the focused terminal test passed with that assertion.

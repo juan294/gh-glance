@@ -317,6 +317,7 @@ function safe(value) {
   // function that claims to provide it.
   const value_ = typeof value === "string" ? value : value == null ? "" : String(value);
   const cleaned = value_.replace(BIDI_OVERRIDES, "").replace(CONTROL_CHARS, " ").trim();
+  if (cleaned.length <= MAX_FIELD_LENGTH) return cleaned;
   const points = Array.from(cleaned);
   return points.length > MAX_FIELD_LENGTH ? points.slice(0, MAX_FIELD_LENGTH).join("") : cleaned;
 }
@@ -9519,9 +9520,9 @@ function prepareCollectorSnapshot(input, resource = input?.resource) {
   const snapshot = projectCollectorSnapshot(input, resource);
   if (!snapshot) throw new Error("invalid collector snapshot");
   const json = JSON.stringify(snapshot);
-  const payload = Buffer.from(json);
-  if (payload.length > COLLECTOR_ASSEMBLY_MAX_BYTES) throw new Error("collector snapshot too large");
-  return { snapshot, json, payload };
+  if (Buffer.byteLength(json) > COLLECTOR_ASSEMBLY_MAX_BYTES) throw new Error("collector snapshot too large");
+  let payload;
+  return { snapshot, json, get payload() { return payload ??= Buffer.from(json); } };
 }
 
 function createCollectorSnapshotEncodingCache() {
@@ -9563,10 +9564,11 @@ function *collectorSnapshotLineIterator(id, serverEpoch, prepared, serverNow = D
   if (!validCollectorId(id) || !validGovernorId(serverEpoch) && !validCollectorId(serverEpoch)) {
     throw new Error("invalid collector snapshot");
   }
-  const { snapshot, json, payload } = prepared;
+  const { snapshot, json } = prepared;
   const small = `{"type":"snapshot","id":${JSON.stringify(id)},"serverEpoch":${JSON.stringify(serverEpoch)},` +
     `"generation":${snapshot.generation},"serverNow":${serverNow},"snapshot":${json}}\n`;
   if (Buffer.byteLength(small) <= COLLECTOR_FRAME_MAX_BYTES) { yield small; return; }
+  const { payload } = prepared;
   const snapshotId = randomUUID();
   const digest = createHash("sha256").update(payload).digest("hex");
   const rawChunkBytes = 360 * 1024;
@@ -9586,13 +9588,14 @@ function *collectorSnapshotLineIterator(id, serverEpoch, prepared, serverNow = D
 
 function *collectorSnapshotFrameIterator(id, serverEpoch, input, resource = input?.resource, serverNow = Date.now()) {
   const prepared = prepareCollectorSnapshot(input, resource);
-  const { snapshot, payload } = prepared;
+  const { snapshot } = prepared;
   if (!validCollectorId(id) || !validGovernorId(serverEpoch) && !validCollectorId(serverEpoch) ||
       !snapshot) throw new Error("invalid collector snapshot");
   const small = { type: "snapshot", id, serverEpoch, generation: snapshot.generation, serverNow, snapshot };
   try { encodeCollectorFrame(small); yield small; return; } catch (error) {
     if (!/frame too large/.test(error.message)) throw error;
   }
+  const { payload } = prepared;
   const snapshotId = randomUUID();
   const digest = createHash("sha256").update(payload).digest("hex");
   const rawChunkBytes = 360 * 1024;
@@ -15104,14 +15107,14 @@ function writeAcquisitionArtifact(root, artifact, payload) {
   }
 }
 
-function writeAcquisitionStore(path, state) {
+function writeAcquisitionStore(path, state, prepareSnapshot) {
   const persisted = { ...state, queries: {} };
   const staged = [];
   let snapshotBytes = 0;
   for (const [queryKey, record] of Object.entries(state.queries)) {
     let snapshot = record.snapshot;
     if (snapshot && Array.isArray(snapshot.rows)) {
-      const prepared = prepareAcquisitionSnapshot(queryKey, snapshot);
+      const prepared = prepareSnapshot(queryKey, snapshot);
       if (prepared.descriptor.bytes > ACQUISITION_MAX_BYTES) return { ok: false, reason: "capacity" };
       staged.push(prepared);
       snapshot = prepared.descriptor;
@@ -15163,12 +15166,19 @@ function withAcquisitionStore(path, operation, {
   return withFileLock(`${path}.lock`, () => {
     const loaded = loadAcquisitionMetadata(path, { now });
     if (!loaded.ok) return loaded;
-    const result = operation(loaded.value);
+    let candidate;
+    function prepareSnapshot(queryKey, snapshot, remember = false) {
+      if (candidate?.queryKey === queryKey && candidate.snapshot === snapshot) return candidate.prepared;
+      const prepared = prepareAcquisitionSnapshot(queryKey, snapshot);
+      if (remember) candidate = { queryKey, snapshot, prepared };
+      return prepared;
+    }
+    const result = operation(loaded.value, prepareSnapshot);
     if (result?.ok === false) return result;
     if (result?.changed === false) {
       return { ok: true, value: result?.value, state: loaded.value, written: false };
     }
-    const written = writeAcquisitionStore(path, loaded.value);
+    const written = writeAcquisitionStore(path, loaded.value, prepareSnapshot);
     return written.ok ? { ok: true, value: result?.value, state: written.persisted, written: true } : written;
   }, { pid, kill });
 }
@@ -15210,13 +15220,13 @@ function acquisitionSharingCount(state, queryKey) {
     .filter((subscription) => subscription.queryKey === queryKey).length;
 }
 
-function trimAcquisitionStore(state, protectedQueryKey = null) {
+function trimAcquisitionStore(state, protectedQueryKey = null, prepareSnapshot = prepareAcquisitionSnapshot) {
   const pinned = new Set(Object.values(state.subscriptions).map((subscription) =>
     state.queries[subscription.queryKey]?.query.targetKey).filter(Boolean));
   const targets = new Map();
   const entries = Object.entries(state.queries).map(([key, query]) => {
     const prepared = query.snapshot && Array.isArray(query.snapshot.rows)
-      ? prepareAcquisitionSnapshot(key, query.snapshot) : null;
+      ? prepareSnapshot(key, query.snapshot, key === protectedQueryKey) : null;
     const snapshotBytes = prepared?.descriptor.bytes ?? query.snapshot?.bytes ?? 0;
     const entityCount = prepared?.descriptor.entityCount ?? query.snapshot?.entityCount ?? 0;
     const metadataRecord = { ...query, snapshot: prepared?.descriptor ?? query.snapshot };
@@ -15563,7 +15573,7 @@ function createAcquisitionEngine({
   function publish(id, claim, produced) {
     const item = local.get(id);
     if (!item || !isRecord(claim)) return { ok: false, reason: "invalid" };
-    const committed = transact((state) => {
+    const committed = transact((state, prepareSnapshot) => {
       let record = state.queries[item.queryKey];
       if (!record || record.claim?.nonce !== claim.nonce ||
           record.claim.generation !== claim.generation || record.query.accessKey !== claim.accessKey) {
@@ -15623,7 +15633,7 @@ function createAcquisitionEngine({
       record.claim = null;
       record.hold = null;
       record.lastUsedAt = now();
-      if (!trimAcquisitionStore(state, record.query.queryKey)) {
+      if (!trimAcquisitionStore(state, record.query.queryKey, prepareSnapshot)) {
         record.snapshot = previous;
         record.generation -= 1;
         record.claim = previousClaim;
@@ -15977,13 +15987,14 @@ function createAcquisitionEngine({
     });
   }
 
-  function syncQuotaProjection(scope) {
+  function syncQuotaProjection(scope, observation) {
     if (!isRecord(scope) || !/^[0-9a-f]{64}$/.test(scope.hash ?? "")) {
       return { ok: false, reason: "invalid" };
     }
     // Quota is read before the acquisition lock. This diagnostic copy never
     // grants requests and a failed read cannot block source publication.
-    const observed = inspectGovernor(scope, now());
+    const observed = observation?.scope === scope && observation.inspection?.ok === true
+      ? observation.inspection : inspectGovernor(scope, now());
     if (!observed.ok) {
       return transact((state) => {
         const previous = state.quotaProjections[scope.hash];
@@ -20996,7 +21007,7 @@ function App({ onCreateRemote = () => {} } = {}) {
 
     function syncRuntimeQuotaProjection(currentScope, snapshot) {
       if (!snapshot?.ok) return;
-      acquisitionEngine.syncQuotaProjection(currentScope);
+      acquisitionEngine.syncQuotaProjection(currentScope, { scope: currentScope, inspection: snapshot });
     }
 
     function commit(key, run, {

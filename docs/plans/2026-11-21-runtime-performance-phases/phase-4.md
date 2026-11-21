@@ -44,3 +44,9 @@ In `safe`, after the existing conversion, control removal and trim, return a cle
 5. Run focused tests followed by the [main plan](../2026-11-21-runtime-performance.md)'s sequential lint, syntax, unit, efficiency and PTY commands.
 
 **Manual acceptance.** No manual operation required. Report preparation and allocation counts, output equality and a successful read after each induced recoverable failure. Whole-process RSS is a separate measurement.
+
+## Completion
+
+- [x] Reuse the finalized disk artifact and exact-scope display observation.
+- [x] Delay the collector payload buffer and avoid the short-field code-point array.
+- [x] Check byte equality, failures and retries, Unicode boundaries and terminal behavior. See [implementation notes](../2026-11-21-runtime-performance-notes.md).
