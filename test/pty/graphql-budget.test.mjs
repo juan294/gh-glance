@@ -10,6 +10,8 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { graphqlInput } from "../../index.mjs";
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, "fixtures", "gh");
 
@@ -32,23 +34,7 @@ function envelope(result) {
   return JSON.parse(result.stdout.slice(separator.index + separator[0].length));
 }
 
-const PAGE = (connection, after = null) => ({
-  query: `query($owner:String!,$name:String!,$first:Int!,$after:String){
-  repository(owner:$owner,name:$name){
-    id
-    name
-    nameWithOwner
-    url
-    ${connection}(first:$first,after:$after,states:OPEN,orderBy:{field:UPDATED_AT,direction:DESC}){
-      totalCount
-      pageInfo{hasNextPage endCursor}
-      nodes{id number title url updatedAt author{login}${connection === "issues" ? " labels(first:1){nodes{name}}" : " headRefName isDraft reviewDecision"}}
-    }
-  }
-  rateLimit{cost limit used remaining resetAt}
-}`,
-  variables: { owner: "acme", name: "widget", first: 50, after },
-});
+const PAGE = (kind, after = null) => graphqlInput(kind, { owner: "acme", name: "widget", first: 50, after });
 
 test("GQL-01 the observer and a data page are priced apart, and both meter themselves", () => {
   const observer = invoke({ query: "query{rateLimit{cost limit used remaining resetAt}}", variables: {} });
@@ -128,7 +114,7 @@ test("GQL-06 the stateful fixture debits GraphQL by document and never by comman
   assert.equal(observer.status, 0, observer.stderr);
   assert.equal(read().used, 1, "the observer is not free");
 
-  const page = invoke(PAGE("pullRequests"), env);
+  const page = invoke(PAGE("prs"), env);
   assert.equal(page.status, 0, page.stderr);
   assert.equal(read().used, 3, "a page costs two, on top of the observer's one");
   // The envelope's meter agrees with the ledger, so what the app settles on and

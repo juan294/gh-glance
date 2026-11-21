@@ -60,7 +60,11 @@ test("PAGE-01 the first display requires exactly one 50-row page", async () => {
     page(rows(50, 51), { hasNextPage: true, cursor: "cursor:2" }),
     page(rows(50, 101), { hasNextPage: false, cursor: null }),
   ]);
-  const result = await fetchGraphqlList("issues", (n) => ({ number: n.number }), {
+  let mapped = 0;
+  const result = await fetchGraphqlList("issues", (n) => {
+    mapped++;
+    return { number: n.number };
+  }, {
     governor: { scope: {}, leaseId: "lease" },
     fetchPage,
     admit: admitAll,
@@ -69,6 +73,7 @@ test("PAGE-01 the first display requires exactly one 50-row page", async () => {
   // rows on the very first paint, which is three requests for a pane that shows
   // about twenty.
   assert.deepEqual(seen, [null]);
+  assert.equal(mapped, 50, "generation and display share the first page");
   assert.equal(result.parse().length, 50);
   // And it says so truthfully: more rows exist.
   assert.equal(result.hasNextPage, true);

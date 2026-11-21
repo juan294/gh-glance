@@ -1071,7 +1071,8 @@ async function ghApi(args, { operation, signal, etag = null, run = runGh, includ
 
 // The version travels in the query key, so a changed document invalidates its
 // cursors instead of paging a new shape with an old cursor.
-const GRAPHQL_QUERY_VERSION = 2;
+const ACQUISITION_QUERY_VERSIONS = Object.freeze({ actions: 2, issues: 3, prs: 3, security: 2 });
+const ACQUISITION_CONTENT_VERSION = 2;
 // GitHub prices a connection by the pages it could return, and the row's single
 // label is a nested connection of its own. Two points is the conservative bound
 // for one page; the observer selects nothing but the meter and costs one.
@@ -1092,13 +1093,11 @@ const GRAPHQL_MAX_RESET_MS = 2 * 60 * 60 * 1000;
 const ISSUE_PAGE_QUERY = `query($owner:String!,$name:String!,$first:Int!,$after:String){
   repository(owner:$owner,name:$name){
     id
-    name
     nameWithOwner
-    url
     issues(first:$first,after:$after,states:OPEN,orderBy:{field:UPDATED_AT,direction:DESC}){
       totalCount
       pageInfo{hasNextPage endCursor}
-      nodes{id number title url updatedAt author{login} labels(first:1){nodes{name}}}
+      nodes{number title url updatedAt author{login} labels(first:1){nodes{name}}}
     }
   }
   rateLimit{cost limit used remaining resetAt}
@@ -1107,13 +1106,11 @@ const ISSUE_PAGE_QUERY = `query($owner:String!,$name:String!,$first:Int!,$after:
 const PULL_PAGE_QUERY = `query($owner:String!,$name:String!,$first:Int!,$after:String){
   repository(owner:$owner,name:$name){
     id
-    name
     nameWithOwner
-    url
     pullRequests(first:$first,after:$after,states:OPEN,orderBy:{field:UPDATED_AT,direction:DESC}){
       totalCount
       pageInfo{hasNextPage endCursor}
-      nodes{id number title url updatedAt author{login} headRefName isDraft reviewDecision}
+      nodes{number title url updatedAt author{login} headRefName isDraft reviewDecision}
     }
   }
   rateLimit{cost limit used remaining resetAt}
@@ -2159,7 +2156,7 @@ async function fetchConditionalEntity({
   };
 }
 
-function conditionalBatchResult(responses, previousRaw, joinedRaw = null) {
+function conditionalBatchResult(responses, previousRaw, changedRaw = null) {
   const list = Array.isArray(responses) ? responses : [];
   let allNotModified = list.length > 0;
   let restSpent = 0;
@@ -2178,7 +2175,8 @@ function conditionalBatchResult(responses, previousRaw, joinedRaw = null) {
   return {
     raw: allNotModified
       ? previousRaw
-      : joinedRaw ?? list.map((response) => response?.body ?? "").join("\0"),
+      : typeof changedRaw === "function" ? changedRaw()
+      : changedRaw ?? list.map((response) => response?.body ?? "").join("\0"),
     allNotModified,
     restSpent,
     restNotModified,
@@ -2243,8 +2241,6 @@ function stagedAcquisitionPublicationView({ entities, stagedEntities, transition
     unchangedCount: advanceUnchangedCount(unchangedCount, transitionKind),
   };
 }
-
-const ACTIONS_QUERY_VERSION = 2;
 
 async function fetchActions(signal, {
   entities = new Map(),
@@ -2326,12 +2322,13 @@ async function fetchActions(signal, {
     // scheduling outcome would hide missing names for fifteen minutes over a
     // moment of budget pressure.
   }
-  const rows = resolveWorkflowNames(runs, nextCatalog);
+  let rows;
+  const parse = () => rows ??= resolveWorkflowNames(runs, nextCatalog);
   // The payload identity is what is rendered, not the concatenated bodies. The
   // catalog is fetched on some polls and not others, and joining raw bodies
   // made that alternation look like a content change every time.
-  const raw = JSON.stringify({ v: ACTIONS_QUERY_VERSION, rows });
-  const batch = conditionalBatchResult(responses, previousRaw, raw);
+  const batch = conditionalBatchResult(responses, previousRaw,
+    () => JSON.stringify({ v: ACQUISITION_CONTENT_VERSION, rows: parse() }));
   return {
     raw: batch.raw,
     limit: ACTIONS_RUN_LIMIT,
@@ -2348,7 +2345,7 @@ async function fetchActions(signal, {
     stagedEntities: batch.stagedEntities,
     observations: batch.observations,
     catalog: nextCatalog,
-    parse: () => rows,
+    parse,
   };
 }
 
@@ -2558,19 +2555,15 @@ async function fetchGraphqlList(kind, mapRow, {
   let overrun = first.overrun;
   let current = graphqlConnection(first, connection);
   const totalCount = current?.totalCount ?? null;
-  const generation = pageGeneration((current?.nodes ?? []).map(mapRow));
+  const firstRows = current?.nodes.map(mapRow) ?? [];
+  const generation = pageGeneration(firstRows);
   const wanted = Math.min(
     Math.max(1, Number.isSafeInteger(pages) ? pages : 1),
     Math.max(1, Math.ceil(LIST_LIMIT / GRAPHQL_PAGE_SIZE)),
   );
   const acquired = [];
-  const collect = (value) => acquired.push({
-    generation,
-    rows: (value?.nodes ?? []).map(mapRow),
-    pageInfo: value?.pageInfo ?? null,
-  });
-  let truncatedWalk = false;
-  if (current) collect(current); else truncatedWalk = true;
+  let truncatedWalk = !current;
+  if (current) acquired.push({ generation, rows: firstRows, pageInfo: current.pageInfo });
   while (acquired.length < wanted && current?.pageInfo?.hasNextPage) {
     const cursor = current.pageInfo.endCursor;
     if (typeof cursor !== "string" || cursor.length === 0) { truncatedWalk = true; break; }
@@ -2602,7 +2595,7 @@ async function fetchGraphqlList(kind, mapRow, {
     spent += admitted.value.observedCost;
     current = graphqlConnection(admitted.value, connection);
     if (!current) { truncatedWalk = true; break; }
-    collect(current);
+    acquired.push({ generation, rows: current.nodes.map(mapRow), pageInfo: current.pageInfo });
   }
   if (overrun) {
     // Recorded at its real cost above; suspended here until the resource resets,
@@ -10449,6 +10442,7 @@ function createCollectorAcquisitionRuntime({
         signal: boundedSignal,
         entities,
         previousRaw: force ? null : snapshot?.raw ?? null,
+        catalog: force ? null : claim.state.workflowCatalog,
         force,
         pages: demand.pages,
         governor: { scope: transportScope, leaseId: context.leaseId },
@@ -10485,6 +10479,7 @@ function createCollectorAcquisitionRuntime({
         unchangedCount: claim.state.unchangedCount,
       });
       if (reconciliation !== null) publication.nextDueAt = completedAt + reconciliation;
+      if (resource === "actions") claim.workflowCatalog = result.catalog;
       return publication;
     } catch (error) {
       const terminal = queueTerminalization(context.scope, admitted.receiptCapability,
@@ -10732,6 +10727,7 @@ function createCollectorAcquisitionRuntime({
       };
       item.pollPhase = "claimed";
       const producer = produce ?? defaultProduce;
+      const producerClaim = { ...claim, state: item };
       item.controller = new AbortController();
       try {
         const produceBound = () => acquisitionFenceStorage.run(
@@ -10741,7 +10737,7 @@ function createCollectorAcquisitionRuntime({
           demand: { ...ownership.value.demand, background: item.demand.background,
             active: ownership.value.demand?.active || item.requestedAt !== null },
           snapshot: ownership.value.snapshot,
-          claim: { ...claim, state: item },
+          claim: producerClaim,
           provider,
           signal: item.controller.signal,
           force,
@@ -10786,6 +10782,13 @@ function createCollectorAcquisitionRuntime({
         const published = await engine.refresh(subscriptionId, { claim, publish: produced });
         if (!published.ok) { item.onHold?.("disconnected"); retryIn = 1_000; }
         else {
+          // The parsed catalog belongs to this binding and never travels with the snapshot.
+          if (producerClaim.workflowCatalog !== undefined && !closed && !item.closed &&
+              item.id === subscriptionId && item.bindingRevision === bindingRevision &&
+              item.identity?.accessKey === claim.accessKey &&
+              (!provider?.coordinator || provider.coordinator.current()?.accessKey === claim.accessKey)) {
+            item.workflowCatalog = producerClaim.workflowCatalog;
+          }
           provider?.coordinator?.markAuthorized?.();
           // A replay answers the request as far as backoff allows without
           // advancing the success time that would otherwise clear it.
@@ -10850,6 +10853,7 @@ function createCollectorAcquisitionRuntime({
       }, { resumeFreshSnapshot: true });
       if (!subscription.ok) throw new Error("collector subscription unavailable");
       item.id = subscription.value.id;
+      item.workflowCatalog = null;
       const generation = subscription.value.snapshot?.generation ?? 0;
       const accessReset = [...item.invalidations].some((waiter) =>
         waiter.bindingRevision === bindingRevision && waiter.accessRemoved);
@@ -14181,7 +14185,7 @@ function normalizeCachedItem(tabKey, item) {
 // and, for Security, the coverage notes. Timestamps are excluded on purpose.
 function acquisitionContentRaw(resource, { rows, truncated = false, hasNextPage = false, notes = [], blind = false }) {
   return JSON.stringify({
-    v: GRAPHQL_QUERY_VERSION,
+    v: ACQUISITION_CONTENT_VERSION,
     resource,
     truncated: truncated === true,
     hasNextPage: hasNextPage === true,
@@ -14631,7 +14635,7 @@ function acquisitionQueryForTab(key, identity, repository, pages = 1) {
     accessKey: identity.accessKey,
     targetKey: privateIdentityDigest("acquisition-target-v1", identity.host, normalizedRepository),
     resource: key,
-    queryVersion: key === "actions" ? ACTIONS_QUERY_VERSION : GRAPHQL_QUERY_VERSION,
+    queryVersion: ACQUISITION_QUERY_VERSIONS[key],
     filters: {},
     pageSize: key === "actions" ? ACTIONS_RUN_LIMIT : key === "security" ? ALERT_PER_PAGE : GRAPHQL_PAGE_SIZE,
     cursorGeneration: "first",

@@ -39,3 +39,9 @@ Give Issues and PR acquisition queries version 3, as required for changed docume
 4. Run focused tests and then sequential lint, syntax, unit, efficiency and PTY commands from the [main plan](../2026-11-21-runtime-performance.md).
 
 **Manual acceptance.** No owner operation required. Record collector call counts, conditional result checks, fixture bytes and version-isolation evidence.
+
+## Completion
+
+- [x] Reuse the bound catalog and defer comparison work on usable Actions conditional hits.
+- [x] Map list page one once and trim/version the two ordinary list documents.
+- [x] Verify compatible clients and producer isolation, review, simplify and run all local gates. See 2026-11-21-runtime-performance-notes.md.

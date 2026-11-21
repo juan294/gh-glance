@@ -79,3 +79,26 @@ On the final executable, the baseline/candidate callback counts per three second
 The initial local comparison used executable digest prefix `6d4aafa055f4` prior to the short-circuit cleanup. The final gated executable is SHA-256 `417fa566dc939892413b4cbc1c13e5eb1139f5059662d68987b37ea9c535abe2`. Cache/writer source is identical in those two candidates.
 
 Local gates on the final phase 2 executable passed on Node 24.22.3, macOS arm64. Lint, Node syntax, 1,133 unit tests, nine efficiency tests and 271 PTY tests passed. One optional historical 0.15.2 PTY reproduction skipped for its documented missing binary. All remaining phases were authorized in this session. Phase 3 starts at this worktree commit.
+
+## Phase 3 · GitHub reads
+
+Phase 3 starts at `1eacd0a`. The collector keeps a parsed workflow catalog per live Actions subscription. A successful producer publication installs its candidate catalog only while its binding and access partition still match. Forced reads begin cold. An all-usable-304 Actions batch returns its existing comparison identity and resolves rows only if a consumer asks for them. Issues and PRs share the already mapped first page with the generation calculation. Their ordinary documents request fewer fields and use acquisition query version 3. Actions and Security acquisition keys and the stored comparison format keep version 2.
+
+Four targeted regressions failed on the baseline and then passed after the change. These covered eager workflow-name projection, duplicated first-page mapping, the previous document selections and ordinary collector catalog refetches. Two targets with the same numeric workflow ID kept their own names across three polls and a forced refresh.
+
+| Fixed workload | Baseline | Candidate |
+| --- | ---: | ---: |
+| Three ordinary collector polls, unnamed workflow | 3 runs + 3 catalog requests | 3 runs + 1 catalog request |
+| All usable 304 on 60 cached Actions rows, before parse | 60 names resolved, 1 row comparison serialized | 0 names resolved, 0 comparisons serialized |
+| One 50-row Issues or PR page | 100 row mapper calls | 50 row mapper calls |
+| Two 50-row pages with one duplicate | 150 mapper calls, 99 final rows | 100 mapper calls, same 99 rows |
+| Issues response, uncompressed fixture UTF-8 | 10,841 bytes | 9,736 bytes |
+| PR response, uncompressed fixture UTF-8 | 12,538 bytes | 11,383 bytes |
+
+The serialized request shrank from 530 to 508 bytes for Issues and 542 to 520 for PRs. The two-page fixtures kept identical ordering, row digests, comparison identity, repository identity, counts and metered cost. On the conditional Actions hit both builds made one request. Explicit parse on the candidate resolved 60 names once and returned the same row array on repeat, including with null previous raw. The network and cost figures use local fixture responses.
+
+The candidate connected client received ordinary Issue and PR rows from a phase 2 default collector over a real private Unix socket. Its subscribe frame used the existing versionless protocol. Two live engines with v2 and v3 claims for the same access and repository kept separate results across canonical alias admission, including v3 publishing first. All mixed-version and measurement scratch state was removed.
+
+A real gh-backed collector changed its synthetic credential while an old Actions catalog response was in flight. It fetched the new account's name and discarded the obsolete result. An initial fixture tried an in-process regrant with the GitHub App provider, whose existing authority-invalidation contract requires restart. The final check uses the supported gh account switch to test the same collector publication boundary. App-provider policy was outside this phase. Independent review verified the freshness/identity comparisons, canonical acquisition keys, late-binding fences and actual outbound queries. The simplify review checked lazy allocation, first-page reuse and shared request construction. The PTY query fixture now consumes the production document instead of a second hand-written copy. Eight focused test files passed on the final source.
+
+Final phase 3 executable SHA-256 `e3c7ac2561c6e70af930aa08b5a85965801e4bc24dfd8c1d9e679a45c5e2ed40`. On Node 24.22.3, macOS arm64, lint, syntax, 1,137 unit tests, nine efficiency tests and 271 PTY tests passed. The optional 0.15.2 reproduction skipped. Phase 4 starts at this local worktree commit.

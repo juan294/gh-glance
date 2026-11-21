@@ -3,7 +3,8 @@ import { generateKeyPairSync } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import {
@@ -132,13 +133,31 @@ function twoTargetRuntime(t, { provider = APP_PROVIDER, rest, readCore = null, i
     requests.push({ kind: "rest", repo, path: path.split("?")[0] });
     return ghChild(() => rest({ repo, path, at: Date.now() }));
   };
-  const runtime = createCollectorAcquisitionRuntime({ config, pathOptions: privatePathOptions(t),
+  const pathOptions = privatePathOptions(t);
+  if (provider.type === "gh") {
+    // The default user provider bootstraps with a real gh process. Give it only
+    // the offline fixture and a private token/config throughout its lifetime.
+    const fixture = fileURLToPath(new URL("./pty/fixtures/", import.meta.url));
+    const env = { PATH: `${fixture}:${dirname(process.execPath)}:/usr/bin:/bin`,
+      HOME: pathOptions.home, GH_CONFIG_DIR: pathOptions.home, XDG_CONFIG_HOME: pathOptions.home,
+      GH_TOKEN: "synthetic-catalog-account-one", GH_GLANCE_FIXTURE_USER_ID: "41", GH_HOST: "github.com" };
+    for (const [key, value] of Object.entries(env)) {
+      const original = process.env[key];
+      process.env[key] = value;
+      t.after(() => { if (original === undefined) delete process.env[key]; else process.env[key] = original; });
+    }
+  }
+  const runtime = createCollectorAcquisitionRuntime({ config, pathOptions,
     executeGh,
     onDiagnostic: (event) => diagnostics.push(event),
     githubAppOptions: { readPrivateKey: () => PRIVATE_KEY,
       requestToken: async () => tokenResponse(provider, "installation-token", Date.now() + 3_600_000) },
     ...(injectTargetIdentity ? { resolveTargetIdentity: async ({ target }) => ({
       id: REPOSITORIES[target.repo].id, nameWithOwner: target.repo }) } : {}),
+    ...(provider.type === "gh" ? { readBudgets: async () => ({
+      core: { budget: { resource: "core", limit: 5000, remaining: 4999, used: 1,
+        resetMs: Date.now() + BUDGET_WINDOW_MS }, receivedAt: Date.now(), cost: 1 },
+    }) } : {}),
     readInstallationCore: async () => {
       requests.push({ kind: "core-observer" });
       await readCore?.();
@@ -218,6 +237,64 @@ test("PC-01 (#163): two targets on one provider keep their own repository throug
         `${repo} received another target's rows: ${JSON.stringify(fixture.requests)}`);
     }
   }
+});
+
+test("collector Actions polls reuse workflow names per target until a forced refresh", async (t) => {
+  let label = "initial";
+  const fixture = twoTargetRuntime(t, { injectTargetIdentity: true, rest: ({ repo, path, at }) => ({
+    stdout: ghResponse("core", path.includes("/actions/runs")
+      ? [{ ...sentinelRun(repo), workflowName: "" }]
+      : [{ id: 1, name: `${repo} ${label}` }], at),
+  }) });
+  const repos = Object.keys(REPOSITORIES);
+  for (const repo of repos) fixture.subscribe(repo, "actions");
+  for (let poll = 0; poll < 4; poll++) {
+    const forced = poll === 3;
+    if (forced) label = "forced";
+    const handles = repos.map((repo) => fixture.handles.get(repo));
+    await fixture.settle("catalog poll", handles.map((handle) =>
+      poll === 0 ? handle.whenCurrentPollSettled() : handle.refresh(forced)));
+    for (const repo of repos) {
+      const reads = fixture.requests.filter((r) => r.kind === "rest" && r.repo === repo);
+      assert.equal(reads.filter((r) => r.path.endsWith("/runs")).length, poll + 1);
+      assert.equal(reads.filter((r) => r.path.endsWith("/workflows")).length, forced ? 2 : 1);
+      const snapshot = fixture.snapshots.get(repo).at(-1);
+      assert.equal(snapshot.rows[0].workflowName, `${repo} ${label}`);
+      assert.equal(Object.hasOwn(snapshot, "catalog"), false);
+    }
+  }
+});
+
+test("a delayed Actions catalog cannot supply names to a rebound collector subscription", async (t) => {
+  let label = "initial";
+  let began;
+  const delayedRead = new Promise((resolve) => { began = resolve; });
+  const fixture = twoTargetRuntime(t, { provider: { type: "gh", host: "github.com" },
+    injectTargetIdentity: true, rest: ({ repo, path, at }) => {
+      if (path.includes("/actions/runs")) {
+        return { stdout: ghResponse("core", [{ ...sentinelRun(repo), workflowName: "" }], at) };
+      }
+      if (label === "obsolete") began();
+      return { stdout: ghResponse("core", [{ id: 1, name: label }], at), delayMs: label === "obsolete" ? 200 : 0 };
+    },
+  });
+  const target = fixture.config.targets[0];
+  const handle = fixture.subscribe(target.repo, "actions");
+  await handle.whenCurrentPollSettled();
+  assert.equal(fixture.snapshots.get(target.repo).at(-1)?.rows[0]?.workflowName, "initial");
+  label = "obsolete";
+  const oldPoll = handle.refresh(true);
+  await within(delayedRead);
+  label = "new access";
+  process.env.GH_TOKEN = "synthetic-catalog-account-two";
+  process.env.GH_GLANCE_FIXTURE_USER_ID = "42";
+  await fixture.settle("catalog rebind", [oldPoll, fixture.runtime.invalidate({
+    host: target.host, repo: target.repo, provider: target.provider, resource: "actions", accessRemoved: true,
+  })]);
+  const names = fixture.snapshots.get(target.repo).flatMap((snap) => snap.rows.map((row) => row.workflowName));
+  assert.equal(names.includes("obsolete"), false);
+  assert.equal(names.at(-1), "new access");
+  assert.equal(fixture.requests.filter((r) => r.path?.endsWith("/workflows")).length, 3);
 });
 
 // Dependabot is the only granted Security source, so each Security poll makes
