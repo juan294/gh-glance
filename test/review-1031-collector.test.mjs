@@ -274,17 +274,19 @@ test("a delayed Actions catalog cannot supply names to a rebound collector subsc
       if (path.includes("/actions/runs")) {
         return { stdout: ghResponse("core", [{ ...sentinelRun(repo), workflowName: "" }], at) };
       }
+      // Wake the test before ghChild delivers this captured response on its next timer.
+      // The awaiting test starts invalidation in a microtask before that timer can run.
       if (label === "obsolete") began();
-      return { stdout: ghResponse("core", [{ id: 1, name: label }], at), delayMs: label === "obsolete" ? 200 : 0 };
+      return { stdout: ghResponse("core", [{ id: 1, name: label }], at) };
     },
   });
   const target = fixture.config.targets[0];
   const handle = fixture.subscribe(target.repo, "actions");
-  await handle.whenCurrentPollSettled();
+  await fixture.settle("initial Actions catalog", [handle.whenCurrentPollSettled()]);
   assert.equal(fixture.snapshots.get(target.repo).at(-1)?.rows[0]?.workflowName, "initial");
   label = "obsolete";
   const oldPoll = handle.refresh(true);
-  await within(delayedRead);
+  await fixture.settle("obsolete Actions catalog request", [delayedRead]);
   label = "new access";
   process.env.GH_TOKEN = "synthetic-catalog-account-two";
   process.env.GH_GLANCE_FIXTURE_USER_ID = "42";
