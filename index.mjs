@@ -317,6 +317,7 @@ function safe(value) {
   // function that claims to provide it.
   const value_ = typeof value === "string" ? value : value == null ? "" : String(value);
   const cleaned = value_.replace(BIDI_OVERRIDES, "").replace(CONTROL_CHARS, " ").trim();
+  if (cleaned.length <= MAX_FIELD_LENGTH) return cleaned;
   const points = Array.from(cleaned);
   return points.length > MAX_FIELD_LENGTH ? points.slice(0, MAX_FIELD_LENGTH).join("") : cleaned;
 }
@@ -1071,7 +1072,8 @@ async function ghApi(args, { operation, signal, etag = null, run = runGh, includ
 
 // The version travels in the query key, so a changed document invalidates its
 // cursors instead of paging a new shape with an old cursor.
-const GRAPHQL_QUERY_VERSION = 2;
+const ACQUISITION_QUERY_VERSIONS = Object.freeze({ actions: 2, issues: 3, prs: 3, security: 2 });
+const ACQUISITION_CONTENT_VERSION = 2;
 // GitHub prices a connection by the pages it could return, and the row's single
 // label is a nested connection of its own. Two points is the conservative bound
 // for one page; the observer selects nothing but the meter and costs one.
@@ -1092,13 +1094,11 @@ const GRAPHQL_MAX_RESET_MS = 2 * 60 * 60 * 1000;
 const ISSUE_PAGE_QUERY = `query($owner:String!,$name:String!,$first:Int!,$after:String){
   repository(owner:$owner,name:$name){
     id
-    name
     nameWithOwner
-    url
     issues(first:$first,after:$after,states:OPEN,orderBy:{field:UPDATED_AT,direction:DESC}){
       totalCount
       pageInfo{hasNextPage endCursor}
-      nodes{id number title url updatedAt author{login} labels(first:1){nodes{name}}}
+      nodes{number title url updatedAt author{login} labels(first:1){nodes{name}}}
     }
   }
   rateLimit{cost limit used remaining resetAt}
@@ -1107,13 +1107,11 @@ const ISSUE_PAGE_QUERY = `query($owner:String!,$name:String!,$first:Int!,$after:
 const PULL_PAGE_QUERY = `query($owner:String!,$name:String!,$first:Int!,$after:String){
   repository(owner:$owner,name:$name){
     id
-    name
     nameWithOwner
-    url
     pullRequests(first:$first,after:$after,states:OPEN,orderBy:{field:UPDATED_AT,direction:DESC}){
       totalCount
       pageInfo{hasNextPage endCursor}
-      nodes{id number title url updatedAt author{login} headRefName isDraft reviewDecision}
+      nodes{number title url updatedAt author{login} headRefName isDraft reviewDecision}
     }
   }
   rateLimit{cost limit used remaining resetAt}
@@ -2159,7 +2157,7 @@ async function fetchConditionalEntity({
   };
 }
 
-function conditionalBatchResult(responses, previousRaw, joinedRaw = null) {
+function conditionalBatchResult(responses, previousRaw, changedRaw = null) {
   const list = Array.isArray(responses) ? responses : [];
   let allNotModified = list.length > 0;
   let restSpent = 0;
@@ -2178,7 +2176,8 @@ function conditionalBatchResult(responses, previousRaw, joinedRaw = null) {
   return {
     raw: allNotModified
       ? previousRaw
-      : joinedRaw ?? list.map((response) => response?.body ?? "").join("\0"),
+      : typeof changedRaw === "function" ? changedRaw()
+      : changedRaw ?? list.map((response) => response?.body ?? "").join("\0"),
     allNotModified,
     restSpent,
     restNotModified,
@@ -2243,8 +2242,6 @@ function stagedAcquisitionPublicationView({ entities, stagedEntities, transition
     unchangedCount: advanceUnchangedCount(unchangedCount, transitionKind),
   };
 }
-
-const ACTIONS_QUERY_VERSION = 2;
 
 async function fetchActions(signal, {
   entities = new Map(),
@@ -2326,12 +2323,13 @@ async function fetchActions(signal, {
     // scheduling outcome would hide missing names for fifteen minutes over a
     // moment of budget pressure.
   }
-  const rows = resolveWorkflowNames(runs, nextCatalog);
+  let rows;
+  const parse = () => rows ??= resolveWorkflowNames(runs, nextCatalog);
   // The payload identity is what is rendered, not the concatenated bodies. The
   // catalog is fetched on some polls and not others, and joining raw bodies
   // made that alternation look like a content change every time.
-  const raw = JSON.stringify({ v: ACTIONS_QUERY_VERSION, rows });
-  const batch = conditionalBatchResult(responses, previousRaw, raw);
+  const batch = conditionalBatchResult(responses, previousRaw,
+    () => JSON.stringify({ v: ACQUISITION_CONTENT_VERSION, rows: parse() }));
   return {
     raw: batch.raw,
     limit: ACTIONS_RUN_LIMIT,
@@ -2348,7 +2346,7 @@ async function fetchActions(signal, {
     stagedEntities: batch.stagedEntities,
     observations: batch.observations,
     catalog: nextCatalog,
-    parse: () => rows,
+    parse,
   };
 }
 
@@ -2558,19 +2556,15 @@ async function fetchGraphqlList(kind, mapRow, {
   let overrun = first.overrun;
   let current = graphqlConnection(first, connection);
   const totalCount = current?.totalCount ?? null;
-  const generation = pageGeneration((current?.nodes ?? []).map(mapRow));
+  const firstRows = current?.nodes.map(mapRow) ?? [];
+  const generation = pageGeneration(firstRows);
   const wanted = Math.min(
     Math.max(1, Number.isSafeInteger(pages) ? pages : 1),
     Math.max(1, Math.ceil(LIST_LIMIT / GRAPHQL_PAGE_SIZE)),
   );
   const acquired = [];
-  const collect = (value) => acquired.push({
-    generation,
-    rows: (value?.nodes ?? []).map(mapRow),
-    pageInfo: value?.pageInfo ?? null,
-  });
-  let truncatedWalk = false;
-  if (current) collect(current); else truncatedWalk = true;
+  let truncatedWalk = !current;
+  if (current) acquired.push({ generation, rows: firstRows, pageInfo: current.pageInfo });
   while (acquired.length < wanted && current?.pageInfo?.hasNextPage) {
     const cursor = current.pageInfo.endCursor;
     if (typeof cursor !== "string" || cursor.length === 0) { truncatedWalk = true; break; }
@@ -2602,7 +2596,7 @@ async function fetchGraphqlList(kind, mapRow, {
     spent += admitted.value.observedCost;
     current = graphqlConnection(admitted.value, connection);
     if (!current) { truncatedWalk = true; break; }
-    collect(current);
+    acquired.push({ generation, rows: current.nodes.map(mapRow), pageInfo: current.pageInfo });
   }
   if (overrun) {
     // Recorded at its real cost above; suspended here until the resource resets,
@@ -9526,9 +9520,9 @@ function prepareCollectorSnapshot(input, resource = input?.resource) {
   const snapshot = projectCollectorSnapshot(input, resource);
   if (!snapshot) throw new Error("invalid collector snapshot");
   const json = JSON.stringify(snapshot);
-  const payload = Buffer.from(json);
-  if (payload.length > COLLECTOR_ASSEMBLY_MAX_BYTES) throw new Error("collector snapshot too large");
-  return { snapshot, json, payload };
+  if (Buffer.byteLength(json) > COLLECTOR_ASSEMBLY_MAX_BYTES) throw new Error("collector snapshot too large");
+  let payload;
+  return { snapshot, json, get payload() { return payload ??= Buffer.from(json); } };
 }
 
 function createCollectorSnapshotEncodingCache() {
@@ -9570,10 +9564,11 @@ function *collectorSnapshotLineIterator(id, serverEpoch, prepared, serverNow = D
   if (!validCollectorId(id) || !validGovernorId(serverEpoch) && !validCollectorId(serverEpoch)) {
     throw new Error("invalid collector snapshot");
   }
-  const { snapshot, json, payload } = prepared;
+  const { snapshot, json } = prepared;
   const small = `{"type":"snapshot","id":${JSON.stringify(id)},"serverEpoch":${JSON.stringify(serverEpoch)},` +
     `"generation":${snapshot.generation},"serverNow":${serverNow},"snapshot":${json}}\n`;
   if (Buffer.byteLength(small) <= COLLECTOR_FRAME_MAX_BYTES) { yield small; return; }
+  const { payload } = prepared;
   const snapshotId = randomUUID();
   const digest = createHash("sha256").update(payload).digest("hex");
   const rawChunkBytes = 360 * 1024;
@@ -9593,13 +9588,14 @@ function *collectorSnapshotLineIterator(id, serverEpoch, prepared, serverNow = D
 
 function *collectorSnapshotFrameIterator(id, serverEpoch, input, resource = input?.resource, serverNow = Date.now()) {
   const prepared = prepareCollectorSnapshot(input, resource);
-  const { snapshot, payload } = prepared;
+  const { snapshot } = prepared;
   if (!validCollectorId(id) || !validGovernorId(serverEpoch) && !validCollectorId(serverEpoch) ||
       !snapshot) throw new Error("invalid collector snapshot");
   const small = { type: "snapshot", id, serverEpoch, generation: snapshot.generation, serverNow, snapshot };
   try { encodeCollectorFrame(small); yield small; return; } catch (error) {
     if (!/frame too large/.test(error.message)) throw error;
   }
+  const { payload } = prepared;
   const snapshotId = randomUUID();
   const digest = createHash("sha256").update(payload).digest("hex");
   const rawChunkBytes = 360 * 1024;
@@ -10449,6 +10445,7 @@ function createCollectorAcquisitionRuntime({
         signal: boundedSignal,
         entities,
         previousRaw: force ? null : snapshot?.raw ?? null,
+        catalog: force ? null : claim.state.workflowCatalog,
         force,
         pages: demand.pages,
         governor: { scope: transportScope, leaseId: context.leaseId },
@@ -10485,6 +10482,7 @@ function createCollectorAcquisitionRuntime({
         unchangedCount: claim.state.unchangedCount,
       });
       if (reconciliation !== null) publication.nextDueAt = completedAt + reconciliation;
+      if (resource === "actions") claim.workflowCatalog = result.catalog;
       return publication;
     } catch (error) {
       const terminal = queueTerminalization(context.scope, admitted.receiptCapability,
@@ -10732,6 +10730,7 @@ function createCollectorAcquisitionRuntime({
       };
       item.pollPhase = "claimed";
       const producer = produce ?? defaultProduce;
+      const producerClaim = { ...claim, state: item };
       item.controller = new AbortController();
       try {
         const produceBound = () => acquisitionFenceStorage.run(
@@ -10741,7 +10740,7 @@ function createCollectorAcquisitionRuntime({
           demand: { ...ownership.value.demand, background: item.demand.background,
             active: ownership.value.demand?.active || item.requestedAt !== null },
           snapshot: ownership.value.snapshot,
-          claim: { ...claim, state: item },
+          claim: producerClaim,
           provider,
           signal: item.controller.signal,
           force,
@@ -10786,6 +10785,13 @@ function createCollectorAcquisitionRuntime({
         const published = await engine.refresh(subscriptionId, { claim, publish: produced });
         if (!published.ok) { item.onHold?.("disconnected"); retryIn = 1_000; }
         else {
+          // The parsed catalog belongs to this binding and never travels with the snapshot.
+          if (producerClaim.workflowCatalog !== undefined && !closed && !item.closed &&
+              item.id === subscriptionId && item.bindingRevision === bindingRevision &&
+              item.identity?.accessKey === claim.accessKey &&
+              (!provider?.coordinator || provider.coordinator.current()?.accessKey === claim.accessKey)) {
+            item.workflowCatalog = producerClaim.workflowCatalog;
+          }
           provider?.coordinator?.markAuthorized?.();
           // A replay answers the request as far as backoff allows without
           // advancing the success time that would otherwise clear it.
@@ -10850,6 +10856,7 @@ function createCollectorAcquisitionRuntime({
       }, { resumeFreshSnapshot: true });
       if (!subscription.ok) throw new Error("collector subscription unavailable");
       item.id = subscription.value.id;
+      item.workflowCatalog = null;
       const generation = subscription.value.snapshot?.generation ?? 0;
       const accessReset = [...item.invalidations].some((waiter) =>
         waiter.bindingRevision === bindingRevision && waiter.accessRemoved);
@@ -11561,6 +11568,14 @@ async function readGitRemotes({ cwd } = {}) {
 
 async function gitRemoteUrls(options = {}) {
   return selectGhDefaultRemoteUrls(await readGitRemotes(options));
+}
+
+function startupRemoteUrls() {
+  const withoutRemotes = { remoteUrls: [] };
+  if (runtimeRemoteUrls.length || (effectiveRuntimeRepository(withoutRemotes) && effectiveRuntimeHost(withoutRemotes))) {
+    return runtimeRemoteUrls;
+  }
+  return gitRemoteUrls();
 }
 
 function targetSource(remotes = []) {
@@ -12614,6 +12629,11 @@ Environment:
   INK_SCREEN_READER=true    Linear, unthrottled rendering (unverified -- see README)
 `;
 
+function loadUiModules() {
+  return Promise.all([import("react"), import("ink")]);
+}
+
+let startupUiModules;
 // argv and the TTY guard run *before* react and ink are imported. Loading ink
 // costs a measured 137ms and 46MB of RSS, which is a poor trade for printing a
 // version string -- and `--version`/`--help` are exactly the paths shell
@@ -12684,7 +12704,7 @@ if (IS_MAIN) {
   // otherwise a cold invocation paints a dashboard that can only say
   // Disconnected and never has a subscription it can recover.
   if (opts.connect !== null) {
-    runtimeRemoteUrls = await gitRemoteUrls();
+    runtimeRemoteUrls = await startupRemoteUrls();
     const source = opts.connect === "local" ? "local collector" : "SSH collector";
     const problem = collectorClientPreflight(runtimeRemoteUrls, source);
     if (problem) {
@@ -12720,12 +12740,17 @@ if (IS_MAIN) {
   // Capture only on CLI startup; imported modules never read or mutate this key.
   runtimeJevSession = createJevSession({enabled:opts.jev,key:process.env.TYPESAFE_API_KEY??"",maxRequests:opts.jevMaxRequests});
   if(opts.jev && !process.stdin.isTTY){console.error("gh-glance: --jev requires an interactive standalone terminal");process.exit(2);}
+  if (opts.connect === null) {
+    startupUiModules = loadUiModules();
+    // Preflight owns the first diagnostic. Await the original import promise below.
+    startupUiModules.catch(() => {});
+  }
   const problem = opts.connect !== null ? null : await preflight();
   if (problem) {
     console.error(problem);
     process.exit(3);
   }
-  if (opts.connect === null) runtimeRemoteUrls = await gitRemoteUrls();
+  if (opts.connect === null) runtimeRemoteUrls = await startupRemoteUrls();
   runtimeIdentityCoordinator = opts.connect !== null
     ? null
     : createIdentityCoordinator({ host: () => effectiveRuntimeHost() });
@@ -12748,10 +12773,9 @@ if (IS_MAIN) {
 }
 
 const headlessEntry = IS_MAIN && runtime.headlessMode;
-const ReactModule = headlessEntry
-  ? { default: { Component: class {}, createElement: () => null, memo: (component) => component } }
-  : await import("react");
-const InkModule = headlessEntry ? {} : await import("ink");
+const [ReactModule, InkModule] = headlessEntry
+  ? [{ default: { Component: class {}, createElement: () => null, memo: (component) => component } }, {}]
+  : await (startupUiModules ?? loadUiModules());
 const { render, measureElement, Box, Text, useStdout, useInput, useStdin, useApp } = InkModule;
 
 const React = ReactModule.default;
@@ -13716,7 +13740,7 @@ function withPersistenceLock(path, operation) {
 }
 
 function samePersistedValue(left, right) {
-  return JSON.stringify(left) === JSON.stringify(right);
+  return left === right || JSON.stringify(left) === JSON.stringify(right);
 }
 
 function mergeWidthPreferenceSnapshots(base, disk, next) {
@@ -13944,6 +13968,9 @@ function createCoalescedWriter({ write, delay = 200, onResult = () => {} }) {
       // reported, while async replacements can neither race on disk nor report
       // out of order.
       if (!isLatest) continue;
+      // A successful snapshot has no retry consumer. Drop it before onResult
+      // can schedule a newer value; a failed write still needs its exact input.
+      if (result.ok !== false) latest = undefined;
       report(result);
       // Leave the latest generation dirty after failure. A later flush/dispose
       // retries it; concurrent callers still share this completed attempt.
@@ -14161,7 +14188,7 @@ function normalizeCachedItem(tabKey, item) {
 // and, for Security, the coverage notes. Timestamps are excluded on purpose.
 function acquisitionContentRaw(resource, { rows, truncated = false, hasNextPage = false, notes = [], blind = false }) {
   return JSON.stringify({
-    v: GRAPHQL_QUERY_VERSION,
+    v: ACQUISITION_CONTENT_VERSION,
     resource,
     truncated: truncated === true,
     hasNextPage: hasNextPage === true,
@@ -14265,11 +14292,8 @@ function decodeDashboardCache(raw) {
 }
 
 function serializeDashboardCache(cache, { normalized = false } = {}) {
-  return `${JSON.stringify(
-    { version: DASHBOARD_CACHE_VERSION, targets: normalized ? cache : normalizeDashboardCache(cache) },
-    null,
-    2,
-  )}\n`;
+  const targets = normalized ? cache : normalizeDashboardCache(cache);
+  return `${JSON.stringify({ version: DASHBOARD_CACHE_VERSION, targets })}\n`;
 }
 
 function loadDashboardCache(path, target) {
@@ -14614,7 +14638,7 @@ function acquisitionQueryForTab(key, identity, repository, pages = 1) {
     accessKey: identity.accessKey,
     targetKey: privateIdentityDigest("acquisition-target-v1", identity.host, normalizedRepository),
     resource: key,
-    queryVersion: key === "actions" ? ACTIONS_QUERY_VERSION : GRAPHQL_QUERY_VERSION,
+    queryVersion: ACQUISITION_QUERY_VERSIONS[key],
     filters: {},
     pageSize: key === "actions" ? ACTIONS_RUN_LIMIT : key === "security" ? ALERT_PER_PAGE : GRAPHQL_PAGE_SIZE,
     cursorGeneration: "first",
@@ -15083,14 +15107,14 @@ function writeAcquisitionArtifact(root, artifact, payload) {
   }
 }
 
-function writeAcquisitionStore(path, state) {
+function writeAcquisitionStore(path, state, prepareSnapshot) {
   const persisted = { ...state, queries: {} };
   const staged = [];
   let snapshotBytes = 0;
   for (const [queryKey, record] of Object.entries(state.queries)) {
     let snapshot = record.snapshot;
     if (snapshot && Array.isArray(snapshot.rows)) {
-      const prepared = prepareAcquisitionSnapshot(queryKey, snapshot);
+      const prepared = prepareSnapshot(queryKey, snapshot);
       if (prepared.descriptor.bytes > ACQUISITION_MAX_BYTES) return { ok: false, reason: "capacity" };
       staged.push(prepared);
       snapshot = prepared.descriptor;
@@ -15142,12 +15166,19 @@ function withAcquisitionStore(path, operation, {
   return withFileLock(`${path}.lock`, () => {
     const loaded = loadAcquisitionMetadata(path, { now });
     if (!loaded.ok) return loaded;
-    const result = operation(loaded.value);
+    let candidate;
+    function prepareSnapshot(queryKey, snapshot, remember = false) {
+      if (candidate?.queryKey === queryKey && candidate.snapshot === snapshot) return candidate.prepared;
+      const prepared = prepareAcquisitionSnapshot(queryKey, snapshot);
+      if (remember) candidate = { queryKey, snapshot, prepared };
+      return prepared;
+    }
+    const result = operation(loaded.value, prepareSnapshot);
     if (result?.ok === false) return result;
     if (result?.changed === false) {
       return { ok: true, value: result?.value, state: loaded.value, written: false };
     }
-    const written = writeAcquisitionStore(path, loaded.value);
+    const written = writeAcquisitionStore(path, loaded.value, prepareSnapshot);
     return written.ok ? { ok: true, value: result?.value, state: written.persisted, written: true } : written;
   }, { pid, kill });
 }
@@ -15189,13 +15220,13 @@ function acquisitionSharingCount(state, queryKey) {
     .filter((subscription) => subscription.queryKey === queryKey).length;
 }
 
-function trimAcquisitionStore(state, protectedQueryKey = null) {
+function trimAcquisitionStore(state, protectedQueryKey = null, prepareSnapshot = prepareAcquisitionSnapshot) {
   const pinned = new Set(Object.values(state.subscriptions).map((subscription) =>
     state.queries[subscription.queryKey]?.query.targetKey).filter(Boolean));
   const targets = new Map();
   const entries = Object.entries(state.queries).map(([key, query]) => {
     const prepared = query.snapshot && Array.isArray(query.snapshot.rows)
-      ? prepareAcquisitionSnapshot(key, query.snapshot) : null;
+      ? prepareSnapshot(key, query.snapshot, key === protectedQueryKey) : null;
     const snapshotBytes = prepared?.descriptor.bytes ?? query.snapshot?.bytes ?? 0;
     const entityCount = prepared?.descriptor.entityCount ?? query.snapshot?.entityCount ?? 0;
     const metadataRecord = { ...query, snapshot: prepared?.descriptor ?? query.snapshot };
@@ -15542,7 +15573,7 @@ function createAcquisitionEngine({
   function publish(id, claim, produced) {
     const item = local.get(id);
     if (!item || !isRecord(claim)) return { ok: false, reason: "invalid" };
-    const committed = transact((state) => {
+    const committed = transact((state, prepareSnapshot) => {
       let record = state.queries[item.queryKey];
       if (!record || record.claim?.nonce !== claim.nonce ||
           record.claim.generation !== claim.generation || record.query.accessKey !== claim.accessKey) {
@@ -15602,7 +15633,7 @@ function createAcquisitionEngine({
       record.claim = null;
       record.hold = null;
       record.lastUsedAt = now();
-      if (!trimAcquisitionStore(state, record.query.queryKey)) {
+      if (!trimAcquisitionStore(state, record.query.queryKey, prepareSnapshot)) {
         record.snapshot = previous;
         record.generation -= 1;
         record.claim = previousClaim;
@@ -15956,13 +15987,14 @@ function createAcquisitionEngine({
     });
   }
 
-  function syncQuotaProjection(scope) {
+  function syncQuotaProjection(scope, observation) {
     if (!isRecord(scope) || !/^[0-9a-f]{64}$/.test(scope.hash ?? "")) {
       return { ok: false, reason: "invalid" };
     }
     // Quota is read before the acquisition lock. This diagnostic copy never
     // grants requests and a failed read cannot block source publication.
-    const observed = inspectGovernor(scope, now());
+    const observed = observation?.scope === scope && observation.inspection?.ok === true
+      ? observation.inspection : inspectGovernor(scope, now());
     if (!observed.ok) {
       return transact((state) => {
         const previous = state.quotaProjections[scope.hash];
@@ -16369,6 +16401,18 @@ function governorTabControlReady(snapshot, key, nowMs) {
 
 function governorControlRetryAt(nowMs, floorMs) {
   return nowMs + Math.min(floorMs, 1000);
+}
+
+function createInitialPollWake(scheduler) {
+  let opened = false;
+  return ({ key, rows, currentScope, refreshed, snapshot, checkedAt, pendingBlocks, dueAt }, run) => {
+    if (opened) return false;
+    opened = true;
+    if (rows !== null || !currentScope || !governorDataReady(refreshed, snapshot, key, checkedAt)) return false;
+    const costs = tabRequestCost(key);
+    if (RATE_RESOURCES.some((resource) => costs[resource] > 0 && pendingBlocks.has(resource))) return false;
+    return scheduler.arm("data", dueAt, run);
+  };
 }
 
 function createWakeScheduler({
@@ -19524,11 +19568,16 @@ function App({ onCreateRemote = () => {} } = {}) {
       remoteUrls: runtimeRemoteUrls,
     }),
   );
-  const [loadedCache] = useState(() => loadDashboardCache(cachePath, cacheTarget));
+  const dashboardCacheRef = useRef(null);
+  if (dashboardCacheRef.current === null) {
+    dashboardCacheRef.current = loadDashboardCache(cachePath, cacheTarget).cache;
+  }
+  const dashboardCachePersistedRef = useRef(dashboardCacheRef.current);
+  // Keep the initial target's collector checkpoint for reconnects. The full
+  // cache is owned by the two refs above, which advance together after a save.
+  const [cachedEntry] = useState(() => pick(dashboardCacheRef.current, cacheTarget, null));
   const [acquisitionEngine] = useState(() => createAcquisitionEngine());
   useEffect(() => () => acquisitionEngine.close(), [acquisitionEngine]);
-  const dashboardCacheRef = useRef(loadedCache.cache);
-  const dashboardCachePersistedRef = useRef(loadedCache.cache);
   const dashboardCacheTargetRef = useRef(cacheTarget);
   const [dashboardCacheWriter] = useState(() =>
     createCoalescedWriter({
@@ -19548,7 +19597,6 @@ function App({ onCreateRemote = () => {} } = {}) {
     // a filesystem error from replacing terminal teardown.
     void dashboardCacheWriter.dispose();
   }, [dashboardCacheWriter]);
-  const cachedEntry = loadedCache.entry;
   // `null` means "never resolved" -- distinct from `[]`, which means "resolved
   // and genuinely empty". The tab bar and the body render those differently.
   const [data, setData] = useState(() =>
@@ -20064,12 +20112,6 @@ function App({ onCreateRemote = () => {} } = {}) {
   // faster than once a minute, so it decides how often `now` has to advance.
   const hasInProgressRef = useRef(false);
   hasInProgressRef.current = (data.actions ?? []).some((r) => r.status !== "completed");
-
-  // Queued runs don't spin -- standing still is how they read as queued -- and
-  // the icons only exist on the Actions tab, so a run turning behind another
-  // tab would be ten redraws a second nobody can see.
-  const hasRunningVisible =
-    ANIMATE && tab.key === "actions" && (data.actions ?? []).some((r) => r.status === "in_progress");
 
   const inFlightRef = useRef({});
   const rawRef = useRef({});
@@ -20977,7 +21019,7 @@ function App({ onCreateRemote = () => {} } = {}) {
 
     function syncRuntimeQuotaProjection(currentScope, snapshot) {
       if (!snapshot?.ok) return;
-      acquisitionEngine.syncQuotaProjection(currentScope);
+      acquisitionEngine.syncQuotaProjection(currentScope, { scope: currentScope, inspection: snapshot });
     }
 
     function commit(key, run, {
@@ -21322,6 +21364,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     // can tell an acquisition that already answers it from one that predates it.
     const inFlightStartedAt = {};
     const wakeScheduler = createWakeScheduler();
+    const armInitialPoll = createInitialPollWake(wakeScheduler);
     let scope = null;
     let notificationsSeeded = false;
     let scopeFailure = null;
@@ -21755,7 +21798,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     // used to place them. Opening them all at the same deadline would start
     // three fetches within one wake -- the herd the rotation exists to prevent,
     // and it only diverges again once each tab has taken its own interval.
-    function openPollDeadlines(at) {
+    function openPollDeadlines(at, observedScope, refreshed, snapshot) {
       const activeKey = TABS[activeIndexRef.current].key;
       const opened = { ...NEVER_DUE };
       if (runtime.background === "on-demand") requestedTabs.set(activeKey, at);
@@ -21770,6 +21813,13 @@ function App({ onCreateRemote = () => {} } = {}) {
       }
       pollDueAt = opened;
       pollDeadlinesOpen = true;
+      const current = identity();
+      armInitialPoll({
+        key: activeKey, rows: dataRef.current[activeKey], dueAt: opened[activeKey],
+        currentScope: observedScope === scope && registeredScopeHash === observedScope.hash &&
+          observedScope.hash === current?.quotaKey && observedScope.accessKey === current?.accessKey,
+        refreshed, snapshot, checkedAt: at, pendingBlocks: pendingBlockPublications,
+      }, dataWake);
     }
 
     function armWake(kind, at, run) {
@@ -22793,7 +22843,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       publishControlStatus(activeKey, refreshed, snapshot, checkedAt);
       if (currentScope && snapshot.ok) {
         if (!pollDeadlinesOpen) {
-          openPollDeadlines(checkedAt);
+          openPollDeadlines(checkedAt, currentScope, refreshed, snapshot);
           heartbeatWake.start();
         } else if (controlEpochs !== null) {
           for (const key of TAB_KEYS) {
@@ -22876,7 +22926,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     });
 
     async function runBootstrap() {
-      remoteUrls = runtimeRemoteUrls.length > 0 ? runtimeRemoteUrls : await gitRemoteUrls();
+      remoteUrls = await startupRemoteUrls();
       runtimeRemoteUrls = remoteUrls;
       if (cancelled) return;
       if (enterRemoteSetup()) return;
@@ -22900,7 +22950,7 @@ function App({ onCreateRemote = () => {} } = {}) {
       publishControlStatus(activeKey, refreshed, snapshot, checkedAt);
       if (snapshot.ok) {
         controlEpochs = { ...snapshot.value.epochs };
-        openPollDeadlines(checkedAt);
+        openPollDeadlines(checkedAt, currentScope, refreshed, snapshot);
         heartbeatWake.start();
       }
       if (!refreshed.ok) {
@@ -22990,19 +23040,6 @@ function App({ onCreateRemote = () => {} } = {}) {
     disconnected: statusDisconnected,
     screenReader,
   });
-  const showSpinner = !remoteSetup && ANIMATE && (semanticStatus.animate || hasRunningVisible);
-  useEffect(() => {
-    if (!showSpinner) {
-      // Park on a fixed frame rather than freezing wherever the animation
-      // happened to stop: the resting glyph is then the same every time, so
-      // consecutive idle frames stay byte-identical and Ink writes nothing.
-      setFrame(0);
-      return;
-    }
-    const id = setInterval(() => setFrame((f) => (f + 1) % SPINNER.length), SPINNER_MS);
-    return () => clearInterval(id);
-  }, [showSpinner]);
-
   // Armed on the same condition the loading line renders on, so a start that
   // resolves inside ICON_HINT_AFTER_MS clears the timer on the way past and
   // never writes state at all -- the fast path stays exactly as many renders as
@@ -23257,6 +23294,28 @@ function App({ onCreateRemote = () => {} } = {}) {
   });
   shortTabLabelsRef.current = tabEntries[0].tier !== "full";
 
+  const drawnRows = tooNarrow || showHelp || notificationsOpen || remoteSetup || ciView || attentionView
+    ? [] : visibleItems;
+  const runningAction = (item) => item.status === "in_progress";
+  const checkingGlyph = semanticStatus.animate && ICON_PROFILE !== "ascii" && !resizeRef.current.active;
+  const firstLoadBadge = anyFirstLoad && tabEntries[0].tier !== "digits";
+  const showSpinner = ANIMATE && !remoteSetup && (
+    checkingGlyph || (tab.key === "actions" && drawnRows.some(runningAction)) ||
+    // An inactive first-load badge follows an already animated clock.
+    (firstLoadBadge && (semanticStatus.animate || (tab.key === "actions" && data.actions?.some(runningAction))))
+  );
+  useEffect(() => {
+    if (!showSpinner) {
+      // Park on a fixed frame rather than freezing wherever the animation
+      // happened to stop: the resting glyph is then the same every time, so
+      // consecutive idle frames stay byte-identical and Ink writes nothing.
+      setFrame(0);
+      return;
+    }
+    const id = setInterval(() => setFrame((f) => (f + 1) % SPINNER.length), SPINNER_MS);
+    return () => clearInterval(id);
+  }, [showSpinner]);
+
   return e(
     Box,
     { flexDirection: "column", width: frameCols, height: frameRows },
@@ -23331,7 +23390,7 @@ function App({ onCreateRemote = () => {} } = {}) {
           selectedWidthKey: resizeRef.current.active ? selectedWidthKey : null,
           headerRef,
         }),
-      ...(tooNarrow || showHelp || notificationsOpen || remoteSetup || ciView || attentionView ? [] : visibleItems).map((item) => {
+      ...drawnRows.map((item) => {
         const key = itemKey(item);
         return e(
           RowBoundary,
@@ -23984,6 +24043,7 @@ export {
   governorTabControlReady,
   governorControlRetryAt,
   createWakeScheduler,
+  createInitialPollWake,
   createRecurringWake,
   createSingleFlightWake,
   pendingFailureIsTerminal,

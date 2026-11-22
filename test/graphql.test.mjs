@@ -14,6 +14,7 @@ import {
   admittedRowUrl,
   fetchGraphqlList,
   operationPausedUntil,
+  acquisitionQueryForTab,
   fetchGraphqlPage,
   LIST_LIMIT,
   graphqlArgs,
@@ -61,6 +62,36 @@ test("GQL-03 every declared query is bounded, typed, and carries its own price",
   const argv = graphqlArgs("github.com");
   assert.deepEqual(argv.slice(0, 5), ["api", "-i", "graphql", "--input", "-"]);
   assert.ok(!argv.some((argument) => argument.includes("repository(")));
+});
+
+test("list documents request only used repository and row fields under a new query identity", async () => {
+  const identity = { host: "github.com", accessKey: "a".repeat(64) };
+  for (const [kind, connection] of [["issues", "issues"], ["prs", "pullRequests"]]) {
+    const page = await fetchGraphqlPage(kind, {
+      variables: VARS,
+      run: async (_args, { input }) => {
+        const { query, variables } = JSON.parse(input);
+        assert.deepEqual(variables, VARS);
+        const flat = query.replace(/\s+/g, " ");
+        assert.ok(flat.includes(`repository(owner:$owner,name:$name){ id nameWithOwner ${connection}(`), flat);
+        assert.match(flat, /nodes\{number title url updatedAt author\{login\}/);
+        const node = { number: 1, title: "title", url: "https://github.com/acme/widget/issues/1",
+          updatedAt: RESET, author: { login: "me" }, ...(kind === "issues"
+            ? { labels: { nodes: [] } } : { headRefName: "fix", isDraft: false, reviewDecision: null }) };
+        return headers() + JSON.stringify({ data: { rateLimit: meter(2), repository: {
+          id: "R", nameWithOwner: "acme/widget", [connection]: {
+            totalCount: 1, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [node],
+          },
+        } } });
+      },
+    });
+    assert.equal(page.ok, true, page.failure?.message);
+    assert.equal(page.data.repository[connection].nodes[0].title, "title");
+    assert.equal(acquisitionQueryForTab(kind, identity, "acme/widget").queryVersion, 3);
+  }
+  for (const kind of ["actions", "security"]) {
+    assert.equal(acquisitionQueryForTab(kind, identity, "acme/widget").queryVersion, 2);
+  }
 });
 
 test("GQL-02 a rejected or partial envelope keeps its budget evidence and publishes no rows", async () => {

@@ -16,7 +16,7 @@
       "sourceInputs": [
         {
           "path": "package.json",
-          "sha256": "56aed7c1e46c9e437e9b1c8e72a296b5ecc906effa15893a23de73429ec3b8e6"
+          "sha256": "f4d054ec6ce62e3f56d35036ef46193d54d0bdfe6efb46fcf3e25203483fc5bd"
         },
         {
           "path": "scripts/test-select.mjs",
@@ -28,7 +28,7 @@
         },
         {
           "path": "package-lock.json",
-          "sha256": "82634de20837f6b43b8e44de8327bcdf17ade4a2b8d1bae6831db06fd489d0ab"
+          "sha256": "92a2cef91454c54db820b850a664d206caa2a49c69b1556366bea9e29317a059"
         }
       ],
       "nativeNodeVersion": "22.22.2",

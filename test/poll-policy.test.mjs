@@ -242,6 +242,31 @@ test("POLL-03 a failed catalog keeps a valid run list with the last-known name",
   assert.deepEqual(resolveWorkflowNames(runs, null).map((run) => run.workflowName), ["", ""]);
 });
 
+test("a usable Actions 304 projects names only when its rows are read", async () => {
+  const path = actionsRunsArgs()[0];
+  const body = JSON.stringify(Array.from({ length: 60 }, (_, i) => ({
+    databaseId: i + 1, workflowId: 10, workflowName: "",
+  })));
+  const entities = new Map([[entityKey("actions", path), { etag: '"runs"', body }]]);
+  let lookups = 0;
+  class CountNames extends Map {
+    get(key) { lookups++; return super.get(key); }
+  }
+  const catalog = { at: NOW, names: new CountNames([[10, "CI"]]) };
+  for (const previousRaw of ["known", null]) {
+    lookups = 0;
+    const result = await fetchActions(undefined, { entities, previousRaw, catalog,
+      request: async () => ({ status: 304, body: "", rateLimit: null }) });
+    assert.equal(result.raw, previousRaw);
+    assert.equal(lookups, 0);
+    const rows = result.parse();
+    assert.equal(lookups, 60);
+    assert.equal(rows[0].workflowName, "CI");
+    assert.equal(result.parse(), rows);
+    assert.equal(lookups, 60);
+  }
+});
+
 // ---------- REFRESH ----------
 
 test("REFRESH-03 Width mode owns r and R and starts no refresh", async () => {

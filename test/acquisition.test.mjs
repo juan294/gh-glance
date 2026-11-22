@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmdirSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -2349,4 +2349,116 @@ test("full-store hydration survives four consecutive replaced artifacts", async 
   assert.equal(replacements, 4);
   assert.equal(loaded.ok, true);
   assert.equal(loaded.value.queries[subscribed.value.queryKey].generation, 5);
+});
+
+test("disk publication prepares only one payload for each retained candidate", async (t) => {
+  const box = fixture(t);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  const { id } = engine.subscribe(query(), { active: true, floorMs: 5_000 }).value;
+  const stringify = JSON.stringify;
+  const serialized = [];
+  t.mock.method(JSON, "stringify", function (value, ...args) {
+    const text = stringify(value, ...args);
+    if (value?.schema === 1 && Array.isArray(value.entities) && !Object.hasOwn(value, "raw")) {
+      serialized.push(text);
+    }
+    return text;
+  });
+  for (const title of ["normal run", "x".repeat(299) + " z"]) {
+    serialized.length = 0;
+    const published = await engine.refresh(id, { force: true, acquire: async () => snapshot(title) });
+    assert.equal(published.ok, true);
+    const stored = published.value.snapshot;
+    const { raw, ...payload } = stored;
+    const descriptor = JSON.parse(readFileSync(engine.path, "utf8")).queries[stored.queryKey].snapshot;
+    const bytes = readFileSync(join(engine.path + ".snapshots", descriptor.artifact), "utf8");
+    assert.equal(bytes, stringify(payload));
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    assert.equal(descriptor.artifact, `${stored.queryKey}.${stored.generation}.${digest}.json`);
+    assert.equal(descriptor.bytes, Buffer.byteLength(bytes));
+    assert.equal(stored.contentDigest, createHash("sha256").update(stringify(stored.rows)).digest("hex"));
+    if (title.startsWith("x")) {
+      assert.equal(stored.rows[0].displayTitle, "x".repeat(299) + " ");
+      assert.equal(JSON.parse(raw).rows[0].displayTitle, "x".repeat(299));
+    } else {
+      assert.deepEqual(loadAcquisitionStore(engine.path).value.queries[stored.queryKey].snapshot.rows, stored.rows);
+    }
+    assert.equal(serialized.length, 1);
+  }
+});
+
+test("quota projection reuses a successful inspection only for its original scope and access", (t) => {
+  const box = fixture(t);
+  const engine = createAcquisitionEngine(box);
+  t.after(() => engine.close());
+  const original = createGovernorScope({ effectiveHost: "github.com", authIdentity: "reuse-projection",
+    env: box.pathOptions.env, now: box.now }).value;
+  let accesses = 0;
+  const scope = { ...original, accessKey: ACCESS, get path() { accesses++; return original.path; } };
+  const inspection = inspectGovernor(scope, box.now());
+  assert.equal(inspection.ok, true);
+  const projection = () => loadAcquisitionStore(engine.path).value.quotaProjections[scope.hash];
+  assert.equal(engine.syncQuotaProjection(scope).ok, true);
+  const expected = projection();
+  accesses = 0;
+  assert.equal(engine.syncQuotaProjection(scope, { scope, inspection }).ok, true);
+  assert.deepEqual(projection(), expected);
+  assert.equal(accesses, 0);
+  for (const changed of [{ hash: "f".repeat(64) }, { accessKey: "b".repeat(64) }, { path: original.path + ".other" }]) {
+    const other = { ...scope, ...changed };
+    accesses = 0;
+    assert.equal(engine.syncQuotaProjection(scope, { scope: other, inspection }).ok, true);
+    assert.ok(accesses > 0);
+    assert.deepEqual(projection(), expected);
+  }
+
+  const leaseId = randomUUID();
+  assert.equal(registerLease(scope, { id: leaseId, expiresAt: NOW + GOVERNOR_LEASE_TTL_MS,
+    floorMs: 5_000, activeTab: "actions", phaseSeed: { seed: leaseId, registeredAt: NOW },
+    demand: { core: 1, graphql: 0 } }).ok, true);
+  const newer = inspectGovernor(scope, box.now());
+  assert.ok(newer.value.revision > inspection.value.revision);
+  assert.equal(engine.syncQuotaProjection(scope, { scope, inspection: newer }).value, true);
+  assert.equal(engine.syncQuotaProjection(scope, { scope, inspection }).value, false);
+  assert.equal(projection().revision, newer.value.revision);
+
+  const ledger = readFileSync(original.path);
+  writeFileSync(original.path, "{invalid");
+  assert.equal(engine.syncQuotaProjection(scope).value, false);
+  assert.equal(projection().status, "unavailable");
+  writeFileSync(original.path, ledger);
+  assert.equal(engine.syncQuotaProjection(scope).value, true);
+  assert.equal(projection().status, "current");
+});
+
+test("rejected or unwritable disk candidates preserve the previous generation and retry", async (t) => {
+  const engine = createAcquisitionEngine(fixture(t));
+  t.after(() => engine.close());
+  const { id, queryKey } = engine.subscribe(query(), { active: true, floorMs: 5_000 }).value;
+  const previous = await engine.refresh(id, { acquire: async () => snapshot("first") });
+  const read = () => loadAcquisitionStore(engine.path).value.queries[queryKey].snapshot;
+  const claim = { ...(await engine.refresh(id, { force: true })).value, accessKey: ACCESS };
+  const oversized = snapshot("too many entities");
+  oversized.entities = Array(ACQUISITION_MAX_ENTITIES + 1).fill(oversized.entities[0]);
+  assert.equal((await engine.refresh(id, { claim, publish: oversized })).reason, "capacity");
+  assert.deepEqual(read(), previous.value.snapshot);
+  assert.equal(readdirSync(engine.path + ".snapshots").length, 1);
+  const replacement = await engine.refresh(id, { claim, publish: snapshot("smaller") });
+  assert.deepEqual(read(), replacement.value.snapshot);
+
+  // Block just the next artifact rename, leaving the committed artifact readable.
+  const next = { ...replacement.value.snapshot, generation: claim.generation + 1 };
+  delete next.raw;
+  const digest = createHash("sha256").update(JSON.stringify(next)).digest("hex");
+  const blocked = join(engine.path + ".snapshots", `${queryKey}.${next.generation}.${digest}.json`);
+  mkdirSync(blocked);
+  const nextClaim = { ...(await engine.refresh(id, { force: true })).value, accessKey: ACCESS };
+  assert.equal((await engine.refresh(id, { claim: nextClaim, publish: snapshot("smaller") })).reason, "unwritable");
+  assert.deepEqual(read(), replacement.value.snapshot);
+  rmdirSync(blocked);
+  const retried = await engine.refresh(id);
+  assert.equal(retried.ok, true);
+  assert.equal(read().generation, next.generation);
+  assert.equal(read().rows[0].displayTitle, "smaller");
 });

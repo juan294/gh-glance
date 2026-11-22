@@ -209,17 +209,17 @@ test("CX-13: a live narrow-to-wide resize restores the full empty-state explanat
 test("CX-13/14: a one-row populated notice retains the required authorization remedy", (t) => {
   const box = fixture(t, { apiEntities: {} });
   const options = { cols: 80, rows: 10, signal: "none", settle: 30,
-    args: "--repo acme/widget --refresh 300 --background off", configHome: box.root,
+    args: "--repo acme/widget --refresh 5 --background off", configHome: box.root,
     env: { GH_GLANCE_FIXTURE_STATE: box.statePath, GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" } };
   capture({ ...options, stdin: waitFor("ci: pin actions") + "sleep .7; printf q" });
   const state = JSON.parse(readFileSync(box.statePath));
   const warmSequence = Math.max(...state.events.map((event) => event.sequence));
-  // This case needs a sustained failure, whether startup or the explicit refresh
-  // reaches the source first. It must not recover before the layout assertion.
+  // A cached first frame can paint before Ink enables raw input. Let an
+  // ordinary refresh fail so an echoed key cannot occupy the terminal guard row.
   state.failure = { selector: "actions", remaining: 10, message: "HTTP 401: Bad credentials" };
   writeFileSync(box.statePath, JSON.stringify(state));
   const result = capture({ ...options,
-    stdin: waitFor("ci: pin actions") + "printf R; " + waitFor("Failed") +
+    stdin: waitFor("Failed") +
       waitFor("Run gh auth status") + "sleep 3; printf q" });
   const failedRequests = JSON.parse(readFileSync(box.statePath)).events.filter((event) =>
     event.type === "end" && event.sequence > warmSequence && event.argv.includes(RUNS));
@@ -229,7 +229,7 @@ test("CX-13/14: a one-row populated notice retains the required authorization re
   assert.match(screen, /Run gh auth status/);
   assert.match(screen, /ci: pin actions/);
   assert.match(screen, /Failed/);
-  assert.equal(result.finalFrame.lines.length, 9);
+  assert.equal(result.finalFrame.lines.length, 9, screen);
   assert.equal(result.exitCode, 0);
 });
 

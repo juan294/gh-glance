@@ -524,6 +524,37 @@ test("ASCII profile keeps the same status label and a width-one marker", (t) => 
   assert.equal(result.finalFrame.widest <= 45, true);
 });
 
+test("the Actions spinner parks behind Help and outside the viewport, then resumes", (t) => {
+  const path = "repos/acme/widget/actions/runs?exclude_pull_requests=true&per_page=60";
+  const body = readFileSync(new URL("./fixtures/actions-runs-running.json", import.meta.url), "utf8");
+  const box = sharedFixture(t, { apiEntities: { [path]: { sequence: [{ etag: '"running"', body }] } } });
+  const ticks = join(box.root, "ticks");
+  const samples = join(box.root, "samples");
+  writeFileSync(ticks, "");
+  // Ignore input transitions. Compare ticker counts at both ends of each settled view.
+  const sample = (seconds) => 'before=$(wc -c < "$GH_GLANCE_TEST_SPINNER_TICKS"); ' +
+    `sleep ${seconds}; after=$(wc -c < "$GH_GLANCE_TEST_SPINNER_TICKS"); ` +
+    'echo $((after - before)) >> "$GH_GLANCE_TEST_SAMPLES"; ';
+  const result = capture({
+    cols: 110, rows: 10, signal: "none", settle: 28, animation: true, configHome: box.root,
+    args: "--repo acme/widget --refresh 120 --background off",
+    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "deploy the staging bundle") { ok=1 }') +
+      sample(1) + "printf '?'; sleep .6; " + sample(3) +
+      "printf '?'; sleep .6; " + sample(1) + "printf j; sleep .2; printf j; sleep .2; printf j; sleep .6; " +
+      sample(3) + "printf k; sleep .2; printf k; sleep .6; " + sample(1) + "printf q",
+    env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1", GH_GLANCE_FIXTURE_STATE: box.statePath,
+      GH_GLANCE_TEST_SPINNER_TICKS: ticks, GH_GLANCE_TEST_SAMPLES: samples,
+      NODE_OPTIONS: `--import=${new URL("./fixtures/spinner-ticks.mjs", import.meta.url).href}` },
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(actionsRuns(box.read()).length, 1);
+  const [visible, help, returned, offscreen, scrolledBack] =
+    readFileSync(samples, "utf8").trim().split("\n").map(Number);
+  assert.ok(visible > 0 && returned > 0 && scrolledBack > 0, JSON.stringify({ visible, returned, scrolledBack }));
+  assert.equal(help, 0, "Help covers every Actions row");
+  assert.equal(offscreen, 0, "only queued or completed rows fit in the scrolled viewport");
+});
+
 test("delayed admitted startup animates Checking and settles to Watching", (t) => {
   const box = sharedFixture(t, { delayByCommand: { actions: 1_200 } });
   const output = '"$GH_GLANCE_CAPTURE_OUT"';
@@ -868,6 +899,8 @@ test("stale cached rows retain an acquisition cause through budget observation a
     writeFileSync(lockPath, `${JSON.stringify({ pid: process.pid, nonce: "live-acquisition-owner" })}\n`, {
       mode: 0o600,
     });
+    const journalPath = `${governorPath(box.root)}.recovery.json`;
+    const blockedStartedAt = Date.now();
     const blocked = capture({
       cols,
       rows: 24,
@@ -875,18 +908,24 @@ test("stale cached rows retain an acquisition cause through budget observation a
       settle: 25,
       // The busy store is a wait, listed in Notifications; at 80 columns the
       // view is opened to read it, at 24 the badge is enough.
-      stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', cols === 80
-        ? 'index($0, "lock busy") { busy=1 } index($0, "Events (") { badge=1 } busy && badge { ok=1 }'
-        : 'index($0, "Stale") { stale=1 } index($0, "5(") { badge=1 } stale && badge { ok=1 }', 120) +
+      // A transient bootstrap badge can clear before the store lock is observed.
+      stdin: (cols === 80
+        ? waitForAwk('"$GH_GLANCE_CAPTURE_OUT"',
+          'index($0, "lock busy") { busy=1 } index($0, "Events (") { badge=1 } busy && badge { ok=1 }', 120)
+        : waitForAwk('"$GH_GLANCE_RECOVERY_JOURNAL"', 'index($0, "acquisition-busy") { ok=1 }', 120) +
+          waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "[1(") { ok=index($0, "5(") }', 120)) +
         (cols === 80 ? "printf 5; " + waitForAwk('"$GH_GLANCE_CAPTURE_OUT"',
           'index($0, "Acquisition store is busy") { ok=1 }', 120) : "") + "sleep .4; printf q",
       configHome: box.root,
       env: {
         GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+        GH_GLANCE_RECOVERY_JOURNAL: journalPath,
         GH_GLANCE_FIXTURE_STATE: box.statePath,
       },
     });
     rmSync(lockPath, { force: true });
+    const journal = JSON.parse(readFileSync(journalPath, "utf8"));
+    assert.ok(journal.entries.some((entry) => entry.code === "acquisition-busy" && entry.at >= blockedStartedAt));
     const blockedStatuses = blocked.liveScreen.statusHistory;
     // Ink emits only changed cells: a later, more specific cause can replace
     // its row without rewriting the action that remains visible beside it.

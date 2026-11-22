@@ -4,6 +4,7 @@ import { test } from "node:test";
 
 import {
   COLLECTOR_FRAME_MAX_BYTES,
+  COLLECTOR_ASSEMBLY_MAX_BYTES,
   collectorDisplayDecision,
   createCollectorFrameDecoder,
   createCollectorSnapshotAssembler,
@@ -29,6 +30,16 @@ function largeRows(fields = 10) {
     updatedAt: "x".repeat(fields * 90),
     url: "x".repeat(fields * 90),
   }));
+}
+
+function countSnapshotBuffers(t) {
+  const from = Buffer.from;
+  let payloads = 0;
+  t.mock.method(Buffer, "from", function (value, ...args) {
+    if (typeof value === "string" && value.startsWith('{"resource":"actions","generation":')) payloads++;
+    return from.call(this, value, ...args);
+  });
+  return () => payloads;
 }
 
 test("COL-02: newline JSON accepts exact messages and rejects arbitrary input", () => {
@@ -375,7 +386,8 @@ test("COL-08: identical demand is a wire no-op and changed demand emits once", (
   client.close();
 });
 
-test("COL-08: service-scoped snapshot preparation is shared across healthy clients", async () => {
+test("COL-08: service-scoped snapshot preparation is shared across healthy clients", async (t) => {
+  const payloads = countSnapshotBuffers(t);
   class HealthySocket extends EventEmitter {
     destroyed = false;
     lines = [];
@@ -390,6 +402,7 @@ test("COL-08: service-scoped snapshot preparation is shared across healthy clien
   const senders = sockets.map((socket) => createCollectorSender(socket, { bytes: 0 }, { snapshotCache: cache }));
   assert.deepEqual(senders.map((sender, index) => sender.sendSnapshot(`sub-${index}`, "epoch", snapshot)), [true, true]);
   while (senders.some((sender) => sender.inspect().active)) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(payloads(), 1);
   assert.equal(cache.inspect().preparations, 1);
   assert.equal(cache.inspect().references, 0);
   assert.ok(sockets.every((socket) => socket.lines.some((line) => JSON.parse(line).type === "snapshot-begin")));
@@ -444,4 +457,66 @@ test("COL on-demand refresh waits for welcome and coalesces force before subscri
   assert.deepEqual(socket.writes.map((frame) => frame.type), ["hello", "subscribe", "refresh"]);
   assert.equal(socket.writes[2].force, true);
   client.close();
+});
+
+test("small single-frame encoders leave their UTF-8 payload unallocated", (t) => {
+  const payloads = countSnapshotBuffers(t);
+  const snapshot = { resource: "actions", generation: 29, rows: [], lastSuccessAt: 1, lastChangedAt: 1, nextDueAt: 2 };
+  const frames = encodeCollectorSnapshotFrames("sub", "epoch", snapshot);
+  assert.equal(frames[0].type, "snapshot");
+  const socket = new EventEmitter();
+  const lines = [];
+  socket.write = (line) => { lines.push(JSON.parse(line)); return true; };
+  const sender = createCollectorSender(socket, { bytes: 0 });
+  assert.equal(sender.sendSnapshot("sub", "epoch", snapshot), true);
+  assert.equal(lines[0].type, "snapshot");
+  assert.equal(payloads(), 0);
+  const handle = createCollectorSnapshotEncodingCache().acquire(snapshot);
+  assert.equal(payloads(), 0);
+  const bytes = handle.value.payload;
+  assert.equal(bytes.toString(), handle.value.json);
+  assert.strictEqual(handle.value.payload, bytes);
+  assert.equal(payloads(), 1);
+  handle.release();
+});
+
+test("both encoders switch at the complete multibyte frame limit including its newline", async (t) => {
+  t.mock.method(Date, "now", () => 123);
+  const snapshot = { resource: "actions", generation: 1, rows: largeRows(2),
+    lastSuccessAt: 1, lastChangedAt: 1, nextDueAt: 2 };
+  const title = "🌱".repeat(120);
+  for (const row of snapshot.rows) row.displayTitle = title;
+  const frame = { type: "snapshot", id: "sub", serverEpoch: "epoch", generation: 1, serverNow: Date.now(),
+    snapshot: projectCollectorSnapshot(snapshot) };
+  const initialBytes = Buffer.byteLength(JSON.stringify(frame) + "\n");
+  for (const delta of [-1, 0, 1]) {
+    let padding = COLLECTOR_FRAME_MAX_BYTES + delta - initialBytes;
+    for (const row of snapshot.rows) {
+      const count = Math.min(180, padding);
+      row.displayTitle = title + "a".repeat(count);
+      padding -= count;
+    }
+    assert.equal(padding, 0);
+    const expected = delta > 0 ? "snapshot-begin" : "snapshot";
+    assert.equal(encodeCollectorSnapshotFrames("sub", "epoch", snapshot)[0].type, expected);
+    const socket = new EventEmitter();
+    const lines = [];
+    socket.write = (line) => { lines.push(line); return true; };
+    const sender = createCollectorSender(socket);
+    assert.equal(sender.sendSnapshot("sub", "epoch", snapshot), true);
+    while (sender.inspect().active) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(JSON.parse(lines[0]).type, expected);
+    if (delta <= 0) assert.equal(Buffer.byteLength(lines[0]), COLLECTOR_FRAME_MAX_BYTES + delta);
+  }
+});
+
+test("declared assembly size accepts the byte limit and rejects the next byte", () => {
+  for (const delta of [-1, 0, 1]) {
+    const assembler = createCollectorSnapshotAssembler({ onSnapshot() {} });
+    const begin = { type: "snapshot-begin", id: "sub", serverEpoch: "epoch", resource: "actions",
+      generation: 1, snapshotId: "snapshot-1", totalBytes: COLLECTOR_ASSEMBLY_MAX_BYTES + delta,
+      parts: 24, digest: "a".repeat(64) };
+    assert.equal(assembler.accept(begin).ok, delta <= 0);
+    assembler.reset();
+  }
 });

@@ -17,6 +17,7 @@ import {
   dashboardCachePath,
   dashboardCacheTarget,
   loadDashboardCache,
+  mergeDashboardCacheSnapshots,
   nextSecurityRaw,
   saveDashboardCache,
   serializeDashboardCache,
@@ -413,6 +414,35 @@ test("stale writers preserve same-target tabs across a later local save", () => 
     assert.equal(loadDashboardCache(path, target).entry.tabs.actions.data[0].displayTitle, "second update");
     assert.ok(loadDashboardCache(path, target).entry.tabs.issues);
   });
+});
+
+test("an indented v3 cache saves as compact JSON after a target changes", () => {
+  withTemporaryRoot((root) => {
+    const path = cachePath(root);
+    const cache = cacheFor("one", { actions: actionsTab("déjà vu") });
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ version: 3, targets: cache }, null, 2));
+    const base = loadDashboardCache(path, "one").cache;
+    assert.deepEqual(base, cache);
+    const next = { ...base, ...cacheFor("two") };
+    assert.equal(saveDashboardCache(path, next, { base }).ok, true);
+    const raw = readFileSync(path, "utf8");
+    assert.deepEqual(JSON.parse(raw), { version: 3, targets: next });
+    assert.equal(raw, JSON.stringify(JSON.parse(raw)) + "\n");
+  });
+});
+
+test("merging shared dashboard entries skips their comparison serialization", () => {
+  const shared = cacheFor("one").one;
+  let reads = 0;
+  const observed = new Proxy(shared, { get(target, prop, owner) {
+    if (prop === "toJSON") reads++;
+    return Reflect.get(target, prop, owner);
+  } });
+  const base = { one: observed };
+  const disk = { one: { ...shared, updatedAt: NOW + 1 } };
+  assert.deepEqual(mergeDashboardCacheSnapshots(base, disk, { ...base }), disk);
+  assert.equal(reads, 0);
 });
 
 test("repeated dashboard saves atomically replace content without leaving a temp file", () => {

@@ -1,0 +1,41 @@
+# Phase 5 · Time to the first fresh row
+
+Use the accepted phase 4 commit as the control. The research observed an initial one-second data timer and reservations scheduled several seconds ahead. These waits can overlap. Test whether submitting the initial demand earlier actually gets a fresh row onto the terminal. The outcome can be a measured decision to keep the existing scheduler.
+
+## Candidate and limits
+
+At the **first opening of standalone poll deadlines** after mount, allow one ordinary asynchronous data wake at the active tab's existing opening deadline, provided the pane is cold for that tab, its scope is current, and a successful budget observation supports ordinary demand. Read the active key at opening, after the async budget refresh. Check that same key with `governorDataReady(refreshed, snapshot, openingKey, checkedAt)`, any pending blocks for its charged resources, and current scope. Arm via `wakeScheduler.arm('data', opened[openingKey], dataWake)` once. This uses the existing earliest-timer and single-flight rules while avoiding the one-second overdue clamp on this first eligible deadline. See `index.mjs:16348` and `index.mjs:21775`. Keep the existing call that arms from current state. A later arm cannot postpone an earlier timer. Keep the initial request on the normal path through fresh governor state, held-resource checks, poll scheduling, shared producer selection and reservation start. An already admitted request still waits for its own permitted slot.
+
+Consume the one-time opportunity on that first opening, including a warm opening. Known-empty cached rows count as warm. If bootstrap cannot open polling, a healthy control recovery can perform the first opening. A later epoch, account switch or ordinary retry cannot regain the opportunity. Keep background stagger, on-demand mode, interactive refresh, reconnect and retry delay unchanged. Use the smallest effect-local state needed to remember the first opening. See `index.mjs:21758`, `index.mjs:21775`, `index.mjs:21889`, `index.mjs:21998`, `index.mjs:22664`, `index.mjs:22728`, `index.mjs:22796`, `index.mjs:22903`.
+
+```
+@ first poll opening -> one ordinary scheduled data wake
+pre: standalone effect still current and opening deadlines after inspecting its scope
+do:
+  1. compute normal active and inactive deadlines
+  2. validate first opening, active rows absent and active budget usable
+  3. emit an asynchronous arm of the existing data wake for the active due time if eligible
+  4. compute ordinary control and data wakes as before
+br: held or warm -> existing arming and recovery
+fail: state changes before callback -> fresh inspection, single-flight and admission still govern
+```
+
+## Consumer sweep
+
+Run `rg -n 'openPollDeadlines|pollDeadlinesOpen|armFromState|armWake\(|createWakeScheduler|governorEpochPhaseAt|runDataWake' index.mjs test scripts`. The two opening calls are bootstrap and control recovery above. Scope resets at `index.mjs:21889`, time/heartbeat or pending callbacks at `index.mjs:22019` and `index.mjs:22860`, and retry at `index.mjs:22751` retain their current scheduling rules. The active tab's data test at `index.mjs:21009` treats null differently from an empty list. Keep the lane/phase decision at `index.mjs:3307`, poll scheduling at `index.mjs:16184`, governor wake calculation at `index.mjs:16289`, earliest-timer semantics at `index.mjs:16374` and lease registration at `index.mjs:21980`. Connected clients and collector timers have separate lifecycles. No provider or release change is part of the experiment.
+
+## Automated experiment and decision
+
+1. First write a deterministic scheduler regression using a controlled clock. Cover the initial active deadline already past versus still in the future, warm cached data including a known empty list, initial hold then healthy, retry after a failed request, simultaneous control/data callbacks, active-tab switch, cancellation, and scope reset. Assert one prompt eligible wake at most, no retry spin and no transport before its persisted slot. Exercise same-target and different-target panes so savings cannot come from duplicate fetching or collapsed spacing. Use `test/governor.test.mjs:632`, `test/governor.test.mjs:1023`, `test/pty/governor.test.mjs:441`, `test/pty/governor.test.mjs:487`.
+2. Compare control and candidate with the real binary, local synthetic gh, identical fixture latency, terminal size, Node version, background mode and fresh private roots per trial. Use one pane and simultaneous same-target panes, in both early and late phase conditions, with at least five alternating matched pairs per condition. Include a same-build control/control run series to establish timing noise first. Fix or match the intrinsic phase relative to poll opening using the fixture lease seed, registration time and budget epoch. Match lane availability as well. Early means the intrinsic slot is already available or lies within 250 ms of opening. Late means at least 1.5 s ahead. Record the unclamped phase and lane provenance before looking at results. The final grant time is an outcome and cannot define the cohorts. Give simultaneous panes distinct process/lease identities, the same credential access partition, canonical query and coordination directory, and matching lease seed sets across builds. Isolate directories between trials. Use test-only instrumentation and existing harness teardown. See `index.mjs:3089`, `index.mjs:3307`, `test/pty/capture.mjs:463`, `test/pty/capture.mjs:503`, `test/pty/governor.test.mjs:230`.
+3. Record monotonic elapsed time to first frame, first demand, first reservation, earliest permitted start, actual Actions invocation, and first **fresh** fixture row, with per-pane/API counts and a common observation window. Use the existing reservation and fixture start records to check every actual start against its own grant. Include settled subsequent polls, held→healthy recovery and warm restart. Report first-row paired medians, number of improved pairs, and same-build noise. Leave unmatched trials visible as such.
+4. **Keep the candidate** only if in early-slot single-pane runs the median first fresh row improves by at least 500 ms, exceeds observed same-build noise, and at least four out of five pairs improve (80% for larger cohorts). Require no median regression beyond the measured same-build jitter in any other cohort or in first frame. Use the median absolute paired control/control difference per workload as that jitter. Require equal intended remote request counts, one shared producer for simultaneous equivalent demand, valid slot spacing, no increase in recurring wakes, and successful recovery and shutdown. Timing thresholds are local decision criteria. Record an inconclusive or failed comparison as a discard, keep the accepted phase 4 runtime and document which constraint absorbed the saving.
+5. For the implemented candidate, run focused regressions followed by sequential lint, syntax, unit, efficiency and PTY commands in the [main plan](../2026-11-21-runtime-performance.md). If discarding, preserve the experiment results and verify the final local runtime is identical to the accepted phase 4 runtime. All owned fixture children and private roots follow the capture harness lifecycle.
+
+**Manual acceptance.** No manual operation required. Present the keep/discard decision with the actual paired data and tested source identities. A passing scheduler unit test alone cannot establish a first-row improvement.
+
+## Completion
+
+- [x] Exercise first-opening eligibility, cancellation, budget recovery and regular admission.
+- [x] Compare five matched pairs per workload across 80 trials and 120 pane exits, including baseline repeat measurements.
+- [x] Keep the candidate. The early single-pane paired median improved by 1,014 ms. All latency, sharing and recurring-wake criteria passed. See the [paired observations, trade-off and final verification](../2026-11-21-runtime-performance-notes.md#phase-5--first-fresh-terminal-row).

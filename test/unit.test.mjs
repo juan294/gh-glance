@@ -2526,6 +2526,21 @@ test("overlapping asynchronous width preference writes are serialized in schedul
   await writer.dispose();
 });
 
+test("a width write scheduled while reporting success drains in the same flush", async () => {
+  const writes = [];
+  const writer = createWidthPreferenceWriter({
+    delay: 60_000,
+    write(value) { writes.push(value); return { ok: true }; },
+    onResult() {
+      if (writes.length === 1) writer.schedule(2);
+    },
+  });
+  writer.schedule(1);
+  await writer.flush();
+  await writer.dispose();
+  assert.deepEqual(writes, [1, 2]);
+});
+
 test("concurrent width preference flushes share one in-flight write", async () => {
   const pending = deferred();
   const value = { issues: { author: 9 } };
@@ -3717,4 +3732,18 @@ test("on-demand status labels cached data without hiding errors or incomplete Se
   assert.equal(refreshStatus({ onDemand: true, activeError: { verdict: "other" } }).label, "Failed");
   assert.equal(refreshStatus({ onDemand: true, securityIncomplete: true }).label, "Limited");
   assert.equal(refreshStatus({ onDemand: true, disconnected: true }).label, "Disconnected");
+});
+
+test("safe avoids allocating code points for short sanitized fields", (t) => {
+  const original = Array.from;
+  let allocations = 0;
+  t.mock.method(Array, "from", function (value, ...args) {
+    if (value === "hi 🌱") allocations++;
+    return original.call(this, value, ...args);
+  });
+  assert.equal(safe([" \u202ehi\u001b🌱  "]), "hi 🌱");
+  assert.equal(allocations, 0);
+  assert.equal(safe("x".repeat(299) + "🌱"), "x".repeat(299) + "🌱");
+  assert.equal(safe("x".repeat(300) + "🌱"), "x".repeat(300));
+  assert.equal(safe("🌱".repeat(301)), "🌱".repeat(300));
 });

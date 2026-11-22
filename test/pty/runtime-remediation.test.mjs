@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 
-import { capture, waitForAwk } from "./capture.mjs";
+import { capture, isStatusLine, waitForAwk } from "./capture.mjs";
 import { AUTH_RETRY_MS, GOVERNOR_PHASE_WINDOW_MS, resourceReserve, tabRequestCost, pollPolicyInterval } from "../../index.mjs";
 
 const ESC = String.fromCharCode(27);
@@ -252,30 +252,37 @@ const actionsReadyMs = Math.ceil(GOVERNOR_PHASE_WINDOW_MS +
 const automaticPollWaitMs = 2 * actionsReadyMs + pollPolicyInterval({
   tab: "actions", floorMs: 5000, demand: "active", unchangedCount: 2, inProgressCI: false,
 });
+// The first automatic poll revalidates the warm rows. The second returns a
+// distinct row, so its settled frame cannot be mistaken for the first poll's.
 const automaticPollDriver = join(cachedConfigHome, "automatic-poll.mjs");
 writeFileSync(automaticPollDriver, `
-import {readFileSync} from 'node:fs';
-import {parseCapture} from ${JSON.stringify(new URL('./capture.mjs', import.meta.url).href)};
-const deadline=Date.now()+${automaticPollWaitMs};
-try{while(Date.now()<deadline){try{
-  const calls=readFileSync(process.env.GH_GLANCE_CAPTURE_OUT+'.calls','utf8').split('\\n');
-  const statuses=parseCapture(readFileSync(process.env.GH_GLANCE_CAPTURE_OUT,'utf8'),{cols:80,rows:24}).liveScreen.statusHistory;
-  const lastChecking=statuses.findLastIndex(status=>/ Checking(?:\\s|$)/.test(status));
-  if(calls.filter(call=>call.includes('/actions/runs?')).length>=2 &&
-    statuses.some((status,index)=>index>lastChecking && / Watching(?:\\s|$)/.test(status)) &&
-    / Watching(?:\\s|$)/.test(statuses.at(-1)??''))break;
-}catch(error){if(error.code!=='ENOENT')throw error;}
-  await new Promise(resolve=>setTimeout(resolve,50));
-}}finally{process.stdout.write('q');}
+import { readFileSync } from 'node:fs';
+import { isStatusLine, parseCapture } from ${JSON.stringify(new URL('./capture.mjs', import.meta.url).href)};
+const deadline = Date.now() + ${automaticPollWaitMs};
+try {
+  while (Date.now() < deadline) {
+    try {
+      const raw = readFileSync(process.env.GH_GLANCE_CAPTURE_OUT, 'utf8');
+      const { liveScreen } = parseCapture(raw, { cols: 80, rows: 24 });
+      if (liveScreen.lines.some(line => line.includes('new run one')) &&
+        liveScreen.lines.some(line => isStatusLine(line) && / Watching(?:\\s|$)/.test(line))) break;
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+} finally { process.stdout.write('q'); }
 `);
 const automaticPoll = capture({
   cols: 80,
   rows: 24,
   signal: "none",
+  animation: true,
   settle: Math.ceil(automaticPollWaitMs / 1000) + 5,
   args: "--background off",
   stdin: `node '${automaticPollDriver}'`,
-  env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1" },
+  env: {
+    GH_GLANCE_CAPTURE_LIVE_FLUSH: "1",
+    GH_GLANCE_FIXTURE_RUN_SEQUENCE_FILE: join(cachedConfigHome, "automatic-poll-sequence"),
+  },
   configHome: cachedConfigHome,
 });
 rmSync(cachedConfigHome, { recursive: true, force: true });
@@ -423,19 +430,18 @@ test("a cache-hydrated adapted check is static and settles before routine polls"
   assert.equal(automaticPoll.exitCode, 0);
   const runCalls = automaticPoll.fixtureCalls.filter((call) => call.includes("/actions/runs?"));
   assert.ok(runCalls.length >= 2, `expected automatic polls, saw ${runCalls.length}`);
-  const firstData = automaticPoll.raw.indexOf("ci: pin actions");
-  assert.ok(firstData >= 0, "expected the first successful Actions frame");
-  const statuses = automaticPoll.liveScreen.statusHistory;
-  const lastCheckingAt = statuses.findLastIndex((status) => / Checking(?:\s|$)/.test(status));
-  const settledAt = statuses.findIndex(
-    (status, index) => index > lastCheckingAt && / Watching(?:\s|$)/.test(status),
-  );
-  assert.ok(settledAt >= 0, `expected Watching after data, saw ${statuses.join(" -> ")}`);
-  assert.match(statuses.at(-1), / Watching(?:\s|$)/, "quit only after the current check settled");
-  assert.equal(
-    statuses.slice(settledAt + 1).some((status) => / Checking(?:\s|$)/.test(status)),
-    false,
-  );
+  const firstFrameEnd = automaticPoll.raw.indexOf(`${ESC}[?2026l`);
+  assert.ok(firstFrameEnd >= 0, "expected a complete synchronized dashboard frame");
+  assert.match(strip(automaticPoll.raw.slice(0, firstFrameEnd)), /docs: update the readme/,
+    "expected cached Actions rows in the initial dashboard frame");
+
+  // A floor-rate poll can run silently. Any visible adapted checks on this
+  // hydrated dashboard must use a static glyph, even with animation enabled.
+  const checking = automaticPoll.liveScreen.statusHistory.filter((line) => / Checking(?:\s|$)/.test(line));
+  assert.ok(new Set(checking.map((line) => [...line][0])).size <= 1, checking.join(" -> "));
+  const final = automaticPoll.finalFrame.lines;
+  assert.match(final.join("\n"), /new run one/, "expected the second automatic poll to render");
+  assert.match(final.find(isStatusLine) ?? "", / Watching(?:\s|$)/, "expected a settled footer after the second poll");
 });
 
 test("short contextual help keeps source context and explicit paging and exit", () => {

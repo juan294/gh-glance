@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-22
+
+### Changed
+
+- A standalone pane that opens with no cached rows for the selected tab now
+  starts its first request as soon as its request slot is due. Before, it
+  waited for the next scheduled poll wake, so the first fresh row could appear
+  about a second later than needed. A pane whose slot is still in the future,
+  that opens with cached rows, or whose rate-limit budget is exhausted starts
+  as before.
+- Starting with a valid `--repo` or `GH_REPO` no longer reads the current
+  folder's git remotes or its `gh` default repository. The dashboard also
+  loads its interface while its startup checks run, so the first frame appears
+  slightly sooner.
+- The status animation stops while nothing animated is on screen, such as in
+  Help, in Notifications, when the running row is scrolled out of view or when
+  the pane is too narrow. It starts again when an animated row or label is
+  visible. This stops about five redraws a second in panes where nothing
+  moves.
+- The Issues and Pull requests tabs ask GitHub for fewer fields, so each
+  response is about 10% smaller. While panes for a repository run both this
+  version and an older one, the two versions do not share Issues and Pull
+  requests results, and each version makes its own requests.
+- The display cache file is written without indentation, which makes it about
+  39% smaller.
+
+### Fixed
+
+- The collector (`--serve`) now reuses the Actions workflow catalog for 15
+  minutes, as the standalone dashboard does. Before, it requested the catalog
+  again on every poll while a run had no workflow name.
+
 ## [0.19.4] - 2026-11-20
 
 ### Fixed
@@ -1469,7 +1501,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.19.4...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/juan294/gh-glance/compare/v0.19.4...v0.20.0
 [0.19.4]: https://github.com/juan294/gh-glance/compare/v0.19.3...v0.19.4
 [0.19.3]: https://github.com/juan294/gh-glance/compare/v0.19.2...v0.19.3
 [0.19.2]: https://github.com/juan294/gh-glance/compare/v0.19.1...v0.19.2
