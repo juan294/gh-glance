@@ -69,8 +69,8 @@ try{
  if(!/Source[\\s│]+.*old/.test(screen()))throw Error('Semantic results lost source age');
  if(count()!==4)throw Error('50-row batching wrong');
  send('\\u001b');await until(()=>!screen().includes('Focus:'));
- for(let i=0;!screen().includes('of 150') && i<20;i++){send('\\u001b[6~');await pause(180);}
- await until(()=>screen().includes('of 150'));await pause(500);
+ // Each loaded page needs another scroll to demand the next one, so keep scrolling until the last page lands.
+ let nextScroll=0;await until(()=>{if(screen().includes('of 150'))return true;if(Date.now()>=nextScroll){send('\\u001b[6~');nextScroll=Date.now()+180;}return false;});await pause(500);
  const before=JSON.stringify({data:source().data,lastOk:source().lastOk,at:source().meta.at});const beforeCalls=count();
  send('/');await until(()=>screen().includes('Focus >'));send('authentication');await pause(80);send('\\r');await until(()=>screen().includes('Focus:'));
  send('J');await until(()=>screen().includes('60/150 eligible'));if(count()-beforeCalls!==4)throw Error('first60 wrong');
