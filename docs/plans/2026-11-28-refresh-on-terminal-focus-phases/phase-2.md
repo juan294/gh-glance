@@ -58,7 +58,8 @@ In Rex, with the built checkout: put a pane on Issues, wait more than 15 s, focu
 
 ## Completion
 
-- [ ] Decision function, standalone entry point and handler, with unit table
-- [ ] TF-10 to TF-18 green; efficiency unchanged; full local gates green on Node 24 and the focused set on Node 22
-- [ ] Help, README and CHANGELOG updated, and checked against the last tag
-- [ ] Independent review and simplify pass; owner visual check recorded
+- [x] Decision function, standalone entry point and handler, with unit table
+- [x] TF-10 to TF-18 green; efficiency unchanged; focused set green on Node 22 and 24. Full `test:pty` had one unrelated intermittent failure (see notes, "Open")
+- [x] Help, README and CHANGELOG updated, and checked against the last tag
+- [x] Independent review and simplify pass
+- [ ] Owner visual check in Rex (manual, pending)

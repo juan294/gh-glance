@@ -66,3 +66,22 @@ Recorded per run. Exit code 0 means every test in the selection passed.
 | Phase 2 working tree | `npm run test:efficiency` | 24.22.3 | 0 (9/9) |
 | Phase 2 working tree | `npm test` equivalent (`node --test --test-skip-pattern='E2E-' test/*.test.mjs`) | 22.22.2 | 0 (1148/1148) |
 | Phase 2 working tree | `test/pty/terminal-focus.test.mjs` | 22.22.2 | 0 (8/8) |
+| Phase 1 (`5b74e0e`) | `npm run test:pty` | 24.22.3 | 0 (273 passed, 0 failed, 2,678 s) |
+| Final (`81a3056`) | `npm run lint`, `node --check index.mjs` | 24.22.3 | 0, 0 |
+| Final (`81a3056`) | `npm test` | 24.22.3 | 0 (1148/1148) |
+| Final (`81a3056`) | `npm run test:efficiency` | 24.22.3 | 0 (9/9) |
+| Final (`81a3056`) | `npm test` equivalent | 22.22.2 | 0 (1148/1148) |
+| Final (`81a3056`) | `test/pty/terminal-focus.test.mjs`; TF-18 in `test/pty/collector.test.mjs` | 22.22.2 | 0 (7/7); 0 (1/1) |
+| Final (`81a3056`) | `test/pty/terminal-focus.test.mjs`, `test/pty/mouse.test.mjs`; TF-18 | 24.22.3 | 0 (14/14); 0 (1/1) |
+| Final (`81a3056`) | `npm run test:pty` | 24.22.3 | **1** (278 passed, 1 failed, 2,825 s) |
+| Final (`81a3056`) | `test/pty/status.test.mjs` rerun | 24.22.3 | 0 (26/26) |
+
+### Open: intermittent "linear screen-reader output retains startup, holds..." failure
+
+The one failure in the final `npm run test:pty` run is `test/pty/status.test.mjs:1244`. Its core-exhausted capture expected `reset \d+m`. Instead it showed "Paused coordination" with the fallback copy "Local coordination unavailable". The capture lasted 1.86 s and made no core observer call (`api -i user`). The test's barrier waits for any "Paused", so a transient coordination pause satisfies it before the reset hold is published.
+
+- VERIFIED: the test sends no focus input. A file probe in `handleTerminalFocusIn` (positive control: 5 entries in TF-01) logged no focus-in in 14 runs of this test.
+- VERIFIED: in isolated reruns on `81a3056`, it failed 1 of 3 at first, then passed 18 in a row. The whole file passed once (26/26). It passed 13 of 13 on the base `154930d`.
+- INFERRED: a startup coordination race that the loose "Paused" barrier exposes. It is not caused by focus code, which no run reached. With 2 failures in 22 candidate runs and 0 in 13 base runs, the sample cannot rule out a timing contribution from the extra `?1004h` write at mount. The root cause is unproven.
+- Disposition: recorded as an open risk for owner review. Next step if it recurs: tighten the barrier to wait for `reset \d+m`, and compare failure rates with the focus effect disabled.
+

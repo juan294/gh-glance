@@ -39,7 +39,7 @@ None required. Optional: start the checkout in Rex, switch panes and confirm not
 
 ## Completion
 
-- [ ] Lifecycle functions and restore ordering, with unit tests
-- [ ] Mount effect and first-branch consumption
-- [ ] TF-01 to TF-05 green; full local gates green on the tested commit
-- [ ] Independent review and simplify pass recorded in the phase handoff
+- [x] Lifecycle functions and restore ordering, with unit tests
+- [x] Mount effect and first-branch consumption
+- [x] TF-01 to TF-05 green; full local gates green on the tested commit
+- [x] Independent review and simplify pass recorded in the phase handoff
