@@ -63,7 +63,7 @@ Budget now (VERIFIED, `gh-glance --doctor`, 06:15 UTC): core 3,103 remaining and
 
 ### Architecture corpus (Archy)
 
-The O'Reilly books are **not** in Archy's searchable Supabase store: its 59,544 documents include no `pdf` or `epub` source type (VERIFIED by read-only SELECT). The 28 ePUBs in the owner's Dropbox folder `Software Architecture 2024` were extracted and searched by keyword. *Designing Data-Intensive Applications* and *Release It!* are not in the corpus. Relevant passages:
+The O'Reilly books are **not** in Archy's searchable Supabase store: its 59,544 documents include no `pdf` or `epub` source type (VERIFIED by read-only SELECT). A local library of 28 architecture ePUBs was extracted and searched by keyword. *Designing Data-Intensive Applications* and *Release It!* are not in the corpus. Relevant passages:
 
 - Newman, *Building Microservices* 2e, ch. 13 "Invalidation: Notification-based": notification limits the stale window to "the time taken for the notification to be sent and processed". The same chapter says a conditional GET still pays the round trip. This supports a cheap signal followed by a fetch, rather than more ETag polling.
 - Newman, ch. 4: data shared through files is learned "via some sort of polling mechanism". It suggests pairing that with a separate "new data available" call. This is the doorbell pattern.
