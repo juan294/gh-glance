@@ -2201,6 +2201,34 @@ test("drag widths derive from the press snapshot and the divider growth directio
   }
 });
 
+test("terminal focus reporting is idempotent and restore disables it before leaving the alternate screen", () => {
+  const writes = [];
+  const terminal = createTerminalLifecycle((chunk) => writes.push(chunk));
+
+  assert.equal(terminal.isFocusReportingEnabled(), false);
+  assert.equal(terminal.disableFocusReporting(), false);
+  assert.equal(writes.join(""), "");
+
+  assert.equal(terminal.enableFocusReporting(), true);
+  assert.equal(terminal.enableFocusReporting(), false);
+  assert.equal(terminal.isFocusReportingEnabled(), true);
+  assert.equal(terminal.disableFocusReporting(), true);
+  assert.equal(terminal.disableFocusReporting(), false);
+  assert.equal(writes.join(""), `${ESC}[?1004h${ESC}[?1004l`);
+
+  writes.length = 0;
+  assert.equal(terminal.enableMouseReporting(), true);
+  assert.equal(terminal.enableFocusReporting(), true);
+  assert.equal(terminal.restoreScreen(), true);
+  assert.equal(terminal.enableFocusReporting(), false);
+  assert.equal(terminal.isFocusReportingEnabled(), false);
+  assert.equal(
+    writes.join(""),
+    `${ESC}[?1002h${ESC}[?1006h${ESC}[?1004h` +
+      `${ESC}[?1002l${ESC}[?1006l${ESC}[?1004l${ESC}[?25h${ESC}[?1049l`,
+  );
+});
+
 test("terminal mouse lifecycle transitions are idempotent and restore disables reporting first", () => {
   const writes = [];
   const terminal = createTerminalLifecycle((chunk) => writes.push(chunk));

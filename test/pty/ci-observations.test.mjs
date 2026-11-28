@@ -61,7 +61,7 @@ assert.equal(JSON.stringify(sourceCalls()),beforeSource);assert.equal(readFileSy
 
 test('CI suspected secret blocks cloud input; range editor owns q and clean original lines can be explicitly sent',t=>scenario(t,{log:'Authorization: Bearer synthetic-private-value\nAssertionError: expected true, actual false\nclean finish',config:{ciProbabilities:{assertion_mismatch:.9}},program:String.raw`
 await openLog();send('J');await until(()=>screen().includes('Suspected secret'));save('secret');assert.equal(jevCalls().length,0);assert.equal(readFileSync(root+'/imports','utf8'),'');
-send('e');await until(()=>screen().includes('CI range >'));send('q');await pause(100);assert.ok(screen().includes('CI range > q'));send('\r');await until(()=>screen().includes('Invalid CI line range'));
+send('e');await until(()=>screen().includes('CI range >'));send('\u001b[I\u001b[O');await pause(150);send('q');await pause(100);assert.ok(screen().includes('CI range > q'),'terminal focus reports leaked into the range draft');send('\r');await until(()=>screen().includes('Invalid CI line range'));
 send('\u007f');await pause(60);send('2-3');await pause(100);send('\r');await until(()=>screen().includes('Range 2-3 ready'));save('range');
 send('J');await until(()=>screen().includes('TypeSafe preview'));send('\r');await until(()=>screen().includes('Assertion mismatch'));
 assert.equal(jevCalls().length,1);assert.ok(!JSON.stringify(jevCalls()[0].request).includes('synthetic-private-value'));assert.equal(jevCalls()[0].request.state.excerpt.s1.lineStart,2);

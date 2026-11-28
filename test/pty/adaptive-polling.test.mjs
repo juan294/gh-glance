@@ -365,6 +365,9 @@ test("default on-demand tabs stop after opening and refresh again with r", (t) =
   assert.match(frame, /Cached/);
   assert.doesNotMatch(frame, /Watching/);
   assert.equal(result.exitCode, 0);
+  // TF-05: focus reporting was on and no focus report arrived, which is what a
+  // terminal without mode 1004 looks like. The counts above are unchanged.
+  assert.equal(result.focus1004Enter, 1, "focus reporting must be enabled for this baseline");
 });
 
 test("cached secondary age advances while no new observation is requested", (t) => {

@@ -20125,6 +20125,8 @@ function App({ onCreateRemote = () => {} } = {}) {
     return Number.isFinite(sourceAt) ? [[candidate.key, sourceAt]] : [];
   })));
   const fetchTabRef = useRef(null);
+  // Called with true on terminal focus-in and false on focus-out.
+  const terminalFocusRef = useRef(null);
   const contextCoordinatorRef = useRef(null);
   const governorRef = useRef(null);
 
@@ -20177,6 +20179,16 @@ function App({ onCreateRemote = () => {} } = {}) {
       disableMouseReporting();
     };
   }, [interactive, widthMode]);
+
+  // Focus reporting stays on for the whole interactive session; width mode and
+  // every view consume the tokens before any key binding sees them.
+  useEffect(() => {
+    if (!interactive) return;
+    enableFocusReporting();
+    return () => {
+      disableFocusReporting();
+    };
+  }, [interactive]);
 
   function applyWidthOverrides(next) {
     const current = widthOverridesRef.current;
@@ -20458,6 +20470,12 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (input.startsWith("[<")) {
         const mouse = parseSgrMouse(input);
         if (mouse) handleSgrMouse(mouse);
+        return;
+      }
+      // Terminal focus reports (mode 1004) arrive the same way, as "[I" and
+      // "[O". Consume them before every binding: a leaked Escape would quit.
+      if (input === "[I" || input === "[O") {
+        terminalFocusRef.current?.(input === "[I");
         return;
       }
       if(featureRef.current?.mode==='ci' && featureRef.current.ciRange && !(input==='c' && key.ctrl)){
@@ -23460,6 +23478,7 @@ function enterAlternateScreen() {
 function createTerminalLifecycle(write) {
   if (typeof write !== "function") throw new TypeError("write must be a function");
   let mouseReportingEnabled = false;
+  let focusReportingEnabled = false;
   let screenRestored = false;
 
   function enableMouseReporting() {
@@ -23476,9 +23495,27 @@ function createTerminalLifecycle(write) {
     return true;
   }
 
+  // Terminal focus reporting (xterm mode 1004): the terminal sends ESC [ I on
+  // focus-in and ESC [ O on focus-out. Not the Jev semantic Focus feature.
+  function enableFocusReporting() {
+    if (focusReportingEnabled || screenRestored) return false;
+    write("\x1b[?1004h");
+    focusReportingEnabled = true;
+    return true;
+  }
+
+  function disableFocusReporting() {
+    if (!focusReportingEnabled) return false;
+    write("\x1b[?1004l");
+    focusReportingEnabled = false;
+    return true;
+  }
+
   function restoreScreen() {
     if (screenRestored) return false;
     disableMouseReporting();
+    // Left on, the shell would receive ^[[I and ^[[O on every pane switch.
+    disableFocusReporting();
     screenRestored = true;
     // Ink restores the cursor only through its own unmount path, which an
     // explicit process.exit() skips.
@@ -23489,8 +23526,11 @@ function createTerminalLifecycle(write) {
   return {
     enableMouseReporting,
     disableMouseReporting,
+    enableFocusReporting,
+    disableFocusReporting,
     restoreScreen,
     isMouseReportingEnabled: () => mouseReportingEnabled,
+    isFocusReportingEnabled: () => focusReportingEnabled,
   };
 }
 
@@ -23504,9 +23544,17 @@ function disableMouseReporting() {
   return terminalLifecycle.disableMouseReporting();
 }
 
+function enableFocusReporting() {
+  return terminalLifecycle.enableFocusReporting();
+}
+
+function disableFocusReporting() {
+  return terminalLifecycle.disableFocusReporting();
+}
+
 // Idempotent because both the lifecycle controller and this process-level
-// wrapper share one restored state. Mouse modes are always disabled before the
-// alternate buffer is released, including when this is only the exit backstop.
+// wrapper share one restored state. Mouse and focus modes are always disabled
+// before the alternate buffer is released, including when this is only the exit backstop.
 function restoreScreen() {
   return terminalLifecycle.restoreScreen();
 }
