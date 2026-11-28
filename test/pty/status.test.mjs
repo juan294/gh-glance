@@ -908,12 +908,16 @@ test("stale cached rows retain an acquisition cause through budget observation a
       settle: 25,
       // The busy store is a wait, listed in Notifications; at 80 columns the
       // view is opened to read it, at 24 the badge is enough.
-      // A transient bootstrap badge can clear before the store lock is observed.
+      // At 24 columns a bootstrap badge is still drawn when the busy cause reaches
+      // the journal. It clears, and the cause's own badge follows its debounce, so
+      // a badge counts only after an earlier one cleared.
       stdin: (cols === 80
         ? waitForAwk('"$GH_GLANCE_CAPTURE_OUT"',
           'index($0, "lock busy") { busy=1 } index($0, "Events (") { badge=1 } busy && badge { ok=1 }', 120)
         : waitForAwk('"$GH_GLANCE_RECOVERY_JOURNAL"', 'index($0, "acquisition-busy") { ok=1 }', 120) +
-          waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "[1(") { ok=index($0, "5(") }', 120)) +
+          waitForAwk('"$GH_GLANCE_CAPTURE_OUT"',
+            'index($0, "[1(") { badge=index($0, "5("); if (badge) seen=1; else if (seen) cleared=1; ok=badge && cleared }',
+            120)) +
         (cols === 80 ? "printf 5; " + waitForAwk('"$GH_GLANCE_CAPTURE_OUT"',
           'index($0, "Acquisition store is busy") { ok=1 }', 120) : "") + "sleep .4; printf q",
       configHome: box.root,
@@ -1282,9 +1286,11 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
     rows: 24,
     signal: "none",
     settle: 30,
+    // Wait for the reset hold itself. A transient "Paused coordination" can
+    // render first, and quitting on it left the assertions below unmet.
     stdin: waitForAwk(
       '"$GH_GLANCE_CAPTURE_OUT"',
-      'index($0, "Paused") { ok=1 }',
+      '/reset [0-9]+m/ { ok=1 }',
       250,
     ) + "sleep .3; printf q",
     configHome: heldBox.root,

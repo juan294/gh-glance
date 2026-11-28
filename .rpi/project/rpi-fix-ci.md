@@ -1,4 +1,4 @@
-<!-- rpi-overlay: skill=rpi-fix-ci; written-against=454a24af1503 -->
+<!-- rpi-overlay: skill=rpi-fix-ci; written-against=e5a90fd252e8 -->
 # Project overlay for rpi-fix-ci
 
 ## Procedure

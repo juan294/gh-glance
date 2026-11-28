@@ -207,6 +207,13 @@ const AUTH_RETRY_MS = [30_000];
 // byte-identical-idle-frame property the rest of this file works to keep.
 const STALE_AFTER_MS = 30_000;
 
+// Terminal focus (xterm mode 1004), not the Jev semantic Focus: a focus-in
+// checks the selected tab when its data is this old, at most once per tab per
+// throttle window timed from the attempt (so a failing tab is not retried on
+// every return). See docs/research/2026-11-28-intermediate-background-refresh-assessment.md.
+const TERMINAL_FOCUS_MIN_AGE_MS = 15_000;
+const TERMINAL_FOCUS_THROTTLE_MS = 15_000;
+
 // A coordination hold must persist long enough to be meaningful before it
 // takes the notice row. Short startup and lock-contention states recover on
 // their own and should not present themselves as user-visible failures.
@@ -12554,6 +12561,10 @@ Options:
                            \`off\` never requests data
                            for a tab you are not looking at; its count stays at
                            the last known value and visibly ages.
+                           In standalone mode, when the terminal reports focus,
+                           returning to the pane checks the selected tab if its
+                           data is at least ${TERMINAL_FOCUS_MIN_AGE_MS / 1000}s old. In tmux, enable
+                           \`set -g focus-events on\`.
   --jev                    Enable explicit semantic Focus, CI observations and
                            attention badges in standalone mode.
   --jev-max-requests <n>    Session call cap, 1-10000 (default 100); requires --jev.
@@ -16161,6 +16172,20 @@ function manualRefreshRequest(intent) {
     return { kind: "manual", force: true, dropValidators: true, clearCapabilityBackoff: true };
   }
   return null;
+}
+
+// Whether a terminal focus-in should check the selected tab. Pure so the
+// thresholds are pinned by a table; the caller supplies the tab's state.
+function terminalFocusRevalidation({ nowMs, lastOkAt, lastAttemptAt, inFlight }) {
+  if (inFlight) return { revalidate: false, reason: "in-flight" };
+  if (Number.isFinite(lastAttemptAt) && nowMs - lastAttemptAt < TERMINAL_FOCUS_THROTTLE_MS) {
+    return { revalidate: false, reason: "throttled" };
+  }
+  if (!Number.isFinite(lastOkAt)) return { revalidate: true, reason: "never-loaded" };
+  // A source time ahead of this clock yields a negative age, which is fresh.
+  return nowMs - lastOkAt >= TERMINAL_FOCUS_MIN_AGE_MS
+    ? { revalidate: true, reason: "stale" }
+    : { revalidate: false, reason: "fresh" };
 }
 
 // A press during automatic work either rides that work or schedules exactly one
@@ -20125,6 +20150,9 @@ function App({ onCreateRemote = () => {} } = {}) {
     return Number.isFinite(sourceAt) ? [[candidate.key, sourceAt]] : [];
   })));
   const fetchTabRef = useRef(null);
+  // Set only by the standalone acquisition effect; connected mode has none.
+  const focusRevalidateRef = useRef(null);
+  const lastFocusAttemptRef = useRef({});
   const contextCoordinatorRef = useRef(null);
   const governorRef = useRef(null);
 
@@ -20154,6 +20182,21 @@ function App({ onCreateRemote = () => {} } = {}) {
   showHelpRef.current = showHelp;
   const remoteSetupRef = useRef(false);
   remoteSetupRef.current = remoteSetup;
+  function handleTerminalFocusIn() {
+    const revalidate = focusRevalidateRef.current;
+    if (!revalidate || notificationsOpenRef.current || remoteSetupRef.current) return;
+    const key = TABS[activeIndexRef.current].key;
+    const nowMs = Date.now();
+    const decision = terminalFocusRevalidation({
+      nowMs,
+      lastOkAt: lastOkRef.current[key],
+      lastAttemptAt: lastFocusAttemptRef.current[key],
+      inFlight: inFlightRef.current[key],
+    });
+    if (!decision.revalidate) return;
+    lastFocusAttemptRef.current[key] = nowMs;
+    void revalidate(key);
+  }
   const headerRef = useRef(null);
   const dragRef = useRef(null);
   const resizeRef = useRef({
@@ -20177,6 +20220,17 @@ function App({ onCreateRemote = () => {} } = {}) {
       disableMouseReporting();
     };
   }, [interactive, widthMode]);
+
+  // Focus reporting stays on for the whole interactive session; width mode and
+  // every view consume the tokens before any key binding sees them.
+  // Off while remote setup owns the terminal, so no report reaches gh's prompt.
+  useEffect(() => {
+    if (!interactive || remoteSetup) return;
+    enableFocusReporting();
+    return () => {
+      disableFocusReporting();
+    };
+  }, [interactive, remoteSetup]);
 
   function applyWidthOverrides(next) {
     const current = widthOverridesRef.current;
@@ -20458,6 +20512,14 @@ function App({ onCreateRemote = () => {} } = {}) {
       if (input.startsWith("[<")) {
         const mouse = parseSgrMouse(input);
         if (mouse) handleSgrMouse(mouse);
+        return;
+      }
+      // Terminal focus reports (mode 1004) arrive the same way, as "[I" and
+      // "[O", or with an Escape read in the same chunk kept in front. Consume
+      // them before every binding: a leaked Escape would quit.
+      // eslint-disable-next-line no-control-regex -- the optional Escape is the point
+      if (/^\x1b?\[[IO]$/.test(input)) {
+        if (input.endsWith("I")) handleTerminalFocusIn();
         return;
       }
       if(featureRef.current?.mode==='ci' && featureRef.current.ciRange && !(input==='c' && key.ctrl)){
@@ -22156,8 +22218,11 @@ function App({ onCreateRemote = () => {} } = {}) {
     // `manual` is the user asking now: it bypasses the scheduled deadline and
     // the tab's failure ladder. `force` is the separate, stronger request that
     // also drops validators -- the `R` key. `r` is manual and not forced, which
-    // is what makes a quiet refresh cost nothing.
-    async function requestTab(key, kind = "active", { force = false, detachTransport = false } = {}) {
+    // is what makes a quiet refresh cost nothing. `newGeneration` asks the
+    // shared engine for a new observation before the snapshot is due, without
+    // the manual or forced semantics.
+    async function requestTab(key, kind = "active",
+      { force = false, detachTransport = false, newGeneration = false } = {}) {
       const manual = kind === "manual";
       const signal = controller.signal;
       const monotonicNow = performance.now();
@@ -22224,7 +22289,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         // Manual refresh and viewport page demand both request a new shared
         // generation now. Only uppercase R sets transport `force` below and
         // drops validators; lowercase r and pagination remain conditional.
-        force: manual || force,
+        force: manual || force || newGeneration,
       });
       if (!ownership.ok) {
         pauseCoordination(key, ownership.reason, null, true);
@@ -22630,6 +22695,14 @@ function App({ onCreateRemote = () => {} } = {}) {
       return requestTab(key, kind, { force });
     };
 
+    // Terminal focus-in on the selected tab. Not the tab-switch path above,
+    // whose side effects would reset a quiet tab; the one-shot entry keeps an
+    // on-demand tab eligible through an admission delay.
+    focusRevalidateRef.current = (key) => {
+      if (runtime.background === "on-demand" && key !== "actions") requestedTabs.set(key, Date.now());
+      return requestTab(key, "active", { newGeneration: true });
+    };
+
     async function resumePending(nowMs) {
       for (const item of [...cleanupQueue]) retryPendingCleanup(item.cleanupKey, item, nowMs);
       for (const [key, item] of [...pending]) {
@@ -22976,6 +23049,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     void bootstrap();
     return () => {
       cancelled = true;
+      focusRevalidateRef.current = null;
       livenessWake.stop();
       heartbeatWake.stop();
       queuedManual.clear();
@@ -23460,6 +23534,7 @@ function enterAlternateScreen() {
 function createTerminalLifecycle(write) {
   if (typeof write !== "function") throw new TypeError("write must be a function");
   let mouseReportingEnabled = false;
+  let focusReportingEnabled = false;
   let screenRestored = false;
 
   function enableMouseReporting() {
@@ -23476,9 +23551,27 @@ function createTerminalLifecycle(write) {
     return true;
   }
 
+  // Terminal focus reporting (xterm mode 1004): the terminal sends ESC [ I on
+  // focus-in and ESC [ O on focus-out. Not the Jev semantic Focus feature.
+  function enableFocusReporting() {
+    if (focusReportingEnabled || screenRestored) return false;
+    write("\x1b[?1004h");
+    focusReportingEnabled = true;
+    return true;
+  }
+
+  function disableFocusReporting() {
+    if (!focusReportingEnabled) return false;
+    write("\x1b[?1004l");
+    focusReportingEnabled = false;
+    return true;
+  }
+
   function restoreScreen() {
     if (screenRestored) return false;
     disableMouseReporting();
+    // Left on, the shell would receive ^[[I and ^[[O on every pane switch.
+    disableFocusReporting();
     screenRestored = true;
     // Ink restores the cursor only through its own unmount path, which an
     // explicit process.exit() skips.
@@ -23489,8 +23582,11 @@ function createTerminalLifecycle(write) {
   return {
     enableMouseReporting,
     disableMouseReporting,
+    enableFocusReporting,
+    disableFocusReporting,
     restoreScreen,
     isMouseReportingEnabled: () => mouseReportingEnabled,
+    isFocusReportingEnabled: () => focusReportingEnabled,
   };
 }
 
@@ -23504,9 +23600,17 @@ function disableMouseReporting() {
   return terminalLifecycle.disableMouseReporting();
 }
 
+function enableFocusReporting() {
+  return terminalLifecycle.enableFocusReporting();
+}
+
+function disableFocusReporting() {
+  return terminalLifecycle.disableFocusReporting();
+}
+
 // Idempotent because both the lifecycle controller and this process-level
-// wrapper share one restored state. Mouse modes are always disabled before the
-// alternate buffer is released, including when this is only the exit backstop.
+// wrapper share one restored state. Mouse and focus modes are always disabled
+// before the alternate buffer is released, including when this is only the exit backstop.
 function restoreScreen() {
   return terminalLifecycle.restoreScreen();
 }
@@ -23717,6 +23821,9 @@ if (IS_MAIN && !runtime.headlessMode) {
 // Exported for unit tests. The dashboard itself is still one file; these are
 // the pure functions worth pinning, and nothing here is part of the public API.
 export {
+  TERMINAL_FOCUS_MIN_AGE_MS,
+  TERMINAL_FOCUS_THROTTLE_MS,
+  terminalFocusRevalidation,
   focusDisclosureLines, focusSemanticRows, focusSemanticCoverage,
   JEV_MODEL, JEV_QUESTION_VERSION, withoutJevCredential, classifyJevProbability, validateJevResponse, buildFocusJevRequest, createJevSession,
   CI_QUESTION_VERSION, CI_OBSERVATION_CATEGORIES, prepareCiSpans, buildCiQuestions, validateCiObservations,

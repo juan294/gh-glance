@@ -31,6 +31,8 @@ const MOUSE_1002_ENTER = `${ESC}[?1002h`;
 const MOUSE_1002_EXIT = `${ESC}[?1002l`;
 const MOUSE_1006_ENTER = `${ESC}[?1006h`;
 const MOUSE_1006_EXIT = `${ESC}[?1006l`;
+const FOCUS_1004_ENTER = `${ESC}[?1004h`;
+const FOCUS_1004_EXIT = `${ESC}[?1004l`;
 
 const OSC = new RegExp(`${ESC}\\][^\\x07${ESC}]*(?:\\x07|${ESC}\\\\)`, "g");
 const SGR_MOUSE = new RegExp(`${ESC}\\[<[0-9]+;[0-9]+;[0-9]+[Mm]`, "g");
@@ -374,6 +376,15 @@ export function parseCapture(raw, dimensions = null) {
       const last1006Exit = lastBefore(mouse1006ExitPositions, position);
       return last1002Exit > last1002Enter && last1006Exit > last1006Enter;
     });
+  const focus1004EnterPositions = positionsOf(raw, FOCUS_1004_ENTER);
+  const focus1004ExitPositions = positionsOf(raw, FOCUS_1004_EXIT);
+  const focusEnableAfterAltEnter =
+    focus1004EnterPositions.length > 0 &&
+    focus1004EnterPositions[0] > (positionsOf(raw, ALT_ENTER)[0] ?? Infinity);
+  const focusDisableBeforeAltExit =
+    altExitPositions.length > 0 &&
+    altExitPositions.every((position) =>
+      lastBefore(focus1004ExitPositions, position) > lastBefore(focus1004EnterPositions, position));
   const mouseReportingEnabled =
     lastPosition(mouse1002EnterPositions) > lastPosition(mouse1002ExitPositions) ||
     lastPosition(mouse1006EnterPositions) > lastPosition(mouse1006ExitPositions);
@@ -433,6 +444,12 @@ export function parseCapture(raw, dimensions = null) {
     mouse1006EnterPositions,
     mouse1006ExitPositions,
     mouseDisableBeforeAltExit,
+    focus1004Enter: focus1004EnterPositions.length,
+    focus1004Exit: focus1004ExitPositions.length,
+    focus1004EnterPositions,
+    focus1004ExitPositions,
+    focusEnableAfterAltEnter,
+    focusDisableBeforeAltExit,
     finalFrame: {
       lines: finalFrameLines,
       widest: finalFrameLines.reduce((max, line) => Math.max(max, [...line].length), 0),

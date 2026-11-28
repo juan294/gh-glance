@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-28
+
+### Added
+
+- In standalone mode, returning to a gh-glance pane now checks the selected
+  tab if its data is at least 15 seconds old, when the terminal reports focus
+  changes. Cached rows stay on screen while the check runs. The check covers
+  that tab only, runs at most once every 15 seconds per tab, and respects
+  rate-limit holds and failure backoff. On a quiet Actions tab it is a free
+  conditional request. Hidden tabs, Notifications and `--connect` panes are
+  not checked. Terminals without focus reporting behave as before; in tmux,
+  enable `set -g focus-events on`.
+
 ## [0.20.0] - 2026-11-22
 
 ### Changed
@@ -1501,7 +1514,8 @@ engineering, security, QA and UX. What follows is what changed as a result.
 - The `main` field from `package.json`. It advertised the file as importable,
   but importing it took over the terminal or exited the host process.
 
-[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/juan294/gh-glance/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/juan294/gh-glance/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/juan294/gh-glance/compare/v0.19.4...v0.20.0
 [0.19.4]: https://github.com/juan294/gh-glance/compare/v0.19.3...v0.19.4
 [0.19.3]: https://github.com/juan294/gh-glance/compare/v0.19.2...v0.19.3

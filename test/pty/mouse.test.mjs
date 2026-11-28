@@ -99,6 +99,15 @@ function assertMouseLifecycle(result, label) {
   );
 }
 
+// Terminal focus reporting (mode 1004) shares the restore path. Asserted only
+// for real runs: the synthetic capture below never enabled it.
+function assertFocusLifecycle(result, label) {
+  assert.equal(result.focus1004Enter, 1, `${label}: focus reporting enable count`);
+  assert.equal(result.focus1004Exit, 1, `${label}: focus reporting disable count`);
+  assert.equal(result.focusEnableAfterAltEnter, true, `${label}: focus reporting enabled outside the alternate screen`);
+  assert.equal(result.focusDisableBeforeAltExit, true, `${label}: focus reporting disabled too late`);
+}
+
 function assertMouseNeverEnabled(result, label) {
   assert.equal(result.altEnter, 1, `${label}: alternate-screen enter count`);
   assert.equal(result.altExit, 1, `${label}: alternate-screen exit count`);
@@ -218,6 +227,7 @@ if (path.basename(process.argv[1] || "") === "index.mjs") {
   assert.equal(terminated.exitCode, 143, "SIGTERM should use the conventional exit code");
   assertBoundedFrame(terminated, { cols: 80, rows: 24, label: "SIGTERM" });
   assertMouseLifecycle(terminated, "SIGTERM");
+  assertFocusLifecycle(terminated, "SIGTERM");
   assert.equal(terminated.afterRestore.visible, "", "SIGTERM left output on the primary buffer");
 });
 
@@ -253,6 +263,7 @@ if (path.basename(process.argv[1] || "") === "index.mjs") {
   // describe it. The bounded repaint and teardown contracts still apply.
   assert.ok(crashed.fullClears <= 2, "crash: unexpected full-screen repaint count");
   assertMouseLifecycle(crashed, "crash");
+  assertFocusLifecycle(crashed, "crash");
   assert.match(crashed.afterRestore.visible, /gh-glance: crashed/);
   assert.match(crashed.afterRestore.visible, /phase4 lifecycle test crash/);
 });
@@ -292,6 +303,12 @@ test("remote setup disables mouse reporting before handing the terminal to gh", 
   // count nor its width describes the 24x80 dashboard anymore.
   assert.ok(handoff.fullClears <= 2, "remote setup: unexpected full-screen repaint count");
   assertMouseNeverEnabled(handoff, "remote setup");
+  // Remote setup owns the terminal, so focus reporting is off before the
+  // handoff: either never enabled, or every enable has a later disable.
+  assert.equal(handoff.focus1004Enter, handoff.focus1004Exit, "remote setup: focus reporting left on");
+  if (handoff.focus1004Enter > 0) {
+    assert.equal(handoff.focusDisableBeforeAltExit, true, "remote setup: focus reporting disabled too late");
+  }
   assert.deepEqual(
     handoff.fixtureCalls.filter((call) => call === "repo create"),
     ["repo create"],

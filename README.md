@@ -448,7 +448,7 @@ pane definition. Flags are there when you want them:
 | `-R`, `--repo [host/]owner/name` | Watch a specific repository instead of the current directory's. Works from anywhere -- you do not need a local clone. The optional host targets a GitHub Enterprise or EMU data-residency tenant, e.g. `tenant.ghe.com/acme/widget`. |
 | `--refresh <seconds>` | Minimum automatic poll interval, 2-3600, default 5. A floor, never a ceiling: a tab whose content is unchanged twice in a row slows to 30 seconds (60 for Security), and Actions with a running or queued job is checked every 5. Safe shared grants can make any check later. |
 | `--tab <name>` | Start on `actions`, `issues`, `prs` or `security`. |
-| `--background <mode>` | `on-demand` (default): active Actions updates automatically; Issues, PRs and Security use cached data and check when opened or refreshed with `r`. Unopened tabs make no data requests. `all` continuously polls active and inactive tabs; `off` continuously polls only the selected tab. |
+| `--background <mode>` | `on-demand` (default): active Actions updates automatically; Issues, PRs and Security use cached data and check when opened or refreshed with `r`. Unopened tabs make no data requests. `all` continuously polls active and inactive tabs; `off` continuously polls only the selected tab. In standalone mode, returning to the pane checks the selected tab if its data is at least 15 seconds old, when the terminal reports focus (see [Rate limit](#rate-limit)). |
 | `--jev` | Enable optional semantic Focus, CI observations and attention badges in an interactive standalone dashboard. Requires `TYPESAFE_API_KEY` and explicit scoped consent; startup and ordinary refresh send no model requests. |
 | `--jev-max-requests <n>` | Set the per-process model-call cap, 1-10000 (default 100); requires `--jev`. |
 | `--verbose` | Log one line per dashboard `gh` call to stderr, with timing and outcome. Credential lookup and the account-identity proof are deliberately excluded, so that they cannot log anything derived from a token. stderr must be redirected: `gh-glance --verbose 2>gh-glance.log`. |
@@ -911,6 +911,14 @@ outstanding request continues through admission delays and transient failures.
 Cached tab counts are last known values, not live counts. `--background all`
 restores continuous polling of all tabs; `--background off` continuously polls
 only the selected tab.
+
+In standalone mode, when the terminal reports focus, returning to the pane
+checks the selected tab if its data is at least 15 seconds old. Cached rows
+stay on screen while that check runs. It is a check of that tab only, at most
+once every 15 seconds, and the governor still decides when it runs. On a quiet
+Actions tab it is a conditional request that costs nothing. Hidden tabs and Notifications are not checked, and `--connect` panes do
+not use it. Terminals without focus reporting behave as before. In tmux, add
+`set -g focus-events on` to your configuration to forward focus changes.
 
 The following cadence table applies to automatically polled tabs:
 
