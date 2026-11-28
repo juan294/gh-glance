@@ -1286,9 +1286,11 @@ test("linear screen-reader output retains startup, holds, failures, limits, stal
     rows: 24,
     signal: "none",
     settle: 30,
+    // Wait for the reset hold itself. A transient "Paused coordination" can
+    // render first, and quitting on it left the assertions below unmet.
     stdin: waitForAwk(
       '"$GH_GLANCE_CAPTURE_OUT"',
-      'index($0, "Paused") { ok=1 }',
+      '/reset [0-9]+m/ { ok=1 }',
       250,
     ) + "sleep .3; printf q",
     configHome: heldBox.root,

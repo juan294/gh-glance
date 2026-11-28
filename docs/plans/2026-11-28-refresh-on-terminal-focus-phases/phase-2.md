@@ -62,4 +62,4 @@ In Rex, with the built checkout: put a pane on Issues, wait more than 15 s, focu
 - [x] TF-10 to TF-18 green; efficiency unchanged; focused set green on Node 22 and 24. Full `test:pty` had one unrelated intermittent failure (see notes, "Open")
 - [x] Help, README and CHANGELOG updated, and checked against the last tag
 - [x] Independent review and simplify pass
-- [ ] Owner visual check in Rex (manual, pending)
+- [x] Owner visual check in Rex, 2026-11-28: after more than 15 s away, returning fetched exactly one more Issues page; #41 stayed visible in all 16 captured frames and its title updated in place; clean exit

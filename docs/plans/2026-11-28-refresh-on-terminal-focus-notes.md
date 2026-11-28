@@ -76,7 +76,7 @@ Recorded per run. Exit code 0 means every test in the selection passed.
 | Final (`81a3056`) | `npm run test:pty` | 24.22.3 | **1** (278 passed, 1 failed, 2,825 s) |
 | Final (`81a3056`) | `test/pty/status.test.mjs` rerun | 24.22.3 | 0 (26/26) |
 
-### Open: intermittent "linear screen-reader output retains startup, holds..." failure
+### Resolved: intermittent "linear screen-reader output retains startup, holds..." failure
 
 The one failure in the final `npm run test:pty` run is `test/pty/status.test.mjs:1244`. Its core-exhausted capture expected `reset \d+m`. Instead it showed "Paused coordination" with the fallback copy "Local coordination unavailable". The capture lasted 1.86 s and made no core observer call (`api -i user`). The test's barrier waits for any "Paused", so a transient coordination pause satisfies it before the reset hold is published.
 
@@ -84,4 +84,6 @@ The one failure in the final `npm run test:pty` run is `test/pty/status.test.mjs
 - VERIFIED: in isolated reruns on `81a3056`, it failed 1 of 3 at first, then passed 18 in a row. The whole file passed once (26/26). It passed 13 of 13 on the base `154930d`.
 - INFERRED: a startup coordination race that the loose "Paused" barrier exposes. It is not caused by focus code, which no run reached. With 2 failures in 22 candidate runs and 0 in 13 base runs, the sample cannot rule out a timing contribution from the extra `?1004h` write at mount. The root cause is unproven.
 - Disposition: recorded as an open risk for owner review. Next step if it recurs: tighten the barrier to wait for `reset \d+m`, and compare failure rates with the focus effect disabled.
+
+Resolved 2026-11-28. The owner accepted the focus feature and diagnosed the test. In three diagnostic runs on the same fixture, waiting for the reset time showed "Paused coordination" followed by "Paused reset 60m" every time. The barrier now waits for `reset [0-9]+m` and the assertion is unchanged, so the test still fails if the rate-limit message never appears. After the change the test passed 5 of 5 in isolation and `test/pty/status.test.mjs` passed 26 of 26 (Node 24.22.3). No focus code changed. The recorded full `npm run test:pty` result for `81a3056` stays 278 passed, 1 failed.
 
