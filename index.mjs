@@ -207,6 +207,16 @@ const AUTH_RETRY_MS = [30_000];
 // byte-identical-idle-frame property the rest of this file works to keep.
 const STALE_AFTER_MS = 30_000;
 
+// Terminal focus (xterm mode 1004), not the Jev semantic Focus. Returning to a
+// pane checks its selected tab only when that data is at least this old, and
+// at most once per throttle window per tab, timed from the attempt so a tab
+// whose age cannot advance (failure, hold) is not retried on every return.
+// SWR throttles focus revalidation to 5s; 15s skips quick glances away while
+// still catching a free 304 on a quiet Actions tab
+// (docs/research/2026-11-28-intermediate-background-refresh-assessment.md).
+const TERMINAL_FOCUS_MIN_AGE_MS = 15_000;
+const TERMINAL_FOCUS_THROTTLE_MS = 15_000;
+
 // A coordination hold must persist long enough to be meaningful before it
 // takes the notice row. Short startup and lock-contention states recover on
 // their own and should not present themselves as user-visible failures.
@@ -12554,6 +12564,10 @@ Options:
                            \`off\` never requests data
                            for a tab you are not looking at; its count stays at
                            the last known value and visibly ages.
+                           In standalone mode, when the terminal reports focus,
+                           returning to the pane checks the selected tab if its
+                           data is older than ${TERMINAL_FOCUS_MIN_AGE_MS / 1000}s. In tmux, enable
+                           \`set -g focus-events on\`.
   --jev                    Enable explicit semantic Focus, CI observations and
                            attention badges in standalone mode.
   --jev-max-requests <n>    Session call cap, 1-10000 (default 100); requires --jev.
@@ -16161,6 +16175,21 @@ function manualRefreshRequest(intent) {
     return { kind: "manual", force: true, dropValidators: true, clearCapabilityBackoff: true };
   }
   return null;
+}
+
+// Whether a terminal focus-in should check the selected tab. Pure so the
+// thresholds are pinned by a table; the caller supplies the tab's state.
+function terminalFocusRevalidation({ nowMs, lastOkAt, lastAttemptAt, inFlight, fetcherReady }) {
+  if (!fetcherReady) return { revalidate: false, reason: "unavailable" };
+  if (inFlight) return { revalidate: false, reason: "in-flight" };
+  if (Number.isFinite(lastAttemptAt) && nowMs - lastAttemptAt < TERMINAL_FOCUS_THROTTLE_MS) {
+    return { revalidate: false, reason: "throttled" };
+  }
+  if (!Number.isFinite(lastOkAt)) return { revalidate: true, reason: "never-loaded" };
+  // A source time ahead of this clock yields a negative age, which is fresh.
+  return nowMs - lastOkAt >= TERMINAL_FOCUS_MIN_AGE_MS
+    ? { revalidate: true, reason: "stale" }
+    : { revalidate: false, reason: "fresh" };
 }
 
 // A press during automatic work either rides that work or schedules exactly one
@@ -20127,6 +20156,9 @@ function App({ onCreateRemote = () => {} } = {}) {
   const fetchTabRef = useRef(null);
   // Called with true on terminal focus-in and false on focus-out.
   const terminalFocusRef = useRef(null);
+  // Set only by the standalone acquisition effect; connected mode has none.
+  const focusRevalidateRef = useRef(null);
+  const lastFocusAttemptRef = useRef({});
   const contextCoordinatorRef = useRef(null);
   const governorRef = useRef(null);
 
@@ -20156,6 +20188,21 @@ function App({ onCreateRemote = () => {} } = {}) {
   showHelpRef.current = showHelp;
   const remoteSetupRef = useRef(false);
   remoteSetupRef.current = remoteSetup;
+  terminalFocusRef.current = (focused) => {
+    if (!focused || notificationsOpenRef.current || remoteSetupRef.current) return;
+    const key = TABS[activeIndexRef.current].key;
+    const nowMs = Date.now();
+    const decision = terminalFocusRevalidation({
+      nowMs,
+      lastOkAt: lastOkRef.current[key] ?? null,
+      lastAttemptAt: lastFocusAttemptRef.current[key] ?? null,
+      inFlight: Boolean(inFlightRef.current[key]),
+      fetcherReady: focusRevalidateRef.current !== null,
+    });
+    if (!decision.revalidate) return;
+    lastFocusAttemptRef.current[key] = nowMs;
+    void focusRevalidateRef.current(key);
+  };
   const headerRef = useRef(null);
   const dragRef = useRef(null);
   const resizeRef = useRef({
@@ -20182,13 +20229,14 @@ function App({ onCreateRemote = () => {} } = {}) {
 
   // Focus reporting stays on for the whole interactive session; width mode and
   // every view consume the tokens before any key binding sees them.
+  // Off while remote setup owns the terminal, so no report reaches gh's prompt.
   useEffect(() => {
-    if (!interactive) return;
+    if (!interactive || remoteSetup) return;
     enableFocusReporting();
     return () => {
       disableFocusReporting();
     };
-  }, [interactive]);
+  }, [interactive, remoteSetup]);
 
   function applyWidthOverrides(next) {
     const current = widthOverridesRef.current;
@@ -20474,8 +20522,9 @@ function App({ onCreateRemote = () => {} } = {}) {
       }
       // Terminal focus reports (mode 1004) arrive the same way, as "[I" and
       // "[O". Consume them before every binding: a leaked Escape would quit.
-      if (input === "[I" || input === "[O") {
-        terminalFocusRef.current?.(input === "[I");
+      // An Escape read together with a report arrives as meta + "\x1b[I".
+      if (input === "[I" || input === "[O" || input === "\x1b[I" || input === "\x1b[O") {
+        terminalFocusRef.current?.(input.endsWith("[I"));
         return;
       }
       if(featureRef.current?.mode==='ci' && featureRef.current.ciRange && !(input==='c' && key.ctrl)){
@@ -22174,8 +22223,11 @@ function App({ onCreateRemote = () => {} } = {}) {
     // `manual` is the user asking now: it bypasses the scheduled deadline and
     // the tab's failure ladder. `force` is the separate, stronger request that
     // also drops validators -- the `R` key. `r` is manual and not forced, which
-    // is what makes a quiet refresh cost nothing.
-    async function requestTab(key, kind = "active", { force = false, detachTransport = false } = {}) {
+    // is what makes a quiet refresh cost nothing. `revalidate` asks the shared
+    // engine for a new generation even before the snapshot is due, keeping
+    // validators, the failure ladder and automatic priority: terminal focus.
+    async function requestTab(key, kind = "active",
+      { force = false, detachTransport = false, revalidate = false } = {}) {
       const manual = kind === "manual";
       const signal = controller.signal;
       const monotonicNow = performance.now();
@@ -22242,7 +22294,7 @@ function App({ onCreateRemote = () => {} } = {}) {
         // Manual refresh and viewport page demand both request a new shared
         // generation now. Only uppercase R sets transport `force` below and
         // drops validators; lowercase r and pagination remain conditional.
-        force: manual || force,
+        force: manual || force || revalidate,
       });
       if (!ownership.ok) {
         pauseCoordination(key, ownership.reason, null, true);
@@ -22648,6 +22700,16 @@ function App({ onCreateRemote = () => {} } = {}) {
       return requestTab(key, kind, { force });
     };
 
+    // Terminal focus-in on the selected tab. Deliberately not the tab-switch
+    // path above: no quiet-counter reset, no clearing of other one-shot
+    // requests, no cancellation of other pending work and no deadline move.
+    // The one-shot entry keeps an on-demand tab eligible through an admission
+    // delay, exactly as for a tab you open.
+    focusRevalidateRef.current = (key) => {
+      if (runtime.background === "on-demand" && key !== "actions") requestedTabs.set(key, Date.now());
+      return requestTab(key, "active", { revalidate: true });
+    };
+
     async function resumePending(nowMs) {
       for (const item of [...cleanupQueue]) retryPendingCleanup(item.cleanupKey, item, nowMs);
       for (const [key, item] of [...pending]) {
@@ -22994,6 +23056,7 @@ function App({ onCreateRemote = () => {} } = {}) {
     void bootstrap();
     return () => {
       cancelled = true;
+      focusRevalidateRef.current = null;
       livenessWake.stop();
       heartbeatWake.stop();
       queuedManual.clear();
@@ -23765,6 +23828,9 @@ if (IS_MAIN && !runtime.headlessMode) {
 // Exported for unit tests. The dashboard itself is still one file; these are
 // the pure functions worth pinning, and nothing here is part of the public API.
 export {
+  TERMINAL_FOCUS_MIN_AGE_MS,
+  TERMINAL_FOCUS_THROTTLE_MS,
+  terminalFocusRevalidation,
   focusDisclosureLines, focusSemanticRows, focusSemanticCoverage,
   JEV_MODEL, JEV_QUESTION_VERSION, withoutJevCredential, classifyJevProbability, validateJevResponse, buildFocusJevRequest, createJevSession,
   CI_QUESTION_VERSION, CI_OBSERVATION_CATEGORIES, prepareCiSpans, buildCiQuestions, validateCiObservations,

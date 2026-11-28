@@ -14,3 +14,37 @@ No project overlay exists for `rpi-implement` (`.rpi/project/rpi-implement.md` i
 | TF-02 covers the CI line-range draft in the new file | The draft needs the Jev, CI log and HTTPS fixtures of `test/pty/ci-observations.test.mjs` | Focus reports are sent while the draft is open in the existing "range editor owns q" case. The draft must read `CI range > q` afterwards | Same assertion, no second copy of the CI fixture setup |
 | TF-05 is a new run with no focus input | That run would duplicate "default on-demand tabs stop after opening" (`test/pty/adaptive-polling.test.mjs`), which now runs with focus reporting on | That case asserts `focus1004Enter === 1` with its existing request counts | Same evidence without another 35 s PTY run |
 | Frame unchanged after a focus report | Whole-frame equality is unstable because ages tick | The tab bar line, the selected row and a view marker must be identical before and after | Detects every leak we can produce (the guard removed makes TF-02 fail at "help: selection changed") |
+| Focus guard is "the very first branch" | It is the second branch, after the SGR mouse `[<` branch. The two never match the same input | Kept | Recorded after independent review; no behavior impact |
+
+Phase 1 review (fresh-context agent, 2026-11-28): no blocking findings. Repairs applied in the phase 2 commit:
+
+- A focus report read together with a user's Escape arrives as meta plus `\x1b[I`; it is now consumed too.
+- Focus reporting is off while remote setup owns the terminal, so a buffered report cannot reach `gh repo create`. The remote-setup PTY assertion now requires every enable to have a later disable.
+- TF-02 now proves a selected row exists before comparing it (the first version compared two empty strings on Issues, because nothing is selected until you move), and asserts that no `gh` call follows a focus report.
+
+Rejected as non-actionable: the TF-03 split cannot prove two reads through `script(1)`. This is the same limit as the SGR mouse precedent and is recorded in the plan's evidence limits.
+
+### Phase 2
+
+| Plan said | Found | Chose | Why |
+| --- | --- | --- | --- |
+| Call `requestTab(key, "active")` unchanged | A non-manual, non-forced request returns the shared snapshot as `fresh` while `snapshot.nextDueAt` is in the future (`acquisitionEngine.refresh`, `requestedGeneration <= record.generation && record.snapshot?.nextDueAt > now()`). A quiet Actions tab is due 30 s after its last check, so a focus-in at 16 s would fetch nothing | New `revalidate` option on `requestTab`: the engine call uses `force: manual \|\| force \|\| revalidate`. Transport `force` (validators), priority, backoff and the manual probe are unchanged | Without it the plan's outcome ("checks if older than 15 s") and TF-13/16 cannot hold. A fresh shared observation from another pane still updates `lastOkRef`, so the 15 s age check suppresses a duplicate |
+| TF-13 and TF-16 are separate | Both need the same quiet-Actions setup | One test: a conditional request with 0 core, starting within 3 s of the focus-in, and the next scheduled check at least 25 s later | One 60 s run instead of two |
+| TF-16 second case: a held Issues request completes after focus on Actions | Reaching Actions from Issues needs a tab switch, which is the path under comparison, and the Issues request is in flight rather than governor-pending, which neither path cancels. The test could not tell the two paths apart | Not added. The entry point is reviewed to contain no `cancelPending`, `requestedTabs.clear()`, `unchangedPolls` write or `replaceActivePoll` | A test that cannot fail on the regression is not evidence |
+| TF-14 uses `GH_GLANCE_FIXTURE_FAIL` | With `GH_GLANCE_FIXTURE_STATE` set, the fixture runs `gh-state.mjs`, which takes failures only from its state file | State `failure: { selector: "graphql-data", remaining: 2, message: "HTTP 404: Not Found" }` ("unavailable", 60 s ladder) | Same verdict and ladder through the fixture's supported switch |
+| TF-15: focus-in during a hold, then the fixture budget is restored | Lowering the budget mid-run is not observed until the next response | GraphQL starts below the reserve with a reset at 14 s. Opening Issues is held; two focus-ins during the hold add no request; after the reset exactly one Issues page completes | Same property: focus joins the held intent and adds none |
+| TF-13 "0 GraphQL" | The GraphQL budget observer runs on its own schedule | Assert no GraphQL data page (`*.page`) | The observer is control-plane work, not a focus request |
+
+## Gate evidence
+
+Recorded per run. Exit code 0 means every test in the selection passed.
+
+| Candidate | Check | Node | Result |
+| --- | --- | --- | --- |
+| Phase 1 (`5b74e0e`) | `npm run lint`, `node --check index.mjs` | 24.22.3 | 0, 0 |
+| Phase 1 (`5b74e0e`) | `npm test` | 24.22.3 | 0 (1146/1146) |
+| Phase 2 working tree (committed below as the phase 2 commit) | `npm run lint`, `node --check index.mjs` | 24.22.3 | 0, 0 |
+| Phase 2 working tree | `npm test` | 24.22.3 | 0 (1148/1148) |
+| Phase 2 working tree | `npm run test:efficiency` | 24.22.3 | 0 (9/9) |
+| Phase 2 working tree | `npm test` equivalent (`node --test --test-skip-pattern='E2E-' test/*.test.mjs`) | 22.22.2 | 0 (1148/1148) |
+| Phase 2 working tree | `test/pty/terminal-focus.test.mjs` | 22.22.2 | 0 (8/8) |

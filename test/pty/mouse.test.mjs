@@ -302,7 +302,12 @@ test("remote setup disables mouse reporting before handing the terminal to gh", 
   // count nor its width describes the 24x80 dashboard anymore.
   assert.ok(handoff.fullClears <= 2, "remote setup: unexpected full-screen repaint count");
   assertMouseNeverEnabled(handoff, "remote setup");
-  assertFocusLifecycle(handoff, "remote setup");
+  // Remote setup owns the terminal, so focus reporting is off before the
+  // handoff: either never enabled, or every enable has a later disable.
+  assert.equal(handoff.focus1004Enter, handoff.focus1004Exit, "remote setup: focus reporting left on");
+  if (handoff.focus1004Enter > 0) {
+    assert.equal(handoff.focusDisableBeforeAltExit, true, "remote setup: focus reporting disabled too late");
+  }
   assert.deepEqual(
     handoff.fixtureCalls.filter((call) => call === "repo create"),
     ["repo create"],
