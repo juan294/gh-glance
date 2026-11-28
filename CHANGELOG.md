@@ -10,10 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - In standalone mode, returning to a gh-glance pane now checks the selected
-  tab if its data is older than 15 seconds, when the terminal reports focus
-  changes. Cached rows stay on screen while the check runs. The check is one
-  conditional request for that tab only, at most once every 15 seconds per tab,
-  and it respects rate-limit holds and failure backoff. Hidden tabs,
+  tab if its data is at least 15 seconds old, when the terminal reports focus
+  changes. Cached rows stay on screen while the check runs. The check covers
+  that tab only, runs at most once every 15 seconds per tab, and respects
+  rate-limit holds and failure backoff. On a quiet Actions tab it is a free
+  conditional request. Hidden tabs,
   Notifications and `--connect` panes are not checked. Terminals without focus
   reporting behave as before; in tmux, enable `set -g focus-events on`.
 

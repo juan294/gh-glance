@@ -35,6 +35,24 @@ Rejected as non-actionable: the TF-03 split cannot prove two reads through `scri
 | TF-15: focus-in during a hold, then the fixture budget is restored | Lowering the budget mid-run is not observed until the next response | GraphQL starts below the reserve with a reset at 14 s. Opening Issues is held; two focus-ins during the hold add no request; after the reset exactly one Issues page completes | Same property: focus joins the held intent and adds none |
 | TF-13 "0 GraphQL" | The GraphQL budget observer runs on its own schedule | Assert no GraphQL data page (`*.page`) | The observer is control-plane work, not a focus request |
 
+Phase 2 review (fresh-context agent, on `ea87155`): no blocking findings. Dispositions:
+
+- Should-fix, fixed: README and CHANGELOG said "one conditional request". Issues and PRs are GraphQL pages without validators, extra loaded pages are fetched too, and Security makes several source requests. The text now says the check covers that tab only and is a free conditional request on a quiet Actions tab. "Older than 15 s" became "at least 15 s old", matching `>= 15_000`.
+- Should-fix, fixed in part: TF-11 could not fail if the throttle or the blur guard were removed, because its second focus-in lands on fresh data. TF-10 now sends a focus-out on data at least 15 s old and requires no request. The attempt throttle cannot be observed in a PTY run, because backoff, holds and in-flight work already block a repeat. Its evidence is the unit table (14,999 ms throttled, 15,000 ms not). This corrects the plan's stuck-state row "second focus-in within 15 s makes no call", which claimed PTY proof.
+- Should-fix, addressed below: the gate evidence now names the final commit, and the full `npm run test:pty` and the Node 22 and 24 focus runs are recorded against it.
+- Nits accepted without change: `void` on the request promise has the same exposure as the existing `fetchTabRef` callers; a focus-in before the first scope exists behaves like the mount tab switch; focus still fires under Help, width mode and feature views, as the plan allows.
+- `revalidate` (renamed `newGeneration` in the simplify pass) was accepted. A cancelled or failed forced claim leaves `requestedGeneration` one ahead, which only makes the next scheduled refresh claim instead of follow. Manual `r` already does this.
+
+Simplify pass (four parallel reviewers: reuse, simplification, efficiency, altitude). Applied:
+
+- `terminalFocusRevalidation` no longer takes `fetcherReady`; the caller checks the entry point once. The `terminalFocusRef` indirection became a plain `handleTerminalFocusIn`, called only on focus-in. One regex replaces four string comparisons. Shorter comments.
+- `requestTab`'s option is named `newGeneration`, after what it asks of the engine.
+- `parseCapture` computes `focusEnableAfterAltEnter`; both `assertFocusLifecycle` copies use it.
+- TF-18 moved into `test/pty/collector.test.mjs` to reuse its entry, fixture, config and `waitForExit`, and it now waits for the collector to exit.
+- The driver parses the fixture state once per read and the screen once per sample. TF-13/16 checks a 26 s window instead of waiting for a fifth run (about 4 s shorter). TF-18's trailing wait is 2 s.
+
+Skipped: one shared one-shot helper for the three `requestedTabs` sites (unifying them would change the existing Actions behavior at the two older sites); a leading-Escape strip for mouse reports too, and moving the disable into `createRemote` (both change mouse behavior outside this diff); a boolean-only decision result and a single constant (the plan's table pins the reasons, and the owner accepted the age and the throttle as separate values).
+
 ## Gate evidence
 
 Recorded per run. Exit code 0 means every test in the selection passed.

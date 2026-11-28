@@ -10,15 +10,14 @@
 // the Escape and the rest of the report arrive in separate reads.
 
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { capture, captureAsync, waitForAwk } from "./capture.mjs";
+import { capture } from "./capture.mjs";
 
-const ESC = String.fromCharCode(27);
 const reader = new URL("./capture.mjs", import.meta.url).href;
 
 function fixture(t, overrides = {}) {
@@ -84,10 +83,8 @@ function assertDriver(root) {
 function assertFocusLifecycle(result, label) {
   assert.equal(result.focus1004Enter, 1, `${label}: focus reporting enable count`);
   assert.equal(result.focus1004Exit, 1, `${label}: focus reporting disable count`);
+  assert.equal(result.focusEnableAfterAltEnter, true, `${label}: focus reporting enabled outside the alternate screen`);
   assert.equal(result.focusDisableBeforeAltExit, true, `${label}: focus reporting disabled too late`);
-  const altEnter = result.raw.indexOf(`${ESC}[?1049h`);
-  assert.ok(altEnter !== -1 && result.focus1004EnterPositions[0] > altEnter,
-    `${label}: focus reporting enabled before the alternate screen`);
 }
 
 // ---------- TF-01 / TF-02 / TF-03 ----------
@@ -170,8 +167,12 @@ const REQUESTS = `
 const state = () => JSON.parse(readFileSync(process.env.GH_GLANCE_FIXTURE_STATE, "utf8"));
 const starts = (match) => state().events.filter((event) => event.type === "start" && match(event));
 const issuePages = () => starts((event) => event.graphqlOperation === "issues.page");
-const issueEnds = () => state().events.filter((event) => event.type === "end" &&
-  issuePages().some((start) => start.sequence === event.sequence));
+const issueEnds = () => {
+  const { events } = state();
+  const pages = new Set(events.filter((event) => event.type === "start" &&
+    event.graphqlOperation === "issues.page").map((event) => event.sequence));
+  return events.filter((event) => event.type === "end" && pages.has(event.sequence));
+};
 const runs = () => starts((event) => event.argv?.some((argument) => argument === ${JSON.stringify(RUNS_PATH)}));
 const dataStarts = () => starts((event) => event.graphqlOperation ||
   event.argv?.some((argument) => /actions\\/runs|alerts/.test(String(argument))));
@@ -210,18 +211,25 @@ await pause(3000);
 send(ESC + "[I");
 await pause(2500);
 if ((await settle(issuePages)).length !== 1) throw Error("TF-12: a fresh focus-in fetched");
-// TF-10: past 15 s the same focus-in checks the selected tab, rows in place.
+// A focus-out on the same stale data never checks anything.
 await pauseUntil(firstEnd + 16500);
+send(ESC + "[O");
+await pause(2000);
+if ((await settle(issuePages)).length !== 1) throw Error("a focus-out fetched");
+// TF-10: past 15 s a focus-in checks the selected tab, rows in place.
 const sentAt = Date.now();
 send(ESC + "[I");
 const samples = [];
-const sample = () => samples.push({ rows: screen().includes("SIGTERM erases"),
-  waiting: /Waiting to check|Loading/.test(screen()) });
+const sample = () => {
+  const text = screen();
+  samples.push({ rows: text.includes("SIGTERM erases"), waiting: /Waiting to check|Loading/.test(text) });
+};
 await until(() => { sample(); return issueEnds().length === 2; }, 10000);
 for (let index = 0; index < 20; index += 1) { sample(); await pause(50); }
 mark("samples", samples);
 mark("second-start", String((await settle(issuePages))[1].at - sentAt));
-// TF-11: an immediate second focus-in and a focus-out are throttled; r is not.
+// TF-11: an immediate second focus-in makes no request (here the data is
+// fresh; the 15 s attempt throttle itself is pinned by the unit table); r does.
 send(ESC + "[I"); send(ESC + "[O");
 await pause(2500);
 if ((await settle(issuePages)).length !== 2) throw Error("TF-11: a throttled focus-in fetched");
@@ -250,7 +258,7 @@ test("TF-13/16 a quiet Actions focus-in is a free conditional check that keeps t
   const box = fixture(t);
   const dimensions = { cols: 100, rows: 24 };
   const result = capture({
-    ...dimensions, signal: "none", settle: 100, configHome: box.root,
+    ...dimensions, signal: "none", settle: 75, configHome: box.root,
     args: "--repo acme/widget --refresh 2 --tab actions",
     env: { GH_GLANCE_CAPTURE_LIVE_FLUSH: "1", GH_GLANCE_FIXTURE_STATE: box.statePath },
     stdin: driver(box.root, REQUESTS + `
@@ -263,8 +271,11 @@ if ((await settle(runs)).length !== 3) throw Error("Actions was not on its quiet
 const sentAt = Date.now();
 send(ESC + "[I");
 await until(() => runs().length === 4, 5000);
-mark("focus-start", String((await settle(runs))[3].at - sentAt));
-await until(() => runs().length === 5, 45000);
+const focused = (await settle(runs))[3];
+mark("focus-start", String(focused.at - sentAt));
+// A tab-switch style reset would bring the next check back to the 2 s floor.
+await pauseUntil(focused.at + 26000);
+mark("runs-after-window", String((await settle(runs)).length));
 `, dimensions),
   });
   assertDriver(box.root);
@@ -274,9 +285,10 @@ await until(() => runs().length === 5, 45000);
   const focused = runs[3];
   assert.ok(isConditional(focused), "focus-in dropped If-None-Match");
   assert.equal(focused.cost.core, 0, "a quiet focus-in check spent primary REST");
-  // No tab-switch side effect: the quiet counter was not reset to the floor.
-  assert.ok(runs[4].at - focused.at >= 25_000,
-    `next scheduled check ${runs[4].at - focused.at}ms after the focus check`);
+  // No tab-switch side effect: the quiet counter was not reset to the floor,
+  // so no scheduled check follows within 26 s of the focus check.
+  assert.equal(readFileSync(join(box.root, "runs-after-window"), "utf8"), "4",
+    `scheduled checks too soon after the focus check: ${JSON.stringify(runs.map((run) => run.at - focused.at))}`);
   // The GraphQL observer is budget control-plane work; no data page may follow.
   assert.equal(state.events.filter((event) => event.type === "start" &&
     /\.page$/.test(event.graphqlOperation ?? "")).length, 0, "focus-in on Actions fetched GraphQL data");
@@ -376,48 +388,3 @@ if (!screen().includes("[5:Events")) throw Error("TF-17: focus-in left Notificat
   assert.equal(result.exitCode, 0);
 });
 
-// Modelled on "COL on-demand: real collector refreshes secondary data exactly
-// on request" in collector.test.mjs. Connected mode never installs the focus
-// entry point, so a stale focus-in sends no collector refresh.
-test("TF-18 focus-in in connected mode sends no collector refresh", async (t) => {
-  const entry = new URL("../../index.mjs", import.meta.url).pathname;
-  const fixtures = new URL("./fixtures/", import.meta.url).pathname;
-  // Short /tmp path: the collector socket path has a length limit.
-  const root = mkdtempSync("/tmp/ggc-focus-");
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const config = join(root, "collector.json");
-  const serverCalls = join(root, "server.calls");
-  const clientCalls = join(root, "client.calls");
-  writeFileSync(config, JSON.stringify({ version: 1,
-    providers: { personal: { type: "gh", host: "github.com" } },
-    targets: [{ host: "github.com", repo: "acme/widget", provider: "personal" }] }), { mode: 0o600 });
-  const fixturePath = `${fixtures}:${process.env.PATH}`;
-  const service = spawn(process.execPath, [entry, "--serve", "--config", config], {
-    env: { ...process.env, PATH: fixturePath, XDG_CONFIG_HOME: root, GH_CONFIG_DIR: root,
-      GH_GLANCE_FIXTURE_LOG: serverCalls },
-    stdio: ["ignore", "ignore", "pipe"],
-  });
-  t.after(() => service.kill("SIGTERM"));
-  let stderr = "";
-  service.stderr.on("data", (chunk) => { stderr += chunk; });
-  for (let index = 0; index < 200 && !stderr.includes("collector listening"); index += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  assert.match(stderr, /collector listening/);
-  const result = await captureAsync({
-    cols: 80, rows: 20, signal: "none", settle: 45, configHome: root,
-    args: "--connect local --repo acme/widget --tab issues --refresh 2",
-    env: { PATH: fixturePath, GH_GLANCE_FIXTURE_LOG: clientCalls },
-    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Cached") { ok=1 }', 200) +
-      "sleep 17; printf '\\033[I'; sleep 4; printf q",
-  });
-  const serverLog = existsSync(serverCalls) ? readFileSync(serverCalls, "utf8") : "";
-  const clientLog = existsSync(clientCalls) ? readFileSync(clientCalls, "utf8") : "";
-  assert.ok(result.liveScreen.statusHistory.some((line) => /Cached/.test(line)),
-    JSON.stringify({ statuses: result.liveScreen.statusHistory, serverLog, stderr }));
-  assert.equal(result.focus1004Enter, 1, "focus reporting must be on in connected mode too");
-  assert.equal(serverLog.split("\n").filter((line) => line.startsWith("graphql issues.page")).length, 1,
-    serverLog);
-  assert.equal(clientLog, "");
-  assert.equal(result.exitCode, 0);
-});

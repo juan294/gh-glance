@@ -328,7 +328,7 @@ test("--help describes refresh as a shared-governor floor", () => {
   assert.match(help, /^[ \t]*R[ \t]+Resynchronize the current tab, ignoring cached validators and backoff$/m);
   assert.match(help, /--background <mode>\s+all or off or on-demand \(default on-demand\)/);
   assert.match(help, /never requests data\n\s+for a tab you are not looking at/);
-  assert.match(help, /when the terminal reports focus,\n\s+returning to the pane checks the selected tab if its\n\s+data is older than 15s/);
+  assert.match(help, /when the terminal reports focus,\n\s+returning to the pane checks the selected tab if its\n\s+data is at least 15s old/);
   assert.match(help, /set -g focus-events on/);
   assert.match(help, /--doctor --probe\s+Run bounded, admitted GitHub capability probes/);
   assert.match(help, /a quiet tab slows to 30s \(60s for Security\),\n\s+and running Actions are checked every 5s/);

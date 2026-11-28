@@ -378,6 +378,9 @@ export function parseCapture(raw, dimensions = null) {
     });
   const focus1004EnterPositions = positionsOf(raw, FOCUS_1004_ENTER);
   const focus1004ExitPositions = positionsOf(raw, FOCUS_1004_EXIT);
+  const focusEnableAfterAltEnter =
+    focus1004EnterPositions.length > 0 &&
+    focus1004EnterPositions[0] > (positionsOf(raw, ALT_ENTER)[0] ?? Infinity);
   const focusDisableBeforeAltExit =
     altExitPositions.length > 0 &&
     altExitPositions.every((position) =>
@@ -445,6 +448,7 @@ export function parseCapture(raw, dimensions = null) {
     focus1004Exit: focus1004ExitPositions.length,
     focus1004EnterPositions,
     focus1004ExitPositions,
+    focusEnableAfterAltEnter,
     focusDisableBeforeAltExit,
     finalFrame: {
       lines: finalFrameLines,

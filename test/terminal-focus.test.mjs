@@ -8,7 +8,7 @@ import {
 } from "../index.mjs";
 
 const NOW = 1_800_000_000_000;
-const base = { nowMs: NOW, lastOkAt: NOW - 60_000, lastAttemptAt: null, inFlight: false, fetcherReady: true };
+const base = { nowMs: NOW, lastOkAt: NOW - 60_000, lastAttemptAt: undefined, inFlight: undefined };
 const decide = (overrides) => terminalFocusRevalidation({ ...base, ...overrides });
 
 test("terminal focus revalidation thresholds are 15 seconds", () => {
@@ -18,7 +18,6 @@ test("terminal focus revalidation thresholds are 15 seconds", () => {
 
 test("terminal focus revalidation decision table", () => {
   const cases = [
-    [{ fetcherReady: false }, false, "unavailable"],
     [{ inFlight: true }, false, "in-flight"],
     [{ lastAttemptAt: NOW - 14_999 }, false, "throttled"],
     [{ lastAttemptAt: NOW - 15_000 }, true, "stale"],
@@ -29,8 +28,7 @@ test("terminal focus revalidation decision table", () => {
     [{ lastOkAt: NOW - 15_000 }, true, "stale"],
     // A source time ahead of this clock is not a negative age.
     [{ lastOkAt: NOW + 60_000 }, false, "fresh"],
-    // Unavailability and in-flight work outrank every age decision.
-    [{ fetcherReady: false, lastOkAt: null }, false, "unavailable"],
+    // In-flight work and the throttle outrank every age decision.
     [{ inFlight: true, lastOkAt: null }, false, "in-flight"],
     [{ lastAttemptAt: NOW - 1, lastOkAt: null }, false, "throttled"],
   ];

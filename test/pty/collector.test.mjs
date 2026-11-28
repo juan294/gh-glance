@@ -193,6 +193,50 @@ test("COL on-demand: real collector refreshes secondary data exactly on request"
   await waitForExit(service);
 });
 
+// TF-18 (docs/plans/2026-11-28-refresh-on-terminal-focus.md): connected mode
+// never installs the terminal focus entry point, so a stale focus-in sends no
+// collector refresh. Same setup as "COL on-demand" above.
+test("TF-18 terminal focus-in in connected mode sends no collector refresh", async (t) => {
+  const root = mkdtempSync("/tmp/ggc-focus-");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const config = join(root, "collector.json");
+  const serverCalls = join(root, "server.calls");
+  const clientCalls = join(root, "client.calls");
+  writeFileSync(config, JSON.stringify(CONFIG), { mode: 0o600 });
+  const fixturePath = `${FIXTURES}:${process.env.PATH}`;
+  const service = spawn(process.execPath, [ENTRY, "--serve", "--config", config], {
+    env: { ...process.env, PATH: fixturePath, XDG_CONFIG_HOME: root, GH_CONFIG_DIR: root,
+      GH_GLANCE_FIXTURE_LOG: serverCalls },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  t.after(() => service.kill("SIGTERM"));
+  let stderr = "";
+  service.stderr.on("data", (chunk) => { stderr += chunk; });
+  for (let index = 0; index < 200 && !stderr.includes("collector listening"); index += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.match(stderr, /collector listening/);
+  const result = await captureAsync({
+    cols: 80, rows: 20, signal: "none", settle: 45, configHome: root,
+    args: "--connect local --repo acme/widget --tab issues --refresh 2",
+    env: { PATH: fixturePath, GH_GLANCE_FIXTURE_LOG: clientCalls },
+    // Past the 15 s minimum age, then long enough for a refresh to reach the server.
+    stdin: waitForAwk('"$GH_GLANCE_CAPTURE_OUT"', 'index($0, "Cached") { ok=1 }', 200) +
+      "sleep 17; printf '\\033[I'; sleep 2; printf q",
+  });
+  const serverLog = existsSync(serverCalls) ? readFileSync(serverCalls, "utf8") : "";
+  const clientLog = existsSync(clientCalls) ? readFileSync(clientCalls, "utf8") : "";
+  assert.ok(result.liveScreen.statusHistory.some((line) => /Cached/.test(line)),
+    JSON.stringify({ statuses: result.liveScreen.statusHistory, serverLog, stderr }));
+  assert.equal(result.focus1004Enter, 1, "focus reporting must be on in connected mode too");
+  assert.equal(serverLog.split("\n").filter((line) => line.startsWith("graphql issues.page")).length, 1,
+    serverLog);
+  assert.equal(clientLog, "");
+  assert.equal(result.exitCode, 0);
+  service.kill("SIGTERM");
+  await waitForExit(service);
+});
+
 for (const [background, label, failure] of [["all", "Stale", "disconnect"], ["on-demand", "Cached", "app-auth"]]) {
   test(`FE-M1: repeated old collector snapshots stay ${label} until ${failure}`, async (t) => {
     const root = mkdtempSync("/tmp/ggc-stale-");

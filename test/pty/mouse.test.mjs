@@ -104,6 +104,7 @@ function assertMouseLifecycle(result, label) {
 function assertFocusLifecycle(result, label) {
   assert.equal(result.focus1004Enter, 1, `${label}: focus reporting enable count`);
   assert.equal(result.focus1004Exit, 1, `${label}: focus reporting disable count`);
+  assert.equal(result.focusEnableAfterAltEnter, true, `${label}: focus reporting enabled outside the alternate screen`);
   assert.equal(result.focusDisableBeforeAltExit, true, `${label}: focus reporting disabled too late`);
 }
 
